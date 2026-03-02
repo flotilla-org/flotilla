@@ -1,3 +1,4 @@
+mod actions;
 mod app;
 mod data;
 mod event;
@@ -52,6 +53,36 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_root: PathBuf) -> Res
                     // (tick-based refresh will be refined later)
                 }
             }
+        }
+
+        // Process pending actions
+        match app.take_pending_action() {
+            app::PendingAction::SwitchWorktree(i) => {
+                if let Some(wt) = app.data.worktrees.get(i) {
+                    let _ = actions::switch_to_worktree(&wt.path).await;
+                }
+            }
+            app::PendingAction::RemoveWorktree(i) => {
+                if let Some(wt) = app.data.worktrees.get(i) {
+                    let branch = wt.branch.clone();
+                    let repo = app.repo_root.clone();
+                    let _ = actions::remove_worktree(&branch, &repo).await;
+                    app.refresh_data().await;
+                }
+            }
+            app::PendingAction::OpenPr(number) => {
+                let repo = app.repo_root.clone();
+                let _ = actions::open_pr_in_browser(number, &repo).await;
+            }
+            app::PendingAction::CreateWorktree(branch) => {
+                let repo = app.repo_root.clone();
+                let _ = actions::create_worktree(&branch, &repo).await;
+                app.refresh_data().await;
+            }
+            app::PendingAction::Refresh => {
+                app.refresh_data().await;
+            }
+            app::PendingAction::None => {}
         }
 
         if app.should_quit {

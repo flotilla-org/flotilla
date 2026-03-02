@@ -5,6 +5,17 @@ use strum::{Display, EnumIter, FromRepr, IntoEnumIterator};
 use crate::data::DataStore;
 use std::path::PathBuf;
 
+#[derive(Default)]
+pub enum PendingAction {
+    #[default]
+    None,
+    SwitchWorktree(usize),
+    CreateWorktree(String),
+    RemoveWorktree(usize),
+    OpenPr(i64),
+    Refresh,
+}
+
 #[derive(Default, Clone, Copy, Display, FromRepr, EnumIter, PartialEq)]
 pub enum Tab {
     #[default]
@@ -37,6 +48,7 @@ pub struct App {
     pub data: DataStore,
     pub repo_root: PathBuf,
     pub list_state: ListState,
+    pub pending_action: PendingAction,
 }
 
 impl App {
@@ -68,8 +80,50 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
             KeyCode::Char('r') => {} // refresh handled in main loop
+            KeyCode::Enter => {
+                if let Some(i) = self.list_state.selected() {
+                    match self.current_tab {
+                        Tab::Worktrees => self.pending_action = PendingAction::SwitchWorktree(i),
+                        Tab::Prs => {
+                            if let Some(pr) = self.data.prs.get(i) {
+                                self.pending_action = PendingAction::OpenPr(pr.number);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Char('d') if self.current_tab == Tab::Worktrees => {
+                if let Some(i) = self.list_state.selected() {
+                    self.pending_action = PendingAction::RemoveWorktree(i);
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(i) = self.list_state.selected() {
+                    match self.current_tab {
+                        Tab::Worktrees => {
+                            // Find PR for this worktree's branch
+                            if let Some(wt) = self.data.worktrees.get(i) {
+                                if let Some(pr) = self.data.prs.iter().find(|pr| pr.head_ref_name == wt.branch) {
+                                    self.pending_action = PendingAction::OpenPr(pr.number);
+                                }
+                            }
+                        }
+                        Tab::Prs => {
+                            if let Some(pr) = self.data.prs.get(i) {
+                                self.pending_action = PendingAction::OpenPr(pr.number);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    pub fn take_pending_action(&mut self) -> PendingAction {
+        std::mem::take(&mut self.pending_action)
     }
 
     pub fn tick(&mut self) {
