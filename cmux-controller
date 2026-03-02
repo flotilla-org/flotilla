@@ -1,0 +1,280 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pyyaml"]
+# ///
+"""cmux-controller: workspace orchestrator for cmux.
+
+Presents a unified fzf picker of web sessions, GitHub issues, and new-blank
+options, then returns the user's selection as type:id metadata.  Later tasks
+will add worktree setup and cmux workspace creation.
+"""
+
+import argparse
+import copy
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+# ---------------------------------------------------------------------------
+# ANSI helpers
+# ---------------------------------------------------------------------------
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+# ---------------------------------------------------------------------------
+# Default template (single pane with {main_command})
+# ---------------------------------------------------------------------------
+DEFAULT_TEMPLATE: dict = {
+    "panes": [
+        {"name": "main", "surfaces": [{"command": "{main_command}"}]},
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Task 1 — repo detection
+# ---------------------------------------------------------------------------
+def detect_repo_root() -> Path | None:
+    """Auto-detect the git repo root via `git rev-parse`."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return Path(result.stdout.strip())
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Task 2 — template loading & rendering
+# ---------------------------------------------------------------------------
+def load_template(repo_root: Path, override: Path | None = None) -> dict:
+    """Load a workspace template from file, falling back to DEFAULT_TEMPLATE."""
+    path = override if override else repo_root / ".cmux" / "workspace.yaml"
+    if path and path.exists():
+        with open(path) as f:
+            return yaml.safe_load(f)
+    return copy.deepcopy(DEFAULT_TEMPLATE)
+
+
+def render_template(template: dict, variables: dict[str, str]) -> dict:
+    """Substitute ``{var}`` placeholders in all command strings."""
+    rendered = copy.deepcopy(template)
+    for pane in rendered.get("panes", []):
+        for surface in pane.get("surfaces", []):
+            cmd = surface.get("command", "")
+            for key, value in variables.items():
+                cmd = cmd.replace(f"{{{key}}}", value)
+            surface["command"] = cmd
+    return rendered
+
+
+# ---------------------------------------------------------------------------
+# Task 3 — data sources
+# ---------------------------------------------------------------------------
+def fetch_web_sessions() -> list[dict]:
+    """Fetch web sessions from claude.ai API.
+
+    Stubbed until the API endpoint is discovered.  Expected shape per session::
+
+        {
+            "type": "web_session",
+            "id": "<session-uuid>",
+            "title": "Fix auth bug",
+            "branch": "robert/fix-auth-bug",
+            "repo": "myorg/myrepo",
+            "age": "2h ago",
+        }
+    """
+    # TODO: Wire up real API when claude.ai/code session list is available.
+    return []
+
+
+def fetch_github_issues(repo_root: Path) -> list[dict]:
+    """Fetch open issues from the current repo via the ``gh`` CLI."""
+    try:
+        result = subprocess.run(
+            [
+                "gh", "issue", "list",
+                "--json", "number,title,labels,updatedAt",
+                "--limit", "20",
+                "--state", "open",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+        )
+    except FileNotFoundError:
+        # gh CLI not installed
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        issues = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    return [
+        {
+            "type": "issue",
+            "id": str(issue["number"]),
+            "title": issue["title"],
+            "labels": ",".join(
+                label["name"] for label in issue.get("labels", [])
+            ),
+            "age": issue.get("updatedAt", ""),
+        }
+        for issue in issues
+    ]
+
+
+def new_session_options() -> list[dict]:
+    """Return the set of 'create-new' options for the picker."""
+    return [
+        {
+            "type": "new_blank",
+            "id": "blank",
+            "title": "Blank session (current repo)",
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — fzf picker
+# ---------------------------------------------------------------------------
+def format_picker_lines(
+    sessions: list[dict],
+    new_opts: list[dict],
+    issues: list[dict],
+) -> list[str]:
+    """Build fzf-compatible lines with hidden metadata prefix.
+
+    Format per selectable line: ``type:id<TAB>display_text``
+    Section headers have no metadata prefix and are therefore not selectable.
+    """
+    lines: list[str] = []
+
+    # -- Web Sessions -------------------------------------------------------
+    if sessions:
+        lines.append(f"{DIM}  Web Sessions{RESET}")
+        for s in sessions:
+            meta = f"web_session:{s['id']}"
+            display = (
+                f"    {s['title']:<30s} "
+                f"{CYAN}{s.get('branch', ''):<30s}{RESET} "
+                f"{s.get('repo', ''):<20s} "
+                f"{DIM}{s.get('age', '')}{RESET}"
+            )
+            lines.append(f"{meta}\t{display}")
+
+    # -- New Session --------------------------------------------------------
+    lines.append(f"{DIM}  New Session{RESET}")
+    for n in new_opts:
+        meta = f"new_blank:{n['id']}"
+        lines.append(f"{meta}\t    {GREEN}\u2219 {n['title']}{RESET}")
+
+    # -- GitHub Issues ------------------------------------------------------
+    if issues:
+        lines.append(f"{DIM}  GitHub Issues{RESET}")
+        for i in issues:
+            meta = f"issue:{i['id']}"
+            labels = (
+                f" {DIM}{i['labels']}{RESET}" if i.get("labels") else ""
+            )
+            lines.append(
+                f"{meta}\t    {YELLOW}#{i['id']:<5s}{RESET} "
+                f"{i['title']:<45s}{labels}"
+            )
+
+    return lines
+
+
+def run_picker(lines: list[str]) -> str | None:
+    """Run fzf with formatted lines; return the metadata prefix of the selection."""
+    input_text = "\n".join(lines)
+    try:
+        result = subprocess.run(
+            [
+                "fzf",
+                "--ansi",
+                "--no-sort",
+                "--delimiter=\t",
+                "--with-nth=2",
+                "--header=\u2191\u2193 navigate  enter select  ctrl-c cancel",
+                "--prompt=  workspace> ",
+                "--pointer=\u25b6",
+                "--color=pointer:cyan,prompt:cyan",
+            ],
+            input=input_text,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("Error: fzf is not installed", file=sys.stderr)
+        sys.exit(1)
+
+    if result.returncode != 0:
+        return None
+
+    selected = result.stdout.strip()
+    if "\t" in selected:
+        return selected.split("\t", 1)[0]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="cmux workspace orchestrator",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Git repo root (auto-detected if omitted)",
+    )
+    parser.add_argument(
+        "--template",
+        type=Path,
+        default=None,
+        help="Workspace template file (default: .cmux/workspace.yaml)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without executing",
+    )
+    args = parser.parse_args()
+
+    # -- Detect repo root ---------------------------------------------------
+    repo_root = args.repo_root or detect_repo_root()
+    if not repo_root:
+        print("Error: not in a git repository", file=sys.stderr)
+        sys.exit(1)
+
+    # -- Fetch data sources -------------------------------------------------
+    sessions = fetch_web_sessions()
+    new_opts = new_session_options()
+    issues = fetch_github_issues(repo_root)
+
+    # -- Run picker ---------------------------------------------------------
+    lines = format_picker_lines(sessions, new_opts, issues)
+    selection = run_picker(lines)
+    if not selection:
+        print("Cancelled.")
+        sys.exit(0)
+
+    print(f"Selected: {selection}")
+
+
+if __name__ == "__main__":
+    main()

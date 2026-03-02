@@ -1,0 +1,29 @@
+# example-workspace.yaml
+# Copy to .cmux/workspace.yaml in your repo to customise
+# the cmux workspace layout created by cmux-controller.
+#
+# Variables substituted at workspace creation time:
+#   {main_command}  — determined by picker selection
+#   {branch}        — the git branch name
+#   {repo}          — the repository directory name
+#   {issue_number}  — GitHub issue number (if applicable)
+#   {session_id}    — web session UUID   (if applicable)
+
+panes:
+  - name: main
+    surfaces:
+      - command: "{main_command}"
+
+  - name: ai
+    split: right
+    surfaces:
+      - name: codex
+        command: codex
+      - name: gemini
+        command: gemini
+
+  - name: shell
+    split: down
+    parent: ai
+    surfaces:
+      - command: ""
