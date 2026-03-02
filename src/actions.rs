@@ -1,10 +1,63 @@
+use crate::template::WorkspaceTemplate;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::process::Command;
 
-pub async fn switch_to_worktree(worktree_path: &PathBuf) -> Result<(), String> {
-    // Focus the cmux workspace if it exists, or just report the path
-    // For now, just print info — cmux workspace creation comes in Task 7
-    let _ = worktree_path;
+const CMUX_BIN: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";
+
+async fn cmux_cmd(args: &[&str]) -> Result<String, String> {
+    let output = Command::new(CMUX_BIN)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub async fn create_cmux_workspace(
+    template: &WorkspaceTemplate,
+    worktree_path: &PathBuf,
+    main_command: &str,
+) -> Result<(), String> {
+    let mut vars = HashMap::new();
+    vars.insert("main_command".to_string(), main_command.to_string());
+    let rendered = template.render(&vars);
+
+    // Create workspace
+    cmux_cmd(&["new-workspace"]).await?;
+
+    let mut pane_refs: HashMap<String, String> = HashMap::new();
+
+    for (i, pane) in rendered.panes.iter().enumerate() {
+        let pane_ref = if i == 0 {
+            // First pane exists already — just use it
+            "pane:1".to_string()
+        } else {
+            let direction = pane.split.as_deref().unwrap_or("right");
+            let mut args = vec!["new-split", direction];
+            if let Some(parent) = &pane.parent {
+                if let Some(parent_ref) = pane_refs.get(parent) {
+                    args.extend(["--panel", parent_ref]);
+                }
+            }
+            cmux_cmd(&args).await?;
+            format!("pane:{}", i + 1)
+        };
+        pane_refs.insert(pane.name.clone(), pane_ref.clone());
+
+        for (j, surface) in pane.surfaces.iter().enumerate() {
+            if !(i == 0 && j == 0) {
+                cmux_cmd(&["new-surface", "--type", "terminal", "--pane", &pane_ref]).await?;
+            }
+            let cmd = if surface.command.is_empty() {
+                format!("cd {}", worktree_path.display())
+            } else {
+                format!("cd {} && {}", worktree_path.display(), surface.command)
+            };
+            cmux_cmd(&["send", &format!("{cmd}\n")]).await?;
+        }
+    }
+
     Ok(())
 }
 

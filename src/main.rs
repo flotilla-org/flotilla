@@ -2,6 +2,7 @@ mod actions;
 mod app;
 mod data;
 mod event;
+mod template;
 mod ui;
 
 use std::path::PathBuf;
@@ -59,7 +60,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_root: PathBuf) -> Res
         match app.take_pending_action() {
             app::PendingAction::SwitchWorktree(i) => {
                 if let Some(wt) = app.data.worktrees.get(i) {
-                    let _ = actions::switch_to_worktree(&wt.path).await;
+                    let tmpl = template::WorkspaceTemplate::load(&app.repo_root);
+                    let _ = actions::create_cmux_workspace(
+                        &tmpl,
+                        &wt.path,
+                        "claude",
+                    ).await;
                 }
             }
             app::PendingAction::RemoveWorktree(i) => {
