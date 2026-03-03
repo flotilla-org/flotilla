@@ -15,14 +15,19 @@ pub struct PaneTemplate {
     pub parent: Option<String>,
     #[serde(default)]
     pub surfaces: Vec<SurfaceTemplate>,
+    #[serde(default)]
+    pub focus: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SurfaceTemplate {
     #[serde(default)]
+    #[allow(dead_code)]
     pub name: Option<String>,
     #[serde(default)]
     pub command: String,
+    #[serde(default)]
+    pub active: bool,
 }
 
 impl WorkspaceTemplate {
@@ -45,7 +50,9 @@ impl WorkspaceTemplate {
                 surfaces: vec![SurfaceTemplate {
                     name: None,
                     command: "{main_command}".to_string(),
+                    active: false,
                 }],
+                focus: true,
             }],
         }
     }

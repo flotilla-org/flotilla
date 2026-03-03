@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 pub enum Event {
     Tick,
     Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
 }
 
 pub struct EventHandler {
@@ -18,6 +19,19 @@ impl EventHandler {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut reader = EventStream::new();
+
+            // Drain any stale input (e.g. the Enter key from launching the program)
+            // by discarding events that arrive within the first 50ms.
+            let drain_until = tokio::time::Instant::now() + Duration::from_millis(50);
+            loop {
+                let timeout = tokio::time::sleep_until(drain_until);
+                let event = reader.next().fuse();
+                tokio::select! {
+                    _ = timeout => break,
+                    _ = event => {} // discard
+                }
+            }
+
             let mut interval = tokio::time::interval(tick_rate);
             loop {
                 let delay = interval.tick();
@@ -29,6 +43,9 @@ impl EventHandler {
                             if k.kind == KeyEventKind::Press =>
                         {
                             let _ = tx.send(Event::Key(k));
+                        }
+                        Some(Ok(crossterm::event::Event::Mouse(m))) => {
+                            let _ = tx.send(Event::Mouse(m));
                         }
                         _ => {}
                     }

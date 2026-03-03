@@ -173,7 +173,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "strum",
  "tokio",
  "tui-input",
 ]
