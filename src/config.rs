@@ -63,6 +63,7 @@ pub fn save_repo(path: &Path) {
 }
 
 /// Remove a repo's config file.
+#[allow(dead_code)]
 pub fn remove_repo(path: &Path) {
     let dir = config_dir();
     let slug = path_to_slug(path);

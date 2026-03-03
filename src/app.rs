@@ -18,6 +18,7 @@ pub enum InputMode {
 }
 
 pub struct RepoState {
+    #[allow(dead_code)]
     pub repo_root: PathBuf,
     pub data: DataStore,
     pub table_state: TableState,
@@ -333,6 +334,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn refresh_data(&mut self) -> Vec<String> {
         let rs = self.active_mut();
         let errors = rs.data.refresh(&rs.repo_root).await;

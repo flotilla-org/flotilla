@@ -701,10 +701,16 @@ fn render_file_picker(app: &App, frame: &mut Frame) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if max == 0 {
+        return String::new();
+    }
+    // Use char count for display width (good enough for most text)
+    let char_count: usize = s.chars().count();
+    if char_count <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{truncated}…")
     }
 }
 
