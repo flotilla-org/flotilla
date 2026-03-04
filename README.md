@@ -23,9 +23,9 @@ Requires these tools on your system:
 | [cmux](https://cmux.dev) | Terminal workspace manager |
 | [worktrunk](https://github.com/max-sixty/worktrunk) (`wt`) | Git worktree manager |
 | [`gh`](https://cli.github.com/) | GitHub CLI (PRs, issues, browser opening) |
-| `git` | Repo detection, remote branches |
+| [`git`](https://git-scm.com/) | Repo detection, remote branches |
 | [`claude`](https://docs.anthropic.com/en/docs/claude-code) | Branch name generation via AI, session teleport |
-| `security` | macOS Keychain (OAuth token for Claude sessions API) |
+| [`security`](https://ss64.com/mac/security.html) | macOS Keychain (OAuth token for Claude sessions API) |
 
 ## Data sources
 
