@@ -1,6 +1,8 @@
 # flotilla
 
-TUI dashboard for managing development workspaces across cmux, git worktrees, and GitHub.
+TUI dashboard for managing development workspaces across [cmux](https://cmux.dev), git worktrees, and GitHub.
+
+![splash](assets/splash.png)
 
 Provides a unified view of worktrees, pull requests, issues, Claude Code sessions, and remote branches. Enter on any item gets you into a workspace — creating whatever is missing (worktree, workspace) along the way.
 
@@ -10,7 +12,7 @@ Provides a unified view of worktrees, pull requests, issues, Claude Code session
 cargo run -- [--repo-root <path>]
 ```
 
-Repo root is auto-detected from the current directory if omitted.
+Repo root is auto-detected from the current directory if omitted. Multiple repos can be managed as tabs.
 
 ## Dependencies
 
@@ -18,13 +20,12 @@ Requires these tools on your system:
 
 | Tool | Purpose |
 |------|---------|
-| [cmux](https://cmux.app) | Terminal workspace manager |
-| `wt` | Git worktree helper (`wt list --format=json`, `wt switch --create`) |
-| `gh` | GitHub CLI (PRs, issues, browser opening) |
+| [cmux](https://cmux.dev) | Terminal workspace manager |
+| [worktrunk](https://github.com/max-sixty/worktrunk) (`wt`) | Git worktree manager |
+| [`gh`](https://cli.github.com/) | GitHub CLI (PRs, issues, browser opening) |
 | `git` | Repo detection, remote branches |
-| `claude` | Branch name generation via AI, session teleport |
-| `curl` | Claude Code sessions API |
-| `security` | macOS Keychain (OAuth token for sessions API) |
+| [`claude`](https://docs.anthropic.com/en/docs/claude-code) | Branch name generation via AI, session teleport |
+| `security` | macOS Keychain (OAuth token for Claude sessions API) |
 
 ## Data sources
 
@@ -46,8 +47,11 @@ Data auto-refreshes every 10 seconds. Press `r` to refresh manually.
 | Key | Action |
 |-----|--------|
 | `j` / `k` / `↑` / `↓` | Navigate list |
+| `[` / `]` | Switch tabs |
+| `{` / `}` | Reorder tabs |
 | Click | Select item |
 | Scroll wheel | Navigate list |
+| Drag tab | Reorder tabs |
 
 ### Actions
 
@@ -59,6 +63,8 @@ Data auto-refreshes every 10 seconds. Press `r` to refresh manually.
 | `d` | Remove worktree (with safety confirmation) |
 | `p` | Open PR in browser |
 | `r` | Refresh data |
+| `a` | Add repo tab |
+| `c` | Toggle providers panel |
 
 ### Multi-select (issues)
 
@@ -74,6 +80,7 @@ Data auto-refreshes every 10 seconds. Press `r` to refresh manually.
 | Key | Action |
 |-----|--------|
 | `?` | Toggle help overlay |
+| `D` | Toggle debug panel |
 | `q` / Esc | Quit |
 
 ## Workspace template
