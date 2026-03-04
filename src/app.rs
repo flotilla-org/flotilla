@@ -21,6 +21,7 @@ pub enum InputMode {
 pub struct RepoState {
     #[allow(dead_code)]
     pub repo_root: PathBuf,
+    pub registry: ProviderRegistry,
     pub data: DataStore,
     pub table_state: TableState,
     pub selected_selectable_idx: Option<usize>,
@@ -29,9 +30,10 @@ pub struct RepoState {
 }
 
 impl RepoState {
-    pub fn new(repo_root: PathBuf) -> Self {
+    pub fn new(repo_root: PathBuf, registry: ProviderRegistry) -> Self {
         Self {
             repo_root,
+            registry,
             data: DataStore::default(),
             table_state: TableState::default(),
             selected_selectable_idx: None,
@@ -235,7 +237,6 @@ pub struct App {
     pub repos: HashMap<PathBuf, RepoState>,
     pub repo_order: Vec<PathBuf>,
     pub active_repo: usize,
-    pub registry: ProviderRegistry,
     pub pending_action: PendingAction,
     pub show_action_menu: bool,
     pub action_menu_items: Vec<Action>,
@@ -273,7 +274,8 @@ impl App {
         let mut order = Vec::new();
         for path in repos {
             if !map.contains_key(&path) {
-                map.insert(path.clone(), RepoState::new(path.clone()));
+                let registry = crate::providers::discovery::detect_providers(&path);
+                map.insert(path.clone(), RepoState::new(path.clone(), registry));
                 order.push(path);
             }
         }
@@ -295,6 +297,12 @@ impl App {
         self.repos.get_mut(key).unwrap()
     }
 
+    /// Reference to the active repo's provider registry.
+    #[allow(dead_code)]
+    pub fn active_registry(&self) -> &ProviderRegistry {
+        &self.active().registry
+    }
+
     /// Path of the active repo.
     pub fn active_repo_root(&self) -> &PathBuf {
         &self.repo_order[self.active_repo]
@@ -309,7 +317,8 @@ impl App {
 
     pub fn add_repo(&mut self, path: PathBuf) {
         if !self.repos.contains_key(&path) {
-            self.repos.insert(path.clone(), RepoState::new(path.clone()));
+            let registry = crate::providers::discovery::detect_providers(&path);
+            self.repos.insert(path.clone(), RepoState::new(path.clone(), registry));
             self.repo_order.push(path);
         }
     }
@@ -341,9 +350,12 @@ impl App {
     #[allow(dead_code)]
     pub async fn refresh_data(&mut self) -> Vec<String> {
         let key = self.repo_order[self.active_repo].clone();
-        let mut ds = std::mem::take(&mut self.repos.get_mut(&key).unwrap().data);
-        let errors = ds.refresh(&key, &self.registry).await;
         let rs = self.repos.get_mut(&key).unwrap();
+        let mut ds = std::mem::take(&mut rs.data);
+        let reg = std::mem::take(&mut rs.registry);
+        let errors = ds.refresh(&key, &reg).await;
+        let rs = self.repos.get_mut(&key).unwrap();
+        rs.registry = reg;
         rs.data = ds;
         // Restore selection or pick first
         if rs.data.selectable_indices.is_empty() {

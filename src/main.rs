@@ -13,8 +13,6 @@ use std::time::Duration;
 use clap::Parser;
 use color_eyre::Result;
 use crossterm::{execute, event::{EnableMouseCapture, DisableMouseCapture}};
-use providers::discovery::detect_providers;
-
 /// TUI dashboard for managing development workspaces across cmux, worktrunk, and GitHub.
 #[derive(Parser)]
 #[command(version)]
@@ -77,11 +75,6 @@ async fn main() -> Result<()> {
 
 async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) -> Result<()> {
     let mut app = app::App::new(repo_roots);
-
-    // Discover providers from the first repo
-    if let Some(first_repo) = app.repo_order.first().cloned() {
-        app.registry = detect_providers(&first_repo);
-    }
 
     let mut events = event::EventHandler::new(Duration::from_millis(250));
     let mut last_refresh = std::time::Instant::now();
@@ -178,7 +171,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                 }
             }
             app::PendingAction::SelectWorkspace(ws_ref) => {
-                if let Some((_, ws_mgr)) = &app.registry.workspace_manager {
+                if let Some((_, ws_mgr)) = &app.active().registry.workspace_manager {
                     if let Err(e) = ws_mgr.select_workspace(&ws_ref).await {
                         app.status_message = Some(e);
                     }
@@ -210,54 +203,62 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
             app::PendingAction::ConfirmDelete => {
                 if let Some(info) = app.delete_confirm_info.take() {
                     let repo = app.active_repo_root().clone();
-                    if let Some(cm) = app.registry.checkout_managers.values().next() {
-                        if let Err(e) = cm.remove_checkout(repo.as_path(), &info.branch).await {
-                            app.status_message = Some(e);
-                        }
+                    let result = if let Some(cm) = app.active().registry.checkout_managers.values().next() {
+                        Some(cm.remove_checkout(repo.as_path(), &info.branch).await)
+                    } else {
+                        None
+                    };
+                    if let Some(Err(e)) = result {
+                        app.status_message = Some(e);
                     }
                     refresh_all(&mut app).await;
                 }
             }
             app::PendingAction::OpenPr(id) => {
                 let repo = app.active_repo_root().clone();
-                if let Some(cr) = app.registry.code_review.values().next() {
+                if let Some(cr) = app.active().registry.code_review.values().next() {
                     let _ = cr.open_in_browser(&repo, &id).await;
                 }
             }
             app::PendingAction::OpenIssueBrowser(id) => {
                 let repo = app.active_repo_root().clone();
-                if let Some(it) = app.registry.issue_trackers.values().next() {
+                if let Some(it) = app.active().registry.issue_trackers.values().next() {
                     let _ = it.open_in_browser(&repo, &id).await;
                 }
             }
             app::PendingAction::CreateWorktree(branch) => {
                 let repo = app.active_repo_root().clone();
-                if let Some(cm) = app.registry.checkout_managers.values().next() {
-                    match cm.create_checkout(repo.as_path(), &branch).await {
-                        Ok(checkout) => {
-                            let tmpl = template::WorkspaceTemplate::load(app.active_repo_root());
-                            if let Err(e) = actions::create_cmux_workspace(
-                                &tmpl,
-                                &checkout.path,
-                                "claude",
-                                &branch,
-                            ).await {
-                                app.status_message = Some(e);
-                            }
-                        }
-                        Err(e) => app.status_message = Some(e),
-                    }
+                let checkout_result = if let Some(cm) = app.active().registry.checkout_managers.values().next() {
+                    Some(cm.create_checkout(repo.as_path(), &branch).await)
                 } else {
-                    app.status_message = Some("No checkout manager available".to_string());
+                    None
+                };
+                match checkout_result {
+                    Some(Ok(checkout)) => {
+                        let tmpl = template::WorkspaceTemplate::load(app.active_repo_root());
+                        if let Err(e) = actions::create_cmux_workspace(
+                            &tmpl,
+                            &checkout.path,
+                            "claude",
+                            &branch,
+                        ).await {
+                            app.status_message = Some(e);
+                        }
+                    }
+                    Some(Err(e)) => app.status_message = Some(e),
+                    None => app.status_message = Some("No checkout manager available".to_string()),
                 }
                 refresh_all(&mut app).await;
             }
             app::PendingAction::ArchiveSession(ses_idx) => {
                 if let Some(session) = app.active().data.sessions.get(ses_idx).cloned() {
-                    if let Some(ca) = app.registry.coding_agents.values().next() {
-                        if let Err(e) = ca.archive_session(&session.id).await {
-                            app.status_message = Some(e);
-                        }
+                    let result = if let Some(ca) = app.active().registry.coding_agents.values().next() {
+                        Some(ca.archive_session(&session.id).await)
+                    } else {
+                        None
+                    };
+                    if let Some(Err(e)) = result {
+                        app.status_message = Some(e);
                     }
                     refresh_all(&mut app).await;
                 }
@@ -269,11 +270,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                     app.active().data.worktrees.get(wt_idx).map(|wt| wt.path.clone())
                 } else if let Some(branch_name) = &branch {
                     let repo = app.active_repo_root().clone();
-                    if let Some(cm) = app.registry.checkout_managers.values().next() {
-                        cm.create_checkout(repo.as_path(), branch_name).await.ok().map(|c| c.path)
+                    let checkout_result = if let Some(cm) = app.active().registry.checkout_managers.values().next() {
+                        cm.create_checkout(repo.as_path(), branch_name).await.ok()
                     } else {
                         None
-                    }
+                    };
+                    checkout_result.map(|c| c.path)
                 } else {
                     None
                 };
@@ -294,7 +296,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                     .map(|issue| (issue.id.clone(), issue.title.clone()))
                     .collect();
 
-                if let Some(ai) = app.registry.ai_utilities.values().next() {
+                let branch_result = if let Some(ai) = app.active().registry.ai_utilities.values().next() {
                     let context: Vec<String> = issues.iter()
                         .map(|(id, title)| format!("{} #{}", title, id))
                         .collect();
@@ -303,20 +305,18 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                     } else {
                         context.join("; ")
                     };
-                    match ai.generate_branch_name(&prompt_text).await {
-                        Ok(branch) => app.prefill_branch_input(&branch),
-                        Err(_) => {
-                            let fallback: Vec<String> = issues.iter()
-                                .map(|(id, _)| format!("issue-{}", id))
-                                .collect();
-                            app.prefill_branch_input(&fallback.join("-"));
-                        }
-                    }
+                    Some(ai.generate_branch_name(&prompt_text).await)
                 } else {
-                    let fallback: Vec<String> = issues.iter()
-                        .map(|(id, _)| format!("issue-{}", id))
-                        .collect();
-                    app.prefill_branch_input(&fallback.join("-"));
+                    None
+                };
+                match branch_result {
+                    Some(Ok(branch)) => app.prefill_branch_input(&branch),
+                    _ => {
+                        let fallback: Vec<String> = issues.iter()
+                            .map(|(id, _)| format!("issue-{}", id))
+                            .collect();
+                        app.prefill_branch_input(&fallback.join("-"));
+                    }
                 }
             }
             app::PendingAction::AddRepo(path) => {
@@ -341,30 +341,30 @@ async fn refresh_all(app: &mut app::App) {
         .map(|path| app.repos[path].data_snapshot())
         .collect();
 
-    // Extract data stores first (mutable borrow of app.repos)
-    let items: Vec<(PathBuf, data::DataStore)> = app.repo_order.iter()
+    // Extract data stores AND registries (both moved out)
+    let items: Vec<(PathBuf, data::DataStore, providers::registry::ProviderRegistry)> = app.repo_order.iter()
         .map(|path| {
-            let ds = std::mem::take(&mut app.repos.get_mut(path).unwrap().data);
-            (path.clone(), ds)
+            let rs = app.repos.get_mut(path).unwrap();
+            let ds = std::mem::take(&mut rs.data);
+            let reg = std::mem::take(&mut rs.registry);
+            (path.clone(), ds, reg)
         })
         .collect();
 
-    // Now we can borrow registry immutably (previous mutable borrow ended with collect())
-    let registry = &app.registry;
-
     let results = futures::future::join_all(
-        items.into_iter().map(|(root, mut ds)| {
+        items.into_iter().map(|(root, mut ds, registry)| {
             async move {
-                let errors = ds.refresh(&root, registry).await;
-                (root, ds, errors)
+                let errors = ds.refresh(&root, &registry).await;
+                (root, ds, registry, errors)
             }
         })
     ).await;
 
     let mut all_errors: Vec<String> = Vec::new();
-    for (i, (path, data, errors)) in results.into_iter().enumerate() {
+    for (i, (path, data, registry, errors)) in results.into_iter().enumerate() {
         let rs = app.repos.get_mut(&path).unwrap();
         rs.data = data;
+        rs.registry = registry;
 
         // Change detection
         let new_snapshot = rs.data_snapshot();
