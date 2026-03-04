@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use crate::providers::types::*;
 
@@ -25,6 +25,25 @@ const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 impl super::Vcs for GitVcs {
     fn display_name(&self) -> &str {
         "Git"
+    }
+
+    fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
+        // git-common-dir points to the shared .git dir (same as .git for
+        // non-worktree repos, the main repo's .git for worktrees).
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .current_dir(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        // The repo root is the parent of the .git directory
+        git_dir.parent().map(|p| p.to_path_buf())
     }
 
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {

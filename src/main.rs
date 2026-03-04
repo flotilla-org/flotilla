@@ -279,15 +279,15 @@ fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
 
-    // 3. Auto-detect from cwd — always include if it's a git repo
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output();
-    if let Ok(output) = output {
-        if output.status.success() {
-            let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-            if !repo_roots.contains(&path) {
-                repo_roots.push(path);
+    // 3. Auto-detect from cwd — resolve to main repo root (not worktree)
+    let cwd = std::env::current_dir().ok();
+    if let Some(ref cwd) = cwd {
+        use crate::providers::vcs::git::GitVcs;
+        use crate::providers::vcs::Vcs;
+        let git = GitVcs::new();
+        if let Some(repo_root) = git.resolve_repo_root(cwd) {
+            if !repo_roots.contains(&repo_root) {
+                repo_roots.push(repo_root);
             }
         }
     }
