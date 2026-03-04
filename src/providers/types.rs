@@ -52,6 +52,7 @@ pub struct WorkingTreeStatus {
 pub struct ChangeRequest {
     pub id: String,
     pub title: String,
+    #[allow(dead_code)]
     pub branch: String,
     pub status: ChangeRequestStatus,
     #[allow(dead_code)]
@@ -96,6 +97,7 @@ pub enum SessionStatus {
 pub struct Workspace {
     pub ws_ref: String,
     pub name: String,
+    #[allow(dead_code)]
     pub directories: Vec<PathBuf>,
     pub correlation_keys: Vec<CorrelationKey>,
 }

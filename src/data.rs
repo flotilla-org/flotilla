@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::providers::correlation::{self, CorrelatedItem, CorrelatedGroup, ItemKind as CorItemKind};
 use crate::providers::types::{
-    ChangeRequest, Checkout, CloudAgentSession, CorrelationKey, Issue, Workspace,
+    ChangeRequest, Checkout, CloudAgentSession, Issue, Workspace,
 };
 use crate::providers::registry::ProviderRegistry;
 
@@ -154,131 +155,183 @@ impl DataStore {
         errors
     }
 
-    fn find_workspaces_for_checkout(&self, co: &Checkout) -> Vec<String> {
-        self.workspaces.iter().filter(|ws| {
-            ws.directories.iter().any(|dir| dir == &co.path)
-        }).map(|ws| ws.ws_ref.clone()).collect()
+    fn group_to_work_item(&self, group: &CorrelatedGroup) -> WorkItem {
+        let mut worktree_idx: Option<usize> = None;
+        let mut pr_idx: Option<usize> = None;
+        let mut session_idx: Option<usize> = None;
+        let mut issue_idxs: Vec<usize> = Vec::new();
+        let mut workspace_refs: Vec<String> = Vec::new();
+        let mut is_main_worktree = false;
+
+        for item in &group.items {
+            match item.kind {
+                CorItemKind::Checkout => {
+                    worktree_idx = Some(item.source_index);
+                    if let Some(co) = self.checkouts.get(item.source_index) {
+                        is_main_worktree = co.is_trunk;
+                    }
+                }
+                CorItemKind::ChangeRequest => {
+                    pr_idx = Some(item.source_index);
+                }
+                CorItemKind::CloudSession => {
+                    if session_idx.is_none() {
+                        session_idx = Some(item.source_index);
+                    }
+                }
+                CorItemKind::Issue => {
+                    issue_idxs.push(item.source_index);
+                }
+                CorItemKind::Workspace => {
+                    if let Some(ws) = self.workspaces.get(item.source_index) {
+                        workspace_refs.push(ws.ws_ref.clone());
+                    }
+                }
+                CorItemKind::RemoteBranch => {}
+            }
+        }
+
+        // Determine kind by priority: Checkout > Pr > Session > Issue
+        let kind = if worktree_idx.is_some() {
+            WorkItemKind::Checkout
+        } else if pr_idx.is_some() {
+            WorkItemKind::Pr
+        } else if session_idx.is_some() {
+            WorkItemKind::Session
+        } else {
+            WorkItemKind::Issue
+        };
+
+        let branch = group.branch().map(|s| s.to_string());
+
+        let description = match kind {
+            WorkItemKind::Checkout => branch.clone().unwrap_or_default(),
+            WorkItemKind::Pr => pr_idx
+                .and_then(|i| self.change_requests.get(i))
+                .map(|cr| cr.title.clone())
+                .unwrap_or_default(),
+            WorkItemKind::Session => session_idx
+                .and_then(|i| self.sessions.get(i))
+                .map(|s| s.title.clone())
+                .unwrap_or_default(),
+            WorkItemKind::Issue => issue_idxs
+                .first()
+                .and_then(|&i| self.issues.get(i))
+                .map(|iss| iss.title.clone())
+                .unwrap_or_default(),
+            WorkItemKind::RemoteBranch => branch.clone().unwrap_or_default(),
+        };
+
+        WorkItem {
+            kind,
+            branch,
+            description,
+            worktree_idx,
+            is_main_worktree,
+            pr_idx,
+            session_idx,
+            issue_idxs,
+            workspace_refs,
+        }
     }
 
     fn correlate(&mut self) {
-        let mut items_by_branch: HashMap<String, WorkItem> = HashMap::new();
-        let mut branchless_sessions: Vec<WorkItem> = Vec::new();
+        // Phase 1: Build CorrelatedItems from all data sources
+        let mut items: Vec<CorrelatedItem> = Vec::new();
 
-        // 1. Insert checkouts (primary items)
         for (i, co) in self.checkouts.iter().enumerate() {
-            let branch = co.branch.clone();
-            let ws_refs = self.find_workspaces_for_checkout(co);
-            let item = WorkItem {
-                kind: WorkItemKind::Checkout,
-                branch: Some(branch.clone()),
-                description: branch.clone(),
-                worktree_idx: Some(i),
-                is_main_worktree: co.is_trunk,
-                pr_idx: None,
-                session_idx: None,
-                issue_idxs: Vec::new(),
-                workspace_refs: ws_refs,
-            };
-            items_by_branch.insert(branch, item);
+            items.push(CorrelatedItem {
+                provider_name: "checkout".to_string(),
+                kind: CorItemKind::Checkout,
+                title: co.branch.clone(),
+                correlation_keys: co.correlation_keys.clone(),
+                source_index: i,
+            });
         }
 
-        // 2. Augment with change requests (or create new items)
         for (i, cr) in self.change_requests.iter().enumerate() {
-            let branch = cr.branch.clone();
-            if let Some(item) = items_by_branch.get_mut(&branch) {
-                item.pr_idx = Some(i);
-            } else {
-                let item = WorkItem {
-                    kind: WorkItemKind::Pr,
-                    branch: Some(branch.clone()),
-                    description: cr.title.clone(),
-                    worktree_idx: None,
-                    is_main_worktree: false,
-                    pr_idx: Some(i),
-                    session_idx: None,
-                    issue_idxs: Vec::new(),
-                    workspace_refs: Vec::new(),
-                };
-                items_by_branch.insert(branch, item);
-            }
+            items.push(CorrelatedItem {
+                provider_name: "change_request".to_string(),
+                kind: CorItemKind::ChangeRequest,
+                title: cr.title.clone(),
+                correlation_keys: cr.correlation_keys.clone(),
+                source_index: i,
+            });
         }
 
-        // 3. Augment with sessions
+        for (i, issue) in self.issues.iter().enumerate() {
+            items.push(CorrelatedItem {
+                provider_name: "issue".to_string(),
+                kind: CorItemKind::Issue,
+                title: issue.title.clone(),
+                correlation_keys: issue.correlation_keys.clone(),
+                source_index: i,
+            });
+        }
+
         for (i, session) in self.sessions.iter().enumerate() {
-            if let Some(branch) = session_branch(session) {
-                if let Some(item) = items_by_branch.get_mut(&branch) {
-                    item.session_idx = Some(i);
-                } else {
-                    let item = WorkItem {
-                        kind: WorkItemKind::Session,
-                        branch: Some(branch.clone()),
-                        description: session.title.clone(),
-                        worktree_idx: None,
-                        is_main_worktree: false,
-                        pr_idx: None,
-                        session_idx: Some(i),
-                        issue_idxs: Vec::new(),
-                        workspace_refs: Vec::new(),
-                    };
-                    items_by_branch.insert(branch, item);
+            items.push(CorrelatedItem {
+                provider_name: "session".to_string(),
+                kind: CorItemKind::CloudSession,
+                title: session.title.clone(),
+                correlation_keys: session.correlation_keys.clone(),
+                source_index: i,
+            });
+        }
+
+        for (i, ws) in self.workspaces.iter().enumerate() {
+            items.push(CorrelatedItem {
+                provider_name: "workspace".to_string(),
+                kind: CorItemKind::Workspace,
+                title: ws.name.clone(),
+                correlation_keys: ws.correlation_keys.clone(),
+                source_index: i,
+            });
+        }
+
+        // Phase 2: Run correlation engine
+        let groups = correlation::correlate(items);
+
+        // Phase 3: Convert groups to WorkItems and categorize
+        let mut checkout_items: Vec<WorkItem> = Vec::new();
+        let mut session_items: Vec<WorkItem> = Vec::new();
+        let mut pr_items: Vec<WorkItem> = Vec::new();
+        let mut linked_issue_indices: HashSet<usize> = HashSet::new();
+
+        for group in &groups {
+            let work_item = self.group_to_work_item(group);
+
+            // Track linked issues: only when the group contains non-issue items too
+            if work_item.kind != WorkItemKind::Issue {
+                for &idx in &work_item.issue_idxs {
+                    linked_issue_indices.insert(idx);
                 }
-            } else {
-                branchless_sessions.push(WorkItem {
-                    kind: WorkItemKind::Session,
-                    branch: None,
-                    description: session.title.clone(),
-                    worktree_idx: None,
-                    is_main_worktree: false,
-                    pr_idx: None,
-                    session_idx: Some(i),
-                    issue_idxs: Vec::new(),
-                    workspace_refs: Vec::new(),
-                });
+            }
+
+            match work_item.kind {
+                WorkItemKind::Checkout => checkout_items.push(work_item),
+                WorkItemKind::Session => session_items.push(work_item),
+                WorkItemKind::Pr => pr_items.push(work_item),
+                WorkItemKind::Issue => {} // standalone issues handled in Phase 4
+                WorkItemKind::RemoteBranch => {} // handled separately
             }
         }
 
-        // 4. Link issues to change requests using correlation keys
-        let mut linked_issues: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for cr in &self.change_requests {
-            for key in &cr.correlation_keys {
-                if let CorrelationKey::IssueRef(_, issue_id) = key {
-                    linked_issues.insert(issue_id.clone());
-                    // Find which branch this CR belongs to and link the issue
-                    if let Some(item) = items_by_branch.get_mut(&cr.branch) {
-                        if let Some(issue_idx) = self.issues.iter().position(|i| i.id == *issue_id) {
-                            if !item.issue_idxs.contains(&issue_idx) {
-                                item.issue_idxs.push(issue_idx);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5. Build table entries in section order
+        // Phase 4: Build table entries in section order
         let mut entries: Vec<TableEntry> = Vec::new();
         let mut selectable: Vec<usize> = Vec::new();
 
-        // Worktrees section -- sorted by branch name
-        let mut wt_items: Vec<WorkItem> = items_by_branch.values()
-            .filter(|item| item.kind == WorkItemKind::Checkout)
-            .cloned()
-            .collect();
-        wt_items.sort_by(|a, b| a.branch.cmp(&b.branch));
-        if !wt_items.is_empty() {
+        // Checkouts section -- sorted by branch name ascending
+        checkout_items.sort_by(|a, b| a.branch.cmp(&b.branch));
+        if !checkout_items.is_empty() {
             entries.push(TableEntry::Header(SectionHeader::Checkouts));
-            for item in wt_items {
+            for item in checkout_items {
                 selectable.push(entries.len());
                 entries.push(TableEntry::Item(item));
             }
         }
 
         // Sessions section -- sorted by updated_at descending (most recent first)
-        let mut session_items: Vec<WorkItem> = items_by_branch.values()
-            .filter(|item| item.kind == WorkItemKind::Session)
-            .cloned()
-            .chain(branchless_sessions)
-            .collect();
         session_items.sort_by(|a, b| {
             let a_time = a.session_idx.and_then(|i| self.sessions.get(i)).and_then(|s| s.updated_at.as_deref());
             let b_time = b.session_idx.and_then(|i| self.sessions.get(i)).and_then(|s| s.updated_at.as_deref());
@@ -293,10 +346,6 @@ impl DataStore {
         }
 
         // PRs section -- sorted by id descending (most recent first)
-        let mut pr_items: Vec<WorkItem> = items_by_branch.values()
-            .filter(|item| item.kind == WorkItemKind::Pr)
-            .cloned()
-            .collect();
         pr_items.sort_by(|a, b| {
             let a_num = a.pr_idx.and_then(|i| self.change_requests.get(i)).and_then(|cr| cr.id.parse::<i64>().ok());
             let b_num = b.pr_idx.and_then(|i| self.change_requests.get(i)).and_then(|cr| cr.id.parse::<i64>().ok());
@@ -311,10 +360,16 @@ impl DataStore {
         }
 
         // Remote branches section -- sorted by branch name
-        let known_branches: std::collections::HashSet<&str> = items_by_branch.keys()
-            .map(|s| s.as_str())
-            .collect();
-        let merged_set: std::collections::HashSet<&str> = self.merged_branches.iter()
+        // Collect known branches from all correlated groups
+        let mut known_branches: HashSet<String> = HashSet::new();
+        for entry in &entries {
+            if let TableEntry::Item(item) = entry {
+                if let Some(ref b) = item.branch {
+                    known_branches.insert(b.clone());
+                }
+            }
+        }
+        let merged_set: HashSet<&str> = self.merged_branches.iter()
             .map(|s| s.as_str())
             .collect();
         let mut remote_items: Vec<WorkItem> = self.remote_branches.iter()
@@ -346,10 +401,10 @@ impl DataStore {
             }
         }
 
-        // Issues section -- sorted by issue id descending (most recent first)
+        // Issues section -- standalone only (not in linked_issue_indices)
         let mut issue_items: Vec<WorkItem> = self.issues.iter()
             .enumerate()
-            .filter(|(_, issue)| !linked_issues.contains(&issue.id))
+            .filter(|(i, _)| !linked_issue_indices.contains(i))
             .map(|(i, issue)| WorkItem {
                 kind: WorkItemKind::Issue,
                 branch: None,
@@ -378,17 +433,6 @@ impl DataStore {
         self.table_entries = entries;
         self.selectable_indices = selectable;
     }
-}
-
-/// Extract branch from a session's correlation keys.
-fn session_branch(session: &CloudAgentSession) -> Option<String> {
-    session.correlation_keys.iter().find_map(|key| {
-        if let CorrelationKey::Branch(ref b) = key {
-            Some(b.clone())
-        } else {
-            None
-        }
-    })
 }
 
 async fn run_command(cmd: &str, args: &[&str], cwd: Option<&PathBuf>) -> Result<String, String> {

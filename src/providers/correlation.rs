@@ -10,16 +10,20 @@ pub enum ItemKind {
     Issue,
     CloudSession,
     Workspace,
+    #[allow(dead_code)]
     RemoteBranch,
 }
 
 /// A single item submitted for correlation.
 #[derive(Debug, Clone)]
 pub struct CorrelatedItem {
+    #[allow(dead_code)]
     pub provider_name: String,
     pub kind: ItemKind,
+    #[allow(dead_code)]
     pub title: String,
     pub correlation_keys: Vec<CorrelationKey>,
+    pub source_index: usize,
 }
 
 /// A group of items that are transitively related via shared correlation keys.
@@ -42,6 +46,7 @@ impl CorrelatedGroup {
     }
 
     /// Returns true if the group contains an item of the given kind.
+    #[allow(dead_code)]
     pub fn has(&self, kind: &ItemKind) -> bool {
         self.items.iter().any(|item| item.kind == *kind)
     }
@@ -160,6 +165,7 @@ mod tests {
             kind,
             title: title.to_string(),
             correlation_keys: keys,
+            source_index: 0,
         }
     }
 
