@@ -31,6 +31,7 @@ pub struct SurfaceTemplate {
 }
 
 impl WorkspaceTemplate {
+    #[allow(dead_code)]
     pub fn load(repo_root: &PathBuf) -> Self {
         let path = repo_root.join(".cmux/workspace.yaml");
         if path.exists() {

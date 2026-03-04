@@ -1,4 +1,3 @@
-mod actions;
 mod app;
 mod data;
 mod event;
@@ -158,13 +157,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
         match pending {
             app::PendingAction::SwitchWorktree(i) => {
                 if let Some(wt) = app.active().data.worktrees.get(i).cloned() {
-                    let tmpl = template::WorkspaceTemplate::load(app.active_repo_root());
-                    if let Err(e) = actions::create_cmux_workspace(
-                        &tmpl,
-                        &wt.path,
-                        "claude",
-                        &wt.branch,
-                    ).await {
+                    let ws_result = if let Some((_, ws_mgr)) = &app.active().registry.workspace_manager {
+                        let config = workspace_config(app.active_repo_root(), &wt.branch, &wt.path, "claude");
+                        Some(ws_mgr.create_workspace(&config).await)
+                    } else {
+                        None
+                    };
+                    if let Some(Err(e)) = ws_result {
                         app.status_message = Some(e);
                     }
                     refresh_all(&mut app).await;
@@ -235,13 +234,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                 };
                 match checkout_result {
                     Some(Ok(checkout)) => {
-                        let tmpl = template::WorkspaceTemplate::load(app.active_repo_root());
-                        if let Err(e) = actions::create_cmux_workspace(
-                            &tmpl,
-                            &checkout.path,
-                            "claude",
-                            &branch,
-                        ).await {
+                        let ws_result = if let Some((_, ws_mgr)) = &app.active().registry.workspace_manager {
+                            let config = workspace_config(app.active_repo_root(), &branch, &checkout.path, "claude");
+                            Some(ws_mgr.create_workspace(&config).await)
+                        } else {
+                            None
+                        };
+                        if let Some(Err(e)) = ws_result {
                             app.status_message = Some(e);
                         }
                     }
@@ -265,7 +264,6 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
             }
             app::PendingAction::TeleportSession { session_id, branch, worktree_idx } => {
                 let teleport_cmd = format!("claude --teleport {}", session_id);
-                let tmpl = template::WorkspaceTemplate::load(app.active_repo_root());
                 let wt_path = if let Some(wt_idx) = worktree_idx {
                     app.active().data.worktrees.get(wt_idx).map(|wt| wt.path.clone())
                 } else if let Some(branch_name) = &branch {
@@ -281,9 +279,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                 };
                 if let Some(path) = wt_path {
                     let name = branch.as_deref().unwrap_or("session");
-                    if let Err(e) = actions::create_cmux_workspace(
-                        &tmpl, &path, &teleport_cmd, name,
-                    ).await {
+                    let ws_result = if let Some((_, ws_mgr)) = &app.active().registry.workspace_manager {
+                        let config = workspace_config(app.active_repo_root(), name, &path, &teleport_cmd);
+                        Some(ws_mgr.create_workspace(&config).await)
+                    } else {
+                        None
+                    };
+                    if let Some(Err(e)) = ws_result {
                         app.status_message = Some(e);
                     }
                 }
@@ -334,6 +336,24 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
         }
     }
     Ok(())
+}
+
+fn workspace_config(
+    repo_root: &std::path::Path,
+    name: &str,
+    working_dir: &std::path::Path,
+    main_command: &str,
+) -> crate::providers::types::WorkspaceConfig {
+    let tmpl_path = repo_root.join(".cmux/workspace.yaml");
+    let template_yaml = std::fs::read_to_string(&tmpl_path).ok();
+    let mut template_vars = std::collections::HashMap::new();
+    template_vars.insert("main_command".to_string(), main_command.to_string());
+    crate::providers::types::WorkspaceConfig {
+        name: name.to_string(),
+        working_directory: working_dir.to_path_buf(),
+        template_vars,
+        template_yaml,
+    }
 }
 
 async fn refresh_all(app: &mut app::App) {
