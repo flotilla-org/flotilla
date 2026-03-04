@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 tui-input = "0.10"
 dirs = "6"
 toml = "0.8"
+minijinja = "2"
 async-trait = "0.1"
 indexmap = "2"
 tracing = "0.1.44"
