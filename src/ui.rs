@@ -30,8 +30,8 @@ pub fn render(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
     render_status_bar(model, ui, frame, chunks[2]);
     render_action_menu(model, ui, frame);
     render_input_popup(ui, frame);
-    render_delete_confirm(ui, frame);
-    render_help(ui, frame);
+    render_delete_confirm(model, ui, frame);
+    render_help(model, ui, frame);
     render_file_picker(ui, frame);
 }
 
@@ -533,7 +533,7 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
 
         if let Some(pr_idx) = item.pr_idx {
             if let Some(cr) = model.active().data.change_requests.get(pr_idx) {
-                lines.push(format!("PR #{}: {}", cr.id, cr.title));
+                lines.push(format!("{} #{}: {}", model.active_labels().code_review.abbr, cr.id, cr.title));
                 lines.push(format!("State: {:?}", cr.status));
             }
         }
@@ -581,7 +581,7 @@ fn format_correlation_key(key: &CorrelationKey) -> String {
     match key {
         CorrelationKey::Branch(b) => format!("Branch({})", b),
         CorrelationKey::CheckoutPath(p) => format!("Path({})", p.display()),
-        CorrelationKey::ChangeRequestRef(provider, id) => format!("PR({}/{})", provider, id),
+        CorrelationKey::ChangeRequestRef(provider, id) => format!("CR({}/{})", provider, id),
         CorrelationKey::SessionRef(provider, id) => format!("Ses({}/{})", provider, id),
     }
 }
@@ -598,7 +598,7 @@ fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: R
                 for ci in &group.items {
                     let kind_label = match ci.kind {
                         CorItemKind::Checkout => "Checkout",
-                        CorItemKind::ChangeRequest => "PR",
+                        CorItemKind::ChangeRequest => "CR",
                         CorItemKind::CloudSession => "Session",
                         CorItemKind::Workspace => "Workspace",
                     };
@@ -676,7 +676,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn render_delete_confirm(ui: &UiState, frame: &mut Frame) {
+fn render_delete_confirm(model: &AppModel, ui: &UiState, frame: &mut Frame) {
     let UiMode::DeleteConfirm { ref info, loading } = ui.mode else { return; };
 
     let area = popup_area(frame.area(), 60, 50);
@@ -704,7 +704,7 @@ fn render_delete_confirm(ui: &UiState, frame: &mut Frame) {
                 _ => (pr_status.as_str(), Color::White),
             };
             lines.push(Line::from(vec![
-                Span::raw("  PR: "),
+                Span::raw(format!("  {}: ", model.active_labels().code_review.abbr)),
                 Span::styled(status_text, Style::default().fg(color).bold()),
             ]));
             if let Some(sha) = &info.merge_commit_sha {
@@ -712,7 +712,7 @@ fn render_delete_confirm(ui: &UiState, frame: &mut Frame) {
             }
         } else {
             lines.push(Line::from(Span::styled(
-                "  No PR found",
+                format!("  No {} found", model.active_labels().code_review.abbr),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -754,13 +754,14 @@ fn render_delete_confirm(ui: &UiState, frame: &mut Frame) {
         )));
     }
 
+    let title = format!(" Remove {} ", model.active_labels().checkouts.noun_capitalized());
     let paragraph = Paragraph::new(lines)
-        .block(Block::bordered().title(" Remove Worktree "))
+        .block(Block::bordered().title(title))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
-fn render_help(ui: &UiState, frame: &mut Frame) {
+fn render_help(model: &AppModel, ui: &UiState, frame: &mut Frame) {
     if !matches!(ui.mode, UiMode::Help) {
         return;
     }
@@ -768,6 +769,7 @@ fn render_help(ui: &UiState, frame: &mut Frame) {
     let area = popup_area(frame.area(), 60, 70);
     frame.render_widget(Clear, area);
 
+    let labels = model.active_labels();
     let help_text = vec![
         Line::from(Span::styled("Navigation", Style::default().bold())),
         Line::from("  j/k or ↑/↓      Navigate list"),
@@ -779,9 +781,9 @@ fn render_help(ui: &UiState, frame: &mut Frame) {
         Line::from("  Double-click     Same as Enter"),
         Line::from("  Space            Action menu (all available actions)"),
         Line::from("  Right-click      Action menu"),
-        Line::from("  n                New branch (enter name, creates worktree)"),
-        Line::from("  d                Remove worktree (with safety check)"),
-        Line::from("  p                Show PR in browser"),
+        Line::from(format!("  n                New branch (enter name, creates {})", labels.checkouts.noun)),
+        Line::from(format!("  d                Remove {} (with safety check)", labels.checkouts.noun)),
+        Line::from(format!("  p                Show {} in browser", labels.code_review.abbr)),
         Line::from("  r                Refresh data"),
         Line::from(""),
         Line::from(Span::styled("Multi-select (issues)", Style::default().bold())),
