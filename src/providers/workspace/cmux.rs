@@ -69,7 +69,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
                     .as_array()
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| PathBuf::from(s)))
+                            .filter_map(|v| v.as_str().map(PathBuf::from))
                             .collect()
                     })
                     .unwrap_or_default();

@@ -82,28 +82,11 @@ impl WtWorktree {
     }
 }
 
+use crate::providers::run_cmd;
+
 impl WtCheckoutManager {
     pub fn new() -> Self {
         Self
-    }
-
-    async fn run_cmd(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-    ) -> Result<String, String> {
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
     }
 
     /// Strip ANSI escape codes that `wt` may append after JSON output.
@@ -120,8 +103,7 @@ impl super::CheckoutManager for WtCheckoutManager {
     }
 
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String> {
-        let output = self
-            .run_cmd("wt", &["list", "--format=json"], repo_root)
+        let output = run_cmd("wt", &["list", "--format=json"], repo_root)
             .await?;
         let json = Self::strip_to_json(&output);
         let worktrees: Vec<WtWorktree> =
@@ -138,7 +120,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         branch: &str,
     ) -> Result<Checkout, String> {
         // Create the worktree via `wt switch --create <branch> --no-cd`
-        self.run_cmd(
+        run_cmd(
             "wt",
             &["switch", "--create", branch, "--no-cd"],
             repo_root,
@@ -146,8 +128,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         .await?;
 
         // Look up the path of the newly created worktree
-        let list_output = self
-            .run_cmd("wt", &["list", "--format=json"], repo_root)
+        let list_output = run_cmd("wt", &["list", "--format=json"], repo_root)
             .await?;
         let json = Self::strip_to_json(&list_output);
         let worktrees: Vec<WtWorktree> =
@@ -167,7 +148,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         repo_root: &Path,
         branch: &str,
     ) -> Result<(), String> {
-        self.run_cmd("wt", &["remove", branch], repo_root).await?;
+        run_cmd("wt", &["remove", branch], repo_root).await?;
         Ok(())
     }
 }

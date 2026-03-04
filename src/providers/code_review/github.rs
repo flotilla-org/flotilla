@@ -18,28 +18,11 @@ struct GhPr {
     body: Option<String>,
 }
 
+use crate::providers::run_cmd;
+
 impl GitHubCodeReview {
     pub fn new(provider_name: String) -> Self {
         Self { provider_name }
-    }
-
-    async fn run_cmd(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-    ) -> Result<String, String> {
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
     }
 
     fn parse_state(state: &str) -> ChangeRequestStatus {
@@ -66,10 +49,8 @@ impl GitHubCodeReview {
                 if let Some(rest) = rest.strip_prefix('#') {
                     let num_str: String =
                         rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    if !num_str.is_empty() {
-                        if !issues.contains(&num_str) {
-                            issues.push(num_str);
-                        }
+                    if !num_str.is_empty() && !issues.contains(&num_str) {
+                        issues.push(num_str);
                     }
                 }
                 search_from = after;
@@ -120,8 +101,7 @@ impl super::CodeReview for GitHubCodeReview {
         limit: usize,
     ) -> Result<Vec<ChangeRequest>, String> {
         let limit_str = limit.to_string();
-        let output = self
-            .run_cmd(
+        let output = run_cmd(
                 "gh",
                 &[
                     "pr",
@@ -144,8 +124,7 @@ impl super::CodeReview for GitHubCodeReview {
         repo_root: &Path,
         id: &str,
     ) -> Result<ChangeRequest, String> {
-        let output = self
-            .run_cmd(
+        let output = run_cmd(
                 "gh",
                 &[
                     "pr",
@@ -167,7 +146,7 @@ impl super::CodeReview for GitHubCodeReview {
         repo_root: &Path,
         id: &str,
     ) -> Result<(), String> {
-        self.run_cmd("gh", &["pr", "view", id, "--web"], repo_root)
+        run_cmd("gh", &["pr", "view", id, "--web"], repo_root)
             .await?;
         Ok(())
     }
@@ -178,8 +157,7 @@ impl super::CodeReview for GitHubCodeReview {
         limit: usize,
     ) -> Result<Vec<String>, String> {
         let limit_str = limit.to_string();
-        let output = self
-            .run_cmd(
+        let output = run_cmd(
                 "gh",
                 &[
                     "pr", "list", "--state", "merged", "--limit", &limit_str,

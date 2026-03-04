@@ -4,28 +4,11 @@ use crate::providers::types::*;
 
 pub struct GitVcs;
 
+use crate::providers::run_cmd;
+
 impl GitVcs {
     pub fn new() -> Self {
         Self
-    }
-
-    async fn run_cmd(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-    ) -> Result<String, String> {
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
     }
 }
 
@@ -38,8 +21,7 @@ impl super::Vcs for GitVcs {
     }
 
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
-        let output = self
-            .run_cmd(
+        let output = run_cmd(
                 "git",
                 &["branch", "--list", "--format=%(refname:short)"],
                 repo_root,
@@ -57,8 +39,7 @@ impl super::Vcs for GitVcs {
     }
 
     async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String> {
-        let output = self
-            .run_cmd("git", &["ls-remote", "--heads", "origin"], repo_root)
+        let output = run_cmd("git", &["ls-remote", "--heads", "origin"], repo_root)
             .await?;
         // Output format: "<sha>\trefs/heads/<branch>"
         Ok(output
@@ -79,8 +60,7 @@ impl super::Vcs for GitVcs {
         limit: usize,
     ) -> Result<Vec<CommitInfo>, String> {
         let limit_arg = format!("-{}", limit);
-        let output = self
-            .run_cmd(
+        let output = run_cmd(
                 "git",
                 &["log", branch, "--oneline", &limit_arg],
                 repo_root,
@@ -105,8 +85,7 @@ impl super::Vcs for GitVcs {
         reference: &str,
     ) -> Result<AheadBehind, String> {
         let range = format!("{}...{}", branch, reference);
-        let output = self
-            .run_cmd(
+        let output = run_cmd(
                 "git",
                 &["rev-list", "--count", "--left-right", &range],
                 repo_root,
@@ -130,8 +109,7 @@ impl super::Vcs for GitVcs {
         _repo_root: &Path,
         checkout_path: &Path,
     ) -> Result<WorkingTreeStatus, String> {
-        let output = self
-            .run_cmd("git", &["status", "--porcelain"], checkout_path)
+        let output = run_cmd("git", &["status", "--porcelain"], checkout_path)
             .await?;
         let mut status = WorkingTreeStatus::default();
         for line in output.lines() {

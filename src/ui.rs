@@ -161,7 +161,7 @@ fn render_unified_table(app: &mut App, frame: &mut Frame, area: Rect) {
     // Resolve actual column widths for truncation
     // Account for border (2) and highlight spacing (2)
     let inner_width = area.width.saturating_sub(4);
-    let col_areas = Layout::horizontal(&widths).split(Rect::new(0, 0, inner_width, 1));
+    let col_areas = Layout::horizontal(widths).split(Rect::new(0, 0, inner_width, 1));
     let col_widths: Vec<u16> = col_areas.iter().map(|r| r.width).collect();
 
     // Build rows from active repo state (immutable borrow)

@@ -190,7 +190,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                         let repo_root = app.active_repo_root().clone();
                         let info = data::fetch_delete_confirm_info(
                             &branch,
-                            wt_path.as_ref(),
+                            wt_path.as_deref(),
                             pr_id.as_deref(),
                             &repo_root,
                         ).await;

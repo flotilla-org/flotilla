@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkspaceTemplate {
@@ -32,7 +32,7 @@ pub struct SurfaceTemplate {
 
 impl WorkspaceTemplate {
     #[allow(dead_code)]
-    pub fn load(repo_root: &PathBuf) -> Self {
+    pub fn load(repo_root: &Path) -> Self {
         let path = repo_root.join(".cmux/workspace.yaml");
         if path.exists() {
             let content = std::fs::read_to_string(&path).unwrap_or_default();

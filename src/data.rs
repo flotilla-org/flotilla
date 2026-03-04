@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::providers::types::{
     ChangeRequest, Checkout, CloudAgentSession, CorrelationKey, Issue, Workspace,
@@ -71,14 +71,14 @@ pub struct DataStore {
 }
 
 impl DataStore {
-    pub async fn refresh(&mut self, repo_root: &PathBuf, registry: &ProviderRegistry) -> Vec<String> {
+    pub async fn refresh(&mut self, repo_root: &Path, registry: &ProviderRegistry) -> Vec<String> {
         self.loading = true;
         let mut errors = Vec::new();
 
         // Checkouts through registry
         let checkouts_fut = async {
             if let Some(cm) = registry.checkout_managers.values().next() {
-                cm.list_checkouts(repo_root.as_path()).await
+                cm.list_checkouts(repo_root).await
             } else {
                 Ok(vec![])
             }
@@ -87,7 +87,7 @@ impl DataStore {
         // Change requests through registry
         let cr_fut = async {
             if let Some(cr) = registry.code_review.values().next() {
-                cr.list_change_requests(repo_root.as_path(), 20).await
+                cr.list_change_requests(repo_root, 20).await
             } else {
                 Ok(vec![])
             }
@@ -96,7 +96,7 @@ impl DataStore {
         // Issues through registry
         let issues_fut = async {
             if let Some(it) = registry.issue_trackers.values().next() {
-                it.list_issues(repo_root.as_path(), 20).await
+                it.list_issues(repo_root, 20).await
             } else {
                 Ok(vec![])
             }
@@ -114,7 +114,7 @@ impl DataStore {
         // Remote branches through registry
         let branches_fut = async {
             if let Some(vcs) = registry.vcs.values().next() {
-                vcs.list_remote_branches(repo_root.as_path()).await
+                vcs.list_remote_branches(repo_root).await
             } else {
                 Ok(vec![])
             }
@@ -123,7 +123,7 @@ impl DataStore {
         // Merged branches through registry
         let merged_fut = async {
             if let Some(cr) = registry.code_review.values().next() {
-                cr.list_merged_branch_names(repo_root.as_path(), 50).await
+                cr.list_merged_branch_names(repo_root, 50).await
             } else {
                 Ok(vec![])
             }
@@ -416,15 +416,15 @@ pub struct DeleteConfirmInfo {
 
 pub async fn fetch_delete_confirm_info(
     branch: &str,
-    worktree_path: Option<&PathBuf>,
+    worktree_path: Option<&Path>,
     pr_number: Option<&str>,
-    repo_root: &PathBuf,
+    repo_root: &Path,
 ) -> DeleteConfirmInfo {
     let branch_owned = branch.to_string();
-    let repo = repo_root.clone();
-    let wt_path = worktree_path.cloned();
+    let repo = repo_root.to_path_buf();
+    let wt_path = worktree_path.map(|p| p.to_path_buf());
     let pr_num = pr_number.map(|s| s.to_string());
-    let repo2 = repo_root.clone();
+    let repo2 = repo_root.to_path_buf();
 
     let (unpushed, uncommitted, pr_info) = tokio::join!(
         async {
