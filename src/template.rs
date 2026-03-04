@@ -41,6 +41,10 @@ impl WorkspaceTemplate {
         }
     }
 
+    pub fn load_default() -> Self {
+        Self::default_template()
+    }
+
     fn default_template() -> Self {
         Self {
             panes: vec![PaneTemplate {

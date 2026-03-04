@@ -1,3 +1,5 @@
+pub mod cmux;
+
 use async_trait::async_trait;
 use crate::providers::types::{Workspace, WorkspaceConfig};
 

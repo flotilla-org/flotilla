@@ -1,3 +1,5 @@
+pub mod claude;
+
 use async_trait::async_trait;
 use crate::providers::types::CloudAgentSession;
 
