@@ -9,7 +9,7 @@ struct RepoConfig {
 fn config_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/cmux-controller/repos")
+        .join(".config/flotilla/repos")
 }
 
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
@@ -69,4 +69,29 @@ pub fn remove_repo(path: &Path) {
     let slug = path_to_slug(path);
     let file = dir.join(format!("{slug}.toml"));
     let _ = std::fs::remove_file(file);
+}
+
+fn tab_order_file() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".config/flotilla/tab-order.json")
+}
+
+/// Load persisted tab order. Returns None if file doesn't exist or is invalid.
+pub fn load_tab_order() -> Option<Vec<PathBuf>> {
+    let content = std::fs::read_to_string(tab_order_file()).ok()?;
+    let paths: Vec<String> = serde_json::from_str(&content).ok()?;
+    Some(paths.into_iter().map(PathBuf::from).collect())
+}
+
+/// Save tab order to disk.
+pub fn save_tab_order(order: &[PathBuf]) {
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".config/flotilla");
+    let _ = std::fs::create_dir_all(&dir);
+    let paths: Vec<&str> = order.iter().filter_map(|p| p.to_str()).collect();
+    if let Ok(content) = serde_json::to_string_pretty(&paths) {
+        let _ = std::fs::write(tab_order_file(), content);
+    }
 }
