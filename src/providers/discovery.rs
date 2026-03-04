@@ -12,6 +12,7 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::vcs::git::GitVcs;
 use crate::providers::vcs::wt::WtCheckoutManager;
 use crate::providers::workspace::cmux::CmuxWorkspaceManager;
+use crate::providers::workspace::zellij::ZellijWorkspaceManager;
 
 /// Extract the first git remote URL for this repo.
 pub fn first_remote_url(repo_root: &Path) -> Option<String> {
@@ -159,7 +160,16 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         ));
         info!("{repo_name}: Workspace mgr → cmux");
     }
-    // TODO: check $ZELLIJ env var for Zellij workspace manager
+    // 7. Workspace manager: zellij (if cmux not already registered)
+    if registry.workspace_manager.is_none() && std::env::var("ZELLIJ").is_ok() {
+        if ZellijWorkspaceManager::check_version().is_ok() {
+            registry.workspace_manager = Some((
+                "zellij".to_string(),
+                Box::new(ZellijWorkspaceManager::new()),
+            ));
+            info!("{repo_name}: Workspace mgr → zellij");
+        }
+    }
     // TODO: check $TMUX env var for tmux workspace manager
 
     registry

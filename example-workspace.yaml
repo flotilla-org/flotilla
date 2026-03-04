@@ -1,6 +1,6 @@
 # example-workspace.yaml
-# Copy to .cmux/workspace.yaml in your repo to customise
-# the cmux workspace layout created by cmux-controller.
+# Copy to .flotilla/workspace.yaml in your repo to customise
+# the workspace layout created by flotilla (works with cmux and zellij).
 #
 # Variables substituted at workspace creation time:
 #   {main_command}  — determined by picker selection
