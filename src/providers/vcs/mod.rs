@@ -1,3 +1,6 @@
+pub mod git;
+pub mod wt;
+
 use std::path::Path;
 use async_trait::async_trait;
 use crate::providers::types::*;
