@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -58,14 +58,31 @@ pub struct RepoUiState {
     pub show_providers: bool,
 }
 
+/// Identifies a clickable tab in the tab bar.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TabId {
+    /// The main flotilla app tab (config/home).
+    Flotilla,
+    /// A repository tab, identified by index in repo_order.
+    Repo(usize),
+    /// The [+] button for adding repos.
+    Add,
+    /// The gear/settings icon.
+    Gear,
+}
+
+impl TabId {
+    /// Label for the flotilla app tab.
+    pub const FLOTILLA_LABEL: &str = " ⚓ flotilla ";
+    /// Display width of the label (⚓ is 1 column, not 3 bytes).
+    pub const FLOTILLA_LABEL_WIDTH: u16 = 13;
+}
+
 #[derive(Default)]
 pub struct LayoutAreas {
     pub table_area: Rect,
     pub menu_area: Rect,
-    pub tab_areas: Vec<Rect>,
-    pub add_tab_area: Rect,
-    pub flotilla_tab_area: Rect,
-    pub gear_icon_area: Rect,
+    pub tab_areas: BTreeMap<TabId, Rect>,
     pub event_log_filter_area: Rect,
     pub file_picker_area: Rect,
     pub file_picker_list_area: Rect,

@@ -9,7 +9,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{AppModel, Intent, ProviderStatus, UiMode, UiState};
+use unicode_width::UnicodeWidthStr;
+
+use crate::app::{AppModel, Intent, ProviderStatus, TabId, UiMode, UiState};
 use crate::data::{SectionHeader, TableEntry, WorkItem, WorkItemKind};
 use crate::event_log::{self, LevelExt};
 use crate::providers::correlation::ItemKind as CorItemKind;
@@ -36,7 +38,7 @@ pub fn render(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
 }
 
 fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
-    let flotilla_label = " flotilla ";
+    let flotilla_label = TabId::FLOTILLA_LABEL;
     let flotilla_style = if ui.mode.is_config() {
         Style::default().bold().fg(Color::Black).bg(Color::White)
     } else {
@@ -44,9 +46,10 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
     };
     let mut spans: Vec<Span> = vec![Span::styled(flotilla_label, flotilla_style)];
 
-    ui.layout.flotilla_tab_area = Rect::new(area.x, area.y, flotilla_label.len() as u16, 1);
     ui.layout.tab_areas.clear();
-    let mut x_offset: u16 = flotilla_label.len() as u16;
+    let flotilla_width = TabId::FLOTILLA_LABEL_WIDTH;
+    ui.layout.tab_areas.insert(TabId::Flotilla, Rect::new(area.x, area.y, flotilla_width, 1));
+    let mut x_offset: u16 = flotilla_width;
 
     for (i, path) in model.repo_order.iter().enumerate() {
         let rm = &model.repos[path];
@@ -61,7 +64,7 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
         x_offset += 3;
 
         let label = format!("{name}{changed}{loading}");
-        let label_len = label.len() as u16;
+        let label_len = label.width() as u16;
         let style = if is_active && ui.drag.active {
             Style::default().bold().fg(Color::Cyan).underlined()
         } else if is_active {
@@ -71,7 +74,7 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
         };
         spans.push(Span::styled(label, style));
 
-        ui.layout.tab_areas.push(Rect::new(area.x + x_offset, area.y, label_len, 1));
+        ui.layout.tab_areas.insert(TabId::Repo(i), Rect::new(area.x + x_offset, area.y, label_len, 1));
         x_offset += label_len;
     }
 
@@ -81,7 +84,7 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
     x_offset += 3;
     let add_label = Span::styled("[+]", Style::default().fg(Color::Green));
     spans.push(add_label);
-    ui.layout.add_tab_area = Rect::new(area.x + x_offset, area.y, 3, 1);
+    ui.layout.tab_areas.insert(TabId::Add, Rect::new(area.x + x_offset, area.y, 3, 1));
 
     let line = Line::from(spans);
     let title = Paragraph::new(line);
@@ -252,13 +255,13 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
     let rui = active_rui(model, ui);
     if rui.show_providers {
         let close_x = area.x + area.width.saturating_sub(5);
-        ui.layout.gear_icon_area = Rect::new(close_x, area.y, 3, 1);
+        ui.layout.tab_areas.insert(TabId::Gear, Rect::new(close_x, area.y, 3, 1));
         render_repo_providers(model, ui, frame, area);
         return;
     }
 
     let gear_x = area.x + area.width.saturating_sub(5);
-    ui.layout.gear_icon_area = Rect::new(gear_x, area.y, 3, 1);
+    ui.layout.tab_areas.insert(TabId::Gear, Rect::new(gear_x, area.y, 3, 1));
 
     let labels = model.active_labels();
     let header = Row::new(vec![

@@ -93,58 +93,50 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                                 tab_clicked = true;
                             }
 
-                            // Check flotilla pseudo-tab area
+                            // Check which tab area was clicked
                             if !tab_clicked {
-                                let fa = app.ui.layout.flotilla_tab_area;
-                                if x >= fa.x && x < fa.x + fa.width && y >= fa.y && y < fa.y + fa.height {
-                                    app.ui.mode = app::UiMode::Config;
-                                    app.ui.drag.dragging_tab = None;
-                                    tab_clicked = true;
-                                }
-                            }
+                                let hit = app.ui.layout.tab_areas.iter().find(|(_, r)| {
+                                    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+                                }).map(|(id, _)| id.clone());
 
-                            // Check repo tab areas
-                            if !tab_clicked {
-                                for (i, tab_area) in app.ui.layout.tab_areas.iter().enumerate() {
-                                    if x >= tab_area.x && x < tab_area.x + tab_area.width
-                                        && y >= tab_area.y && y < tab_area.y + tab_area.height
-                                    {
+                                match hit {
+                                    Some(app::TabId::Flotilla) => {
+                                        app.ui.mode = app::UiMode::Config;
+                                        app.ui.drag.dragging_tab = None;
+                                        tab_clicked = true;
+                                    }
+                                    Some(app::TabId::Repo(i)) => {
                                         app.switch_tab(i);
                                         app.ui.drag.dragging_tab = Some(i);
                                         app.ui.drag.start_x = x;
                                         app.ui.drag.active = false;
                                         tab_clicked = true;
-                                        break;
                                     }
-                                }
-                            }
-                            // Check gear icon area
-                            if !tab_clicked && !app.ui.mode.is_config() {
-                                let ga = app.ui.layout.gear_icon_area;
-                                if x >= ga.x && x < ga.x + ga.width && y >= ga.y && y < ga.y + ga.height {
-                                    let sp = app.active_ui().show_providers;
-                                    app.active_ui_mut().show_providers = !sp;
-                                    tab_clicked = true;
+                                    Some(app::TabId::Gear) if !app.ui.mode.is_config() => {
+                                        let sp = app.active_ui().show_providers;
+                                        app.active_ui_mut().show_providers = !sp;
+                                        tab_clicked = true;
+                                    }
+                                    Some(app::TabId::Add) => {
+                                        let mut input = tui_input::Input::default();
+                                        if let Some(parent) = app.model.active_repo_root().parent() {
+                                            let parent_str = format!("{}/", parent.display());
+                                            input = tui_input::Input::from(parent_str.as_str());
+                                        }
+                                        app.ui.mode = app::UiMode::FilePicker {
+                                            input,
+                                            dir_entries: Vec::new(),
+                                            selected: 0,
+                                        };
+                                        app.refresh_dir_listing();
+                                        tab_clicked = true;
+                                    }
+                                    _ => {}
                                 }
                             }
                             if !tab_clicked {
                                 app.ui.drag.dragging_tab = None;
-                                let a = app.ui.layout.add_tab_area;
-                                if x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height {
-                                    let mut input = tui_input::Input::default();
-                                    if let Some(parent) = app.model.active_repo_root().parent() {
-                                        let parent_str = format!("{}/", parent.display());
-                                        input = tui_input::Input::from(parent_str.as_str());
-                                    }
-                                    app.ui.mode = app::UiMode::FilePicker {
-                                        input,
-                                        dir_entries: Vec::new(),
-                                        selected: 0,
-                                    };
-                                    app.refresh_dir_listing();
-                                } else {
-                                    app.handle_mouse(m);
-                                }
+                                app.handle_mouse(m);
                             }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
@@ -156,17 +148,19 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                                     }
                                 }
                                 if app.ui.drag.active {
-                                    for (i, tab_area) in app.ui.layout.tab_areas.iter().enumerate() {
-                                        if m.column >= tab_area.x
-                                            && m.column < tab_area.x + tab_area.width
-                                            && m.row >= tab_area.y
-                                            && m.row < tab_area.y + tab_area.height
-                                            && i != dragging_idx
-                                        {
-                                            app.model.repo_order.swap(dragging_idx, i);
-                                            app.model.active_repo = i;
-                                            app.ui.drag.dragging_tab = Some(i);
-                                            break;
+                                    for (id, r) in &app.ui.layout.tab_areas {
+                                        if let app::TabId::Repo(i) = *id {
+                                            if m.column >= r.x
+                                                && m.column < r.x + r.width
+                                                && m.row >= r.y
+                                                && m.row < r.y + r.height
+                                                && i != dragging_idx
+                                            {
+                                                app.model.repo_order.swap(dragging_idx, i);
+                                                app.model.active_repo = i;
+                                                app.ui.drag.dragging_tab = Some(i);
+                                                break;
+                                            }
                                         }
                                     }
                                 }

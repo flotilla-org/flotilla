@@ -16,7 +16,7 @@ use std::time::Instant;
 pub use command::{Command, CommandQueue};
 pub use intent::Intent;
 pub use model::{AppModel, ProviderStatus};
-pub use ui_state::{DirEntry, UiMode, UiState, RepoUiState};
+pub use ui_state::{DirEntry, TabId, UiMode, UiState, RepoUiState};
 
 pub struct App {
     pub model: AppModel,
