@@ -92,7 +92,6 @@ impl GitCheckoutManager {
 
     /// Gather detailed info for a single worktree checkout.
     async fn enrich_checkout(
-        _repo_root: &Path,
         path: &Path,
         branch: &str,
         is_trunk: bool,
@@ -235,7 +234,6 @@ impl super::CheckoutManager for GitCheckoutManager {
         for (path, branch, _bare) in &entries {
             let is_trunk = *branch == default_branch;
             let checkout = Self::enrich_checkout(
-                repo_root,
                 path,
                 branch,
                 is_trunk,
@@ -255,6 +253,9 @@ impl super::CheckoutManager for GitCheckoutManager {
         let wt_path = self.render_worktree_path(repo_root, branch)?;
         info!("git: creating worktree for {branch} at {}", wt_path.display());
 
+        let wt_str = wt_path.to_str()
+            .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", wt_path.display()))?;
+
         let branch_exists = run_cmd(
             "git",
             &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
@@ -266,14 +267,14 @@ impl super::CheckoutManager for GitCheckoutManager {
         if branch_exists {
             run_cmd(
                 "git",
-                &["worktree", "add", wt_path.to_str().unwrap_or(""), branch],
+                &["worktree", "add", wt_str, branch],
                 repo_root,
             )
             .await?;
         } else {
             run_cmd(
                 "git",
-                &["worktree", "add", "-b", branch, wt_path.to_str().unwrap_or("")],
+                &["worktree", "add", "-b", branch, wt_str],
                 repo_root,
             )
             .await?;
@@ -281,7 +282,7 @@ impl super::CheckoutManager for GitCheckoutManager {
 
         let default_branch = Self::default_branch(repo_root).await;
         let is_trunk = branch == default_branch;
-        Ok(Self::enrich_checkout(repo_root, &wt_path, branch, is_trunk, &default_branch).await)
+        Ok(Self::enrich_checkout(&wt_path, branch, is_trunk, &default_branch).await)
     }
 
     async fn remove_checkout(
@@ -299,14 +300,23 @@ impl super::CheckoutManager for GitCheckoutManager {
             .map(|(p, _, _)| p.clone())
             .ok_or_else(|| format!("no worktree found for branch {branch}"))?;
 
+        let wt_str = wt_path.to_str()
+            .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", wt_path.display()))?;
+
         run_cmd(
             "git",
-            &["worktree", "remove", wt_path.to_str().unwrap_or("")],
+            &["worktree", "remove", wt_str],
             repo_root,
         )
         .await?;
 
-        let _ = run_cmd("git", &["branch", "-D", branch], repo_root).await;
+        // Safe-delete branch (-d, not -D) and skip trunk
+        let default_branch = Self::default_branch(repo_root).await;
+        if branch != default_branch {
+            if let Err(e) = run_cmd("git", &["branch", "-d", branch], repo_root).await {
+                tracing::warn!("could not delete branch {branch}: {e}");
+            }
+        }
 
         Ok(())
     }

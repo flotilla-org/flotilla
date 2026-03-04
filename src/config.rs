@@ -52,7 +52,27 @@ pub struct RepoFileConfig {
     #[allow(dead_code)]
     pub path: String,
     #[serde(default)]
-    pub vcs: VcsConfig,
+    pub vcs: RepoVcsConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoVcsConfig {
+    #[serde(default)]
+    pub git: RepoGitConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoGitConfig {
+    #[serde(default)]
+    pub checkouts: RepoCheckoutsOverride,
+}
+
+/// Per-repo checkout overrides. Fields are Option so we can distinguish
+/// "not set" from "explicitly set to the default value."
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoCheckoutsOverride {
+    pub path: Option<String>,
+    pub provider: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -170,16 +190,8 @@ pub fn resolve_checkouts_config(repo_root: &std::path::Path) -> CheckoutsConfig 
         if let Ok(repo_cfg) = toml::from_str::<RepoFileConfig>(&content) {
             let repo_co = &repo_cfg.vcs.git.checkouts;
             return CheckoutsConfig {
-                path: if repo_co.path != CheckoutsConfig::default_path() {
-                    repo_co.path.clone()
-                } else {
-                    global.vcs.git.checkouts.path
-                },
-                provider: if repo_co.provider != CheckoutsConfig::default_provider() {
-                    repo_co.provider.clone()
-                } else {
-                    global.vcs.git.checkouts.provider
-                },
+                path: repo_co.path.clone().unwrap_or(global.vcs.git.checkouts.path),
+                provider: repo_co.provider.clone().unwrap_or(global.vcs.git.checkouts.provider),
             };
         }
     }
