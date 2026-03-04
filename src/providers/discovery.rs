@@ -150,24 +150,34 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         info!("{repo_name}: AI utility → Claude");
     }
 
-    // 6. Workspace manager: cmux
-    // Check for the cmux binary at the known path
-    let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
-    if cmux_bin.exists() {
-        registry.workspace_manager = Some((
-            "cmux".to_string(),
-            Box::new(CmuxWorkspaceManager::new()),
-        ));
-        info!("{repo_name}: Workspace mgr → cmux");
-    }
-    // 7. Workspace manager: zellij (if cmux not already registered)
-    if registry.workspace_manager.is_none() && std::env::var("ZELLIJ").is_ok() {
+    // 6. Workspace manager: prefer env-var detection (proves we're *inside* the terminal)
+    //    over binary-exists checks (just means the app is installed).
+    if std::env::var("CMUX_SOCKET_PATH").is_ok() {
+        let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
+        if cmux_bin.exists() {
+            registry.workspace_manager = Some((
+                "cmux".to_string(),
+                Box::new(CmuxWorkspaceManager::new()),
+            ));
+            info!("{repo_name}: Workspace mgr → cmux");
+        }
+    } else if std::env::var("ZELLIJ").is_ok() {
         if ZellijWorkspaceManager::check_version().is_ok() {
             registry.workspace_manager = Some((
                 "zellij".to_string(),
                 Box::new(ZellijWorkspaceManager::new()),
             ));
             info!("{repo_name}: Workspace mgr → zellij");
+        }
+    } else {
+        // Fallback: cmux binary exists but not running inside cmux
+        let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
+        if cmux_bin.exists() {
+            registry.workspace_manager = Some((
+                "cmux".to_string(),
+                Box::new(CmuxWorkspaceManager::new()),
+            ));
+            info!("{repo_name}: Workspace mgr → cmux (fallback)");
         }
     }
     // TODO: check $TMUX env var for tmux workspace manager
