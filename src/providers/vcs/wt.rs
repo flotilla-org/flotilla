@@ -60,7 +60,7 @@ impl WtWorktree {
     fn into_checkout(self) -> Checkout {
         let correlation_keys = vec![
             CorrelationKey::Branch(self.branch.clone()),
-            CorrelationKey::RepoPath(self.path.clone()),
+            CorrelationKey::CheckoutPath(self.path.clone()),
         ];
         Checkout {
             branch: self.branch,

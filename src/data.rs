@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::providers::correlation::{self, CorrelatedItem, CorrelatedGroup, ItemKind as CorItemKind};
 use crate::providers::types::{
-    ChangeRequest, Checkout, CloudAgentSession, Issue, Workspace,
+    ChangeRequest, Checkout, CloudAgentSession, CorrelationKey, Issue, Workspace,
 };
 use crate::providers::registry::ProviderRegistry;
 
@@ -155,11 +155,12 @@ impl DataStore {
         errors
     }
 
+    /// Convert a correlation group into a WorkItem.
+    /// Issues are NOT in groups — they are linked post-correlation via IssueRef.
     fn group_to_work_item(&self, group: &CorrelatedGroup) -> WorkItem {
         let mut worktree_idx: Option<usize> = None;
         let mut pr_idx: Option<usize> = None;
         let mut session_idx: Option<usize> = None;
-        let mut issue_idxs: Vec<usize> = Vec::new();
         let mut workspace_refs: Vec<String> = Vec::new();
         let mut is_main_worktree = false;
 
@@ -179,27 +180,22 @@ impl DataStore {
                         session_idx = Some(item.source_index);
                     }
                 }
-                CorItemKind::Issue => {
-                    issue_idxs.push(item.source_index);
-                }
                 CorItemKind::Workspace => {
                     if let Some(ws) = self.workspaces.get(item.source_index) {
                         workspace_refs.push(ws.ws_ref.clone());
                     }
                 }
-                CorItemKind::RemoteBranch => {}
+                _ => {}
             }
         }
 
-        // Determine kind by priority: Checkout > Pr > Session > Issue
+        // Determine kind by priority: Checkout > Pr > Session
         let kind = if worktree_idx.is_some() {
             WorkItemKind::Checkout
         } else if pr_idx.is_some() {
             WorkItemKind::Pr
-        } else if session_idx.is_some() {
-            WorkItemKind::Session
         } else {
-            WorkItemKind::Issue
+            WorkItemKind::Session
         };
 
         let branch = group.branch().map(|s| s.to_string());
@@ -214,12 +210,7 @@ impl DataStore {
                 .and_then(|i| self.sessions.get(i))
                 .map(|s| s.title.clone())
                 .unwrap_or_default(),
-            WorkItemKind::Issue => issue_idxs
-                .first()
-                .and_then(|&i| self.issues.get(i))
-                .map(|iss| iss.title.clone())
-                .unwrap_or_default(),
-            WorkItemKind::RemoteBranch => branch.clone().unwrap_or_default(),
+            _ => branch.clone().unwrap_or_default(),
         };
 
         WorkItem {
@@ -230,21 +221,31 @@ impl DataStore {
             is_main_worktree,
             pr_idx,
             session_idx,
-            issue_idxs,
+            issue_idxs: Vec::new(), // populated post-correlation
             workspace_refs,
         }
     }
 
     fn correlate(&mut self) {
-        // Phase 1: Build CorrelatedItems from all data sources
+        // Phase 1: Build CorrelatedItems from identity-keyed sources.
+        // IssueRef keys are excluded — they are association keys, not identity
+        // keys. Two PRs referencing the same issue are separate work units.
+        // Issues are linked post-correlation via IssueRef on change requests.
         let mut items: Vec<CorrelatedItem> = Vec::new();
+
+        let strip_issue_refs = |keys: &[CorrelationKey]| -> Vec<CorrelationKey> {
+            keys.iter()
+                .filter(|k| !matches!(k, CorrelationKey::IssueRef(_, _)))
+                .cloned()
+                .collect()
+        };
 
         for (i, co) in self.checkouts.iter().enumerate() {
             items.push(CorrelatedItem {
                 provider_name: "checkout".to_string(),
                 kind: CorItemKind::Checkout,
                 title: co.branch.clone(),
-                correlation_keys: co.correlation_keys.clone(),
+                correlation_keys: strip_issue_refs(&co.correlation_keys),
                 source_index: i,
             });
         }
@@ -254,27 +255,20 @@ impl DataStore {
                 provider_name: "change_request".to_string(),
                 kind: CorItemKind::ChangeRequest,
                 title: cr.title.clone(),
-                correlation_keys: cr.correlation_keys.clone(),
+                correlation_keys: strip_issue_refs(&cr.correlation_keys),
                 source_index: i,
             });
         }
 
-        for (i, issue) in self.issues.iter().enumerate() {
-            items.push(CorrelatedItem {
-                provider_name: "issue".to_string(),
-                kind: CorItemKind::Issue,
-                title: issue.title.clone(),
-                correlation_keys: issue.correlation_keys.clone(),
-                source_index: i,
-            });
-        }
+        // Issues are NOT submitted to the correlation engine — they link
+        // only via IssueRef, which is an association key handled below.
 
         for (i, session) in self.sessions.iter().enumerate() {
             items.push(CorrelatedItem {
                 provider_name: "session".to_string(),
                 kind: CorItemKind::CloudSession,
                 title: session.title.clone(),
-                correlation_keys: session.correlation_keys.clone(),
+                correlation_keys: strip_issue_refs(&session.correlation_keys),
                 source_index: i,
             });
         }
@@ -284,12 +278,12 @@ impl DataStore {
                 provider_name: "workspace".to_string(),
                 kind: CorItemKind::Workspace,
                 title: ws.name.clone(),
-                correlation_keys: ws.correlation_keys.clone(),
+                correlation_keys: strip_issue_refs(&ws.correlation_keys),
                 source_index: i,
             });
         }
 
-        // Phase 2: Run correlation engine
+        // Phase 2: Run correlation engine (identity keys only)
         let groups = correlation::correlate(items);
 
         // Phase 3: Convert groups to WorkItems and categorize
@@ -299,12 +293,21 @@ impl DataStore {
         let mut linked_issue_indices: HashSet<usize> = HashSet::new();
 
         for group in &groups {
-            let work_item = self.group_to_work_item(group);
+            let mut work_item = self.group_to_work_item(group);
 
-            // Track linked issues: only when the group contains non-issue items too
-            if work_item.kind != WorkItemKind::Issue {
-                for &idx in &work_item.issue_idxs {
-                    linked_issue_indices.insert(idx);
+            // Post-correlation: link issues via IssueRef keys on change requests
+            if let Some(pr_i) = work_item.pr_idx {
+                if let Some(cr) = self.change_requests.get(pr_i) {
+                    for key in &cr.correlation_keys {
+                        if let CorrelationKey::IssueRef(_, issue_id) = key {
+                            if let Some(issue_idx) = self.issues.iter().position(|i| &i.id == issue_id) {
+                                if !work_item.issue_idxs.contains(&issue_idx) {
+                                    work_item.issue_idxs.push(issue_idx);
+                                    linked_issue_indices.insert(issue_idx);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -312,7 +315,7 @@ impl DataStore {
                 WorkItemKind::Checkout => checkout_items.push(work_item),
                 WorkItemKind::Session => session_items.push(work_item),
                 WorkItemKind::Pr => pr_items.push(work_item),
-                WorkItemKind::Issue => {} // standalone issues handled in Phase 4
+                WorkItemKind::Issue => {} // not possible — issues not in engine
                 WorkItemKind::RemoteBranch => {} // handled separately
             }
         }

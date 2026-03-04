@@ -7,6 +7,7 @@ use super::types::CorrelationKey;
 pub enum ItemKind {
     Checkout,
     ChangeRequest,
+    #[allow(dead_code)]
     Issue,
     CloudSession,
     Workspace,
@@ -296,13 +297,13 @@ mod tests {
                 "git",
                 ItemKind::Checkout,
                 "main checkout",
-                vec![CorrelationKey::RepoPath(repo.clone())],
+                vec![CorrelationKey::CheckoutPath(repo.clone())],
             ),
             item(
                 "tmux",
                 ItemKind::Workspace,
                 "my-workspace",
-                vec![CorrelationKey::RepoPath(repo)],
+                vec![CorrelationKey::CheckoutPath(repo)],
             ),
         ];
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CorrelationKey {
     Branch(String),
-    RepoPath(PathBuf),
+    CheckoutPath(PathBuf),
     IssueRef(String, String),          // (provider_name, issue_id)
     ChangeRequestRef(String, String),  // (provider_name, CR id)
     SessionRef(String, String),        // (provider_name, session_id)
@@ -73,6 +73,7 @@ pub struct Issue {
     pub id: String,
     pub title: String,
     pub labels: Vec<String>,
+    #[allow(dead_code)]
     pub correlation_keys: Vec<CorrelationKey>,
 }
 

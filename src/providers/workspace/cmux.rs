@@ -74,7 +74,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
 
                 let correlation_keys: Vec<CorrelationKey> = directories
                     .iter()
-                    .map(|d| CorrelationKey::RepoPath(d.clone()))
+                    .map(|d| CorrelationKey::CheckoutPath(d.clone()))
                     .collect();
 
                 Some(Workspace {
@@ -258,7 +258,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         let directories = vec![config.working_directory.clone()];
         let correlation_keys = directories
             .iter()
-            .map(|d| CorrelationKey::RepoPath(d.clone()))
+            .map(|d| CorrelationKey::CheckoutPath(d.clone()))
             .collect();
 
         Ok(Workspace {
