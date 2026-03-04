@@ -1,5 +1,6 @@
 pub mod git;
 pub mod wt;
+pub mod git_worktree;
 
 use std::path::Path;
 use async_trait::async_trait;
