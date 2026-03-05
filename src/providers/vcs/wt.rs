@@ -129,15 +129,14 @@ impl super::CheckoutManager for WtCheckoutManager {
         &self,
         repo_root: &Path,
         branch: &str,
+        create_branch: bool,
     ) -> Result<Checkout, String> {
-        info!("wt: creating worktree for {branch}");
-        // Create the worktree via `wt switch --create <branch> --no-cd`
-        run_cmd(
-            "wt",
-            &["switch", "--create", branch, "--no-cd"],
-            repo_root,
-        )
-        .await?;
+        info!("wt: creating worktree for {branch} (create_branch={create_branch})");
+        if create_branch {
+            run_cmd("wt", &["switch", "--create", branch, "--no-cd"], repo_root).await?;
+        } else {
+            run_cmd("wt", &["switch", branch, "--no-cd", "--yes"], repo_root).await?;
+        }
 
         // Look up the path of the newly created worktree
         let list_output = run_cmd("wt", &["list", "--format=json"], repo_root)

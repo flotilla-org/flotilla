@@ -69,7 +69,10 @@ impl Intent {
                 app.active_ui().selected_selectable_idx.map(Command::FetchDeleteInfo)
             }
             Intent::CreateWorktreeAndWorkspace => {
-                item.branch.as_ref().map(|branch| Command::CreateWorktree(branch.clone()))
+                item.branch.as_ref().map(|branch| Command::CreateWorktree {
+                    branch: branch.clone(),
+                    create_branch: item.kind != WorkItemKind::RemoteBranch && item.kind != WorkItemKind::Pr,
+                })
             }
             Intent::GenerateBranchName => {
                 if !item.issue_idxs.is_empty() {

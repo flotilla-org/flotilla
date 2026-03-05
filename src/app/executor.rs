@@ -95,11 +95,11 @@ pub async fn execute(cmd: Command, app: &mut App) {
                 let _ = it.open_in_browser(&repo, &id).await;
             }
         }
-        Command::CreateWorktree(branch) => {
+        Command::CreateWorktree { branch, create_branch } => {
             info!("creating {} {branch}", app.model.active_labels().checkouts.noun);
             let repo = app.model.active_repo_root().clone();
             let checkout_result = if let Some(cm) = app.model.active().registry.checkout_managers.values().next() {
-                Some(cm.create_checkout(repo.as_path(), &branch).await)
+                Some(cm.create_checkout(repo.as_path(), &branch, create_branch).await)
             } else {
                 None
             };
@@ -116,7 +116,10 @@ pub async fn execute(cmd: Command, app: &mut App) {
                         app.model.status_message = Some(e);
                     }
                 }
-                Some(Err(e)) => app.model.status_message = Some(e),
+                Some(Err(e)) => {
+                    error!("create worktree failed: {e}");
+                    app.model.status_message = Some(e);
+                }
                 None => app.model.status_message = Some("No checkout manager available".to_string()),
             }
             refresh_all(app).await;
@@ -144,7 +147,7 @@ pub async fn execute(cmd: Command, app: &mut App) {
             } else if let Some(branch_name) = &branch {
                 let repo = app.model.active_repo_root().clone();
                 let checkout_result = if let Some(cm) = app.model.active().registry.checkout_managers.values().next() {
-                    cm.create_checkout(repo.as_path(), branch_name).await.ok()
+                    cm.create_checkout(repo.as_path(), branch_name, false).await.ok()
                 } else {
                     None
                 };
@@ -360,7 +363,5 @@ pub async fn refresh_all(app: &mut App) {
 
     if !all_errors.is_empty() {
         app.model.status_message = Some(all_errors.join("; "));
-    } else {
-        app.model.status_message = None;
     }
 }

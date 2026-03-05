@@ -512,7 +512,7 @@ impl App {
                 return;
             };
             if !branch.is_empty() {
-                self.commands.push(Command::CreateWorktree(branch));
+                self.commands.push(Command::CreateWorktree { branch, create_branch: true });
             }
             self.ui.mode = UiMode::Normal;
             return;
