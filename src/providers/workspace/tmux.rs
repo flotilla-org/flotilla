@@ -179,7 +179,8 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         // Small delay to let tmux process window creation
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Track pane count for focus
+        // Track pane count for focus. focus_pane_index captures the tmux pane index
+        // of the first surface in the template pane marked with focus=true.
         let mut pane_count: usize = 0;
         let mut focus_pane_index: Option<usize> = None;
 
@@ -243,9 +244,10 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
             }
         }
 
-        // Focus the designated pane
+        // Focus the designated pane (use pane index within current window
+        // to avoid issues with window names containing special characters)
         if let Some(fi) = focus_pane_index {
-            let target = format!("{}.{}", config.name, fi);
+            let target = format!("{fi}");
             Self::tmux_cmd(&["select-pane", "-t", &target]).await.ok();
         }
 

@@ -257,18 +257,16 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
             }
         }
 
-        // Focus the designated pane: move focus back to the first pane that has focus=true.
-        // Since zellij creates panes left-to-right / top-to-bottom, we navigate back
-        // to the focus pane by counting how many panes were created after it.
+        // Focus the designated pane. Use focus-previous-pane which walks panes in
+        // reverse creation order regardless of split direction (unlike move-focus which
+        // is direction-specific and fails for mixed horizontal/vertical layouts).
         let focus_index = rendered.panes.iter().position(|p| p.focus);
         let total_panes: usize = rendered.panes.iter().map(|p| p.surfaces.len().max(1)).sum();
         if let Some(fi) = focus_index {
-            // Count panes created before the focus pane
             let panes_before: usize = rendered.panes.iter().take(fi).map(|p| p.surfaces.len().max(1)).sum();
-            // Focus is currently on the last pane; move back (total - 1 - panes_before) times
             let moves_back = total_panes.saturating_sub(1).saturating_sub(panes_before);
             for _ in 0..moves_back {
-                Self::zellij_action(&["move-focus", "left"]).await.ok();
+                Self::zellij_action(&["focus-previous-pane"]).await.ok();
             }
         }
 

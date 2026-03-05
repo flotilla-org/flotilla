@@ -195,6 +195,9 @@ impl ClaudeCodingAgent {
         }
     }
 
+    /// Fetch sessions from the API. The x-organization-uuid header was removed because
+    /// the OAuth token's scopes no longer include user:profile (needed to fetch the org
+    /// UUID from /api/oauth/profile), and the sessions API works without it.
     async fn fetch_sessions_inner() -> Result<Vec<WebSession>, String> {
         let token = get_oauth_token().await?;
         let access_token = token.access_token;
