@@ -58,18 +58,8 @@ impl TmuxWorkspaceManager {
     }
 
     /// Return the current tmux session name.
-    fn session_name() -> Result<String, String> {
-        let output = std::process::Command::new("tmux")
-            .args(["display-message", "-p", "#{session_name}"])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("failed to get tmux session name: {e}"))?;
-
-        if !output.status.success() {
-            return Err("failed to get tmux session name".to_string());
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    async fn session_name() -> Result<String, String> {
+        Self::tmux_cmd(&["display-message", "-p", "#{session_name}"]).await
     }
 
     /// Return the state file path: `~/.config/flotilla/tmux/{session}/state.toml`.
@@ -139,9 +129,10 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         let window_names: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
 
         // Load state for enrichment
-        let state = Self::session_name()
-            .map(|s| Self::load_state(&s))
-            .unwrap_or_default();
+        let state = match Self::session_name().await {
+            Ok(s) => Self::load_state(&s),
+            Err(_) => TmuxState::default(),
+        };
 
         let workspaces = window_names
             .into_iter()
@@ -171,8 +162,10 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         info!("tmux: creating workspace '{}'", config.name);
 
         let template = if let Some(ref yaml) = config.template_yaml {
-            serde_yaml::from_str::<WorkspaceTemplate>(yaml)
-                .unwrap_or_else(|_| WorkspaceTemplate::load_default())
+            serde_yaml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+                warn!("tmux: failed to parse workspace template, using default: {e}");
+                WorkspaceTemplate::load_default()
+            })
         } else {
             WorkspaceTemplate::load_default()
         };
@@ -257,7 +250,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         }
 
         // Save state
-        if let Ok(session) = Self::session_name() {
+        if let Ok(session) = Self::session_name().await {
             let mut state = Self::load_state(&session);
             let timestamp = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)

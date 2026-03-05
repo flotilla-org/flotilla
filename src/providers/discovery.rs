@@ -184,7 +184,7 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
                 "cmux".to_string(),
                 Box::new(CmuxWorkspaceManager::new()),
             ));
-            info!("{repo_name}: Workspace mgr → cmux (fallback)");
+            info!("{repo_name}: Workspace mgr → cmux (binary found, not running inside cmux)");
         }
     }
 

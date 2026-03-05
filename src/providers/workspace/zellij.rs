@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::providers::types::*;
 use crate::template::WorkspaceTemplate;
@@ -199,8 +199,10 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
 
         // Parse template from YAML if provided, otherwise use default
         let template = if let Some(ref yaml) = config.template_yaml {
-            serde_yaml::from_str::<WorkspaceTemplate>(yaml)
-                .unwrap_or_else(|_| WorkspaceTemplate::load_default())
+            serde_yaml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+                warn!("zellij: failed to parse workspace template, using default: {e}");
+                WorkspaceTemplate::load_default()
+            })
         } else {
             WorkspaceTemplate::load_default()
         };
@@ -217,14 +219,13 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         for (i, pane) in rendered.panes.iter().enumerate() {
             if i == 0 {
                 // First pane is the tab's initial pane — send command via write-chars
+                // (--cwd on new-tab already sets working directory, so skip if no command)
                 if let Some(surface) = pane.surfaces.first() {
-                    let text = if surface.command.is_empty() {
-                        format!("cd {working_dir}\n")
-                    } else {
-                        format!("{}\n", surface.command)
-                    };
-                    Self::zellij_action(&["write-chars", &text]).await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if !surface.command.is_empty() {
+                        let text = format!("{}\n", surface.command);
+                        Self::zellij_action(&["write-chars", &text]).await?;
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
 
                 // Additional surfaces in the first pane: stacked panes
