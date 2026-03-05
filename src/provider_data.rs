@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::providers::types::*;
 
 #[derive(Debug, Default, Clone)]
@@ -11,5 +9,4 @@ pub struct ProviderData {
     pub remote_branches: Vec<String>,
     pub merged_branches: Vec<String>,
     pub workspaces: Vec<Workspace>,
-    pub provider_health: HashMap<&'static str, bool>,
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub struct RefreshSnapshot {
     pub work_items: Vec<WorkItem>,
     pub correlation_groups: Vec<CorrelatedGroup>,
     pub errors: Vec<ProviderError>,
+    pub provider_health: HashMap<&'static str, bool>,
 }
 
 impl Default for RefreshSnapshot {
@@ -27,6 +29,7 @@ impl Default for RefreshSnapshot {
             work_items: Vec::new(),
             correlation_groups: Vec::new(),
             errors: Vec::new(),
+            provider_health: HashMap::new(),
         }
     }
 }
@@ -63,6 +66,7 @@ impl RepoRefreshHandle {
                 // Fetch all provider data
                 let mut provider_data = ProviderData::default();
                 let errors = refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, skip_issues_clone.load(Ordering::Relaxed)).await;
+                let provider_health = compute_provider_health(&registry, &errors);
 
                 // Correlate
                 let providers = Arc::new(provider_data);
@@ -73,6 +77,7 @@ impl RepoRefreshHandle {
                     work_items,
                     correlation_groups,
                     errors,
+                    provider_health,
                 });
 
                 // Publish — receivers will see has_changed().
@@ -183,17 +188,22 @@ async fn refresh_providers(
     pd.remote_branches = branches.unwrap_or_else(|e| { errors.push(ProviderError { category: "branches", message: e }); Vec::new() });
     pd.merged_branches = merged.unwrap_or_else(|e| { errors.push(ProviderError { category: "merged", message: e }); Vec::new() });
 
-    // Determine per-provider health from errors
-    pd.provider_health.clear();
+    errors
+}
+
+fn compute_provider_health(
+    registry: &ProviderRegistry,
+    errors: &[ProviderError],
+) -> HashMap<&'static str, bool> {
+    let mut health = HashMap::new();
     if registry.coding_agents.values().next().is_some() {
-        pd.provider_health.insert("coding_agent", !errors.iter().any(|e| e.category == "sessions"));
+        health.insert("coding_agent", !errors.iter().any(|e| e.category == "sessions"));
     }
     if registry.code_review.values().next().is_some() {
-        pd.provider_health.insert("code_review", !errors.iter().any(|e| e.category == "PRs" || e.category == "merged"));
+        health.insert("code_review", !errors.iter().any(|e| e.category == "PRs" || e.category == "merged"));
     }
     if registry.issue_trackers.values().next().is_some() {
-        pd.provider_health.insert("issue_tracker", !errors.iter().any(|e| e.category == "issues"));
+        health.insert("issue_tracker", !errors.iter().any(|e| e.category == "issues"));
     }
-
-    errors
+    health
 }

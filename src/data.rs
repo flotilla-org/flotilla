@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::provider_data::ProviderData;
 use crate::providers::correlation::{self, CorrelatedItem, CorrelatedGroup, ItemKind as CorItemKind};
 use crate::providers::types::AssociationKey;
@@ -65,10 +68,11 @@ pub struct TableView {
 
 #[derive(Debug, Default, Clone)]
 pub struct DataStore {
-    pub providers: ProviderData,
+    pub providers: Arc<ProviderData>,
     pub loading: bool,
     /// Set from the latest background refresh snapshot, for debug display.
     pub correlation_groups: Vec<CorrelatedGroup>,
+    pub provider_health: HashMap<&'static str, bool>,
 }
 
 pub struct SectionLabels {

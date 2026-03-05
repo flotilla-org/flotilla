@@ -11,6 +11,7 @@ mod providers;
 
 use std::io::stdout;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use clap::Parser;
 use color_eyre::Result;
@@ -218,10 +219,10 @@ fn drain_snapshots(app: &mut app::App) {
 
         let snapshot = handle.snapshot_rx.borrow_and_update().clone();
 
-        let old_providers = std::mem::take(&mut rm.data.providers);
+        let old_providers = std::mem::replace(&mut rm.data.providers, Arc::clone(&snapshot.providers));
         // Apply snapshot to DataStore
-        rm.data.providers = (*snapshot.providers).clone();
         rm.data.correlation_groups = snapshot.correlation_groups.clone();
+        rm.data.provider_health = snapshot.provider_health.clone();
 
         rm.data.loading = false;
 
@@ -240,12 +241,12 @@ fn drain_snapshots(app: &mut app::App) {
             e.category == "issues" && e.message.contains("has disabled issues")
         );
         if issues_disabled {
-            rm.data.providers.provider_health.remove("issue_tracker");
+            rm.data.provider_health.remove("issue_tracker");
             handle.skip_issues.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Provider health -> model-level statuses
-        for (kind, healthy) in &rm.data.providers.provider_health {
+        for (kind, healthy) in &rm.data.provider_health {
             let provider_name = match *kind {
                 "coding_agent" => rm.registry.coding_agents.keys().next(),
                 "code_review" => rm.registry.code_review.keys().next(),
