@@ -8,13 +8,13 @@ use crate::providers::vcs::{CheckoutManager, Vcs};
 use crate::providers::workspace::WorkspaceManager;
 
 pub struct ProviderRegistry {
-    pub vcs: IndexMap<String, Box<dyn Vcs>>,
-    pub checkout_managers: IndexMap<String, Box<dyn CheckoutManager>>,
-    pub code_review: IndexMap<String, Box<dyn CodeReview>>,
-    pub issue_trackers: IndexMap<String, Box<dyn IssueTracker>>,
+    pub vcs: IndexMap<String, Arc<dyn Vcs>>,
+    pub checkout_managers: IndexMap<String, Arc<dyn CheckoutManager>>,
+    pub code_review: IndexMap<String, Arc<dyn CodeReview>>,
+    pub issue_trackers: IndexMap<String, Arc<dyn IssueTracker>>,
     pub coding_agents: IndexMap<String, Arc<dyn CodingAgent>>,
-    pub ai_utilities: IndexMap<String, Box<dyn AiUtility>>,
-    pub workspace_manager: Option<(String, Box<dyn WorkspaceManager>)>,
+    pub ai_utilities: IndexMap<String, Arc<dyn AiUtility>>,
+    pub workspace_manager: Option<(String, Arc<dyn WorkspaceManager>)>,
 }
 
 impl ProviderRegistry {

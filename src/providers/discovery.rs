@@ -110,7 +110,7 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
     if repo_root.join(".git").exists() {
         registry
             .vcs
-            .insert("git".to_string(), Box::new(GitVcs::new()));
+            .insert("git".to_string(), Arc::new(GitVcs::new()));
         info!("{repo_name}: VCS → git");
     }
 
@@ -121,19 +121,19 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
             if command_exists("wt", &["--version"]) {
                 registry
                     .checkout_managers
-                    .insert("git".to_string(), Box::new(WtCheckoutManager::new()));
+                    .insert("git".to_string(), Arc::new(WtCheckoutManager::new()));
                 info!("{repo_name}: Checkout mgr → wt (forced)");
             } else {
                 tracing::warn!("{repo_name}: provider = \"wt\" but wt not found in PATH, falling back to git");
                 registry
                     .checkout_managers
-                    .insert("git".to_string(), Box::new(GitCheckoutManager::new(co_config)));
+                    .insert("git".to_string(), Arc::new(GitCheckoutManager::new(co_config)));
             }
         }
         "git" => {
             registry
                 .checkout_managers
-                .insert("git".to_string(), Box::new(GitCheckoutManager::new(co_config)));
+                .insert("git".to_string(), Arc::new(GitCheckoutManager::new(co_config)));
             info!("{repo_name}: Checkout mgr → git (forced)");
         }
         _ => {
@@ -141,12 +141,12 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
             if command_exists("wt", &["--version"]) {
                 registry
                     .checkout_managers
-                    .insert("git".to_string(), Box::new(WtCheckoutManager::new()));
+                    .insert("git".to_string(), Arc::new(WtCheckoutManager::new()));
                 info!("{repo_name}: Checkout mgr → wt");
             } else {
                 registry
                     .checkout_managers
-                    .insert("git".to_string(), Box::new(GitCheckoutManager::new(co_config)));
+                    .insert("git".to_string(), Arc::new(GitCheckoutManager::new(co_config)));
                 info!("{repo_name}: Checkout mgr → git (fallback)");
             }
         }
@@ -157,11 +157,11 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         if host == "github" && command_exists("gh", &["--version"]) {
             registry.code_review.insert(
                 "github".to_string(),
-                Box::new(GitHubCodeReview::new("github".to_string())),
+                Arc::new(GitHubCodeReview::new("github".to_string())),
             );
             registry.issue_trackers.insert(
                 "github".to_string(),
-                Box::new(GitHubIssueTracker::new("github".to_string())),
+                Arc::new(GitHubIssueTracker::new("github".to_string())),
             );
             info!("{repo_name}: Code review → GitHub");
             info!("{repo_name}: Issue tracker → GitHub");
@@ -177,7 +177,7 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         );
         registry
             .ai_utilities
-            .insert("claude".to_string(), Box::new(ClaudeAiUtility::new(claude_bin)));
+            .insert("claude".to_string(), Arc::new(ClaudeAiUtility::new(claude_bin)));
         info!("{repo_name}: Coding agent → Claude Sessions");
         info!("{repo_name}: AI utility → Claude");
     }
@@ -189,7 +189,7 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         if cmux_bin.exists() {
             registry.workspace_manager = Some((
                 "cmux".to_string(),
-                Box::new(CmuxWorkspaceManager::new()),
+                Arc::new(CmuxWorkspaceManager::new()),
             ));
             info!("{repo_name}: Workspace mgr → cmux");
         }
@@ -197,14 +197,14 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         if ZellijWorkspaceManager::check_version().is_ok() {
             registry.workspace_manager = Some((
                 "zellij".to_string(),
-                Box::new(ZellijWorkspaceManager::new()),
+                Arc::new(ZellijWorkspaceManager::new()),
             ));
             info!("{repo_name}: Workspace mgr → zellij");
         }
     } else if std::env::var("TMUX").is_ok() {
         registry.workspace_manager = Some((
             "tmux".to_string(),
-            Box::new(TmuxWorkspaceManager::new()),
+            Arc::new(TmuxWorkspaceManager::new()),
         ));
         info!("{repo_name}: Workspace mgr → tmux");
     } else {
@@ -213,7 +213,7 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         if cmux_bin.exists() {
             registry.workspace_manager = Some((
                 "cmux".to_string(),
-                Box::new(CmuxWorkspaceManager::new()),
+                Arc::new(CmuxWorkspaceManager::new()),
             ));
             info!("{repo_name}: Workspace mgr → cmux (binary found, not running inside cmux)");
         }
