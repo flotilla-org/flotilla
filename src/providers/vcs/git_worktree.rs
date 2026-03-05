@@ -80,8 +80,11 @@ impl GitCheckoutManager {
             } else if let Some(sha) = line.strip_prefix("HEAD ") {
                 head_sha = Some(sha.to_string());
             } else if line == "bare" {
-                // Skip bare worktrees — not useful as checkouts
+                // Skip bare worktrees — not useful as checkouts.
+                // Clear all state so flush() is a no-op.
                 path = None;
+                branch = None;
+                head_sha = None;
             }
         }
         flush(&mut results, path, branch, head_sha);
@@ -291,6 +294,7 @@ impl super::CheckoutManager for GitCheckoutManager {
             )
             .await?;
         } else {
+            // New branch bases from HEAD of the main worktree
             run_cmd(
                 "git",
                 &["worktree", "add", "-b", branch, wt_str],
