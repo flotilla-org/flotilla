@@ -208,7 +208,6 @@ fn drain_snapshots(app: &mut app::App) {
     let app::AppModel { repos, repo_order, provider_statuses, active_repo, status_message, .. } = model;
 
     let mut all_errors: Vec<String> = Vec::new();
-    let mut any_snapshot_processed = false;
 
     for (i, path) in repo_order.iter().enumerate() {
         let rm = repos.get_mut(path).unwrap();
@@ -218,7 +217,6 @@ fn drain_snapshots(app: &mut app::App) {
         }
 
         let snapshot = handle.snapshot_rx.borrow_and_update().clone();
-        any_snapshot_processed = true;
 
         let old_providers = std::mem::take(&mut rm.data.providers);
         // Apply snapshot to DataStore
@@ -309,12 +307,8 @@ fn drain_snapshots(app: &mut app::App) {
         }
     }
 
-    if any_snapshot_processed {
-        if all_errors.is_empty() {
-            *status_message = None;
-        } else {
-            *status_message = Some(all_errors.join("; "));
-        }
+    if !all_errors.is_empty() {
+        *status_message = Some(all_errors.join("; "));
     }
 }
 
