@@ -9,11 +9,16 @@ use crate::providers::types::*;
 
 pub struct GitCheckoutManager {
     config: CheckoutsConfig,
+    env: minijinja::Environment<'static>,
 }
 
 impl GitCheckoutManager {
     pub fn new(config: CheckoutsConfig) -> Self {
-        Self { config }
+        let mut env = minijinja::Environment::new();
+        env.add_filter("sanitize", |value: String| -> String {
+            value.replace(['/', '\\'], "-")
+        });
+        Self { config, env }
     }
 
     /// Render the worktree path template for a given repo and branch.
@@ -23,19 +28,15 @@ impl GitCheckoutManager {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
 
-        let mut env = minijinja::Environment::new();
-        env.add_filter("sanitize", |value: String| -> String {
-            value.replace(['/', '\\'], "-")
-        });
-        env.add_template("path", &self.config.path)
-            .map_err(|e| format!("invalid worktree path template: {e}"))?;
-        let tmpl = env.get_template("path").map_err(|e| e.to_string())?;
-        let rendered = tmpl
-            .render(minijinja::context! {
-                repo_path => repo_root.to_string_lossy(),
-                repo => repo_name,
-                branch => branch,
-            })
+        let rendered = self.env
+            .render_str(
+                &self.config.path,
+                minijinja::context! {
+                    repo_path => repo_root.to_string_lossy(),
+                    repo => repo_name,
+                    branch => branch,
+                },
+            )
             .map_err(|e| format!("failed to render worktree path: {e}"))?;
 
         let path = PathBuf::from(rendered.trim());
@@ -46,30 +47,44 @@ impl GitCheckoutManager {
         })
     }
 
-    /// Parse `git worktree list --porcelain` output into (path, branch, is_bare) tuples.
-    fn parse_porcelain(output: &str) -> Vec<(PathBuf, String, bool)> {
+    /// Parse `git worktree list --porcelain` output into (path, branch) tuples.
+    /// Entries without a branch (detached HEAD, bare) use a synthetic label.
+    fn parse_porcelain(output: &str) -> Vec<(PathBuf, String)> {
         let mut results = Vec::new();
         let mut path: Option<PathBuf> = None;
         let mut branch: Option<String> = None;
-        let mut bare = false;
+        let mut head_sha: Option<String> = None;
+
+        let flush = |results: &mut Vec<(PathBuf, String)>,
+                     path: Option<PathBuf>,
+                     branch: Option<String>,
+                     head_sha: Option<String>| {
+            if let Some(p) = path {
+                let label = branch.unwrap_or_else(|| {
+                    head_sha
+                        .map(|sha| format!("(detached: {})", &sha[..sha.len().min(7)]))
+                        .unwrap_or_else(|| "(unknown)".to_string())
+                });
+                results.push((p, label));
+            }
+        };
 
         for line in output.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
-                if let (Some(p), Some(b)) = (path.take(), branch.take()) {
-                    results.push((p, b, bare));
-                }
+                flush(&mut results, path.take(), branch.take(), head_sha.take());
                 path = Some(PathBuf::from(p));
                 branch = None;
-                bare = false;
+                head_sha = None;
             } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
                 branch = Some(b.to_string());
+            } else if let Some(sha) = line.strip_prefix("HEAD ") {
+                head_sha = Some(sha.to_string());
             } else if line == "bare" {
-                bare = true;
+                // Skip bare worktrees — not useful as checkouts
+                path = None;
             }
         }
-        if let (Some(p), Some(b)) = (path, branch) {
-            results.push((p, b, bare));
-        }
+        flush(&mut results, path, branch, head_sha);
         results
     }
 
@@ -102,67 +117,63 @@ impl GitCheckoutManager {
             CorrelationKey::CheckoutPath(path.to_path_buf()),
         ];
 
-        let trunk_ahead_behind = if !is_trunk {
-            run_cmd(
-                "git",
-                &[
-                    "rev-list",
-                    "--left-right",
-                    "--count",
-                    &format!("HEAD...{default_branch}"),
-                ],
-                path,
-            )
-            .await
-            .ok()
-            .and_then(|out| parse_ahead_behind(&out))
-        } else {
-            None
-        };
+        let trunk_ref = format!("HEAD...{default_branch}");
+        let remote_ref = format!("HEAD...origin/{branch}");
 
-        let remote_ahead_behind = run_cmd(
-            "git",
-            &[
-                "rev-list",
-                "--left-right",
-                "--count",
-                &format!("HEAD...origin/{branch}"),
-            ],
-            path,
-        )
-        .await
-        .ok()
-        .and_then(|out| parse_ahead_behind(&out));
-
-        let working_tree = run_cmd("git", &["status", "--porcelain"], path)
-            .await
-            .ok()
-            .map(|out| parse_working_tree(&out));
-
-        let last_commit = run_cmd(
-            "git",
-            &["log", "-1", "--format=%h\t%s"],
-            path,
-        )
-        .await
-        .ok()
-        .and_then(|out| {
-            let trimmed = out.trim();
-            let (sha, msg) = trimmed.split_once('\t')?;
-            Some(CommitInfo {
-                short_sha: sha.to_string(),
-                message: msg.to_string(),
-            })
-        });
+        let (trunk_ab, remote_ab, wt_status, commit) = tokio::join!(
+            async {
+                if !is_trunk {
+                    run_cmd(
+                        "git",
+                        &["rev-list", "--left-right", "--count", &trunk_ref],
+                        path,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|out| parse_ahead_behind(&out))
+                } else {
+                    None
+                }
+            },
+            async {
+                run_cmd(
+                    "git",
+                    &["rev-list", "--left-right", "--count", &remote_ref],
+                    path,
+                )
+                .await
+                .ok()
+                .and_then(|out| parse_ahead_behind(&out))
+            },
+            async {
+                run_cmd("git", &["status", "--porcelain"], path)
+                    .await
+                    .ok()
+                    .map(|out| parse_working_tree(&out))
+            },
+            async {
+                run_cmd("git", &["log", "-1", "--format=%h\t%s"], path)
+                    .await
+                    .ok()
+                    .and_then(|out| {
+                        let trimmed = out.trim();
+                        let (sha, msg) = trimmed.split_once('\t')?;
+                        Some(CommitInfo {
+                            short_sha: sha.to_string(),
+                            message: msg.to_string(),
+                        })
+                    })
+            },
+        );
 
         Checkout {
             branch: branch.to_string(),
             path: path.to_path_buf(),
             is_trunk,
-            trunk_ahead_behind,
-            remote_ahead_behind,
-            working_tree,
-            last_commit,
+            trunk_ahead_behind: trunk_ab,
+            remote_ahead_behind: remote_ab,
+            working_tree: wt_status,
+            last_commit: commit,
             correlation_keys,
         }
     }
@@ -230,19 +241,14 @@ impl super::CheckoutManager for GitCheckoutManager {
         let entries = Self::parse_porcelain(&output);
         let default_branch = Self::default_branch(repo_root).await;
 
-        let mut checkouts = Vec::new();
-        for (path, branch, _bare) in &entries {
-            let is_trunk = *branch == default_branch;
-            let checkout = Self::enrich_checkout(
-                path,
-                branch,
-                is_trunk,
-                &default_branch,
-            )
-            .await;
-            checkouts.push(checkout);
-        }
-        Ok(checkouts)
+        let futures: Vec<_> = entries
+            .iter()
+            .map(|(path, branch)| {
+                let is_trunk = *branch == default_branch;
+                Self::enrich_checkout(path, branch, is_trunk, &default_branch)
+            })
+            .collect();
+        Ok(futures::future::join_all(futures).await)
     }
 
     async fn create_checkout(
@@ -296,8 +302,8 @@ impl super::CheckoutManager for GitCheckoutManager {
         let entries = Self::parse_porcelain(&output);
         let wt_path = entries
             .iter()
-            .find(|(_, b, _)| b == branch)
-            .map(|(p, _, _)| p.clone())
+            .find(|(_, b)| b == branch)
+            .map(|(p, _)| p.clone())
             .ok_or_else(|| format!("no worktree found for branch {branch}"))?;
 
         let wt_str = wt_path.to_str()
@@ -310,14 +316,101 @@ impl super::CheckoutManager for GitCheckoutManager {
         )
         .await?;
 
-        // Safe-delete branch (-d, not -D) and skip trunk
+        // Force-delete branch (-D) since feature branches are typically
+        // unmerged locally. Skip trunk to prevent catastrophic deletion.
         let default_branch = Self::default_branch(repo_root).await;
         if branch != default_branch {
-            if let Err(e) = run_cmd("git", &["branch", "-d", branch], repo_root).await {
-                tracing::warn!("could not delete branch {branch}: {e}");
-            }
+            let _ = run_cmd("git", &["branch", "-D", branch], repo_root).await;
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_porcelain_normal_worktrees() {
+        let output = "\
+worktree /home/user/repo
+HEAD abc1234567890
+branch refs/heads/main
+
+worktree /home/user/repo.feature-x
+HEAD def4567890123
+branch refs/heads/feature/x
+";
+        let entries = GitCheckoutManager::parse_porcelain(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, PathBuf::from("/home/user/repo"));
+        assert_eq!(entries[0].1, "main");
+        assert_eq!(entries[1].0, PathBuf::from("/home/user/repo.feature-x"));
+        assert_eq!(entries[1].1, "feature/x");
+    }
+
+    #[test]
+    fn parse_porcelain_detached_head() {
+        let output = "\
+worktree /home/user/repo
+HEAD abc1234567890
+branch refs/heads/main
+
+worktree /home/user/repo.detached
+HEAD def4567890123
+detached
+";
+        let entries = GitCheckoutManager::parse_porcelain(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "main");
+        assert_eq!(entries[1].1, "(detached: def4567)");
+    }
+
+    #[test]
+    fn parse_porcelain_bare_repo_skipped() {
+        let output = "\
+worktree /home/user/repo.git
+HEAD abc1234567890
+bare
+
+worktree /home/user/repo.feature
+HEAD def4567890123
+branch refs/heads/feature
+";
+        let entries = GitCheckoutManager::parse_porcelain(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "feature");
+    }
+
+    #[test]
+    fn parse_ahead_behind_valid() {
+        assert!(parse_ahead_behind("3\t5\n").is_some());
+        let ab = parse_ahead_behind("3\t5\n").unwrap();
+        assert_eq!(ab.ahead, 3);
+        assert_eq!(ab.behind, 5);
+    }
+
+    #[test]
+    fn parse_ahead_behind_empty() {
+        assert!(parse_ahead_behind("").is_none());
+        assert!(parse_ahead_behind("just-one").is_none());
+    }
+
+    #[test]
+    fn parse_working_tree_mixed() {
+        let output = "M  src/main.rs\n?? new_file.rs\nA  added.rs\n M modified.rs\n";
+        let wt = parse_working_tree(output);
+        assert_eq!(wt.staged, 2); // M and A in index column
+        assert_eq!(wt.modified, 1); // M in worktree column
+        assert_eq!(wt.untracked, 1); // ??
+    }
+
+    #[test]
+    fn parse_working_tree_empty() {
+        let wt = parse_working_tree("");
+        assert_eq!(wt.staged, 0);
+        assert_eq!(wt.modified, 0);
+        assert_eq!(wt.untracked, 0);
     }
 }

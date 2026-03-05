@@ -42,7 +42,10 @@ impl super::Vcs for GitVcs {
             return None;
         }
         let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-        // The repo root is the parent of the .git directory
+        // The repo root is the parent of the .git directory.
+        // Note: for bare repos, git-common-dir returns the repo dir itself,
+        // so parent() gives the containing dir — not an issue for our use case
+        // since we only call this from cwd auto-detect.
         git_dir.parent().map(|p| p.to_path_buf())
     }
 
