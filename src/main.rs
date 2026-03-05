@@ -239,6 +239,7 @@ fn drain_snapshots(app: &mut app::App) {
         );
         if issues_disabled {
             rm.data.providers.provider_health.remove("issue_tracker");
+            handle.skip_issues.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Provider health -> model-level statuses

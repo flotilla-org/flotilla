@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
@@ -33,6 +34,7 @@ impl Default for RefreshSnapshot {
 pub struct RepoRefreshHandle {
     pub refresh_trigger: Arc<Notify>,
     pub snapshot_rx: watch::Receiver<Arc<RefreshSnapshot>>,
+    pub skip_issues: Arc<AtomicBool>,
     _task_handle: JoinHandle<()>,
 }
 
@@ -46,6 +48,8 @@ impl RepoRefreshHandle {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(RefreshSnapshot::default()));
         let refresh_trigger = Arc::new(Notify::new());
         let trigger = refresh_trigger.clone();
+        let skip_issues = Arc::new(AtomicBool::new(false));
+        let skip_issues_clone = skip_issues.clone();
 
         let task_handle = tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -57,7 +61,7 @@ impl RepoRefreshHandle {
 
                 // Fetch all provider data
                 let mut provider_data = ProviderData::default();
-                let errors = refresh_providers(&mut provider_data, &repo_root, &registry, &criteria).await;
+                let errors = refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, skip_issues_clone.load(Ordering::Relaxed)).await;
 
                 // Correlate
                 let providers = Arc::new(provider_data);
@@ -78,6 +82,7 @@ impl RepoRefreshHandle {
         Self {
             refresh_trigger,
             snapshot_rx,
+            skip_issues,
             _task_handle: task_handle,
         }
     }
@@ -94,6 +99,7 @@ async fn refresh_providers(
     repo_root: &Path,
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
+    skip_issues: bool,
 ) -> Vec<ProviderError> {
     let mut errors = Vec::new();
 
@@ -114,6 +120,9 @@ async fn refresh_providers(
     };
 
     let issues_fut = async {
+        if skip_issues {
+            return Ok(vec![]);
+        }
         if let Some(it) = registry.issue_trackers.values().next() {
             it.list_issues(repo_root, 20).await
         } else {
