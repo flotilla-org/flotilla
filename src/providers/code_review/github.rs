@@ -1,30 +1,30 @@
 use std::path::Path;
+use std::sync::Arc;
 use async_trait::async_trait;
-use serde::Deserialize;
 use crate::providers::types::*;
+use crate::providers::github_api::GhApiClient;
 
 pub struct GitHubCodeReview {
     provider_name: String,
+    repo_slug: String,
+    api: Arc<GhApiClient>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct GhPr {
     number: i64,
     title: String,
-    #[serde(rename = "headRefName")]
     head_ref_name: String,
     state: String,
-    #[serde(default)]
     body: Option<String>,
-    #[serde(default, rename = "isDraft")]
     is_draft: bool,
 }
 
 use crate::providers::run_cmd;
 
 impl GitHubCodeReview {
-    pub fn new(provider_name: String) -> Self {
-        Self { provider_name }
+    pub fn new(provider_name: String, repo_slug: String, api: Arc<GhApiClient>) -> Self {
+        Self { provider_name, repo_slug, api }
     }
 
     fn parse_state(state: &str) -> ChangeRequestStatus {
@@ -114,23 +114,35 @@ impl super::CodeReview for GitHubCodeReview {
         repo_root: &Path,
         limit: usize,
     ) -> Result<Vec<ChangeRequest>, String> {
-        let limit_str = limit.to_string();
-        let output = run_cmd(
-                "gh",
-                &[
-                    "pr",
-                    "list",
-                    "--json",
-                    "number,title,headRefName,state,body,isDraft",
-                    "--limit",
-                    &limit_str,
-                ],
-                repo_root,
-            )
-            .await?;
-        let prs: Vec<GhPr> =
-            serde_json::from_str(&output).map_err(|e| e.to_string())?;
-        Ok(prs.iter().map(|pr| self.gh_pr_to_change_request(pr)).collect())
+        let endpoint = format!(
+            "repos/{}/pulls?state=open&per_page={}",
+            self.repo_slug, limit
+        );
+        let body = self.api.get(&endpoint, repo_root).await?;
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+
+        Ok(items
+            .iter()
+            .filter_map(|v| {
+                let number = v["number"].as_i64()?;
+                let title = v["title"].as_str()?.to_string();
+                let head_ref = v["head"]["ref"].as_str()?.to_string();
+                let state = v["state"].as_str().unwrap_or("open").to_string();
+                let body_text = v["body"].as_str().map(|s| s.to_string());
+                let is_draft = v["draft"].as_bool().unwrap_or(false);
+
+                let pr = GhPr {
+                    number,
+                    title,
+                    head_ref_name: head_ref,
+                    state,
+                    body: body_text,
+                    is_draft,
+                };
+                Some(self.gh_pr_to_change_request(&pr))
+            })
+            .collect())
     }
 
     async fn get_change_request(
@@ -138,20 +150,26 @@ impl super::CodeReview for GitHubCodeReview {
         repo_root: &Path,
         id: &str,
     ) -> Result<ChangeRequest, String> {
-        let output = run_cmd(
-                "gh",
-                &[
-                    "pr",
-                    "view",
-                    id,
-                    "--json",
-                    "number,title,headRefName,state,body,isDraft",
-                ],
-                repo_root,
-            )
-            .await?;
-        let pr: GhPr =
-            serde_json::from_str(&output).map_err(|e| e.to_string())?;
+        let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
+        let body = self.api.get(&endpoint, repo_root).await?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+
+        let number = v["number"].as_i64().ok_or("missing number")?;
+        let title = v["title"].as_str().ok_or("missing title")?.to_string();
+        let head_ref = v["head"]["ref"].as_str().ok_or("missing head ref")?.to_string();
+        let state = v["state"].as_str().unwrap_or("open").to_string();
+        let body_text = v["body"].as_str().map(|s| s.to_string());
+        let is_draft = v["draft"].as_bool().unwrap_or(false);
+
+        let pr = GhPr {
+            number,
+            title,
+            head_ref_name: head_ref,
+            state,
+            body: body_text,
+            is_draft,
+        };
         Ok(self.gh_pr_to_change_request(&pr))
     }
 
@@ -170,21 +188,51 @@ impl super::CodeReview for GitHubCodeReview {
         repo_root: &Path,
         limit: usize,
     ) -> Result<Vec<String>, String> {
-        let limit_str = limit.to_string();
-        let output = run_cmd(
-                "gh",
-                &[
-                    "pr", "list", "--state", "merged", "--limit", &limit_str,
-                    "--json", "headRefName",
-                ],
-                repo_root,
-            )
-            .await?;
-        let prs: Vec<serde_json::Value> =
-            serde_json::from_str(&output).map_err(|e| e.to_string())?;
-        Ok(prs
+        let endpoint = format!(
+            "repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}",
+            self.repo_slug, limit
+        );
+        let body = self.api.get(&endpoint, repo_root).await?;
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+
+        Ok(items
             .iter()
-            .filter_map(|p| p.get("headRefName").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter(|v| v["merged_at"].as_str().is_some())
+            .filter_map(|v| v["head"]["ref"].as_str().map(|s| s.to_string()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rest_api_pr_fields() {
+        let json = r#"{
+            "number": 42,
+            "title": "Add feature",
+            "head": {"ref": "feature-branch"},
+            "state": "open",
+            "body": "Fixes #7",
+            "draft": true
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["number"].as_i64().unwrap(), 42);
+        assert_eq!(v["head"]["ref"].as_str().unwrap(), "feature-branch");
+        assert_eq!(v["draft"].as_bool().unwrap(), true);
+    }
+
+    #[test]
+    fn parse_merged_pr_has_merged_at() {
+        let json = r#"{
+            "number": 10,
+            "head": {"ref": "old-branch"},
+            "state": "closed",
+            "merged_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(v["merged_at"].as_str().is_some());
     }
 }

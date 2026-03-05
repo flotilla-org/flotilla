@@ -1,30 +1,19 @@
 use std::path::Path;
+use std::sync::Arc;
 use async_trait::async_trait;
-use serde::Deserialize;
 use crate::providers::types::*;
+use crate::providers::github_api::GhApiClient;
+use crate::providers::run_cmd;
 
 pub struct GitHubIssueTracker {
     provider_name: String,
+    repo_slug: String,
+    api: Arc<GhApiClient>,
 }
-
-#[derive(Debug, Deserialize)]
-struct GhIssue {
-    number: i64,
-    title: String,
-    #[serde(default)]
-    labels: Vec<GhLabel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhLabel {
-    name: String,
-}
-
-use crate::providers::run_cmd;
 
 impl GitHubIssueTracker {
-    pub fn new(provider_name: String) -> Self {
-        Self { provider_name }
+    pub fn new(provider_name: String, repo_slug: String, api: Arc<GhApiClient>) -> Self {
+        Self { provider_name, repo_slug, api }
     }
 }
 
@@ -39,38 +28,44 @@ impl super::IssueTracker for GitHubIssueTracker {
         repo_root: &Path,
         limit: usize,
     ) -> Result<Vec<Issue>, String> {
-        let limit_str = limit.to_string();
-        let output = run_cmd(
-                "gh",
-                &[
-                    "issue",
-                    "list",
-                    "--json",
-                    "number,title,labels",
-                    "--limit",
-                    &limit_str,
-                    "--state",
-                    "open",
-                ],
-                repo_root,
-            )
-            .await?;
-        let issues: Vec<GhIssue> =
-            serde_json::from_str(&output).map_err(|e| e.to_string())?;
-        Ok(issues
+        let endpoint = format!(
+            "repos/{}/issues?state=open&per_page={}",
+            self.repo_slug, limit
+        );
+        let body = self.api.get(&endpoint, repo_root).await?;
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+
+        Ok(items
             .into_iter()
-            .map(|issue| {
-                let id = issue.number.to_string();
+            .filter(|v| {
+                // REST /issues includes PRs — filter them out
+                !v.as_object()
+                    .map(|o| o.contains_key("pull_request"))
+                    .unwrap_or(false)
+            })
+            .filter_map(|v| {
+                let number = v["number"].as_i64()?;
+                let title = v["title"].as_str()?.to_string();
+                let labels: Vec<String> = v["labels"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|l| l["name"].as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let id = number.to_string();
                 let association_keys = vec![AssociationKey::IssueRef(
                     self.provider_name.clone(),
                     id.clone(),
                 )];
-                Issue {
+                Some(Issue {
                     id,
-                    title: issue.title,
-                    labels: issue.labels.into_iter().map(|l| l.name).collect(),
+                    title,
+                    labels,
                     association_keys,
-                }
+                })
             })
             .collect())
     }
@@ -83,5 +78,27 @@ impl super::IssueTracker for GitHubIssueTracker {
         run_cmd("gh", &["issue", "view", id, "--web"], repo_root)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rest_api_issues_filters_pull_requests() {
+        let json = r#"[
+            {"number": 1, "title": "Bug report", "labels": [{"name": "bug"}]},
+            {"number": 2, "title": "Feature PR", "labels": [], "pull_request": {"url": "..."}},
+            {"number": 3, "title": "Enhancement", "labels": [{"name": "enhancement"}]}
+        ]"#;
+        let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        let filtered: Vec<&serde_json::Value> = items
+            .iter()
+            .filter(|v| !v.as_object().unwrap().contains_key("pull_request"))
+            .collect();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0]["number"], 1);
+        assert_eq!(filtered[1]["number"], 3);
     }
 }

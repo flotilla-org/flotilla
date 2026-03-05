@@ -7,6 +7,7 @@ use tracing::info;
 use crate::providers::ai_utility::claude::ClaudeAiUtility;
 use crate::providers::code_review::github::GitHubCodeReview;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
+use crate::providers::github_api::GhApiClient;
 use crate::providers::issue_tracker::github::GitHubIssueTracker;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::vcs::git::GitVcs;
@@ -90,6 +91,12 @@ pub fn extract_repo_slug(url: &str) -> Option<String> {
     }
 }
 
+/// Detect "owner/repo" slug from the first git remote URL.
+fn detect_repo_slug(repo_root: &Path) -> Option<String> {
+    let url = first_remote_url(repo_root)?;
+    extract_repo_slug(&url)
+}
+
 /// Detect available providers for a given repository.
 ///
 /// Detection pipeline:
@@ -155,13 +162,15 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
     // 3. Remote host detection -> code review & issue tracker
     if let Some(ref host) = detect_remote_host(repo_root) {
         if host == "github" && command_exists("gh", &["--version"]) {
+            let slug = detect_repo_slug(repo_root).unwrap_or_default();
+            let api = Arc::new(GhApiClient::new());
             registry.code_review.insert(
                 "github".to_string(),
-                Arc::new(GitHubCodeReview::new("github".to_string())),
+                Arc::new(GitHubCodeReview::new("github".to_string(), slug.clone(), Arc::clone(&api))),
             );
             registry.issue_trackers.insert(
                 "github".to_string(),
-                Arc::new(GitHubIssueTracker::new("github".to_string())),
+                Arc::new(GitHubIssueTracker::new("github".to_string(), slug, api)),
             );
             info!("{repo_name}: Code review → GitHub");
             info!("{repo_name}: Issue tracker → GitHub");
