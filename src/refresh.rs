@@ -53,6 +53,7 @@ impl RepoRefreshHandle {
 
         let task_handle = tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = timer.tick() => {}
