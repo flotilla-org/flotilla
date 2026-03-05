@@ -234,8 +234,8 @@ fn drain_snapshots(app: &mut app::App) {
         };
         let table_view = data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
 
-        // Handle issues_disabled — can't mutate Arc<ProviderRegistry>,
-        // just suppress display-side effects
+        // Handle issues_disabled — tell the background task to stop querying,
+        // and suppress from provider health display
         let issues_disabled = snapshot.errors.iter().any(|e|
             e.category == "issues" && e.message.contains("has disabled issues")
         );
