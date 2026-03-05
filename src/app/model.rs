@@ -140,11 +140,11 @@ impl RepoModel {
     /// Snapshot for change detection: (worktrees, change_requests, sessions, branches, issues)
     pub fn data_snapshot(&self) -> (usize, usize, usize, usize, usize) {
         (
-            self.data.checkouts.len(),
-            self.data.change_requests.len(),
-            self.data.sessions.len(),
-            self.data.remote_branches.len(),
-            self.data.issues.len(),
+            self.data.providers.checkouts.len(),
+            self.data.providers.change_requests.len(),
+            self.data.providers.sessions.len(),
+            self.data.providers.remote_branches.len(),
+            self.data.providers.issues.len(),
         )
     }
 }

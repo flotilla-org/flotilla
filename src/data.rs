@@ -1,11 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::provider_data::ProviderData;
 use crate::providers::correlation::{self, CorrelatedItem, CorrelatedGroup, ItemKind as CorItemKind};
-use crate::providers::types::{
-    AssociationKey, ChangeRequest, Checkout, CloudAgentSession, Issue, RepoCriteria, Workspace,
-};
+use crate::providers::types::{AssociationKey, RepoCriteria};
 use crate::providers::registry::ProviderRegistry;
 
 #[derive(Debug, Clone)]
@@ -61,21 +60,12 @@ pub struct WorkItem {
 
 #[derive(Debug, Default, Clone)]
 pub struct DataStore {
-    pub checkouts: Vec<Checkout>,
-    pub change_requests: Vec<ChangeRequest>,
-    pub issues: Vec<Issue>,
-    pub workspaces: Vec<Workspace>,
-    pub sessions: Vec<CloudAgentSession>,
-    pub remote_branches: Vec<String>,
-    pub merged_branches: Vec<String>,
+    pub providers: ProviderData,
     pub table_entries: Vec<TableEntry>,
     pub selectable_indices: Vec<usize>,
     pub loading: bool,
     /// Preserved from last correlate() for debug display.
     pub correlation_groups: Vec<CorrelatedGroup>,
-    /// Per-provider-kind health, set during refresh.
-    /// Keys: "coding_agent", "code_review", "issue_tracker"
-    pub provider_health: HashMap<&'static str, bool>,
 }
 
 pub struct SectionLabels {
@@ -168,23 +158,23 @@ impl DataStore {
             checkouts_fut, cr_fut, issues_fut, sessions_fut, branches_fut, merged_fut, ws_fut
         );
 
-        self.checkouts = checkouts.unwrap_or_else(|e| { errors.push(ProviderError { category: "checkouts", message: e }); Vec::new() });
-        self.change_requests = crs.unwrap_or_else(|e| { errors.push(ProviderError { category: "PRs", message: e }); Vec::new() });
-        self.issues = issues.unwrap_or_else(|e| { errors.push(ProviderError { category: "issues", message: e }); Vec::new() });
-        self.workspaces = workspaces.unwrap_or_else(|e| { errors.push(ProviderError { category: "workspaces", message: e }); Vec::new() });
-        self.sessions = sessions.unwrap_or_else(|e| { errors.push(ProviderError { category: "sessions", message: e }); Vec::new() });
-        self.remote_branches = branches.unwrap_or_else(|e| { errors.push(ProviderError { category: "branches", message: e }); Vec::new() });
-        self.merged_branches = merged.unwrap_or_else(|e| { errors.push(ProviderError { category: "merged", message: e }); Vec::new() });
+        self.providers.checkouts = checkouts.unwrap_or_else(|e| { errors.push(ProviderError { category: "checkouts", message: e }); Vec::new() });
+        self.providers.change_requests = crs.unwrap_or_else(|e| { errors.push(ProviderError { category: "PRs", message: e }); Vec::new() });
+        self.providers.issues = issues.unwrap_or_else(|e| { errors.push(ProviderError { category: "issues", message: e }); Vec::new() });
+        self.providers.workspaces = workspaces.unwrap_or_else(|e| { errors.push(ProviderError { category: "workspaces", message: e }); Vec::new() });
+        self.providers.sessions = sessions.unwrap_or_else(|e| { errors.push(ProviderError { category: "sessions", message: e }); Vec::new() });
+        self.providers.remote_branches = branches.unwrap_or_else(|e| { errors.push(ProviderError { category: "branches", message: e }); Vec::new() });
+        self.providers.merged_branches = merged.unwrap_or_else(|e| { errors.push(ProviderError { category: "merged", message: e }); Vec::new() });
         // Determine per-provider health from errors
-        self.provider_health.clear();
+        self.providers.provider_health.clear();
         if registry.coding_agents.values().next().is_some() {
-            self.provider_health.insert("coding_agent", !errors.iter().any(|e| e.category == "sessions"));
+            self.providers.provider_health.insert("coding_agent", !errors.iter().any(|e| e.category == "sessions"));
         }
         if registry.code_review.values().next().is_some() {
-            self.provider_health.insert("code_review", !errors.iter().any(|e| e.category == "PRs" || e.category == "merged"));
+            self.providers.provider_health.insert("code_review", !errors.iter().any(|e| e.category == "PRs" || e.category == "merged"));
         }
         if registry.issue_trackers.values().next().is_some() {
-            self.provider_health.insert("issue_tracker", !errors.iter().any(|e| e.category == "issues"));
+            self.providers.provider_health.insert("issue_tracker", !errors.iter().any(|e| e.category == "issues"));
         }
 
         let section_labels = SectionLabels {
@@ -220,7 +210,7 @@ impl DataStore {
             match item.kind {
                 CorItemKind::Checkout => {
                     worktree_idx = Some(item.source_index);
-                    if let Some(co) = self.checkouts.get(item.source_index) {
+                    if let Some(co) = self.providers.checkouts.get(item.source_index) {
                         is_main_worktree = co.is_trunk;
                     }
                 }
@@ -233,7 +223,7 @@ impl DataStore {
                     }
                 }
                 CorItemKind::Workspace => {
-                    if let Some(ws) = self.workspaces.get(item.source_index) {
+                    if let Some(ws) = self.providers.workspaces.get(item.source_index) {
                         workspace_refs.push(ws.ws_ref.clone());
                     }
                 }
@@ -258,11 +248,11 @@ impl DataStore {
         // PR titles are usually human-written summaries; session titles next;
         // branch names are terse identifiers and the fallback.
         let pr_title = pr_idx
-            .and_then(|i| self.change_requests.get(i))
+            .and_then(|i| self.providers.change_requests.get(i))
             .map(|cr| cr.title.clone())
             .filter(|t| !t.is_empty());
         let session_title = session_idx
-            .and_then(|i| self.sessions.get(i))
+            .and_then(|i| self.providers.sessions.get(i))
             .map(|s| s.title.clone())
             .filter(|t| !t.is_empty());
         let description = pr_title
@@ -291,7 +281,7 @@ impl DataStore {
         // Issues are linked post-correlation via AssociationKey::IssueRef.
         let mut items: Vec<CorrelatedItem> = Vec::new();
 
-        for (i, co) in self.checkouts.iter().enumerate() {
+        for (i, co) in self.providers.checkouts.iter().enumerate() {
             items.push(CorrelatedItem {
                 provider_name: "checkout".to_string(),
                 kind: CorItemKind::Checkout,
@@ -301,7 +291,7 @@ impl DataStore {
             });
         }
 
-        for (i, cr) in self.change_requests.iter().enumerate() {
+        for (i, cr) in self.providers.change_requests.iter().enumerate() {
             items.push(CorrelatedItem {
                 provider_name: "change_request".to_string(),
                 kind: CorItemKind::ChangeRequest,
@@ -314,7 +304,7 @@ impl DataStore {
         // Issues are NOT submitted to the correlation engine — they link
         // only via AssociationKey::IssueRef, handled post-correlation.
 
-        for (i, session) in self.sessions.iter().enumerate() {
+        for (i, session) in self.providers.sessions.iter().enumerate() {
             items.push(CorrelatedItem {
                 provider_name: "session".to_string(),
                 kind: CorItemKind::CloudSession,
@@ -324,7 +314,7 @@ impl DataStore {
             });
         }
 
-        for (i, ws) in self.workspaces.iter().enumerate() {
+        for (i, ws) in self.providers.workspaces.iter().enumerate() {
             items.push(CorrelatedItem {
                 provider_name: "workspace".to_string(),
                 kind: CorItemKind::Workspace,
@@ -351,10 +341,10 @@ impl DataStore {
 
             // Post-correlation: link issues via association keys on change requests
             if let Some(pr_i) = work_item.pr_idx {
-                if let Some(cr) = self.change_requests.get(pr_i) {
+                if let Some(cr) = self.providers.change_requests.get(pr_i) {
                     for key in &cr.association_keys {
                         let AssociationKey::IssueRef(_, issue_id) = key;
-                        if let Some(issue_idx) = self.issues.iter().position(|i| &i.id == issue_id) {
+                        if let Some(issue_idx) = self.providers.issues.iter().position(|i| &i.id == issue_id) {
                             if !work_item.issue_idxs.contains(&issue_idx) {
                                 work_item.issue_idxs.push(issue_idx);
                                 linked_issue_indices.insert(issue_idx);
@@ -389,8 +379,8 @@ impl DataStore {
 
         // Sessions section -- sorted by updated_at descending (most recent first)
         session_items.sort_by(|a, b| {
-            let a_time = a.session_idx.and_then(|i| self.sessions.get(i)).and_then(|s| s.updated_at.as_deref());
-            let b_time = b.session_idx.and_then(|i| self.sessions.get(i)).and_then(|s| s.updated_at.as_deref());
+            let a_time = a.session_idx.and_then(|i| self.providers.sessions.get(i)).and_then(|s| s.updated_at.as_deref());
+            let b_time = b.session_idx.and_then(|i| self.providers.sessions.get(i)).and_then(|s| s.updated_at.as_deref());
             b_time.cmp(&a_time) // descending
         });
         if !session_items.is_empty() {
@@ -403,8 +393,8 @@ impl DataStore {
 
         // PRs section -- sorted by id descending (most recent first)
         pr_items.sort_by(|a, b| {
-            let a_num = a.pr_idx.and_then(|i| self.change_requests.get(i)).and_then(|cr| cr.id.parse::<i64>().ok());
-            let b_num = b.pr_idx.and_then(|i| self.change_requests.get(i)).and_then(|cr| cr.id.parse::<i64>().ok());
+            let a_num = a.pr_idx.and_then(|i| self.providers.change_requests.get(i)).and_then(|cr| cr.id.parse::<i64>().ok());
+            let b_num = b.pr_idx.and_then(|i| self.providers.change_requests.get(i)).and_then(|cr| cr.id.parse::<i64>().ok());
             b_num.cmp(&a_num) // descending
         });
         if !pr_items.is_empty() {
@@ -425,10 +415,10 @@ impl DataStore {
                 }
             }
         }
-        let merged_set: HashSet<&str> = self.merged_branches.iter()
+        let merged_set: HashSet<&str> = self.providers.merged_branches.iter()
             .map(|s| s.as_str())
             .collect();
-        let mut remote_items: Vec<WorkItem> = self.remote_branches.iter()
+        let mut remote_items: Vec<WorkItem> = self.providers.remote_branches.iter()
             .filter(|b| {
                 b.as_str() != "HEAD" && b.as_str() != "main" && b.as_str() != "master"
                     && !known_branches.contains(b.as_str())
@@ -459,7 +449,7 @@ impl DataStore {
         }
 
         // Issues section -- standalone only (not in linked_issue_indices)
-        let mut issue_items: Vec<WorkItem> = self.issues.iter()
+        let mut issue_items: Vec<WorkItem> = self.providers.issues.iter()
             .enumerate()
             .filter(|(i, _)| !linked_issue_indices.contains(i))
             .map(|(i, issue)| WorkItem {
@@ -476,8 +466,8 @@ impl DataStore {
             })
             .collect();
         issue_items.sort_by(|a, b| {
-            let a_num = a.issue_idxs.first().and_then(|&i| self.issues.get(i)).and_then(|iss| iss.id.parse::<i64>().ok());
-            let b_num = b.issue_idxs.first().and_then(|&i| self.issues.get(i)).and_then(|iss| iss.id.parse::<i64>().ok());
+            let a_num = a.issue_idxs.first().and_then(|&i| self.providers.issues.get(i)).and_then(|iss| iss.id.parse::<i64>().ok());
+            let b_num = b.issue_idxs.first().and_then(|&i| self.providers.issues.get(i)).and_then(|iss| iss.id.parse::<i64>().ok());
             b_num.cmp(&a_num) // descending
         });
         if !issue_items.is_empty() {

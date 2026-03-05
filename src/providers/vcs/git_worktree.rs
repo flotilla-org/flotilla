@@ -267,6 +267,7 @@ impl super::CheckoutManager for GitCheckoutManager {
         &self,
         repo_root: &Path,
         branch: &str,
+        _create_branch: bool,
     ) -> Result<Checkout, String> {
         let wt_path = self.render_worktree_path(repo_root, branch)?;
         info!("git: creating worktree for {branch} at {}", wt_path.display());

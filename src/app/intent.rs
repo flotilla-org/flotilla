@@ -83,19 +83,19 @@ impl Intent {
             }
             Intent::OpenPr => {
                 item.pr_idx.and_then(|pr_idx| {
-                    app.model.active().data.change_requests.get(pr_idx)
+                    app.model.active().data.providers.change_requests.get(pr_idx)
                         .map(|cr| Command::OpenPr(cr.id.clone()))
                 })
             }
             Intent::OpenIssue => {
                 item.issue_idxs.first().and_then(|&issue_idx| {
-                    app.model.active().data.issues.get(issue_idx)
+                    app.model.active().data.providers.issues.get(issue_idx)
                         .map(|issue| Command::OpenIssueBrowser(issue.id.clone()))
                 })
             }
             Intent::TeleportSession => {
                 item.session_idx.and_then(|ses_idx| {
-                    app.model.active().data.sessions.get(ses_idx).map(|session| {
+                    app.model.active().data.providers.sessions.get(ses_idx).map(|session| {
                         Command::TeleportSession {
                             session_id: session.id.clone(),
                             branch: item.branch.clone(),

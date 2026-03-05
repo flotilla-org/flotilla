@@ -2,6 +2,7 @@ mod app;
 mod data;
 mod event;
 mod event_log;
+mod provider_data;
 mod template;
 mod ui;
 mod config;

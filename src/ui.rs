@@ -366,7 +366,7 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
             }
         }
         WorkItemKind::Session => {
-            let session = item.session_idx.and_then(|idx| data.sessions.get(idx));
+            let session = item.session_idx.and_then(|idx| data.providers.sessions.get(idx));
             match session.map(|s| &s.status) {
                 Some(SessionStatus::Running) => ("▶", Color::Magenta),
                 Some(SessionStatus::Idle) => ("◆", Color::Magenta),
@@ -401,7 +401,7 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
     let branch_display = truncate(branch, branch_width);
 
     let pr_display = if let Some(pr_idx) = item.pr_idx {
-        if let Some(cr) = data.change_requests.get(pr_idx) {
+        if let Some(cr) = data.providers.change_requests.get(pr_idx) {
             let state_icon = match cr.status {
                 ChangeRequestStatus::Merged => "✓",
                 ChangeRequestStatus::Closed => "✗",
@@ -416,7 +416,7 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
     };
 
     let session_display = if let Some(ses_idx) = item.session_idx {
-        if let Some(ses) = data.sessions.get(ses_idx) {
+        if let Some(ses) = data.providers.sessions.get(ses_idx) {
             match ses.status {
                 SessionStatus::Running => "▶".to_string(),
                 SessionStatus::Idle => "◆".to_string(),
@@ -432,13 +432,13 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
     let issues_display = item
         .issue_idxs
         .iter()
-        .filter_map(|&idx| data.issues.get(idx))
+        .filter_map(|&idx| data.providers.issues.get(idx))
         .map(|i| format!("#{}", i.id))
         .collect::<Vec<_>>()
         .join(",");
 
     let git_display = if let Some(wt_idx) = item.worktree_idx {
-        if let Some(co) = data.checkouts.get(wt_idx) {
+        if let Some(co) = data.providers.checkouts.get(wt_idx) {
             let mut s = String::new();
             if co.working_tree.as_ref().is_some_and(|w| w.modified > 0) {
                 s.push('M');
@@ -512,7 +512,7 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
         }
 
         if let Some(wt_idx) = item.worktree_idx {
-            if let Some(co) = model.active().data.checkouts.get(wt_idx) {
+            if let Some(co) = model.active().data.providers.checkouts.get(wt_idx) {
                 lines.push(format!("Path: {}", co.path.display()));
                 if let Some(commit) = &co.last_commit {
                     let sha = if commit.short_sha.is_empty() { "?" } else { &commit.short_sha };
@@ -535,14 +535,14 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
         }
 
         if let Some(pr_idx) = item.pr_idx {
-            if let Some(cr) = model.active().data.change_requests.get(pr_idx) {
+            if let Some(cr) = model.active().data.providers.change_requests.get(pr_idx) {
                 lines.push(format!("{} #{}: {}", model.active_labels().code_review.abbr, cr.id, cr.title));
                 lines.push(format!("State: {:?}", cr.status));
             }
         }
 
         if let Some(ses_idx) = item.session_idx {
-            if let Some(ses) = model.active().data.sessions.get(ses_idx) {
+            if let Some(ses) = model.active().data.providers.sessions.get(ses_idx) {
                 lines.push(format!("Session: {}", ses.title));
                 lines.push(format!("Status: {:?}", ses.status));
                 if let Some(ref model) = ses.model {
@@ -556,14 +556,14 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
         }
 
         for ws_ref in &item.workspace_refs {
-            if let Some(ws) = model.active().data.workspaces.iter().find(|w| &w.ws_ref == ws_ref) {
+            if let Some(ws) = model.active().data.providers.workspaces.iter().find(|w| &w.ws_ref == ws_ref) {
                 let name = if ws.name.is_empty() { &ws.ws_ref } else { &ws.name };
                 lines.push(format!("Workspace: {}", name));
             }
         }
 
         for &issue_idx in &item.issue_idxs {
-            if let Some(issue) = model.active().data.issues.get(issue_idx) {
+            if let Some(issue) = model.active().data.providers.issues.get(issue_idx) {
                 let labels = issue.labels.join(", ");
                 lines.push(format!("Issue #{}: {} [{}]", issue.id, issue.title, labels));
             }

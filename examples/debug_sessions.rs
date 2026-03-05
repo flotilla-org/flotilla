@@ -41,25 +41,25 @@ async fn main() {
         }
     }
 
-    println!("\n  Checkouts: {}", ds.checkouts.len());
-    for (i, co) in ds.checkouts.iter().enumerate() {
+    println!("\n  Checkouts: {}", ds.providers.checkouts.len());
+    for (i, co) in ds.providers.checkouts.iter().enumerate() {
         println!("    [{i}] branch={:?} keys={:?}", co.branch, co.correlation_keys);
     }
 
-    println!("\n  Change Requests: {}", ds.change_requests.len());
-    for (i, cr) in ds.change_requests.iter().enumerate() {
+    println!("\n  Change Requests: {}", ds.providers.change_requests.len());
+    for (i, cr) in ds.providers.change_requests.iter().enumerate() {
         println!("    [{i}] title={:?} branch={:?} corr_keys={:?} assoc_keys={:?}",
             cr.title, cr.branch, cr.correlation_keys, cr.association_keys);
     }
 
-    println!("\n  Sessions: {}", ds.sessions.len());
-    for (i, s) in ds.sessions.iter().enumerate() {
+    println!("\n  Sessions: {}", ds.providers.sessions.len());
+    for (i, s) in ds.providers.sessions.iter().enumerate() {
         println!("    [{i}] title={:?} status={:?} keys={:?}",
             s.title, s.status, s.correlation_keys);
     }
 
-    println!("\n  Workspaces: {}", ds.workspaces.len());
-    for (i, ws) in ds.workspaces.iter().enumerate() {
+    println!("\n  Workspaces: {}", ds.providers.workspaces.len());
+    for (i, ws) in ds.providers.workspaces.iter().enumerate() {
         println!("    [{i}] name={:?} dirs={:?} keys={:?}",
             ws.name, ws.directories, ws.correlation_keys);
     }

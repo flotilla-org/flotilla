@@ -14,7 +14,7 @@ pub async fn execute(cmd: Command, app: &mut App) {
     app.model.status_message = None;
     match cmd {
         Command::SwitchWorktree(i) => {
-            if let Some(co) = app.model.active().data.checkouts.get(i).cloned() {
+            if let Some(co) = app.model.active().data.providers.checkouts.get(i).cloned() {
                 info!("entering workspace for {}", co.branch);
                 let ws_result = if let Some((_, ws_mgr)) = &app.model.active().registry.workspace_manager {
                     let config = workspace_config(app.model.active_repo_root(), &co.branch, &co.path, "claude");
@@ -42,10 +42,10 @@ pub async fn execute(cmd: Command, app: &mut App) {
                 if let Some(data::TableEntry::Item(item)) = app.model.active().data.table_entries.get(table_idx).cloned() {
                     let branch = item.branch.clone().unwrap_or_default();
                     let wt_path = item.worktree_idx
-                        .and_then(|idx| app.model.active().data.checkouts.get(idx))
+                        .and_then(|idx| app.model.active().data.providers.checkouts.get(idx))
                         .map(|co| co.path.clone());
                     let pr_id = item.pr_idx
-                        .and_then(|idx| app.model.active().data.change_requests.get(idx))
+                        .and_then(|idx| app.model.active().data.providers.change_requests.get(idx))
                         .map(|cr| cr.id.clone());
                     let repo_root = app.model.active_repo_root().clone();
                     let info = data::fetch_delete_confirm_info(
@@ -125,7 +125,7 @@ pub async fn execute(cmd: Command, app: &mut App) {
             refresh_all(app).await;
         }
         Command::ArchiveSession(ses_idx) => {
-            if let Some(session) = app.model.active().data.sessions.get(ses_idx).cloned() {
+            if let Some(session) = app.model.active().data.providers.sessions.get(ses_idx).cloned() {
                 info!("archiving session {}", session.id);
                 let result = if let Some(ca) = app.model.active().registry.coding_agents.values().next() {
                     Some(ca.archive_session(&session.id).await)
@@ -143,7 +143,7 @@ pub async fn execute(cmd: Command, app: &mut App) {
             let claude_bin = providers::resolve_claude_path().unwrap_or_else(|| "claude".into());
             let teleport_cmd = format!("{} --teleport {}", claude_bin, session_id);
             let wt_path = if let Some(wt_idx) = worktree_idx {
-                app.model.active().data.checkouts.get(wt_idx).map(|co| co.path.clone())
+                app.model.active().data.providers.checkouts.get(wt_idx).map(|co| co.path.clone())
             } else if let Some(branch_name) = &branch {
                 let repo = app.model.active_repo_root().clone();
                 let checkout_result = if let Some(cm) = app.model.active().registry.checkout_managers.values().next() {
@@ -172,7 +172,7 @@ pub async fn execute(cmd: Command, app: &mut App) {
         Command::GenerateBranchName(issue_idxs) => {
             let issues: Vec<(String, String)> = issue_idxs
                 .iter()
-                .filter_map(|&idx| app.model.active().data.issues.get(idx))
+                .filter_map(|&idx| app.model.active().data.providers.issues.get(idx))
                 .map(|issue| (issue.id.clone(), issue.title.clone()))
                 .collect();
 
@@ -274,7 +274,7 @@ pub async fn refresh_all(app: &mut App) {
         );
         if issues_disabled {
             rm.registry.issue_trackers.clear();
-            rm.data.provider_health.remove("issue_tracker");
+            rm.data.providers.provider_health.remove("issue_tracker");
         }
 
         // Populate labels from provider traits
@@ -333,7 +333,7 @@ pub async fn refresh_all(app: &mut App) {
         // Copy provider health from DataStore into model-level statuses
         let name = AppModel::repo_name(&path);
 
-        for (kind, healthy) in &rm.data.provider_health {
+        for (kind, healthy) in &rm.data.providers.provider_health {
             let provider_name = match *kind {
                 "coding_agent" => rm.registry.coding_agents.keys().next(),
                 "code_review" => rm.registry.code_review.keys().next(),
