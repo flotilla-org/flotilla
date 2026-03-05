@@ -187,12 +187,17 @@ pub fn resolve_checkouts_config(repo_root: &std::path::Path) -> CheckoutsConfig 
     let slug = path_to_slug(repo_root);
     let repo_file = config_dir().join(format!("{slug}.toml"));
     if let Ok(content) = std::fs::read_to_string(&repo_file) {
-        if let Ok(repo_cfg) = toml::from_str::<RepoFileConfig>(&content) {
-            let repo_co = &repo_cfg.vcs.git.checkouts;
-            return CheckoutsConfig {
-                path: repo_co.path.clone().unwrap_or(global.vcs.git.checkouts.path),
-                provider: repo_co.provider.clone().unwrap_or(global.vcs.git.checkouts.provider),
-            };
+        match toml::from_str::<RepoFileConfig>(&content) {
+            Ok(repo_cfg) => {
+                let repo_co = &repo_cfg.vcs.git.checkouts;
+                return CheckoutsConfig {
+                    path: repo_co.path.clone().unwrap_or(global.vcs.git.checkouts.path),
+                    provider: repo_co.provider.clone().unwrap_or(global.vcs.git.checkouts.provider),
+                };
+            }
+            Err(e) => {
+                tracing::warn!("failed to parse {}: {e}", repo_file.display());
+            }
         }
     }
     global.vcs.git.checkouts

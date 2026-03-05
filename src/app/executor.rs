@@ -219,7 +219,7 @@ pub fn workspace_config(
 ) -> crate::providers::types::WorkspaceConfig {
     let tmpl_path = repo_root.join(".flotilla/workspace.yaml");
     let template_yaml = std::fs::read_to_string(&tmpl_path).ok().or_else(|| {
-        let global_path = dirs::config_dir()?.join("flotilla/workspace.yaml");
+        let global_path = dirs::home_dir()?.join(".config/flotilla/workspace.yaml");
         std::fs::read_to_string(global_path).ok()
     });
     let mut template_vars = std::collections::HashMap::new();

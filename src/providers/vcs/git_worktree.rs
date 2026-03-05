@@ -88,7 +88,7 @@ impl GitCheckoutManager {
         results
     }
 
-    /// Detect the default branch (main or master) for trunk detection.
+    /// Detect the default branch for trunk detection.
     async fn default_branch(repo_root: &Path) -> String {
         if let Ok(out) = run_cmd(
             "git",
@@ -100,6 +100,19 @@ impl GitCheckoutManager {
             let trimmed = out.trim();
             if let Some(branch) = trimmed.strip_prefix("origin/") {
                 return branch.to_string();
+            }
+        }
+        // Fallback: check which common trunk names exist locally
+        for name in &["main", "master", "trunk"] {
+            if run_cmd(
+                "git",
+                &["show-ref", "--verify", "--quiet", &format!("refs/heads/{name}")],
+                repo_root,
+            )
+            .await
+            .is_ok()
+            {
+                return name.to_string();
             }
         }
         "main".to_string()
