@@ -1,3 +1,4 @@
+pub mod github_api;
 pub mod types;
 pub mod vcs;
 pub mod code_review;
