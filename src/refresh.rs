@@ -74,8 +74,11 @@ impl RepoRefreshHandle {
                     errors,
                 });
 
-                // Publish — receivers will see has_changed()
-                let _ = snapshot_tx.send(snapshot);
+                // Publish — receivers will see has_changed().
+                // Break if receiver is dropped (handle dropped without Drop running).
+                if snapshot_tx.send(snapshot).is_err() {
+                    break;
+                }
             }
         });
 

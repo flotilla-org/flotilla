@@ -1,7 +1,5 @@
 # Async Refresh Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Replace the blocking `refresh_all` with background tasks and watch channels so the UI never freezes during provider queries.
 
 **Architecture:** Three-layer reactive split — ProviderData (background), CorrelatedData (background), TableView (UI). Connected by `tokio::watch` channels carrying `Arc` snapshots. See `docs/plans/2026-03-05-async-refresh-design.md`.
