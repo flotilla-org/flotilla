@@ -30,6 +30,7 @@ impl super::Vcs for GitVcs {
     fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
         // git-common-dir points to the shared .git dir (same as .git for
         // non-worktree repos, the main repo's .git for worktrees).
+        // --path-format=absolute requires git >= 2.31 (Feb 2021).
         let output = std::process::Command::new("git")
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(path)

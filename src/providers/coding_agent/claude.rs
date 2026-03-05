@@ -44,13 +44,11 @@ struct OAuthToken {
 
 struct AuthCache {
     token: Option<OAuthToken>,
-    org_uuid: Option<String>,
 }
 
 static AUTH_CACHE: LazyLock<Mutex<AuthCache>> = LazyLock::new(|| {
     Mutex::new(AuthCache {
         token: None,
-        org_uuid: None,
     })
 });
 
@@ -166,64 +164,42 @@ async fn get_oauth_token() -> Result<OAuthToken, String> {
     let token = read_oauth_token_from_keychain().await?;
     let mut cache = AUTH_CACHE.lock().unwrap();
     cache.token = Some(token.clone());
-    cache.org_uuid = None; // new token might mean different user
     Ok(token)
-}
-
-async fn get_org_uuid(token: &str) -> Result<String, String> {
-    {
-        let cache = AUTH_CACHE.lock().unwrap();
-        if let Some(ref uuid) = cache.org_uuid {
-            return Ok(uuid.clone());
-        }
-    }
-    let uuid = read_org_uuid(token).await?;
-    let mut cache = AUTH_CACHE.lock().unwrap();
-    cache.org_uuid = Some(uuid.clone());
-    Ok(uuid)
 }
 
 fn invalidate_auth_cache() {
     let mut cache = AUTH_CACHE.lock().unwrap();
     cache.token = None;
-    cache.org_uuid = None;
-}
-
-async fn read_org_uuid(token: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .get("https://api.anthropic.com/api/oauth/profile")
-        .bearer_auth(token)
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    v.get("organization")
-        .and_then(|o| o.get("uuid"))
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "No organization.uuid in profile".to_string())
 }
 
 impl ClaudeCodingAgent {
     /// Fetch all non-archived sessions from the API, sorted by updated_at descending.
+    /// Returns empty list on auth errors (insufficient scopes, expired token) to
+    /// degrade gracefully instead of spamming errors on every refresh cycle.
     async fn fetch_sessions() -> Result<Vec<WebSession>, String> {
         match Self::fetch_sessions_inner().await {
             Ok(sessions) => Ok(sessions),
             Err(e) if e.contains("authentication") || e.contains("missing field `data`") => {
-                warn!("session fetch failed, clearing auth cache and retrying: {e}");
+                debug!("session fetch failed, clearing auth cache and retrying: {e}");
                 invalidate_auth_cache();
-                Self::fetch_sessions_inner().await
+                match Self::fetch_sessions_inner().await {
+                    Ok(sessions) => Ok(sessions),
+                    Err(e) if e.contains("authentication") => {
+                        warn!("Claude sessions unavailable: {e} (token may lack required scopes)");
+                        Ok(vec![])
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
     }
 
+    /// Fetch sessions from the API. The x-organization-uuid header was removed because
+    /// the OAuth token's scopes no longer include user:profile (needed to fetch the org
+    /// UUID from /api/oauth/profile), and the sessions API works without it.
     async fn fetch_sessions_inner() -> Result<Vec<WebSession>, String> {
         let token = get_oauth_token().await?;
-        let org_uuid = get_org_uuid(&token.access_token).await?;
         let access_token = token.access_token;
 
         let client = reqwest::Client::new();
@@ -232,7 +208,6 @@ impl ClaudeCodingAgent {
             .bearer_auth(&access_token)
             .header("anthropic-beta", "ccr-byoc-2025-07-29")
             .header("anthropic-version", "2023-06-01")
-            .header("x-organization-uuid", &org_uuid)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -369,7 +344,6 @@ impl super::CodingAgent for ClaudeCodingAgent {
     async fn archive_session(&self, session_id: &str) -> Result<(), String> {
         info!("archiving session {session_id}");
         let token = get_oauth_token().await?;
-        let org_uuid = get_org_uuid(&token.access_token).await?;
         let access_token = token.access_token;
 
         let url = format!("https://api.anthropic.com/v1/sessions/{session_id}");
@@ -379,7 +353,6 @@ impl super::CodingAgent for ClaudeCodingAgent {
             .bearer_auth(&access_token)
             .header("anthropic-beta", "ccr-byoc-2025-07-29")
             .header("anthropic-version", "2023-06-01")
-            .header("x-organization-uuid", &org_uuid)
             .json(&serde_json::json!({"session_status": "archived"}))
             .send()
             .await

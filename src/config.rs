@@ -177,7 +177,11 @@ pub fn load_config() -> FlotillaConfig {
         .join(".config/flotilla/config.toml");
     std::fs::read_to_string(&path)
         .ok()
-        .and_then(|content| toml::from_str(&content).ok())
+        .and_then(|content| {
+            toml::from_str(&content)
+                .map_err(|e| tracing::warn!("failed to parse {}: {e}", path.display()))
+                .ok()
+        })
         .unwrap_or_default()
 }
 

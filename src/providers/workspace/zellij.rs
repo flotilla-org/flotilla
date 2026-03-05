@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::providers::types::*;
-#[allow(unused_imports)]
 use crate::template::WorkspaceTemplate;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -123,11 +123,16 @@ impl ZellijWorkspaceManager {
             Ok(c) => c,
             Err(_) => return ZellijState::default(),
         };
-        toml::from_str(&contents).unwrap_or_default()
+        match toml::from_str(&contents) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!("corrupt zellij state file, treating as empty: {e}");
+                ZellijState::default()
+            }
+        }
     }
 
     /// Save state for the given session. Silently ignores errors.
-    #[allow(dead_code)]
     fn save_state(session: &str, state: &ZellijState) {
         let path = match Self::state_path(session) {
             Ok(p) => p,
@@ -138,6 +143,14 @@ impl ZellijWorkspaceManager {
         }
         if let Ok(contents) = toml::to_string(state) {
             let _ = std::fs::write(&path, contents);
+        }
+    }
+
+    /// Append `-- sh -c "command"` to args if command is non-empty.
+    /// Uses sh -c to avoid quoting issues with complex commands.
+    fn append_command_args<'a>(args: &mut Vec<&'a str>, command: &'a str) {
+        if !command.is_empty() {
+            args.extend(["--", "sh", "-c", command]);
         }
     }
 }
@@ -181,8 +194,112 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         Ok(workspaces)
     }
 
-    async fn create_workspace(&self, _config: &WorkspaceConfig) -> Result<Workspace, String> {
-        todo!()
+    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<Workspace, String> {
+        info!("zellij: creating workspace '{}'", config.name);
+
+        // Parse template from YAML if provided, otherwise use default
+        let template = if let Some(ref yaml) = config.template_yaml {
+            serde_yaml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+                warn!("zellij: failed to parse workspace template, using default: {e}");
+                WorkspaceTemplate::load_default()
+            })
+        } else {
+            WorkspaceTemplate::load_default()
+        };
+
+        let rendered = template.render(&config.template_vars);
+        let working_dir = config.working_directory.display().to_string();
+
+        // Create new tab
+        Self::zellij_action(&["new-tab", "--name", &config.name, "--cwd", &working_dir]).await?;
+
+        // Small delay to let zellij process the tab creation
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        for (i, pane) in rendered.panes.iter().enumerate() {
+            if i == 0 {
+                // First pane is the tab's initial pane — send command via write-chars
+                // (--cwd on new-tab already sets working directory, so skip if no command)
+                if let Some(surface) = pane.surfaces.first() {
+                    if !surface.command.is_empty() {
+                        let text = format!("{}\n", surface.command);
+                        Self::zellij_action(&["write-chars", &text]).await?;
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+
+                // Additional surfaces in the first pane: stacked panes
+                for surface in pane.surfaces.iter().skip(1) {
+                    let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
+                    Self::append_command_args(&mut args, &surface.command);
+                    Self::zellij_action(&args).await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } else {
+                // Subsequent panes: create via new-pane with direction
+                let direction = pane.split.as_deref().unwrap_or("right");
+
+                if let Some(surface) = pane.surfaces.first() {
+                    let mut args: Vec<&str> =
+                        vec!["new-pane", "-d", direction, "--cwd", &working_dir];
+                    Self::append_command_args(&mut args, &surface.command);
+                    Self::zellij_action(&args).await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+
+                // Additional surfaces in this pane: stacked panes
+                for surface in pane.surfaces.iter().skip(1) {
+                    let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
+                    Self::append_command_args(&mut args, &surface.command);
+                    Self::zellij_action(&args).await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        // Focus the designated pane. Use focus-previous-pane which walks panes in
+        // reverse creation order regardless of split direction (unlike move-focus which
+        // is direction-specific and fails for mixed horizontal/vertical layouts).
+        let focus_index = rendered.panes.iter().position(|p| p.focus);
+        let total_panes: usize = rendered.panes.iter().map(|p| p.surfaces.len().max(1)).sum();
+        if let Some(fi) = focus_index {
+            let panes_before: usize = rendered.panes.iter().take(fi).map(|p| p.surfaces.len().max(1)).sum();
+            let moves_back = total_panes.saturating_sub(1).saturating_sub(panes_before);
+            for _ in 0..moves_back {
+                Self::zellij_action(&["focus-previous-pane"]).await.ok();
+            }
+        }
+
+        // Save state
+        if let Ok(session) = Self::session_name() {
+            let mut state = Self::load_state(&session);
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_default();
+            state.tabs.insert(
+                config.name.clone(),
+                TabState {
+                    working_directory: working_dir.clone(),
+                    created_at: timestamp,
+                },
+            );
+            Self::save_state(&session, &state);
+        }
+
+        let directories = vec![config.working_directory.clone()];
+        let correlation_keys = directories
+            .iter()
+            .map(|d| CorrelationKey::CheckoutPath(d.clone()))
+            .collect();
+
+        info!("zellij: workspace '{}' ready", config.name);
+        Ok(Workspace {
+            ws_ref: config.name.clone(),
+            name: config.name.clone(),
+            directories,
+            correlation_keys,
+        })
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {

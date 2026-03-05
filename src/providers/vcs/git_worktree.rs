@@ -196,15 +196,11 @@ impl GitCheckoutManager {
 }
 
 fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
-    let parts: Vec<&str> = output.split_whitespace().collect();
-    if parts.len() == 2 {
-        Some(AheadBehind {
-            ahead: parts[0].parse().ok()?,
-            behind: parts[1].parse().ok()?,
-        })
-    } else {
-        None
-    }
+    let trimmed = output.trim();
+    let mut parts = trimmed.split('\t');
+    let ahead: i64 = parts.next()?.parse().ok()?;
+    let behind: i64 = parts.next()?.parse().ok()?;
+    Some(AheadBehind { ahead, behind })
 }
 
 fn parse_working_tree(output: &str) -> WorkingTreeStatus {
@@ -337,7 +333,9 @@ impl super::CheckoutManager for GitCheckoutManager {
         // unmerged locally. Skip trunk to prevent catastrophic deletion.
         let default_branch = Self::default_branch(repo_root).await;
         if branch != default_branch {
-            let _ = run_cmd("git", &["branch", "-D", branch], repo_root).await;
+            if let Err(e) = run_cmd("git", &["branch", "-D", branch], repo_root).await {
+                tracing::warn!("failed to delete branch {branch}: {e}");
+            }
         }
 
         Ok(())

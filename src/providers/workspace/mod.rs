@@ -1,4 +1,5 @@
 pub mod cmux;
+pub mod tmux;
 pub mod zellij;
 
 use async_trait::async_trait;

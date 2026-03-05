@@ -14,6 +14,8 @@ use crate::providers::vcs::git_worktree::GitCheckoutManager;
 use crate::providers::vcs::wt::WtCheckoutManager;
 use crate::providers::workspace::cmux::CmuxWorkspaceManager;
 use crate::config;
+use crate::providers::workspace::tmux::TmuxWorkspaceManager;
+use crate::providers::workspace::zellij::ZellijWorkspaceManager;
 
 /// Extract the first git remote URL for this repo.
 pub fn first_remote_url(repo_root: &Path) -> Option<String> {
@@ -173,18 +175,42 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         info!("{repo_name}: AI utility → Claude");
     }
 
-    // 6. Workspace manager: cmux
-    // Check for the cmux binary at the known path
-    let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
-    if cmux_bin.exists() {
+    // 6. Workspace manager: prefer env-var detection (proves we're *inside* the terminal)
+    //    over binary-exists checks (just means the app is installed).
+    if std::env::var("CMUX_SOCKET_PATH").is_ok() {
+        let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
+        if cmux_bin.exists() {
+            registry.workspace_manager = Some((
+                "cmux".to_string(),
+                Box::new(CmuxWorkspaceManager::new()),
+            ));
+            info!("{repo_name}: Workspace mgr → cmux");
+        }
+    } else if std::env::var("ZELLIJ").is_ok() {
+        if ZellijWorkspaceManager::check_version().is_ok() {
+            registry.workspace_manager = Some((
+                "zellij".to_string(),
+                Box::new(ZellijWorkspaceManager::new()),
+            ));
+            info!("{repo_name}: Workspace mgr → zellij");
+        }
+    } else if std::env::var("TMUX").is_ok() {
         registry.workspace_manager = Some((
-            "cmux".to_string(),
-            Box::new(CmuxWorkspaceManager::new()),
+            "tmux".to_string(),
+            Box::new(TmuxWorkspaceManager::new()),
         ));
-        info!("{repo_name}: Workspace mgr → cmux");
+        info!("{repo_name}: Workspace mgr → tmux");
+    } else {
+        // Fallback: cmux binary exists but not running inside cmux
+        let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
+        if cmux_bin.exists() {
+            registry.workspace_manager = Some((
+                "cmux".to_string(),
+                Box::new(CmuxWorkspaceManager::new()),
+            ));
+            info!("{repo_name}: Workspace mgr → cmux (binary found, not running inside cmux)");
+        }
     }
-    // TODO: check $ZELLIJ env var for Zellij workspace manager
-    // TODO: check $TMUX env var for tmux workspace manager
 
     registry
 }
