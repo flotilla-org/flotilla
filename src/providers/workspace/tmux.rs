@@ -109,6 +109,8 @@ impl TmuxWorkspaceManager {
     /// Map split direction names to tmux flags.
     /// tmux: -h = horizontal split (pane appears to the right)
     ///        -v = vertical split (pane appears below)
+    /// Note: tmux doesn't support placing a pane to the left or above directly;
+    /// "left" produces the same result as "right" (-h), "up" same as "down" (-v).
     fn split_flag(direction: &str) -> &'static str {
         match direction {
             "left" | "right" => "-h",
@@ -247,7 +249,8 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         // Focus the designated pane (use pane index within current window
         // to avoid issues with window names containing special characters)
         if let Some(fi) = focus_pane_index {
-            let target = format!("{fi}");
+            // :.N targets pane N within the current window
+            let target = format!(":.{fi}");
             Self::tmux_cmd(&["select-pane", "-t", &target]).await.ok();
         }
 
