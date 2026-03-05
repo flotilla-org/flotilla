@@ -205,7 +205,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
 /// Check all repo watch channels for new snapshots and apply them.
 fn drain_snapshots(app: &mut app::App) {
     let app::App { model, ui, .. } = app;
-    let app::AppModel { repos, repo_order, provider_statuses, active_repo, .. } = model;
+    let app::AppModel { repos, repo_order, provider_statuses, active_repo, status_message, .. } = model;
+
+    let mut all_errors: Vec<String> = Vec::new();
 
     for (i, path) in repo_order.iter().enumerate() {
         let rm = repos.get_mut(path).unwrap();
@@ -300,8 +302,13 @@ fn drain_snapshots(app: &mut app::App) {
             for e in &snapshot.errors {
                 if issues_disabled && e.category == "issues" { continue; }
                 tracing::error!("{name}: {}: {}", e.category, e.message);
+                all_errors.push(format!("{name}: {}: {}", e.category, e.message));
             }
         }
+    }
+
+    if !all_errors.is_empty() {
+        *status_message = Some(all_errors.join("; "));
     }
 }
 
