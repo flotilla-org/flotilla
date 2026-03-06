@@ -41,7 +41,9 @@ impl Intent {
             Intent::GenerateBranchName => item.branch.is_none() && !item.issue_idxs.is_empty(),
             Intent::OpenPr => item.pr_idx.is_some(),
             Intent::OpenIssue => !item.issue_idxs.is_empty(),
-            Intent::LinkIssuesToPr => item.pr_idx.is_some() && item.worktree_idx.is_some(),
+            Intent::LinkIssuesToPr => {
+                item.pr_idx.is_some() && item.worktree_idx.is_some() && !item.issue_idxs.is_empty()
+            }
             Intent::TeleportSession => item.session_idx.is_some(),
             Intent::ArchiveSession => item.session_idx.is_some(),
         }
