@@ -238,6 +238,21 @@ pub fn correlate(providers: &ProviderData) -> (Vec<WorkItem>, Vec<CorrelatedGrou
             }
         }
 
+        // Also link issues via association keys on checkouts (from git config)
+        if let Some(co_i) = work_item.worktree_idx {
+            if let Some(co) = providers.checkouts.get(co_i) {
+                for key in &co.association_keys {
+                    let AssociationKey::IssueRef(_, issue_id) = key;
+                    if let Some(issue_idx) = providers.issues.iter().position(|i| &i.id == issue_id) {
+                        if !work_item.issue_idxs.contains(&issue_idx) {
+                            work_item.issue_idxs.push(issue_idx);
+                            linked_issue_indices.insert(issue_idx);
+                        }
+                    }
+                }
+            }
+        }
+
         work_items.push(work_item);
     }
 
