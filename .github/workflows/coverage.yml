@@ -28,7 +28,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-          elif git diff --quiet HEAD~1 -- '*.rs' 'Cargo.*'; then
+          elif git diff --quiet HEAD~1 -- '**/*.rs' '**/Cargo.toml' 'Cargo.*'; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_run=true" >> "$GITHUB_OUTPUT"
@@ -55,17 +55,17 @@ jobs:
           key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-coverage-
-      - name: Generate HTML coverage report
-        run: cargo +nightly llvm-cov --html --locked
+      - name: Generate coverage report
+        run: cargo +nightly llvm-cov --html --json --output-path target/llvm-cov/html/coverage.json --locked
       - name: Add badge JSON
         run: |
-          PERCENT=$(cargo +nightly llvm-cov --locked 2>&1 | grep -E 'TOTAL' | awk '{print $NF}' | tr -d '%')
+          PERCENT=$(jq -r '.data[0].totals.lines.percent | floor' target/llvm-cov/html/coverage.json)
           if [ -z "$PERCENT" ]; then PERCENT="0"; fi
           COLOR="red"
           if awk "BEGIN{exit!($PERCENT>=80)}"; then COLOR="brightgreen"
           elif awk "BEGIN{exit!($PERCENT>=60)}"; then COLOR="yellow"
           fi
-          echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${PERCENT}%\",\"color\":\"${COLOR}\"}" \
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PERCENT" "$COLOR" \
             > target/llvm-cov/html/badge.json
       # NOTE: deploy-pages replaces the entire site. If adding more pages,
       # refactor to merge artifacts from multiple workflows before deploying.
