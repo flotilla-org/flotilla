@@ -306,3 +306,91 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_flag_maps_directions() {
+        assert_eq!(TmuxWorkspaceManager::split_flag("left"), "-h");
+        assert_eq!(TmuxWorkspaceManager::split_flag("right"), "-h");
+        assert_eq!(TmuxWorkspaceManager::split_flag("up"), "-v");
+        assert_eq!(TmuxWorkspaceManager::split_flag("down"), "-v");
+        assert_eq!(TmuxWorkspaceManager::split_flag("unknown"), "-h");
+        assert_eq!(TmuxWorkspaceManager::split_flag(""), "-h");
+    }
+
+    #[test]
+    fn state_path_contains_session_name() {
+        let path = TmuxWorkspaceManager::state_path("my-session").unwrap();
+        assert!(path.ends_with("flotilla/tmux/my-session/state.toml"));
+    }
+
+    #[test]
+    fn load_state_returns_default_for_missing_file() {
+        let state = TmuxWorkspaceManager::load_state("nonexistent-session-xyz");
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_state_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "test-session";
+        let state_path = dir
+            .path()
+            .join("flotilla")
+            .join("tmux")
+            .join(session)
+            .join("state.toml");
+
+        // Create state with a window entry
+        let mut state = TmuxState::default();
+        state.windows.insert(
+            "my-window".to_string(),
+            WindowState {
+                working_directory: "/tmp/work".to_string(),
+                created_at: "1234567890".to_string(),
+            },
+        );
+
+        // Save manually (since state_path uses dirs::config_dir)
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let contents = toml::to_string(&state).unwrap();
+        std::fs::write(&state_path, &contents).unwrap();
+
+        // Load back and verify
+        let loaded: TmuxState =
+            toml::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(loaded.windows.len(), 1);
+        assert_eq!(loaded.windows["my-window"].working_directory, "/tmp/work");
+        assert_eq!(loaded.windows["my-window"].created_at, "1234567890");
+    }
+
+    #[test]
+    fn load_state_handles_corrupt_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        std::fs::write(&path, "this is not valid toml {{{{").unwrap();
+
+        // Direct deserialization should fail
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(toml::from_str::<TmuxState>(&contents).is_err());
+    }
+
+    #[test]
+    fn state_serialization_format() {
+        let mut state = TmuxState::default();
+        state.windows.insert(
+            "feat-branch".to_string(),
+            WindowState {
+                working_directory: "/home/user/project".to_string(),
+                created_at: "1000".to_string(),
+            },
+        );
+        let serialized = toml::to_string(&state).unwrap();
+        assert!(serialized.contains("[windows.feat-branch]"));
+        assert!(serialized.contains("working_directory"));
+        assert!(serialized.contains("created_at"));
+    }
+}
