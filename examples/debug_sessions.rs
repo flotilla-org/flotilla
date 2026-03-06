@@ -90,8 +90,8 @@ async fn main() {
             }
             data::TableEntry::Item(item) => {
                 println!("  [{i}] {:?} desc={:?} branch={:?} co={:?} pr={:?} ses={:?} ws={:?}",
-                    item.kind, item.description, item.branch,
-                    item.checkout_key, item.pr_key, item.session_key, item.workspace_refs);
+                    item.kind(), item.description(), item.branch(),
+                    item.checkout_key(), item.pr_key(), item.session_key(), item.workspace_refs());
             }
         }
     }

@@ -356,16 +356,16 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
 }
 
 fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths: &[u16]) -> Row<'a> {
-    let (icon, icon_color) = match item.kind {
+    let (icon, icon_color) = match item.kind() {
         WorkItemKind::Checkout => {
-            if !item.workspace_refs.is_empty() {
+            if !item.workspace_refs().is_empty() {
                 ("●", Color::Green)
             } else {
                 ("○", Color::Green)
             }
         }
         WorkItemKind::Session => {
-            let session = item.session_key.as_ref().and_then(|k| data.providers.sessions.get(k.as_str()));
+            let session = item.session_key().and_then(|k| data.providers.sessions.get(k));
             match session.map(|s| &s.status) {
                 Some(SessionStatus::Running) => ("▶", Color::Magenta),
                 Some(SessionStatus::Idle) => ("◆", Color::Magenta),
@@ -380,27 +380,27 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
     let desc_width = col_widths.get(1).copied().unwrap_or(15) as usize;
     let branch_width = col_widths.get(2).copied().unwrap_or(25) as usize;
 
-    let description = truncate(&item.description, desc_width);
+    let description = truncate(item.description(), desc_width);
 
-    let wt_indicator = if item.is_main_worktree {
+    let wt_indicator = if item.is_main_worktree() {
         "◆"
-    } else if item.checkout_key.is_some() {
+    } else if item.checkout_key().is_some() {
         "✓"
     } else {
         ""
     };
 
-    let ws_indicator = match item.workspace_refs.len() {
+    let ws_indicator = match item.workspace_refs().len() {
         0 => String::new(),
         1 => "●".to_string(),
         n => format!("{n}"),
     };
 
-    let branch = item.branch.as_deref().unwrap_or("—");
+    let branch = item.branch().unwrap_or("—");
     let branch_display = truncate(branch, branch_width);
 
-    let pr_display = if let Some(ref pr_key) = item.pr_key {
-        if let Some(cr) = data.providers.change_requests.get(pr_key.as_str()) {
+    let pr_display = if let Some(pr_key) = item.pr_key() {
+        if let Some(cr) = data.providers.change_requests.get(pr_key) {
             let state_icon = match cr.status {
                 ChangeRequestStatus::Merged => "✓",
                 ChangeRequestStatus::Closed => "✗",
@@ -414,8 +414,8 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
         String::new()
     };
 
-    let session_display = if let Some(ref ses_key) = item.session_key {
-        if let Some(ses) = data.providers.sessions.get(ses_key.as_str()) {
+    let session_display = if let Some(ses_key) = item.session_key() {
+        if let Some(ses) = data.providers.sessions.get(ses_key) {
             match ses.status {
                 SessionStatus::Running => "▶".to_string(),
                 SessionStatus::Idle => "◆".to_string(),
@@ -429,14 +429,14 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
     };
 
     let issues_display = item
-        .issue_keys
+        .issue_keys()
         .iter()
         .filter_map(|k| data.providers.issues.get(k.as_str()))
         .map(|i| format!("#{}", i.id))
         .collect::<Vec<_>>()
         .join(",");
 
-    let git_display = if let Some(ref wt_key) = item.checkout_key {
+    let git_display = if let Some(wt_key) = item.checkout_key() {
         if let Some(co) = data.providers.checkouts.get(wt_key) {
             let mut s = String::new();
             if co.working_tree.as_ref().is_some_and(|w| w.modified > 0) {
@@ -504,13 +504,13 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
     let text = if let Some(item) = selected_work_item(model, ui) {
         let mut lines = Vec::new();
 
-        lines.push(format!("Description: {}", item.description));
+        lines.push(format!("Description: {}", item.description()));
 
-        if let Some(branch) = &item.branch {
+        if let Some(branch) = item.branch() {
             lines.push(format!("Branch: {}", branch));
         }
 
-        if let Some(ref wt_key) = item.checkout_key {
+        if let Some(wt_key) = item.checkout_key() {
             if let Some(co) = model.active().data.providers.checkouts.get(wt_key) {
                 lines.push(format!("Path: {}", co.path.display()));
                 if let Some(commit) = &co.last_commit {
@@ -533,15 +533,15 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        if let Some(ref pr_key) = item.pr_key {
-            if let Some(cr) = model.active().data.providers.change_requests.get(pr_key.as_str()) {
+        if let Some(pr_key) = item.pr_key() {
+            if let Some(cr) = model.active().data.providers.change_requests.get(pr_key) {
                 lines.push(format!("{} #{}: {}", model.active_labels().code_review.abbr, cr.id, cr.title));
                 lines.push(format!("State: {:?}", cr.status));
             }
         }
 
-        if let Some(ref ses_key) = item.session_key {
-            if let Some(ses) = model.active().data.providers.sessions.get(ses_key.as_str()) {
+        if let Some(ses_key) = item.session_key() {
+            if let Some(ses) = model.active().data.providers.sessions.get(ses_key) {
                 lines.push(format!("Session: {}", ses.title));
                 lines.push(format!("Status: {:?}", ses.status));
                 if let Some(ref model) = ses.model {
@@ -554,14 +554,14 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        for ws_ref in &item.workspace_refs {
+        for ws_ref in item.workspace_refs() {
             if let Some(ws) = model.active().data.providers.workspaces.get(ws_ref.as_str()) {
                 let name = if ws.name.is_empty() { &ws.ws_ref } else { &ws.name };
                 lines.push(format!("Workspace: {}", name));
             }
         }
 
-        for issue_key in &item.issue_keys {
+        for issue_key in item.issue_keys() {
             if let Some(issue) = model.active().data.providers.issues.get(issue_key.as_str()) {
                 let labels = issue.labels.join(", ");
                 lines.push(format!("Issue #{}: {} [{}]", issue.id, issue.title, labels));
@@ -591,7 +591,7 @@ fn format_correlation_key(key: &CorrelationKey) -> String {
 fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Rect) {
     let text = if let Some(item) = selected_work_item(model, ui) {
         let data = &model.active().data;
-        if let Some(group_idx) = item.correlation_group_idx {
+        if let Some(group_idx) = item.correlation_group_idx() {
             if let Some(group) = data.correlation_groups.get(group_idx) {
                 let mut lines = Vec::new();
                 lines.push(format!("Group #{} ({} items)", group_idx, group.items.len()));

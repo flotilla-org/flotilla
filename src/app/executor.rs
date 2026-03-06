@@ -38,9 +38,9 @@ pub async fn execute(cmd: Command, app: &mut App) {
             let table_idx = app.active_ui().table_view.selectable_indices.get(si).copied();
             if let Some(table_idx) = table_idx {
                 if let Some(data::TableEntry::Item(item)) = app.active_ui().table_view.table_entries.get(table_idx).cloned() {
-                    let branch = item.branch.clone().unwrap_or_default();
-                    let wt_path = item.checkout_key.clone();
-                    let pr_id = item.pr_key.clone();
+                    let branch = item.branch().unwrap_or_default().to_string();
+                    let wt_path = item.checkout_key().map(|p| p.to_path_buf());
+                    let pr_id = item.pr_key().map(|s| s.to_string());
                     let repo_root = app.model.active_repo_root().clone();
                     let info = data::fetch_delete_confirm_info(
                         &branch,

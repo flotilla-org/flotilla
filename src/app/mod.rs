@@ -406,7 +406,7 @@ impl App {
             if let TableEntry::Item(item) = entry {
                 if let Some(identity) = item.identity() {
                     if multi_selected.contains(&identity) {
-                        all_issue_keys.extend(item.issue_keys.iter().cloned());
+                        all_issue_keys.extend(item.issue_keys().iter().cloned());
                     }
                 }
             }
@@ -416,7 +416,7 @@ impl App {
         if let Some(item) = self.selected_work_item() {
             if let Some(identity) = item.identity() {
                 if !multi_selected.contains(&identity) {
-                    all_issue_keys.extend(item.issue_keys.iter().cloned());
+                    all_issue_keys.extend(item.issue_keys().iter().cloned());
                 }
             }
         }
