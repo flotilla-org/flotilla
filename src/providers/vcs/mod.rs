@@ -39,3 +39,97 @@ pub struct VcsBundle {
     pub vcs: Box<dyn Vcs>,
     pub checkout_manager: Box<dyn CheckoutManager>,
 }
+
+/// Parse the output of `git config --get-regexp 'branch\.<branch>\.flotilla\.issues\.'`
+/// into association keys. Each line has the format:
+/// `branch.<name>.flotilla.issues.<provider> id1,id2,...`
+pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
+    let mut keys = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((config_key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(provider) = config_key.rsplit_once(".issues.").map(|(_, p)| p) else {
+            continue;
+        };
+        for id in value.split(',') {
+            let id = id.trim();
+            if !id.is_empty() {
+                keys.push(AssociationKey::IssueRef(provider.to_string(), id.to_string()));
+            }
+        }
+    }
+    keys
+}
+
+/// Read issue links from git config for a specific branch.
+/// Returns empty vec if no links or on error (non-fatal).
+pub async fn read_branch_issue_links(repo_root: &Path, branch: &str) -> Vec<AssociationKey> {
+    let pattern = format!("branch\\.{}\\.flotilla\\.issues\\.", regex_escape_branch(branch));
+    let result = crate::providers::run_cmd(
+        "git",
+        &["config", "--get-regexp", &pattern],
+        repo_root,
+    )
+    .await;
+    match result {
+        Ok(output) => parse_issue_config_output(&output),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Escape special regex characters in branch names for git config --get-regexp.
+fn regex_escape_branch(branch: &str) -> String {
+    let mut escaped = String::with_capacity(branch.len());
+    for c in branch.chars() {
+        match c {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '$' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_issue_links_single_provider() {
+        let git_output = "branch.feat-x.flotilla.issues.github 123,456\n";
+        let keys = parse_issue_config_output(git_output);
+        assert_eq!(keys, vec![
+            AssociationKey::IssueRef("github".into(), "123".into()),
+            AssociationKey::IssueRef("github".into(), "456".into()),
+        ]);
+    }
+
+    #[test]
+    fn parse_issue_links_multiple_providers() {
+        let git_output = "branch.feat-x.flotilla.issues.github 42\nbranch.feat-x.flotilla.issues.linear ABC-123\n";
+        let keys = parse_issue_config_output(git_output);
+        assert_eq!(keys, vec![
+            AssociationKey::IssueRef("github".into(), "42".into()),
+            AssociationKey::IssueRef("linear".into(), "ABC-123".into()),
+        ]);
+    }
+
+    #[test]
+    fn parse_issue_links_empty() {
+        let keys = parse_issue_config_output("");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn regex_escape_branch_with_dots() {
+        assert_eq!(regex_escape_branch("feat.x"), "feat\\.x");
+        assert_eq!(regex_escape_branch("simple"), "simple");
+    }
+}
