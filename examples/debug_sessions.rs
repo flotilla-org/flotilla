@@ -2,10 +2,10 @@
 //!
 //! Run with: cargo run --example debug_sessions -- --repo-root ~/dev/reticulate
 
-use flotilla::providers::discovery::{detect_providers, first_remote_url, extract_repo_slug};
-use flotilla::providers::types::RepoCriteria;
-use flotilla::refresh::RepoRefreshHandle;
-use flotilla::data;
+use flotilla_core::providers::discovery::{detect_providers, first_remote_url, extract_repo_slug};
+use flotilla_core::providers::types::RepoCriteria;
+use flotilla_core::refresh::RepoRefreshHandle;
+use flotilla_core::data;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

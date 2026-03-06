@@ -1,12 +1,11 @@
-mod event;
-
-use flotilla::app;
-use flotilla::config;
-use flotilla::data;
-use flotilla::event_log;
-use flotilla::event_log::LevelExt;
-use flotilla::providers;
-use flotilla::ui;
+use flotilla_tui::app;
+use flotilla_tui::event;
+use flotilla_tui::event_log;
+use flotilla_tui::event_log::LevelExt;
+use flotilla_tui::ui;
+use flotilla_core::config;
+use flotilla_core::data;
+use flotilla_core::providers;
 
 use std::io::stdout;
 use std::path::PathBuf;

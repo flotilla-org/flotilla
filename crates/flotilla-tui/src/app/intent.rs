@@ -1,5 +1,5 @@
-use crate::data::{WorkItem, WorkItemKind};
-use crate::command::Command;
+use flotilla_core::data::{WorkItem, WorkItemKind};
+use flotilla_core::command::Command;
 use super::App;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub enum Intent {
 }
 
 impl Intent {
-    pub fn label(&self, labels: &crate::model::RepoLabels) -> String {
+    pub fn label(&self, labels: &flotilla_core::model::RepoLabels) -> String {
         match self {
             Intent::SwitchToWorkspace => "Switch to workspace".into(),
             Intent::CreateWorkspace => "Create workspace".into(),
@@ -49,7 +49,7 @@ impl Intent {
         }
     }
 
-    pub fn shortcut_hint(&self, labels: &crate::model::RepoLabels) -> Option<String> {
+    pub fn shortcut_hint(&self, labels: &flotilla_core::model::RepoLabels) -> Option<String> {
         match self {
             Intent::RemoveWorktree => Some(format!("d:remove {}", labels.checkouts.noun)),
             Intent::OpenPr => Some(format!("p:show {}", labels.code_review.abbr)),
@@ -103,13 +103,13 @@ impl Intent {
                 // Find issue IDs from checkout that aren't already on the PR
                 let pr_issue_ids: std::collections::HashSet<&str> = cr.association_keys.iter()
                     .map(|k| {
-                        let crate::providers::types::AssociationKey::IssueRef(_, id) = k;
+                        let flotilla_core::providers::types::AssociationKey::IssueRef(_, id) = k;
                         id.as_str()
                     })
                     .collect();
                 let missing: Vec<String> = co.association_keys.iter()
                     .filter_map(|k| {
-                        let crate::providers::types::AssociationKey::IssueRef(_, id) = k;
+                        let flotilla_core::providers::types::AssociationKey::IssueRef(_, id) = k;
                         if !pr_issue_ids.contains(id.as_str()) {
                             Some(id.clone())
                         } else {

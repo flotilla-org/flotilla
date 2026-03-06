@@ -12,10 +12,10 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppModel, Intent, ProviderStatus, TabId, UiMode, UiState};
-use crate::data::{SectionHeader, TableEntry, WorkItem, WorkItemKind};
+use flotilla_core::data::{SectionHeader, TableEntry, WorkItem, WorkItemKind};
 use crate::event_log::{self, LevelExt};
-use crate::providers::correlation::ItemKind as CorItemKind;
-use crate::providers::types::{ChangeRequestStatus, CorrelationKey, SessionStatus};
+use flotilla_core::providers::correlation::ItemKind as CorItemKind;
+use flotilla_core::providers::types::{ChangeRequestStatus, CorrelationKey, SessionStatus};
 
 pub fn render(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
     let chunks = Layout::default()
@@ -355,7 +355,7 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
-fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths: &[u16]) -> Row<'a> {
+fn build_item_row<'a>(item: &WorkItem, data: &flotilla_core::data::DataStore, col_widths: &[u16]) -> Row<'a> {
     let (icon, icon_color) = match item.kind() {
         WorkItemKind::Checkout => {
             if !item.workspace_refs().is_empty() {

@@ -6,13 +6,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler as InputEventHandler;
 
-use crate::data::{TableEntry, WorkItem};
+use flotilla_core::data::{TableEntry, WorkItem};
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub use crate::command::{Command, CommandQueue};
+pub use flotilla_core::command::{Command, CommandQueue};
 pub use intent::Intent;
-pub use crate::model::{AppModel, ProviderStatus};
+pub use flotilla_core::model::{AppModel, ProviderStatus};
 pub use ui_state::{DirEntry, TabId, UiMode, UiState, RepoUiState};
 
 pub struct App {
@@ -212,12 +212,12 @@ impl App {
             KeyCode::Char(']') => self.next_tab(),
             KeyCode::Char('{') => {
                 if !self.ui.mode.is_config() && self.move_tab(-1) {
-                    crate::config::save_tab_order(&self.model.repo_order);
+                    flotilla_core::config::save_tab_order(&self.model.repo_order);
                 }
             }
             KeyCode::Char('}') => {
                 if !self.ui.mode.is_config() && self.move_tab(1) {
-                    crate::config::save_tab_order(&self.model.repo_order);
+                    flotilla_core::config::save_tab_order(&self.model.repo_order);
                 }
             }
             KeyCode::Char('c') => {

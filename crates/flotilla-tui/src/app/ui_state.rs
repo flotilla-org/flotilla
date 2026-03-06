@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use tui_input::Input;
 
-use crate::data::{DeleteConfirmInfo, TableView, WorkItemIdentity};
+use flotilla_core::data::{DeleteConfirmInfo, TableView, WorkItemIdentity};
 use super::intent::Intent;
 
 #[derive(Clone)]

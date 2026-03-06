@@ -1089,6 +1089,7 @@ version = "0.1.0"
 dependencies = [
  "color-eyre",
  "crossterm 0.28.1",
+ "dirs",
  "flotilla-core",
  "flotilla-protocol",
  "futures",

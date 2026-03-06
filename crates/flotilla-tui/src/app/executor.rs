@@ -1,9 +1,9 @@
 use tracing::{info, debug, error};
 
-use crate::data;
-use crate::config;
-use crate::providers;
-use crate::command::Command;
+use flotilla_core::data;
+use flotilla_core::config;
+use flotilla_core::providers;
+use flotilla_core::command::Command;
 use super::ui_state::UiMode;
 use super::App;
 
@@ -263,7 +263,7 @@ pub fn workspace_config(
     name: &str,
     working_dir: &std::path::Path,
     main_command: &str,
-) -> crate::providers::types::WorkspaceConfig {
+) -> flotilla_core::providers::types::WorkspaceConfig {
     let tmpl_path = repo_root.join(".flotilla/workspace.yaml");
     let template_yaml = std::fs::read_to_string(&tmpl_path).ok().or_else(|| {
         let global_path = dirs::home_dir()?.join(".config/flotilla/workspace.yaml");
@@ -271,7 +271,7 @@ pub fn workspace_config(
     });
     let mut template_vars = std::collections::HashMap::new();
     template_vars.insert("main_command".to_string(), main_command.to_string());
-    crate::providers::types::WorkspaceConfig {
+    flotilla_core::providers::types::WorkspaceConfig {
         name: name.to_string(),
         working_directory: working_dir.to_path_buf(),
         template_vars,
@@ -295,7 +295,7 @@ async fn write_branch_issue_links(repo_root: &std::path::Path, branch: &str, iss
     for (provider, ids) in by_provider {
         let key = format!("branch.{branch}.flotilla.issues.{provider}");
         let value = ids.join(",");
-        if let Err(e) = crate::providers::run_cmd("git", &["config", &key, &value], repo_root).await {
+        if let Err(e) = flotilla_core::providers::run_cmd("git", &["config", &key, &value], repo_root).await {
             tracing::warn!("failed to write issue link: {e}");
         }
     }
