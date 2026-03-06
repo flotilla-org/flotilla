@@ -72,6 +72,7 @@ impl Intent {
                 item.branch.as_ref().map(|branch| Command::CreateWorktree {
                     branch: branch.clone(),
                     create_branch: item.kind != WorkItemKind::RemoteBranch && item.kind != WorkItemKind::Pr,
+                    issue_ids: Vec::new(),
                 })
             }
             Intent::GenerateBranchName => {

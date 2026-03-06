@@ -4,7 +4,7 @@ use std::path::PathBuf;
 pub enum Command {
     SwitchWorktree(usize),
     SelectWorkspace(String),
-    CreateWorktree { branch: String, create_branch: bool },
+    CreateWorktree { branch: String, create_branch: bool, issue_ids: Vec<(String, String)> },
     FetchDeleteInfo(usize),
     ConfirmDelete,
     OpenPr(String),

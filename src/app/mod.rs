@@ -23,6 +23,7 @@ pub struct App {
     pub ui: UiState,
     pub commands: CommandQueue,
     pub should_quit: bool,
+    pub pending_issue_ids: Vec<(String, String)>,
 }
 
 impl App {
@@ -34,6 +35,7 @@ impl App {
             ui,
             commands: Default::default(),
             should_quit: false,
+            pending_issue_ids: Vec::new(),
         }
     }
 
@@ -511,7 +513,8 @@ impl App {
                 return;
             };
             if !branch.is_empty() {
-                self.commands.push(Command::CreateWorktree { branch, create_branch: true });
+                let issue_ids = std::mem::take(&mut self.pending_issue_ids);
+                self.commands.push(Command::CreateWorktree { branch, create_branch: true, issue_ids });
             }
             self.ui.mode = UiMode::Normal;
             return;
