@@ -3,7 +3,7 @@
 //! This module is the serialization boundary between the rich in-process
 //! core types and the flat, serde-friendly protocol types.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use flotilla_protocol::{
     ProtoCheckoutRef, ProtoError, ProtoWorkItem, ProtoWorkItemIdentity, ProtoWorkItemKind,
@@ -71,10 +71,10 @@ pub fn error_to_proto(error: &ProviderError) -> ProtoError {
     }
 }
 
-pub fn snapshot_to_proto(repo: &PathBuf, seq: u64, refresh: &RefreshSnapshot) -> Snapshot {
+pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot) -> Snapshot {
     Snapshot {
         seq,
-        repo: repo.clone(),
+        repo: repo.to_path_buf(),
         work_items: refresh.work_items.iter().map(work_item_to_proto).collect(),
         provider_health: refresh
             .provider_health

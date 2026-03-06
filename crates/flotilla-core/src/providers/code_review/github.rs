@@ -208,8 +208,6 @@ impl super::CodeReview for GitHubCodeReview {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn parse_rest_api_pr_fields() {
         let json = r#"{

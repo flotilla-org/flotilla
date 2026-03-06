@@ -127,7 +127,7 @@ impl DaemonHandle for InProcessDaemon {
         let state = repos
             .get(repo)
             .ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-        let snapshot = snapshot_to_proto(&repo.to_path_buf(), state.seq, &state.last_snapshot);
+        let snapshot = snapshot_to_proto(repo, state.seq, &state.last_snapshot);
         Ok(snapshot)
     }
 

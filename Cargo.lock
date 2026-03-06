@@ -1017,33 +1017,17 @@ dependencies = [
 name = "flotilla"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "clap",
  "color-eyre",
  "crossterm 0.28.1",
- "dirs",
  "flotilla-core",
- "flotilla-daemon",
- "flotilla-protocol",
  "flotilla-tui",
- "futures",
  "image",
- "indexmap",
- "minijinja",
  "ratatui 0.30.0",
  "ratatui-image",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "time",
  "tokio",
- "toml",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
  "tui-input",
- "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -1069,11 +1053,6 @@ dependencies = [
 [[package]]
 name = "flotilla-daemon"
 version = "0.1.0"
-dependencies = [
- "flotilla-core",
- "flotilla-protocol",
- "tokio",
-]
 
 [[package]]
 name = "flotilla-protocol"
@@ -1096,8 +1075,6 @@ dependencies = [
  "image",
  "ratatui 0.30.0",
  "ratatui-image",
- "serde",
- "serde_json",
  "time",
  "tokio",
  "tracing",

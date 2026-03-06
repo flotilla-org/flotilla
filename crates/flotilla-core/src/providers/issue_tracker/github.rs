@@ -84,8 +84,6 @@ impl super::IssueTracker for GitHubIssueTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn parse_rest_api_issues_filters_pull_requests() {
         let json = r#"[

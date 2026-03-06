@@ -4,6 +4,3 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-flotilla-core = { path = "../flotilla-core" }
-flotilla-protocol = { path = "../flotilla-protocol" }
-tokio = { workspace = true }
