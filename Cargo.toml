@@ -1,25 +1,47 @@
+[workspace]
+members = [
+    "crates/flotilla-core",
+    "crates/flotilla-protocol",
+    "crates/flotilla-daemon",
+    "crates/flotilla-tui",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1.44"
+indexmap = "2"
+color-eyre = "0.6"
+
 [package]
 name = "flotilla"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+flotilla-core = { path = "crates/flotilla-core" }
+flotilla-protocol = { path = "crates/flotilla-protocol" }
+flotilla-daemon = { path = "crates/flotilla-daemon" }
+flotilla-tui = { path = "crates/flotilla-tui" }
 ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true }
 futures = "0.3"
-color-eyre = "0.6"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 tui-input = "0.10"
 dirs = "6"
 toml = "0.8"
 minijinja = "2"
-async-trait = "0.1"
-indexmap = "2"
-tracing = "0.1.44"
+async-trait = { workspace = true }
+indexmap = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = "0.3.22"
 tracing-appender = "0.2.4"
 time = { version = "0.3.47", features = ["local-offset"] }

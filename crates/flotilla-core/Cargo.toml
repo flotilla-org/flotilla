@@ -1,0 +1,19 @@
+[package]
+name = "flotilla-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+indexmap = { workspace = true }
+color-eyre = { workspace = true }
+dirs = "6"
+toml = "0.8"
+reqwest = { version = "0.13.2", features = ["json"] }
+minijinja = "2"
+serde_yaml = "0.9"
