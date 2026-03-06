@@ -99,7 +99,7 @@ impl Intent {
             Intent::LinkIssuesToPr => {
                 let pr_key = item.pr_key()?;
                 let co_key = item.checkout_key()?;
-                let data = &app.model.active().data.providers;
+                let data = &app.model.active().providers;
                 let cr = data.change_requests.get(pr_key)?;
                 let co = data.checkouts.get(co_key)?;
 

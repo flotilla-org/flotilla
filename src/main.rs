@@ -58,7 +58,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
 
     // Mark all repos as loading so ⟳ shows on first render
     for rm in app.model.repos.values_mut() {
-        rm.data.loading = true;
+        rm.loading = true;
     }
 
     let mut events = event::EventHandler::new(Duration::from_millis(250));
@@ -216,12 +216,12 @@ fn drain_snapshots(app: &mut app::App) {
 
         let snapshot = handle.snapshot_rx.borrow_and_update().clone();
 
-        let old_providers = std::mem::replace(&mut rm.data.providers, Arc::clone(&snapshot.providers));
-        // Apply snapshot to DataStore
-        rm.data.correlation_groups = snapshot.correlation_groups.clone();
-        rm.data.provider_health = snapshot.provider_health.clone();
+        let old_providers = std::mem::replace(&mut rm.providers, Arc::clone(&snapshot.providers));
+        // Apply snapshot to RepoModel
+        rm.correlation_groups = snapshot.correlation_groups.clone();
+        rm.provider_health = snapshot.provider_health.clone();
 
-        rm.data.loading = false;
+        rm.loading = false;
 
         // Build table view (needs section labels from registry)
         let section_labels = data::SectionLabels {
@@ -238,12 +238,12 @@ fn drain_snapshots(app: &mut app::App) {
             e.category == "issues" && e.message.contains("has disabled issues")
         );
         if issues_disabled {
-            rm.data.provider_health.remove("issue_tracker");
+            rm.provider_health.remove("issue_tracker");
             handle.skip_issues.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Provider health -> model-level statuses
-        for (kind, healthy) in &rm.data.provider_health {
+        for (kind, healthy) in &rm.provider_health {
             let provider_name = match *kind {
                 "coding_agent" => rm.registry.coding_agents.keys().next(),
                 "code_review" => rm.registry.code_review.keys().next(),
@@ -258,7 +258,7 @@ fn drain_snapshots(app: &mut app::App) {
         }
 
         // Change detection badge for inactive tabs — only if data actually changed
-        if i != *active_repo && *old_providers != *rm.data.providers {
+        if i != *active_repo && *old_providers != *rm.providers {
             if let Some(rui) = ui.repo_ui.get_mut(path) {
                 rui.has_unseen_changes = true;
             }
@@ -275,6 +275,7 @@ fn drain_snapshots(app: &mut app::App) {
                 });
 
             rui.table_view = table_view;
+            *rui.table_state.offset_mut() = 0;
 
             // Restore selection by identity
             if rui.table_view.selectable_indices.is_empty() {

@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::provider_data::ProviderData;
 use crate::providers::correlation::{self, CorrelatedItem, CorrelatedGroup, ItemKind as CorItemKind, ProviderItemKey};
@@ -207,15 +206,6 @@ impl WorkItem {
 pub struct TableView {
     pub table_entries: Vec<TableEntry>,
     pub selectable_indices: Vec<usize>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct DataStore {
-    pub providers: Arc<ProviderData>,
-    pub loading: bool,
-    /// Set from the latest background refresh snapshot, for debug display.
-    pub correlation_groups: Vec<CorrelatedGroup>,
-    pub provider_health: HashMap<&'static str, bool>,
 }
 
 pub struct SectionLabels {

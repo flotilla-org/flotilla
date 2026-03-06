@@ -20,7 +20,7 @@ Provider-based plugin system with data correlation:
 
 ```
 Providers (git, wt, github, claude, cmux)
-  → DataStore (raw: checkouts, PRs, issues, sessions)
+  → RepoModel (providers, health, correlation groups)
     → Correlation engine (union-find groups items by shared keys)
       → WorkItems (correlated work units)
         → UI (ratatui table + tabs)
@@ -47,7 +47,7 @@ User actions flow: **Intent → Command → Executor → Provider call → Refre
 | `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` implementation |
 | `crates/flotilla-core/src/executor.rs` | Executes commands against providers, returns `CommandResult` |
 | `crates/flotilla-core/src/model.rs` | `AppModel` (repos, labels), `RepoModel` (per-repo data) |
-| `crates/flotilla-core/src/data.rs` | `DataStore`, `WorkItem`, `TableEntry`, correlation + table building |
+| `crates/flotilla-core/src/data.rs` | `WorkItem`, `TableEntry`, correlation + table building |
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
 | `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry, discovery, correlation |
 | `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |

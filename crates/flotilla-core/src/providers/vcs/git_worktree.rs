@@ -258,6 +258,8 @@ impl super::CheckoutManager for GitCheckoutManager {
         .await
         .is_ok();
 
+        let default_branch = Self::default_branch(repo_root).await;
+
         if branch_exists {
             run_cmd(
                 "git",
@@ -266,16 +268,14 @@ impl super::CheckoutManager for GitCheckoutManager {
             )
             .await?;
         } else {
-            // New branch bases from HEAD of the main worktree
+            // Base new branch from the default branch, not HEAD of the main worktree
             run_cmd(
                 "git",
-                &["worktree", "add", "-b", branch, wt_str],
+                &["worktree", "add", "-b", branch, wt_str, &default_branch],
                 repo_root,
             )
             .await?;
         }
-
-        let default_branch = Self::default_branch(repo_root).await;
         let is_trunk = branch == default_branch;
         Ok(Self::enrich_checkout(&wt_path, branch, is_trunk, &default_branch).await)
     }

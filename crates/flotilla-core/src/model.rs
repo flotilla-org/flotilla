@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::data::DataStore;
+use crate::provider_data::ProviderData;
+use crate::providers::correlation::CorrelatedGroup;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::RepoCriteria;
 use crate::refresh::RepoRefreshHandle;
@@ -100,14 +101,24 @@ pub struct AppModel {
 
 impl AppModel {
     pub async fn new(repo_paths: Vec<PathBuf>) -> Self {
-        let mut repos = HashMap::new();
+        // Deduplicate while preserving order
         let mut order = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for path in repo_paths {
-            if !repos.contains_key(&path) {
-                repos.insert(path.clone(), Self::build_repo_model(path.clone()).await);
+            if seen.insert(path.clone()) {
                 order.push(path);
             }
         }
+
+        // Detect providers for all repos in parallel
+        let futures: Vec<_> = order
+            .iter()
+            .map(|path| Self::build_repo_model(path.clone()))
+            .collect();
+        let models = futures::future::join_all(futures).await;
+
+        let repos = order.iter().cloned().zip(models).collect();
+
         Self {
             repos,
             repo_order: order,
@@ -154,7 +165,10 @@ impl AppModel {
 /// Domain data for a single repository — no UI concerns.
 pub struct RepoModel {
     pub registry: Arc<ProviderRegistry>,
-    pub data: DataStore,
+    pub providers: Arc<ProviderData>,
+    pub loading: bool,
+    pub correlation_groups: Vec<CorrelatedGroup>,
+    pub provider_health: HashMap<&'static str, bool>,
     pub labels: RepoLabels,
     pub refresh_handle: RepoRefreshHandle,
 }
@@ -172,7 +186,10 @@ impl RepoModel {
         );
         Self {
             registry,
-            data: DataStore::default(),
+            providers: Arc::default(),
+            loading: false,
+            correlation_groups: Vec::new(),
+            provider_health: HashMap::new(),
             labels,
             refresh_handle,
         }

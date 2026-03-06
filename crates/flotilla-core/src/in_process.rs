@@ -46,7 +46,7 @@ impl InProcessDaemon {
             }
             let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
-            model.data.loading = true;
+            model.loading = true;
             repos.insert(
                 path.clone(),
                 RepoState {
@@ -84,11 +84,11 @@ impl InProcessDaemon {
 
             let snapshot = handle.snapshot_rx.borrow_and_update().clone();
 
-            // Update the model's DataStore with the new provider data
-            state.model.data.providers = Arc::clone(&snapshot.providers);
-            state.model.data.correlation_groups = snapshot.correlation_groups.clone();
-            state.model.data.provider_health = snapshot.provider_health.clone();
-            state.model.data.loading = false;
+            // Update the model with the new provider data
+            state.model.providers = Arc::clone(&snapshot.providers);
+            state.model.correlation_groups = snapshot.correlation_groups.clone();
+            state.model.provider_health = snapshot.provider_health.clone();
+            state.model.loading = false;
 
             // Handle issues_disabled — tell the background task to stop querying,
             // and suppress from provider health display
@@ -97,7 +97,7 @@ impl InProcessDaemon {
                 .iter()
                 .any(|e| e.category == "issues" && e.message.contains("has disabled issues"));
             if issues_disabled {
-                state.model.data.provider_health.remove("issue_tracker");
+                state.model.provider_health.remove("issue_tracker");
                 handle
                     .skip_issues
                     .store(true, Ordering::Relaxed);
@@ -141,12 +141,11 @@ impl DaemonHandle for InProcessDaemon {
                     name: AppModel::repo_name(path),
                     provider_health: state
                         .model
-                        .data
                         .provider_health
                         .iter()
                         .map(|(k, v)| (k.to_string(), *v))
                         .collect(),
-                    loading: state.model.data.loading,
+                    loading: state.model.loading,
                 });
             }
         }
@@ -162,7 +161,7 @@ impl DaemonHandle for InProcessDaemon {
                 .ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             (
                 Arc::clone(&state.model.registry),
-                Arc::clone(&state.model.data.providers),
+                Arc::clone(&state.model.providers),
                 repo.to_path_buf(),
             )
         };
@@ -203,13 +202,12 @@ impl DaemonHandle for InProcessDaemon {
         // Create the model outside the lock (spawns provider detection and refresh)
         let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
-        model.data.loading = true;
+        model.loading = true;
 
         let repo_info = RepoInfo {
             path: path.clone(),
             name: AppModel::repo_name(&path),
             provider_health: model
-                .data
                 .provider_health
                 .iter()
                 .map(|(k, v)| (k.to_string(), *v))
