@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use async_trait::async_trait;
 use crate::providers::types::*;
-use crate::providers::github_api::GhApiClient;
+use crate::providers::github_api::{GhApiClient, clamp_per_page};
 
 pub struct GitHubCodeReview {
     provider_name: String,
@@ -114,9 +114,10 @@ impl super::CodeReview for GitHubCodeReview {
         repo_root: &Path,
         limit: usize,
     ) -> Result<Vec<ChangeRequest>, String> {
+        let per_page = clamp_per_page(limit);
         let endpoint = format!(
             "repos/{}/pulls?state=open&per_page={}",
-            self.repo_slug, limit
+            self.repo_slug, per_page
         );
         let body = self.api.get(&endpoint, repo_root).await?;
         let items: Vec<serde_json::Value> =
@@ -188,9 +189,10 @@ impl super::CodeReview for GitHubCodeReview {
         repo_root: &Path,
         limit: usize,
     ) -> Result<Vec<String>, String> {
+        let per_page = clamp_per_page(limit);
         let endpoint = format!(
             "repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}",
-            self.repo_slug, limit
+            self.repo_slug, per_page
         );
         let body = self.api.get(&endpoint, repo_root).await?;
         let items: Vec<serde_json::Value> =

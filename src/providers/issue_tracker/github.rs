@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use async_trait::async_trait;
 use crate::providers::types::*;
-use crate::providers::github_api::GhApiClient;
+use crate::providers::github_api::{GhApiClient, clamp_per_page};
 use crate::providers::run_cmd;
 
 pub struct GitHubIssueTracker {
@@ -28,9 +28,10 @@ impl super::IssueTracker for GitHubIssueTracker {
         repo_root: &Path,
         limit: usize,
     ) -> Result<Vec<Issue>, String> {
+        let per_page = clamp_per_page(limit);
         let endpoint = format!(
             "repos/{}/issues?state=open&per_page={}",
-            self.repo_slug, limit
+            self.repo_slug, per_page
         );
         let body = self.api.get(&endpoint, repo_root).await?;
         let items: Vec<serde_json::Value> =

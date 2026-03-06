@@ -2,6 +2,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+const MAX_PER_PAGE: usize = 100;
+
+/// Clamp a limit to GitHub's max per_page (100), warning if truncated.
+pub(crate) fn clamp_per_page(limit: usize) -> usize {
+    if limit > MAX_PER_PAGE {
+        tracing::warn!("GitHub API per_page capped at {MAX_PER_PAGE} (requested {limit})");
+        MAX_PER_PAGE
+    } else {
+        limit
+    }
+}
+
 /// Parsed response from `gh api --include`.
 pub(crate) struct GhApiResponse {
     pub status: u16,
