@@ -12,7 +12,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppModel, Intent, ProviderStatus, TabId, UiMode, UiState};
-use flotilla_core::data::{CorrelationResult, SectionHeader, TableEntry, WorkItemKind};
+use flotilla_core::data::{CorrelationResult, SectionHeader, GroupEntry, WorkItemKind};
 use crate::event_log::{self, LevelExt};
 use flotilla_core::providers::correlation::ItemKind as CorItemKind;
 use flotilla_core::providers::types::{ChangeRequestStatus, CorrelationKey, SessionStatus};
@@ -99,8 +99,8 @@ fn selected_work_item<'a>(model: &AppModel, ui: &'a UiState) -> Option<&'a Corre
     let rui = active_rui(model, ui);
     let table_idx = rui.table_state.selected()?;
     match rui.table_view.table_entries.get(table_idx)? {
-        TableEntry::Item(item) => Some(item),
-        TableEntry::Header(_) => None,
+        GroupEntry::Item(item) => Some(item),
+        GroupEntry::Header(_) => None,
     }
 }
 
@@ -302,15 +302,15 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
         .table_entries
         .iter()
         .map(|entry| {
-            let is_multi_selected = if let TableEntry::Item(ref item) = entry {
+            let is_multi_selected = if let GroupEntry::Item(ref item) = entry {
                 rui.multi_selected.contains(&item.identity())
             } else {
                 false
             };
 
             match entry {
-                TableEntry::Header(header) => build_header_row(header),
-                TableEntry::Item(item) => {
+                GroupEntry::Header(header) => build_header_row(header),
+                GroupEntry::Item(item) => {
                     let mut row = build_item_row(item, &rm.data, &col_widths);
                     if is_multi_selected {
                         row = row.style(Style::default().bg(Color::Indexed(236)));

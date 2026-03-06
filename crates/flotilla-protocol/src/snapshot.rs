@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,12 @@ pub struct WorkItem {
     pub issue_keys: Vec<String>,
     pub workspace_refs: Vec<String>,
     pub is_main_worktree: bool,
+}
+
+impl WorkItem {
+    pub fn checkout_key(&self) -> Option<&Path> {
+        self.checkout.as_ref().map(|co| co.key.as_path())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

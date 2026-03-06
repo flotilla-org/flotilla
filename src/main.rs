@@ -230,7 +230,7 @@ fn drain_snapshots(app: &mut app::App) {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.sessions.section.clone(),
         };
-        let table_view = data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
+        let table_view = data::group_work_items(&snapshot.work_items, &snapshot.providers, &section_labels);
 
         // Handle issues_disabled — tell the background task to stop querying,
         // and suppress from provider health display
@@ -270,7 +270,7 @@ fn drain_snapshots(app: &mut app::App) {
             let prev_identity = rui.selected_selectable_idx
                 .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
                 .and_then(|ti| match rui.table_view.table_entries.get(ti) {
-                    Some(data::TableEntry::Item(item)) => Some(item.identity()),
+                    Some(data::GroupEntry::Item(item)) => Some(item.identity()),
                     _ => None,
                 });
 
@@ -284,7 +284,7 @@ fn drain_snapshots(app: &mut app::App) {
                 let found = rui.table_view.selectable_indices.iter().enumerate().find(|(_, &ti)| {
                     matches!(
                         rui.table_view.table_entries.get(ti),
-                        Some(data::TableEntry::Item(item)) if item.identity() == *identity
+                        Some(data::GroupEntry::Item(item)) if item.identity() == *identity
                     )
                 });
                 if let Some((si, &ti)) = found {
@@ -303,7 +303,7 @@ fn drain_snapshots(app: &mut app::App) {
             // Clean up stale multi-select identities
             let current_identities: std::collections::HashSet<data::WorkItemIdentity> = rui.table_view.table_entries.iter()
                 .filter_map(|e| match e {
-                    data::TableEntry::Item(item) => Some(item.identity()),
+                    data::GroupEntry::Item(item) => Some(item.identity()),
                     _ => None,
                 })
                 .collect();

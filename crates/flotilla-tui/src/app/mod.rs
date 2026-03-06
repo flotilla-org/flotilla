@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler as InputEventHandler;
 
-use flotilla_core::data::{CorrelationResult, TableEntry};
+use flotilla_core::data::{CorrelationResult, GroupEntry};
 use flotilla_protocol::Command;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -63,8 +63,8 @@ impl App {
     pub fn selected_work_item(&self) -> Option<&CorrelationResult> {
         let table_idx = self.active_ui().table_state.selected()?;
         match self.active_ui().table_view.table_entries.get(table_idx)? {
-            TableEntry::Item(item) => Some(item),
-            TableEntry::Header(_) => None,
+            GroupEntry::Item(item) => Some(item),
+            GroupEntry::Header(_) => None,
         }
     }
 
@@ -382,7 +382,7 @@ impl App {
     fn toggle_multi_select(&mut self) {
         if let Some(si) = self.active_ui().selected_selectable_idx {
             if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
-                if let Some(TableEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
+                if let Some(GroupEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
                     let identity = item.identity();
                     let rui = self.active_ui_mut();
                     if !rui.multi_selected.remove(&identity) {
@@ -417,7 +417,7 @@ impl App {
 
         // Collect issues from multi-selected items
         for entry in &self.active_ui().table_view.table_entries {
-            if let TableEntry::Item(item) = entry {
+            if let GroupEntry::Item(item) = entry {
                 if multi_selected.contains(&item.identity()) {
                     all_issue_keys.extend(item.issue_keys().iter().cloned());
                 }

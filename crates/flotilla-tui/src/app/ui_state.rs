@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use tui_input::Input;
 
-use flotilla_core::data::{TableView, WorkItemIdentity};
+use flotilla_core::data::{GroupedWorkItems, WorkItemIdentity};
 use flotilla_protocol::DeleteInfo;
 use super::intent::Intent;
 
@@ -54,7 +54,7 @@ impl UiMode {
 /// Per-repo UI state (selection, table widget state, visual flags).
 #[derive(Default)]
 pub struct RepoUiState {
-    pub table_view: TableView,
+    pub table_view: GroupedWorkItems,
     pub table_state: TableState,
     pub selected_selectable_idx: Option<usize>,
     pub has_unseen_changes: bool,

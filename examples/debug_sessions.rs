@@ -81,13 +81,13 @@ async fn main() {
     // Step 3: Show resulting table entries
     println!("\n=== Step 3: Table entries after correlate() ===");
     let section_labels = data::SectionLabels::default();
-    let table_view = data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
+    let table_view = data::group_work_items(&snapshot.work_items, &snapshot.providers, &section_labels);
     for (i, entry) in table_view.table_entries.iter().enumerate() {
         match entry {
-            data::TableEntry::Header(h) => {
+            data::GroupEntry::Header(h) => {
                 println!("  [{i}] HEADER: {h}");
             }
-            data::TableEntry::Item(item) => {
+            data::GroupEntry::Item(item) => {
                 println!("  [{i}] {:?} desc={:?} branch={:?} co={:?} pr={:?} ses={:?} ws={:?}",
                     item.kind(), item.description(), item.branch(),
                     item.checkout_key(), item.pr_key(), item.session_key(), item.workspace_refs());

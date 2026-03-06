@@ -33,7 +33,7 @@ impl fmt::Display for SectionHeader {
 }
 
 #[derive(Debug, Clone)]
-pub enum TableEntry {
+pub enum GroupEntry {
     Header(SectionHeader),
     Item(CorrelationResult),
 }
@@ -183,8 +183,8 @@ impl CorrelationResult {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct TableView {
-    pub table_entries: Vec<TableEntry>,
+pub struct GroupedWorkItems {
+    pub table_entries: Vec<GroupEntry>,
     pub selectable_indices: Vec<usize>,
 }
 
@@ -440,7 +440,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
 }
 
 /// Phase 4: Sort work items into sections and build table entries.
-pub fn build_table_view(work_items: &[CorrelationResult], providers: &ProviderData, labels: &SectionLabels) -> TableView {
+pub fn group_work_items(work_items: &[CorrelationResult], providers: &ProviderData, labels: &SectionLabels) -> GroupedWorkItems {
     let mut checkout_items: Vec<&CorrelationResult> = Vec::new();
     let mut session_items: Vec<&CorrelationResult> = Vec::new();
     let mut pr_items: Vec<&CorrelationResult> = Vec::new();
@@ -457,16 +457,16 @@ pub fn build_table_view(work_items: &[CorrelationResult], providers: &ProviderDa
         }
     }
 
-    let mut entries: Vec<TableEntry> = Vec::new();
+    let mut entries: Vec<GroupEntry> = Vec::new();
     let mut selectable: Vec<usize> = Vec::new();
 
     // Checkouts -- sorted by branch name ascending
     checkout_items.sort_by(|a, b| a.branch().cmp(&b.branch()));
     if !checkout_items.is_empty() {
-        entries.push(TableEntry::Header(SectionHeader(labels.checkouts.clone())));
+        entries.push(GroupEntry::Header(SectionHeader(labels.checkouts.clone())));
         for item in checkout_items {
             selectable.push(entries.len());
-            entries.push(TableEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(item.clone()));
         }
     }
 
@@ -477,10 +477,10 @@ pub fn build_table_view(work_items: &[CorrelationResult], providers: &ProviderDa
         b_time.cmp(&a_time)
     });
     if !session_items.is_empty() {
-        entries.push(TableEntry::Header(SectionHeader(labels.sessions.clone())));
+        entries.push(GroupEntry::Header(SectionHeader(labels.sessions.clone())));
         for item in session_items {
             selectable.push(entries.len());
-            entries.push(TableEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(item.clone()));
         }
     }
 
@@ -491,20 +491,20 @@ pub fn build_table_view(work_items: &[CorrelationResult], providers: &ProviderDa
         b_num.cmp(&a_num)
     });
     if !pr_items.is_empty() {
-        entries.push(TableEntry::Header(SectionHeader(labels.code_review.clone())));
+        entries.push(GroupEntry::Header(SectionHeader(labels.code_review.clone())));
         for item in pr_items {
             selectable.push(entries.len());
-            entries.push(TableEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(item.clone()));
         }
     }
 
     // Remote branches -- sorted by branch name
     remote_items.sort_by(|a, b| a.branch().cmp(&b.branch()));
     if !remote_items.is_empty() {
-        entries.push(TableEntry::Header(SectionHeader("Remote Branches".into())));
+        entries.push(GroupEntry::Header(SectionHeader("Remote Branches".into())));
         for item in remote_items {
             selectable.push(entries.len());
-            entries.push(TableEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(item.clone()));
         }
     }
 
@@ -515,14 +515,14 @@ pub fn build_table_view(work_items: &[CorrelationResult], providers: &ProviderDa
         b_num.cmp(&a_num)
     });
     if !issue_items.is_empty() {
-        entries.push(TableEntry::Header(SectionHeader(labels.issues.clone())));
+        entries.push(GroupEntry::Header(SectionHeader(labels.issues.clone())));
         for item in issue_items {
             selectable.push(entries.len());
-            entries.push(TableEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(item.clone()));
         }
     }
 
-    TableView {
+    GroupedWorkItems {
         table_entries: entries,
         selectable_indices: selectable,
     }
