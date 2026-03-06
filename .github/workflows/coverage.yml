@@ -1,0 +1,89 @@
+name: Coverage
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch: # allow manual runs
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: coverage
+  cancel-in-progress: true
+
+jobs:
+  check-changes:
+    name: Check for changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet HEAD~1 -- '**/*.rs' '**/Cargo.toml' 'Cargo.*'; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  coverage:
+    name: Generate report
+    needs: check-changes
+    if: needs.check-changes.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+      - name: Generate coverage report
+        run: cargo +nightly llvm-cov --html --json --output-path target/llvm-cov/html/coverage.json --locked
+      - name: Add badge JSON
+        run: |
+          PERCENT=$(jq -r '.data[0].totals.lines.percent | floor' target/llvm-cov/html/coverage.json)
+          if [ -z "$PERCENT" ]; then PERCENT="0"; fi
+          COLOR="red"
+          if awk "BEGIN{exit!($PERCENT>=80)}"; then COLOR="brightgreen"
+          elif awk "BEGIN{exit!($PERCENT>=60)}"; then COLOR="yellow"
+          fi
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PERCENT" "$COLOR" \
+            > target/llvm-cov/html/badge.json
+      # NOTE: deploy-pages replaces the entire site. If adding more pages,
+      # refactor to merge artifacts from multiple workflows before deploying.
+      - name: Stage under coverage/
+        run: |
+          mkdir -p _site/coverage
+          cp -r target/llvm-cov/html/* _site/coverage/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site/
+
+  deploy:
+    name: Deploy to Pages
+    needs: coverage
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

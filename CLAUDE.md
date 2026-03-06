@@ -12,7 +12,7 @@ cargo run -- --repo-root /path       # run with explicit repo
 cargo run                            # run, auto-detect repo from cwd
 ```
 
-Always typecheck (`cargo check`) and run tests before making a PR.
+Before pushing, always run `cargo fmt`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`.
 
 ## Architecture
 
