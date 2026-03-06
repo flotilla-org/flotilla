@@ -490,7 +490,11 @@ impl App {
         }
         if key.code == KeyCode::Enter {
             self.execute_menu_action();
-            self.ui.mode = UiMode::Normal;
+            // Only reset to Normal if the action didn't set a different mode
+            // (e.g. DeleteConfirm, BranchInput)
+            if matches!(self.ui.mode, UiMode::ActionMenu { .. }) {
+                self.ui.mode = UiMode::Normal;
+            }
             return;
         }
         let UiMode::ActionMenu { ref items, ref mut index } = self.ui.mode else { return; };
