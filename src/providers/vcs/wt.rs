@@ -120,10 +120,22 @@ impl super::CheckoutManager for WtCheckoutManager {
         let json = Self::strip_to_json(&output);
         let worktrees: Vec<WtWorktree> =
             serde_json::from_str(json).map_err(|e| e.to_string())?;
-        Ok(worktrees
+        let mut checkouts: Vec<Checkout> = worktrees
             .into_iter()
             .map(|wt| wt.into_checkout())
-            .collect())
+            .collect();
+
+        // Enrich with issue links from git config
+        let futures: Vec<_> = checkouts
+            .iter()
+            .map(|co| super::read_branch_issue_links(repo_root, &co.branch))
+            .collect();
+        let all_links = futures::future::join_all(futures).await;
+        for (co, links) in checkouts.iter_mut().zip(all_links) {
+            co.association_keys = links;
+        }
+
+        Ok(checkouts)
     }
 
     async fn create_checkout(
