@@ -192,6 +192,7 @@ impl ClaudeCodingAgent {
                         if !AUTH_WARNED.swap(true, Ordering::Relaxed) {
                             warn!("Claude sessions unavailable: insufficient OAuth scopes");
                         }
+                        debug!("Claude auth error detail: {e}");
                         Ok(vec![])
                     }
                     Err(e) => Err(e),
