@@ -181,16 +181,16 @@ impl WorkItem {
         }
     }
 
-    pub fn identity(&self) -> Option<WorkItemIdentity> {
+    pub fn identity(&self) -> WorkItemIdentity {
         match self {
             WorkItem::Correlated(c) => match &c.anchor {
-                CorrelatedAnchor::Checkout(co) => Some(WorkItemIdentity::Checkout(co.key.clone())),
-                CorrelatedAnchor::Pr(key) => Some(WorkItemIdentity::ChangeRequest(key.clone())),
-                CorrelatedAnchor::Session(key) => Some(WorkItemIdentity::Session(key.clone())),
+                CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(co.key.clone()),
+                CorrelatedAnchor::Pr(key) => WorkItemIdentity::ChangeRequest(key.clone()),
+                CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
             },
             WorkItem::Standalone(s) => match s {
-                StandaloneWorkItem::Issue { key, .. } => Some(WorkItemIdentity::Issue(key.clone())),
-                StandaloneWorkItem::RemoteBranch { branch } => Some(WorkItemIdentity::RemoteBranch(branch.clone())),
+                StandaloneWorkItem::Issue { key, .. } => WorkItemIdentity::Issue(key.clone()),
+                StandaloneWorkItem::RemoteBranch { branch } => WorkItemIdentity::RemoteBranch(branch.clone()),
             },
         }
     }
@@ -571,6 +571,7 @@ pub struct DeleteConfirmInfo {
     pub merge_commit_sha: Option<String>,
     pub unpushed_commits: Vec<String>,
     pub has_uncommitted: bool,
+    pub base_detection_warning: Option<String>,
 }
 
 #[cfg(test)]
@@ -592,7 +593,7 @@ mod tests {
             workspace_refs: Vec::new(),
             correlation_group_idx: 0,
         });
-        assert_eq!(wi.identity(), Some(WorkItemIdentity::Checkout(PathBuf::from("/tmp/foo"))));
+        assert_eq!(wi.identity(), WorkItemIdentity::Checkout(PathBuf::from("/tmp/foo")));
     }
 
     #[test]
@@ -607,7 +608,7 @@ mod tests {
             workspace_refs: Vec::new(),
             correlation_group_idx: 0,
         });
-        assert_eq!(wi.identity(), Some(WorkItemIdentity::ChangeRequest("42".to_string())));
+        assert_eq!(wi.identity(), WorkItemIdentity::ChangeRequest("42".to_string()));
     }
 
     #[test]
@@ -622,7 +623,7 @@ mod tests {
             workspace_refs: Vec::new(),
             correlation_group_idx: 0,
         });
-        assert_eq!(wi.identity(), Some(WorkItemIdentity::Session("sess-1".to_string())));
+        assert_eq!(wi.identity(), WorkItemIdentity::Session("sess-1".to_string()));
     }
 
     #[test]
@@ -631,7 +632,7 @@ mod tests {
             key: "7".to_string(),
             description: String::new(),
         });
-        assert_eq!(wi.identity(), Some(WorkItemIdentity::Issue("7".to_string())));
+        assert_eq!(wi.identity(), WorkItemIdentity::Issue("7".to_string()));
     }
 
     #[test]
@@ -639,7 +640,7 @@ mod tests {
         let wi = WorkItem::Standalone(StandaloneWorkItem::RemoteBranch {
             branch: "feature/x".to_string(),
         });
-        assert_eq!(wi.identity(), Some(WorkItemIdentity::RemoteBranch("feature/x".to_string())));
+        assert_eq!(wi.identity(), WorkItemIdentity::RemoteBranch("feature/x".to_string()));
     }
 
     #[test]
@@ -709,7 +710,7 @@ pub async fn fetch_delete_confirm_info(
     let repo_for_base = repo.clone();
     let branch_for_base = branch_owned.clone();
 
-    let (unpushed, uncommitted, pr_info) = tokio::join!(
+    let (unpushed_result, uncommitted, pr_info) = tokio::join!(
         async {
             let base = async {
                 let upstream = run_command(
@@ -734,18 +735,19 @@ pub async fn fetch_delete_confirm_info(
                         return Ok(rh.to_string());
                     }
                 }
-                Err("(could not determine base — unpushed status unknown)".to_string())
+                Err("Could not determine base branch — unpushed commit status unknown".to_string())
             }.await;
 
             match base {
                 Ok(base_ref) => {
-                    run_command(
+                    let log = run_command(
                         "git",
                         &["log", &format!("{base_ref}..{branch_for_base}"), "--oneline"],
                         Some(&repo_for_base),
-                    ).await.unwrap_or_default()
+                    ).await.unwrap_or_default();
+                    Ok(log)
                 }
-                Err(warning) => warning,
+                Err(warning) => Err(warning),
             }
         },
         async {
@@ -774,11 +776,18 @@ pub async fn fetch_delete_confirm_info(
         ..Default::default()
     };
 
-    info.unpushed_commits = unpushed
-        .lines()
-        .map(|l| l.to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    match unpushed_result {
+        Ok(log_output) => {
+            info.unpushed_commits = log_output
+                .lines()
+                .map(|l| l.to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+        }
+        Err(warning) => {
+            info.base_detection_warning = Some(warning);
+        }
+    }
 
     info.has_uncommitted = !uncommitted.trim().is_empty();
 

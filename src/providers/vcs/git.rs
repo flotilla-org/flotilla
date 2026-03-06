@@ -42,11 +42,28 @@ impl super::Vcs for GitVcs {
             return None;
         }
         let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-        // The repo root is the parent of the .git directory.
-        // Note: for bare repos git-common-dir IS the repo dir (e.g. foo.git),
-        // so parent() gives the containing dir, not the repo root. Not an issue
-        // since we only call this from cwd auto-detect on non-bare repos.
-        git_dir.parent().map(|p| p.to_path_buf())
+
+        // For bare repos, git-common-dir IS the repo directory itself (e.g.
+        // foo.git), so calling parent() would give the containing directory
+        // rather than the repo root.  Detect bare repos and return git_dir
+        // directly in that case.
+        let bare_output = std::process::Command::new("git")
+            .args(["rev-parse", "--is-bare-repository"])
+            .current_dir(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let is_bare = bare_output.status.success()
+            && String::from_utf8_lossy(&bare_output.stdout).trim() == "true";
+
+        if is_bare {
+            Some(git_dir)
+        } else {
+            // The repo root is the parent of the .git directory.
+            git_dir.parent().map(|p| p.to_path_buf())
+        }
     }
 
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {

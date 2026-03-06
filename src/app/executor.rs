@@ -281,9 +281,7 @@ pub fn workspace_config(
 
 /// Trigger an immediate background refresh on the active repo.
 fn trigger_active_refresh(app: &App) {
-    if let Some(handle) = &app.model.active().refresh_handle {
-        handle.trigger_refresh();
-    }
+    app.model.active().refresh_handle.trigger_refresh();
 }
 
 async fn write_branch_issue_links(repo_root: &std::path::Path, branch: &str, issue_ids: &[(String, String)]) {

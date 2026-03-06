@@ -370,11 +370,10 @@ impl App {
         if let Some(si) = self.active_ui().selected_selectable_idx {
             if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
                 if let Some(TableEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
-                    if let Some(identity) = item.identity() {
-                        let rui = self.active_ui_mut();
-                        if !rui.multi_selected.remove(&identity) {
-                            rui.multi_selected.insert(identity);
-                        }
+                    let identity = item.identity();
+                    let rui = self.active_ui_mut();
+                    if !rui.multi_selected.remove(&identity) {
+                        rui.multi_selected.insert(identity);
                     }
                 }
             }
@@ -406,20 +405,16 @@ impl App {
         // Collect issues from multi-selected items
         for entry in &self.active_ui().table_view.table_entries {
             if let TableEntry::Item(item) = entry {
-                if let Some(identity) = item.identity() {
-                    if multi_selected.contains(&identity) {
-                        all_issue_keys.extend(item.issue_keys().iter().cloned());
-                    }
+                if multi_selected.contains(&item.identity()) {
+                    all_issue_keys.extend(item.issue_keys().iter().cloned());
                 }
             }
         }
 
         // Also include current selection if not already in multi_selected
         if let Some(item) = self.selected_work_item() {
-            if let Some(identity) = item.identity() {
-                if !multi_selected.contains(&identity) {
-                    all_issue_keys.extend(item.issue_keys().iter().cloned());
-                }
+            if !multi_selected.contains(&item.identity()) {
+                all_issue_keys.extend(item.issue_keys().iter().cloned());
             }
         }
 

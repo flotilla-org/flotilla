@@ -154,7 +154,7 @@ pub struct RepoModel {
     pub registry: Arc<ProviderRegistry>,
     pub data: DataStore,
     pub labels: RepoLabels,
-    pub refresh_handle: Option<RepoRefreshHandle>,
+    pub refresh_handle: RepoRefreshHandle,
 }
 
 impl RepoModel {
@@ -174,7 +174,7 @@ impl RepoModel {
             registry,
             data: DataStore::default(),
             labels,
-            refresh_handle: Some(refresh_handle),
+            refresh_handle,
         }
     }
 }

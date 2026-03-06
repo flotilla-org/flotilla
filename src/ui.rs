@@ -303,9 +303,7 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
         .iter()
         .map(|entry| {
             let is_multi_selected = if let TableEntry::Item(ref item) = entry {
-                item.identity()
-                    .map(|id| rui.multi_selected.contains(&id))
-                    .unwrap_or(false)
+                rui.multi_selected.contains(&item.identity())
             } else {
                 false
             };
@@ -728,7 +726,12 @@ fn render_delete_confirm(model: &AppModel, ui: &UiState, frame: &mut Frame) {
             )));
         }
 
-        if !info.unpushed_commits.is_empty() {
+        if let Some(warning) = &info.base_detection_warning {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {}", warning),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if !info.unpushed_commits.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("  ⚠ {} unpushed commit(s):", info.unpushed_commits.len()),
                 Style::default().fg(Color::Red).bold(),
@@ -740,6 +743,7 @@ fn render_delete_confirm(model: &AppModel, ui: &UiState, frame: &mut Frame) {
 
         if !info.has_uncommitted
             && info.unpushed_commits.is_empty()
+            && info.base_detection_warning.is_none()
             && info.pr_status.as_deref() == Some("MERGED")
         {
             lines.push(Line::from(""));

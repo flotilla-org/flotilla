@@ -76,9 +76,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                     let is_normal = matches!(app.ui.mode, app::UiMode::Normal);
                     if k.code == crossterm::event::KeyCode::Char('r') && is_normal {
                         // Trigger immediate refresh on active repo
-                        if let Some(handle) = &app.model.active().refresh_handle {
-                            handle.trigger_refresh();
-                        }
+                        app.model.active().refresh_handle.trigger_refresh();
                     } else {
                         app.handle_key(k);
                     }
@@ -212,7 +210,7 @@ fn drain_snapshots(app: &mut app::App) {
 
     for (i, path) in repo_order.iter().enumerate() {
         let rm = repos.get_mut(path).unwrap();
-        let Some(ref mut handle) = rm.refresh_handle else { continue };
+        let handle = &mut rm.refresh_handle;
         if !handle.snapshot_rx.has_changed().unwrap_or(false) {
             continue;
         }
@@ -273,7 +271,7 @@ fn drain_snapshots(app: &mut app::App) {
             let prev_identity = rui.selected_selectable_idx
                 .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
                 .and_then(|ti| match rui.table_view.table_entries.get(ti) {
-                    Some(data::TableEntry::Item(item)) => item.identity(),
+                    Some(data::TableEntry::Item(item)) => Some(item.identity()),
                     _ => None,
                 });
 
@@ -287,7 +285,7 @@ fn drain_snapshots(app: &mut app::App) {
                 let found = rui.table_view.selectable_indices.iter().enumerate().find(|(_, &ti)| {
                     matches!(
                         rui.table_view.table_entries.get(ti),
-                        Some(data::TableEntry::Item(item)) if item.identity().as_ref() == Some(identity)
+                        Some(data::TableEntry::Item(item)) if item.identity() == *identity
                     )
                 });
                 if let Some((si, &ti)) = found {
@@ -306,7 +304,7 @@ fn drain_snapshots(app: &mut app::App) {
             // Clean up stale multi-select identities
             let current_identities: std::collections::HashSet<data::WorkItemIdentity> = rui.table_view.table_entries.iter()
                 .filter_map(|e| match e {
-                    data::TableEntry::Item(item) => item.identity(),
+                    data::TableEntry::Item(item) => Some(item.identity()),
                     _ => None,
                 })
                 .collect();

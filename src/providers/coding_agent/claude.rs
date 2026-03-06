@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use reqwest;
@@ -51,6 +52,9 @@ static AUTH_CACHE: LazyLock<Mutex<AuthCache>> = LazyLock::new(|| {
         token: None,
     })
 });
+
+/// Guard so the "sessions unavailable" warning is emitted only once per process.
+static AUTH_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ---------- API deserialization types ----------
 
@@ -185,7 +189,9 @@ impl ClaudeCodingAgent {
                 match Self::fetch_sessions_inner().await {
                     Ok(sessions) => Ok(sessions),
                     Err(e) if e.contains("authentication") => {
-                        warn!("Claude sessions unavailable: {e} (token may lack required scopes)");
+                        if !AUTH_WARNED.swap(true, Ordering::Relaxed) {
+                            warn!("Claude sessions unavailable: insufficient OAuth scopes");
+                        }
                         Ok(vec![])
                     }
                     Err(e) => Err(e),
