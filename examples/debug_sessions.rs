@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example debug_sessions -- --repo-root ~/dev/reticulate
 
-use flotilla::providers::discovery::{detect_providers, first_remote_url, extract_repo_slug};
+use flotilla::providers::discovery::detect_providers;
 use flotilla::providers::types::RepoCriteria;
 use flotilla::refresh::RepoRefreshHandle;
 use flotilla::data;
@@ -22,7 +22,7 @@ async fn main() {
 
     // Step 1: Build registry (same as app startup)
     println!("\n=== Step 1: Build ProviderRegistry ===");
-    let registry = detect_providers(&repo_root).await;
+    let (registry, repo_slug) = detect_providers(&repo_root).await;
     println!("  checkout_managers: {}", registry.checkout_managers.len());
     println!("  code_review: {}", registry.code_review.len());
     println!("  issue_trackers: {}", registry.issue_trackers.len());
@@ -32,7 +32,6 @@ async fn main() {
 
     // Step 2: Spawn background refresh and wait for first snapshot
     println!("\n=== Step 2: Background refresh ===");
-    let repo_slug = first_remote_url(&repo_root).await.and_then(|u| extract_repo_slug(&u));
     let criteria = RepoCriteria { repo_slug };
     println!("  repo_criteria: {:?}", criteria);
 

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::data::DataStore;
-use crate::providers::discovery;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::RepoCriteria;
 use crate::refresh::RepoRefreshHandle;
@@ -105,10 +104,7 @@ impl AppModel {
         let mut order = Vec::new();
         for path in repo_paths {
             if !repos.contains_key(&path) {
-                let registry = crate::providers::discovery::detect_providers(&path).await;
-                let repo_slug = discovery::first_remote_url(&path).await
-                    .and_then(|u| discovery::extract_repo_slug(&u));
-                repos.insert(path.clone(), RepoModel::new(path.clone(), registry, repo_slug));
+                repos.insert(path.clone(), Self::build_repo_model(path.clone()).await);
                 order.push(path);
             }
         }
@@ -144,12 +140,14 @@ impl AppModel {
 
     pub async fn add_repo(&mut self, path: PathBuf) {
         if !self.repos.contains_key(&path) {
-            let registry = crate::providers::discovery::detect_providers(&path).await;
-            let repo_slug = discovery::first_remote_url(&path).await
-                .and_then(|u| discovery::extract_repo_slug(&u));
-            self.repos.insert(path.clone(), RepoModel::new(path.clone(), registry, repo_slug));
+            self.repos.insert(path.clone(), Self::build_repo_model(path.clone()).await);
             self.repo_order.push(path);
         }
+    }
+
+    async fn build_repo_model(path: PathBuf) -> RepoModel {
+        let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
+        RepoModel::new(path, registry, repo_slug)
     }
 }
 

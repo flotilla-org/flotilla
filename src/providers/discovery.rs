@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use super::{command_exists, resolve_claude_path};
@@ -23,9 +24,9 @@ pub async fn first_remote_url(repo_root: &Path) -> Option<String> {
     let remotes_output = Command::new("git")
         .args(["remote"])
         .current_dir(repo_root)
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(Stdio::null())
         .output()
         .await
         .ok()?;
@@ -43,9 +44,9 @@ pub async fn first_remote_url(repo_root: &Path) -> Option<String> {
         let url_output = Command::new("git")
             .args(["remote", "get-url", remote])
             .current_dir(repo_root)
-            .stdin(std::process::Stdio::null())
+            .stdin(Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(Stdio::null())
             .output()
             .await
             .ok();
@@ -101,7 +102,7 @@ pub fn extract_repo_slug(url: &str) -> Option<String> {
 /// 4. Coding agent: check for `claude` CLI
 /// 5. AI utility: check for `claude` CLI
 /// 6. Workspace manager: check for cmux binary
-pub async fn detect_providers(repo_root: &Path) -> ProviderRegistry {
+pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<String>) {
     let mut registry = ProviderRegistry::new();
     let repo_name = repo_root
         .file_name()
@@ -156,9 +157,10 @@ pub async fn detect_providers(repo_root: &Path) -> ProviderRegistry {
 
     // 3. Remote host detection -> code review & issue tracker
     let remote_url = first_remote_url(repo_root).await;
+    let repo_slug = remote_url.as_deref().and_then(extract_repo_slug);
     if let Some(ref host) = remote_url.as_deref().and_then(detect_host_from_url) {
         if host == "github" && command_exists("gh", &["--version"]).await {
-            if let Some(slug) = remote_url.as_deref().and_then(extract_repo_slug) {
+            if let Some(slug) = repo_slug.clone() {
                 let api = Arc::new(GhApiClient::new());
                 registry.code_review.insert(
                     "github".to_string(),
@@ -227,5 +229,5 @@ pub async fn detect_providers(repo_root: &Path) -> ProviderRegistry {
         }
     }
 
-    registry
+    (registry, repo_slug)
 }
