@@ -3,7 +3,7 @@ use tracing::{info, debug, error};
 use crate::data;
 use crate::config;
 use crate::providers;
-use super::command::Command;
+use crate::command::Command;
 use super::ui_state::UiMode;
 use super::App;
 

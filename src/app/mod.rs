@@ -1,7 +1,5 @@
-pub mod command;
 pub mod executor;
 pub mod intent;
-pub mod model;
 pub mod ui_state;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -12,9 +10,9 @@ use crate::data::{TableEntry, WorkItem};
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub use command::{Command, CommandQueue};
+pub use crate::command::{Command, CommandQueue};
 pub use intent::Intent;
-pub use model::{AppModel, ProviderStatus};
+pub use crate::model::{AppModel, ProviderStatus};
 pub use ui_state::{DirEntry, TabId, UiMode, UiState, RepoUiState};
 
 pub struct App {

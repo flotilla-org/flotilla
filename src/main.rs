@@ -1,13 +1,12 @@
-mod app;
-mod data;
 mod event;
-mod event_log;
-mod provider_data;
-mod refresh;
-mod template;
-mod ui;
-mod config;
-mod providers;
+
+use flotilla::app;
+use flotilla::config;
+use flotilla::data;
+use flotilla::event_log;
+use flotilla::event_log::LevelExt;
+use flotilla::providers;
+use flotilla::ui;
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -17,7 +16,6 @@ use clap::Parser;
 use color_eyre::Result;
 use crossterm::{execute, event::{EnableMouseCapture, DisableMouseCapture}};
 use tracing::info;
-use event_log::LevelExt;
 /// Flotilla: TUI dashboard for managing development workspaces across terminal multiplexers, source code checkouts and cloud agent services.
 #[derive(Parser)]
 #[command(version)]
@@ -409,8 +407,8 @@ fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     // 3. Auto-detect from cwd — resolve to main repo root (not worktree)
     let cwd = std::env::current_dir().ok();
     if let Some(ref cwd) = cwd {
-        use crate::providers::vcs::git::GitVcs;
-        use crate::providers::vcs::Vcs;
+        use providers::vcs::git::GitVcs;
+        use providers::vcs::Vcs;
         let git = GitVcs::new();
         if let Some(repo_root) = git.resolve_repo_root(cwd) {
             if !repo_roots.contains(&repo_root) {

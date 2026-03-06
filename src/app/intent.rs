@@ -1,5 +1,5 @@
 use crate::data::{WorkItem, WorkItemKind};
-use super::command::Command;
+use crate::command::Command;
 use super::App;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub enum Intent {
 }
 
 impl Intent {
-    pub fn label(&self, labels: &super::model::RepoLabels) -> String {
+    pub fn label(&self, labels: &crate::model::RepoLabels) -> String {
         match self {
             Intent::SwitchToWorkspace => "Switch to workspace".into(),
             Intent::CreateWorkspace => "Create workspace".into(),
@@ -49,7 +49,7 @@ impl Intent {
         }
     }
 
-    pub fn shortcut_hint(&self, labels: &super::model::RepoLabels) -> Option<String> {
+    pub fn shortcut_hint(&self, labels: &crate::model::RepoLabels) -> Option<String> {
         match self {
             Intent::RemoveWorktree => Some(format!("d:remove {}", labels.checkouts.noun)),
             Intent::OpenPr => Some(format!("p:show {}", labels.code_review.abbr)),
