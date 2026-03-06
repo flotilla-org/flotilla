@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -165,10 +165,25 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         let output = Self::zellij_action(&["query-tab-names"]).await?;
         let tab_names: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
 
-        // Try to load state for enrichment
-        let state = Self::session_name()
-            .map(|s| Self::load_state(&s))
-            .unwrap_or_default();
+        // Load state for enrichment, pruning stale entries
+        let (session, mut state) = match Self::session_name() {
+            Ok(s) => {
+                let st = Self::load_state(&s);
+                (Some(s), st)
+            }
+            Err(_) => (None, ZellijState::default()),
+        };
+
+        let live_names: HashSet<&str> = tab_names.iter().copied().collect();
+        let before_len = state.tabs.len();
+        state
+            .tabs
+            .retain(|name, _| live_names.contains(name.as_str()));
+        if state.tabs.len() != before_len {
+            if let Some(ref session) = session {
+                Self::save_state(session, &state);
+            }
+        }
 
         let workspaces = tab_names
             .into_iter()
