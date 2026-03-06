@@ -28,28 +28,44 @@ Providers (git, wt, github, claude, cmux)
 
 User actions flow: **Intent → Command → Executor → Provider call → Refresh**
 
+### Crate Structure
+
+| Crate | Role |
+|-------|------|
+| `flotilla-core` | Providers, correlation, refresh, executor, config, `DaemonHandle` trait, `InProcessDaemon` |
+| `flotilla-protocol` | Serde-only types: commands, results, snapshots, events, envelope |
+| `flotilla-tui` | UI rendering, input handling, event loop, thin executor wrapper |
+| `flotilla-daemon` | Socket server (Step 2, placeholder) |
+| `flotilla` (root) | Thin `src/main.rs` entry point |
+
 ### Key Modules
 
 | Path | Role |
 |------|------|
 | `src/main.rs` | Entry point, event loop, mouse handling |
-| `src/app/mod.rs` | `App` struct, key/mouse dispatch, mode transitions |
-| `src/app/model.rs` | `AppModel` (repos, labels), `RepoModel` (per-repo data) |
-| `src/app/command.rs` | `Command` enum, `CommandQueue` |
-| `src/app/intent.rs` | `Intent` enum (available actions per work item) |
-| `src/app/executor.rs` | Executes commands against providers |
-| `src/app/ui_state.rs` | `UiState`, `TabId`, `UiMode`, per-repo UI state |
-| `src/data.rs` | `DataStore`, `WorkItem`, `TableEntry`, correlation + table building |
-| `src/ui.rs` | All ratatui rendering |
-| `src/providers/` | Provider traits, implementations, registry, discovery, correlation |
-| `src/config.rs` | Persistence to `~/.config/flotilla/` |
-| `src/template.rs` | `.flotilla/workspace.yaml` pane templates |
-| `src/event.rs` | Terminal event stream (key, mouse, tick) |
-| `src/event_log.rs` | In-app tracing log with level filtering |
+| `crates/flotilla-core/src/daemon.rs` | `DaemonHandle` trait |
+| `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` implementation |
+| `crates/flotilla-core/src/executor.rs` | Executes commands against providers, returns `CommandResult` |
+| `crates/flotilla-core/src/model.rs` | `AppModel` (repos, labels), `RepoModel` (per-repo data) |
+| `crates/flotilla-core/src/data.rs` | `DataStore`, `WorkItem`, `TableEntry`, correlation + table building |
+| `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
+| `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry, discovery, correlation |
+| `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |
+| `crates/flotilla-core/src/template.rs` | `.flotilla/workspace.yaml` pane templates |
+| `crates/flotilla-protocol/src/lib.rs` | `Message` envelope, `DaemonEvent` |
+| `crates/flotilla-protocol/src/commands.rs` | `ProtoCommand`, `CommandResult` |
+| `crates/flotilla-protocol/src/snapshot.rs` | `Snapshot`, `ProtoWorkItem`, `RepoInfo` |
+| `crates/flotilla-tui/src/app/mod.rs` | `App` struct, key/mouse dispatch, mode transitions |
+| `crates/flotilla-tui/src/app/intent.rs` | `Intent` enum, resolves to `ProtoCommand` |
+| `crates/flotilla-tui/src/app/executor.rs` | Thin executor: routes to core, interprets results into UI state |
+| `crates/flotilla-tui/src/app/ui_state.rs` | `UiState`, `TabId`, `UiMode`, per-repo UI state |
+| `crates/flotilla-tui/src/ui.rs` | All ratatui rendering |
+| `crates/flotilla-tui/src/event.rs` | Terminal event stream (key, mouse, tick) |
+| `crates/flotilla-tui/src/event_log.rs` | In-app tracing log with level filtering |
 
 ### Provider Traits
 
-Each trait lives in `src/providers/<category>/mod.rs` with implementations alongside:
+Each trait lives in `crates/flotilla-core/src/providers/<category>/mod.rs` with implementations alongside:
 
 - **Vcs** + **CheckoutManager** (`vcs/git.rs`, `vcs/wt.rs`)
 - **CodeReview** (`code_review/github.rs`)
@@ -62,7 +78,7 @@ Every provider trait has label methods: `section_label()`, `item_noun()`, `abbre
 
 ### Correlation
 
-Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `ChangeRequestRef`, `SessionRef`). Items sharing any key merge into a single `WorkItem`. Issues link post-correlation via `AssociationKey` (don't cause merges). Tests in `src/providers/correlation.rs`.
+Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `ChangeRequestRef`, `SessionRef`). Items sharing any key merge into a single `WorkItem`. Issues link post-correlation via `AssociationKey` (don't cause merges). Tests in `crates/flotilla-core/src/providers/correlation.rs`.
 
 ## Conventions
 

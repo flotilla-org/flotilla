@@ -309,9 +309,12 @@ pub async fn execute(
             }
         }
 
-        // These are handled at the daemon level, not here
+        // These are handled at the daemon level (InProcessDaemon / SocketDaemon),
+        // not by the per-repo executor. If they reach here, it's a routing bug.
         ProtoCommand::AddRepo { .. } | ProtoCommand::RemoveRepo { .. } | ProtoCommand::Refresh => {
-            CommandResult::Ok
+            CommandResult::Error {
+                message: "bug: daemon-level command reached per-repo executor".to_string(),
+            }
         }
     }
 }

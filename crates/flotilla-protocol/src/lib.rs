@@ -36,6 +36,8 @@ pub enum DaemonEvent {
     RepoAdded(RepoInfo),
     #[serde(rename = "repo_removed")]
     RepoRemoved { path: std::path::PathBuf },
+    /// Async command completion notification for socket subscribers (Step 2).
+    /// Not emitted in the in-process path where results are returned directly.
     #[serde(rename = "command_result")]
     CommandResult {
         repo: std::path::PathBuf,
