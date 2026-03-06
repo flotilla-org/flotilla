@@ -49,6 +49,7 @@ pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot) -> Sn
             .iter()
             .map(correlation_result_to_work_item)
             .collect(),
+        providers: (*refresh.providers).clone(),
         provider_health: refresh
             .provider_health
             .iter()

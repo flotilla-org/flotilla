@@ -1,9 +1,14 @@
 pub mod commands;
+pub mod provider_data;
 pub mod snapshot;
 
 use serde::{Deserialize, Serialize};
 
 pub use commands::{Command, CommandResult, DeleteInfo};
+pub use provider_data::{
+    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
+    CommitInfo, CorrelationKey, Issue, ProviderData, SessionStatus, Workspace, WorkingTreeStatus,
+};
 pub use snapshot::{
     CheckoutRef, ProviderError, RepoInfo, Snapshot, WorkItem, WorkItemIdentity, WorkItemKind,
 };
@@ -22,7 +27,7 @@ pub enum Message {
     #[serde(rename = "response")]
     Response { id: u64, result: CommandResult },
     #[serde(rename = "event")]
-    Event { event: DaemonEvent },
+    Event { event: Box<DaemonEvent> },
 }
 
 /// Events pushed from daemon to subscribed clients.
@@ -30,7 +35,7 @@ pub enum Message {
 #[serde(tag = "kind")]
 pub enum DaemonEvent {
     #[serde(rename = "snapshot")]
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     #[serde(rename = "repo_added")]
     RepoAdded(RepoInfo),
     #[serde(rename = "repo_removed")]
@@ -89,6 +94,7 @@ mod tests {
                 workspace_refs: vec![],
                 is_main_worktree: false,
             }],
+            providers: ProviderData::default(),
             provider_health: HashMap::from([
                 ("git".to_string(), true),
                 ("github".to_string(), false),
@@ -99,13 +105,14 @@ mod tests {
             }],
         };
         let msg = Message::Event {
-            event: DaemonEvent::Snapshot(snapshot),
+            event: Box::new(DaemonEvent::Snapshot(Box::new(snapshot))),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
-            Message::Event { event } => match event {
+            Message::Event { event } => match *event {
                 DaemonEvent::Snapshot(snap) => {
+                    let snap = *snap;
                     assert_eq!(snap.seq, 7);
                     assert_eq!(snap.repo, PathBuf::from("/tmp/my-repo"));
                     assert_eq!(snap.work_items.len(), 1);

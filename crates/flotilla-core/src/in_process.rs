@@ -110,7 +110,7 @@ impl InProcessDaemon {
             // Build and broadcast proto snapshot
             let proto_snapshot = snapshot_to_proto(path, state.seq, &snapshot);
             // Ignore send errors (no receivers is fine)
-            let _ = self.event_tx.send(DaemonEvent::Snapshot(proto_snapshot));
+            let _ = self.event_tx.send(DaemonEvent::Snapshot(Box::new(proto_snapshot)));
         }
     }
 }

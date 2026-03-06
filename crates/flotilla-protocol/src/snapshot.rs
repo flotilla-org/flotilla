@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider_data::ProviderData;
+
 /// Repo info for list_repos response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
@@ -18,6 +20,7 @@ pub struct Snapshot {
     pub seq: u64,
     pub repo: PathBuf,
     pub work_items: Vec<WorkItem>,
+    pub providers: ProviderData,
     pub provider_health: HashMap<String, bool>,
     pub errors: Vec<ProviderError>,
 }
