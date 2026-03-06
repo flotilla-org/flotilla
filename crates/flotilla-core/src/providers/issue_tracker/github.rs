@@ -1,9 +1,9 @@
+use crate::providers::github_api::{clamp_per_page, GhApiClient};
+use crate::providers::run_cmd;
+use crate::providers::types::*;
+use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
-use async_trait::async_trait;
-use crate::providers::types::*;
-use crate::providers::github_api::{GhApiClient, clamp_per_page};
-use crate::providers::run_cmd;
 
 pub struct GitHubIssueTracker {
     provider_name: String,
@@ -13,7 +13,11 @@ pub struct GitHubIssueTracker {
 
 impl GitHubIssueTracker {
     pub fn new(provider_name: String, repo_slug: String, api: Arc<GhApiClient>) -> Self {
-        Self { provider_name, repo_slug, api }
+        Self {
+            provider_name,
+            repo_slug,
+            api,
+        }
     }
 }
 
@@ -23,11 +27,7 @@ impl super::IssueTracker for GitHubIssueTracker {
         "GitHub Issues"
     }
 
-    async fn list_issues(
-        &self,
-        repo_root: &Path,
-        limit: usize,
-    ) -> Result<Vec<Issue>, String> {
+    async fn list_issues(&self, repo_root: &Path, limit: usize) -> Result<Vec<Issue>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!(
             "repos/{}/issues?state=open&per_page={}",
@@ -71,13 +71,8 @@ impl super::IssueTracker for GitHubIssueTracker {
             .collect())
     }
 
-    async fn open_in_browser(
-        &self,
-        repo_root: &Path,
-        id: &str,
-    ) -> Result<(), String> {
-        run_cmd("gh", &["issue", "view", id, "--web"], repo_root)
-            .await?;
+    async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
+        run_cmd("gh", &["issue", "view", id, "--web"], repo_root).await?;
         Ok(())
     }
 }

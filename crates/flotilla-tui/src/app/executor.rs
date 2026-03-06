@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use flotilla_core::config;
-use flotilla_protocol::{CommandResult, ProtoCommand};
 use super::ui_state::UiMode;
 use super::App;
+use flotilla_core::config;
+use flotilla_protocol::{CommandResult, ProtoCommand};
 
 /// Execute a single ProtoCommand against the app state.
 ///

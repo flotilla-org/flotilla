@@ -12,8 +12,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppModel, Intent, ProviderStatus, TabId, UiMode, UiState};
-use flotilla_core::data::{SectionHeader, TableEntry, WorkItem, WorkItemKind};
 use crate::event_log::{self, LevelExt};
+use flotilla_core::data::{SectionHeader, TableEntry, WorkItem, WorkItemKind};
 use flotilla_core::providers::correlation::ItemKind as CorItemKind;
 use flotilla_core::providers::types::{ChangeRequestStatus, CorrelationKey, SessionStatus};
 
@@ -48,7 +48,10 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
 
     ui.layout.tab_areas.clear();
     let flotilla_width = TabId::FLOTILLA_LABEL_WIDTH;
-    ui.layout.tab_areas.insert(TabId::Flotilla, Rect::new(area.x, area.y, flotilla_width, 1));
+    ui.layout.tab_areas.insert(
+        TabId::Flotilla,
+        Rect::new(area.x, area.y, flotilla_width, 1),
+    );
     let mut x_offset: u16 = flotilla_width;
 
     for (i, path) in model.repo_order.iter().enumerate() {
@@ -74,7 +77,10 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
         };
         spans.push(Span::styled(label, style));
 
-        ui.layout.tab_areas.insert(TabId::Repo(i), Rect::new(area.x + x_offset, area.y, label_len, 1));
+        ui.layout.tab_areas.insert(
+            TabId::Repo(i),
+            Rect::new(area.x + x_offset, area.y, label_len, 1),
+        );
         x_offset += label_len;
     }
 
@@ -84,7 +90,9 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
     x_offset += 3;
     let add_label = Span::styled("[+]", Style::default().fg(Color::Green));
     spans.push(add_label);
-    ui.layout.tab_areas.insert(TabId::Add, Rect::new(area.x + x_offset, area.y, 3, 1));
+    ui.layout
+        .tab_areas
+        .insert(TabId::Add, Rect::new(area.x + x_offset, area.y, 3, 1));
 
     let line = Line::from(spans);
     let title = Paragraph::new(line);
@@ -116,8 +124,12 @@ fn render_status_bar(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Re
 
     let text: String = match &ui.mode {
         UiMode::Config => " j/k:scroll log  [/]:switch tab  ?:help  q:quit".into(),
-        UiMode::BranchInput { generating: true, .. } => " Generating branch name...".into(),
-        UiMode::BranchInput { generating: false, .. } => " type branch name  enter:create  esc:cancel".into(),
+        UiMode::BranchInput {
+            generating: true, ..
+        } => " Generating branch name...".into(),
+        UiMode::BranchInput {
+            generating: false, ..
+        } => " type branch name  enter:create  esc:cancel".into(),
         UiMode::ActionMenu { .. } => " j/k:navigate  enter:select  esc:close".into(),
         UiMode::FilePicker { .. } => " j/k:navigate  tab:complete  enter:select  esc:cancel".into(),
         UiMode::DeleteConfirm { .. } => " y/enter:confirm  n/esc:cancel".into(),
@@ -174,49 +186,72 @@ fn render_repo_providers(model: &AppModel, _ui: &UiState, frame: &mut Frame, are
     let categories: Vec<(&str, Option<String>, Option<ProviderStatus>)> = vec![
         (
             "VCS",
-            reg.vcs.values().next().map(|v| v.display_name().to_string()),
+            reg.vcs
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string()),
             None,
         ),
         (
             "Checkout mgr",
-            reg.checkout_managers.values().next().map(|v| v.display_name().to_string()),
+            reg.checkout_managers
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string()),
             None,
         ),
         (
             "Code review",
-            reg.code_review.values().next().map(|v| v.display_name().to_string()),
+            reg.code_review
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string()),
             reg.code_review.iter().next().and_then(|(pname, _)| {
-                model.provider_statuses
+                model
+                    .provider_statuses
                     .get(&(path.clone(), "code_review".into(), pname.clone()))
                     .copied()
             }),
         ),
         (
             "Issue tracker",
-            reg.issue_trackers.values().next().map(|v| v.display_name().to_string()),
+            reg.issue_trackers
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string()),
             reg.issue_trackers.iter().next().and_then(|(pname, _)| {
-                model.provider_statuses
+                model
+                    .provider_statuses
                     .get(&(path.clone(), "issue_tracker".into(), pname.clone()))
                     .copied()
             }),
         ),
         (
             "Coding agent",
-            reg.coding_agents.values().next().map(|v| v.display_name().to_string()),
+            reg.coding_agents
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string()),
             reg.coding_agents.iter().next().and_then(|(pname, _)| {
-                model.provider_statuses
+                model
+                    .provider_statuses
                     .get(&(path.clone(), "coding_agent".into(), pname.clone()))
                     .copied()
             }),
         ),
         (
             "AI utility",
-            reg.ai_utilities.values().next().map(|v| v.display_name().to_string()),
+            reg.ai_utilities
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string()),
             None,
         ),
         (
             "Workspace mgr",
-            reg.workspace_manager.as_ref().map(|(_, w)| w.display_name().to_string()),
+            reg.workspace_manager
+                .as_ref()
+                .map(|(_, w)| w.display_name().to_string()),
             None,
         ),
     ];
@@ -235,16 +270,16 @@ fn render_repo_providers(model: &AppModel, _ui: &UiState, frame: &mut Frame, are
             _ => Style::default().fg(Color::DarkGray),
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<16}", category), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {:<16}", category),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(value, value_style),
         ]));
     }
 
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::bordered()
-                .title_top(Line::from(" ✕ ").right_aligned())
-        )
+        .block(Block::bordered().title_top(Line::from(" ✕ ").right_aligned()))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
@@ -255,13 +290,17 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
     let rui = active_rui(model, ui);
     if rui.show_providers {
         let close_x = area.x + area.width.saturating_sub(5);
-        ui.layout.tab_areas.insert(TabId::Gear, Rect::new(close_x, area.y, 3, 1));
+        ui.layout
+            .tab_areas
+            .insert(TabId::Gear, Rect::new(close_x, area.y, 3, 1));
         render_repo_providers(model, ui, frame, area);
         return;
     }
 
     let gear_x = area.x + area.width.saturating_sub(5);
-    ui.layout.tab_areas.insert(TabId::Gear, Rect::new(gear_x, area.y, 3, 1));
+    ui.layout
+        .tab_areas
+        .insert(TabId::Gear, Rect::new(gear_x, area.y, 3, 1));
 
     let labels = model.active_labels();
     let header = Row::new(vec![
@@ -323,10 +362,7 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::bordered()
-                .title_top(Line::from(" ⚙ ").right_aligned())
-        )
+        .block(Block::bordered().title_top(Line::from(" ⚙ ").right_aligned()))
         .row_highlight_style(Style::default().bg(Color::DarkGray).bold())
         .highlight_symbol("▸ ")
         .highlight_spacing(HighlightSpacing::Always);
@@ -353,7 +389,11 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
-fn build_item_row<'a>(item: &WorkItem, data: &flotilla_core::data::DataStore, col_widths: &[u16]) -> Row<'a> {
+fn build_item_row<'a>(
+    item: &WorkItem,
+    data: &flotilla_core::data::DataStore,
+    col_widths: &[u16],
+) -> Row<'a> {
     let (icon, icon_color) = match item.kind() {
         WorkItemKind::Checkout => {
             if !item.workspace_refs().is_empty() {
@@ -363,7 +403,9 @@ fn build_item_row<'a>(item: &WorkItem, data: &flotilla_core::data::DataStore, co
             }
         }
         WorkItemKind::Session => {
-            let session = item.session_key().and_then(|k| data.providers.sessions.get(k));
+            let session = item
+                .session_key()
+                .and_then(|k| data.providers.sessions.get(k));
             match session.map(|s| &s.status) {
                 Some(SessionStatus::Running) => ("▶", Color::Magenta),
                 Some(SessionStatus::Idle) => ("◆", Color::Magenta),
@@ -458,7 +500,10 @@ fn build_item_row<'a>(item: &WorkItem, data: &flotilla_core::data::DataStore, co
     };
 
     Row::new(vec![
-        Cell::from(Span::styled(format!(" {icon}"), Style::default().fg(icon_color))),
+        Cell::from(Span::styled(
+            format!(" {icon}"),
+            Style::default().fg(icon_color),
+        )),
         Cell::from(description),
         Cell::from(Span::styled(
             branch_display,
@@ -512,7 +557,11 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             if let Some(co) = model.active().data.providers.checkouts.get(wt_key) {
                 lines.push(format!("Path: {}", co.path.display()));
                 if let Some(commit) = &co.last_commit {
-                    let sha = if commit.short_sha.is_empty() { "?" } else { &commit.short_sha };
+                    let sha = if commit.short_sha.is_empty() {
+                        "?"
+                    } else {
+                        &commit.short_sha
+                    };
                     lines.push(format!("Commit: {} {}", sha, commit.message));
                 }
                 if let Some(main) = &co.trunk_ahead_behind {
@@ -522,10 +571,7 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
                 }
                 if let Some(remote) = &co.remote_ahead_behind {
                     if remote.ahead > 0 || remote.behind > 0 {
-                        lines.push(format!(
-                            "vs remote: +{} -{}",
-                            remote.ahead, remote.behind
-                        ));
+                        lines.push(format!("vs remote: +{} -{}", remote.ahead, remote.behind));
                     }
                 }
             }
@@ -533,7 +579,12 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
 
         if let Some(pr_key) = item.pr_key() {
             if let Some(cr) = model.active().data.providers.change_requests.get(pr_key) {
-                lines.push(format!("{} #{}: {}", model.active_labels().code_review.abbr, cr.id, cr.title));
+                lines.push(format!(
+                    "{} #{}: {}",
+                    model.active_labels().code_review.abbr,
+                    cr.id,
+                    cr.title
+                ));
                 lines.push(format!("State: {:?}", cr.status));
             }
         }
@@ -553,8 +604,18 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
         }
 
         for ws_ref in item.workspace_refs() {
-            if let Some(ws) = model.active().data.providers.workspaces.get(ws_ref.as_str()) {
-                let name = if ws.name.is_empty() { &ws.ws_ref } else { &ws.name };
+            if let Some(ws) = model
+                .active()
+                .data
+                .providers
+                .workspaces
+                .get(ws_ref.as_str())
+            {
+                let name = if ws.name.is_empty() {
+                    &ws.ws_ref
+                } else {
+                    &ws.name
+                };
                 lines.push(format!("Workspace: {}", name));
             }
         }
@@ -592,7 +653,11 @@ fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: R
         if let Some(group_idx) = item.correlation_group_idx() {
             if let Some(group) = data.correlation_groups.get(group_idx) {
                 let mut lines = Vec::new();
-                lines.push(format!("Group #{} ({} items)", group_idx, group.items.len()));
+                lines.push(format!(
+                    "Group #{} ({} items)",
+                    group_idx,
+                    group.items.len()
+                ));
                 lines.push(String::new());
 
                 for ci in &group.items {
@@ -602,7 +667,10 @@ fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: R
                         CorItemKind::CloudSession => "Session",
                         CorItemKind::Workspace => "Workspace",
                     };
-                    lines.push(format!("{}: {} [key={:?}]", kind_label, ci.title, ci.source_key));
+                    lines.push(format!(
+                        "{}: {} [key={:?}]",
+                        kind_label, ci.title, ci.source_key
+                    ));
                     for key in &ci.correlation_keys {
                         lines.push(format!("  {}", format_correlation_key(key)));
                     }
@@ -626,7 +694,9 @@ fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: R
 }
 
 fn render_action_menu(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
-    let UiMode::ActionMenu { ref items, index } = ui.mode else { return; };
+    let UiMode::ActionMenu { ref items, index } = ui.mode else {
+        return;
+    };
 
     let area = popup_area(frame.area(), 40, 40);
     ui.layout.menu_area = area;
@@ -650,7 +720,14 @@ fn render_action_menu(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
 }
 
 fn render_input_popup(ui: &UiState, frame: &mut Frame) {
-    let UiMode::BranchInput { ref input, generating, .. } = ui.mode else { return; };
+    let UiMode::BranchInput {
+        ref input,
+        generating,
+        ..
+    } = ui.mode
+    else {
+        return;
+    };
 
     let area = popup_area(frame.area(), 50, 20);
     frame.render_widget(Clear, area);
@@ -660,8 +737,8 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     frame.render_widget(inner, area);
 
     if generating {
-        let paragraph = Paragraph::new("  Generating branch name...")
-            .style(Style::default().fg(Color::Yellow));
+        let paragraph =
+            Paragraph::new("  Generating branch name...").style(Style::default().fg(Color::Yellow));
         frame.render_widget(paragraph, inner_area);
         return;
     }
@@ -677,7 +754,9 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
 }
 
 fn render_delete_confirm(model: &AppModel, ui: &UiState, frame: &mut Frame) {
-    let UiMode::DeleteConfirm { ref info, loading } = ui.mode else { return; };
+    let UiMode::DeleteConfirm { ref info, loading } = ui.mode else {
+        return;
+    };
 
     let area = popup_area(frame.area(), 60, 50);
     frame.render_widget(Clear, area);
@@ -760,7 +839,10 @@ fn render_delete_confirm(model: &AppModel, ui: &UiState, frame: &mut Frame) {
         )));
     }
 
-    let title = format!(" Remove {} ", model.active_labels().checkouts.noun_capitalized());
+    let title = format!(
+        " Remove {} ",
+        model.active_labels().checkouts.noun_capitalized()
+    );
     let paragraph = Paragraph::new(lines)
         .block(Block::bordered().title(title))
         .wrap(Wrap { trim: true });
@@ -787,12 +869,24 @@ fn render_help(model: &AppModel, ui: &UiState, frame: &mut Frame) {
         Line::from("  Double-click     Same as Enter"),
         Line::from("  Space            Action menu (all available actions)"),
         Line::from("  Right-click      Action menu"),
-        Line::from(format!("  n                New branch (enter name, creates {})", labels.checkouts.noun)),
-        Line::from(format!("  d                Remove {} (with safety check)", labels.checkouts.noun)),
-        Line::from(format!("  p                Show {} in browser", labels.code_review.abbr)),
+        Line::from(format!(
+            "  n                New branch (enter name, creates {})",
+            labels.checkouts.noun
+        )),
+        Line::from(format!(
+            "  d                Remove {} (with safety check)",
+            labels.checkouts.noun
+        )),
+        Line::from(format!(
+            "  p                Show {} in browser",
+            labels.code_review.abbr
+        )),
         Line::from("  r                Refresh data"),
         Line::from(""),
-        Line::from(Span::styled("Multi-select (issues)", Style::default().bold())),
+        Line::from(Span::styled(
+            "Multi-select (issues)",
+            Style::default().bold(),
+        )),
         Line::from("  Shift+Enter      Toggle selection on current item"),
         Line::from("  Shift+Click      Toggle selection on clicked item"),
         Line::from("  Enter            Generate branch name for all selected"),
@@ -817,7 +911,14 @@ fn render_help(model: &AppModel, ui: &UiState, frame: &mut Frame) {
 }
 
 fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
-    let UiMode::FilePicker { ref input, ref dir_entries, selected } = ui.mode else { return; };
+    let UiMode::FilePicker {
+        ref input,
+        ref dir_entries,
+        selected,
+    } = ui.mode
+    else {
+        return;
+    };
 
     let area = popup_area(frame.area(), 60, 60);
     ui.layout.file_picker_area = area;
@@ -903,30 +1004,61 @@ fn render_global_status(model: &AppModel, frame: &mut Frame, area: Rect) {
         let reg = &model.repos[path].registry;
 
         if vcs_name.is_none() {
-            vcs_name = reg.vcs.values().next().map(|v| v.display_name().to_string());
+            vcs_name = reg
+                .vcs
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string());
         }
         if checkout_name.is_none() {
-            checkout_name = reg.checkout_managers.values().next().map(|v| v.display_name().to_string());
+            checkout_name = reg
+                .checkout_managers
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string());
         }
         if code_review_name.is_none() {
-            code_review_name = reg.code_review.values().next().map(|v| v.display_name().to_string());
+            code_review_name = reg
+                .code_review
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string());
         }
         if issue_tracker_name.is_none() {
-            issue_tracker_name = reg.issue_trackers.values().next().map(|v| v.display_name().to_string());
+            issue_tracker_name = reg
+                .issue_trackers
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string());
         }
         if coding_agent_name.is_none() {
-            coding_agent_name = reg.coding_agents.values().next().map(|v| v.display_name().to_string());
+            coding_agent_name = reg
+                .coding_agents
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string());
         }
         if ai_utility_name.is_none() {
-            ai_utility_name = reg.ai_utilities.values().next().map(|v| v.display_name().to_string());
+            ai_utility_name = reg
+                .ai_utilities
+                .values()
+                .next()
+                .map(|v| v.display_name().to_string());
         }
         if workspace_name.is_none() {
-            workspace_name = reg.workspace_manager.as_ref().map(|(_, w)| w.display_name().to_string());
+            workspace_name = reg
+                .workspace_manager
+                .as_ref()
+                .map(|(_, w)| w.display_name().to_string());
         }
 
         if coding_agent_status.is_none() {
             for (pname, _) in reg.coding_agents.iter() {
-                if let Some(&status) = model.provider_statuses.get(&(path.clone(), "coding_agent".into(), pname.clone())) {
+                if let Some(&status) = model.provider_statuses.get(&(
+                    path.clone(),
+                    "coding_agent".into(),
+                    pname.clone(),
+                )) {
                     coding_agent_status = Some(status);
                     break;
                 }
@@ -957,7 +1089,10 @@ fn render_global_status(model: &AppModel, frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::DarkGray)
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<16}", category), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {:<16}", category),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(value, style),
         ]));
     }
@@ -975,7 +1110,10 @@ fn render_global_status(model: &AppModel, frame: &mut Frame, area: Rect) {
             None => ("? unknown", Color::DarkGray),
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<16}", agent_name), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {:<16}", agent_name),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(status_text, Style::default().fg(color)),
         ]));
     } else {
@@ -1021,7 +1159,10 @@ fn render_event_log(_model: &AppModel, ui: &mut UiState, frame: &mut Frame, area
                 };
 
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{} ", timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} ", timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::styled(
                         format!("{:<5} ", entry.level),
                         Style::default().fg(level_color),
@@ -1029,12 +1170,10 @@ fn render_event_log(_model: &AppModel, ui: &mut UiState, frame: &mut Frame, area
                     Span::raw(&entry.message),
                 ]))
             }
-            DisplayEntry::RetentionMarker(level) => {
-                ListItem::new(Line::from(Span::styled(
-                    format!("── {level} retention starts here ──"),
-                    Style::default().fg(Color::DarkGray),
-                )))
-            }
+            DisplayEntry::RetentionMarker(level) => ListItem::new(Line::from(Span::styled(
+                format!("── {level} retention starts here ──"),
+                Style::default().fg(Color::DarkGray),
+            ))),
         })
         .collect();
 
@@ -1045,15 +1184,13 @@ fn render_event_log(_model: &AppModel, ui: &mut UiState, frame: &mut Frame, area
 
     let list = List::new(items)
         .block(
-            Block::bordered()
-                .title(" Event Log ")
-                .title_top(
-                    Line::from(Span::styled(
-                        filter_label,
-                        Style::default().fg(Color::DarkGray),
-                    ))
-                    .right_aligned(),
-                ),
+            Block::bordered().title(" Event Log ").title_top(
+                Line::from(Span::styled(
+                    filter_label,
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .right_aligned(),
+            ),
         )
         .highlight_style(Style::default().bg(Color::Indexed(236)));
 

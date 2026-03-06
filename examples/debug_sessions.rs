@@ -2,10 +2,10 @@
 //!
 //! Run with: cargo run --example debug_sessions -- --repo-root ~/dev/reticulate
 
+use flotilla_core::data;
 use flotilla_core::providers::discovery::detect_providers;
 use flotilla_core::providers::types::RepoCriteria;
 use flotilla_core::refresh::RepoRefreshHandle;
-use flotilla_core::data;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +28,10 @@ async fn main() {
     println!("  issue_trackers: {}", registry.issue_trackers.len());
     println!("  coding_agents: {}", registry.coding_agents.len());
     println!("  vcs: {}", registry.vcs.len());
-    println!("  workspace_manager: {}", registry.workspace_manager.is_some());
+    println!(
+        "  workspace_manager: {}",
+        registry.workspace_manager.is_some()
+    );
 
     // Step 2: Spawn background refresh and wait for first snapshot
     println!("\n=== Step 2: Background refresh ===");
@@ -57,40 +60,60 @@ async fn main() {
 
     println!("\n  Checkouts: {}", snapshot.providers.checkouts.len());
     for (i, (_path, co)) in snapshot.providers.checkouts.iter().enumerate() {
-        println!("    [{i}] branch={:?} keys={:?}", co.branch, co.correlation_keys);
+        println!(
+            "    [{i}] branch={:?} keys={:?}",
+            co.branch, co.correlation_keys
+        );
     }
 
-    println!("\n  Change Requests: {}", snapshot.providers.change_requests.len());
+    println!(
+        "\n  Change Requests: {}",
+        snapshot.providers.change_requests.len()
+    );
     for (i, (_id, cr)) in snapshot.providers.change_requests.iter().enumerate() {
-        println!("    [{i}] title={:?} branch={:?} corr_keys={:?} assoc_keys={:?}",
-            cr.title, cr.branch, cr.correlation_keys, cr.association_keys);
+        println!(
+            "    [{i}] title={:?} branch={:?} corr_keys={:?} assoc_keys={:?}",
+            cr.title, cr.branch, cr.correlation_keys, cr.association_keys
+        );
     }
 
     println!("\n  Sessions: {}", snapshot.providers.sessions.len());
     for (i, (_id, s)) in snapshot.providers.sessions.iter().enumerate() {
-        println!("    [{i}] title={:?} status={:?} keys={:?}",
-            s.title, s.status, s.correlation_keys);
+        println!(
+            "    [{i}] title={:?} status={:?} keys={:?}",
+            s.title, s.status, s.correlation_keys
+        );
     }
 
     println!("\n  Workspaces: {}", snapshot.providers.workspaces.len());
     for (i, (_ref, ws)) in snapshot.providers.workspaces.iter().enumerate() {
-        println!("    [{i}] name={:?} dirs={:?} keys={:?}",
-            ws.name, ws.directories, ws.correlation_keys);
+        println!(
+            "    [{i}] name={:?} dirs={:?} keys={:?}",
+            ws.name, ws.directories, ws.correlation_keys
+        );
     }
 
     // Step 3: Show resulting table entries
     println!("\n=== Step 3: Table entries after correlate() ===");
     let section_labels = data::SectionLabels::default();
-    let table_view = data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
+    let table_view =
+        data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
     for (i, entry) in table_view.table_entries.iter().enumerate() {
         match entry {
             data::TableEntry::Header(h) => {
                 println!("  [{i}] HEADER: {h}");
             }
             data::TableEntry::Item(item) => {
-                println!("  [{i}] {:?} desc={:?} branch={:?} co={:?} pr={:?} ses={:?} ws={:?}",
-                    item.kind(), item.description(), item.branch(),
-                    item.checkout_key(), item.pr_key(), item.session_key(), item.workspace_refs());
+                println!(
+                    "  [{i}] {:?} desc={:?} branch={:?} co={:?} pr={:?} ses={:?} ws={:?}",
+                    item.kind(),
+                    item.description(),
+                    item.branch(),
+                    item.checkout_key(),
+                    item.pr_key(),
+                    item.session_key(),
+                    item.workspace_refs()
+                );
             }
         }
     }

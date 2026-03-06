@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
-use async_trait::async_trait;
 use crate::providers::types::*;
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 
 pub struct GitVcs;
 
@@ -68,11 +68,11 @@ impl super::Vcs for GitVcs {
 
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
         let output = run_cmd(
-                "git",
-                &["branch", "--list", "--format=%(refname:short)"],
-                repo_root,
-            )
-            .await?;
+            "git",
+            &["branch", "--list", "--format=%(refname:short)"],
+            repo_root,
+        )
+        .await?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -86,13 +86,14 @@ impl super::Vcs for GitVcs {
 
     async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String> {
         // Check if any remote exists; return empty if not (local-only repo).
-        let remotes = run_cmd("git", &["remote"], repo_root).await.unwrap_or_default();
+        let remotes = run_cmd("git", &["remote"], repo_root)
+            .await
+            .unwrap_or_default();
         if remotes.trim().is_empty() {
             return Ok(vec![]);
         }
         let remote = remotes.lines().next().unwrap_or("origin");
-        let output = run_cmd("git", &["ls-remote", "--heads", remote], repo_root)
-            .await?;
+        let output = run_cmd("git", &["ls-remote", "--heads", remote], repo_root).await?;
         // Output format: "<sha>\trefs/heads/<branch>"
         Ok(output
             .lines()
@@ -112,12 +113,7 @@ impl super::Vcs for GitVcs {
         limit: usize,
     ) -> Result<Vec<CommitInfo>, String> {
         let limit_arg = format!("-{}", limit);
-        let output = run_cmd(
-                "git",
-                &["log", branch, "--oneline", &limit_arg],
-                repo_root,
-            )
-            .await?;
+        let output = run_cmd("git", &["log", branch, "--oneline", &limit_arg], repo_root).await?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -138,21 +134,15 @@ impl super::Vcs for GitVcs {
     ) -> Result<AheadBehind, String> {
         let range = format!("{}...{}", branch, reference);
         let output = run_cmd(
-                "git",
-                &["rev-list", "--count", "--left-right", &range],
-                repo_root,
-            )
-            .await?;
+            "git",
+            &["rev-list", "--count", "--left-right", &range],
+            repo_root,
+        )
+        .await?;
         let trimmed = output.trim();
         let mut parts = trimmed.split('\t');
-        let ahead: i64 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let behind: i64 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let ahead: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let behind: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         Ok(AheadBehind { ahead, behind })
     }
 
@@ -161,8 +151,7 @@ impl super::Vcs for GitVcs {
         _repo_root: &Path,
         checkout_path: &Path,
     ) -> Result<WorkingTreeStatus, String> {
-        let output = run_cmd("git", &["status", "--porcelain"], checkout_path)
-            .await?;
+        let output = run_cmd("git", &["status", "--porcelain"], checkout_path).await?;
         Ok(super::parse_porcelain_status(&output))
     }
 }

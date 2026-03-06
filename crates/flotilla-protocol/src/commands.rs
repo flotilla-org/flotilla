@@ -60,10 +60,17 @@ pub enum ProtoCommand {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandResult {
     Ok,
-    WorktreeCreated { branch: String },
-    BranchNameGenerated { name: String, issue_ids: Vec<(String, String)> },
+    WorktreeCreated {
+        branch: String,
+    },
+    BranchNameGenerated {
+        name: String,
+        issue_ids: Vec<(String, String)>,
+    },
     DeleteInfo(ProtoDeleteInfo),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

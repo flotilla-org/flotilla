@@ -54,28 +54,40 @@ pub struct RepoLabels {
 impl RepoLabels {
     pub fn from_registry(registry: &ProviderRegistry) -> Self {
         Self {
-            checkouts: registry.checkout_managers.values().next()
+            checkouts: registry
+                .checkout_managers
+                .values()
+                .next()
                 .map(|cm| CategoryLabels {
                     section: cm.section_label().into(),
                     noun: cm.item_noun().into(),
                     abbr: cm.abbreviation().into(),
                 })
                 .unwrap_or_default(),
-            code_review: registry.code_review.values().next()
+            code_review: registry
+                .code_review
+                .values()
+                .next()
                 .map(|cr| CategoryLabels {
                     section: cr.section_label().into(),
                     noun: cr.item_noun().into(),
                     abbr: cr.abbreviation().into(),
                 })
                 .unwrap_or_default(),
-            issues: registry.issue_trackers.values().next()
+            issues: registry
+                .issue_trackers
+                .values()
+                .next()
                 .map(|it| CategoryLabels {
                     section: it.section_label().into(),
                     noun: it.item_noun().into(),
                     abbr: it.abbreviation().into(),
                 })
                 .unwrap_or_default(),
-            sessions: registry.coding_agents.values().next()
+            sessions: registry
+                .coding_agents
+                .values()
+                .next()
                 .map(|ca| CategoryLabels {
                     section: ca.section_label().into(),
                     noun: ca.item_noun().into(),
@@ -140,7 +152,8 @@ impl AppModel {
 
     pub async fn add_repo(&mut self, path: PathBuf) {
         if !self.repos.contains_key(&path) {
-            self.repos.insert(path.clone(), Self::build_repo_model(path.clone()).await);
+            self.repos
+                .insert(path.clone(), Self::build_repo_model(path.clone()).await);
             self.repo_order.push(path);
         }
     }

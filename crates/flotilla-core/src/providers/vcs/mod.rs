@@ -1,10 +1,10 @@
 pub mod git;
-pub mod wt;
 pub mod git_worktree;
+pub mod wt;
 
-use std::path::{Path, PathBuf};
-use async_trait::async_trait;
 use crate::providers::types::*;
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
@@ -17,20 +17,45 @@ pub trait Vcs: Send + Sync {
     fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf>;
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String>;
     async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String>;
-    async fn commit_log(&self, repo_root: &Path, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String>;
-    async fn ahead_behind(&self, repo_root: &Path, branch: &str, reference: &str) -> Result<AheadBehind, String>;
-    async fn working_tree_status(&self, repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String>;
+    async fn commit_log(
+        &self,
+        repo_root: &Path,
+        branch: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, String>;
+    async fn ahead_behind(
+        &self,
+        repo_root: &Path,
+        branch: &str,
+        reference: &str,
+    ) -> Result<AheadBehind, String>;
+    async fn working_tree_status(
+        &self,
+        repo_root: &Path,
+        checkout_path: &Path,
+    ) -> Result<WorkingTreeStatus, String>;
 }
 
 #[async_trait]
 pub trait CheckoutManager: Send + Sync {
     #[allow(dead_code)]
     fn display_name(&self) -> &str;
-    fn section_label(&self) -> &str { "Checkouts" }
-    fn item_noun(&self) -> &str { "checkout" }
-    fn abbreviation(&self) -> &str { "CO" }
+    fn section_label(&self) -> &str {
+        "Checkouts"
+    }
+    fn item_noun(&self) -> &str {
+        "checkout"
+    }
+    fn abbreviation(&self) -> &str {
+        "CO"
+    }
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String>;
-    async fn create_checkout(&self, repo_root: &Path, branch: &str, create_branch: bool) -> Result<Checkout, String>;
+    async fn create_checkout(
+        &self,
+        repo_root: &Path,
+        branch: &str,
+        create_branch: bool,
+    ) -> Result<Checkout, String>;
     async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String>;
 }
 
@@ -94,7 +119,10 @@ pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
         for id in value.split(',') {
             let id = id.trim();
             if !id.is_empty() {
-                keys.push(AssociationKey::IssueRef(provider.to_string(), id.to_string()));
+                keys.push(AssociationKey::IssueRef(
+                    provider.to_string(),
+                    id.to_string(),
+                ));
             }
         }
     }
@@ -104,13 +132,12 @@ pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
 /// Read issue links from git config for a specific branch.
 /// Returns empty vec if no links or on error (non-fatal).
 pub async fn read_branch_issue_links(repo_root: &Path, branch: &str) -> Vec<AssociationKey> {
-    let pattern = format!("branch\\.{}\\.flotilla\\.issues\\.", regex_escape_branch(branch));
-    let result = crate::providers::run_cmd(
-        "git",
-        &["config", "--get-regexp", &pattern],
-        repo_root,
-    )
-    .await;
+    let pattern = format!(
+        "branch\\.{}\\.flotilla\\.issues\\.",
+        regex_escape_branch(branch)
+    );
+    let result =
+        crate::providers::run_cmd("git", &["config", "--get-regexp", &pattern], repo_root).await;
     match result {
         Ok(output) => parse_issue_config_output(&output),
         Err(_) => Vec::new(),
@@ -140,20 +167,26 @@ mod tests {
     fn parse_issue_links_single_provider() {
         let git_output = "branch.feat-x.flotilla.issues.github 123,456\n";
         let keys = parse_issue_config_output(git_output);
-        assert_eq!(keys, vec![
-            AssociationKey::IssueRef("github".into(), "123".into()),
-            AssociationKey::IssueRef("github".into(), "456".into()),
-        ]);
+        assert_eq!(
+            keys,
+            vec![
+                AssociationKey::IssueRef("github".into(), "123".into()),
+                AssociationKey::IssueRef("github".into(), "456".into()),
+            ]
+        );
     }
 
     #[test]
     fn parse_issue_links_multiple_providers() {
         let git_output = "branch.feat-x.flotilla.issues.github 42\nbranch.feat-x.flotilla.issues.linear ABC-123\n";
         let keys = parse_issue_config_output(git_output);
-        assert_eq!(keys, vec![
-            AssociationKey::IssueRef("github".into(), "42".into()),
-            AssociationKey::IssueRef("linear".into(), "ABC-123".into()),
-        ]);
+        assert_eq!(
+            keys,
+            vec![
+                AssociationKey::IssueRef("github".into(), "42".into()),
+                AssociationKey::IssueRef("linear".into(), "ABC-123".into()),
+            ]
+        );
     }
 
     #[test]

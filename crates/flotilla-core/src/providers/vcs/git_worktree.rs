@@ -28,7 +28,8 @@ impl GitCheckoutManager {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
 
-        let rendered = self.env
+        let rendered = self
+            .env
             .render_str(
                 &self.config.path,
                 minijinja::context! {
@@ -109,7 +110,12 @@ impl GitCheckoutManager {
         for name in super::TRUNK_NAMES {
             if run_cmd(
                 "git",
-                &["show-ref", "--verify", "--quiet", &format!("refs/heads/{name}")],
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{name}"),
+                ],
                 repo_root,
             )
             .await
@@ -180,9 +186,7 @@ impl GitCheckoutManager {
                         })
                     })
             },
-            async {
-                super::read_branch_issue_links(path, branch).await
-            },
+            async { super::read_branch_issue_links(path, branch).await },
         );
 
         Checkout {
@@ -245,34 +249,33 @@ impl super::CheckoutManager for GitCheckoutManager {
         _create_branch: bool,
     ) -> Result<Checkout, String> {
         let wt_path = self.render_worktree_path(repo_root, branch)?;
-        info!("git: creating worktree for {branch} at {}", wt_path.display());
+        info!(
+            "git: creating worktree for {branch} at {}",
+            wt_path.display()
+        );
 
-        let wt_str = wt_path.to_str()
+        let wt_str = wt_path
+            .to_str()
             .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", wt_path.display()))?;
 
         let branch_exists = run_cmd(
             "git",
-            &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
             repo_root,
         )
         .await
         .is_ok();
 
         if branch_exists {
-            run_cmd(
-                "git",
-                &["worktree", "add", wt_str, branch],
-                repo_root,
-            )
-            .await?;
+            run_cmd("git", &["worktree", "add", wt_str, branch], repo_root).await?;
         } else {
             // New branch bases from HEAD of the main worktree
-            run_cmd(
-                "git",
-                &["worktree", "add", "-b", branch, wt_str],
-                repo_root,
-            )
-            .await?;
+            run_cmd("git", &["worktree", "add", "-b", branch, wt_str], repo_root).await?;
         }
 
         let default_branch = Self::default_branch(repo_root).await;
@@ -280,11 +283,7 @@ impl super::CheckoutManager for GitCheckoutManager {
         Ok(Self::enrich_checkout(&wt_path, branch, is_trunk, &default_branch).await)
     }
 
-    async fn remove_checkout(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-    ) -> Result<(), String> {
+    async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String> {
         info!("git: removing worktree for {branch}");
 
         let output = run_cmd("git", &["worktree", "list", "--porcelain"], repo_root).await?;
@@ -295,15 +294,11 @@ impl super::CheckoutManager for GitCheckoutManager {
             .map(|(p, _)| p.clone())
             .ok_or_else(|| format!("no worktree found for branch {branch}"))?;
 
-        let wt_str = wt_path.to_str()
+        let wt_str = wt_path
+            .to_str()
             .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", wt_path.display()))?;
 
-        run_cmd(
-            "git",
-            &["worktree", "remove", "--force", wt_str],
-            repo_root,
-        )
-        .await?;
+        run_cmd("git", &["worktree", "remove", "--force", wt_str], repo_root).await?;
 
         // Force-delete branch (-D) since feature branches are typically
         // unmerged locally. Skip trunk to prevent catastrophic deletion.
@@ -412,7 +407,10 @@ branch refs/heads/feature
         let repo = Path::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(repo, "feature/my-branch").unwrap();
-        assert_eq!(path, PathBuf::from("/home/user/myrepo/../myrepo.feature-my-branch"));
+        assert_eq!(
+            path,
+            PathBuf::from("/home/user/myrepo/../myrepo.feature-my-branch")
+        );
     }
 
     #[test]

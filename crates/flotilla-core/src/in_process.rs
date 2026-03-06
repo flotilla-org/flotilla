@@ -98,9 +98,7 @@ impl InProcessDaemon {
                 .any(|e| e.category == "issues" && e.message.contains("has disabled issues"));
             if issues_disabled {
                 state.model.data.provider_health.remove("issue_tracker");
-                handle
-                    .skip_issues
-                    .store(true, Ordering::Relaxed);
+                handle.skip_issues.store(true, Ordering::Relaxed);
             }
 
             // Increment sequence and store snapshot
@@ -264,9 +262,7 @@ impl DaemonHandle for InProcessDaemon {
         config::save_tab_order(&order);
 
         info!("removed repo {}", path.display());
-        let _ = self
-            .event_tx
-            .send(DaemonEvent::RepoRemoved { path });
+        let _ = self.event_tx.send(DaemonEvent::RepoRemoved { path });
 
         Ok(())
     }

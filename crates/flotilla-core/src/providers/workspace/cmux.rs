@@ -66,8 +66,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
 
     async fn list_workspaces(&self) -> Result<Vec<Workspace>, String> {
         let output = Self::cmux_cmd(&["--json", "list-workspaces"]).await?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).map_err(|e| e.to_string())?;
+        let parsed: serde_json::Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
         let workspaces = parsed["workspaces"]
             .as_array()
             .ok_or("no workspaces array")?;
@@ -260,14 +259,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
 
         // Focus the designated pane last (for keyboard focus)
         if let Some(pane_ref) = &focus_pane {
-            Self::cmux_cmd(&[
-                "focus-pane",
-                "--pane",
-                pane_ref,
-                "--workspace",
-                &ws_ref,
-            ])
-            .await?;
+            Self::cmux_cmd(&["focus-pane", "--pane", pane_ref, "--workspace", &ws_ref]).await?;
         }
 
         let directories = vec![config.working_directory.clone()];

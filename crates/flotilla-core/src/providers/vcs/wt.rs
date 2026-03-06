@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use crate::providers::types::*;
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use tracing::info;
-use crate::providers::types::*;
 
 pub struct WtCheckoutManager;
 
@@ -67,8 +67,14 @@ impl WtWorktree {
             branch: self.branch,
             path: self.path,
             is_trunk: self.is_main,
-            trunk_ahead_behind: self.main.map(|m| AheadBehind { ahead: m.ahead, behind: m.behind }),
-            remote_ahead_behind: self.remote.map(|r| AheadBehind { ahead: r.ahead, behind: r.behind }),
+            trunk_ahead_behind: self.main.map(|m| AheadBehind {
+                ahead: m.ahead,
+                behind: m.behind,
+            }),
+            remote_ahead_behind: self.remote.map(|r| AheadBehind {
+                ahead: r.ahead,
+                behind: r.behind,
+            }),
             working_tree: self.working_tree.map(|w| WorkingTreeStatus {
                 staged: if w.staged { 1 } else { 0 },
                 modified: if w.modified { 1 } else { 0 },
@@ -110,20 +116,22 @@ impl super::CheckoutManager for WtCheckoutManager {
         "wt"
     }
 
-    fn section_label(&self) -> &str { "Worktrees" }
-    fn item_noun(&self) -> &str { "worktree" }
-    fn abbreviation(&self) -> &str { "WT" }
+    fn section_label(&self) -> &str {
+        "Worktrees"
+    }
+    fn item_noun(&self) -> &str {
+        "worktree"
+    }
+    fn abbreviation(&self) -> &str {
+        "WT"
+    }
 
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String> {
-        let output = run_cmd("wt", &["list", "--format=json"], repo_root)
-            .await?;
+        let output = run_cmd("wt", &["list", "--format=json"], repo_root).await?;
         let json = Self::strip_to_json(&output);
-        let worktrees: Vec<WtWorktree> =
-            serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let mut checkouts: Vec<Checkout> = worktrees
-            .into_iter()
-            .map(|wt| wt.into_checkout())
-            .collect();
+        let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let mut checkouts: Vec<Checkout> =
+            worktrees.into_iter().map(|wt| wt.into_checkout()).collect();
 
         // Enrich with issue links from git config
         let futures: Vec<_> = checkouts
@@ -152,11 +160,9 @@ impl super::CheckoutManager for WtCheckoutManager {
         }
 
         // Look up the path of the newly created worktree
-        let list_output = run_cmd("wt", &["list", "--format=json"], repo_root)
-            .await?;
+        let list_output = run_cmd("wt", &["list", "--format=json"], repo_root).await?;
         let json = Self::strip_to_json(&list_output);
-        let worktrees: Vec<WtWorktree> =
-            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
 
         for wt in worktrees {
             if wt.branch == branch || wt.branch.ends_with(&format!("/{branch}")) {
@@ -168,11 +174,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         Err("Could not find worktree path after creation".to_string())
     }
 
-    async fn remove_checkout(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-    ) -> Result<(), String> {
+    async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String> {
         info!("wt: removing worktree {branch}");
         run_cmd("wt", &["remove", branch], repo_root).await?;
         Ok(())

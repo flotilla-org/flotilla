@@ -14,15 +14,15 @@ pub struct RepoCriteria {
 pub enum CorrelationKey {
     Branch(String),
     CheckoutPath(PathBuf),
-    ChangeRequestRef(String, String),  // (provider_name, CR id)
-    SessionRef(String, String),        // (provider_name, session_id)
+    ChangeRequestRef(String, String), // (provider_name, CR id)
+    SessionRef(String, String),       // (provider_name, session_id)
 }
 
 /// Association keys — "related to" links that do NOT merge work units.
 /// Two PRs referencing the same issue are separate work streams.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssociationKey {
-    IssueRef(String, String),          // (provider_name, issue_id)
+    IssueRef(String, String), // (provider_name, issue_id)
 }
 
 #[allow(dead_code)]

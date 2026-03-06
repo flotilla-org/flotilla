@@ -6,8 +6,8 @@ use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use tui_input::Input;
 
-use flotilla_core::data::{DeleteConfirmInfo, TableView, WorkItemIdentity};
 use super::intent::Intent;
+use flotilla_core::data::{DeleteConfirmInfo, TableView, WorkItemIdentity};
 
 #[derive(Clone)]
 pub struct DirEntry {
@@ -132,7 +132,8 @@ pub struct UiState {
 
 impl UiState {
     pub fn new(repo_paths: &[PathBuf]) -> Self {
-        let repo_ui = repo_paths.iter()
+        let repo_ui = repo_paths
+            .iter()
             .map(|p| (p.clone(), RepoUiState::default()))
             .collect();
         Self {

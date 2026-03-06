@@ -88,9 +88,7 @@ impl ZellijWorkspaceManager {
             .map_err(|_| format!("invalid minor version: {}", parts[1]))?;
 
         if major == 0 && minor < 40 {
-            return Err(format!(
-                "zellij >= 0.40 required, found {version_part}"
-            ));
+            return Err(format!("zellij >= 0.40 required, found {version_part}"));
         }
 
         info!("zellij version {version_part} OK");
@@ -99,14 +97,15 @@ impl ZellijWorkspaceManager {
 
     /// Return the current Zellij session name from the environment.
     pub fn session_name() -> Result<String, String> {
-        std::env::var("ZELLIJ_SESSION_NAME")
-            .map_err(|_| "not running inside a zellij session (ZELLIJ_SESSION_NAME not set)".to_string())
+        std::env::var("ZELLIJ_SESSION_NAME").map_err(|_| {
+            "not running inside a zellij session (ZELLIJ_SESSION_NAME not set)".to_string()
+        })
     }
 
     /// Return the state file path: `~/.config/flotilla/zellij/{session}/state.toml`.
     pub fn state_path(session: &str) -> Result<PathBuf, String> {
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| "could not determine config directory".to_string())?;
+        let config_dir =
+            dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
         Ok(config_dir
             .join("flotilla")
             .join("zellij")
@@ -264,7 +263,12 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         let focus_index = rendered.panes.iter().position(|p| p.focus);
         let total_panes: usize = rendered.panes.iter().map(|p| p.surfaces.len().max(1)).sum();
         if let Some(fi) = focus_index {
-            let panes_before: usize = rendered.panes.iter().take(fi).map(|p| p.surfaces.len().max(1)).sum();
+            let panes_before: usize = rendered
+                .panes
+                .iter()
+                .take(fi)
+                .map(|p| p.surfaces.len().max(1))
+                .sum();
             let moves_back = total_panes.saturating_sub(1).saturating_sub(panes_before);
             for _ in 0..moves_back {
                 Self::zellij_action(&["focus-previous-pane"]).await.ok();

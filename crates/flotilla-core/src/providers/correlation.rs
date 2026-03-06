@@ -131,7 +131,10 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
     let mut group_singletons: HashMap<usize, Vec<ItemKind>> = HashMap::new();
     for (idx, item) in items.iter().enumerate() {
         if is_singleton_kind(&item.kind) {
-            group_singletons.entry(idx).or_default().push(item.kind.clone());
+            group_singletons
+                .entry(idx)
+                .or_default()
+                .push(item.kind.clone());
         }
     }
 
@@ -150,7 +153,8 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
                     // Check if merging would combine two singleton kinds
                     let singletons_a = group_singletons.get(&root_a);
                     let singletons_b = group_singletons.get(&root_b);
-                    let would_conflict = if let (Some(sa), Some(sb)) = (singletons_a, singletons_b) {
+                    let would_conflict = if let (Some(sa), Some(sb)) = (singletons_a, singletons_b)
+                    {
                         sa.iter().any(|k| sb.contains(k))
                     } else {
                         false
@@ -336,9 +340,27 @@ mod tests {
     #[test]
     fn no_correlation_keys_each_item_separate() {
         let items = vec![
-            item("git", ItemKind::Checkout, "orphan-a", vec![], ProviderItemKey::Checkout(PathBuf::from("/code/orphan-a"))),
-            item("github", ItemKind::ChangeRequest, "orphan-b", vec![], ProviderItemKey::ChangeRequest("orphan-b".into())),
-            item("claude", ItemKind::CloudSession, "orphan-c", vec![], ProviderItemKey::Session("orphan-c".into())),
+            item(
+                "git",
+                ItemKind::Checkout,
+                "orphan-a",
+                vec![],
+                ProviderItemKey::Checkout(PathBuf::from("/code/orphan-a")),
+            ),
+            item(
+                "github",
+                ItemKind::ChangeRequest,
+                "orphan-b",
+                vec![],
+                ProviderItemKey::ChangeRequest("orphan-b".into()),
+            ),
+            item(
+                "claude",
+                ItemKind::CloudSession,
+                "orphan-c",
+                vec![],
+                ProviderItemKey::Session("orphan-c".into()),
+            ),
         ];
 
         let groups = correlate(items);
@@ -414,7 +436,11 @@ mod tests {
 
         let groups = correlate(items);
         // The workspace should attach to one checkout, not bridge them
-        assert_eq!(groups.len(), 2, "two checkouts must stay in separate groups");
+        assert_eq!(
+            groups.len(),
+            2,
+            "two checkouts must stay in separate groups"
+        );
         // One group has 2 items (checkout + workspace), the other has 1 (checkout alone)
         let mut sizes: Vec<usize> = groups.iter().map(|g| g.items.len()).collect();
         sizes.sort();

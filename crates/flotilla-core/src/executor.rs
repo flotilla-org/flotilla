@@ -71,8 +71,7 @@ pub async fn execute(
                     info!("created checkout at {}", checkout.path.display());
                     // Create workspace if manager available
                     if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                        let config =
-                            workspace_config(repo_root, &branch, &checkout.path, "claude");
+                        let config = workspace_config(repo_root, &branch, &checkout.path, "claude");
                         if let Err(e) = ws_mgr.create_workspace(&config).await {
                             // Checkout was created but workspace failed — report as error
                             // but the worktree still exists
@@ -274,21 +273,18 @@ pub async fn execute(
             checkout_key,
         } => {
             info!("teleporting to session {session_id}");
-            let claude_bin =
-                providers::resolve_claude_path().await.unwrap_or_else(|| "claude".into());
+            let claude_bin = providers::resolve_claude_path()
+                .await
+                .unwrap_or_else(|| "claude".into());
             let teleport_cmd = format!("{} --teleport {}", claude_bin, session_id);
             let wt_path = if let Some(ref key) = checkout_key {
-                providers_data
-                    .checkouts
-                    .get(key)
-                    .map(|co| co.path.clone())
+                providers_data.checkouts.get(key).map(|co| co.path.clone())
             } else if let Some(branch_name) = &branch {
-                let checkout_result =
-                    if let Some(cm) = registry.checkout_managers.values().next() {
-                        cm.create_checkout(repo_root, branch_name, false).await.ok()
-                    } else {
-                        None
-                    };
+                let checkout_result = if let Some(cm) = registry.checkout_managers.values().next() {
+                    cm.create_checkout(repo_root, branch_name, false).await.ok()
+                } else {
+                    None
+                };
                 checkout_result.map(|c| c.path)
             } else {
                 None
@@ -344,11 +340,7 @@ pub(crate) fn workspace_config(
 }
 
 /// Write branch-to-issue links into git config.
-async fn write_branch_issue_links(
-    repo_root: &Path,
-    branch: &str,
-    issue_ids: &[(String, String)],
-) {
+async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)]) {
     use std::collections::HashMap;
     let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
     for (provider, id) in issue_ids {

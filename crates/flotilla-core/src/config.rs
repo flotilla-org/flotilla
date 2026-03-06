@@ -195,8 +195,14 @@ pub fn resolve_checkouts_config(repo_root: &std::path::Path) -> CheckoutsConfig 
             Ok(repo_cfg) => {
                 let repo_co = &repo_cfg.vcs.git.checkouts;
                 return CheckoutsConfig {
-                    path: repo_co.path.clone().unwrap_or(global.vcs.git.checkouts.path),
-                    provider: repo_co.provider.clone().unwrap_or(global.vcs.git.checkouts.provider),
+                    path: repo_co
+                        .path
+                        .clone()
+                        .unwrap_or(global.vcs.git.checkouts.path),
+                    provider: repo_co
+                        .provider
+                        .clone()
+                        .unwrap_or(global.vcs.git.checkouts.provider),
                 };
             }
             Err(e) => {

@@ -3,8 +3,8 @@ pub mod intent;
 pub mod ui_state;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler as InputEventHandler;
+use tui_input::Input;
 
 use flotilla_core::data::{TableEntry, WorkItem};
 use flotilla_protocol::ProtoCommand;
@@ -12,9 +12,9 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub use intent::Intent;
 pub use flotilla_core::model::{AppModel, ProviderStatus};
-pub use ui_state::{DirEntry, TabId, UiMode, UiState, RepoUiState};
+pub use intent::Intent;
+pub use ui_state::{DirEntry, RepoUiState, TabId, UiMode, UiState};
 
 #[derive(Default)]
 pub struct ProtoCommandQueue {
@@ -52,7 +52,8 @@ impl App {
     // ── Convenience accessors ──
 
     pub fn active_ui(&self) -> &RepoUiState {
-        self.ui.active_repo_ui(&self.model.repo_order, self.model.active_repo)
+        self.ui
+            .active_repo_ui(&self.model.repo_order, self.model.active_repo)
     }
 
     pub fn active_ui_mut(&mut self) -> &mut RepoUiState {
@@ -128,7 +129,11 @@ impl App {
         true
     }
 
-    pub fn prefill_branch_input(&mut self, branch_name: &str, pending_issue_ids: Vec<(String, String)>) {
+    pub fn prefill_branch_input(
+        &mut self,
+        branch_name: &str,
+        pending_issue_ids: Vec<(String, String)>,
+    ) {
         self.ui.mode = UiMode::BranchInput {
             input: Input::from(branch_name),
             generating: false,
@@ -144,8 +149,14 @@ impl App {
         // Toggle help from Normal or Help modes
         if key.code == KeyCode::Char('?') {
             match self.ui.mode {
-                UiMode::Normal => { self.ui.mode = UiMode::Help; return; }
-                UiMode::Help => { self.ui.mode = UiMode::Normal; return; }
+                UiMode::Normal => {
+                    self.ui.mode = UiMode::Help;
+                    return;
+                }
+                UiMode::Help => {
+                    self.ui.mode = UiMode::Normal;
+                    return;
+                }
                 _ => {}
             }
         }
@@ -292,7 +303,10 @@ impl App {
 
                 if let Some(si) = self.row_at_mouse(mouse.column, mouse.row) {
                     let now = Instant::now();
-                    let is_double_click = self.ui.double_click.last_time
+                    let is_double_click = self
+                        .ui
+                        .double_click
+                        .last_time
                         .map(|t| now.duration_since(t).as_millis() < 400)
                         .unwrap_or(false)
                         && self.ui.double_click.last_selectable_idx == Some(si);
@@ -382,7 +396,9 @@ impl App {
     fn toggle_multi_select(&mut self) {
         if let Some(si) = self.active_ui().selected_selectable_idx {
             if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
-                if let Some(TableEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
+                if let Some(TableEntry::Item(item)) =
+                    self.active_ui().table_view.table_entries.get(table_idx)
+                {
                     let identity = item.identity();
                     let rui = self.active_ui_mut();
                     if !rui.multi_selected.remove(&identity) {
@@ -439,7 +455,9 @@ impl App {
                 generating: true,
                 pending_issue_ids: Vec::new(),
             };
-            self.proto_commands.push(ProtoCommand::GenerateBranchName { issue_keys: all_issue_keys });
+            self.proto_commands.push(ProtoCommand::GenerateBranchName {
+                issue_keys: all_issue_keys,
+            });
         }
         self.active_ui_mut().multi_selected.clear();
     }
@@ -507,7 +525,13 @@ impl App {
             }
             return;
         }
-        let UiMode::ActionMenu { ref items, ref mut index } = self.ui.mode else { return; };
+        let UiMode::ActionMenu {
+            ref items,
+            ref mut index,
+        } = self.ui.mode
+        else {
+            return;
+        };
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if *index < items.len().saturating_sub(1) {
@@ -523,7 +547,13 @@ impl App {
 
     fn handle_branch_input_key(&mut self, key: KeyEvent) {
         // Ignore keys while generating
-        if matches!(self.ui.mode, UiMode::BranchInput { generating: true, .. }) {
+        if matches!(
+            self.ui.mode,
+            UiMode::BranchInput {
+                generating: true,
+                ..
+            }
+        ) {
             return;
         }
 
@@ -532,13 +562,22 @@ impl App {
             return;
         }
         if key.code == KeyCode::Enter {
-            let (branch, issue_ids) = if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
+            let (branch, issue_ids) = if let UiMode::BranchInput {
+                ref input,
+                ref mut pending_issue_ids,
+                ..
+            } = self.ui.mode
+            {
                 (input.value().to_string(), std::mem::take(pending_issue_ids))
             } else {
                 return;
             };
             if !branch.is_empty() {
-                self.proto_commands.push(ProtoCommand::CreateWorktree { branch, create_branch: true, issue_ids });
+                self.proto_commands.push(ProtoCommand::CreateWorktree {
+                    branch,
+                    create_branch: true,
+                    issue_ids,
+                });
             }
             self.ui.mode = UiMode::Normal;
             return;
@@ -560,15 +599,26 @@ impl App {
         }
 
         let needs_refresh = {
-            let UiMode::FilePicker { ref mut input, ref mut dir_entries, ref mut selected } = self.ui.mode else { return; };
+            let UiMode::FilePicker {
+                ref mut input,
+                ref mut dir_entries,
+                ref mut selected,
+            } = self.ui.mode
+            else {
+                return;
+            };
             match key.code {
-                KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() || key.code == KeyCode::Down => {
+                KeyCode::Down | KeyCode::Char('j')
+                    if key.modifiers.is_empty() || key.code == KeyCode::Down =>
+                {
                     if !dir_entries.is_empty() {
                         *selected = (*selected + 1).min(dir_entries.len() - 1);
                     }
                     false
                 }
-                KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() || key.code == KeyCode::Up => {
+                KeyCode::Up | KeyCode::Char('k')
+                    if key.modifiers.is_empty() || key.code == KeyCode::Up =>
+                {
                     *selected = selected.saturating_sub(1);
                     false
                 }
@@ -578,7 +628,8 @@ impl App {
                         let base = if current.ends_with('/') {
                             current.clone()
                         } else {
-                            current.rsplit_once('/')
+                            current
+                                .rsplit_once('/')
                                 .map(|(prefix, _)| format!("{prefix}/"))
                                 .unwrap_or_default()
                         };
@@ -602,13 +653,23 @@ impl App {
 
     fn activate_dir_entry(&mut self) {
         let (entry, base) = {
-            let UiMode::FilePicker { ref input, ref dir_entries, selected } = self.ui.mode else { return; };
-            let Some(entry) = dir_entries.get(selected).cloned() else { return; };
+            let UiMode::FilePicker {
+                ref input,
+                ref dir_entries,
+                selected,
+            } = self.ui.mode
+            else {
+                return;
+            };
+            let Some(entry) = dir_entries.get(selected).cloned() else {
+                return;
+            };
             let current = input.value().to_string();
             let base = if current.ends_with('/') {
                 current
             } else {
-                current.rsplit_once('/')
+                current
+                    .rsplit_once('/')
                     .map(|(prefix, _)| format!("{prefix}/"))
                     .unwrap_or_default()
             };
@@ -618,11 +679,17 @@ impl App {
         if entry.is_git_repo && !entry.is_added {
             let path = PathBuf::from(format!("{}{}", base, entry.name));
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            self.proto_commands.push(ProtoCommand::AddRepo { path: canonical });
+            self.proto_commands
+                .push(ProtoCommand::AddRepo { path: canonical });
             self.ui.mode = UiMode::Normal;
         } else if entry.is_dir {
             let new_path = format!("{}{}/", base, entry.name);
-            if let UiMode::FilePicker { ref mut input, ref mut selected, .. } = self.ui.mode {
+            if let UiMode::FilePicker {
+                ref mut input,
+                ref mut selected,
+                ..
+            } = self.ui.mode
+            {
                 *input = Input::from(new_path.as_str());
                 *selected = 0;
             }
@@ -644,13 +711,19 @@ impl App {
         let la = self.ui.layout.file_picker_list_area;
         if x >= la.x && x < la.x + la.width && y >= la.y && y < la.y + la.height {
             let row = (y - la.y) as usize;
-            let len = if let UiMode::FilePicker { ref dir_entries, .. } = self.ui.mode {
+            let len = if let UiMode::FilePicker {
+                ref dir_entries, ..
+            } = self.ui.mode
+            {
                 dir_entries.len()
             } else {
                 return;
             };
             if row < len {
-                if let UiMode::FilePicker { ref mut selected, .. } = self.ui.mode {
+                if let UiMode::FilePicker {
+                    ref mut selected, ..
+                } = self.ui.mode
+                {
                     *selected = row;
                 }
                 self.activate_dir_entry();
@@ -660,13 +733,23 @@ impl App {
 
     pub fn refresh_dir_listing(&mut self) {
         let Self { model, ui, .. } = self;
-        let UiMode::FilePicker { ref input, ref mut dir_entries, .. } = ui.mode else { return; };
+        let UiMode::FilePicker {
+            ref input,
+            ref mut dir_entries,
+            ..
+        } = ui.mode
+        else {
+            return;
+        };
 
         let path_str = input.value().to_string();
         let dir = if path_str.ends_with('/') {
             PathBuf::from(&path_str)
         } else {
-            PathBuf::from(&path_str).parent().map(|p| p.to_path_buf()).unwrap_or_default()
+            PathBuf::from(&path_str)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default()
         };
 
         let filter = if !path_str.ends_with('/') {
@@ -714,8 +797,14 @@ impl App {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if !loading {
                     // Extract branch from DeleteConfirmInfo and send RemoveCheckout
-                    if let UiMode::DeleteConfirm { info: Some(ref info), .. } = self.ui.mode {
-                        self.proto_commands.push(ProtoCommand::RemoveCheckout { branch: info.branch.clone() });
+                    if let UiMode::DeleteConfirm {
+                        info: Some(ref info),
+                        ..
+                    } = self.ui.mode
+                    {
+                        self.proto_commands.push(ProtoCommand::RemoveCheckout {
+                            branch: info.branch.clone(),
+                        });
                     }
                     self.ui.mode = UiMode::Normal;
                 }
@@ -729,9 +818,15 @@ impl App {
 
     fn execute_menu_action(&mut self) {
         let (intent, item) = {
-            let UiMode::ActionMenu { ref items, index } = self.ui.mode else { return; };
-            let Some(&intent) = items.get(index) else { return; };
-            let Some(item) = self.selected_work_item().cloned() else { return; };
+            let UiMode::ActionMenu { ref items, index } = self.ui.mode else {
+                return;
+            };
+            let Some(&intent) = items.get(index) else {
+                return;
+            };
+            let Some(item) = self.selected_work_item().cloned() else {
+                return;
+            };
             (intent, item)
         };
         self.resolve_and_push(intent, &item);

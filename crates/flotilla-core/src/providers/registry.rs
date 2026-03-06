@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use indexmap::IndexMap;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::code_review::CodeReview;
 use crate::providers::coding_agent::CodingAgent;
 use crate::providers::issue_tracker::IssueTracker;
 use crate::providers::vcs::{CheckoutManager, Vcs};
 use crate::providers::workspace::WorkspaceManager;
+use indexmap::IndexMap;
+use std::sync::Arc;
 
 pub struct ProviderRegistry {
     pub vcs: IndexMap<String, Arc<dyn Vcs>>,
@@ -32,5 +32,7 @@ impl ProviderRegistry {
 }
 
 impl Default for ProviderRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

@@ -65,7 +65,14 @@ impl RepoRefreshHandle {
 
                 // Fetch all provider data
                 let mut provider_data = ProviderData::default();
-                let errors = refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, skip_issues_clone.load(Ordering::Relaxed)).await;
+                let errors = refresh_providers(
+                    &mut provider_data,
+                    &repo_root,
+                    &registry,
+                    &criteria,
+                    skip_issues_clone.load(Ordering::Relaxed),
+                )
+                .await;
                 let provider_health = compute_provider_health(&registry, &errors);
 
                 // Correlate
@@ -177,21 +184,84 @@ async fn refresh_providers(
     };
 
     let (checkouts, crs, issues, sessions, branches, merged, workspaces) = tokio::join!(
-        checkouts_fut, cr_fut, issues_fut, sessions_fut, branches_fut, merged_fut, ws_fut
+        checkouts_fut,
+        cr_fut,
+        issues_fut,
+        sessions_fut,
+        branches_fut,
+        merged_fut,
+        ws_fut
     );
 
-    pd.checkouts = checkouts.unwrap_or_else(|e| { errors.push(ProviderError { category: "checkouts", message: e }); Vec::new() })
-        .into_iter().map(|co| (co.path.clone(), co)).collect();
-    pd.change_requests = crs.unwrap_or_else(|e| { errors.push(ProviderError { category: "PRs", message: e }); Vec::new() })
-        .into_iter().map(|cr| (cr.id.clone(), cr)).collect();
-    pd.issues = issues.unwrap_or_else(|e| { errors.push(ProviderError { category: "issues", message: e }); Vec::new() })
-        .into_iter().map(|issue| (issue.id.clone(), issue)).collect();
-    pd.workspaces = workspaces.unwrap_or_else(|e| { errors.push(ProviderError { category: "workspaces", message: e }); Vec::new() })
-        .into_iter().map(|ws| (ws.ws_ref.clone(), ws)).collect();
-    pd.sessions = sessions.unwrap_or_else(|e| { errors.push(ProviderError { category: "sessions", message: e }); Vec::new() })
-        .into_iter().map(|s| (s.id.clone(), s)).collect();
-    pd.remote_branches = branches.unwrap_or_else(|e| { errors.push(ProviderError { category: "branches", message: e }); Vec::new() });
-    pd.merged_branches = merged.unwrap_or_else(|e| { errors.push(ProviderError { category: "merged", message: e }); Vec::new() });
+    pd.checkouts = checkouts
+        .unwrap_or_else(|e| {
+            errors.push(ProviderError {
+                category: "checkouts",
+                message: e,
+            });
+            Vec::new()
+        })
+        .into_iter()
+        .map(|co| (co.path.clone(), co))
+        .collect();
+    pd.change_requests = crs
+        .unwrap_or_else(|e| {
+            errors.push(ProviderError {
+                category: "PRs",
+                message: e,
+            });
+            Vec::new()
+        })
+        .into_iter()
+        .map(|cr| (cr.id.clone(), cr))
+        .collect();
+    pd.issues = issues
+        .unwrap_or_else(|e| {
+            errors.push(ProviderError {
+                category: "issues",
+                message: e,
+            });
+            Vec::new()
+        })
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    pd.workspaces = workspaces
+        .unwrap_or_else(|e| {
+            errors.push(ProviderError {
+                category: "workspaces",
+                message: e,
+            });
+            Vec::new()
+        })
+        .into_iter()
+        .map(|ws| (ws.ws_ref.clone(), ws))
+        .collect();
+    pd.sessions = sessions
+        .unwrap_or_else(|e| {
+            errors.push(ProviderError {
+                category: "sessions",
+                message: e,
+            });
+            Vec::new()
+        })
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    pd.remote_branches = branches.unwrap_or_else(|e| {
+        errors.push(ProviderError {
+            category: "branches",
+            message: e,
+        });
+        Vec::new()
+    });
+    pd.merged_branches = merged.unwrap_or_else(|e| {
+        errors.push(ProviderError {
+            category: "merged",
+            message: e,
+        });
+        Vec::new()
+    });
 
     errors
 }
@@ -202,13 +272,24 @@ fn compute_provider_health(
 ) -> HashMap<&'static str, bool> {
     let mut health = HashMap::new();
     if registry.coding_agents.values().next().is_some() {
-        health.insert("coding_agent", !errors.iter().any(|e| e.category == "sessions"));
+        health.insert(
+            "coding_agent",
+            !errors.iter().any(|e| e.category == "sessions"),
+        );
     }
     if registry.code_review.values().next().is_some() {
-        health.insert("code_review", !errors.iter().any(|e| e.category == "PRs" || e.category == "merged"));
+        health.insert(
+            "code_review",
+            !errors
+                .iter()
+                .any(|e| e.category == "PRs" || e.category == "merged"),
+        );
     }
     if registry.issue_trackers.values().next().is_some() {
-        health.insert("issue_tracker", !errors.iter().any(|e| e.category == "issues"));
+        health.insert(
+            "issue_tracker",
+            !errors.iter().any(|e| e.category == "issues"),
+        );
     }
     health
 }

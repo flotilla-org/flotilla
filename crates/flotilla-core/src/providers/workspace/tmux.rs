@@ -64,8 +64,8 @@ impl TmuxWorkspaceManager {
 
     /// Return the state file path: `~/.config/flotilla/tmux/{session}/state.toml`.
     fn state_path(session: &str) -> Result<PathBuf, String> {
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| "could not determine config directory".to_string())?;
+        let config_dir =
+            dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
         Ok(config_dir
             .join("flotilla")
             .join("tmux")

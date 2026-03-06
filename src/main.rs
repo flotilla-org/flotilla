@@ -1,19 +1,22 @@
+use flotilla_core::config;
+use flotilla_core::data;
+use flotilla_core::providers;
 use flotilla_tui::app;
 use flotilla_tui::event;
 use flotilla_tui::event_log;
 use flotilla_tui::event_log::LevelExt;
 use flotilla_tui::ui;
-use flotilla_core::config;
-use flotilla_core::data;
-use flotilla_core::providers;
 
+use clap::Parser;
+use color_eyre::Result;
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
+};
 use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use clap::Parser;
-use color_eyre::Result;
-use crossterm::{execute, event::{EnableMouseCapture, DisableMouseCapture}};
 use tracing::info;
 /// Flotilla: TUI dashboard for managing development workspaces across terminal multiplexers, source code checkouts and cloud agent services.
 #[derive(Parser)]
@@ -38,7 +41,11 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    info!("config loaded: {} repo(s) in {:.0?}", repo_roots.len(), startup.elapsed());
+    info!(
+        "config loaded: {} repo(s) in {:.0?}",
+        repo_roots.len(),
+        startup.elapsed()
+    );
 
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
@@ -81,7 +88,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                     }
                 }
                 event::Event::Mouse(m) => {
-                    use crossterm::event::{MouseEventKind, MouseButton};
+                    use crossterm::event::{MouseButton, MouseEventKind};
                     match m.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             let x = m.column;
@@ -90,7 +97,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
 
                             // Check event log filter area (click cycles level)
                             let ef = app.ui.layout.event_log_filter_area;
-                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height {
+                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height
+                            {
                                 app.ui.event_log.filter = app.ui.event_log.filter.cycle();
                                 app.ui.event_log.count = 0;
                                 tab_clicked = true;
@@ -98,9 +106,18 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
 
                             // Check which tab area was clicked
                             if !tab_clicked {
-                                let hit = app.ui.layout.tab_areas.iter().find(|(_, r)| {
-                                    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-                                }).map(|(id, _)| id.clone());
+                                let hit = app
+                                    .ui
+                                    .layout
+                                    .tab_areas
+                                    .iter()
+                                    .find(|(_, r)| {
+                                        x >= r.x
+                                            && x < r.x + r.width
+                                            && y >= r.y
+                                            && y < r.y + r.height
+                                    })
+                                    .map(|(id, _)| id.clone());
 
                                 match hit {
                                     Some(app::TabId::Flotilla) => {
@@ -122,7 +139,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                                     }
                                     Some(app::TabId::Add) => {
                                         let mut input = tui_input::Input::default();
-                                        if let Some(parent) = app.model.active_repo_root().parent() {
+                                        if let Some(parent) = app.model.active_repo_root().parent()
+                                        {
                                             let parent_str = format!("{}/", parent.display());
                                             input = tui_input::Input::from(parent_str.as_str());
                                         }
@@ -145,7 +163,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                         MouseEventKind::Drag(MouseButton::Left) => {
                             if let Some(dragging_idx) = app.ui.drag.dragging_tab {
                                 if !app.ui.drag.active {
-                                    let dx = (m.column as i16 - app.ui.drag.start_x as i16).unsigned_abs();
+                                    let dx = (m.column as i16 - app.ui.drag.start_x as i16)
+                                        .unsigned_abs();
                                     if dx >= 2 {
                                         app.ui.drag.active = true;
                                     }
@@ -203,7 +222,14 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
 /// Check all repo watch channels for new snapshots and apply them.
 fn drain_snapshots(app: &mut app::App) {
     let app::App { model, ui, .. } = app;
-    let app::AppModel { repos, repo_order, provider_statuses, active_repo, status_message, .. } = model;
+    let app::AppModel {
+        repos,
+        repo_order,
+        provider_statuses,
+        active_repo,
+        status_message,
+        ..
+    } = model;
 
     let mut all_errors: Vec<String> = Vec::new();
 
@@ -216,7 +242,8 @@ fn drain_snapshots(app: &mut app::App) {
 
         let snapshot = handle.snapshot_rx.borrow_and_update().clone();
 
-        let old_providers = std::mem::replace(&mut rm.data.providers, Arc::clone(&snapshot.providers));
+        let old_providers =
+            std::mem::replace(&mut rm.data.providers, Arc::clone(&snapshot.providers));
         // Apply snapshot to DataStore
         rm.data.correlation_groups = snapshot.correlation_groups.clone();
         rm.data.provider_health = snapshot.provider_health.clone();
@@ -230,16 +257,20 @@ fn drain_snapshots(app: &mut app::App) {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.sessions.section.clone(),
         };
-        let table_view = data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
+        let table_view =
+            data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
 
         // Handle issues_disabled — tell the background task to stop querying,
         // and suppress from provider health display
-        let issues_disabled = snapshot.errors.iter().any(|e|
-            e.category == "issues" && e.message.contains("has disabled issues")
-        );
+        let issues_disabled = snapshot
+            .errors
+            .iter()
+            .any(|e| e.category == "issues" && e.message.contains("has disabled issues"));
         if issues_disabled {
             rm.data.provider_health.remove("issue_tracker");
-            handle.skip_issues.store(true, std::sync::atomic::Ordering::Relaxed);
+            handle
+                .skip_issues
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Provider health -> model-level statuses
@@ -252,7 +283,11 @@ fn drain_snapshots(app: &mut app::App) {
             };
             if let Some(pname) = provider_name {
                 let key = (path.clone(), kind.to_string(), pname.clone());
-                let status = if *healthy { app::ProviderStatus::Ok } else { app::ProviderStatus::Error };
+                let status = if *healthy {
+                    app::ProviderStatus::Ok
+                } else {
+                    app::ProviderStatus::Error
+                };
                 provider_statuses.insert(key, status);
             }
         }
@@ -267,7 +302,8 @@ fn drain_snapshots(app: &mut app::App) {
         // Store table view on UI state and restore selection by identity
         if let Some(rui) = ui.repo_ui.get_mut(path) {
             // Save current selection identity
-            let prev_identity = rui.selected_selectable_idx
+            let prev_identity = rui
+                .selected_selectable_idx
                 .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
                 .and_then(|ti| match rui.table_view.table_entries.get(ti) {
                     Some(data::TableEntry::Item(item)) => Some(item.identity()),
@@ -281,40 +317,53 @@ fn drain_snapshots(app: &mut app::App) {
                 rui.selected_selectable_idx = None;
                 rui.table_state.select(None);
             } else if let Some(ref identity) = prev_identity {
-                let found = rui.table_view.selectable_indices.iter().enumerate().find(|(_, &ti)| {
-                    matches!(
-                        rui.table_view.table_entries.get(ti),
-                        Some(data::TableEntry::Item(item)) if item.identity() == *identity
-                    )
-                });
+                let found =
+                    rui.table_view
+                        .selectable_indices
+                        .iter()
+                        .enumerate()
+                        .find(|(_, &ti)| {
+                            matches!(
+                                rui.table_view.table_entries.get(ti),
+                                Some(data::TableEntry::Item(item)) if item.identity() == *identity
+                            )
+                        });
                 if let Some((si, &ti)) = found {
                     rui.selected_selectable_idx = Some(si);
                     rui.table_state.select(Some(ti));
                 } else {
                     // Item was removed — select first
                     rui.selected_selectable_idx = Some(0);
-                    rui.table_state.select(Some(rui.table_view.selectable_indices[0]));
+                    rui.table_state
+                        .select(Some(rui.table_view.selectable_indices[0]));
                 }
             } else {
                 rui.selected_selectable_idx = Some(0);
-                rui.table_state.select(Some(rui.table_view.selectable_indices[0]));
+                rui.table_state
+                    .select(Some(rui.table_view.selectable_indices[0]));
             }
 
             // Clean up stale multi-select identities
-            let current_identities: std::collections::HashSet<data::WorkItemIdentity> = rui.table_view.table_entries.iter()
+            let current_identities: std::collections::HashSet<data::WorkItemIdentity> = rui
+                .table_view
+                .table_entries
+                .iter()
                 .filter_map(|e| match e {
                     data::TableEntry::Item(item) => Some(item.identity()),
                     _ => None,
                 })
                 .collect();
-            rui.multi_selected.retain(|id| current_identities.contains(id));
+            rui.multi_selected
+                .retain(|id| current_identities.contains(id));
         }
 
         // Log errors
         if !snapshot.errors.is_empty() {
             let name = app::AppModel::repo_name(path);
             for e in &snapshot.errors {
-                if issues_disabled && e.category == "issues" { continue; }
+                if issues_disabled && e.category == "issues" {
+                    continue;
+                }
                 tracing::error!("{name}: {}: {}", e.category, e.message);
                 all_errors.push(format!("{name}: {}: {}", e.category, e.message));
             }
@@ -336,8 +385,7 @@ fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let img_w = dyn_img.width() as f64;
     let img_h = dyn_img.height() as f64;
 
-    let picker = Picker::from_query_stdio()
-        .unwrap_or_else(|_| Picker::halfblocks());
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     let mut protocol = picker.new_resize_protocol(dyn_img);
 
     let deadline = std::time::Instant::now() + Duration::from_millis(700);

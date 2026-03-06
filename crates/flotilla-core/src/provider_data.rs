@@ -1,6 +1,6 @@
-use std::path::PathBuf;
-use indexmap::IndexMap;
 use crate::providers::types::*;
+use indexmap::IndexMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProviderData {

@@ -1,13 +1,13 @@
 use async_trait::async_trait;
+use reqwest;
 use serde::Deserialize;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
-use reqwest;
 
-use tracing::{info, debug, warn};
 use crate::providers::types::*;
+use tracing::{debug, info, warn};
 
 pub struct ClaudeCodingAgent {
     provider_name: String,
@@ -47,11 +47,8 @@ struct AuthCache {
     token: Option<OAuthToken>,
 }
 
-static AUTH_CACHE: LazyLock<Mutex<AuthCache>> = LazyLock::new(|| {
-    Mutex::new(AuthCache {
-        token: None,
-    })
-});
+static AUTH_CACHE: LazyLock<Mutex<AuthCache>> =
+    LazyLock::new(|| Mutex::new(AuthCache { token: None }));
 
 /// Guard so the "sessions unavailable" warning is emitted only once per process.
 static AUTH_WARNED: AtomicBool = AtomicBool::new(false);
@@ -133,7 +130,12 @@ const SESSIONS_CACHE_TTL_SECS: u64 = 30;
 
 async fn read_oauth_token_from_keychain() -> Result<OAuthToken, String> {
     let output = tokio::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .stdin(Stdio::null())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -251,7 +253,10 @@ impl super::CodingAgent for ClaudeCodingAgent {
         "Claude Sessions"
     }
 
-    async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<CloudAgentSession>, String> {
+    async fn list_sessions(
+        &self,
+        criteria: &RepoCriteria,
+    ) -> Result<Vec<CloudAgentSession>, String> {
         // Check instance cache
         let cached = {
             let cache = self.sessions_cache.lock().unwrap();

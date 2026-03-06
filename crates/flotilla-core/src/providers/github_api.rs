@@ -75,7 +75,11 @@ impl GhApiClient {
             cache.get(endpoint).map(|e| e.etag.clone())
         };
 
-        let mut args = vec!["api".to_string(), "--include".to_string(), endpoint.to_string()];
+        let mut args = vec![
+            "api".to_string(),
+            "--include".to_string(),
+            endpoint.to_string(),
+        ];
         if let Some(ref etag) = cached_etag {
             args.push("-H".to_string());
             args.push(format!("If-None-Match: {}", etag));
@@ -153,7 +157,12 @@ mod tests {
         for header in ["Etag: \"x\"", "etag: \"x\"", "ETag: \"x\"", "ETAG: \"x\""] {
             let raw = format!("HTTP/2.0 200 OK\r\n{}\r\n\r\n{{}}", header);
             let result = parse_gh_api_response(&raw);
-            assert_eq!(result.etag, Some("\"x\"".to_string()), "failed for: {}", header);
+            assert_eq!(
+                result.etag,
+                Some("\"x\"".to_string()),
+                "failed for: {}",
+                header
+            );
         }
     }
 

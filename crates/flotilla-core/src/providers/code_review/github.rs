@@ -1,8 +1,8 @@
+use crate::providers::github_api::{clamp_per_page, GhApiClient};
+use crate::providers::types::*;
+use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
-use async_trait::async_trait;
-use crate::providers::types::*;
-use crate::providers::github_api::{GhApiClient, clamp_per_page};
 
 pub struct GitHubCodeReview {
     provider_name: String,
@@ -24,7 +24,11 @@ use crate::providers::run_cmd;
 
 impl GitHubCodeReview {
     pub fn new(provider_name: String, repo_slug: String, api: Arc<GhApiClient>) -> Self {
-        Self { provider_name, repo_slug, api }
+        Self {
+            provider_name,
+            repo_slug,
+            api,
+        }
     }
 
     fn parse_state(state: &str) -> ChangeRequestStatus {
@@ -49,8 +53,7 @@ impl GitHubCodeReview {
                 let rest = &lower[after..];
                 let rest = rest.trim_start();
                 if let Some(rest) = rest.strip_prefix('#') {
-                    let num_str: String =
-                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if !num_str.is_empty() && !issues.contains(&num_str) {
                         issues.push(num_str);
                     }
@@ -73,8 +76,7 @@ impl GitHubCodeReview {
         let texts = [pr.title.as_str(), pr.body.as_deref().unwrap_or("")];
         for text in texts {
             for issue_num in Self::parse_linked_issues(text) {
-                let key =
-                    AssociationKey::IssueRef(self.provider_name.clone(), issue_num);
+                let key = AssociationKey::IssueRef(self.provider_name.clone(), issue_num);
                 if !association_keys.contains(&key) {
                     association_keys.push(key);
                 }
@@ -105,9 +107,15 @@ impl super::CodeReview for GitHubCodeReview {
         "GitHub Pull Requests"
     }
 
-    fn section_label(&self) -> &str { "Pull Requests" }
-    fn item_noun(&self) -> &str { "pull request" }
-    fn abbreviation(&self) -> &str { "PR" }
+    fn section_label(&self) -> &str {
+        "Pull Requests"
+    }
+    fn item_noun(&self) -> &str {
+        "pull request"
+    }
+    fn abbreviation(&self) -> &str {
+        "PR"
+    }
 
     async fn list_change_requests(
         &self,
@@ -153,12 +161,14 @@ impl super::CodeReview for GitHubCodeReview {
     ) -> Result<ChangeRequest, String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
         let body = self.api.get(&endpoint, repo_root).await?;
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         let number = v["number"].as_i64().ok_or("missing number")?;
         let title = v["title"].as_str().ok_or("missing title")?.to_string();
-        let head_ref = v["head"]["ref"].as_str().ok_or("missing head ref")?.to_string();
+        let head_ref = v["head"]["ref"]
+            .as_str()
+            .ok_or("missing head ref")?
+            .to_string();
         let state = v["state"].as_str().unwrap_or("open").to_string();
         let body_text = v["body"].as_str().map(|s| s.to_string());
         let is_draft = v["draft"].as_bool().unwrap_or(false);
@@ -174,13 +184,8 @@ impl super::CodeReview for GitHubCodeReview {
         Ok(self.gh_pr_to_change_request(&pr))
     }
 
-    async fn open_in_browser(
-        &self,
-        repo_root: &Path,
-        id: &str,
-    ) -> Result<(), String> {
-        run_cmd("gh", &["pr", "view", id, "--web"], repo_root)
-            .await?;
+    async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
+        run_cmd("gh", &["pr", "view", id, "--web"], repo_root).await?;
         Ok(())
     }
 

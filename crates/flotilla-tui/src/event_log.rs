@@ -195,9 +195,8 @@ impl EventLog {
 /// Local wall-clock time as (hour, minute, second).
 fn wall_hms() -> (u8, u8, u8) {
     let now = time::OffsetDateTime::now_utc();
-    let local = now.to_offset(
-        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC),
-    );
+    let local =
+        now.to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
     (local.hour(), local.minute(), local.second())
 }
 

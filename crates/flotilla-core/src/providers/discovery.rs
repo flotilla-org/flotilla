@@ -3,8 +3,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use super::{command_exists, resolve_claude_path};
-use tokio::process::Command;
-use tracing::{info, warn};
+use crate::config;
 use crate::providers::ai_utility::claude::ClaudeAiUtility;
 use crate::providers::code_review::github::GitHubCodeReview;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
@@ -15,9 +14,10 @@ use crate::providers::vcs::git::GitVcs;
 use crate::providers::vcs::git_worktree::GitCheckoutManager;
 use crate::providers::vcs::wt::WtCheckoutManager;
 use crate::providers::workspace::cmux::CmuxWorkspaceManager;
-use crate::config;
 use crate::providers::workspace::tmux::TmuxWorkspaceManager;
 use crate::providers::workspace::zellij::ZellijWorkspaceManager;
+use tokio::process::Command;
+use tracing::{info, warn};
 
 /// Extract the first git remote URL for this repo.
 pub async fn first_remote_url(repo_root: &Path) -> Option<String> {
@@ -127,16 +127,20 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
                     .insert("git".to_string(), Arc::new(WtCheckoutManager::new()));
                 info!("{repo_name}: Checkout mgr → wt (forced)");
             } else {
-                tracing::warn!("{repo_name}: provider = \"wt\" but wt not found in PATH, falling back to git");
-                registry
-                    .checkout_managers
-                    .insert("git".to_string(), Arc::new(GitCheckoutManager::new(co_config)));
+                tracing::warn!(
+                    "{repo_name}: provider = \"wt\" but wt not found in PATH, falling back to git"
+                );
+                registry.checkout_managers.insert(
+                    "git".to_string(),
+                    Arc::new(GitCheckoutManager::new(co_config)),
+                );
             }
         }
         "git" => {
-            registry
-                .checkout_managers
-                .insert("git".to_string(), Arc::new(GitCheckoutManager::new(co_config)));
+            registry.checkout_managers.insert(
+                "git".to_string(),
+                Arc::new(GitCheckoutManager::new(co_config)),
+            );
             info!("{repo_name}: Checkout mgr → git (forced)");
         }
         _ => {
@@ -147,9 +151,10 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
                     .insert("git".to_string(), Arc::new(WtCheckoutManager::new()));
                 info!("{repo_name}: Checkout mgr → wt");
             } else {
-                registry
-                    .checkout_managers
-                    .insert("git".to_string(), Arc::new(GitCheckoutManager::new(co_config)));
+                registry.checkout_managers.insert(
+                    "git".to_string(),
+                    Arc::new(GitCheckoutManager::new(co_config)),
+                );
                 info!("{repo_name}: Checkout mgr → git (fallback)");
             }
         }
@@ -164,7 +169,11 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
                 let api = Arc::new(GhApiClient::new());
                 registry.code_review.insert(
                     "github".to_string(),
-                    Arc::new(GitHubCodeReview::new("github".to_string(), slug.clone(), Arc::clone(&api))),
+                    Arc::new(GitHubCodeReview::new(
+                        "github".to_string(),
+                        slug.clone(),
+                        Arc::clone(&api),
+                    )),
                 );
                 registry.issue_trackers.insert(
                     "github".to_string(),
@@ -185,9 +194,10 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
             "claude".to_string(),
             Arc::new(ClaudeCodingAgent::new("claude".to_string())),
         );
-        registry
-            .ai_utilities
-            .insert("claude".to_string(), Arc::new(ClaudeAiUtility::new(claude_bin)));
+        registry.ai_utilities.insert(
+            "claude".to_string(),
+            Arc::new(ClaudeAiUtility::new(claude_bin)),
+        );
         info!("{repo_name}: Coding agent → Claude Sessions");
         info!("{repo_name}: AI utility → Claude");
     }
@@ -197,10 +207,8 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
     if std::env::var("CMUX_SOCKET_PATH").is_ok() {
         let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
         if cmux_bin.exists() {
-            registry.workspace_manager = Some((
-                "cmux".to_string(),
-                Arc::new(CmuxWorkspaceManager::new()),
-            ));
+            registry.workspace_manager =
+                Some(("cmux".to_string(), Arc::new(CmuxWorkspaceManager::new())));
             info!("{repo_name}: Workspace mgr → cmux");
         }
     } else if std::env::var("ZELLIJ").is_ok() {
@@ -212,19 +220,15 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
             info!("{repo_name}: Workspace mgr → zellij");
         }
     } else if std::env::var("TMUX").is_ok() {
-        registry.workspace_manager = Some((
-            "tmux".to_string(),
-            Arc::new(TmuxWorkspaceManager::new()),
-        ));
+        registry.workspace_manager =
+            Some(("tmux".to_string(), Arc::new(TmuxWorkspaceManager::new())));
         info!("{repo_name}: Workspace mgr → tmux");
     } else {
         // Fallback: cmux binary exists but not running inside cmux
         let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
         if cmux_bin.exists() {
-            registry.workspace_manager = Some((
-                "cmux".to_string(),
-                Arc::new(CmuxWorkspaceManager::new()),
-            ));
+            registry.workspace_manager =
+                Some(("cmux".to_string(), Arc::new(CmuxWorkspaceManager::new())));
             info!("{repo_name}: Workspace mgr → cmux (binary found, not running inside cmux)");
         }
     }

@@ -6,8 +6,7 @@
 use std::path::Path;
 
 use flotilla_protocol::{
-    ProtoCheckoutRef, ProtoError, ProtoWorkItem, ProtoWorkItemIdentity, ProtoWorkItemKind,
-    Snapshot,
+    ProtoCheckoutRef, ProtoError, ProtoWorkItem, ProtoWorkItemIdentity, ProtoWorkItemKind, Snapshot,
 };
 
 use crate::data::{ProviderError, WorkItem, WorkItemIdentity, WorkItemKind};

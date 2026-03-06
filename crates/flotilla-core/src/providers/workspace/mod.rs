@@ -2,8 +2,8 @@ pub mod cmux;
 pub mod tmux;
 pub mod zellij;
 
-use async_trait::async_trait;
 use crate::providers::types::{Workspace, WorkspaceConfig};
+use async_trait::async_trait;
 
 #[async_trait]
 pub trait WorkspaceManager: Send + Sync {
