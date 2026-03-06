@@ -6,7 +6,7 @@ Development fleet management. Agents, branches, PRs, and workspaces across every
 
 ![screenshot](assets/screenshot.png)
 
-FLotilla in cmux: Each row correlates a branch with its PR, agent sessions, and workspace automatically.
+Flotilla in cmux: Each row correlates a branch with its PR, agent sessions, and workspace automatically.
 
 ## Integrations
 
