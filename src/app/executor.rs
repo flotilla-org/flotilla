@@ -89,7 +89,44 @@ pub async fn execute(cmd: Command, app: &mut App) {
                 let _ = it.open_in_browser(&repo, &id).await;
             }
         }
-        Command::CreateWorktree { branch, create_branch } => {
+        Command::LinkIssuesToPr { pr_id, issue_ids } => {
+            info!("linking issues {:?} to PR #{pr_id}", issue_ids);
+            let repo = app.model.active_repo_root().clone();
+            let body_result = providers::run_cmd(
+                "gh",
+                &["pr", "view", &pr_id, "--json", "body", "--jq", ".body"],
+                &repo,
+            ).await;
+            match body_result {
+                Ok(current_body) => {
+                    let fixes_lines: Vec<String> = issue_ids.iter()
+                        .map(|id| format!("Fixes #{id}"))
+                        .collect();
+                    let new_body = if current_body.trim().is_empty() {
+                        fixes_lines.join("\n")
+                    } else {
+                        format!("{}\n\n{}", current_body.trim(), fixes_lines.join("\n"))
+                    };
+                    let result = providers::run_cmd(
+                        "gh",
+                        &["pr", "edit", &pr_id, "--body", &new_body],
+                        &repo,
+                    ).await;
+                    if let Err(e) = result {
+                        error!("failed to edit PR: {e}");
+                        app.model.status_message = Some(e);
+                    } else {
+                        info!("linked issues to PR #{pr_id}");
+                    }
+                }
+                Err(e) => {
+                    error!("failed to read PR body: {e}");
+                    app.model.status_message = Some(e);
+                }
+            }
+            trigger_active_refresh(app);
+        }
+        Command::CreateWorktree { branch, create_branch, issue_ids } => {
             info!("creating {} {branch}", app.model.active_labels().checkouts.noun);
             let repo = app.model.active_repo_root().clone();
             let checkout_result = if let Some(cm) = app.model.active().registry.checkout_managers.values().next() {
@@ -99,6 +136,10 @@ pub async fn execute(cmd: Command, app: &mut App) {
             };
             match checkout_result {
                 Some(Ok(checkout)) => {
+                    // Write issue links to git config
+                    if !issue_ids.is_empty() {
+                        write_branch_issue_links(app.model.active_repo_root(), &branch, &issue_ids).await;
+                    }
                     info!("created {} at {}", app.model.active_labels().checkouts.noun, checkout.path.display());
                     let ws_result = if let Some((_, ws_mgr)) = &app.model.active().registry.workspace_manager {
                         let config = workspace_config(app.model.active_repo_root(), &branch, &checkout.path, "claude");
@@ -170,6 +211,15 @@ pub async fn execute(cmd: Command, app: &mut App) {
                 .map(|issue| (issue.id.clone(), issue.title.clone()))
                 .collect();
 
+            // Collect (provider_name, issue_id) pairs for the created branch
+            let issue_id_pairs: Vec<(String, String)> = {
+                let provider = app.model.active().registry.issue_trackers
+                    .keys().next().cloned().unwrap_or_else(|| "github".to_string());
+                issues.iter()
+                    .map(|(id, _title)| (provider.clone(), id.clone()))
+                    .collect()
+            };
+
             info!("generating branch name");
             let branch_result = if let Some(ai) = app.model.active().registry.ai_utilities.values().next() {
                 let context: Vec<String> = issues.iter()
@@ -187,13 +237,13 @@ pub async fn execute(cmd: Command, app: &mut App) {
             match branch_result {
                 Some(Ok(branch)) => {
                     info!("AI suggested: {branch}");
-                    app.prefill_branch_input(&branch);
+                    app.prefill_branch_input(&branch, issue_id_pairs);
                 }
                 _ => {
                     let fallback: Vec<String> = issues.iter()
                         .map(|(id, _)| format!("issue-{}", id))
                         .collect();
-                    app.prefill_branch_input(&fallback.join("-"));
+                    app.prefill_branch_input(&fallback.join("-"), issue_id_pairs);
                 }
             }
         }
@@ -233,5 +283,20 @@ pub fn workspace_config(
 fn trigger_active_refresh(app: &App) {
     if let Some(handle) = &app.model.active().refresh_handle {
         handle.trigger_refresh();
+    }
+}
+
+async fn write_branch_issue_links(repo_root: &std::path::Path, branch: &str, issue_ids: &[(String, String)]) {
+    use std::collections::HashMap;
+    let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (provider, id) in issue_ids {
+        by_provider.entry(provider.as_str()).or_default().push(id.as_str());
+    }
+    for (provider, ids) in by_provider {
+        let key = format!("branch.{branch}.flotilla.issues.{provider}");
+        let value = ids.join(",");
+        if let Err(e) = crate::providers::run_cmd("git", &["config", &key, &value], repo_root).await {
+            tracing::warn!("failed to write issue link: {e}");
+        }
     }
 }

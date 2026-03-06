@@ -652,7 +652,7 @@ fn render_action_menu(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
 }
 
 fn render_input_popup(ui: &UiState, frame: &mut Frame) {
-    let UiMode::BranchInput { ref input, generating } = ui.mode else { return; };
+    let UiMode::BranchInput { ref input, generating, .. } = ui.mode else { return; };
 
     let area = popup_area(frame.area(), 50, 20);
     frame.render_widget(Clear, area);

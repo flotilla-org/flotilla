@@ -262,6 +262,21 @@ pub fn correlate(providers: &ProviderData) -> (Vec<WorkItem>, Vec<CorrelatedGrou
             }
         }
 
+        // Also link issues via association keys on checkouts (from git config)
+        if let Some(ref co_key) = work_item.checkout_key {
+            if let Some(co) = providers.checkouts.get(co_key) {
+                for key in &co.association_keys {
+                    let AssociationKey::IssueRef(_, issue_id) = key;
+                    if providers.issues.contains_key(issue_id.as_str())
+                        && !work_item.issue_keys.contains(issue_id)
+                    {
+                        work_item.issue_keys.push(issue_id.clone());
+                        linked_issue_keys.insert(issue_id.clone());
+                    }
+                }
+            }
+        }
+
         work_items.push(work_item);
     }
 
@@ -483,6 +498,57 @@ mod tests {
             ..default_work_item()
         };
         assert_eq!(wi.identity(), Some(WorkItemIdentity::RemoteBranch("feature/x".to_string())));
+    }
+
+    #[test]
+    fn checkout_association_keys_link_issues() {
+        use crate::provider_data::ProviderData;
+        use crate::providers::types::*;
+
+        let mut providers = ProviderData::default();
+
+        // A checkout with an association key pointing to issue "42"
+        let co_path = PathBuf::from("/tmp/feat-x");
+        providers.checkouts.insert(co_path.clone(), Checkout {
+            branch: "feat-x".to_string(),
+            path: co_path.clone(),
+            is_trunk: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![
+                CorrelationKey::Branch("feat-x".to_string()),
+                CorrelationKey::CheckoutPath(co_path.clone()),
+            ],
+            association_keys: vec![
+                AssociationKey::IssueRef("github".to_string(), "42".to_string()),
+            ],
+        });
+
+        // An issue with id "42"
+        providers.issues.insert("42".to_string(), Issue {
+            id: "42".to_string(),
+            title: "Fix the thing".to_string(),
+            labels: vec![],
+            association_keys: vec![],
+        });
+
+        let (work_items, _groups) = correlate(&providers);
+
+        // The checkout work item should have issue "42" linked
+        let checkout_wi = work_items.iter()
+            .find(|wi| wi.kind == WorkItemKind::Checkout)
+            .expect("should have a checkout work item");
+        assert!(checkout_wi.issue_keys.contains(&"42".to_string()),
+            "checkout should link issue 42 via association key, got: {:?}", checkout_wi.issue_keys);
+
+        // Issue "42" should NOT appear as a standalone work item
+        let standalone_issues: Vec<_> = work_items.iter()
+            .filter(|wi| wi.kind == WorkItemKind::Issue)
+            .collect();
+        assert!(standalone_issues.is_empty(),
+            "issue 42 should be linked, not standalone");
     }
 }
 

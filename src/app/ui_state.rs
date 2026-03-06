@@ -30,6 +30,8 @@ pub enum UiMode {
     BranchInput {
         input: Input,
         generating: bool,
+        /// Issue IDs to link to the branch when created (provider_name, issue_id).
+        pending_issue_ids: Vec<(String, String)>,
     },
     FilePicker {
         input: Input,

@@ -136,7 +136,7 @@ impl GitCheckoutManager {
         let trunk_ref = format!("HEAD...{default_branch}");
         let remote_ref = format!("HEAD...origin/{branch}");
 
-        let (trunk_ab, remote_ab, wt_status, commit) = tokio::join!(
+        let (trunk_ab, remote_ab, wt_status, commit, issue_links) = tokio::join!(
             async {
                 if !is_trunk {
                     run_cmd(
@@ -180,6 +180,9 @@ impl GitCheckoutManager {
                         })
                     })
             },
+            async {
+                super::read_branch_issue_links(path, branch).await
+            },
         );
 
         Checkout {
@@ -191,6 +194,7 @@ impl GitCheckoutManager {
             working_tree: wt_status,
             last_commit: commit,
             correlation_keys,
+            association_keys: issue_links,
         }
     }
 }

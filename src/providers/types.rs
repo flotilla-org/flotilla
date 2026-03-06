@@ -42,6 +42,7 @@ pub struct Checkout {
     pub working_tree: Option<WorkingTreeStatus>,
     pub last_commit: Option<CommitInfo>,
     pub correlation_keys: Vec<CorrelationKey>,
+    pub association_keys: Vec<AssociationKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

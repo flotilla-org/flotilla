@@ -115,10 +115,11 @@ impl App {
         true
     }
 
-    pub fn prefill_branch_input(&mut self, branch_name: &str) {
+    pub fn prefill_branch_input(&mut self, branch_name: &str, pending_issue_ids: Vec<(String, String)>) {
         self.ui.mode = UiMode::BranchInput {
             input: Input::from(branch_name),
             generating: false,
+            pending_issue_ids,
         };
     }
 
@@ -203,6 +204,7 @@ impl App {
                 self.ui.mode = UiMode::BranchInput {
                     input: Input::default(),
                     generating: false,
+                    pending_issue_ids: Vec::new(),
                 };
             }
             KeyCode::Char('d') => self.dispatch_if_available(Intent::RemoveWorktree),
@@ -425,6 +427,7 @@ impl App {
             self.ui.mode = UiMode::BranchInput {
                 input: Input::default(),
                 generating: true,
+                pending_issue_ids: Vec::new(),
             };
             self.commands.push(Command::GenerateBranchName(all_issue_keys));
         }
@@ -453,6 +456,7 @@ impl App {
                     self.ui.mode = UiMode::BranchInput {
                         input: Input::default(),
                         generating: true,
+                        pending_issue_ids: Vec::new(),
                     };
                 }
                 _ => {}
@@ -469,7 +473,7 @@ impl App {
         let items: Vec<Intent> = Intent::all_in_menu_order()
             .iter()
             .copied()
-            .filter(|a| a.is_available(&item))
+            .filter(|a| a.is_available(&item) && a.resolve(&item, self).is_some())
             .collect();
 
         if items.is_empty() {
@@ -514,13 +518,13 @@ impl App {
             return;
         }
         if key.code == KeyCode::Enter {
-            let branch = if let UiMode::BranchInput { ref input, .. } = self.ui.mode {
-                input.value().to_string()
+            let (branch, issue_ids) = if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
+                (input.value().to_string(), std::mem::take(pending_issue_ids))
             } else {
                 return;
             };
             if !branch.is_empty() {
-                self.commands.push(Command::CreateWorktree { branch, create_branch: true });
+                self.commands.push(Command::CreateWorktree { branch, create_branch: true, issue_ids });
             }
             self.ui.mode = UiMode::Normal;
             return;
