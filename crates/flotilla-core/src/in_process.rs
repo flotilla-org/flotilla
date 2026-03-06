@@ -18,7 +18,7 @@ use crate::config;
 use crate::convert::snapshot_to_proto;
 use crate::daemon::DaemonHandle;
 use crate::executor;
-use crate::model::{AppModel, RepoModel};
+use crate::model::{AppModel, RepoModel, provider_names_from_registry};
 use crate::refresh::RefreshSnapshot;
 
 struct RepoState {
@@ -139,6 +139,8 @@ impl DaemonHandle for InProcessDaemon {
                 result.push(RepoInfo {
                     path: path.clone(),
                     name: AppModel::repo_name(path),
+                    labels: state.model.labels.clone(),
+                    provider_names: provider_names_from_registry(&state.model.registry),
                     provider_health: state
                         .model
                         .data
@@ -208,6 +210,8 @@ impl DaemonHandle for InProcessDaemon {
         let repo_info = RepoInfo {
             path: path.clone(),
             name: AppModel::repo_name(&path),
+            labels: model.labels.clone(),
+            provider_names: provider_names_from_registry(&model.registry),
             provider_health: model
                 .data
                 .provider_health
@@ -241,7 +245,7 @@ impl DaemonHandle for InProcessDaemon {
         config::save_tab_order(&order);
 
         info!("added repo {}", path.display());
-        let _ = self.event_tx.send(DaemonEvent::RepoAdded(repo_info));
+        let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
 
         Ok(())
     }

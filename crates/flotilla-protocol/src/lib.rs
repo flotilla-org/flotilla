@@ -10,7 +10,8 @@ pub use provider_data::{
     CommitInfo, CorrelationKey, Issue, ProviderData, SessionStatus, Workspace, WorkingTreeStatus,
 };
 pub use snapshot::{
-    CheckoutRef, ProviderError, RepoInfo, Snapshot, WorkItem, WorkItemIdentity, WorkItemKind,
+    CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem,
+    WorkItemIdentity, WorkItemKind,
 };
 
 /// Top-level message envelope for the JSON protocol.
@@ -37,7 +38,7 @@ pub enum DaemonEvent {
     #[serde(rename = "snapshot")]
     Snapshot(Box<Snapshot>),
     #[serde(rename = "repo_added")]
-    RepoAdded(RepoInfo),
+    RepoAdded(Box<RepoInfo>),
     #[serde(rename = "repo_removed")]
     RepoRemoved { path: std::path::PathBuf },
     /// Async command completion notification for socket subscribers (Step 2).

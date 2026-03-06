@@ -5,11 +5,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider_data::ProviderData;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryLabels {
+    pub section: String,
+    pub noun: String,
+    pub abbr: String,
+}
+
+impl CategoryLabels {
+    pub fn noun_capitalized(&self) -> String {
+        let mut c = self.noun.chars();
+        match c.next() {
+            None => String::new(),
+            Some(f) => f.to_uppercase().to_string() + c.as_str(),
+        }
+    }
+}
+
+impl Default for CategoryLabels {
+    fn default() -> Self {
+        Self {
+            section: "—".into(),
+            noun: "item".into(),
+            abbr: "".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RepoLabels {
+    pub checkouts: CategoryLabels,
+    pub code_review: CategoryLabels,
+    pub issues: CategoryLabels,
+    pub sessions: CategoryLabels,
+}
+
 /// Repo info for list_repos response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub path: PathBuf,
     pub name: String,
+    pub labels: RepoLabels,
+    pub provider_names: HashMap<String, String>,
     pub provider_health: HashMap<String, bool>,
     pub loading: bool,
 }

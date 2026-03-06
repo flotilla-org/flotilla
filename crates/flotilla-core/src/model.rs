@@ -8,6 +8,8 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::RepoCriteria;
 use crate::refresh::RepoRefreshHandle;
 
+pub use flotilla_protocol::{CategoryLabels, RepoLabels};
+
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderStatus {
@@ -15,75 +17,63 @@ pub enum ProviderStatus {
     Error,
 }
 
-#[derive(Clone, Debug)]
-pub struct CategoryLabels {
-    pub section: String,
-    pub noun: String,
-    pub abbr: String,
-}
-
-impl CategoryLabels {
-    /// Capitalize the noun for use in titles: "worktree" -> "Worktree"
-    pub fn noun_capitalized(&self) -> String {
-        let mut c = self.noun.chars();
-        match c.next() {
-            None => String::new(),
-            Some(f) => f.to_uppercase().to_string() + c.as_str(),
-        }
+pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
+    RepoLabels {
+        checkouts: registry.checkout_managers.values().next()
+            .map(|cm| CategoryLabels {
+                section: cm.section_label().into(),
+                noun: cm.item_noun().into(),
+                abbr: cm.abbreviation().into(),
+            })
+            .unwrap_or_default(),
+        code_review: registry.code_review.values().next()
+            .map(|cr| CategoryLabels {
+                section: cr.section_label().into(),
+                noun: cr.item_noun().into(),
+                abbr: cr.abbreviation().into(),
+            })
+            .unwrap_or_default(),
+        issues: registry.issue_trackers.values().next()
+            .map(|it| CategoryLabels {
+                section: it.section_label().into(),
+                noun: it.item_noun().into(),
+                abbr: it.abbreviation().into(),
+            })
+            .unwrap_or_default(),
+        sessions: registry.coding_agents.values().next()
+            .map(|ca| CategoryLabels {
+                section: ca.section_label().into(),
+                noun: ca.item_noun().into(),
+                abbr: ca.abbreviation().into(),
+            })
+            .unwrap_or_default(),
     }
 }
 
-impl Default for CategoryLabels {
-    fn default() -> Self {
-        Self {
-            section: "—".into(),
-            noun: "item".into(),
-            abbr: "".into(),
-        }
+pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    if let Some(v) = registry.vcs.values().next() {
+        names.insert("vcs".into(), v.display_name().into());
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct RepoLabels {
-    pub checkouts: CategoryLabels,
-    pub code_review: CategoryLabels,
-    pub issues: CategoryLabels,
-    pub sessions: CategoryLabels,
-}
-
-impl RepoLabels {
-    pub fn from_registry(registry: &ProviderRegistry) -> Self {
-        Self {
-            checkouts: registry.checkout_managers.values().next()
-                .map(|cm| CategoryLabels {
-                    section: cm.section_label().into(),
-                    noun: cm.item_noun().into(),
-                    abbr: cm.abbreviation().into(),
-                })
-                .unwrap_or_default(),
-            code_review: registry.code_review.values().next()
-                .map(|cr| CategoryLabels {
-                    section: cr.section_label().into(),
-                    noun: cr.item_noun().into(),
-                    abbr: cr.abbreviation().into(),
-                })
-                .unwrap_or_default(),
-            issues: registry.issue_trackers.values().next()
-                .map(|it| CategoryLabels {
-                    section: it.section_label().into(),
-                    noun: it.item_noun().into(),
-                    abbr: it.abbreviation().into(),
-                })
-                .unwrap_or_default(),
-            sessions: registry.coding_agents.values().next()
-                .map(|ca| CategoryLabels {
-                    section: ca.section_label().into(),
-                    noun: ca.item_noun().into(),
-                    abbr: ca.abbreviation().into(),
-                })
-                .unwrap_or_default(),
-        }
+    if let Some(cm) = registry.checkout_managers.values().next() {
+        names.insert("checkout_manager".into(), cm.display_name().into());
     }
+    if let Some(cr) = registry.code_review.values().next() {
+        names.insert("code_review".into(), cr.display_name().into());
+    }
+    if let Some(it) = registry.issue_trackers.values().next() {
+        names.insert("issue_tracker".into(), it.display_name().into());
+    }
+    if let Some(ca) = registry.coding_agents.values().next() {
+        names.insert("coding_agent".into(), ca.display_name().into());
+    }
+    if let Some(ai) = registry.ai_utilities.values().next() {
+        names.insert("ai_utility".into(), ai.display_name().into());
+    }
+    if let Some((_, wm)) = &registry.workspace_manager {
+        names.insert("workspace_manager".into(), wm.display_name().into());
+    }
+    names
 }
 
 /// Domain and config state — no UI concerns.
@@ -161,7 +151,7 @@ pub struct RepoModel {
 
 impl RepoModel {
     pub fn new(repo_root: PathBuf, registry: ProviderRegistry, repo_slug: Option<String>) -> Self {
-        let labels = RepoLabels::from_registry(&registry);
+        let labels = labels_from_registry(&registry);
         let registry = Arc::new(registry);
         let criteria = RepoCriteria { repo_slug };
         let refresh_handle = RepoRefreshHandle::spawn(
