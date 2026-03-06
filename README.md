@@ -14,13 +14,13 @@ Available tools are auto-detected from your environment, with configurable overr
 
 | Category | Focus | WIP | Future |
 |----------|-------|-----|--------|
-| Version control | git | | jj |
-| Checkouts | git worktrees, worktrunk | | jj workspaces |
-| Code review | GitHub PRs | | GitLab MRs |
-| Issue tracking | GitHub Issues | | Linear, Jira |
-| Cloud coding agents | Claude Code sessions | | Codex, other LLMs |
-| Workspace Managers | cmux | tmux, zellij | |
-| AI delegation (e.g branch naming) | Claude code | | LLM apis, ollama |
+| Version control | [git](https://git-scm.com/) | | [jj](https://martinvonz.github.io/jj/) (#45) |
+| Checkouts | [git worktrees](https://git-scm.com/docs/git-worktree), [worktrunk](https://github.com/nicholasgasior/wt) | | jj workspaces (#45), local clones (#44) |
+| Code review | [GitHub](https://github.com/) PRs | | [GitLab](https://gitlab.com/) MRs (#49) |
+| Issue tracking | [GitHub Issues](https://github.com/features/issues) | | [Linear](https://linear.app/) (#51), [Jira](https://www.atlassian.com/software/jira) (#50) |
+| Cloud coding agents | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions | | [Codex](https://openai.com/index/introducing-codex/) (#52), others (#53) |
+| Workspace managers | [cmux](https://github.com/rjwittams/cmux) | [tmux](https://github.com/tmux/tmux) (#54), [zellij](https://zellij.dev/) (#55) | |
+| AI delegation (e.g branch naming) | Claude Code | | LLM APIs (#56), [ollama](https://ollama.com/) |
 
 ## How it works
 
@@ -50,11 +50,11 @@ Repo root is auto-detected from the current directory if omitted. Multiple repos
 
 ## Future direction
 
-- Web dashboard (alternative/in addition to TUI)
-- Persistent sessions
-- Multi-host coordination - coordinate across your development hosts with a unified view. Hand off sessions to hosts with appropriate resources. 
-- User oriented filtering for large team repos
-- Agent integrations - expose fleet functionality to agents - e.g transferring work items/agent sessions to a host with required resources, like a local GPU or ios simulator. 
+- Web dashboard — alternative/in addition to TUI (#36)
+- Persistent sessions (#32)
+- Multi-host coordination — coordinate across your development hosts with a unified view. Hand off sessions to hosts with appropriate resources. (#33)
+- User-oriented filtering for large team repos (#34)
+- Agent integrations — expose fleet functionality to agents, e.g. transferring work items/agent sessions to a host with required resources, like a local GPU or iOS simulator. (#35)
 
 ## Documentation
 
