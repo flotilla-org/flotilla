@@ -67,6 +67,8 @@ jobs:
           fi
           echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${PERCENT}%\",\"color\":\"${COLOR}\"}" \
             > target/llvm-cov/html/badge.json
+      # NOTE: deploy-pages replaces the entire site. If adding more pages,
+      # refactor to merge artifacts from multiple workflows before deploying.
       - name: Stage under coverage/
         run: |
           mkdir -p _site/coverage
