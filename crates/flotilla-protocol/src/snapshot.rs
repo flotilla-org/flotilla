@@ -17,25 +17,25 @@ pub struct RepoInfo {
 pub struct Snapshot {
     pub seq: u64,
     pub repo: PathBuf,
-    pub work_items: Vec<ProtoWorkItem>,
+    pub work_items: Vec<WorkItem>,
     pub provider_health: HashMap<String, bool>,
-    pub errors: Vec<ProtoError>,
+    pub errors: Vec<ProviderError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtoError {
+pub struct ProviderError {
     pub category: String,
     pub message: String,
 }
 
 /// Serializable work item — flattened from the core WorkItem enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtoWorkItem {
-    pub kind: ProtoWorkItemKind,
-    pub identity: ProtoWorkItemIdentity,
+pub struct WorkItem {
+    pub kind: WorkItemKind,
+    pub identity: WorkItemIdentity,
     pub branch: Option<String>,
     pub description: String,
-    pub checkout: Option<ProtoCheckoutRef>,
+    pub checkout: Option<CheckoutRef>,
     pub pr_key: Option<String>,
     pub session_key: Option<String>,
     pub issue_keys: Vec<String>,
@@ -44,7 +44,7 @@ pub struct ProtoWorkItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum ProtoWorkItemKind {
+pub enum WorkItemKind {
     Checkout,
     Session,
     Pr,
@@ -53,7 +53,7 @@ pub enum ProtoWorkItemKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum ProtoWorkItemIdentity {
+pub enum WorkItemIdentity {
     Checkout(PathBuf),
     ChangeRequest(String),
     Session(String),
@@ -62,7 +62,7 @@ pub enum ProtoWorkItemIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtoCheckoutRef {
+pub struct CheckoutRef {
     pub key: PathBuf,
     pub is_main_worktree: bool,
 }

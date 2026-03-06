@@ -3,38 +3,23 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// Re-export protocol types that are used throughout the crate and by consumers.
+pub use flotilla_protocol::{CheckoutRef, DeleteInfo, WorkItemIdentity, WorkItemKind};
+
 use crate::provider_data::ProviderData;
 use crate::providers::correlation::{self, CorrelatedItem, CorrelatedGroup, ItemKind as CorItemKind, ProviderItemKey};
 use crate::providers::types::AssociationKey;
 
 #[derive(Debug, Clone)]
-pub struct ProviderError {
+pub struct RefreshError {
     pub category: &'static str,
     pub message: String,
 }
 
-impl fmt::Display for ProviderError {
+impl fmt::Display for RefreshError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.category, self.message)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WorkItemKind {
-    Checkout,
-    Session,
-    Pr,
-    RemoteBranch,
-    Issue,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum WorkItemIdentity {
-    Checkout(PathBuf),
-    ChangeRequest(String),
-    Session(String),
-    Issue(String),
-    RemoteBranch(String),
 }
 
 
@@ -50,13 +35,7 @@ impl fmt::Display for SectionHeader {
 #[derive(Debug, Clone)]
 pub enum TableEntry {
     Header(SectionHeader),
-    Item(WorkItem),
-}
-
-#[derive(Debug, Clone)]
-pub struct CheckoutRef {
-    pub key: PathBuf,
-    pub is_main_worktree: bool,
+    Item(CorrelationResult),
 }
 
 #[derive(Debug, Clone)]
@@ -79,51 +58,51 @@ pub struct CorrelatedWorkItem {
 }
 
 #[derive(Debug, Clone)]
-pub enum StandaloneWorkItem {
+pub enum StandaloneResult {
     Issue { key: String, description: String },
     RemoteBranch { branch: String },
 }
 
 #[derive(Debug, Clone)]
-pub enum WorkItem {
+pub enum CorrelationResult {
     Correlated(CorrelatedWorkItem),
-    Standalone(StandaloneWorkItem),
+    Standalone(StandaloneResult),
 }
 
-impl WorkItem {
+impl CorrelationResult {
     pub fn kind(&self) -> WorkItemKind {
         match self {
-            WorkItem::Correlated(c) => match &c.anchor {
+            CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(_) => WorkItemKind::Checkout,
                 CorrelatedAnchor::Pr(_) => WorkItemKind::Pr,
                 CorrelatedAnchor::Session(_) => WorkItemKind::Session,
             },
-            WorkItem::Standalone(s) => match s {
-                StandaloneWorkItem::Issue { .. } => WorkItemKind::Issue,
-                StandaloneWorkItem::RemoteBranch { .. } => WorkItemKind::RemoteBranch,
+            CorrelationResult::Standalone(s) => match s {
+                StandaloneResult::Issue { .. } => WorkItemKind::Issue,
+                StandaloneResult::RemoteBranch { .. } => WorkItemKind::RemoteBranch,
             },
         }
     }
 
     pub fn branch(&self) -> Option<&str> {
         match self {
-            WorkItem::Correlated(c) => c.branch.as_deref(),
-            WorkItem::Standalone(StandaloneWorkItem::RemoteBranch { branch }) => Some(branch.as_str()),
-            WorkItem::Standalone(StandaloneWorkItem::Issue { .. }) => None,
+            CorrelationResult::Correlated(c) => c.branch.as_deref(),
+            CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch }) => Some(branch.as_str()),
+            CorrelationResult::Standalone(StandaloneResult::Issue { .. }) => None,
         }
     }
 
     pub fn description(&self) -> &str {
         match self {
-            WorkItem::Correlated(c) => &c.description,
-            WorkItem::Standalone(StandaloneWorkItem::Issue { description, .. }) => description,
-            WorkItem::Standalone(StandaloneWorkItem::RemoteBranch { branch }) => branch,
+            CorrelationResult::Correlated(c) => &c.description,
+            CorrelationResult::Standalone(StandaloneResult::Issue { description, .. }) => description,
+            CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch }) => branch,
         }
     }
 
     pub fn checkout(&self) -> Option<&CheckoutRef> {
         match self {
-            WorkItem::Correlated(c) => match &c.anchor {
+            CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(co) => Some(co),
                 _ => None,
             },
@@ -141,7 +120,7 @@ impl WorkItem {
 
     pub fn pr_key(&self) -> Option<&str> {
         match self {
-            WorkItem::Correlated(c) => match &c.anchor {
+            CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Pr(key) => Some(key.as_str()),
                 _ => c.linked_pr.as_deref(),
             },
@@ -151,7 +130,7 @@ impl WorkItem {
 
     pub fn session_key(&self) -> Option<&str> {
         match self {
-            WorkItem::Correlated(c) => match &c.anchor {
+            CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Session(key) => Some(key.as_str()),
                 _ => c.linked_session.as_deref(),
             },
@@ -161,43 +140,43 @@ impl WorkItem {
 
     pub fn issue_keys(&self) -> &[String] {
         match self {
-            WorkItem::Correlated(c) => &c.linked_issues,
-            WorkItem::Standalone(StandaloneWorkItem::Issue { key, .. }) => std::slice::from_ref(key),
-            WorkItem::Standalone(StandaloneWorkItem::RemoteBranch { .. }) => &[],
+            CorrelationResult::Correlated(c) => &c.linked_issues,
+            CorrelationResult::Standalone(StandaloneResult::Issue { key, .. }) => std::slice::from_ref(key),
+            CorrelationResult::Standalone(StandaloneResult::RemoteBranch { .. }) => &[],
         }
     }
 
     pub fn workspace_refs(&self) -> &[String] {
         match self {
-            WorkItem::Correlated(c) => &c.workspace_refs,
+            CorrelationResult::Correlated(c) => &c.workspace_refs,
             _ => &[],
         }
     }
 
     pub fn correlation_group_idx(&self) -> Option<usize> {
         match self {
-            WorkItem::Correlated(c) => Some(c.correlation_group_idx),
+            CorrelationResult::Correlated(c) => Some(c.correlation_group_idx),
             _ => None,
         }
     }
 
     pub fn identity(&self) -> WorkItemIdentity {
         match self {
-            WorkItem::Correlated(c) => match &c.anchor {
+            CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(co.key.clone()),
                 CorrelatedAnchor::Pr(key) => WorkItemIdentity::ChangeRequest(key.clone()),
                 CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
             },
-            WorkItem::Standalone(s) => match s {
-                StandaloneWorkItem::Issue { key, .. } => WorkItemIdentity::Issue(key.clone()),
-                StandaloneWorkItem::RemoteBranch { branch } => WorkItemIdentity::RemoteBranch(branch.clone()),
+            CorrelationResult::Standalone(s) => match s {
+                StandaloneResult::Issue { key, .. } => WorkItemIdentity::Issue(key.clone()),
+                StandaloneResult::RemoteBranch { branch } => WorkItemIdentity::RemoteBranch(branch.clone()),
             },
         }
     }
 
     pub fn as_correlated_mut(&mut self) -> Option<&mut CorrelatedWorkItem> {
         match self {
-            WorkItem::Correlated(c) => Some(c),
+            CorrelationResult::Correlated(c) => Some(c),
             _ => None,
         }
     }
@@ -236,9 +215,9 @@ impl Default for SectionLabels {
     }
 }
 
-/// Convert a correlation group into a WorkItem.
+/// Convert a correlation group into a CorrelationResult.
 /// Returns None for groups that contain only workspaces (no checkout, PR, or session).
-fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_idx: usize) -> Option<WorkItem> {
+fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_idx: usize) -> Option<CorrelationResult> {
     let mut checkout_ref: Option<CheckoutRef> = None;
     let mut pr_key: Option<String> = None;
     let mut session_key: Option<String> = None;
@@ -307,7 +286,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         .or_else(|| branch.clone())
         .unwrap_or_default();
 
-    Some(WorkItem::Correlated(CorrelatedWorkItem {
+    Some(CorrelationResult::Correlated(CorrelatedWorkItem {
         anchor,
         branch,
         description,
@@ -319,9 +298,9 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
     }))
 }
 
-/// Phases 1-3: Build CorrelatedItems, run union-find, convert to WorkItems.
+/// Phases 1-3: Build CorrelatedItems, run union-find, convert to CorrelationResults.
 /// Returns (work_items, correlation_groups).
-pub fn correlate(providers: &ProviderData) -> (Vec<WorkItem>, Vec<CorrelatedGroup>) {
+pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<CorrelatedGroup>) {
     // Phase 1: Build CorrelatedItems from identity-keyed sources.
     let mut items: Vec<CorrelatedItem> = Vec::new();
 
@@ -368,8 +347,8 @@ pub fn correlate(providers: &ProviderData) -> (Vec<WorkItem>, Vec<CorrelatedGrou
     // Phase 2: Run correlation engine
     let groups = correlation::correlate(items);
 
-    // Phase 3: Convert groups to WorkItems
-    let mut work_items: Vec<WorkItem> = Vec::new();
+    // Phase 3: Convert groups to CorrelationResults
+    let mut work_items: Vec<CorrelationResult> = Vec::new();
     let mut linked_issue_keys: HashSet<String> = HashSet::new();
 
     for (group_idx, group) in groups.iter().enumerate() {
@@ -432,7 +411,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<WorkItem>, Vec<CorrelatedGrou
     // Add standalone issues (not linked to any PR)
     for (id, issue) in &providers.issues {
         if !linked_issue_keys.contains(id.as_str()) {
-            work_items.push(WorkItem::Standalone(StandaloneWorkItem::Issue {
+            work_items.push(CorrelationResult::Standalone(StandaloneResult::Issue {
                 key: id.clone(),
                 description: issue.title.clone(),
             }));
@@ -451,7 +430,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<WorkItem>, Vec<CorrelatedGrou
             && !known_branches.contains(b.as_str())
             && !merged_set.contains(b.as_str())
         {
-            work_items.push(WorkItem::Standalone(StandaloneWorkItem::RemoteBranch {
+            work_items.push(CorrelationResult::Standalone(StandaloneResult::RemoteBranch {
                 branch: b.clone(),
             }));
         }
@@ -461,12 +440,12 @@ pub fn correlate(providers: &ProviderData) -> (Vec<WorkItem>, Vec<CorrelatedGrou
 }
 
 /// Phase 4: Sort work items into sections and build table entries.
-pub fn build_table_view(work_items: &[WorkItem], providers: &ProviderData, labels: &SectionLabels) -> TableView {
-    let mut checkout_items: Vec<&WorkItem> = Vec::new();
-    let mut session_items: Vec<&WorkItem> = Vec::new();
-    let mut pr_items: Vec<&WorkItem> = Vec::new();
-    let mut remote_items: Vec<&WorkItem> = Vec::new();
-    let mut issue_items: Vec<&WorkItem> = Vec::new();
+pub fn build_table_view(work_items: &[CorrelationResult], providers: &ProviderData, labels: &SectionLabels) -> TableView {
+    let mut checkout_items: Vec<&CorrelationResult> = Vec::new();
+    let mut session_items: Vec<&CorrelationResult> = Vec::new();
+    let mut pr_items: Vec<&CorrelationResult> = Vec::new();
+    let mut remote_items: Vec<&CorrelationResult> = Vec::new();
+    let mut issue_items: Vec<&CorrelationResult> = Vec::new();
 
     for item in work_items {
         match item.kind() {
@@ -564,15 +543,6 @@ async fn run_command(cmd: &str, args: &[&str], cwd: Option<&PathBuf>) -> Result<
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DeleteConfirmInfo {
-    pub branch: String,
-    pub pr_status: Option<String>,
-    pub merge_commit_sha: Option<String>,
-    pub unpushed_commits: Vec<String>,
-    pub has_uncommitted: bool,
-    pub base_detection_warning: Option<String>,
-}
 
 #[cfg(test)]
 mod tests {
@@ -580,7 +550,7 @@ mod tests {
 
     #[test]
     fn identity_checkout() {
-        let wi = WorkItem::Correlated(CorrelatedWorkItem {
+        let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Checkout(CheckoutRef {
                 key: PathBuf::from("/tmp/foo"),
                 is_main_worktree: false,
@@ -598,7 +568,7 @@ mod tests {
 
     #[test]
     fn identity_pr() {
-        let wi = WorkItem::Correlated(CorrelatedWorkItem {
+        let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Pr("42".to_string()),
             branch: None,
             description: String::new(),
@@ -613,7 +583,7 @@ mod tests {
 
     #[test]
     fn identity_session() {
-        let wi = WorkItem::Correlated(CorrelatedWorkItem {
+        let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Session("sess-1".to_string()),
             branch: None,
             description: String::new(),
@@ -628,7 +598,7 @@ mod tests {
 
     #[test]
     fn identity_issue() {
-        let wi = WorkItem::Standalone(StandaloneWorkItem::Issue {
+        let wi = CorrelationResult::Standalone(StandaloneResult::Issue {
             key: "7".to_string(),
             description: String::new(),
         });
@@ -637,7 +607,7 @@ mod tests {
 
     #[test]
     fn identity_remote_branch() {
-        let wi = WorkItem::Standalone(StandaloneWorkItem::RemoteBranch {
+        let wi = CorrelationResult::Standalone(StandaloneResult::RemoteBranch {
             branch: "feature/x".to_string(),
         });
         assert_eq!(wi.identity(), WorkItemIdentity::RemoteBranch("feature/x".to_string()));
@@ -700,7 +670,7 @@ pub async fn fetch_delete_confirm_info(
     worktree_path: Option<&Path>,
     pr_number: Option<&str>,
     repo_root: &Path,
-) -> DeleteConfirmInfo {
+) -> DeleteInfo {
     let branch_owned = branch.to_string();
     let repo = repo_root.to_path_buf();
     let wt_path = worktree_path.map(|p| p.to_path_buf());
@@ -771,7 +741,7 @@ pub async fn fetch_delete_confirm_info(
         },
     );
 
-    let mut info = DeleteConfirmInfo {
+    let mut info = DeleteInfo {
         branch: branch.to_string(),
         ..Default::default()
     };

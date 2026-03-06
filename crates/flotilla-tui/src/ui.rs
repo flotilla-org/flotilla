@@ -12,7 +12,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppModel, Intent, ProviderStatus, TabId, UiMode, UiState};
-use flotilla_core::data::{SectionHeader, TableEntry, WorkItem, WorkItemKind};
+use flotilla_core::data::{CorrelationResult, SectionHeader, TableEntry, WorkItemKind};
 use crate::event_log::{self, LevelExt};
 use flotilla_core::providers::correlation::ItemKind as CorItemKind;
 use flotilla_core::providers::types::{ChangeRequestStatus, CorrelationKey, SessionStatus};
@@ -95,7 +95,7 @@ fn active_rui<'a>(model: &AppModel, ui: &'a UiState) -> &'a crate::app::RepoUiSt
     ui.active_repo_ui(&model.repo_order, model.active_repo)
 }
 
-fn selected_work_item<'a>(model: &AppModel, ui: &'a UiState) -> Option<&'a WorkItem> {
+fn selected_work_item<'a>(model: &AppModel, ui: &'a UiState) -> Option<&'a CorrelationResult> {
     let rui = active_rui(model, ui);
     let table_idx = rui.table_state.selected()?;
     match rui.table_view.table_entries.get(table_idx)? {
@@ -353,7 +353,7 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
-fn build_item_row<'a>(item: &WorkItem, data: &flotilla_core::data::DataStore, col_widths: &[u16]) -> Row<'a> {
+fn build_item_row<'a>(item: &CorrelationResult, data: &flotilla_core::data::DataStore, col_widths: &[u16]) -> Row<'a> {
     let (icon, icon_color) = match item.kind() {
         WorkItemKind::Checkout => {
             if !item.workspace_refs().is_empty() {

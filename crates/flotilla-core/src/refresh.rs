@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 
-use crate::data::{self, ProviderError, WorkItem};
+use crate::data::{self, CorrelationResult, RefreshError};
 use crate::provider_data::ProviderData;
 use crate::providers::correlation::CorrelatedGroup;
 use crate::providers::registry::ProviderRegistry;
@@ -16,9 +16,9 @@ use crate::providers::types::RepoCriteria;
 #[derive(Debug, Clone)]
 pub struct RefreshSnapshot {
     pub providers: Arc<ProviderData>,
-    pub work_items: Vec<WorkItem>,
+    pub work_items: Vec<CorrelationResult>,
     pub correlation_groups: Vec<CorrelatedGroup>,
-    pub errors: Vec<ProviderError>,
+    pub errors: Vec<RefreshError>,
     pub provider_health: HashMap<&'static str, bool>,
 }
 
@@ -114,7 +114,7 @@ async fn refresh_providers(
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
     skip_issues: bool,
-) -> Vec<ProviderError> {
+) -> Vec<RefreshError> {
     let mut errors = Vec::new();
 
     let checkouts_fut = async {
@@ -180,25 +180,25 @@ async fn refresh_providers(
         checkouts_fut, cr_fut, issues_fut, sessions_fut, branches_fut, merged_fut, ws_fut
     );
 
-    pd.checkouts = checkouts.unwrap_or_else(|e| { errors.push(ProviderError { category: "checkouts", message: e }); Vec::new() })
+    pd.checkouts = checkouts.unwrap_or_else(|e| { errors.push(RefreshError { category: "checkouts", message: e }); Vec::new() })
         .into_iter().map(|co| (co.path.clone(), co)).collect();
-    pd.change_requests = crs.unwrap_or_else(|e| { errors.push(ProviderError { category: "PRs", message: e }); Vec::new() })
+    pd.change_requests = crs.unwrap_or_else(|e| { errors.push(RefreshError { category: "PRs", message: e }); Vec::new() })
         .into_iter().map(|cr| (cr.id.clone(), cr)).collect();
-    pd.issues = issues.unwrap_or_else(|e| { errors.push(ProviderError { category: "issues", message: e }); Vec::new() })
+    pd.issues = issues.unwrap_or_else(|e| { errors.push(RefreshError { category: "issues", message: e }); Vec::new() })
         .into_iter().map(|issue| (issue.id.clone(), issue)).collect();
-    pd.workspaces = workspaces.unwrap_or_else(|e| { errors.push(ProviderError { category: "workspaces", message: e }); Vec::new() })
+    pd.workspaces = workspaces.unwrap_or_else(|e| { errors.push(RefreshError { category: "workspaces", message: e }); Vec::new() })
         .into_iter().map(|ws| (ws.ws_ref.clone(), ws)).collect();
-    pd.sessions = sessions.unwrap_or_else(|e| { errors.push(ProviderError { category: "sessions", message: e }); Vec::new() })
+    pd.sessions = sessions.unwrap_or_else(|e| { errors.push(RefreshError { category: "sessions", message: e }); Vec::new() })
         .into_iter().map(|s| (s.id.clone(), s)).collect();
-    pd.remote_branches = branches.unwrap_or_else(|e| { errors.push(ProviderError { category: "branches", message: e }); Vec::new() });
-    pd.merged_branches = merged.unwrap_or_else(|e| { errors.push(ProviderError { category: "merged", message: e }); Vec::new() });
+    pd.remote_branches = branches.unwrap_or_else(|e| { errors.push(RefreshError { category: "branches", message: e }); Vec::new() });
+    pd.merged_branches = merged.unwrap_or_else(|e| { errors.push(RefreshError { category: "merged", message: e }); Vec::new() });
 
     errors
 }
 
 fn compute_provider_health(
     registry: &ProviderRegistry,
-    errors: &[ProviderError],
+    errors: &[RefreshError],
 ) -> HashMap<&'static str, bool> {
     let mut health = HashMap::new();
     if registry.coding_agents.values().next().is_some() {

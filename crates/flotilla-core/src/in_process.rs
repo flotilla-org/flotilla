@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
-use flotilla_protocol::{CommandResult, DaemonEvent, ProtoCommand, RepoInfo, Snapshot};
+use flotilla_protocol::{Command, CommandResult, DaemonEvent, RepoInfo, Snapshot};
 
 use crate::config;
 use crate::convert::snapshot_to_proto;
@@ -153,7 +153,7 @@ impl DaemonHandle for InProcessDaemon {
         Ok(result)
     }
 
-    async fn execute(&self, repo: &Path, command: ProtoCommand) -> Result<CommandResult, String> {
+    async fn execute(&self, repo: &Path, command: Command) -> Result<CommandResult, String> {
         // Extract the data we need under a read lock, then drop it before the async work
         let (registry, providers_data, repo_root) = {
             let repos = self.repos.read().await;

@@ -3,20 +3,20 @@ use std::sync::Arc;
 use tracing::info;
 
 use flotilla_core::config;
-use flotilla_protocol::{CommandResult, ProtoCommand};
+use flotilla_protocol::{Command, CommandResult};
 use super::ui_state::UiMode;
 use super::App;
 
-/// Execute a single ProtoCommand against the app state.
+/// Execute a single Command against the app state.
 ///
 /// Commands that modify the daemon-side state (providers, worktrees, etc.) are
 /// routed through `flotilla_core::executor::execute()`.  Commands that modify
 /// only TUI-local state (AddRepo) are handled here directly.
-pub async fn execute(cmd: ProtoCommand, app: &mut App) {
+pub async fn execute(cmd: Command, app: &mut App) {
     app.model.status_message = None;
 
     // Handle AddRepo locally — it needs to update AppModel
-    if let ProtoCommand::AddRepo { ref path } = cmd {
+    if let Command::AddRepo { ref path } = cmd {
         let path = path.clone();
         info!("adding repo {}", path.display());
         config::save_repo(&path);
@@ -52,14 +52,7 @@ fn handle_result(result: CommandResult, app: &mut App) {
         }
         CommandResult::DeleteInfo(info) => {
             app.ui.mode = UiMode::DeleteConfirm {
-                info: Some(flotilla_core::data::DeleteConfirmInfo {
-                    branch: info.branch,
-                    pr_status: info.pr_status,
-                    merge_commit_sha: info.merge_commit_sha,
-                    unpushed_commits: info.unpushed_commits,
-                    has_uncommitted: info.has_uncommitted,
-                    base_detection_warning: info.base_detection_warning,
-                }),
+                info: Some(info),
                 loading: false,
             };
         }

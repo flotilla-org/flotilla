@@ -6,7 +6,8 @@ use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use tui_input::Input;
 
-use flotilla_core::data::{DeleteConfirmInfo, TableView, WorkItemIdentity};
+use flotilla_core::data::{TableView, WorkItemIdentity};
+use flotilla_protocol::DeleteInfo;
 use super::intent::Intent;
 
 #[derive(Clone)]
@@ -39,7 +40,7 @@ pub enum UiMode {
         selected: usize,
     },
     DeleteConfirm {
-        info: Option<DeleteConfirmInfo>,
+        info: Option<DeleteInfo>,
         loading: bool,
     },
 }
