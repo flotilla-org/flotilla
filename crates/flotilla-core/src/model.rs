@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::data::DataStore;
+use crate::provider_data::ProviderData;
+use crate::providers::correlation::CorrelatedGroup;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::RepoCriteria;
 use crate::refresh::RepoRefreshHandle;
@@ -164,7 +165,10 @@ impl AppModel {
 /// Domain data for a single repository — no UI concerns.
 pub struct RepoModel {
     pub registry: Arc<ProviderRegistry>,
-    pub data: DataStore,
+    pub providers: Arc<ProviderData>,
+    pub loading: bool,
+    pub correlation_groups: Vec<CorrelatedGroup>,
+    pub provider_health: HashMap<&'static str, bool>,
     pub labels: RepoLabels,
     pub refresh_handle: RepoRefreshHandle,
 }
@@ -182,7 +186,10 @@ impl RepoModel {
         );
         Self {
             registry,
-            data: DataStore::default(),
+            providers: Arc::default(),
+            loading: false,
+            correlation_groups: Vec::new(),
+            provider_health: HashMap::new(),
             labels,
             refresh_handle,
         }

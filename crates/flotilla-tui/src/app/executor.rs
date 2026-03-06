@@ -30,7 +30,7 @@ pub async fn execute(cmd: ProtoCommand, app: &mut App) {
     // Get what we need from the model
     let repo_root = app.model.active_repo_root().clone();
     let registry = Arc::clone(&app.model.active().registry);
-    let providers = Arc::clone(&app.model.active().data.providers);
+    let providers = Arc::clone(&app.model.active().providers);
 
     let result = flotilla_core::executor::execute(cmd, &repo_root, &registry, &providers).await;
 
