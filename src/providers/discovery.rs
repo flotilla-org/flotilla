@@ -57,10 +57,9 @@ pub fn first_remote_url(repo_root: &Path) -> Option<String> {
     None
 }
 
-/// Check all git remotes for known hosts.
+/// Check a remote URL for known hosts.
 /// Returns "github" or "gitlab" if matched, None otherwise.
-fn detect_remote_host(repo_root: &Path) -> Option<String> {
-    let url = first_remote_url(repo_root)?;
+fn detect_host_from_url(url: &str) -> Option<String> {
     let url_lower = url.to_lowercase();
     if url_lower.contains("github.com") {
         Some("github".to_string())
@@ -89,12 +88,6 @@ pub fn extract_repo_slug(url: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Detect "owner/repo" slug from the first git remote URL.
-fn detect_repo_slug(repo_root: &Path) -> Option<String> {
-    let url = first_remote_url(repo_root)?;
-    extract_repo_slug(&url)
 }
 
 /// Detect available providers for a given repository.
@@ -160,9 +153,10 @@ pub fn detect_providers(repo_root: &Path) -> ProviderRegistry {
     }
 
     // 3. Remote host detection -> code review & issue tracker
-    if let Some(ref host) = detect_remote_host(repo_root) {
+    let remote_url = first_remote_url(repo_root);
+    if let Some(ref host) = remote_url.as_deref().and_then(detect_host_from_url) {
         if host == "github" && command_exists("gh", &["--version"]) {
-            if let Some(slug) = detect_repo_slug(repo_root) {
+            if let Some(slug) = remote_url.as_deref().and_then(extract_repo_slug) {
                 let api = Arc::new(GhApiClient::new());
                 registry.code_review.insert(
                     "github".to_string(),

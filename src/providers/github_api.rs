@@ -29,11 +29,8 @@ pub(crate) fn parse_gh_api_response(raw: &str) -> GhApiResponse {
             if let Some(code_str) = line.split_whitespace().nth(1) {
                 status = code_str.parse().unwrap_or(0);
             }
-        } else if let Some(value) = line
-            .strip_prefix("Etag: ")
-            .or_else(|| line.strip_prefix("etag: "))
-        {
-            etag = Some(value.trim().to_string());
+        } else if line.len() >= 6 && line[..5].eq_ignore_ascii_case("etag:") {
+            etag = Some(line[5..].trim().to_string());
         }
     }
 
@@ -62,7 +59,7 @@ impl GhApiClient {
     pub async fn get(&self, endpoint: &str, repo_root: &Path) -> Result<String, String> {
         // Build args
         let cached_etag = {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             cache.get(endpoint).map(|e| e.etag.clone())
         };
 
@@ -83,25 +80,26 @@ impl GhApiClient {
             .map_err(|e| e.to_string())?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        // gh api exits 1 on 304 with "HTTP 304" on stderr
-        if !output.status.success() {
-            if stderr.contains("HTTP 304") {
-                // Serve from cache
-                let cache = self.cache.lock().unwrap();
-                if let Some(entry) = cache.get(endpoint) {
-                    return Ok(entry.body.clone());
-                }
-                return Err("304 but no cached response".to_string());
+        // Always parse stdout — gh api --include writes headers even on 304
+        let parsed = parse_gh_api_response(&stdout);
+
+        if parsed.status == 304 {
+            // Serve from cache
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = cache.get(endpoint) {
+                return Ok(entry.body.clone());
             }
+            return Err("304 but no cached response".to_string());
+        }
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(stderr);
         }
 
-        // Parse 200 response
-        let parsed = parse_gh_api_response(&stdout);
         if let Some(etag) = parsed.etag {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             cache.insert(
                 endpoint.to_string(),
                 CacheEntry {
@@ -135,6 +133,16 @@ mod tests {
         assert_eq!(result.etag, Some("\"abc123\"".to_string()));
         assert_eq!(result.body, "");
         assert_eq!(result.status, 304);
+    }
+
+    #[test]
+    fn parse_etag_case_insensitive() {
+        // GitHub sends "Etag:" but HTTP spec allows any casing
+        for header in ["Etag: \"x\"", "etag: \"x\"", "ETag: \"x\"", "ETAG: \"x\""] {
+            let raw = format!("HTTP/2.0 200 OK\r\n{}\r\n\r\n{{}}", header);
+            let result = parse_gh_api_response(&raw);
+            assert_eq!(result.etag, Some("\"x\"".to_string()), "failed for: {}", header);
+        }
     }
 
     #[test]
