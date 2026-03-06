@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use tui_input::Input;
 
-use crate::data::{DeleteConfirmInfo, TableView};
+use crate::data::{DeleteConfirmInfo, TableView, WorkItemIdentity};
 use super::intent::Intent;
 
 #[derive(Clone)]
@@ -55,7 +55,7 @@ pub struct RepoUiState {
     pub table_state: TableState,
     pub selected_selectable_idx: Option<usize>,
     pub has_unseen_changes: bool,
-    pub multi_selected: BTreeSet<usize>,
+    pub multi_selected: HashSet<WorkItemIdentity>,
     pub show_providers: bool,
 }
 

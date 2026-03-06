@@ -261,40 +261,56 @@ fn drain_snapshots(app: &mut app::App) {
         }
 
         // Change detection badge for inactive tabs — only if data actually changed
-        let old_snapshot = (
-            old_providers.checkouts.len(),
-            old_providers.change_requests.len(),
-            old_providers.sessions.len(),
-            old_providers.remote_branches.len(),
-            old_providers.issues.len(),
-        );
-        let new_snapshot = (
-            rm.data.providers.checkouts.len(),
-            rm.data.providers.change_requests.len(),
-            rm.data.providers.sessions.len(),
-            rm.data.providers.remote_branches.len(),
-            rm.data.providers.issues.len(),
-        );
-        if i != *active_repo && old_snapshot != new_snapshot {
+        if i != *active_repo && *old_providers != *rm.data.providers {
             if let Some(rui) = ui.repo_ui.get_mut(path) {
                 rui.has_unseen_changes = true;
             }
         }
 
-        // Store table view on UI state and restore selection
+        // Store table view on UI state and restore selection by identity
         if let Some(rui) = ui.repo_ui.get_mut(path) {
+            // Save current selection identity
+            let prev_identity = rui.selected_selectable_idx
+                .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
+                .and_then(|ti| match rui.table_view.table_entries.get(ti) {
+                    Some(data::TableEntry::Item(item)) => item.identity(),
+                    _ => None,
+                });
+
             rui.table_view = table_view;
+
+            // Restore selection by identity
             if rui.table_view.selectable_indices.is_empty() {
                 rui.selected_selectable_idx = None;
                 rui.table_state.select(None);
-            } else if rui.selected_selectable_idx.is_none() {
+            } else if let Some(ref identity) = prev_identity {
+                let found = rui.table_view.selectable_indices.iter().enumerate().find(|(_, &ti)| {
+                    matches!(
+                        rui.table_view.table_entries.get(ti),
+                        Some(data::TableEntry::Item(item)) if item.identity().as_ref() == Some(identity)
+                    )
+                });
+                if let Some((si, &ti)) = found {
+                    rui.selected_selectable_idx = Some(si);
+                    rui.table_state.select(Some(ti));
+                } else {
+                    // Item was removed — select first
+                    rui.selected_selectable_idx = Some(0);
+                    rui.table_state.select(Some(rui.table_view.selectable_indices[0]));
+                }
+            } else {
                 rui.selected_selectable_idx = Some(0);
                 rui.table_state.select(Some(rui.table_view.selectable_indices[0]));
-            } else if let Some(si) = rui.selected_selectable_idx {
-                let clamped = si.min(rui.table_view.selectable_indices.len() - 1);
-                rui.selected_selectable_idx = Some(clamped);
-                rui.table_state.select(Some(rui.table_view.selectable_indices[clamped]));
             }
+
+            // Clean up stale multi-select identities
+            let current_identities: std::collections::HashSet<data::WorkItemIdentity> = rui.table_view.table_entries.iter()
+                .filter_map(|e| match e {
+                    data::TableEntry::Item(item) => item.identity(),
+                    _ => None,
+                })
+                .collect();
+            rui.multi_selected.retain(|id| current_identities.contains(id));
         }
 
         // Log errors

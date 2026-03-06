@@ -26,13 +26,13 @@ pub enum AssociationKey {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchInfo {
     pub name: String,
     pub is_trunk: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout {
     pub branch: String,
     pub path: PathBuf,
@@ -45,26 +45,26 @@ pub struct Checkout {
     pub association_keys: Vec<AssociationKey>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AheadBehind {
     pub ahead: i64,
     pub behind: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitInfo {
     pub short_sha: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingTreeStatus {
     pub staged: usize,
     pub modified: usize,
     pub untracked: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRequest {
     pub id: String,
     pub title: String,
@@ -85,7 +85,7 @@ pub enum ChangeRequestStatus {
     Closed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
     pub id: String,
     pub title: String,
@@ -94,7 +94,7 @@ pub struct Issue {
     pub association_keys: Vec<AssociationKey>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudAgentSession {
     pub id: String,
     pub title: String,
@@ -111,7 +111,7 @@ pub enum SessionStatus {
     Archived,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     pub ws_ref: String,
     pub name: String,

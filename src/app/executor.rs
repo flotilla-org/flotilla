@@ -11,8 +11,8 @@ use super::App;
 pub async fn execute(cmd: Command, app: &mut App) {
     app.model.status_message = None;
     match cmd {
-        Command::SwitchWorktree(i) => {
-            if let Some(co) = app.model.active().data.providers.checkouts.get(i).cloned() {
+        Command::SwitchWorktree(path) => {
+            if let Some(co) = app.model.active().data.providers.checkouts.get(&path).cloned() {
                 info!("entering workspace for {}", co.branch);
                 let ws_result = if let Some((_, ws_mgr)) = &app.model.active().registry.workspace_manager {
                     let config = workspace_config(app.model.active_repo_root(), &co.branch, &co.path, "claude");
@@ -39,12 +39,8 @@ pub async fn execute(cmd: Command, app: &mut App) {
             if let Some(table_idx) = table_idx {
                 if let Some(data::TableEntry::Item(item)) = app.active_ui().table_view.table_entries.get(table_idx).cloned() {
                     let branch = item.branch.clone().unwrap_or_default();
-                    let wt_path = item.worktree_idx
-                        .and_then(|idx| app.model.active().data.providers.checkouts.get(idx))
-                        .map(|co| co.path.clone());
-                    let pr_id = item.pr_idx
-                        .and_then(|idx| app.model.active().data.providers.change_requests.get(idx))
-                        .map(|cr| cr.id.clone());
+                    let wt_path = item.checkout_key.clone();
+                    let pr_id = item.pr_key.clone();
                     let repo_root = app.model.active_repo_root().clone();
                     let info = data::fetch_delete_confirm_info(
                         &branch,
@@ -163,11 +159,11 @@ pub async fn execute(cmd: Command, app: &mut App) {
             }
             trigger_active_refresh(app);
         }
-        Command::ArchiveSession(ses_idx) => {
-            if let Some(session) = app.model.active().data.providers.sessions.get(ses_idx).cloned() {
-                info!("archiving session {}", session.id);
+        Command::ArchiveSession(session_id) => {
+            if app.model.active().data.providers.sessions.contains_key(session_id.as_str()) {
+                info!("archiving session {}", session_id);
                 let result = if let Some(ca) = app.model.active().registry.coding_agents.values().next() {
-                    Some(ca.archive_session(&session.id).await)
+                    Some(ca.archive_session(&session_id).await)
                 } else {
                     None
                 };
@@ -177,12 +173,12 @@ pub async fn execute(cmd: Command, app: &mut App) {
                 trigger_active_refresh(app);
             }
         }
-        Command::TeleportSession { session_id, branch, worktree_idx } => {
+        Command::TeleportSession { session_id, branch, checkout_key } => {
             info!("teleporting to session {session_id}");
             let claude_bin = providers::resolve_claude_path().unwrap_or_else(|| "claude".into());
             let teleport_cmd = format!("{} --teleport {}", claude_bin, session_id);
-            let wt_path = if let Some(wt_idx) = worktree_idx {
-                app.model.active().data.providers.checkouts.get(wt_idx).map(|co| co.path.clone())
+            let wt_path = if let Some(ref key) = checkout_key {
+                app.model.active().data.providers.checkouts.get(key).map(|co| co.path.clone())
             } else if let Some(branch_name) = &branch {
                 let repo = app.model.active_repo_root().clone();
                 let checkout_result = if let Some(cm) = app.model.active().registry.checkout_managers.values().next() {
@@ -208,10 +204,10 @@ pub async fn execute(cmd: Command, app: &mut App) {
             }
             trigger_active_refresh(app);
         }
-        Command::GenerateBranchName(issue_idxs) => {
-            let issues: Vec<(String, String)> = issue_idxs
+        Command::GenerateBranchName(issue_keys) => {
+            let issues: Vec<(String, String)> = issue_keys
                 .iter()
-                .filter_map(|&idx| app.model.active().data.providers.issues.get(idx))
+                .filter_map(|k| app.model.active().data.providers.issues.get(k.as_str()))
                 .map(|issue| (issue.id.clone(), issue.title.clone()))
                 .collect();
 

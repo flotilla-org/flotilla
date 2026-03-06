@@ -35,17 +35,17 @@ impl Intent {
     pub fn is_available(&self, item: &WorkItem) -> bool {
         match self {
             Intent::SwitchToWorkspace => !item.workspace_refs.is_empty(),
-            Intent::CreateWorkspace => item.worktree_idx.is_some() && item.workspace_refs.is_empty(),
-            Intent::RemoveWorktree => item.worktree_idx.is_some() && !item.is_main_worktree,
-            Intent::CreateWorktreeAndWorkspace => item.worktree_idx.is_none() && item.branch.is_some(),
-            Intent::GenerateBranchName => item.branch.is_none() && !item.issue_idxs.is_empty(),
-            Intent::OpenPr => item.pr_idx.is_some(),
-            Intent::OpenIssue => !item.issue_idxs.is_empty(),
+            Intent::CreateWorkspace => item.checkout_key.is_some() && item.workspace_refs.is_empty(),
+            Intent::RemoveWorktree => item.checkout_key.is_some() && !item.is_main_worktree,
+            Intent::CreateWorktreeAndWorkspace => item.checkout_key.is_none() && item.branch.is_some(),
+            Intent::GenerateBranchName => item.branch.is_none() && !item.issue_keys.is_empty(),
+            Intent::OpenPr => item.pr_key.is_some(),
+            Intent::OpenIssue => !item.issue_keys.is_empty(),
             Intent::LinkIssuesToPr => {
-                item.pr_idx.is_some() && item.worktree_idx.is_some() && !item.issue_idxs.is_empty()
+                item.pr_key.is_some() && item.checkout_key.is_some() && !item.issue_keys.is_empty()
             }
-            Intent::TeleportSession => item.session_idx.is_some(),
-            Intent::ArchiveSession => item.session_idx.is_some(),
+            Intent::TeleportSession => item.session_key.is_some(),
+            Intent::ArchiveSession => item.session_key.is_some(),
         }
     }
 
@@ -65,7 +65,7 @@ impl Intent {
                 item.workspace_refs.first().map(|ws_ref| Command::SelectWorkspace(ws_ref.clone()))
             }
             Intent::CreateWorkspace => {
-                item.worktree_idx.map(Command::SwitchWorktree)
+                item.checkout_key.clone().map(Command::SwitchWorktree)
             }
             Intent::RemoveWorktree => {
                 if item.kind != WorkItemKind::Checkout || item.is_main_worktree {
@@ -81,30 +81,24 @@ impl Intent {
                 })
             }
             Intent::GenerateBranchName => {
-                if !item.issue_idxs.is_empty() {
-                    Some(Command::GenerateBranchName(item.issue_idxs.clone()))
+                if !item.issue_keys.is_empty() {
+                    Some(Command::GenerateBranchName(item.issue_keys.clone()))
                 } else {
                     None
                 }
             }
             Intent::OpenPr => {
-                item.pr_idx.and_then(|pr_idx| {
-                    app.model.active().data.providers.change_requests.get(pr_idx)
-                        .map(|cr| Command::OpenPr(cr.id.clone()))
-                })
+                item.pr_key.as_ref().map(|k| Command::OpenPr(k.clone()))
             }
             Intent::OpenIssue => {
-                item.issue_idxs.first().and_then(|&issue_idx| {
-                    app.model.active().data.providers.issues.get(issue_idx)
-                        .map(|issue| Command::OpenIssueBrowser(issue.id.clone()))
-                })
+                item.issue_keys.first().map(|k| Command::OpenIssueBrowser(k.clone()))
             }
             Intent::LinkIssuesToPr => {
-                let pr_idx = item.pr_idx?;
-                let co_idx = item.worktree_idx?;
+                let pr_key = item.pr_key.as_ref()?;
+                let co_key = item.checkout_key.as_ref()?;
                 let data = &app.model.active().data.providers;
-                let cr = data.change_requests.get(pr_idx)?;
-                let co = data.checkouts.get(co_idx)?;
+                let cr = data.change_requests.get(pr_key.as_str())?;
+                let co = data.checkouts.get(co_key)?;
 
                 // Find issue IDs from checkout that aren't already on the PR
                 let pr_issue_ids: std::collections::HashSet<&str> = cr.association_keys.iter()
@@ -130,18 +124,16 @@ impl Intent {
                 Some(Command::LinkIssuesToPr { pr_id: cr.id.clone(), issue_ids: missing })
             }
             Intent::TeleportSession => {
-                item.session_idx.and_then(|ses_idx| {
-                    app.model.active().data.providers.sessions.get(ses_idx).map(|session| {
-                        Command::TeleportSession {
-                            session_id: session.id.clone(),
-                            branch: item.branch.clone(),
-                            worktree_idx: item.worktree_idx,
-                        }
-                    })
+                item.session_key.as_ref().map(|k| {
+                    Command::TeleportSession {
+                        session_id: k.clone(),
+                        branch: item.branch.clone(),
+                        checkout_key: item.checkout_key.clone(),
+                    }
                 })
             }
             Intent::ArchiveSession => {
-                item.session_idx.map(Command::ArchiveSession)
+                item.session_key.clone().map(Command::ArchiveSession)
             }
         }
     }

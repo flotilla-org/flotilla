@@ -9,7 +9,6 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler as InputEventHandler;
 
 use crate::data::{TableEntry, WorkItem};
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -367,10 +366,15 @@ impl App {
 
     fn toggle_multi_select(&mut self) {
         if let Some(si) = self.active_ui().selected_selectable_idx {
-            if self.active_ui().multi_selected.contains(&si) {
-                self.active_ui_mut().multi_selected.remove(&si);
-            } else {
-                self.active_ui_mut().multi_selected.insert(si);
+            if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
+                if let Some(TableEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
+                    if let Some(identity) = item.identity() {
+                        let rui = self.active_ui_mut();
+                        if !rui.multi_selected.remove(&identity) {
+                            rui.multi_selected.insert(identity);
+                        }
+                    }
+                }
             }
         }
     }
@@ -394,32 +398,37 @@ impl App {
     }
 
     fn action_enter_multi_select(&mut self) {
-        let mut all_issue_idxs: Vec<usize> = Vec::new();
-        let multi_selected: BTreeSet<usize> = self.active_ui().multi_selected.clone();
-        for &si in &multi_selected {
-            if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
-                if let Some(TableEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
-                    all_issue_idxs.extend(&item.issue_idxs);
-                }
-            }
-        }
-        if let Some(si) = self.active_ui().selected_selectable_idx {
-            if !multi_selected.contains(&si) {
-                if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
-                    if let Some(TableEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
-                        all_issue_idxs.extend(&item.issue_idxs);
+        let multi_selected = self.active_ui().multi_selected.clone();
+        let mut all_issue_keys: Vec<String> = Vec::new();
+
+        // Collect issues from multi-selected items
+        for entry in &self.active_ui().table_view.table_entries {
+            if let TableEntry::Item(item) = entry {
+                if let Some(identity) = item.identity() {
+                    if multi_selected.contains(&identity) {
+                        all_issue_keys.extend(item.issue_keys.iter().cloned());
                     }
                 }
             }
         }
-        all_issue_idxs.sort();
-        all_issue_idxs.dedup();
-        if !all_issue_idxs.is_empty() {
+
+        // Also include current selection if not already in multi_selected
+        if let Some(item) = self.selected_work_item() {
+            if let Some(identity) = item.identity() {
+                if !multi_selected.contains(&identity) {
+                    all_issue_keys.extend(item.issue_keys.iter().cloned());
+                }
+            }
+        }
+
+        all_issue_keys.sort();
+        all_issue_keys.dedup();
+        if !all_issue_keys.is_empty() {
             self.ui.mode = UiMode::BranchInput {
                 input: Input::default(),
                 generating: true,
             };
-            self.commands.push(Command::GenerateBranchName(all_issue_idxs));
+            self.commands.push(Command::GenerateBranchName(all_issue_keys));
         }
         self.active_ui_mut().multi_selected.clear();
     }

@@ -1,12 +1,14 @@
+use std::path::PathBuf;
+use indexmap::IndexMap;
 use crate::providers::types::*;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProviderData {
-    pub checkouts: Vec<Checkout>,
-    pub change_requests: Vec<ChangeRequest>,
-    pub issues: Vec<Issue>,
-    pub sessions: Vec<CloudAgentSession>,
+    pub checkouts: IndexMap<PathBuf, Checkout>,
+    pub change_requests: IndexMap<String, ChangeRequest>,
+    pub issues: IndexMap<String, Issue>,
+    pub sessions: IndexMap<String, CloudAgentSession>,
     pub remote_branches: Vec<String>,
     pub merged_branches: Vec<String>,
-    pub workspaces: Vec<Workspace>,
+    pub workspaces: IndexMap<String, Workspace>,
 }

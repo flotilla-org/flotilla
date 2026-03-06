@@ -301,15 +301,14 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
         .table_view
         .table_entries
         .iter()
-        .enumerate()
-        .map(|(table_idx, entry)| {
-            let is_multi_selected = rui
-                .table_view
-                .selectable_indices
-                .iter()
-                .position(|&idx| idx == table_idx)
-                .map(|si| rui.multi_selected.contains(&si))
-                .unwrap_or(false);
+        .map(|entry| {
+            let is_multi_selected = if let TableEntry::Item(ref item) = entry {
+                item.identity()
+                    .map(|id| rui.multi_selected.contains(&id))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
 
             match entry {
                 TableEntry::Header(header) => build_header_row(header),
@@ -366,7 +365,7 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
             }
         }
         WorkItemKind::Session => {
-            let session = item.session_idx.and_then(|idx| data.providers.sessions.get(idx));
+            let session = item.session_key.as_ref().and_then(|k| data.providers.sessions.get(k.as_str()));
             match session.map(|s| &s.status) {
                 Some(SessionStatus::Running) => ("▶", Color::Magenta),
                 Some(SessionStatus::Idle) => ("◆", Color::Magenta),
@@ -385,7 +384,7 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
 
     let wt_indicator = if item.is_main_worktree {
         "◆"
-    } else if item.worktree_idx.is_some() {
+    } else if item.checkout_key.is_some() {
         "✓"
     } else {
         ""
@@ -400,8 +399,8 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
     let branch = item.branch.as_deref().unwrap_or("—");
     let branch_display = truncate(branch, branch_width);
 
-    let pr_display = if let Some(pr_idx) = item.pr_idx {
-        if let Some(cr) = data.providers.change_requests.get(pr_idx) {
+    let pr_display = if let Some(ref pr_key) = item.pr_key {
+        if let Some(cr) = data.providers.change_requests.get(pr_key.as_str()) {
             let state_icon = match cr.status {
                 ChangeRequestStatus::Merged => "✓",
                 ChangeRequestStatus::Closed => "✗",
@@ -415,8 +414,8 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
         String::new()
     };
 
-    let session_display = if let Some(ses_idx) = item.session_idx {
-        if let Some(ses) = data.providers.sessions.get(ses_idx) {
+    let session_display = if let Some(ref ses_key) = item.session_key {
+        if let Some(ses) = data.providers.sessions.get(ses_key.as_str()) {
             match ses.status {
                 SessionStatus::Running => "▶".to_string(),
                 SessionStatus::Idle => "◆".to_string(),
@@ -430,15 +429,15 @@ fn build_item_row<'a>(item: &WorkItem, data: &crate::data::DataStore, col_widths
     };
 
     let issues_display = item
-        .issue_idxs
+        .issue_keys
         .iter()
-        .filter_map(|&idx| data.providers.issues.get(idx))
+        .filter_map(|k| data.providers.issues.get(k.as_str()))
         .map(|i| format!("#{}", i.id))
         .collect::<Vec<_>>()
         .join(",");
 
-    let git_display = if let Some(wt_idx) = item.worktree_idx {
-        if let Some(co) = data.providers.checkouts.get(wt_idx) {
+    let git_display = if let Some(ref wt_key) = item.checkout_key {
+        if let Some(co) = data.providers.checkouts.get(wt_key) {
             let mut s = String::new();
             if co.working_tree.as_ref().is_some_and(|w| w.modified > 0) {
                 s.push('M');
@@ -511,8 +510,8 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             lines.push(format!("Branch: {}", branch));
         }
 
-        if let Some(wt_idx) = item.worktree_idx {
-            if let Some(co) = model.active().data.providers.checkouts.get(wt_idx) {
+        if let Some(ref wt_key) = item.checkout_key {
+            if let Some(co) = model.active().data.providers.checkouts.get(wt_key) {
                 lines.push(format!("Path: {}", co.path.display()));
                 if let Some(commit) = &co.last_commit {
                     let sha = if commit.short_sha.is_empty() { "?" } else { &commit.short_sha };
@@ -534,15 +533,15 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        if let Some(pr_idx) = item.pr_idx {
-            if let Some(cr) = model.active().data.providers.change_requests.get(pr_idx) {
+        if let Some(ref pr_key) = item.pr_key {
+            if let Some(cr) = model.active().data.providers.change_requests.get(pr_key.as_str()) {
                 lines.push(format!("{} #{}: {}", model.active_labels().code_review.abbr, cr.id, cr.title));
                 lines.push(format!("State: {:?}", cr.status));
             }
         }
 
-        if let Some(ses_idx) = item.session_idx {
-            if let Some(ses) = model.active().data.providers.sessions.get(ses_idx) {
+        if let Some(ref ses_key) = item.session_key {
+            if let Some(ses) = model.active().data.providers.sessions.get(ses_key.as_str()) {
                 lines.push(format!("Session: {}", ses.title));
                 lines.push(format!("Status: {:?}", ses.status));
                 if let Some(ref model) = ses.model {
@@ -556,14 +555,14 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
         }
 
         for ws_ref in &item.workspace_refs {
-            if let Some(ws) = model.active().data.providers.workspaces.iter().find(|w| &w.ws_ref == ws_ref) {
+            if let Some(ws) = model.active().data.providers.workspaces.get(ws_ref.as_str()) {
                 let name = if ws.name.is_empty() { &ws.ws_ref } else { &ws.name };
                 lines.push(format!("Workspace: {}", name));
             }
         }
 
-        for &issue_idx in &item.issue_idxs {
-            if let Some(issue) = model.active().data.providers.issues.get(issue_idx) {
+        for issue_key in &item.issue_keys {
+            if let Some(issue) = model.active().data.providers.issues.get(issue_key.as_str()) {
                 let labels = issue.labels.join(", ");
                 lines.push(format!("Issue #{}: {} [{}]", issue.id, issue.title, labels));
             }
@@ -605,7 +604,7 @@ fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: R
                         CorItemKind::CloudSession => "Session",
                         CorItemKind::Workspace => "Workspace",
                     };
-                    lines.push(format!("{}: {} [idx={}]", kind_label, ci.title, ci.source_index));
+                    lines.push(format!("{}: {} [key={:?}]", kind_label, ci.title, ci.source_key));
                     for key in &ci.correlation_keys {
                         lines.push(format!("  {}", format_correlation_key(key)));
                     }

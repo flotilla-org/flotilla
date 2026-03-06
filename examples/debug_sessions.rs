@@ -57,24 +57,24 @@ async fn main() {
     }
 
     println!("\n  Checkouts: {}", snapshot.providers.checkouts.len());
-    for (i, co) in snapshot.providers.checkouts.iter().enumerate() {
+    for (i, (_path, co)) in snapshot.providers.checkouts.iter().enumerate() {
         println!("    [{i}] branch={:?} keys={:?}", co.branch, co.correlation_keys);
     }
 
     println!("\n  Change Requests: {}", snapshot.providers.change_requests.len());
-    for (i, cr) in snapshot.providers.change_requests.iter().enumerate() {
+    for (i, (_id, cr)) in snapshot.providers.change_requests.iter().enumerate() {
         println!("    [{i}] title={:?} branch={:?} corr_keys={:?} assoc_keys={:?}",
             cr.title, cr.branch, cr.correlation_keys, cr.association_keys);
     }
 
     println!("\n  Sessions: {}", snapshot.providers.sessions.len());
-    for (i, s) in snapshot.providers.sessions.iter().enumerate() {
+    for (i, (_id, s)) in snapshot.providers.sessions.iter().enumerate() {
         println!("    [{i}] title={:?} status={:?} keys={:?}",
             s.title, s.status, s.correlation_keys);
     }
 
     println!("\n  Workspaces: {}", snapshot.providers.workspaces.len());
-    for (i, ws) in snapshot.providers.workspaces.iter().enumerate() {
+    for (i, (_ref, ws)) in snapshot.providers.workspaces.iter().enumerate() {
         println!("    [{i}] name={:?} dirs={:?} keys={:?}",
             ws.name, ws.directories, ws.correlation_keys);
     }
@@ -89,9 +89,9 @@ async fn main() {
                 println!("  [{i}] HEADER: {h}");
             }
             data::TableEntry::Item(item) => {
-                println!("  [{i}] {:?} desc={:?} branch={:?} wt={:?} pr={:?} ses={:?} ws={:?}",
+                println!("  [{i}] {:?} desc={:?} branch={:?} co={:?} pr={:?} ses={:?} ws={:?}",
                     item.kind, item.description, item.branch,
-                    item.worktree_idx, item.pr_idx, item.session_idx, item.workspace_refs);
+                    item.checkout_key, item.pr_key, item.session_key, item.workspace_refs);
             }
         }
     }

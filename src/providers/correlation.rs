@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::types::CorrelationKey;
 
@@ -13,6 +14,15 @@ pub enum ItemKind {
     Workspace,
 }
 
+/// A key that uniquely identifies a provider item by its natural identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProviderItemKey {
+    Checkout(PathBuf),
+    ChangeRequest(String),
+    Session(String),
+    Workspace(String),
+}
+
 /// A single item submitted for correlation.
 #[derive(Debug, Clone)]
 pub struct CorrelatedItem {
@@ -22,7 +32,7 @@ pub struct CorrelatedItem {
     #[allow(dead_code)]
     pub title: String,
     pub correlation_keys: Vec<CorrelationKey>,
-    pub source_index: usize,
+    pub source_key: ProviderItemKey,
 }
 
 /// A group of items that are transitively related via shared correlation keys.
@@ -196,13 +206,14 @@ mod tests {
         kind: ItemKind,
         title: &str,
         keys: Vec<CorrelationKey>,
+        source_key: ProviderItemKey,
     ) -> CorrelatedItem {
         CorrelatedItem {
             provider_name: provider.to_string(),
             kind,
             title: title.to_string(),
             correlation_keys: keys,
-            source_index: 0,
+            source_key,
         }
     }
 
@@ -219,6 +230,7 @@ mod tests {
             ItemKind::Checkout,
             "feat-x",
             vec![CorrelationKey::Branch("feat-x".into())],
+            ProviderItemKey::Checkout(PathBuf::from("/code/feat-x")),
         )];
         let groups = correlate(items);
         assert_eq!(groups.len(), 1);
@@ -234,12 +246,14 @@ mod tests {
                 ItemKind::Checkout,
                 "feat-x checkout",
                 vec![CorrelationKey::Branch("feat-x".into())],
+                ProviderItemKey::Checkout(PathBuf::from("/code/feat-x")),
             ),
             item(
                 "github",
                 ItemKind::ChangeRequest,
                 "PR #42: feat-x",
                 vec![CorrelationKey::Branch("feat-x".into())],
+                ProviderItemKey::ChangeRequest("42".into()),
             ),
         ];
 
@@ -263,18 +277,21 @@ mod tests {
                     CorrelationKey::Branch("feat-x".into()),
                     CorrelationKey::CheckoutPath("/code/feat-x".into()),
                 ],
+                ProviderItemKey::Checkout(PathBuf::from("/code/feat-x")),
             ),
             item(
                 "github",
                 ItemKind::ChangeRequest,
                 "PR #42",
                 vec![CorrelationKey::Branch("feat-x".into())],
+                ProviderItemKey::ChangeRequest("42".into()),
             ),
             item(
                 "cmux",
                 ItemKind::Workspace,
                 "my-workspace",
                 vec![CorrelationKey::CheckoutPath("/code/feat-x".into())],
+                ProviderItemKey::Workspace("cmux:my-workspace".into()),
             ),
         ];
 
@@ -294,18 +311,21 @@ mod tests {
                 ItemKind::Checkout,
                 "branch-a",
                 vec![CorrelationKey::Branch("branch-a".into())],
+                ProviderItemKey::Checkout(PathBuf::from("/code/branch-a")),
             ),
             item(
                 "git",
                 ItemKind::Checkout,
                 "branch-b",
                 vec![CorrelationKey::Branch("branch-b".into())],
+                ProviderItemKey::Checkout(PathBuf::from("/code/branch-b")),
             ),
             item(
                 "claude",
                 ItemKind::CloudSession,
                 "session-1",
                 vec![CorrelationKey::SessionRef("claude".into(), "s1".into())],
+                ProviderItemKey::Session("s1".into()),
             ),
         ];
 
@@ -316,9 +336,9 @@ mod tests {
     #[test]
     fn no_correlation_keys_each_item_separate() {
         let items = vec![
-            item("git", ItemKind::Checkout, "orphan-a", vec![]),
-            item("github", ItemKind::ChangeRequest, "orphan-b", vec![]),
-            item("claude", ItemKind::CloudSession, "orphan-c", vec![]),
+            item("git", ItemKind::Checkout, "orphan-a", vec![], ProviderItemKey::Checkout(PathBuf::from("/code/orphan-a"))),
+            item("github", ItemKind::ChangeRequest, "orphan-b", vec![], ProviderItemKey::ChangeRequest("orphan-b".into())),
+            item("claude", ItemKind::CloudSession, "orphan-c", vec![], ProviderItemKey::Session("orphan-c".into())),
         ];
 
         let groups = correlate(items);
@@ -334,12 +354,14 @@ mod tests {
                 ItemKind::Checkout,
                 "main checkout",
                 vec![CorrelationKey::CheckoutPath(repo.clone())],
+                ProviderItemKey::Checkout(repo.clone()),
             ),
             item(
                 "tmux",
                 ItemKind::Workspace,
                 "my-workspace",
                 vec![CorrelationKey::CheckoutPath(repo)],
+                ProviderItemKey::Workspace("tmux:my-workspace".into()),
             ),
         ];
 
@@ -365,6 +387,7 @@ mod tests {
                     CorrelationKey::Branch("main".into()),
                     CorrelationKey::CheckoutPath(main_path.clone()),
                 ],
+                ProviderItemKey::Checkout(main_path.clone()),
             ),
             item(
                 "git",
@@ -374,6 +397,7 @@ mod tests {
                     CorrelationKey::Branch("feat-x".into()),
                     CorrelationKey::CheckoutPath(feat_path.clone()),
                 ],
+                ProviderItemKey::Checkout(feat_path.clone()),
             ),
             item(
                 "cmux",
@@ -384,6 +408,7 @@ mod tests {
                     CorrelationKey::CheckoutPath(feat_path),
                     CorrelationKey::CheckoutPath(main_path),
                 ],
+                ProviderItemKey::Workspace("cmux:buggy-workspace".into()),
             ),
         ];
 
@@ -404,12 +429,14 @@ mod tests {
                 ItemKind::ChangeRequest,
                 "PR #1",
                 vec![CorrelationKey::Branch("shared-branch".into())],
+                ProviderItemKey::ChangeRequest("1".into()),
             ),
             item(
                 "github",
                 ItemKind::ChangeRequest,
                 "PR #2",
                 vec![CorrelationKey::Branch("shared-branch".into())],
+                ProviderItemKey::ChangeRequest("2".into()),
             ),
         ];
 
@@ -425,18 +452,21 @@ mod tests {
                 ItemKind::Checkout,
                 "feat-x",
                 vec![CorrelationKey::Branch("feat-x".into())],
+                ProviderItemKey::Checkout(PathBuf::from("/code/feat-x")),
             ),
             item(
                 "claude",
                 ItemKind::CloudSession,
                 "session-1",
                 vec![CorrelationKey::Branch("feat-x".into())],
+                ProviderItemKey::Session("sess-1".into()),
             ),
             item(
                 "claude",
                 ItemKind::CloudSession,
                 "session-2",
                 vec![CorrelationKey::Branch("feat-x".into())],
+                ProviderItemKey::Session("sess-2".into()),
             ),
         ];
 
