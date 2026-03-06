@@ -67,9 +67,13 @@ jobs:
           fi
           echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${PERCENT}%\",\"color\":\"${COLOR}\"}" \
             > target/llvm-cov/html/badge.json
+      - name: Stage under coverage/
+        run: |
+          mkdir -p _site/coverage
+          cp -r target/llvm-cov/html/* _site/coverage/
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: target/llvm-cov/html/
+          path: _site/
 
   deploy:
     name: Deploy to Pages

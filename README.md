@@ -1,7 +1,7 @@
 # flotilla
 
 [![CI](https://github.com/rjwittams/flotilla/actions/workflows/ci.yml/badge.svg)](https://github.com/rjwittams/flotilla/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://rjwittams.github.io/flotilla/badge.json)](https://rjwittams.github.io/flotilla/)
+[![Coverage](https://img.shields.io/endpoint?url=https://rjwittams.github.io/flotilla/coverage/badge.json)](https://rjwittams.github.io/flotilla/coverage/)
 
 Development fleet management. Agents, branches, PRs, and workspaces across every repo in one view.
 
