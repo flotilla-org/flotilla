@@ -33,12 +33,20 @@ Available tools are auto-detected from your environment, with configurable overr
 ## Quickstart
 
 ```
-cargo install flotilla
+cargo install --git https://github.com/rjwittams/flotilla
 cd your-repo
 flotilla
 ```
 
-Repo root is auto-detected from the current directory. Multiple repos can be managed as tabs.
+Or from source:
+
+```
+git clone https://github.com/rjwittams/flotilla
+cd flotilla
+cargo run -- --repo-root /path/to/your/repo
+```
+
+Repo root is auto-detected from the current directory if omitted. Multiple repos can be managed as tabs.
 
 ## Future direction
 
