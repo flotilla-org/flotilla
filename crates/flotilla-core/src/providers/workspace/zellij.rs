@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_state_round_trip() {
+    fn toml_serialization_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let session = "test-session";
         let state_path = dir
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn load_state_handles_corrupt_toml() {
+    fn corrupt_toml_fails_deserialization() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         std::fs::write(&path, "not valid toml {{{{").unwrap();
@@ -418,5 +418,74 @@ mod tests {
         let mut args: Vec<&str> = vec!["new-pane"];
         ZellijWorkspaceManager::append_command_args(&mut args, "");
         assert_eq!(args, vec!["new-pane"]);
+    }
+
+    #[test]
+    fn prune_retains_only_live_tabs() {
+        let mut state = ZellijState::default();
+        state.tabs.insert(
+            "live-tab".to_string(),
+            TabState {
+                working_directory: "/tmp/live".to_string(),
+                created_at: "1".to_string(),
+            },
+        );
+        state.tabs.insert(
+            "stale-tab".to_string(),
+            TabState {
+                working_directory: "/tmp/stale".to_string(),
+                created_at: "2".to_string(),
+            },
+        );
+        state.tabs.insert(
+            "another-stale".to_string(),
+            TabState {
+                working_directory: "/tmp/stale2".to_string(),
+                created_at: "3".to_string(),
+            },
+        );
+
+        let live_names: HashSet<&str> = ["live-tab"].into_iter().collect();
+        state
+            .tabs
+            .retain(|name, _| live_names.contains(name.as_str()));
+
+        assert_eq!(state.tabs.len(), 1);
+        assert!(state.tabs.contains_key("live-tab"));
+    }
+
+    #[test]
+    fn prune_empty_state_is_noop() {
+        let mut state = ZellijState::default();
+        let live_names: HashSet<&str> = ["tab1", "tab2"].into_iter().collect();
+        state
+            .tabs
+            .retain(|name, _| live_names.contains(name.as_str()));
+        assert!(state.tabs.is_empty());
+    }
+
+    #[test]
+    fn prune_all_live_removes_nothing() {
+        let mut state = ZellijState::default();
+        state.tabs.insert(
+            "tab1".to_string(),
+            TabState {
+                working_directory: "/tmp/1".to_string(),
+                created_at: "1".to_string(),
+            },
+        );
+        state.tabs.insert(
+            "tab2".to_string(),
+            TabState {
+                working_directory: "/tmp/2".to_string(),
+                created_at: "2".to_string(),
+            },
+        );
+
+        let live_names: HashSet<&str> = ["tab1", "tab2"].into_iter().collect();
+        state
+            .tabs
+            .retain(|name, _| live_names.contains(name.as_str()));
+        assert_eq!(state.tabs.len(), 2);
     }
 }

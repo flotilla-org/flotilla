@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_state_round_trip() {
+    fn toml_serialization_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let session = "test-session";
         let state_path = dir
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn load_state_handles_corrupt_toml() {
+    fn corrupt_toml_fails_deserialization() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         std::fs::write(&path, "this is not valid toml {{{{").unwrap();
@@ -392,5 +392,74 @@ mod tests {
         assert!(serialized.contains("[windows.feat-branch]"));
         assert!(serialized.contains("working_directory"));
         assert!(serialized.contains("created_at"));
+    }
+
+    #[test]
+    fn prune_retains_only_live_windows() {
+        let mut state = TmuxState::default();
+        state.windows.insert(
+            "live-window".to_string(),
+            WindowState {
+                working_directory: "/tmp/live".to_string(),
+                created_at: "1".to_string(),
+            },
+        );
+        state.windows.insert(
+            "stale-window".to_string(),
+            WindowState {
+                working_directory: "/tmp/stale".to_string(),
+                created_at: "2".to_string(),
+            },
+        );
+        state.windows.insert(
+            "another-stale".to_string(),
+            WindowState {
+                working_directory: "/tmp/stale2".to_string(),
+                created_at: "3".to_string(),
+            },
+        );
+
+        let live_names: HashSet<&str> = ["live-window"].into_iter().collect();
+        state
+            .windows
+            .retain(|name, _| live_names.contains(name.as_str()));
+
+        assert_eq!(state.windows.len(), 1);
+        assert!(state.windows.contains_key("live-window"));
+    }
+
+    #[test]
+    fn prune_empty_state_is_noop() {
+        let mut state = TmuxState::default();
+        let live_names: HashSet<&str> = ["win1", "win2"].into_iter().collect();
+        state
+            .windows
+            .retain(|name, _| live_names.contains(name.as_str()));
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn prune_all_live_removes_nothing() {
+        let mut state = TmuxState::default();
+        state.windows.insert(
+            "win1".to_string(),
+            WindowState {
+                working_directory: "/tmp/1".to_string(),
+                created_at: "1".to_string(),
+            },
+        );
+        state.windows.insert(
+            "win2".to_string(),
+            WindowState {
+                working_directory: "/tmp/2".to_string(),
+                created_at: "2".to_string(),
+            },
+        );
+
+        let live_names: HashSet<&str> = ["win1", "win2"].into_iter().collect();
+        state
+            .windows
+            .retain(|name, _| live_names.contains(name.as_str()));
+        assert_eq!(state.windows.len(), 2);
     }
 }
