@@ -45,7 +45,8 @@ impl InProcessDaemon {
                 continue;
             }
             let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
-            let model = RepoModel::new(path.clone(), registry, repo_slug);
+            let mut model = RepoModel::new(path.clone(), registry, repo_slug);
+            model.data.loading = true;
             repos.insert(
                 path.clone(),
                 RepoState {
@@ -191,7 +192,7 @@ impl DaemonHandle for InProcessDaemon {
     async fn add_repo(&self, path: &Path) -> Result<(), String> {
         let path = path.to_path_buf();
 
-        // Check if already tracked
+        // Check if already tracked (under read lock for fast path)
         {
             let repos = self.repos.read().await;
             if repos.contains_key(&path) {
@@ -199,9 +200,10 @@ impl DaemonHandle for InProcessDaemon {
             }
         }
 
-        // Create the model (this spawns provider detection and refresh loop)
+        // Create the model outside the lock (spawns provider detection and refresh)
         let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
-        let model = RepoModel::new(path.clone(), registry, repo_slug);
+        let mut model = RepoModel::new(path.clone(), registry, repo_slug);
+        model.data.loading = true;
 
         let repo_info = RepoInfo {
             path: path.clone(),
@@ -215,10 +217,13 @@ impl DaemonHandle for InProcessDaemon {
             loading: true,
         };
 
-        // Insert under write lock
+        // Insert under write lock — re-check to avoid TOCTOU duplicate
         {
             let mut repos = self.repos.write().await;
             let mut order = self.repo_order.write().await;
+            if repos.contains_key(&path) {
+                return Ok(());
+            }
             repos.insert(
                 path.clone(),
                 RepoState {
