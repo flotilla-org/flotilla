@@ -219,7 +219,6 @@ pub async fn execute(cmd: Command, app: &mut App) {
                     .map(|(id, _title)| (provider.clone(), id.clone()))
                     .collect()
             };
-            app.pending_issue_ids = issue_id_pairs;
 
             info!("generating branch name");
             let branch_result = if let Some(ai) = app.model.active().registry.ai_utilities.values().next() {
@@ -238,13 +237,13 @@ pub async fn execute(cmd: Command, app: &mut App) {
             match branch_result {
                 Some(Ok(branch)) => {
                     info!("AI suggested: {branch}");
-                    app.prefill_branch_input(&branch);
+                    app.prefill_branch_input(&branch, issue_id_pairs);
                 }
                 _ => {
                     let fallback: Vec<String> = issues.iter()
                         .map(|(id, _)| format!("issue-{}", id))
                         .collect();
-                    app.prefill_branch_input(&fallback.join("-"));
+                    app.prefill_branch_input(&fallback.join("-"), issue_id_pairs);
                 }
             }
         }
