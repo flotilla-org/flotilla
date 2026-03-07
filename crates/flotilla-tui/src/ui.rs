@@ -353,7 +353,7 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
                 _ => ("○", Color::Magenta),
             }
         }
-        WorkItemKind::Pr => ("⊙", Color::Blue),
+        WorkItemKind::ChangeRequest => ("⊙", Color::Blue),
         WorkItemKind::RemoteBranch => ("⊶", Color::DarkGray),
         WorkItemKind::Issue => ("◇", Color::Yellow),
     };

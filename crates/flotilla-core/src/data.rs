@@ -42,7 +42,7 @@ pub enum GroupEntry {
 #[derive(Debug, Clone)]
 pub enum CorrelatedAnchor {
     Checkout(CheckoutRef),
-    Pr(String),
+    ChangeRequest(String),
     Session(String),
 }
 
@@ -75,7 +75,7 @@ impl CorrelationResult {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(_) => WorkItemKind::Checkout,
-                CorrelatedAnchor::Pr(_) => WorkItemKind::Pr,
+                CorrelatedAnchor::ChangeRequest(_) => WorkItemKind::ChangeRequest,
                 CorrelatedAnchor::Session(_) => WorkItemKind::Session,
             },
             CorrelationResult::Standalone(s) => match s {
@@ -126,7 +126,7 @@ impl CorrelationResult {
     pub fn change_request_key(&self) -> Option<&str> {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
-                CorrelatedAnchor::Pr(key) => Some(key.as_str()),
+                CorrelatedAnchor::ChangeRequest(key) => Some(key.as_str()),
                 _ => c.linked_change_request.as_deref(),
             },
             _ => None,
@@ -171,7 +171,7 @@ impl CorrelationResult {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(co.key.clone()),
-                CorrelatedAnchor::Pr(key) => WorkItemIdentity::ChangeRequest(key.clone()),
+                CorrelatedAnchor::ChangeRequest(key) => WorkItemIdentity::ChangeRequest(key.clone()),
                 CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
             },
             CorrelationResult::Standalone(s) => match s {
@@ -272,7 +272,7 @@ fn group_to_work_item(
             session_key,
         )
     } else if let Some(key) = change_request_key {
-        (CorrelatedAnchor::Pr(key), None, session_key)
+        (CorrelatedAnchor::ChangeRequest(key), None, session_key)
     } else if let Some(key) = session_key {
         (CorrelatedAnchor::Session(key), None, None)
     } else {
@@ -282,7 +282,7 @@ fn group_to_work_item(
     let branch = group.branch().map(|s| s.to_string());
 
     let pr_ref = match &anchor {
-        CorrelatedAnchor::Pr(k) => Some(k.as_str()),
+        CorrelatedAnchor::ChangeRequest(k) => Some(k.as_str()),
         _ => linked_change_request.as_deref(),
     };
     let session_ref = match &anchor {
@@ -484,7 +484,7 @@ pub fn group_work_items(
         match item.kind {
             WorkItemKind::Checkout => checkout_items.push(item),
             WorkItemKind::Session => session_items.push(item),
-            WorkItemKind::Pr => pr_items.push(item),
+            WorkItemKind::ChangeRequest => pr_items.push(item),
             WorkItemKind::RemoteBranch => remote_items.push(item),
             WorkItemKind::Issue => issue_items.push(item),
         }
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn identity_pr() {
         let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
-            anchor: CorrelatedAnchor::Pr("42".to_string()),
+            anchor: CorrelatedAnchor::ChangeRequest("42".to_string()),
             branch: None,
             description: String::new(),
             linked_change_request: None,

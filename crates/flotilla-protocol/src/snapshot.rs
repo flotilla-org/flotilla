@@ -97,7 +97,7 @@ impl WorkItem {
 pub enum WorkItemKind {
     Checkout,
     Session,
-    Pr,
+    ChangeRequest,
     RemoteBranch,
     Issue,
 }

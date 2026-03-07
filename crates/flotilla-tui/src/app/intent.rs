@@ -100,7 +100,7 @@ impl Intent {
                 item.branch.as_ref().map(|branch| Command::CreateCheckout {
                     branch: branch.to_string(),
                     create_branch: item.kind != WorkItemKind::RemoteBranch
-                        && item.kind != WorkItemKind::Pr,
+                        && item.kind != WorkItemKind::ChangeRequest,
                     issue_ids: Vec::new(),
                 })
             }
