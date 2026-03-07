@@ -39,11 +39,14 @@ pub async fn execute(cmd: Command, app: &mut App) {
         }
         // Issue commands are non-blocking — spawn background tasks so the main
         // loop stays responsive for key/mouse input while pages are fetched.
-        Command::SetIssueViewport { .. }
-        | Command::FetchMoreIssues { .. }
-        | Command::SearchIssues { .. }
-        | Command::ClearIssueSearch { .. } => {
+        // Use the repo from the command payload (not active tab) since the
+        // command may target a background repo (e.g. initial fetch on load).
+        Command::SetIssueViewport { ref repo, .. }
+        | Command::FetchMoreIssues { ref repo, .. }
+        | Command::SearchIssues { ref repo, .. }
+        | Command::ClearIssueSearch { ref repo, .. } => {
             let daemon = app.daemon.clone();
+            let repo = repo.clone();
             tokio::spawn(async move {
                 let _ = daemon.execute(&repo, cmd).await;
             });

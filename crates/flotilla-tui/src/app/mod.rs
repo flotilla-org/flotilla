@@ -55,6 +55,8 @@ pub struct TuiRepoModel {
     pub issue_total: Option<u32>,
     pub issue_search_active: bool,
     pub issue_fetch_pending: bool,
+    /// Whether the initial issue fetch has been requested for this repo.
+    pub issue_initial_requested: bool,
 }
 
 /// TUI-side domain model. Mirrors the shape of core's `AppModel` but without
@@ -87,6 +89,7 @@ impl TuiModel {
                     issue_total: None,
                     issue_search_active: false,
                     issue_fetch_pending: false,
+                    issue_initial_requested: false,
                 },
             );
             order.push(info.path);
@@ -167,7 +170,6 @@ impl App {
             None => return,
         };
 
-        let was_loading = rm.loading;
         let old_providers = std::mem::replace(&mut rm.providers, Arc::new(snap.providers));
         rm.provider_health = snap.provider_health.clone();
         rm.loading = false;
@@ -284,8 +286,10 @@ impl App {
             }
         }
 
-        // On first load, tell the daemon our viewport size so it fetches enough issues
-        if was_loading {
+        // Request initial issue fetch once per repo (on first snapshot received)
+        let rm = self.model.repos.get_mut(&path).unwrap();
+        if !rm.issue_initial_requested {
+            rm.issue_initial_requested = true;
             let visible = self.ui.layout.table_area.height.saturating_sub(2) as usize;
             self.proto_commands.push(Command::SetIssueViewport {
                 repo: path,
@@ -311,6 +315,7 @@ impl App {
                 issue_total: None,
                 issue_search_active: false,
                 issue_fetch_pending: false,
+                issue_initial_requested: false,
             },
         );
         self.model.repo_order.push(path.clone());

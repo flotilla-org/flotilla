@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::info;
 
 use flotilla_protocol::{Command, CommandResult, DaemonEvent, Issue, RepoInfo, Snapshot};
@@ -37,6 +37,8 @@ pub struct InProcessDaemon {
     event_tx: broadcast::Sender<DaemonEvent>,
     config: Arc<ConfigStore>,
     runner: Arc<dyn CommandRunner>,
+    /// Serializes issue fetch operations to prevent concurrent page skips.
+    issue_fetch_mutex: Mutex<()>,
 }
 
 impl InProcessDaemon {
@@ -79,6 +81,7 @@ impl InProcessDaemon {
             event_tx,
             config,
             runner,
+            issue_fetch_mutex: Mutex::new(()),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -117,9 +120,17 @@ impl InProcessDaemon {
 
             let snapshot = handle.snapshot_rx.borrow_and_update().clone();
 
-            // Merge cached issues into providers and re-correlate
+            // Merge cached issues into providers and re-correlate.
+            // When search results are active, use those instead of the full cache.
             let mut providers = (*snapshot.providers).clone();
-            providers.issues = state.issue_cache.to_index_map();
+            if let Some(ref search_results) = state.search_results {
+                providers.issues = search_results
+                    .iter()
+                    .map(|i| (i.id.clone(), i.clone()))
+                    .collect();
+            } else {
+                providers.issues = state.issue_cache.to_index_map();
+            }
             let providers = Arc::new(providers);
 
             let (work_items, correlation_groups) = crate::data::correlate(&providers);
@@ -164,6 +175,9 @@ impl InProcessDaemon {
     /// Fetch issue pages until the cache has at least `desired_count` entries
     /// (or no more pages are available).
     async fn ensure_issues_cached(&self, repo: &Path, desired_count: usize) {
+        // Serialize fetches to prevent concurrent calls from reading the same
+        // next_page and skipping pages.
+        let _guard = self.issue_fetch_mutex.lock().await;
         loop {
             // Check cache state and grab registry Arc (single read lock)
             let (page_num, registry) = {
@@ -173,11 +187,22 @@ impl InProcessDaemon {
                 };
                 let need =
                     state.issue_cache.entries.len() < desired_count && state.issue_cache.has_more;
-                let has_tracker = !state.model.registry.issue_trackers.is_empty();
-                if !need || !has_tracker {
+                if !need {
                     break;
                 }
-                (state.issue_cache.next_page, Arc::clone(&state.model.registry))
+                if state.model.registry.issue_trackers.is_empty() {
+                    // No tracker — stop claiming more pages are available
+                    drop(repos);
+                    let mut repos = self.repos.write().await;
+                    if let Some(state) = repos.get_mut(repo) {
+                        state.issue_cache.has_more = false;
+                    }
+                    break;
+                }
+                (
+                    state.issue_cache.next_page,
+                    Arc::clone(&state.model.registry),
+                )
             };
 
             // Fetch the next page outside any lock
@@ -238,9 +263,17 @@ impl InProcessDaemon {
             return;
         };
 
-        // Rebuild snapshot with current cache state
+        // Rebuild snapshot with current cache state.
+        // When search results are active, use those as the issue list instead.
         let mut providers = (*state.last_snapshot.providers).clone();
-        providers.issues = state.issue_cache.to_index_map();
+        if let Some(ref search_results) = state.search_results {
+            providers.issues = search_results
+                .iter()
+                .map(|i| (i.id.clone(), i.clone()))
+                .collect();
+        } else {
+            providers.issues = state.issue_cache.to_index_map();
+        }
         let providers = Arc::new(providers);
         let (work_items, correlation_groups) = crate::data::correlate(&providers);
 
@@ -284,7 +317,14 @@ impl DaemonHandle for InProcessDaemon {
 
         // Merge cached issues into providers and re-correlate
         let mut providers = (*state.last_snapshot.providers).clone();
-        providers.issues = state.issue_cache.to_index_map();
+        if let Some(ref search_results) = state.search_results {
+            providers.issues = search_results
+                .iter()
+                .map(|i| (i.id.clone(), i.clone()))
+                .collect();
+        } else {
+            providers.issues = state.issue_cache.to_index_map();
+        }
         let providers = Arc::new(providers);
         let (work_items, correlation_groups) = crate::data::correlate(&providers);
 
@@ -341,7 +381,8 @@ impl DaemonHandle for InProcessDaemon {
         match &command {
             Command::SetIssueViewport { visible_count, .. } => {
                 // Fetch at least 200 so small repos get all issues upfront
-                self.ensure_issues_cached(repo, (*visible_count * 2).max(200)).await;
+                self.ensure_issues_cached(repo, (*visible_count * 2).max(200))
+                    .await;
                 self.broadcast_snapshot(repo).await;
                 return Ok(CommandResult::Ok);
             }
