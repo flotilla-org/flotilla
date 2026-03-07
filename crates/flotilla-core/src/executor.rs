@@ -24,8 +24,8 @@ pub async fn execute(
     providers_data: &ProviderData,
 ) -> CommandResult {
     match cmd {
-        Command::SwitchWorktree { path } => {
-            if let Some(co) = providers_data.checkouts.get(&path).cloned() {
+        Command::CreateWorkspaceForCheckout { checkout_path } => {
+            if let Some(co) = providers_data.checkouts.get(&checkout_path).cloned() {
                 info!("entering workspace for {}", co.branch);
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
                     let config = workspace_config(repo_root, &co.branch, &co.path, "claude");
@@ -36,7 +36,7 @@ pub async fn execute(
                 CommandResult::Ok
             } else {
                 CommandResult::Error {
-                    message: format!("checkout not found: {}", path.display()),
+                    message: format!("checkout not found: {}", checkout_path.display()),
                 }
             }
         }
@@ -51,7 +51,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::CreateWorktree {
+        Command::CreateCheckout {
             branch,
             create_branch,
             issue_ids,
@@ -74,16 +74,16 @@ pub async fn execute(
                         let config = workspace_config(repo_root, &branch, &checkout.path, "claude");
                         if let Err(e) = ws_mgr.create_workspace(&config).await {
                             // Checkout was created but workspace failed — report as error
-                            // but the worktree still exists
+                            // but the checkout still exists
                             error!("workspace creation failed after checkout: {e}");
                         }
                     }
-                    CommandResult::WorktreeCreated {
+                    CommandResult::CheckoutCreated {
                         branch: branch.clone(),
                     }
                 }
                 Some(Err(e)) => {
-                    error!("create worktree failed: {e}");
+                    error!("create checkout failed: {e}");
                     CommandResult::Error { message: e }
                 }
                 None => CommandResult::Error {
@@ -108,30 +108,30 @@ pub async fn execute(
             }
         }
 
-        Command::FetchDeleteInfo {
+        Command::FetchCheckoutStatus {
             branch,
-            worktree_path,
-            pr_number,
+            checkout_path,
+            change_request_id,
         } => {
-            let info = data::fetch_delete_confirm_info(
+            let info = data::fetch_checkout_status(
                 &branch,
-                worktree_path.as_deref(),
-                pr_number.as_deref(),
+                checkout_path.as_deref(),
+                change_request_id.as_deref(),
                 repo_root,
             )
             .await;
-            CommandResult::DeleteInfo(info)
+            CommandResult::CheckoutStatus(info)
         }
 
-        Command::OpenPr { id } => {
-            debug!("opening PR {id} in browser");
+        Command::OpenChangeRequest { id } => {
+            debug!("opening change request {id} in browser");
             if let Some(cr) = registry.code_review.values().next() {
                 let _ = cr.open_in_browser(repo_root, &id).await;
             }
             CommandResult::Ok
         }
 
-        Command::OpenIssueBrowser { id } => {
+        Command::OpenIssue { id } => {
             debug!("opening issue {id} in browser");
             if let Some(it) = registry.issue_trackers.values().next() {
                 let _ = it.open_in_browser(repo_root, &id).await;
@@ -139,11 +139,25 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::LinkIssuesToPr { pr_id, issue_ids } => {
-            info!("linking issues {:?} to PR #{pr_id}", issue_ids);
+        Command::LinkIssuesToChangeRequest {
+            change_request_id,
+            issue_ids,
+        } => {
+            info!(
+                "linking issues {:?} to change request #{change_request_id}",
+                issue_ids
+            );
             let body_result = providers::run_cmd(
                 "gh",
-                &["pr", "view", &pr_id, "--json", "body", "--jq", ".body"],
+                &[
+                    "pr",
+                    "view",
+                    &change_request_id,
+                    "--json",
+                    "body",
+                    "--jq",
+                    ".body",
+                ],
                 repo_root,
             )
             .await;
@@ -158,23 +172,23 @@ pub async fn execute(
                     };
                     let result = providers::run_cmd(
                         "gh",
-                        &["pr", "edit", &pr_id, "--body", &new_body],
+                        &["pr", "edit", &change_request_id, "--body", &new_body],
                         repo_root,
                     )
                     .await;
                     match result {
                         Ok(_) => {
-                            info!("linked issues to PR #{pr_id}");
+                            info!("linked issues to change request #{change_request_id}");
                             CommandResult::Ok
                         }
                         Err(e) => {
-                            error!("failed to edit PR: {e}");
+                            error!("failed to edit change request: {e}");
                             CommandResult::Error { message: e }
                         }
                     }
                 }
                 Err(e) => {
-                    error!("failed to read PR body: {e}");
+                    error!("failed to read change request body: {e}");
                     CommandResult::Error { message: e }
                 }
             }
@@ -287,7 +301,7 @@ pub async fn execute(
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
                     let config = workspace_config(repo_root, name, &path, &teleport_cmd);
                     if let Err(e) = ws_mgr.create_workspace(&config).await {
-                        // Unlike CreateWorktree, teleport fails entirely if the workspace
+                        // Unlike CreateCheckout, teleport fails entirely if the workspace
                         // can't be created — the checkout may already have existed.
                         return CommandResult::Error { message: e };
                     }
@@ -295,7 +309,7 @@ pub async fn execute(
                 CommandResult::Ok
             } else {
                 CommandResult::Error {
-                    message: "Could not determine worktree path for teleport".to_string(),
+                    message: "Could not determine checkout path for teleport".to_string(),
                 }
             }
         }
