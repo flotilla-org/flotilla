@@ -37,6 +37,18 @@ pub async fn execute(cmd: Command, app: &mut App) {
             }
             return;
         }
+        // Issue commands are non-blocking — spawn background tasks so the main
+        // loop stays responsive for key/mouse input while pages are fetched.
+        Command::SetIssueViewport { .. }
+        | Command::FetchMoreIssues { .. }
+        | Command::SearchIssues { .. }
+        | Command::ClearIssueSearch { .. } => {
+            let daemon = app.daemon.clone();
+            tokio::spawn(async move {
+                let _ = daemon.execute(&repo, cmd).await;
+            });
+            return;
+        }
         _ => {}
     }
 

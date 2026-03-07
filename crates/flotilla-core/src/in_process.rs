@@ -348,7 +348,8 @@ impl DaemonHandle for InProcessDaemon {
         // Handle daemon-level issue commands directly
         match &command {
             Command::SetIssueViewport { visible_count, .. } => {
-                self.ensure_issues_cached(repo, *visible_count * 2).await;
+                // Fetch at least 200 so small repos get all issues upfront
+                self.ensure_issues_cached(repo, (*visible_count * 2).max(200)).await;
                 self.broadcast_snapshot(repo).await;
                 return Ok(CommandResult::Ok);
             }

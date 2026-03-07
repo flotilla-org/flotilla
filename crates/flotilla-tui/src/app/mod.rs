@@ -54,6 +54,7 @@ pub struct TuiRepoModel {
     pub issue_has_more: bool,
     pub issue_total: Option<u32>,
     pub issue_search_active: bool,
+    pub issue_fetch_pending: bool,
 }
 
 /// TUI-side domain model. Mirrors the shape of core's `AppModel` but without
@@ -85,6 +86,7 @@ impl TuiModel {
                     issue_has_more: false,
                     issue_total: None,
                     issue_search_active: false,
+                    issue_fetch_pending: false,
                 },
             );
             order.push(info.path);
@@ -172,6 +174,7 @@ impl App {
         rm.issue_has_more = snap.issue_has_more;
         rm.issue_total = snap.issue_total;
         rm.issue_search_active = snap.issue_search_results.is_some();
+        rm.issue_fetch_pending = false;
 
         // Build table view
         let section_labels = SectionLabels {
@@ -307,6 +310,7 @@ impl App {
                 issue_has_more: false,
                 issue_total: None,
                 issue_search_active: false,
+                issue_fetch_pending: false,
             },
         );
         self.model.repo_order.push(path.clone());
@@ -1150,9 +1154,15 @@ impl App {
 
         // Infinite scroll: fetch more issues when near the bottom
         let total = self.active_ui().table_view.selectable_indices.len();
-        if next + 5 >= total && self.model.active().issue_has_more {
+        if next + 5 >= total
+            && self.model.active().issue_has_more
+            && !self.model.active().issue_fetch_pending
+        {
             let repo = self.model.active_repo_root().clone();
             let desired = total + 50;
+            if let Some(rm) = self.model.repos.get_mut(&repo) {
+                rm.issue_fetch_pending = true;
+            }
             self.proto_commands.push(Command::FetchMoreIssues {
                 repo,
                 desired_count: desired,
