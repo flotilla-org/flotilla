@@ -1083,6 +1083,7 @@ dependencies = [
 name = "flotilla-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "color-eyre",
  "crossterm 0.28.1",
  "dirs",
@@ -1092,6 +1093,8 @@ dependencies = [
  "image",
  "ratatui 0.30.0",
  "ratatui-image",
+ "serde",
+ "serde_json",
  "time",
  "tokio",
  "tracing",
