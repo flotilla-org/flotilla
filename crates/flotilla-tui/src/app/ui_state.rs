@@ -44,6 +44,9 @@ pub enum UiMode {
         info: Option<CheckoutStatus>,
         loading: bool,
     },
+    IssueSearch {
+        input: Input,
+    },
 }
 
 impl UiMode {
@@ -193,6 +196,12 @@ mod tests {
                 UiMode::DeleteConfirm {
                     info: None,
                     loading: false,
+                },
+                false,
+            ),
+            (
+                UiMode::IssueSearch {
+                    input: Input::default(),
                 },
                 false,
             ),

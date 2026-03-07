@@ -130,6 +130,9 @@ fn render_status_bar(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Re
             generating: false, ..
         } => " type branch name  enter:create  esc:cancel".into(),
         UiMode::ActionMenu { .. } => " j/k:navigate  enter:select  esc:close".into(),
+        UiMode::IssueSearch { ref input } => {
+            format!(" / search: {}▏  enter:search  esc:cancel", input.value())
+        }
         UiMode::FilePicker { .. } => " j/k:navigate  tab:complete  enter:select  esc:cancel".into(),
         UiMode::DeleteConfirm { .. } => " y/enter:confirm  n/esc:cancel".into(),
         UiMode::Help => " ?:close help  esc:close help".into(),
@@ -151,7 +154,7 @@ fn render_status_bar(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Re
                         }
                     }
                 }
-                s.push_str("  .:menu  n:new  r:refresh  space:select  ?:help  q:quit");
+                s.push_str("  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit");
                 s
             }
         }
