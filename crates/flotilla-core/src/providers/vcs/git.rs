@@ -168,3 +168,103 @@ impl super::Vcs for GitVcs {
         Ok(super::parse_porcelain_status(&output))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::vcs::Vcs;
+    use crate::providers::CommandRunner;
+    use std::sync::Arc;
+
+    struct MockRunner {
+        responses: std::sync::Mutex<Vec<Result<String, String>>>,
+    }
+
+    impl MockRunner {
+        fn new(responses: Vec<Result<String, String>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for MockRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path) -> Result<String, String> {
+            self.responses.lock().unwrap().remove(0)
+        }
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn list_local_branches_parses_output() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(
+            "main\nfeature/foo\nfix-bar\n".to_string()
+        )]));
+        let vcs = GitVcs::new(runner);
+        let branches = vcs.list_local_branches(Path::new("/fake")).await.unwrap();
+        assert_eq!(branches.len(), 3);
+        assert_eq!(branches[0].name, "main");
+        assert!(branches[0].is_trunk);
+        assert_eq!(branches[1].name, "feature/foo");
+        assert!(!branches[1].is_trunk);
+        assert_eq!(branches[2].name, "fix-bar");
+        assert!(!branches[2].is_trunk);
+    }
+
+    #[tokio::test]
+    async fn working_tree_status_parses_porcelain() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(
+            "M  src/main.rs\n?? new.rs\n".to_string()
+        )]));
+        let vcs = GitVcs::new(runner);
+        let status = vcs
+            .working_tree_status(Path::new("/fake"), Path::new("/fake"))
+            .await
+            .unwrap();
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.untracked, 1);
+        assert_eq!(status.modified, 0);
+    }
+
+    #[tokio::test]
+    async fn commit_log_parses_oneline() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(
+            "abc1234 Initial commit\ndef5678 Add feature\n".to_string(),
+        )]));
+        let vcs = GitVcs::new(runner);
+        let log = vcs
+            .commit_log(Path::new("/fake"), "main", 10)
+            .await
+            .unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].short_sha, "abc1234");
+        assert_eq!(log[0].message, "Initial commit");
+        assert_eq!(log[1].short_sha, "def5678");
+        assert_eq!(log[1].message, "Add feature");
+    }
+
+    #[tokio::test]
+    async fn ahead_behind_parses_count() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("3\t5\n".to_string())]));
+        let vcs = GitVcs::new(runner);
+        let ab = vcs
+            .ahead_behind(Path::new("/fake"), "feature", "main")
+            .await
+            .unwrap();
+        assert_eq!(ab.ahead, 3);
+        assert_eq!(ab.behind, 5);
+    }
+
+    #[tokio::test]
+    async fn list_remote_branches_no_remote() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("".to_string()), // git remote returns empty
+        ]));
+        let vcs = GitVcs::new(runner);
+        let branches = vcs.list_remote_branches(Path::new("/fake")).await.unwrap();
+        assert!(branches.is_empty());
+    }
+}
