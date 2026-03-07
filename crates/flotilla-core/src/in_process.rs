@@ -15,7 +15,7 @@ use tracing::info;
 
 use flotilla_protocol::{Command, CommandResult, DaemonEvent, RepoInfo, Snapshot};
 
-use crate::config;
+use crate::config::ConfigStore;
 use crate::convert::snapshot_to_proto;
 use crate::daemon::DaemonHandle;
 use crate::executor;
@@ -32,6 +32,7 @@ pub struct InProcessDaemon {
     repos: RwLock<HashMap<PathBuf, RepoState>>,
     repo_order: RwLock<Vec<PathBuf>>,
     event_tx: broadcast::Sender<DaemonEvent>,
+    config: Arc<ConfigStore>,
 }
 
 impl InProcessDaemon {
@@ -40,7 +41,7 @@ impl InProcessDaemon {
     /// Returns `Arc<Self>` because a background poll task is spawned that
     /// holds a reference. The poll loop checks every 100ms for new refresh
     /// snapshots and broadcasts `DaemonEvent::Snapshot` for each change.
-    pub async fn new(repo_paths: Vec<PathBuf>) -> Arc<Self> {
+    pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
         let mut repos = HashMap::new();
         let mut order = Vec::new();
@@ -49,7 +50,8 @@ impl InProcessDaemon {
             if repos.contains_key(&path) {
                 continue;
             }
-            let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
+            let (registry, repo_slug) =
+                crate::providers::discovery::detect_providers(&path, &config).await;
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
             repos.insert(
@@ -67,6 +69,7 @@ impl InProcessDaemon {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
             event_tx,
+            config,
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -240,7 +243,8 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
+        let (registry, repo_slug) =
+            crate::providers::discovery::detect_providers(&path, &self.config).await;
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
         model.data.loading = true;
 
@@ -277,9 +281,9 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Persist to config
-        config::save_repo(None, &path);
+        self.config.save_repo(&path);
         let order = self.repo_order.read().await;
-        config::save_tab_order(None, &order);
+        self.config.save_tab_order(&order);
 
         info!("added repo {}", path.display());
         let _ = self
@@ -302,9 +306,9 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Persist to config
-        config::remove_repo(None, &path);
+        self.config.remove_repo(&path);
         let order = self.repo_order.read().await;
-        config::save_tab_order(None, &order);
+        self.config.save_tab_order(&order);
 
         info!("removed repo {}", path.display());
         let _ = self.event_tx.send(DaemonEvent::RepoRemoved { path });

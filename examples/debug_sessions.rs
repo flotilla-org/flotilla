@@ -2,6 +2,7 @@
 //!
 //! Run with: cargo run --example debug_sessions -- --repo-root ~/dev/reticulate
 
+use flotilla_core::config::ConfigStore;
 use flotilla_core::convert::correlation_result_to_work_item;
 use flotilla_core::data;
 use flotilla_core::providers::discovery::detect_providers;
@@ -23,7 +24,8 @@ async fn main() {
 
     // Step 1: Build registry (same as app startup)
     println!("\n=== Step 1: Build ProviderRegistry ===");
-    let (registry, repo_slug) = detect_providers(&repo_root).await;
+    let config = ConfigStore::new();
+    let (registry, repo_slug) = detect_providers(&repo_root, &config).await;
     println!("  checkout_managers: {}", registry.checkout_managers.len());
     println!("  code_review: {}", registry.code_review.len());
     println!("  issue_trackers: {}", registry.issue_trackers.len());

@@ -11,6 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use tui_input::backend::crossterm::EventHandler as InputEventHandler;
 use tui_input::Input;
 
+use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{self, GroupEntry, SectionLabels};
 use flotilla_protocol::{
@@ -112,6 +113,7 @@ impl TuiModel {
 
 pub struct App {
     pub daemon: Arc<dyn DaemonHandle>,
+    pub config: Arc<ConfigStore>,
     pub model: TuiModel,
     pub ui: UiState,
     pub proto_commands: CommandQueue,
@@ -119,11 +121,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>) -> Self {
+    pub fn new(
+        daemon: Arc<dyn DaemonHandle>,
+        repos_info: Vec<RepoInfo>,
+        config: Arc<ConfigStore>,
+    ) -> Self {
         let model = TuiModel::from_repo_info(repos_info);
         let ui = UiState::new(&model.repo_order);
         Self {
             daemon,
+            config,
             model,
             ui,
             proto_commands: Default::default(),
@@ -476,12 +483,12 @@ impl App {
             KeyCode::Char(']') => self.next_tab(),
             KeyCode::Char('{') => {
                 if !self.ui.mode.is_config() && self.move_tab(-1) {
-                    flotilla_core::config::save_tab_order(None, &self.model.repo_order);
+                    self.config.save_tab_order(&self.model.repo_order);
                 }
             }
             KeyCode::Char('}') => {
                 if !self.ui.mode.is_config() && self.move_tab(1) {
-                    flotilla_core::config::save_tab_order(None, &self.model.repo_order);
+                    self.config.save_tab_order(&self.model.repo_order);
                 }
             }
             KeyCode::Char('c') => {

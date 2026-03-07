@@ -1,4 +1,4 @@
-use flotilla_core::config;
+use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_tui::app;
@@ -34,7 +34,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let startup = std::time::Instant::now();
-    let repo_roots = resolve_repo_roots(&cli.repo_root);
+    let config = Arc::new(ConfigStore::new());
+    let repo_roots = resolve_repo_roots(&cli.repo_root, &config);
 
     if repo_roots.is_empty() {
         eprintln!("Error: no git repositories found (use --repo-root to specify)");
@@ -50,17 +51,21 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
     show_splash(&mut terminal)?;
-    let result = run(&mut terminal, repo_roots).await;
+    let result = run(&mut terminal, repo_roots, config).await;
     execute!(stdout(), DisableMouseCapture)?;
     ratatui::restore();
     result
 }
 
-async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) -> Result<()> {
+async fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    repo_roots: Vec<PathBuf>,
+    config: Arc<ConfigStore>,
+) -> Result<()> {
     let t = std::time::Instant::now();
 
     // Create the daemon — it runs provider detection and spawns refresh loops
-    let daemon = InProcessDaemon::new(repo_roots).await;
+    let daemon = InProcessDaemon::new(repo_roots, Arc::clone(&config)).await;
     info!("daemon started in {:.0?}", t.elapsed());
 
     // Get initial repo info from daemon
@@ -70,6 +75,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
     let mut app = app::App::new(
         daemon.clone() as Arc<dyn flotilla_core::daemon::DaemonHandle>,
         repos_info,
+        config,
     );
 
     // Set up event handler and attach daemon events
@@ -203,7 +209,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                         MouseEventKind::Up(MouseButton::Left) => {
                             if app.ui.drag.dragging_tab.take().is_some() {
                                 if app.ui.drag.active {
-                                    config::save_tab_order(None, &app.model.repo_order);
+                                    app.config.save_tab_order(&app.model.repo_order);
                                 }
                                 app.ui.drag.active = false;
                             }
@@ -275,15 +281,15 @@ fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
 /// Collect repo roots: persisted (in saved tab order) first, then CLI args, then auto-detect from cwd.
 /// Persists any new repos and saves tab order.
-fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
+fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBuf> {
     use flotilla_core::providers::vcs::git::GitVcs;
     use flotilla_core::providers::vcs::Vcs;
 
     let mut repo_roots: Vec<PathBuf> = Vec::new();
 
     // 1. Persisted repos in saved tab order
-    let persisted = config::load_repos(None);
-    let tab_order = config::load_tab_order(None);
+    let persisted = config.load_repos();
+    let tab_order = config.load_tab_order();
     if let Some(order) = tab_order {
         for path in &order {
             if persisted.contains(path) && !repo_roots.contains(path) {
@@ -321,9 +327,9 @@ fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
 
     // Persist any new repos and save tab order
     for path in &repo_roots {
-        config::save_repo(None, path);
+        config.save_repo(path);
     }
-    config::save_tab_order(None, &repo_roots);
+    config.save_tab_order(&repo_roots);
 
     repo_roots
 }

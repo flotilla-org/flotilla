@@ -3,7 +3,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use super::{command_exists, resolve_claude_path};
-use crate::config;
+use crate::config::ConfigStore;
 use crate::providers::ai_utility::claude::ClaudeAiUtility;
 use crate::providers::code_review::github::GitHubCodeReview;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
@@ -102,7 +102,10 @@ pub fn extract_repo_slug(url: &str) -> Option<String> {
 /// 4. Coding agent: check for `claude` CLI
 /// 5. AI utility: check for `claude` CLI
 /// 6. Workspace manager: check for cmux binary
-pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<String>) {
+pub async fn detect_providers(
+    repo_root: &Path,
+    config: &ConfigStore,
+) -> (ProviderRegistry, Option<String>) {
     let mut registry = ProviderRegistry::new();
     let repo_name = repo_root
         .file_name()
@@ -118,7 +121,7 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
     }
 
     // 2. Checkout manager: config-driven provider selection
-    let co_config = config::resolve_checkouts_config(None, repo_root);
+    let co_config = config.resolve_checkouts_config(repo_root);
     match co_config.provider.as_str() {
         "wt" => {
             if command_exists("wt", &["--version"]).await {
