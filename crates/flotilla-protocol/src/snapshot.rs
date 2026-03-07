@@ -121,7 +121,7 @@ pub struct CheckoutRef {
 mod tests {
     use super::*;
     use crate::provider_data::ProviderData;
-    use crate::test_helpers::assert_json_roundtrip as assert_roundtrip;
+    use crate::test_helpers::assert_json_roundtrip;
 
     #[test]
     fn category_labels_defaults_and_capitalization() {
@@ -169,7 +169,7 @@ mod tests {
                 abbr: "S".into(),
             },
         };
-        assert_roundtrip(&labels);
+        assert_json_roundtrip(&labels);
 
         let info = RepoInfo {
             path: PathBuf::from("/repos/test"),
@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(decoded.provider_names["vcs"], "git");
         assert_eq!(decoded.provider_names["code_review"], "github");
         assert_eq!(decoded.provider_health.len(), 1);
-        assert_eq!(decoded.provider_health["git"], true);
+        assert!(decoded.provider_health["git"]);
         assert_eq!(decoded.labels.checkouts.section, "Worktrees");
         assert_eq!(decoded.labels.code_review.noun, "PR");
         assert_eq!(decoded.labels.issues.abbr, "I");
@@ -338,7 +338,7 @@ mod tests {
             WorkItemKind::RemoteBranch,
             WorkItemKind::Issue,
         ] {
-            assert_roundtrip(&kind);
+            assert_json_roundtrip(&kind);
         }
 
         let identities = vec![
@@ -349,7 +349,7 @@ mod tests {
             WorkItemIdentity::RemoteBranch("origin/main".into()),
         ];
         for identity in &identities {
-            assert_roundtrip(identity);
+            assert_json_roundtrip(identity);
         }
     }
 

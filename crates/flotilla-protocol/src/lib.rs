@@ -143,8 +143,8 @@ mod tests {
                     assert_eq!(snap.work_items.len(), 1);
                     assert_eq!(snap.work_items[0].branch.as_deref(), Some("feature-x"));
                     assert_eq!(snap.work_items[0].kind, WorkItemKind::Checkout);
-                    assert_eq!(snap.provider_health["git"], true);
-                    assert_eq!(snap.provider_health["github"], false);
+                    assert!(snap.provider_health["git"]);
+                    assert!(!snap.provider_health["github"]);
                     assert_eq!(snap.errors.len(), 1);
                     assert_eq!(snap.errors[0].category, "github");
                 }
