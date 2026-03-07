@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::providers::github_api::{clamp_per_page, GhApi, GhApiResponse};
+use crate::providers::github_api::{clamp_per_page, GhApi};
 use crate::providers::types::*;
 use crate::providers::CommandRunner;
 

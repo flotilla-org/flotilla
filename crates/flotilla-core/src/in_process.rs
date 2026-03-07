@@ -165,36 +165,24 @@ impl InProcessDaemon {
     /// (or no more pages are available).
     async fn ensure_issues_cached(&self, repo: &Path, desired_count: usize) {
         loop {
-            // Check if we already have enough (under read lock)
-            let (need_more, page_num, tracker_exists) = {
+            // Check cache state and grab registry Arc (single read lock)
+            let (page_num, registry) = {
                 let repos = self.repos.read().await;
                 let Some(state) = repos.get(repo) else {
                     return;
                 };
                 let need =
                     state.issue_cache.entries.len() < desired_count && state.issue_cache.has_more;
-                let page = state.issue_cache.next_page;
-                let has_tracker = state
-                    .model
-                    .registry
-                    .issue_trackers
-                    .values()
-                    .next()
-                    .is_some();
-                (need, page, has_tracker)
+                let has_tracker = !state.model.registry.issue_trackers.is_empty();
+                if !need || !has_tracker {
+                    break;
+                }
+                (state.issue_cache.next_page, Arc::clone(&state.model.registry))
             };
 
-            if !need_more || !tracker_exists {
-                break;
-            }
-
-            // Fetch the next page outside the lock
+            // Fetch the next page outside any lock
             let page_result = {
-                let repos = self.repos.read().await;
-                let Some(state) = repos.get(repo) else {
-                    return;
-                };
-                let tracker = state.model.registry.issue_trackers.values().next().unwrap();
+                let tracker = registry.issue_trackers.values().next().unwrap();
                 tracker.list_issues_page(repo, page_num, 50).await
             };
 
@@ -215,12 +203,16 @@ impl InProcessDaemon {
 
     /// Run a search query against the issue tracker and store the results.
     async fn search_issues(&self, repo: &Path, query: &str) {
-        let result = {
+        let registry = {
             let repos = self.repos.read().await;
             let Some(state) = repos.get(repo) else {
                 return;
             };
-            let Some(tracker) = state.model.registry.issue_trackers.values().next() else {
+            Arc::clone(&state.model.registry)
+        };
+
+        let result = {
+            let Some(tracker) = registry.issue_trackers.values().next() else {
                 return;
             };
             tracker.search_issues(repo, query, 50).await
