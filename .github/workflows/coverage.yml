@@ -57,7 +57,7 @@ jobs:
             ${{ runner.os }}-cargo-coverage-
       - name: Generate coverage report
         run: |
-          cargo +nightly llvm-cov --workspace --html --locked --remap-path-prefix
+          cargo +nightly llvm-cov --workspace --html --branch --locked --remap-path-prefix
           cargo +nightly llvm-cov --workspace --json --no-run --locked --output-path target/llvm-cov/html/coverage.json
       - name: Add badge JSON
         run: |
