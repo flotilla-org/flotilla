@@ -178,7 +178,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         info!("tmux: creating workspace '{}'", config.name);
 
         let template = if let Some(ref yaml) = config.template_yaml {
-            serde_yaml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+            serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
                 warn!("tmux: failed to parse workspace template, using default: {e}");
                 WorkspaceTemplate::load_default()
             })

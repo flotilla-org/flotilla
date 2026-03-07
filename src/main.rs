@@ -234,7 +234,9 @@ fn drain_snapshots(app: &mut app::App) {
     let mut all_errors: Vec<String> = Vec::new();
 
     for (i, path) in repo_order.iter().enumerate() {
-        let rm = repos.get_mut(path).unwrap();
+        let Some(rm) = repos.get_mut(path) else {
+            continue;
+        };
         let handle = &mut rm.refresh_handle;
         if !handle.snapshot_rx.has_changed().unwrap_or(false) {
             continue;

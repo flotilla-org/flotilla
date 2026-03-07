@@ -369,8 +369,9 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
 
     // Now mutably borrow for stateful render
     let key = &model.repo_order[model.active_repo];
-    let rui = ui.repo_ui.get_mut(key).unwrap();
-    frame.render_stateful_widget(table, area, &mut rui.table_state);
+    if let Some(rui) = ui.repo_ui.get_mut(key) {
+        frame.render_stateful_widget(table, area, &mut rui.table_state);
+    }
 }
 
 fn build_header_row(header: &SectionHeader) -> Row<'static> {

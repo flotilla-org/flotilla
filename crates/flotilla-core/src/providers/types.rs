@@ -71,7 +71,6 @@ pub struct ChangeRequest {
     #[allow(dead_code)]
     pub branch: String,
     pub status: ChangeRequestStatus,
-    #[allow(dead_code)]
     pub body: Option<String>,
     pub correlation_keys: Vec<CorrelationKey>,
     pub association_keys: Vec<AssociationKey>,
@@ -90,7 +89,6 @@ pub struct Issue {
     pub id: String,
     pub title: String,
     pub labels: Vec<String>,
-    #[allow(dead_code)]
     pub association_keys: Vec<AssociationKey>,
 }
 

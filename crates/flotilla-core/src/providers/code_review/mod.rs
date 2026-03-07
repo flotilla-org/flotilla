@@ -6,7 +6,6 @@ use std::path::Path;
 
 #[async_trait]
 pub trait CodeReview: Send + Sync {
-    #[allow(dead_code)]
     fn display_name(&self) -> &str;
     fn section_label(&self) -> &str {
         "Change Requests"
