@@ -1,20 +1,18 @@
-use crate::providers::types::*;
-use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-pub struct GitVcs;
+use async_trait::async_trait;
 
-use crate::providers::run_cmd;
+use crate::providers::types::*;
+use crate::providers::CommandRunner;
 
-impl Default for GitVcs {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct GitVcs {
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl GitVcs {
-    pub fn new() -> Self {
-        Self
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner }
     }
 }
 
@@ -67,12 +65,14 @@ impl super::Vcs for GitVcs {
     }
 
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
-        let output = run_cmd(
-            "git",
-            &["branch", "--list", "--format=%(refname:short)"],
-            repo_root,
-        )
-        .await?;
+        let output = self
+            .runner
+            .run(
+                "git",
+                &["branch", "--list", "--format=%(refname:short)"],
+                repo_root,
+            )
+            .await?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -86,14 +86,19 @@ impl super::Vcs for GitVcs {
 
     async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String> {
         // Check if any remote exists; return empty if not (local-only repo).
-        let remotes = run_cmd("git", &["remote"], repo_root)
+        let remotes = self
+            .runner
+            .run("git", &["remote"], repo_root)
             .await
             .unwrap_or_default();
         if remotes.trim().is_empty() {
             return Ok(vec![]);
         }
         let remote = remotes.lines().next().unwrap_or("origin");
-        let output = run_cmd("git", &["ls-remote", "--heads", remote], repo_root).await?;
+        let output = self
+            .runner
+            .run("git", &["ls-remote", "--heads", remote], repo_root)
+            .await?;
         // Output format: "<sha>\trefs/heads/<branch>"
         Ok(output
             .lines()
@@ -113,7 +118,10 @@ impl super::Vcs for GitVcs {
         limit: usize,
     ) -> Result<Vec<CommitInfo>, String> {
         let limit_arg = format!("-{}", limit);
-        let output = run_cmd("git", &["log", branch, "--oneline", &limit_arg], repo_root).await?;
+        let output = self
+            .runner
+            .run("git", &["log", branch, "--oneline", &limit_arg], repo_root)
+            .await?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -133,12 +141,14 @@ impl super::Vcs for GitVcs {
         reference: &str,
     ) -> Result<AheadBehind, String> {
         let range = format!("{}...{}", branch, reference);
-        let output = run_cmd(
-            "git",
-            &["rev-list", "--count", "--left-right", &range],
-            repo_root,
-        )
-        .await?;
+        let output = self
+            .runner
+            .run(
+                "git",
+                &["rev-list", "--count", "--left-right", &range],
+                repo_root,
+            )
+            .await?;
         let trimmed = output.trim();
         let mut parts = trimmed.split('\t');
         let ahead: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -151,7 +161,88 @@ impl super::Vcs for GitVcs {
         _repo_root: &Path,
         checkout_path: &Path,
     ) -> Result<WorkingTreeStatus, String> {
-        let output = run_cmd("git", &["status", "--porcelain"], checkout_path).await?;
+        let output = self
+            .runner
+            .run("git", &["status", "--porcelain"], checkout_path)
+            .await?;
         Ok(super::parse_porcelain_status(&output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::testing::MockRunner;
+    use crate::providers::vcs::Vcs;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn list_local_branches_parses_output() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(
+            "main\nfeature/foo\nfix-bar\n".to_string()
+        )]));
+        let vcs = GitVcs::new(runner);
+        let branches = vcs.list_local_branches(Path::new("/fake")).await.unwrap();
+        assert_eq!(branches.len(), 3);
+        assert_eq!(branches[0].name, "main");
+        assert!(branches[0].is_trunk);
+        assert_eq!(branches[1].name, "feature/foo");
+        assert!(!branches[1].is_trunk);
+        assert_eq!(branches[2].name, "fix-bar");
+        assert!(!branches[2].is_trunk);
+    }
+
+    #[tokio::test]
+    async fn working_tree_status_parses_porcelain() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(
+            "M  src/main.rs\n?? new.rs\n".to_string()
+        )]));
+        let vcs = GitVcs::new(runner);
+        let status = vcs
+            .working_tree_status(Path::new("/fake"), Path::new("/fake"))
+            .await
+            .unwrap();
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.untracked, 1);
+        assert_eq!(status.modified, 0);
+    }
+
+    #[tokio::test]
+    async fn commit_log_parses_oneline() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(
+            "abc1234 Initial commit\ndef5678 Add feature\n".to_string(),
+        )]));
+        let vcs = GitVcs::new(runner);
+        let log = vcs
+            .commit_log(Path::new("/fake"), "main", 10)
+            .await
+            .unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].short_sha, "abc1234");
+        assert_eq!(log[0].message, "Initial commit");
+        assert_eq!(log[1].short_sha, "def5678");
+        assert_eq!(log[1].message, "Add feature");
+    }
+
+    #[tokio::test]
+    async fn ahead_behind_parses_count() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("3\t5\n".to_string())]));
+        let vcs = GitVcs::new(runner);
+        let ab = vcs
+            .ahead_behind(Path::new("/fake"), "feature", "main")
+            .await
+            .unwrap();
+        assert_eq!(ab.ahead, 3);
+        assert_eq!(ab.behind, 5);
+    }
+
+    #[tokio::test]
+    async fn list_remote_branches_no_remote() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("".to_string()), // git remote returns empty
+        ]));
+        let vcs = GitVcs::new(runner);
+        let branches = vcs.list_remote_branches(Path::new("/fake")).await.unwrap();
+        assert!(branches.is_empty());
     }
 }

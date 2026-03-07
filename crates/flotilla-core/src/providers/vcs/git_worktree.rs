@@ -1,24 +1,30 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::info;
 
 use crate::config::CheckoutsConfig;
-use crate::providers::run_cmd;
 use crate::providers::types::*;
+use crate::providers::CommandRunner;
 
 pub struct GitCheckoutManager {
     config: CheckoutsConfig,
     env: minijinja::Environment<'static>,
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl GitCheckoutManager {
-    pub fn new(config: CheckoutsConfig) -> Self {
+    pub fn new(config: CheckoutsConfig, runner: Arc<dyn CommandRunner>) -> Self {
         let mut env = minijinja::Environment::new();
         env.add_filter("sanitize", |value: String| -> String {
             value.replace(['/', '\\'], "-")
         });
-        Self { config, env }
+        Self {
+            config,
+            env,
+            runner,
+        }
     }
 
     /// Render the worktree path template for a given repo and branch.
@@ -93,13 +99,15 @@ impl GitCheckoutManager {
     }
 
     /// Detect the default branch for trunk detection.
-    async fn default_branch(repo_root: &Path) -> String {
-        if let Ok(out) = run_cmd(
-            "git",
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
-            repo_root,
-        )
-        .await
+    async fn default_branch(&self, repo_root: &Path) -> String {
+        if let Ok(out) = self
+            .runner
+            .run(
+                "git",
+                &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+                repo_root,
+            )
+            .await
         {
             let trimmed = out.trim();
             if let Some(branch) = trimmed.strip_prefix("origin/") {
@@ -108,18 +116,20 @@ impl GitCheckoutManager {
         }
         // Fallback: check which common trunk names exist locally
         for name in super::TRUNK_NAMES {
-            if run_cmd(
-                "git",
-                &[
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{name}"),
-                ],
-                repo_root,
-            )
-            .await
-            .is_ok()
+            if self
+                .runner
+                .run(
+                    "git",
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{name}"),
+                    ],
+                    repo_root,
+                )
+                .await
+                .is_ok()
             {
                 return name.to_string();
             }
@@ -129,6 +139,7 @@ impl GitCheckoutManager {
 
     /// Gather detailed info for a single worktree checkout.
     async fn enrich_checkout(
+        &self,
         path: &Path,
         branch: &str,
         is_trunk: bool,
@@ -145,36 +156,40 @@ impl GitCheckoutManager {
         let (trunk_ab, remote_ab, wt_status, commit, issue_links) = tokio::join!(
             async {
                 if !is_trunk {
-                    run_cmd(
-                        "git",
-                        &["rev-list", "--left-right", "--count", &trunk_ref],
-                        path,
-                    )
-                    .await
-                    .ok()
-                    .and_then(|out| parse_ahead_behind(&out))
+                    self.runner
+                        .run(
+                            "git",
+                            &["rev-list", "--left-right", "--count", &trunk_ref],
+                            path,
+                        )
+                        .await
+                        .ok()
+                        .and_then(|out| parse_ahead_behind(&out))
                 } else {
                     None
                 }
             },
             async {
-                run_cmd(
-                    "git",
-                    &["rev-list", "--left-right", "--count", &remote_ref],
-                    path,
-                )
-                .await
-                .ok()
-                .and_then(|out| parse_ahead_behind(&out))
+                self.runner
+                    .run(
+                        "git",
+                        &["rev-list", "--left-right", "--count", &remote_ref],
+                        path,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|out| parse_ahead_behind(&out))
             },
             async {
-                run_cmd("git", &["status", "--porcelain"], path)
+                self.runner
+                    .run("git", &["status", "--porcelain"], path)
                     .await
                     .ok()
                     .map(|out| super::parse_porcelain_status(&out))
             },
             async {
-                run_cmd("git", &["log", "-1", "--format=%h\t%s"], path)
+                self.runner
+                    .run("git", &["log", "-1", "--format=%h\t%s"], path)
                     .await
                     .ok()
                     .and_then(|out| {
@@ -186,7 +201,7 @@ impl GitCheckoutManager {
                         })
                     })
             },
-            async { super::read_branch_issue_links(path, branch).await },
+            async { super::read_branch_issue_links(path, branch, &*self.runner).await },
         );
 
         Checkout {
@@ -228,15 +243,18 @@ impl super::CheckoutManager for GitCheckoutManager {
     }
 
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String> {
-        let output = run_cmd("git", &["worktree", "list", "--porcelain"], repo_root).await?;
+        let output = self
+            .runner
+            .run("git", &["worktree", "list", "--porcelain"], repo_root)
+            .await?;
         let entries = Self::parse_porcelain(&output);
-        let default_branch = Self::default_branch(repo_root).await;
+        let default_branch = self.default_branch(repo_root).await;
 
         let futures: Vec<_> = entries
             .iter()
             .map(|(path, branch)| {
                 let is_trunk = *branch == default_branch;
-                Self::enrich_checkout(path, branch, is_trunk, &default_branch)
+                self.enrich_checkout(path, branch, is_trunk, &default_branch)
             })
             .collect();
         Ok(futures::future::join_all(futures).await)
@@ -258,40 +276,50 @@ impl super::CheckoutManager for GitCheckoutManager {
             .to_str()
             .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", wt_path.display()))?;
 
-        let branch_exists = run_cmd(
-            "git",
-            &[
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-            repo_root,
-        )
-        .await
-        .is_ok();
-
-        let default_branch = Self::default_branch(repo_root).await;
-
-        if branch_exists {
-            run_cmd("git", &["worktree", "add", wt_str, branch], repo_root).await?;
-        } else {
-            // Base new branch from the default branch, not HEAD of the main worktree
-            run_cmd(
+        let branch_exists = self
+            .runner
+            .run(
                 "git",
-                &["worktree", "add", "-b", branch, wt_str, &default_branch],
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ],
                 repo_root,
             )
-            .await?;
+            .await
+            .is_ok();
+
+        let default_branch = self.default_branch(repo_root).await;
+
+        if branch_exists {
+            self.runner
+                .run("git", &["worktree", "add", wt_str, branch], repo_root)
+                .await?;
+        } else {
+            // Base new branch from the default branch, not HEAD of the main worktree
+            self.runner
+                .run(
+                    "git",
+                    &["worktree", "add", "-b", branch, wt_str, &default_branch],
+                    repo_root,
+                )
+                .await?;
         }
         let is_trunk = branch == default_branch;
-        Ok(Self::enrich_checkout(&wt_path, branch, is_trunk, &default_branch).await)
+        Ok(self
+            .enrich_checkout(&wt_path, branch, is_trunk, &default_branch)
+            .await)
     }
 
     async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String> {
         info!("git: removing worktree for {branch}");
 
-        let output = run_cmd("git", &["worktree", "list", "--porcelain"], repo_root).await?;
+        let output = self
+            .runner
+            .run("git", &["worktree", "list", "--porcelain"], repo_root)
+            .await?;
         let entries = Self::parse_porcelain(&output);
         let wt_path = entries
             .iter()
@@ -303,13 +331,19 @@ impl super::CheckoutManager for GitCheckoutManager {
             .to_str()
             .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", wt_path.display()))?;
 
-        run_cmd("git", &["worktree", "remove", "--force", wt_str], repo_root).await?;
+        self.runner
+            .run("git", &["worktree", "remove", "--force", wt_str], repo_root)
+            .await?;
 
         // Force-delete branch (-D) since feature branches are typically
         // unmerged locally. Skip trunk to prevent catastrophic deletion.
-        let default_branch = Self::default_branch(repo_root).await;
+        let default_branch = self.default_branch(repo_root).await;
         if branch != default_branch {
-            if let Err(e) = run_cmd("git", &["branch", "-D", branch], repo_root).await {
+            if let Err(e) = self
+                .runner
+                .run("git", &["branch", "-D", branch], repo_root)
+                .await
+            {
                 tracing::warn!("failed to delete branch {branch}: {e}");
             }
         }
@@ -407,8 +441,10 @@ branch refs/heads/feature
 
     #[test]
     fn render_worktree_path_default_template() {
+        let runner: Arc<dyn crate::providers::CommandRunner> =
+            Arc::new(crate::providers::testing::MockRunner::new(vec![]));
         let config = CheckoutsConfig::default();
-        let mgr = GitCheckoutManager::new(config);
+        let mgr = GitCheckoutManager::new(config, runner);
         let repo = Path::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(repo, "feature/my-branch").unwrap();
@@ -420,11 +456,13 @@ branch refs/heads/feature
 
     #[test]
     fn render_worktree_path_absolute_template() {
+        let runner: Arc<dyn crate::providers::CommandRunner> =
+            Arc::new(crate::providers::testing::MockRunner::new(vec![]));
         let config = CheckoutsConfig {
             path: "/tmp/worktrees/{{ repo }}.{{ branch | sanitize }}".to_string(),
             ..Default::default()
         };
-        let mgr = GitCheckoutManager::new(config);
+        let mgr = GitCheckoutManager::new(config, runner);
         let repo = Path::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(repo, "fix\\backslash").unwrap();
@@ -433,11 +471,13 @@ branch refs/heads/feature
 
     #[test]
     fn render_worktree_path_relative_template() {
+        let runner: Arc<dyn crate::providers::CommandRunner> =
+            Arc::new(crate::providers::testing::MockRunner::new(vec![]));
         let config = CheckoutsConfig {
             path: "worktrees/{{ branch | sanitize }}".to_string(),
             ..Default::default()
         };
-        let mgr = GitCheckoutManager::new(config);
+        let mgr = GitCheckoutManager::new(config, runner);
         let repo = Path::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(repo, "dev/thing").unwrap();

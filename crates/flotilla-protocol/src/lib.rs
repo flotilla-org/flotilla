@@ -2,9 +2,32 @@ pub mod commands;
 pub mod provider_data;
 pub mod snapshot;
 
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
+    /// Assert JSON roundtrip via re-serialization (for types without PartialEq).
+    pub fn assert_json_roundtrip<T: Serialize + DeserializeOwned + std::fmt::Debug>(value: &T) {
+        let json = serde_json::to_string(value).expect("serialize");
+        let decoded: T = serde_json::from_str(&json).expect("deserialize");
+        let json2 = serde_json::to_string(&decoded).expect("re-serialize");
+        assert_eq!(json2, json, "JSON roundtrip mismatch");
+    }
+
+    /// Assert JSON roundtrip via PartialEq (for types that derive it).
+    pub fn assert_roundtrip<T: Serialize + DeserializeOwned + std::fmt::Debug + PartialEq>(
+        value: &T,
+    ) {
+        let json = serde_json::to_string(value).expect("serialize");
+        let decoded: T = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, *value);
+    }
+}
+
 use serde::{Deserialize, Serialize};
 
-pub use commands::{Command, CommandResult, DeleteInfo};
+pub use commands::{CheckoutStatus, Command, CommandResult};
 pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
     CommitInfo, CorrelationKey, Issue, ProviderData, SessionStatus, WorkingTreeStatus, Workspace,
@@ -26,9 +49,75 @@ pub enum Message {
         params: serde_json::Value,
     },
     #[serde(rename = "response")]
-    Response { id: u64, result: CommandResult },
+    Response {
+        id: u64,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     #[serde(rename = "event")]
     Event { event: Box<DaemonEvent> },
+}
+
+/// Parsed response from the wire — before type-specific deserialization.
+#[derive(Debug)]
+pub struct RawResponse {
+    pub ok: bool,
+    pub data: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+impl RawResponse {
+    /// Parse the data payload into the expected type.
+    pub fn parse<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        if !self.ok {
+            return Err(self.error.unwrap_or_else(|| "unknown error".into()));
+        }
+        let data = self.data.ok_or("response missing data field")?;
+        serde_json::from_value(data).map_err(|e| format!("failed to parse response: {e}"))
+    }
+
+    /// Parse a response with no data payload (refresh, add_repo, remove_repo).
+    pub fn parse_empty(self) -> Result<(), String> {
+        if !self.ok {
+            return Err(self.error.unwrap_or_else(|| "unknown error".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Message {
+    /// Build a success response with a serializable payload.
+    pub fn ok_response<T: serde::Serialize>(id: u64, data: &T) -> Self {
+        Message::Response {
+            id,
+            ok: true,
+            data: Some(serde_json::to_value(data).expect("response data must be serializable")),
+            error: None,
+        }
+    }
+
+    /// Build a success response with no payload.
+    pub fn empty_ok_response(id: u64) -> Self {
+        Message::Response {
+            id,
+            ok: true,
+            data: None,
+            error: None,
+        }
+    }
+
+    /// Build an error response.
+    pub fn error_response(id: u64, message: impl Into<String>) -> Self {
+        Message::Response {
+            id,
+            ok: false,
+            data: None,
+            error: Some(message.into()),
+        }
+    }
 }
 
 /// Events pushed from daemon to subscribed clients.
@@ -76,6 +165,61 @@ mod tests {
     }
 
     #[test]
+    fn message_response_roundtrip() {
+        // ok=true with data
+        let msg = Message::Response {
+            id: 1,
+            ok: true,
+            data: Some(serde_json::json!({"count": 42})),
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 1);
+                assert!(ok);
+                assert_eq!(data.unwrap()["count"], 42);
+                assert!(error.is_none());
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+        // error=None should not appear in JSON
+        assert!(!json.contains("error"));
+
+        // ok=false with error
+        let msg = Message::Response {
+            id: 2,
+            ok: false,
+            data: None,
+            error: Some("not found".to_string()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 2);
+                assert!(!ok);
+                assert!(data.is_none());
+                assert_eq!(error.as_deref(), Some("not found"));
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+        // data=None should not appear in JSON
+        assert!(!json.contains("data"));
+    }
+
+    #[test]
     fn message_event_snapshot_roundtrip() {
         let snapshot = Snapshot {
             seq: 7,
@@ -87,13 +231,13 @@ mod tests {
                 description: "Feature X".to_string(),
                 checkout: Some(CheckoutRef {
                     key: PathBuf::from("/tmp/my-repo/wt"),
-                    is_main_worktree: false,
+                    is_main_checkout: false,
                 }),
-                pr_key: Some("PR#10".to_string()),
+                change_request_key: Some("PR#10".to_string()),
                 session_key: None,
                 issue_keys: vec!["ISSUE-1".to_string()],
                 workspace_refs: vec![],
-                is_main_worktree: false,
+                is_main_checkout: false,
                 debug_group: vec![],
             }],
             providers: ProviderData::default(),
@@ -120,8 +264,8 @@ mod tests {
                     assert_eq!(snap.work_items.len(), 1);
                     assert_eq!(snap.work_items[0].branch.as_deref(), Some("feature-x"));
                     assert_eq!(snap.work_items[0].kind, WorkItemKind::Checkout);
-                    assert_eq!(snap.provider_health["git"], true);
-                    assert_eq!(snap.provider_health["github"], false);
+                    assert!(snap.provider_health["git"]);
+                    assert!(!snap.provider_health["github"]);
                     assert_eq!(snap.errors.len(), 1);
                     assert_eq!(snap.errors[0].category, "github");
                 }
@@ -132,88 +276,62 @@ mod tests {
     }
 
     #[test]
-    fn command_result_variants_roundtrip() {
-        let variants = vec![
-            CommandResult::Ok,
-            CommandResult::WorktreeCreated {
-                branch: "feat-abc".to_string(),
-            },
-            CommandResult::BranchNameGenerated {
-                name: "feat/cool-thing".to_string(),
-                issue_ids: vec![
-                    ("github".to_string(), "42".to_string()),
-                    ("linear".to_string(), "ABC-123".to_string()),
-                ],
-            },
-            CommandResult::DeleteInfo(DeleteInfo {
-                branch: "old-branch".to_string(),
-                pr_status: Some("merged".to_string()),
-                merge_commit_sha: Some("abc123".to_string()),
-                unpushed_commits: vec!["def456".to_string()],
-                has_uncommitted: false,
-                base_detection_warning: None,
-            }),
-            CommandResult::Error {
-                message: "something went wrong".to_string(),
-            },
-        ];
-
-        for variant in &variants {
-            let json = serde_json::to_string(variant).expect("serialize");
-            let deserialized: CommandResult = serde_json::from_str(&json).expect("deserialize");
-            // Verify by re-serializing and comparing JSON
-            let json2 = serde_json::to_string(&deserialized).expect("re-serialize");
-            assert_eq!(json, json2, "roundtrip mismatch for variant");
-        }
-
-        // Also spot-check specific fields
-        if let CommandResult::WorktreeCreated { branch } = &variants[1] {
-            assert_eq!(branch, "feat-abc");
-        }
-        if let CommandResult::DeleteInfo(info) = &variants[3] {
-            assert_eq!(info.branch, "old-branch");
-            assert_eq!(info.pr_status.as_deref(), Some("merged"));
-            assert!(!info.has_uncommitted);
+    fn ok_response_builds_with_serialized_data() {
+        let data = serde_json::json!({"count": 42, "name": "test"});
+        let msg = Message::ok_response(7, &data);
+        match msg {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 7);
+                assert!(ok);
+                let d = data.expect("should have data");
+                assert_eq!(d["count"], 42);
+                assert_eq!(d["name"], "test");
+                assert!(error.is_none());
+            }
+            other => panic!("expected Response, got {:?}", other),
         }
     }
 
     #[test]
-    fn work_item_roundtrip() {
-        let item = WorkItem {
-            kind: WorkItemKind::Checkout,
-            identity: WorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1")),
-            branch: Some("feature-login".to_string()),
-            description: "Implement login flow".to_string(),
-            checkout: Some(CheckoutRef {
-                key: PathBuf::from("/repos/my-project/wt-1"),
-                is_main_worktree: false,
-            }),
-            pr_key: Some("PR#55".to_string()),
-            session_key: Some("sess-abc".to_string()),
-            issue_keys: vec!["GH-10".to_string(), "LIN-20".to_string()],
-            workspace_refs: vec!["cmux-1".to_string()],
-            is_main_worktree: false,
-            debug_group: vec!["2 correlated items".to_string()],
-        };
+    fn empty_ok_response_builds_with_no_data() {
+        let msg = Message::empty_ok_response(99);
+        match msg {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 99);
+                assert!(ok);
+                assert!(data.is_none());
+                assert!(error.is_none());
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+    }
 
-        let json = serde_json::to_string(&item).expect("serialize");
-        let deserialized: WorkItem = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(deserialized.kind, WorkItemKind::Checkout);
-        assert_eq!(
-            deserialized.identity,
-            WorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1"))
-        );
-        assert_eq!(deserialized.branch.as_deref(), Some("feature-login"));
-        assert_eq!(deserialized.description, "Implement login flow");
-        assert!(deserialized.checkout.is_some());
-        let checkout = deserialized.checkout.unwrap();
-        assert_eq!(checkout.key, PathBuf::from("/repos/my-project/wt-1"));
-        assert!(!checkout.is_main_worktree);
-        assert_eq!(deserialized.pr_key.as_deref(), Some("PR#55"));
-        assert_eq!(deserialized.session_key.as_deref(), Some("sess-abc"));
-        assert_eq!(deserialized.issue_keys, vec!["GH-10", "LIN-20"]);
-        assert_eq!(deserialized.workspace_refs, vec!["cmux-1"]);
-        assert!(!deserialized.is_main_worktree);
+    #[test]
+    fn error_response_builds_with_error_message() {
+        let msg = Message::error_response(5, "something went wrong");
+        match msg {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 5);
+                assert!(!ok);
+                assert!(data.is_none());
+                assert_eq!(error.as_deref(), Some("something went wrong"));
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
     }
 }

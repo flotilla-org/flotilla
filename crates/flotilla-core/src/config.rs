@@ -81,6 +81,13 @@ struct RepoConfig {
     path: String,
 }
 
+/// Default flotilla config directory (used for socket path defaults etc.)
+pub fn flotilla_config_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".config/flotilla")
+}
+
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
 pub fn path_to_slug(path: &Path) -> String {
     path.to_string_lossy()

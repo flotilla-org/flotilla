@@ -11,6 +11,7 @@ use tracing::{debug, error, info};
 use crate::provider_data::ProviderData;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::WorkspaceConfig;
+use crate::providers::CommandRunner;
 use crate::{data, providers};
 
 /// Execute a `Command` against the given repo context.
@@ -22,10 +23,11 @@ pub async fn execute(
     repo_root: &Path,
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
+    runner: &dyn CommandRunner,
 ) -> CommandResult {
     match cmd {
-        Command::SwitchWorktree { path } => {
-            if let Some(co) = providers_data.checkouts.get(&path).cloned() {
+        Command::CreateWorkspaceForCheckout { checkout_path } => {
+            if let Some(co) = providers_data.checkouts.get(&checkout_path).cloned() {
                 info!("entering workspace for {}", co.branch);
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
                     let config = workspace_config(repo_root, &co.branch, &co.path, "claude");
@@ -36,7 +38,7 @@ pub async fn execute(
                 CommandResult::Ok
             } else {
                 CommandResult::Error {
-                    message: format!("checkout not found: {}", path.display()),
+                    message: format!("checkout not found: {}", checkout_path.display()),
                 }
             }
         }
@@ -51,7 +53,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::CreateWorktree {
+        Command::CreateCheckout {
             branch,
             create_branch,
             issue_ids,
@@ -66,7 +68,7 @@ pub async fn execute(
                 Some(Ok(checkout)) => {
                     // Write issue links to git config
                     if !issue_ids.is_empty() {
-                        write_branch_issue_links(repo_root, &branch, &issue_ids).await;
+                        write_branch_issue_links(repo_root, &branch, &issue_ids, runner).await;
                     }
                     info!("created checkout at {}", checkout.path.display());
                     // Create workspace if manager available
@@ -74,16 +76,16 @@ pub async fn execute(
                         let config = workspace_config(repo_root, &branch, &checkout.path, "claude");
                         if let Err(e) = ws_mgr.create_workspace(&config).await {
                             // Checkout was created but workspace failed — report as error
-                            // but the worktree still exists
+                            // but the checkout still exists
                             error!("workspace creation failed after checkout: {e}");
                         }
                     }
-                    CommandResult::WorktreeCreated {
+                    CommandResult::CheckoutCreated {
                         branch: branch.clone(),
                     }
                 }
                 Some(Err(e)) => {
-                    error!("create worktree failed: {e}");
+                    error!("create checkout failed: {e}");
                     CommandResult::Error { message: e }
                 }
                 None => CommandResult::Error {
@@ -108,30 +110,31 @@ pub async fn execute(
             }
         }
 
-        Command::FetchDeleteInfo {
+        Command::FetchCheckoutStatus {
             branch,
-            worktree_path,
-            pr_number,
+            checkout_path,
+            change_request_id,
         } => {
-            let info = data::fetch_delete_confirm_info(
+            let info = data::fetch_checkout_status(
                 &branch,
-                worktree_path.as_deref(),
-                pr_number.as_deref(),
+                checkout_path.as_deref(),
+                change_request_id.as_deref(),
                 repo_root,
+                runner,
             )
             .await;
-            CommandResult::DeleteInfo(info)
+            CommandResult::CheckoutStatus(info)
         }
 
-        Command::OpenPr { id } => {
-            debug!("opening PR {id} in browser");
+        Command::OpenChangeRequest { id } => {
+            debug!("opening change request {id} in browser");
             if let Some(cr) = registry.code_review.values().next() {
                 let _ = cr.open_in_browser(repo_root, &id).await;
             }
             CommandResult::Ok
         }
 
-        Command::OpenIssueBrowser { id } => {
+        Command::OpenIssue { id } => {
             debug!("opening issue {id} in browser");
             if let Some(it) = registry.issue_trackers.values().next() {
                 let _ = it.open_in_browser(repo_root, &id).await;
@@ -139,14 +142,29 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::LinkIssuesToPr { pr_id, issue_ids } => {
-            info!("linking issues {:?} to PR #{pr_id}", issue_ids);
-            let body_result = providers::run_cmd(
-                "gh",
-                &["pr", "view", &pr_id, "--json", "body", "--jq", ".body"],
-                repo_root,
-            )
-            .await;
+        Command::LinkIssuesToChangeRequest {
+            change_request_id,
+            issue_ids,
+        } => {
+            info!(
+                "linking issues {:?} to change request #{change_request_id}",
+                issue_ids
+            );
+            let body_result = runner
+                .run(
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        &change_request_id,
+                        "--json",
+                        "body",
+                        "--jq",
+                        ".body",
+                    ],
+                    repo_root,
+                )
+                .await;
             match body_result {
                 Ok(current_body) => {
                     let fixes_lines: Vec<String> =
@@ -156,25 +174,26 @@ pub async fn execute(
                     } else {
                         format!("{}\n\n{}", current_body.trim(), fixes_lines.join("\n"))
                     };
-                    let result = providers::run_cmd(
-                        "gh",
-                        &["pr", "edit", &pr_id, "--body", &new_body],
-                        repo_root,
-                    )
-                    .await;
+                    let result = runner
+                        .run(
+                            "gh",
+                            &["pr", "edit", &change_request_id, "--body", &new_body],
+                            repo_root,
+                        )
+                        .await;
                     match result {
                         Ok(_) => {
-                            info!("linked issues to PR #{pr_id}");
+                            info!("linked issues to change request #{change_request_id}");
                             CommandResult::Ok
                         }
                         Err(e) => {
-                            error!("failed to edit PR: {e}");
+                            error!("failed to edit change request: {e}");
                             CommandResult::Error { message: e }
                         }
                     }
                 }
                 Err(e) => {
-                    error!("failed to read PR body: {e}");
+                    error!("failed to read change request body: {e}");
                     CommandResult::Error { message: e }
                 }
             }
@@ -266,7 +285,7 @@ pub async fn execute(
             checkout_key,
         } => {
             info!("teleporting to session {session_id}");
-            let claude_bin = providers::resolve_claude_path()
+            let claude_bin = providers::resolve_claude_path(runner)
                 .await
                 .unwrap_or_else(|| "claude".into());
             let teleport_cmd = format!("{} --teleport {}", claude_bin, session_id);
@@ -287,7 +306,7 @@ pub async fn execute(
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
                     let config = workspace_config(repo_root, name, &path, &teleport_cmd);
                     if let Err(e) = ws_mgr.create_workspace(&config).await {
-                        // Unlike CreateWorktree, teleport fails entirely if the workspace
+                        // Unlike CreateCheckout, teleport fails entirely if the workspace
                         // can't be created — the checkout may already have existed.
                         return CommandResult::Error { message: e };
                     }
@@ -295,7 +314,7 @@ pub async fn execute(
                 CommandResult::Ok
             } else {
                 CommandResult::Error {
-                    message: "Could not determine worktree path for teleport".to_string(),
+                    message: "Could not determine checkout path for teleport".to_string(),
                 }
             }
         }
@@ -333,7 +352,12 @@ pub(crate) fn workspace_config(
 }
 
 /// Write branch-to-issue links into git config.
-async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)]) {
+async fn write_branch_issue_links(
+    repo_root: &Path,
+    branch: &str,
+    issue_ids: &[(String, String)],
+    runner: &dyn CommandRunner,
+) {
     use std::collections::HashMap;
     let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
     for (provider, id) in issue_ids {
@@ -345,7 +369,10 @@ async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(
     for (provider, ids) in by_provider {
         let key = format!("branch.{branch}.flotilla.issues.{provider}");
         let value = ids.join(",");
-        if let Err(e) = providers::run_cmd("git", &["config", &key, &value], repo_root).await {
+        if let Err(e) = runner
+            .run("git", &["config", &key, &value], repo_root)
+            .await
+        {
             tracing::warn!("failed to write issue link: {e}");
         }
     }

@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::providers::types::*;
+use crate::providers::CommandRunner;
 use crate::template::WorkspaceTemplate;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -22,44 +23,27 @@ struct WindowState {
     created_at: String,
 }
 
-pub struct TmuxWorkspaceManager;
-
-impl Default for TmuxWorkspaceManager {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct TmuxWorkspaceManager {
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl TmuxWorkspaceManager {
-    pub fn new() -> Self {
-        Self
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner }
     }
 
     /// Run a tmux command and return stdout, or an error on failure.
-    async fn tmux_cmd(args: &[&str]) -> Result<String, String> {
-        let output = Command::new("tmux")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
+    async fn tmux_cmd(&self, args: &[&str]) -> Result<String, String> {
+        self.runner
+            .run("tmux", args, Path::new("."))
             .await
-            .map_err(|e| format!("failed to run tmux: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return Err(format!(
-                "tmux {} failed: {}",
-                args.first().unwrap_or(&""),
-                if stderr.is_empty() { &stdout } else { &stderr }
-            ));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .map(|s| s.trim().to_string())
     }
 
     /// Return the current tmux session name.
-    async fn session_name() -> Result<String, String> {
-        Self::tmux_cmd(&["display-message", "-p", "#{session_name}"]).await
+    async fn session_name(&self) -> Result<String, String> {
+        self.tmux_cmd(&["display-message", "-p", "#{session_name}"])
+            .await
     }
 
     /// Return the state file path: `~/.config/flotilla/tmux/{session}/state.toml`.
@@ -127,11 +111,13 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<Workspace>, String> {
-        let output = Self::tmux_cmd(&["list-windows", "-F", "#{window_name}"]).await?;
+        let output = self
+            .tmux_cmd(&["list-windows", "-F", "#{window_name}"])
+            .await?;
         let window_names: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
 
         // Load state for enrichment, pruning stale entries
-        let (session, mut state) = match Self::session_name().await {
+        let (session, mut state) = match self.session_name().await {
             Ok(s) => {
                 let st = Self::load_state(&s);
                 (Some(s), st)
@@ -178,7 +164,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         info!("tmux: creating workspace '{}'", config.name);
 
         let template = if let Some(ref yaml) = config.template_yaml {
-            serde_yaml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+            serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
                 warn!("tmux: failed to parse workspace template, using default: {e}");
                 WorkspaceTemplate::load_default()
             })
@@ -190,7 +176,8 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         let working_dir = config.working_directory.display().to_string();
 
         // Create new window
-        Self::tmux_cmd(&["new-window", "-n", &config.name, "-c", &working_dir]).await?;
+        self.tmux_cmd(&["new-window", "-n", &config.name, "-c", &working_dir])
+            .await?;
 
         // Small delay to let tmux process window creation
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -219,7 +206,8 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
                 // First pane is the window's initial pane — send command via send-keys
                 if let Some(surface) = pane.surfaces.first() {
                     if !surface.command.is_empty() {
-                        Self::tmux_cmd(&["send-keys", &surface.command, "Enter"]).await?;
+                        self.tmux_cmd(&["send-keys", &surface.command, "Enter"])
+                            .await?;
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -227,9 +215,11 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
 
                 // Additional surfaces in first pane become splits
                 for surface in pane.surfaces.iter().skip(1) {
-                    Self::tmux_cmd(&["split-window", "-v", "-c", &working_dir]).await?;
+                    self.tmux_cmd(&["split-window", "-v", "-c", &working_dir])
+                        .await?;
                     if !surface.command.is_empty() {
-                        Self::tmux_cmd(&["send-keys", &surface.command, "Enter"]).await?;
+                        self.tmux_cmd(&["send-keys", &surface.command, "Enter"])
+                            .await?;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     pane_count += 1;
@@ -240,9 +230,11 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
                 let flag = Self::split_flag(direction);
 
                 if let Some(surface) = pane.surfaces.first() {
-                    Self::tmux_cmd(&["split-window", flag, "-c", &working_dir]).await?;
+                    self.tmux_cmd(&["split-window", flag, "-c", &working_dir])
+                        .await?;
                     if !surface.command.is_empty() {
-                        Self::tmux_cmd(&["send-keys", &surface.command, "Enter"]).await?;
+                        self.tmux_cmd(&["send-keys", &surface.command, "Enter"])
+                            .await?;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     pane_count += 1;
@@ -250,9 +242,11 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
 
                 // Additional surfaces become splits
                 for surface in pane.surfaces.iter().skip(1) {
-                    Self::tmux_cmd(&["split-window", "-v", "-c", &working_dir]).await?;
+                    self.tmux_cmd(&["split-window", "-v", "-c", &working_dir])
+                        .await?;
                     if !surface.command.is_empty() {
-                        Self::tmux_cmd(&["send-keys", &surface.command, "Enter"]).await?;
+                        self.tmux_cmd(&["send-keys", &surface.command, "Enter"])
+                            .await?;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     pane_count += 1;
@@ -265,11 +259,11 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         if let Some(fi) = focus_pane_index {
             // :.N targets pane N within the current window
             let target = format!(":.{fi}");
-            Self::tmux_cmd(&["select-pane", "-t", &target]).await.ok();
+            self.tmux_cmd(&["select-pane", "-t", &target]).await.ok();
         }
 
         // Save state
-        if let Ok(session) = Self::session_name().await {
+        if let Ok(session) = self.session_name().await {
             let mut state = Self::load_state(&session);
             let timestamp = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -302,7 +296,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
         info!("tmux: switching to window '{ws_ref}'");
-        Self::tmux_cmd(&["select-window", "-t", ws_ref]).await?;
+        self.tmux_cmd(&["select-window", "-t", ws_ref]).await?;
         Ok(())
     }
 }

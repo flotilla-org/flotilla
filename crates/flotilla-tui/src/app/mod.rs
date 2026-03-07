@@ -315,7 +315,10 @@ impl App {
 
     pub fn active_ui_mut(&mut self) -> &mut RepoUiState {
         let key = &self.model.repo_order[self.model.active_repo];
-        self.ui.repo_ui.get_mut(key).unwrap()
+        self.ui
+            .repo_ui
+            .get_mut(key)
+            .expect("active repo must have UI state")
     }
 
     pub fn selected_work_item(&self) -> Option<&WorkItem> {
@@ -331,7 +334,11 @@ impl App {
             self.ui.mode = UiMode::Normal;
             self.model.active_repo = idx;
             let key = &self.model.repo_order[idx];
-            self.ui.repo_ui.get_mut(key).unwrap().has_unseen_changes = false;
+            self.ui
+                .repo_ui
+                .get_mut(key)
+                .expect("active repo must have UI state")
+                .has_unseen_changes = false;
         }
     }
 
@@ -476,9 +483,9 @@ impl App {
                     pending_issue_ids: Vec::new(),
                 };
             }
-            KeyCode::Char('d') => self.dispatch_if_available(Intent::RemoveWorktree),
+            KeyCode::Char('d') => self.dispatch_if_available(Intent::RemoveCheckout),
             KeyCode::Char('D') => self.ui.show_debug = !self.ui.show_debug,
-            KeyCode::Char('p') => self.dispatch_if_available(Intent::OpenPr),
+            KeyCode::Char('p') => self.dispatch_if_available(Intent::OpenChangeRequest),
             KeyCode::Char('[') => self.prev_tab(),
             KeyCode::Char(']') => self.next_tab(),
             KeyCode::Char('{') => {
@@ -709,7 +716,7 @@ impl App {
     fn resolve_and_push(&mut self, intent: Intent, item: &WorkItem) {
         if let Some(cmd) = intent.resolve(item, self) {
             match intent {
-                Intent::RemoveWorktree => {
+                Intent::RemoveCheckout => {
                     self.ui.mode = UiMode::DeleteConfirm {
                         info: None,
                         loading: true,
@@ -808,7 +815,7 @@ impl App {
                 return;
             };
             if !branch.is_empty() {
-                self.proto_commands.push(Command::CreateWorktree {
+                self.proto_commands.push(Command::CreateCheckout {
                     branch,
                     create_branch: true,
                     issue_ids,
@@ -1031,7 +1038,7 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if !loading {
-                    // Extract branch from DeleteInfo and send RemoveCheckout
+                    // Extract branch from CheckoutStatus and send RemoveCheckout
                     if let UiMode::DeleteConfirm {
                         info: Some(ref info),
                         ..

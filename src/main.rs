@@ -5,6 +5,7 @@ use flotilla_tui::app;
 use flotilla_tui::event;
 use flotilla_tui::event_log;
 use flotilla_tui::event_log::LevelExt;
+use flotilla_tui::socket::SocketDaemon;
 use flotilla_tui::ui;
 
 use clap::Parser;
@@ -18,65 +19,113 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
-/// Flotilla: TUI dashboard for managing development workspaces across terminal multiplexers, source code checkouts and cloud agent services.
+
+/// Flotilla: TUI dashboard for managing development workspaces
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
     /// Git repo roots (repeatable; auto-detected from cwd if omitted)
     #[arg(long)]
     repo_root: Vec<PathBuf>,
+
+    /// Config directory
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+
+    /// Socket path (default: ${config_dir}/flotilla.sock)
+    #[arg(long)]
+    socket: Option<PathBuf>,
+
+    /// Run in embedded mode (no daemon, in-process)
+    #[arg(long)]
+    embedded: bool,
+
+    #[command(subcommand)]
+    command: Option<SubCommand>,
+}
+
+#[derive(clap::Subcommand)]
+enum SubCommand {
+    /// Run the daemon server
+    Daemon {
+        /// Idle timeout in seconds (0 = no timeout)
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
+    /// Print repo list and state
+    Status,
+    /// Stream daemon events to stdout
+    Watch,
+}
+
+impl Cli {
+    fn config_dir(&self) -> PathBuf {
+        self.config_dir
+            .clone()
+            .unwrap_or_else(flotilla_core::config::flotilla_config_dir)
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.socket
+            .clone()
+            .unwrap_or_else(|| self.config_dir().join("flotilla.sock"))
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    event_log::init();
     let cli = Cli::parse();
 
+    match &cli.command {
+        Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, *timeout).await,
+        Some(SubCommand::Status) => run_status(&cli).await,
+        Some(SubCommand::Watch) => run_watch(&cli).await,
+        None => run_tui(cli).await,
+    }
+}
+
+async fn run_tui(cli: Cli) -> Result<()> {
+    event_log::init();
     let startup = std::time::Instant::now();
     let config = Arc::new(ConfigStore::new());
-    let repo_roots = resolve_repo_roots(&cli.repo_root, &config);
 
-    if repo_roots.is_empty() {
-        eprintln!("Error: no git repositories found (use --repo-root to specify)");
-        std::process::exit(1);
-    }
-
-    info!(
-        "config loaded: {} repo(s) in {:.0?}",
-        repo_roots.len(),
-        startup.elapsed()
-    );
+    let daemon: Arc<dyn DaemonHandle> = if cli.embedded {
+        // Embedded mode — current behavior
+        let repo_roots = resolve_repo_roots(&cli.repo_root, &config);
+        if repo_roots.is_empty() {
+            eprintln!("Error: no git repositories found (use --repo-root to specify)");
+            std::process::exit(1);
+        }
+        info!(
+            "config loaded: {} repo(s) in {:.0?}",
+            repo_roots.len(),
+            startup.elapsed()
+        );
+        let daemon = InProcessDaemon::new(repo_roots, Arc::clone(&config)).await;
+        info!("embedded daemon started in {:.0?}", startup.elapsed());
+        daemon as Arc<dyn DaemonHandle>
+    } else {
+        // Socket mode — connect or auto-spawn
+        if !cli.repo_root.is_empty() {
+            eprintln!(
+                "Warning: --repo-root is ignored in socket mode (repos are managed by the daemon)"
+            );
+        }
+        let socket_path = cli.socket_path();
+        let daemon = connect_or_spawn(&socket_path, &cli)
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!(e))?;
+        info!("connected to daemon in {:.0?}", startup.elapsed());
+        daemon as Arc<dyn DaemonHandle>
+    };
 
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
     show_splash(&mut terminal)?;
-    let result = run(&mut terminal, repo_roots, config).await;
-    execute!(stdout(), DisableMouseCapture)?;
-    ratatui::restore();
-    result
-}
 
-async fn run(
-    terminal: &mut ratatui::DefaultTerminal,
-    repo_roots: Vec<PathBuf>,
-    config: Arc<ConfigStore>,
-) -> Result<()> {
-    let t = std::time::Instant::now();
-
-    // Create the daemon — it runs provider detection and spawns refresh loops
-    let daemon = InProcessDaemon::new(repo_roots, Arc::clone(&config)).await;
-    info!("daemon started in {:.0?}", t.elapsed());
-
-    // Get initial repo info from daemon
     let repos_info = daemon.list_repos().await.unwrap_or_default();
-
-    // Create the app with daemon handle
-    let mut app = app::App::new(
-        daemon.clone() as Arc<dyn flotilla_core::daemon::DaemonHandle>,
-        repos_info,
-        config,
-    );
+    let mut app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config));
 
     // Set up event handler and attach daemon events
     let mut events = event::EventHandler::new(Duration::from_millis(250));
@@ -232,6 +281,149 @@ async fn run(
             break;
         }
     }
+
+    execute!(stdout(), DisableMouseCapture)?;
+    ratatui::restore();
+    Ok(())
+}
+
+async fn connect_or_spawn(
+    socket_path: &std::path::Path,
+    cli: &Cli,
+) -> Result<Arc<SocketDaemon>, String> {
+    // Try to connect to existing daemon
+    if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+        return Ok(daemon);
+    }
+
+    // Clean up stale socket
+    let _ = std::fs::remove_file(socket_path);
+
+    // Spawn daemon process
+    let exe = std::env::current_exe().map_err(|e| format!("can't find self: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon");
+    if let Some(ref config_dir) = cli.config_dir {
+        cmd.arg("--config-dir").arg(config_dir);
+    }
+    if let Some(ref socket) = cli.socket {
+        cmd.arg("--socket").arg(socket);
+    }
+    // Detach: own session so Ctrl-C doesn't kill daemon with TUI
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    // Redirect stdio, log stderr to file for debugging
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    let log_file = cli.config_dir().join("daemon.log");
+    let _ = std::fs::create_dir_all(cli.config_dir());
+    let stderr = std::fs::File::create(&log_file)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+    cmd.stderr(stderr);
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+
+    // Retry connection with backoff
+    let delays = [50, 100, 200, 400, 800];
+    for delay_ms in delays {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+            return Ok(daemon);
+        }
+    }
+
+    Err("timed out waiting for daemon to start".into())
+}
+
+async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
+    // Initialize logging to stderr (no TUI here)
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+
+    let socket_path = cli.socket_path();
+    let timeout = if timeout_secs == 0 {
+        Duration::from_secs(u64::MAX)
+    } else {
+        Duration::from_secs(timeout_secs)
+    };
+
+    // Load repos from config
+    let config = ConfigStore::new();
+    let repo_roots = config.load_repos();
+    info!("starting daemon with {} repo(s)", repo_roots.len());
+
+    let server = flotilla_daemon::server::DaemonServer::new(repo_roots, socket_path, timeout).await;
+
+    server.run().await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_status(cli: &Cli) -> Result<()> {
+    let socket_path = cli.socket_path();
+    let daemon = SocketDaemon::connect(&socket_path)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("cannot connect to daemon: {e}"))?;
+
+    let repos = daemon
+        .list_repos()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+
+    if repos.is_empty() {
+        println!("No repos tracked.");
+        return Ok(());
+    }
+
+    for repo in &repos {
+        let name = &repo.name;
+        let path = repo.path.display();
+        let health: Vec<String> = repo
+            .provider_health
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", if *v { "ok" } else { "error" }))
+            .collect();
+        let loading = if repo.loading { " (loading)" } else { "" };
+        println!("{name}{loading}  {path}");
+        if !health.is_empty() {
+            println!("  providers: {}", health.join(", "));
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_watch(cli: &Cli) -> Result<()> {
+    let socket_path = cli.socket_path();
+    let daemon = SocketDaemon::connect(&socket_path)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("cannot connect to daemon: {e}"))?;
+
+    let mut rx = daemon.subscribe();
+    println!("watching events (Ctrl-C to stop)...");
+
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let json =
+                    serde_json::to_string_pretty(&event).unwrap_or_else(|_| format!("{event:?}"));
+                println!("{json}");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("warning: skipped {n} events");
+            }
+            Err(_) => {
+                eprintln!("daemon disconnected");
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -284,6 +476,7 @@ fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBuf> {
     use flotilla_core::providers::vcs::git::GitVcs;
     use flotilla_core::providers::vcs::Vcs;
+    use flotilla_core::providers::ProcessCommandRunner;
 
     let mut repo_roots: Vec<PathBuf> = Vec::new();
 
@@ -317,7 +510,7 @@ fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBu
     // 3. Auto-detect from cwd — resolve to main repo root (not worktree)
     let cwd = std::env::current_dir().ok();
     if let Some(ref cwd) = cwd {
-        let git = GitVcs::new();
+        let git = GitVcs::new(Arc::new(ProcessCommandRunner));
         if let Some(repo_root) = git.resolve_repo_root(cwd) {
             if !repo_roots.contains(&repo_root) {
                 repo_roots.push(repo_root);

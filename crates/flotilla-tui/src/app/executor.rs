@@ -50,13 +50,13 @@ pub async fn execute(cmd: Command, app: &mut App) {
 pub fn handle_result(result: CommandResult, app: &mut App) {
     match result {
         CommandResult::Ok => {}
-        CommandResult::WorktreeCreated { branch } => {
-            info!("created worktree {branch}");
+        CommandResult::CheckoutCreated { branch } => {
+            info!("created checkout {branch}");
         }
         CommandResult::BranchNameGenerated { name, issue_ids } => {
             app.prefill_branch_input(&name, issue_ids);
         }
-        CommandResult::DeleteInfo(info) => {
+        CommandResult::CheckoutStatus(info) => {
             app.ui.mode = UiMode::DeleteConfirm {
                 info: Some(info),
                 loading: false,

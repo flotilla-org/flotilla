@@ -9,6 +9,9 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
 ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tui-input = "0.10"
@@ -20,3 +23,6 @@ tracing-subscriber = "0.3.22"
 tracing-appender = "0.2.4"
 time = { version = "0.3.47", features = ["local-offset"] }
 futures = "0.3"
+
+[dev-dependencies]
+async-trait = { workspace = true }

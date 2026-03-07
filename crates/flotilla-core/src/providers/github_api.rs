@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::providers::CommandRunner;
 
 use async_trait::async_trait;
 
@@ -63,14 +65,17 @@ struct CacheEntry {
 }
 
 /// Client that wraps `gh api` with ETag-based conditional request caching.
-#[derive(Default)]
 pub struct GhApiClient {
     cache: Mutex<HashMap<String, CacheEntry>>,
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl GhApiClient {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            runner,
+        }
     }
 }
 
@@ -97,18 +102,10 @@ impl GhApi for GhApiClient {
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-        let output = tokio::process::Command::new("gh")
-            .args(&args_refs)
-            .current_dir(repo_root)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let output = self.runner.run_output("gh", &args_refs, repo_root).await?;
 
         // Always parse stdout — gh api --include writes headers even on 304
-        let parsed = parse_gh_api_response(&stdout);
+        let parsed = parse_gh_api_response(&output.stdout);
 
         if parsed.status == 304 {
             // Serve from cache
@@ -119,9 +116,8 @@ impl GhApi for GhApiClient {
             return Err("304 but no cached response".to_string());
         }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(stderr);
+        if !output.success {
+            return Err(output.stderr);
         }
 
         if let Some(etag) = parsed.etag {

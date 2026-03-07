@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 // Re-export protocol types that are used throughout the crate and by consumers.
-pub use flotilla_protocol::{CheckoutRef, DeleteInfo, WorkItemIdentity, WorkItemKind};
+pub use flotilla_protocol::{CheckoutRef, CheckoutStatus, WorkItemIdentity, WorkItemKind};
 
 use crate::provider_data::ProviderData;
 use crate::providers::correlation::{
@@ -42,7 +42,7 @@ pub enum GroupEntry {
 #[derive(Debug, Clone)]
 pub enum CorrelatedAnchor {
     Checkout(CheckoutRef),
-    Pr(String),
+    ChangeRequest(String),
     Session(String),
 }
 
@@ -51,7 +51,7 @@ pub struct CorrelatedWorkItem {
     pub anchor: CorrelatedAnchor,
     pub branch: Option<String>,
     pub description: String,
-    pub linked_pr: Option<String>,
+    pub linked_change_request: Option<String>,
     pub linked_session: Option<String>,
     pub linked_issues: Vec<String>,
     pub workspace_refs: Vec<String>,
@@ -75,7 +75,7 @@ impl CorrelationResult {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(_) => WorkItemKind::Checkout,
-                CorrelatedAnchor::Pr(_) => WorkItemKind::Pr,
+                CorrelatedAnchor::ChangeRequest(_) => WorkItemKind::ChangeRequest,
                 CorrelatedAnchor::Session(_) => WorkItemKind::Session,
             },
             CorrelationResult::Standalone(s) => match s {
@@ -119,15 +119,15 @@ impl CorrelationResult {
         self.checkout().map(|co| co.key.as_path())
     }
 
-    pub fn is_main_worktree(&self) -> bool {
-        self.checkout().is_some_and(|co| co.is_main_worktree)
+    pub fn is_main_checkout(&self) -> bool {
+        self.checkout().is_some_and(|co| co.is_main_checkout)
     }
 
-    pub fn pr_key(&self) -> Option<&str> {
+    pub fn change_request_key(&self) -> Option<&str> {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
-                CorrelatedAnchor::Pr(key) => Some(key.as_str()),
-                _ => c.linked_pr.as_deref(),
+                CorrelatedAnchor::ChangeRequest(key) => Some(key.as_str()),
+                _ => c.linked_change_request.as_deref(),
             },
             _ => None,
         }
@@ -171,7 +171,9 @@ impl CorrelationResult {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(co.key.clone()),
-                CorrelatedAnchor::Pr(key) => WorkItemIdentity::ChangeRequest(key.clone()),
+                CorrelatedAnchor::ChangeRequest(key) => {
+                    WorkItemIdentity::ChangeRequest(key.clone())
+                }
                 CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
             },
             CorrelationResult::Standalone(s) => match s {
@@ -232,7 +234,7 @@ fn group_to_work_item(
     group_idx: usize,
 ) -> Option<CorrelationResult> {
     let mut checkout_ref: Option<CheckoutRef> = None;
-    let mut pr_key: Option<String> = None;
+    let mut change_request_key: Option<String> = None;
     let mut session_key: Option<String> = None;
     let mut workspace_refs: Vec<String> = Vec::new();
 
@@ -240,16 +242,16 @@ fn group_to_work_item(
         match (&item.kind, &item.source_key) {
             (CorItemKind::Checkout, ProviderItemKey::Checkout(path)) => {
                 if checkout_ref.is_none() {
-                    let is_main_worktree =
+                    let is_main_checkout =
                         providers.checkouts.get(path).is_some_and(|co| co.is_trunk);
                     checkout_ref = Some(CheckoutRef {
                         key: path.clone(),
-                        is_main_worktree,
+                        is_main_checkout,
                     });
                 }
             }
             (CorItemKind::ChangeRequest, ProviderItemKey::ChangeRequest(id)) => {
-                pr_key = Some(id.clone());
+                change_request_key = Some(id.clone());
             }
             (CorItemKind::CloudSession, ProviderItemKey::Session(id)) => {
                 if session_key.is_none() {
@@ -265,10 +267,14 @@ fn group_to_work_item(
         }
     }
 
-    let (anchor, linked_pr, linked_session) = if let Some(co) = checkout_ref {
-        (CorrelatedAnchor::Checkout(co), pr_key, session_key)
-    } else if let Some(key) = pr_key {
-        (CorrelatedAnchor::Pr(key), None, session_key)
+    let (anchor, linked_change_request, linked_session) = if let Some(co) = checkout_ref {
+        (
+            CorrelatedAnchor::Checkout(co),
+            change_request_key,
+            session_key,
+        )
+    } else if let Some(key) = change_request_key {
+        (CorrelatedAnchor::ChangeRequest(key), None, session_key)
     } else if let Some(key) = session_key {
         (CorrelatedAnchor::Session(key), None, None)
     } else {
@@ -278,8 +284,8 @@ fn group_to_work_item(
     let branch = group.branch().map(|s| s.to_string());
 
     let pr_ref = match &anchor {
-        CorrelatedAnchor::Pr(k) => Some(k.as_str()),
-        _ => linked_pr.as_deref(),
+        CorrelatedAnchor::ChangeRequest(k) => Some(k.as_str()),
+        _ => linked_change_request.as_deref(),
     };
     let session_ref = match &anchor {
         CorrelatedAnchor::Session(k) => Some(k.as_str()),
@@ -303,7 +309,7 @@ fn group_to_work_item(
         anchor,
         branch,
         description,
-        linked_pr,
+        linked_change_request,
         linked_session,
         linked_issues: Vec::new(),
         workspace_refs,
@@ -371,8 +377,8 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
         };
 
         // Post-correlation: link issues via association keys on change requests
-        if let Some(pr_key) = work_item.pr_key() {
-            if let Some(cr) = providers.change_requests.get(pr_key) {
+        if let Some(change_request_key) = work_item.change_request_key() {
+            if let Some(cr) = providers.change_requests.get(change_request_key) {
                 let issue_ids: Vec<String> = cr
                     .association_keys
                     .iter()
@@ -480,7 +486,7 @@ pub fn group_work_items(
         match item.kind {
             WorkItemKind::Checkout => checkout_items.push(item),
             WorkItemKind::Session => session_items.push(item),
-            WorkItemKind::Pr => pr_items.push(item),
+            WorkItemKind::ChangeRequest => pr_items.push(item),
             WorkItemKind::RemoteBranch => remote_items.push(item),
             WorkItemKind::Issue => issue_items.push(item),
         }
@@ -523,8 +529,14 @@ pub fn group_work_items(
 
     // PRs -- sorted by id descending
     pr_items.sort_by(|a, b| {
-        let a_num = a.pr_key.as_deref().and_then(|k| k.parse::<i64>().ok());
-        let b_num = b.pr_key.as_deref().and_then(|k| k.parse::<i64>().ok());
+        let a_num = a
+            .change_request_key
+            .as_deref()
+            .and_then(|k| k.parse::<i64>().ok());
+        let b_num = b
+            .change_request_key
+            .as_deref()
+            .and_then(|k| k.parse::<i64>().ok());
         b_num.cmp(&a_num)
     });
     if !pr_items.is_empty() {
@@ -567,34 +579,21 @@ pub fn group_work_items(
     }
 }
 
-async fn run_command(cmd: &str, args: &[&str], cwd: Option<&PathBuf>) -> Result<String, String> {
-    let mut command = tokio::process::Command::new(cmd);
-    command.args(args).stdin(std::process::Stdio::null());
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    let output = command.output().await.map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn identity_checkout() {
         let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Checkout(CheckoutRef {
                 key: PathBuf::from("/tmp/foo"),
-                is_main_worktree: false,
+                is_main_checkout: false,
             }),
             branch: None,
             description: String::new(),
-            linked_pr: None,
+            linked_change_request: None,
             linked_session: None,
             linked_issues: Vec::new(),
             workspace_refs: Vec::new(),
@@ -609,10 +608,10 @@ mod tests {
     #[test]
     fn identity_pr() {
         let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
-            anchor: CorrelatedAnchor::Pr("42".to_string()),
+            anchor: CorrelatedAnchor::ChangeRequest("42".to_string()),
             branch: None,
             description: String::new(),
-            linked_pr: None,
+            linked_change_request: None,
             linked_session: None,
             linked_issues: Vec::new(),
             workspace_refs: Vec::new(),
@@ -630,7 +629,7 @@ mod tests {
             anchor: CorrelatedAnchor::Session("sess-1".to_string()),
             branch: None,
             description: String::new(),
-            linked_pr: None,
+            linked_change_request: None,
             linked_session: None,
             linked_issues: Vec::new(),
             workspace_refs: Vec::new(),
@@ -728,16 +727,17 @@ mod tests {
     }
 }
 
-pub async fn fetch_delete_confirm_info(
+pub async fn fetch_checkout_status(
     branch: &str,
-    worktree_path: Option<&Path>,
-    pr_number: Option<&str>,
+    checkout_path: Option<&Path>,
+    change_request_id: Option<&str>,
     repo_root: &Path,
-) -> DeleteInfo {
+    runner: &dyn crate::providers::CommandRunner,
+) -> CheckoutStatus {
     let branch_owned = branch.to_string();
     let repo = repo_root.to_path_buf();
-    let wt_path = worktree_path.map(|p| p.to_path_buf());
-    let pr_num = pr_number.map(|s| s.to_string());
+    let checkout_path = checkout_path.map(|p| p.to_path_buf());
+    let cr_id = change_request_id.map(|s| s.to_string());
     let repo2 = repo_root.to_path_buf();
 
     let repo_for_base = repo.clone();
@@ -746,28 +746,30 @@ pub async fn fetch_delete_confirm_info(
     let (unpushed_result, uncommitted, pr_info) = tokio::join!(
         async {
             let base = async {
-                let upstream = run_command(
-                    "git",
-                    &[
-                        "rev-parse",
-                        "--abbrev-ref",
-                        &format!("{branch_for_base}@{{upstream}}"),
-                    ],
-                    Some(&repo_for_base),
-                )
-                .await;
+                let upstream = runner
+                    .run(
+                        "git",
+                        &[
+                            "rev-parse",
+                            "--abbrev-ref",
+                            &format!("{branch_for_base}@{{upstream}}"),
+                        ],
+                        &repo_for_base,
+                    )
+                    .await;
                 if let Ok(ref u) = upstream {
                     let u = u.trim();
                     if !u.is_empty() {
                         return Ok(u.to_string());
                     }
                 }
-                let remote_head = run_command(
-                    "git",
-                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
-                    Some(&repo_for_base),
-                )
-                .await;
+                let remote_head = runner
+                    .run(
+                        "git",
+                        &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                        &repo_for_base,
+                    )
+                    .await;
                 if let Ok(ref rh) = remote_head {
                     let rh = rh.trim();
                     if !rh.is_empty() {
@@ -780,25 +782,27 @@ pub async fn fetch_delete_confirm_info(
 
             match base {
                 Ok(base_ref) => {
-                    let log = run_command(
-                        "git",
-                        &[
-                            "log",
-                            &format!("{base_ref}..{branch_for_base}"),
-                            "--oneline",
-                        ],
-                        Some(&repo_for_base),
-                    )
-                    .await
-                    .unwrap_or_default();
+                    let log = runner
+                        .run(
+                            "git",
+                            &[
+                                "log",
+                                &format!("{base_ref}..{branch_for_base}"),
+                                "--oneline",
+                            ],
+                            &repo_for_base,
+                        )
+                        .await
+                        .unwrap_or_default();
                     Ok(log)
                 }
                 Err(warning) => Err(warning),
             }
         },
         async {
-            if let Some(path) = &wt_path {
-                run_command("git", &["status", "--porcelain"], Some(path))
+            if let Some(path) = &checkout_path {
+                runner
+                    .run("git", &["status", "--porcelain"], path)
                     .await
                     .unwrap_or_default()
             } else {
@@ -806,21 +810,22 @@ pub async fn fetch_delete_confirm_info(
             }
         },
         async {
-            if let Some(ref num) = pr_num {
-                run_command(
-                    "gh",
-                    &["pr", "view", num, "--json", "state,mergeCommit"],
-                    Some(&repo2),
-                )
-                .await
-                .ok()
+            if let Some(ref num) = cr_id {
+                runner
+                    .run(
+                        "gh",
+                        &["pr", "view", num, "--json", "state,mergeCommit"],
+                        &repo2,
+                    )
+                    .await
+                    .ok()
             } else {
                 None
             }
         },
     );
 
-    let mut info = DeleteInfo {
+    let mut info = CheckoutStatus {
         branch: branch.to_string(),
         ..Default::default()
     };
@@ -842,7 +847,7 @@ pub async fn fetch_delete_confirm_info(
 
     if let Some(pr_json) = pr_info {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pr_json) {
-            info.pr_status = v
+            info.change_request_status = v
                 .get("state")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());

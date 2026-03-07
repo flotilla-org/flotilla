@@ -1,6 +1,6 @@
 use crate::providers::github_api::{clamp_per_page, GhApi};
-use crate::providers::run_cmd;
 use crate::providers::types::*;
+use crate::providers::CommandRunner;
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,14 +9,21 @@ pub struct GitHubIssueTracker {
     provider_name: String,
     repo_slug: String,
     api: Arc<dyn GhApi>,
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl GitHubIssueTracker {
-    pub fn new(provider_name: String, repo_slug: String, api: Arc<dyn GhApi>) -> Self {
+    pub fn new(
+        provider_name: String,
+        repo_slug: String,
+        api: Arc<dyn GhApi>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Self {
         Self {
             provider_name,
             repo_slug,
             api,
+            runner,
         }
     }
 }
@@ -72,7 +79,9 @@ impl super::IssueTracker for GitHubIssueTracker {
     }
 
     async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        run_cmd("gh", &["issue", "view", id, "--web"], repo_root).await?;
+        self.runner
+            .run("gh", &["issue", "view", id, "--web"], repo_root)
+            .await?;
         Ok(())
     }
 }

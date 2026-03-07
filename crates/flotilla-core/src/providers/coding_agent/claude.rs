@@ -1,23 +1,26 @@
 use async_trait::async_trait;
 use reqwest;
 use serde::Deserialize;
-use std::process::Stdio;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use crate::providers::types::*;
+use crate::providers::CommandRunner;
 use tracing::{debug, info, warn};
 
 pub struct ClaudeCodingAgent {
     provider_name: String,
+    runner: Arc<dyn CommandRunner>,
     sessions_cache: Mutex<SessionsCache>,
 }
 
 impl ClaudeCodingAgent {
-    pub fn new(provider_name: String) -> Self {
+    pub fn new(provider_name: String, runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             provider_name,
+            runner,
             sessions_cache: Mutex::new(SessionsCache {
                 sessions: Vec::new(),
                 fetched_at: None,
@@ -128,32 +131,26 @@ const SESSIONS_CACHE_TTL_SECS: u64 = 30;
 
 // ---------- auth helpers ----------
 
-async fn read_oauth_token_from_keychain() -> Result<OAuthToken, String> {
-    let output = tokio::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
-        .stdin(Stdio::null())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
+async fn read_oauth_token_from_keychain(runner: &dyn CommandRunner) -> Result<OAuthToken, String> {
+    let output = runner
+        .run(
+            "security",
+            &[
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ],
+            Path::new("."),
+        )
         .await
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Err("No Claude Code credentials in keychain".to_string());
-    }
-
-    let json = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let creds: OAuthCredentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        .map_err(|_| "No Claude Code credentials in keychain".to_string())?;
+    let json = output.trim();
+    let creds: OAuthCredentials = serde_json::from_str(json).map_err(|e| e.to_string())?;
     Ok(creds.claude_ai_oauth)
 }
 
-async fn get_oauth_token() -> Result<OAuthToken, String> {
+async fn get_oauth_token(runner: &dyn CommandRunner) -> Result<OAuthToken, String> {
     {
         let cache = AUTH_CACHE.lock().unwrap();
         if let Some(ref token) = cache.token {
@@ -167,7 +164,7 @@ async fn get_oauth_token() -> Result<OAuthToken, String> {
         }
     }
     // Token missing or expiring soon — re-read from keychain
-    let token = read_oauth_token_from_keychain().await?;
+    let token = read_oauth_token_from_keychain(runner).await?;
     let mut cache = AUTH_CACHE.lock().unwrap();
     cache.token = Some(token.clone());
     Ok(token)
@@ -182,13 +179,13 @@ impl ClaudeCodingAgent {
     /// Fetch all non-archived sessions from the API, sorted by updated_at descending.
     /// Returns empty list on auth errors (insufficient scopes, expired token) to
     /// degrade gracefully instead of spamming errors on every refresh cycle.
-    async fn fetch_sessions() -> Result<Vec<WebSession>, String> {
-        match Self::fetch_sessions_inner().await {
+    async fn fetch_sessions(runner: &dyn CommandRunner) -> Result<Vec<WebSession>, String> {
+        match Self::fetch_sessions_inner(runner).await {
             Ok(sessions) => Ok(sessions),
             Err(e) if e.contains("authentication") || e.contains("missing field `data`") => {
                 debug!("session fetch failed, clearing auth cache and retrying: {e}");
                 invalidate_auth_cache();
-                match Self::fetch_sessions_inner().await {
+                match Self::fetch_sessions_inner(runner).await {
                     Ok(sessions) => Ok(sessions),
                     Err(e) if e.contains("authentication") => {
                         if !AUTH_WARNED.swap(true, Ordering::Relaxed) {
@@ -207,8 +204,8 @@ impl ClaudeCodingAgent {
     /// Fetch sessions from the API. The x-organization-uuid header was removed because
     /// the OAuth token's scopes no longer include user:profile (needed to fetch the org
     /// UUID from /api/oauth/profile), and the sessions API works without it.
-    async fn fetch_sessions_inner() -> Result<Vec<WebSession>, String> {
-        let token = get_oauth_token().await?;
+    async fn fetch_sessions_inner(runner: &dyn CommandRunner) -> Result<Vec<WebSession>, String> {
+        let token = get_oauth_token(runner).await?;
         let access_token = token.access_token;
 
         let client = reqwest::Client::new();
@@ -275,7 +272,7 @@ impl super::CodingAgent for ClaudeCodingAgent {
             debug!("Claude sessions: cache hit");
             sessions
         } else {
-            let fetched = Self::fetch_sessions().await?;
+            let fetched = Self::fetch_sessions(&*self.runner).await?;
             debug!("Claude sessions: fetched {} from API", fetched.len());
 
             // Diff against known IDs and log additions/removals at INFO
@@ -355,7 +352,7 @@ impl super::CodingAgent for ClaudeCodingAgent {
 
     async fn archive_session(&self, session_id: &str) -> Result<(), String> {
         info!("archiving session {session_id}");
-        let token = get_oauth_token().await?;
+        let token = get_oauth_token(&*self.runner).await?;
         let access_token = token.access_token;
 
         let url = format!("https://api.anthropic.com/v1/sessions/{session_id}");
