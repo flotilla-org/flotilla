@@ -36,7 +36,7 @@ impl fmt::Display for SectionHeader {
 #[derive(Debug, Clone)]
 pub enum GroupEntry {
     Header(SectionHeader),
-    Item(flotilla_protocol::WorkItem),
+    Item(Box<flotilla_protocol::WorkItem>),
 }
 
 #[derive(Debug, Clone)]
@@ -495,7 +495,7 @@ pub fn group_work_items(
         entries.push(GroupEntry::Header(SectionHeader(labels.checkouts.clone())));
         for item in checkout_items {
             selectable.push(entries.len());
-            entries.push(GroupEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(Box::new(item.clone())));
         }
     }
 
@@ -517,7 +517,7 @@ pub fn group_work_items(
         entries.push(GroupEntry::Header(SectionHeader(labels.sessions.clone())));
         for item in session_items {
             selectable.push(entries.len());
-            entries.push(GroupEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(Box::new(item.clone())));
         }
     }
 
@@ -533,7 +533,7 @@ pub fn group_work_items(
         )));
         for item in pr_items {
             selectable.push(entries.len());
-            entries.push(GroupEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(Box::new(item.clone())));
         }
     }
 
@@ -543,7 +543,7 @@ pub fn group_work_items(
         entries.push(GroupEntry::Header(SectionHeader("Remote Branches".into())));
         for item in remote_items {
             selectable.push(entries.len());
-            entries.push(GroupEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(Box::new(item.clone())));
         }
     }
 
@@ -557,7 +557,7 @@ pub fn group_work_items(
         entries.push(GroupEntry::Header(SectionHeader(labels.issues.clone())));
         for item in issue_items {
             selectable.push(entries.len());
-            entries.push(GroupEntry::Item(item.clone()));
+            entries.push(GroupEntry::Item(Box::new(item.clone())));
         }
     }
 
