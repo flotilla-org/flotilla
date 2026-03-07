@@ -1,11 +1,11 @@
 //! Daemon-side command executor.
 //!
-//! Takes a `ProtoCommand`, the repo context, and returns a `CommandResult`.
+//! Takes a `Command`, the repo context, and returns a `CommandResult`.
 //! No UI state mutation — all results are carried in the return value.
 
 use std::path::Path;
 
-use flotilla_protocol::{CommandResult, ProtoCommand, ProtoDeleteInfo};
+use flotilla_protocol::{Command, CommandResult};
 use tracing::{debug, error, info};
 
 use crate::provider_data::ProviderData;
@@ -13,18 +13,18 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::WorkspaceConfig;
 use crate::{data, providers};
 
-/// Execute a `ProtoCommand` against the given repo context.
+/// Execute a `Command` against the given repo context.
 ///
 /// Commands that are handled at the daemon level (AddRepo, RemoveRepo, Refresh)
 /// should not reach this function — the caller should handle them directly.
 pub async fn execute(
-    cmd: ProtoCommand,
+    cmd: Command,
     repo_root: &Path,
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
 ) -> CommandResult {
     match cmd {
-        ProtoCommand::SwitchWorktree { path } => {
+        Command::SwitchWorktree { path } => {
             if let Some(co) = providers_data.checkouts.get(&path).cloned() {
                 info!("entering workspace for {}", co.branch);
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
@@ -41,7 +41,7 @@ pub async fn execute(
             }
         }
 
-        ProtoCommand::SelectWorkspace { ws_ref } => {
+        Command::SelectWorkspace { ws_ref } => {
             info!("switching to workspace {ws_ref}");
             if let Some((_, ws_mgr)) = &registry.workspace_manager {
                 if let Err(e) = ws_mgr.select_workspace(&ws_ref).await {
@@ -51,7 +51,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        ProtoCommand::CreateWorktree {
+        Command::CreateWorktree {
             branch,
             create_branch,
             issue_ids,
@@ -92,7 +92,7 @@ pub async fn execute(
             }
         }
 
-        ProtoCommand::RemoveCheckout { branch } => {
+        Command::RemoveCheckout { branch } => {
             info!("removing checkout {branch}");
             let result = if let Some(cm) = registry.checkout_managers.values().next() {
                 Some(cm.remove_checkout(repo_root, &branch).await)
@@ -108,7 +108,7 @@ pub async fn execute(
             }
         }
 
-        ProtoCommand::FetchDeleteInfo {
+        Command::FetchDeleteInfo {
             branch,
             worktree_path,
             pr_number,
@@ -120,17 +120,10 @@ pub async fn execute(
                 repo_root,
             )
             .await;
-            CommandResult::DeleteInfo(ProtoDeleteInfo {
-                branch: info.branch,
-                pr_status: info.pr_status,
-                merge_commit_sha: info.merge_commit_sha,
-                unpushed_commits: info.unpushed_commits,
-                has_uncommitted: info.has_uncommitted,
-                base_detection_warning: info.base_detection_warning,
-            })
+            CommandResult::DeleteInfo(info)
         }
 
-        ProtoCommand::OpenPr { id } => {
+        Command::OpenPr { id } => {
             debug!("opening PR {id} in browser");
             if let Some(cr) = registry.code_review.values().next() {
                 let _ = cr.open_in_browser(repo_root, &id).await;
@@ -138,7 +131,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        ProtoCommand::OpenIssueBrowser { id } => {
+        Command::OpenIssueBrowser { id } => {
             debug!("opening issue {id} in browser");
             if let Some(it) = registry.issue_trackers.values().next() {
                 let _ = it.open_in_browser(repo_root, &id).await;
@@ -146,7 +139,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        ProtoCommand::LinkIssuesToPr { pr_id, issue_ids } => {
+        Command::LinkIssuesToPr { pr_id, issue_ids } => {
             info!("linking issues {:?} to PR #{pr_id}", issue_ids);
             let body_result = providers::run_cmd(
                 "gh",
@@ -187,7 +180,7 @@ pub async fn execute(
             }
         }
 
-        ProtoCommand::ArchiveSession { session_id } => {
+        Command::ArchiveSession { session_id } => {
             if providers_data.sessions.contains_key(session_id.as_str()) {
                 info!("archiving session {session_id}");
                 let result = if let Some(ca) = registry.coding_agents.values().next() {
@@ -209,7 +202,7 @@ pub async fn execute(
             }
         }
 
-        ProtoCommand::GenerateBranchName { issue_keys } => {
+        Command::GenerateBranchName { issue_keys } => {
             let issues: Vec<(String, String)> = issue_keys
                 .iter()
                 .filter_map(|k| providers_data.issues.get(k.as_str()))
@@ -267,7 +260,7 @@ pub async fn execute(
             }
         }
 
-        ProtoCommand::TeleportSession {
+        Command::TeleportSession {
             session_id,
             branch,
             checkout_key,
@@ -309,7 +302,7 @@ pub async fn execute(
 
         // These are handled at the daemon level (InProcessDaemon / SocketDaemon),
         // not by the per-repo executor. If they reach here, it's a routing bug.
-        ProtoCommand::AddRepo { .. } | ProtoCommand::RemoveRepo { .. } | ProtoCommand::Refresh => {
+        Command::AddRepo { .. } | Command::RemoveRepo { .. } | Command::Refresh => {
             CommandResult::Error {
                 message: "bug: daemon-level command reached per-repo executor".to_string(),
             }

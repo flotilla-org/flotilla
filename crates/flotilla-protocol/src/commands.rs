@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Commands the client can send to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
-pub enum ProtoCommand {
+pub enum Command {
     SwitchWorktree {
         path: PathBuf,
     },
@@ -67,14 +67,14 @@ pub enum CommandResult {
         name: String,
         issue_ids: Vec<(String, String)>,
     },
-    DeleteInfo(ProtoDeleteInfo),
+    DeleteInfo(DeleteInfo),
     Error {
         message: String,
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtoDeleteInfo {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeleteInfo {
     pub branch: String,
     pub pr_status: Option<String>,
     pub merge_commit_sha: Option<String>,

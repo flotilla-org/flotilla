@@ -7,7 +7,9 @@ use ratatui::widgets::TableState;
 use tui_input::Input;
 
 use super::intent::Intent;
-use flotilla_core::data::{DeleteConfirmInfo, TableView, WorkItemIdentity};
+use flotilla_core::data::GroupedWorkItems;
+use flotilla_protocol::DeleteInfo;
+use flotilla_protocol::WorkItemIdentity;
 
 #[derive(Clone)]
 pub struct DirEntry {
@@ -39,7 +41,7 @@ pub enum UiMode {
         selected: usize,
     },
     DeleteConfirm {
-        info: Option<DeleteConfirmInfo>,
+        info: Option<DeleteInfo>,
         loading: bool,
     },
 }
@@ -53,7 +55,7 @@ impl UiMode {
 /// Per-repo UI state (selection, table widget state, visual flags).
 #[derive(Default)]
 pub struct RepoUiState {
-    pub table_view: TableView,
+    pub table_view: GroupedWorkItems,
     pub table_state: TableState,
     pub selected_selectable_idx: Option<usize>,
     pub has_unseen_changes: bool,

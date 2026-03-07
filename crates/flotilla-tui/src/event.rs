@@ -1,22 +1,26 @@
 use crossterm::event::{EventStream, KeyEventKind};
+use flotilla_protocol::DaemonEvent;
 use futures::{FutureExt, StreamExt};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug)]
 pub enum Event {
     Tick,
     Key(crossterm::event::KeyEvent),
     Mouse(crossterm::event::MouseEvent),
+    Daemon(DaemonEvent),
 }
 
 pub struct EventHandler {
+    tx: mpsc::UnboundedSender<Event>,
     rx: mpsc::UnboundedReceiver<Event>,
 }
 
 impl EventHandler {
     pub fn new(tick_rate: Duration) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let tx_clone = tx.clone();
         tokio::spawn(async move {
             let mut reader = EventStream::new();
 
@@ -37,22 +41,41 @@ impl EventHandler {
                 let delay = interval.tick();
                 let event = reader.next().fuse();
                 tokio::select! {
-                    _ = delay => { let _ = tx.send(Event::Tick); }
+                    _ = delay => { let _ = tx_clone.send(Event::Tick); }
                     maybe = event => match maybe {
                         Some(Ok(crossterm::event::Event::Key(k)))
                             if k.kind == KeyEventKind::Press =>
                         {
-                            let _ = tx.send(Event::Key(k));
+                            let _ = tx_clone.send(Event::Key(k));
                         }
                         Some(Ok(crossterm::event::Event::Mouse(m))) => {
-                            let _ = tx.send(Event::Mouse(m));
+                            let _ = tx_clone.send(Event::Mouse(m));
                         }
                         _ => {}
                     }
                 }
             }
         });
-        Self { rx }
+        Self { tx, rx }
+    }
+
+    /// Forward daemon events into the unified event stream.
+    pub fn attach_daemon(&self, mut daemon_rx: broadcast::Receiver<DaemonEvent>) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match daemon_rx.recv().await {
+                    Ok(event) => {
+                        let _ = tx.send(Event::Daemon(event));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("daemon event receiver lagged, skipped {n} events");
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
     }
 
     pub async fn next(&mut self) -> Option<Event> {

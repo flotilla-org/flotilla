@@ -1,12 +1,17 @@
 pub mod commands;
+pub mod provider_data;
 pub mod snapshot;
 
 use serde::{Deserialize, Serialize};
 
-pub use commands::{CommandResult, ProtoCommand, ProtoDeleteInfo};
+pub use commands::{Command, CommandResult, DeleteInfo};
+pub use provider_data::{
+    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
+    CommitInfo, CorrelationKey, Issue, ProviderData, SessionStatus, WorkingTreeStatus, Workspace,
+};
 pub use snapshot::{
-    ProtoCheckoutRef, ProtoError, ProtoWorkItem, ProtoWorkItemIdentity, ProtoWorkItemKind,
-    RepoInfo, Snapshot,
+    CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem,
+    WorkItemIdentity, WorkItemKind,
 };
 
 /// Top-level message envelope for the JSON protocol.
@@ -23,7 +28,7 @@ pub enum Message {
     #[serde(rename = "response")]
     Response { id: u64, result: CommandResult },
     #[serde(rename = "event")]
-    Event { event: DaemonEvent },
+    Event { event: Box<DaemonEvent> },
 }
 
 /// Events pushed from daemon to subscribed clients.
@@ -31,9 +36,9 @@ pub enum Message {
 #[serde(tag = "kind")]
 pub enum DaemonEvent {
     #[serde(rename = "snapshot")]
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     #[serde(rename = "repo_added")]
-    RepoAdded(RepoInfo),
+    RepoAdded(Box<RepoInfo>),
     #[serde(rename = "repo_removed")]
     RepoRemoved { path: std::path::PathBuf },
     /// Async command completion notification for socket subscribers (Step 2).
@@ -75,12 +80,12 @@ mod tests {
         let snapshot = Snapshot {
             seq: 7,
             repo: PathBuf::from("/tmp/my-repo"),
-            work_items: vec![ProtoWorkItem {
-                kind: ProtoWorkItemKind::Checkout,
-                identity: ProtoWorkItemIdentity::Checkout(PathBuf::from("/tmp/my-repo/wt")),
+            work_items: vec![WorkItem {
+                kind: WorkItemKind::Checkout,
+                identity: WorkItemIdentity::Checkout(PathBuf::from("/tmp/my-repo/wt")),
                 branch: Some("feature-x".to_string()),
                 description: "Feature X".to_string(),
-                checkout: Some(ProtoCheckoutRef {
+                checkout: Some(CheckoutRef {
                     key: PathBuf::from("/tmp/my-repo/wt"),
                     is_main_worktree: false,
                 }),
@@ -89,29 +94,32 @@ mod tests {
                 issue_keys: vec!["ISSUE-1".to_string()],
                 workspace_refs: vec![],
                 is_main_worktree: false,
+                debug_group: vec![],
             }],
+            providers: ProviderData::default(),
             provider_health: HashMap::from([
                 ("git".to_string(), true),
                 ("github".to_string(), false),
             ]),
-            errors: vec![ProtoError {
+            errors: vec![ProviderError {
                 category: "github".to_string(),
                 message: "rate limited".to_string(),
             }],
         };
         let msg = Message::Event {
-            event: DaemonEvent::Snapshot(snapshot),
+            event: Box::new(DaemonEvent::Snapshot(Box::new(snapshot))),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
-            Message::Event { event } => match event {
+            Message::Event { event } => match *event {
                 DaemonEvent::Snapshot(snap) => {
+                    let snap = *snap;
                     assert_eq!(snap.seq, 7);
                     assert_eq!(snap.repo, PathBuf::from("/tmp/my-repo"));
                     assert_eq!(snap.work_items.len(), 1);
                     assert_eq!(snap.work_items[0].branch.as_deref(), Some("feature-x"));
-                    assert_eq!(snap.work_items[0].kind, ProtoWorkItemKind::Checkout);
+                    assert_eq!(snap.work_items[0].kind, WorkItemKind::Checkout);
                     assert_eq!(snap.provider_health["git"], true);
                     assert_eq!(snap.provider_health["github"], false);
                     assert_eq!(snap.errors.len(), 1);
@@ -137,7 +145,7 @@ mod tests {
                     ("linear".to_string(), "ABC-123".to_string()),
                 ],
             },
-            CommandResult::DeleteInfo(ProtoDeleteInfo {
+            CommandResult::DeleteInfo(DeleteInfo {
                 branch: "old-branch".to_string(),
                 pr_status: Some("merged".to_string()),
                 merge_commit_sha: Some("abc123".to_string()),
@@ -170,13 +178,13 @@ mod tests {
     }
 
     #[test]
-    fn proto_work_item_roundtrip() {
-        let item = ProtoWorkItem {
-            kind: ProtoWorkItemKind::Checkout,
-            identity: ProtoWorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1")),
+    fn work_item_roundtrip() {
+        let item = WorkItem {
+            kind: WorkItemKind::Checkout,
+            identity: WorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1")),
             branch: Some("feature-login".to_string()),
             description: "Implement login flow".to_string(),
-            checkout: Some(ProtoCheckoutRef {
+            checkout: Some(CheckoutRef {
                 key: PathBuf::from("/repos/my-project/wt-1"),
                 is_main_worktree: false,
             }),
@@ -185,15 +193,16 @@ mod tests {
             issue_keys: vec!["GH-10".to_string(), "LIN-20".to_string()],
             workspace_refs: vec!["cmux-1".to_string()],
             is_main_worktree: false,
+            debug_group: vec!["2 correlated items".to_string()],
         };
 
         let json = serde_json::to_string(&item).expect("serialize");
-        let deserialized: ProtoWorkItem = serde_json::from_str(&json).expect("deserialize");
+        let deserialized: WorkItem = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(deserialized.kind, ProtoWorkItemKind::Checkout);
+        assert_eq!(deserialized.kind, WorkItemKind::Checkout);
         assert_eq!(
             deserialized.identity,
-            ProtoWorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1"))
+            WorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1"))
         );
         assert_eq!(deserialized.branch.as_deref(), Some("feature-login"));
         assert_eq!(deserialized.description, "Implement login flow");

@@ -2,50 +2,300 @@ pub mod executor;
 pub mod intent;
 pub mod ui_state;
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use tui_input::backend::crossterm::EventHandler as InputEventHandler;
 use tui_input::Input;
 
-use flotilla_core::data::{TableEntry, WorkItem};
-use flotilla_protocol::ProtoCommand;
+use flotilla_core::daemon::DaemonHandle;
+use flotilla_core::data::{self, GroupEntry, SectionLabels};
+use flotilla_protocol::{
+    Command, DaemonEvent, ProviderData, RepoInfo, RepoLabels, Snapshot, WorkItem,
+};
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::time::Instant;
 
-pub use flotilla_core::model::{AppModel, ProviderStatus};
 pub use intent::Intent;
 pub use ui_state::{DirEntry, RepoUiState, TabId, UiMode, UiState};
 
-#[derive(Default)]
-pub struct ProtoCommandQueue {
-    queue: VecDeque<ProtoCommand>,
+/// Per-provider auth/health status from last refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStatus {
+    Ok,
+    Error,
 }
 
-impl ProtoCommandQueue {
-    pub fn push(&mut self, cmd: ProtoCommand) {
+#[derive(Default)]
+pub struct CommandQueue {
+    queue: VecDeque<Command>,
+}
+
+impl CommandQueue {
+    pub fn push(&mut self, cmd: Command) {
         self.queue.push_back(cmd);
     }
-    pub fn take_next(&mut self) -> Option<ProtoCommand> {
+    pub fn take_next(&mut self) -> Option<Command> {
         self.queue.pop_front()
     }
 }
 
+/// Per-repo view-model state for the TUI. Contains only what the UI needs
+/// to render — no provider registry, no refresh handle.
+pub struct TuiRepoModel {
+    pub providers: Arc<ProviderData>,
+    pub labels: RepoLabels,
+    pub provider_names: HashMap<String, String>,
+    pub provider_health: HashMap<String, bool>,
+    pub loading: bool,
+}
+
+/// TUI-side domain model. Mirrors the shape of core's `AppModel` but without
+/// daemon-internal fields (registry, refresh handles). Populated from
+/// `DaemonHandle::list_repos()` and updated by `DaemonEvent::Snapshot`.
+pub struct TuiModel {
+    pub repos: HashMap<PathBuf, TuiRepoModel>,
+    pub repo_order: Vec<PathBuf>,
+    pub active_repo: usize,
+    /// Per-repo, per-provider auth status from last refresh.
+    /// Key: (repo_path, provider_category, provider_name)
+    pub provider_statuses: HashMap<(PathBuf, String, String), ProviderStatus>,
+    pub status_message: Option<String>,
+}
+
+impl TuiModel {
+    pub fn from_repo_info(repos_info: Vec<RepoInfo>) -> Self {
+        let mut repos = HashMap::new();
+        let mut order = Vec::new();
+        for info in repos_info {
+            repos.insert(
+                info.path.clone(),
+                TuiRepoModel {
+                    providers: Arc::new(ProviderData::default()),
+                    labels: info.labels,
+                    provider_names: info.provider_names,
+                    provider_health: info.provider_health,
+                    loading: info.loading,
+                },
+            );
+            order.push(info.path);
+        }
+        Self {
+            repos,
+            repo_order: order,
+            active_repo: 0,
+            provider_statuses: HashMap::new(),
+            status_message: None,
+        }
+    }
+
+    pub fn active(&self) -> &TuiRepoModel {
+        &self.repos[&self.repo_order[self.active_repo]]
+    }
+
+    pub fn active_repo_root(&self) -> &PathBuf {
+        &self.repo_order[self.active_repo]
+    }
+
+    pub fn active_labels(&self) -> &RepoLabels {
+        &self.active().labels
+    }
+
+    pub fn repo_name(path: &Path) -> String {
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string())
+    }
+}
+
 pub struct App {
-    pub model: AppModel,
+    pub daemon: Arc<dyn DaemonHandle>,
+    pub model: TuiModel,
     pub ui: UiState,
-    pub proto_commands: ProtoCommandQueue,
+    pub proto_commands: CommandQueue,
     pub should_quit: bool,
 }
 
 impl App {
-    pub async fn new(repos: Vec<PathBuf>) -> Self {
-        let model = AppModel::new(repos).await;
+    pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>) -> Self {
+        let model = TuiModel::from_repo_info(repos_info);
         let ui = UiState::new(&model.repo_order);
         Self {
+            daemon,
             model,
             ui,
             proto_commands: Default::default(),
             should_quit: false,
+        }
+    }
+
+    // ── Daemon event handling ──
+
+    pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
+        match event {
+            DaemonEvent::Snapshot(snap) => self.apply_snapshot(*snap),
+            DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
+            DaemonEvent::RepoRemoved { path } => self.handle_repo_removed(&path),
+            DaemonEvent::CommandResult { result, .. } => {
+                // Not used in-process (results returned directly from execute)
+                executor::handle_result(result, self);
+            }
+        }
+    }
+
+    fn apply_snapshot(&mut self, snap: Snapshot) {
+        let path = snap.repo.clone();
+        let rm = match self.model.repos.get_mut(&path) {
+            Some(rm) => rm,
+            None => return,
+        };
+
+        let old_providers = std::mem::replace(&mut rm.providers, Arc::new(snap.providers));
+        rm.provider_health = snap.provider_health.clone();
+        rm.loading = false;
+
+        // Build table view
+        let section_labels = SectionLabels {
+            checkouts: rm.labels.checkouts.section.clone(),
+            code_review: rm.labels.code_review.section.clone(),
+            issues: rm.labels.issues.section.clone(),
+            sessions: rm.labels.sessions.section.clone(),
+        };
+        let table_view = data::group_work_items(&snap.work_items, &rm.providers, &section_labels);
+
+        // Provider health -> model-level statuses
+        for (kind, healthy) in &rm.provider_health {
+            let provider_name = rm.provider_names.get(kind.as_str()).cloned();
+            if let Some(pname) = provider_name {
+                let key = (path.clone(), kind.clone(), pname);
+                let status = if *healthy {
+                    ProviderStatus::Ok
+                } else {
+                    ProviderStatus::Error
+                };
+                self.model.provider_statuses.insert(key, status);
+            }
+        }
+
+        // Change detection badge for inactive tabs
+        let active_idx = self.model.active_repo;
+        let i = self.model.repo_order.iter().position(|p| p == &path);
+        if let Some(idx) = i {
+            if idx != active_idx && *old_providers != *rm.providers {
+                if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
+                    rui.has_unseen_changes = true;
+                }
+            }
+        }
+
+        // Store table view on UI state and restore selection by identity
+        if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
+            // Save current selection identity
+            let prev_identity = rui
+                .selected_selectable_idx
+                .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
+                .and_then(|ti| match rui.table_view.table_entries.get(ti) {
+                    Some(GroupEntry::Item(item)) => Some(item.identity.clone()),
+                    _ => None,
+                });
+
+            rui.table_view = table_view;
+
+            // Restore selection by identity
+            if rui.table_view.selectable_indices.is_empty() {
+                rui.selected_selectable_idx = None;
+                rui.table_state.select(None);
+            } else if let Some(ref identity) = prev_identity {
+                let found =
+                    rui.table_view
+                        .selectable_indices
+                        .iter()
+                        .enumerate()
+                        .find(|(_, &ti)| {
+                            matches!(
+                                rui.table_view.table_entries.get(ti),
+                                Some(GroupEntry::Item(item)) if item.identity == *identity
+                            )
+                        });
+                if let Some((si, &ti)) = found {
+                    rui.selected_selectable_idx = Some(si);
+                    rui.table_state.select(Some(ti));
+                } else {
+                    // Item was removed — select first
+                    rui.selected_selectable_idx = Some(0);
+                    rui.table_state
+                        .select(Some(rui.table_view.selectable_indices[0]));
+                }
+            } else {
+                rui.selected_selectable_idx = Some(0);
+                rui.table_state
+                    .select(Some(rui.table_view.selectable_indices[0]));
+            }
+
+            // Clean up stale multi-select identities
+            let current_identities: std::collections::HashSet<flotilla_protocol::WorkItemIdentity> =
+                rui.table_view
+                    .table_entries
+                    .iter()
+                    .filter_map(|e| match e {
+                        GroupEntry::Item(item) => Some(item.identity.clone()),
+                        _ => None,
+                    })
+                    .collect();
+            rui.multi_selected
+                .retain(|id| current_identities.contains(id));
+        }
+
+        // Log errors, suppressing "issues disabled" since the daemon handles that
+        if !snap.errors.is_empty() {
+            let name = TuiModel::repo_name(&path);
+            let mut all_errors: Vec<String> = Vec::new();
+            for e in &snap.errors {
+                if e.category == "issues" && e.message.contains("has disabled issues") {
+                    continue;
+                }
+                tracing::error!("{name}: {}: {}", e.category, e.message);
+                all_errors.push(format!("{name}: {}: {}", e.category, e.message));
+            }
+            if !all_errors.is_empty() {
+                self.model.status_message = Some(all_errors.join("; "));
+            }
+        }
+    }
+
+    fn handle_repo_added(&mut self, info: RepoInfo) {
+        let path = info.path.clone();
+        if self.model.repos.contains_key(&path) {
+            return;
+        }
+        self.model.repos.insert(
+            path.clone(),
+            TuiRepoModel {
+                providers: Arc::new(ProviderData::default()),
+                labels: info.labels,
+                provider_names: info.provider_names,
+                provider_health: info.provider_health,
+                loading: info.loading,
+            },
+        );
+        self.model.repo_order.push(path.clone());
+        self.ui.repo_ui.insert(path, RepoUiState::default());
+        self.switch_tab(self.model.repo_order.len() - 1);
+    }
+
+    fn handle_repo_removed(&mut self, path: &Path) {
+        let path = path.to_path_buf();
+        self.model.repos.remove(&path);
+        self.model.repo_order.retain(|p| p != &path);
+        self.ui.repo_ui.remove(&path);
+        if self.model.repo_order.is_empty() {
+            self.should_quit = true;
+            return;
+        }
+        if self.model.active_repo >= self.model.repo_order.len() {
+            self.model.active_repo = self.model.repo_order.len() - 1;
         }
     }
 
@@ -67,15 +317,8 @@ impl App {
     pub fn selected_work_item(&self) -> Option<&WorkItem> {
         let table_idx = self.active_ui().table_state.selected()?;
         match self.active_ui().table_view.table_entries.get(table_idx)? {
-            TableEntry::Item(item) => Some(item),
-            TableEntry::Header(_) => None,
-        }
-    }
-
-    pub async fn add_repo(&mut self, path: PathBuf) {
-        if !self.model.repos.contains_key(&path) {
-            self.model.add_repo(path.clone()).await;
-            self.ui.repo_ui.insert(path, RepoUiState::default());
+            GroupEntry::Item(item) => Some(item),
+            GroupEntry::Header(_) => None,
         }
     }
 
@@ -386,10 +629,10 @@ impl App {
     fn toggle_multi_select(&mut self) {
         if let Some(si) = self.active_ui().selected_selectable_idx {
             if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
-                if let Some(TableEntry::Item(item)) =
+                if let Some(GroupEntry::Item(item)) =
                     self.active_ui().table_view.table_entries.get(table_idx)
                 {
-                    let identity = item.identity();
+                    let identity = item.identity.clone();
                     let rui = self.active_ui_mut();
                     if !rui.multi_selected.remove(&identity) {
                         rui.multi_selected.insert(identity);
@@ -423,17 +666,17 @@ impl App {
 
         // Collect issues from multi-selected items
         for entry in &self.active_ui().table_view.table_entries {
-            if let TableEntry::Item(item) = entry {
-                if multi_selected.contains(&item.identity()) {
-                    all_issue_keys.extend(item.issue_keys().iter().cloned());
+            if let GroupEntry::Item(item) = entry {
+                if multi_selected.contains(&item.identity) {
+                    all_issue_keys.extend(item.issue_keys.iter().cloned());
                 }
             }
         }
 
         // Also include current selection if not already in multi_selected
         if let Some(item) = self.selected_work_item() {
-            if !multi_selected.contains(&item.identity()) {
-                all_issue_keys.extend(item.issue_keys().iter().cloned());
+            if !multi_selected.contains(&item.identity) {
+                all_issue_keys.extend(item.issue_keys.iter().cloned());
             }
         }
 
@@ -445,7 +688,7 @@ impl App {
                 generating: true,
                 pending_issue_ids: Vec::new(),
             };
-            self.proto_commands.push(ProtoCommand::GenerateBranchName {
+            self.proto_commands.push(Command::GenerateBranchName {
                 issue_keys: all_issue_keys,
             });
         }
@@ -563,7 +806,7 @@ impl App {
                 return;
             };
             if !branch.is_empty() {
-                self.proto_commands.push(ProtoCommand::CreateWorktree {
+                self.proto_commands.push(Command::CreateWorktree {
                     branch,
                     create_branch: true,
                     issue_ids,
@@ -670,7 +913,7 @@ impl App {
             let path = PathBuf::from(format!("{}{}", base, entry.name));
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
             self.proto_commands
-                .push(ProtoCommand::AddRepo { path: canonical });
+                .push(Command::AddRepo { path: canonical });
             self.ui.mode = UiMode::Normal;
         } else if entry.is_dir {
             let new_path = format!("{}{}/", base, entry.name);
@@ -786,13 +1029,13 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if !loading {
-                    // Extract branch from DeleteConfirmInfo and send RemoveCheckout
+                    // Extract branch from DeleteInfo and send RemoveCheckout
                     if let UiMode::DeleteConfirm {
                         info: Some(ref info),
                         ..
                     } = self.ui.mode
                     {
-                        self.proto_commands.push(ProtoCommand::RemoveCheckout {
+                        self.proto_commands.push(Command::RemoveCheckout {
                             branch: info.branch.clone(),
                         });
                     }

@@ -1,6 +1,6 @@
 use flotilla_core::config;
-use flotilla_core::data;
-use flotilla_core::providers;
+use flotilla_core::daemon::DaemonHandle;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_tui::app;
 use flotilla_tui::event;
 use flotilla_tui::event_log;
@@ -56,33 +56,43 @@ async fn main() -> Result<()> {
     result
 }
 
-// Step 2 (#47) will replace direct AppModel usage with InProcessDaemon (or SocketDaemon).
-// Currently the TUI manages repos via AppModel and drain_snapshots() below.
 async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) -> Result<()> {
     let t = std::time::Instant::now();
-    let mut app = app::App::new(repo_roots).await;
-    info!("provider detection in {:.0?}", t.elapsed());
 
-    // Mark all repos as loading so ⟳ shows on first render
-    for rm in app.model.repos.values_mut() {
-        rm.loading = true;
-    }
+    // Create the daemon — it runs provider detection and spawns refresh loops
+    let daemon = InProcessDaemon::new(repo_roots).await;
+    info!("daemon started in {:.0?}", t.elapsed());
 
+    // Get initial repo info from daemon
+    let repos_info = daemon.list_repos().await.unwrap_or_default();
+
+    // Create the app with daemon handle
+    let mut app = app::App::new(
+        daemon.clone() as Arc<dyn flotilla_core::daemon::DaemonHandle>,
+        repos_info,
+    );
+
+    // Set up event handler and attach daemon events
     let mut events = event::EventHandler::new(Duration::from_millis(250));
+    events.attach_daemon(daemon.subscribe());
 
     loop {
-        // Drain any new snapshots from background refresh tasks
-        drain_snapshots(&mut app);
-
         terminal.draw(|f| ui::render(&app.model, &mut app.ui, f))?;
 
         if let Some(evt) = events.next().await {
             match evt {
+                event::Event::Daemon(daemon_evt) => {
+                    app.handle_daemon_event(daemon_evt);
+                }
                 event::Event::Key(k) => {
                     let is_normal = matches!(app.ui.mode, app::UiMode::Normal);
                     if k.code == crossterm::event::KeyCode::Char('r') && is_normal {
-                        // Trigger immediate refresh on active repo
-                        app.model.active().refresh_handle.trigger_refresh();
+                        // Trigger immediate refresh on active repo via daemon
+                        let repo = app.model.active_repo_root().clone();
+                        let daemon = app.daemon.clone();
+                        tokio::spawn(async move {
+                            let _ = daemon.refresh(&repo).await;
+                        });
                     } else {
                         app.handle_key(k);
                     }
@@ -219,164 +229,6 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
     Ok(())
 }
 
-/// Check all repo watch channels for new snapshots and apply them.
-fn drain_snapshots(app: &mut app::App) {
-    let app::App { model, ui, .. } = app;
-    let app::AppModel {
-        repos,
-        repo_order,
-        provider_statuses,
-        active_repo,
-        status_message,
-        ..
-    } = model;
-
-    let mut all_errors: Vec<String> = Vec::new();
-
-    for (i, path) in repo_order.iter().enumerate() {
-        let Some(rm) = repos.get_mut(path) else {
-            continue;
-        };
-        let handle = &mut rm.refresh_handle;
-        if !handle.snapshot_rx.has_changed().unwrap_or(false) {
-            continue;
-        }
-
-        let snapshot = handle.snapshot_rx.borrow_and_update().clone();
-
-        let old_providers = std::mem::replace(&mut rm.providers, Arc::clone(&snapshot.providers));
-        // Apply snapshot to RepoModel
-        rm.correlation_groups = snapshot.correlation_groups.clone();
-        rm.provider_health = snapshot.provider_health.clone();
-
-        rm.loading = false;
-
-        // Build table view (needs section labels from registry)
-        let section_labels = data::SectionLabels {
-            checkouts: rm.labels.checkouts.section.clone(),
-            code_review: rm.labels.code_review.section.clone(),
-            issues: rm.labels.issues.section.clone(),
-            sessions: rm.labels.sessions.section.clone(),
-        };
-        let table_view =
-            data::build_table_view(&snapshot.work_items, &snapshot.providers, &section_labels);
-
-        // Handle issues_disabled — tell the background task to stop querying,
-        // and suppress from provider health display
-        let issues_disabled = snapshot
-            .errors
-            .iter()
-            .any(|e| e.category == "issues" && e.message.contains("has disabled issues"));
-        if issues_disabled {
-            rm.provider_health.remove("issue_tracker");
-            handle
-                .skip_issues
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Provider health -> model-level statuses
-        for (kind, healthy) in &rm.provider_health {
-            let provider_name = match *kind {
-                "coding_agent" => rm.registry.coding_agents.keys().next(),
-                "code_review" => rm.registry.code_review.keys().next(),
-                "issue_tracker" => rm.registry.issue_trackers.keys().next(),
-                _ => None,
-            };
-            if let Some(pname) = provider_name {
-                let key = (path.clone(), kind.to_string(), pname.clone());
-                let status = if *healthy {
-                    app::ProviderStatus::Ok
-                } else {
-                    app::ProviderStatus::Error
-                };
-                provider_statuses.insert(key, status);
-            }
-        }
-
-        // Change detection badge for inactive tabs — only if data actually changed
-        if i != *active_repo && *old_providers != *rm.providers {
-            if let Some(rui) = ui.repo_ui.get_mut(path) {
-                rui.has_unseen_changes = true;
-            }
-        }
-
-        // Store table view on UI state and restore selection by identity
-        if let Some(rui) = ui.repo_ui.get_mut(path) {
-            // Save current selection identity
-            let prev_identity = rui
-                .selected_selectable_idx
-                .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
-                .and_then(|ti| match rui.table_view.table_entries.get(ti) {
-                    Some(data::TableEntry::Item(item)) => Some(item.identity()),
-                    _ => None,
-                });
-
-            rui.table_view = table_view;
-            *rui.table_state.offset_mut() = 0;
-
-            // Restore selection by identity
-            if rui.table_view.selectable_indices.is_empty() {
-                rui.selected_selectable_idx = None;
-                rui.table_state.select(None);
-            } else if let Some(ref identity) = prev_identity {
-                let found =
-                    rui.table_view
-                        .selectable_indices
-                        .iter()
-                        .enumerate()
-                        .find(|(_, &ti)| {
-                            matches!(
-                                rui.table_view.table_entries.get(ti),
-                                Some(data::TableEntry::Item(item)) if item.identity() == *identity
-                            )
-                        });
-                if let Some((si, &ti)) = found {
-                    rui.selected_selectable_idx = Some(si);
-                    rui.table_state.select(Some(ti));
-                } else {
-                    // Item was removed — select first
-                    rui.selected_selectable_idx = Some(0);
-                    rui.table_state
-                        .select(Some(rui.table_view.selectable_indices[0]));
-                }
-            } else {
-                rui.selected_selectable_idx = Some(0);
-                rui.table_state
-                    .select(Some(rui.table_view.selectable_indices[0]));
-            }
-
-            // Clean up stale multi-select identities
-            let current_identities: std::collections::HashSet<data::WorkItemIdentity> = rui
-                .table_view
-                .table_entries
-                .iter()
-                .filter_map(|e| match e {
-                    data::TableEntry::Item(item) => Some(item.identity()),
-                    _ => None,
-                })
-                .collect();
-            rui.multi_selected
-                .retain(|id| current_identities.contains(id));
-        }
-
-        // Log errors
-        if !snapshot.errors.is_empty() {
-            let name = app::AppModel::repo_name(path);
-            for e in &snapshot.errors {
-                if issues_disabled && e.category == "issues" {
-                    continue;
-                }
-                tracing::error!("{name}: {}: {}", e.category, e.message);
-                all_errors.push(format!("{name}: {}: {}", e.category, e.message));
-            }
-        }
-    }
-
-    if !all_errors.is_empty() {
-        *status_message = Some(all_errors.join("; "));
-    }
-}
-
 fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     use ratatui_image::{picker::Picker, StatefulImage};
 
@@ -424,6 +276,9 @@ fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 /// Collect repo roots: persisted (in saved tab order) first, then CLI args, then auto-detect from cwd.
 /// Persists any new repos and saves tab order.
 fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
+    use flotilla_core::providers::vcs::git::GitVcs;
+    use flotilla_core::providers::vcs::Vcs;
+
     let mut repo_roots: Vec<PathBuf> = Vec::new();
 
     // 1. Persisted repos in saved tab order
@@ -456,8 +311,6 @@ fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     // 3. Auto-detect from cwd — resolve to main repo root (not worktree)
     let cwd = std::env::current_dir().ok();
     if let Some(ref cwd) = cwd {
-        use providers::vcs::git::GitVcs;
-        use providers::vcs::Vcs;
         let git = GitVcs::new();
         if let Some(repo_root) = git.resolve_repo_root(cwd) {
             if !repo_roots.contains(&repo_root) {

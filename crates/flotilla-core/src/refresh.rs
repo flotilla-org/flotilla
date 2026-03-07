@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 
-use crate::data::{self, ProviderError, WorkItem};
+use crate::data::{self, CorrelationResult, RefreshError};
 use crate::provider_data::ProviderData;
 use crate::providers::correlation::CorrelatedGroup;
 use crate::providers::registry::ProviderRegistry;
@@ -16,9 +16,9 @@ use crate::providers::types::RepoCriteria;
 #[derive(Debug, Clone)]
 pub struct RefreshSnapshot {
     pub providers: Arc<ProviderData>,
-    pub work_items: Vec<WorkItem>,
+    pub work_items: Vec<CorrelationResult>,
     pub correlation_groups: Vec<CorrelatedGroup>,
-    pub errors: Vec<ProviderError>,
+    pub errors: Vec<RefreshError>,
     pub provider_health: HashMap<&'static str, bool>,
 }
 
@@ -121,7 +121,7 @@ async fn refresh_providers(
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
     skip_issues: bool,
-) -> Vec<ProviderError> {
+) -> Vec<RefreshError> {
     let mut errors = Vec::new();
 
     let checkouts_fut = async {
@@ -195,7 +195,7 @@ async fn refresh_providers(
 
     pd.checkouts = checkouts
         .unwrap_or_else(|e| {
-            errors.push(ProviderError {
+            errors.push(RefreshError {
                 category: "checkouts",
                 message: e,
             });
@@ -206,7 +206,7 @@ async fn refresh_providers(
         .collect();
     pd.change_requests = crs
         .unwrap_or_else(|e| {
-            errors.push(ProviderError {
+            errors.push(RefreshError {
                 category: "PRs",
                 message: e,
             });
@@ -217,7 +217,7 @@ async fn refresh_providers(
         .collect();
     pd.issues = issues
         .unwrap_or_else(|e| {
-            errors.push(ProviderError {
+            errors.push(RefreshError {
                 category: "issues",
                 message: e,
             });
@@ -228,7 +228,7 @@ async fn refresh_providers(
         .collect();
     pd.workspaces = workspaces
         .unwrap_or_else(|e| {
-            errors.push(ProviderError {
+            errors.push(RefreshError {
                 category: "workspaces",
                 message: e,
             });
@@ -239,7 +239,7 @@ async fn refresh_providers(
         .collect();
     pd.sessions = sessions
         .unwrap_or_else(|e| {
-            errors.push(ProviderError {
+            errors.push(RefreshError {
                 category: "sessions",
                 message: e,
             });
@@ -249,14 +249,14 @@ async fn refresh_providers(
         .map(|s| (s.id.clone(), s))
         .collect();
     pd.remote_branches = branches.unwrap_or_else(|e| {
-        errors.push(ProviderError {
+        errors.push(RefreshError {
             category: "branches",
             message: e,
         });
         Vec::new()
     });
     pd.merged_branches = merged.unwrap_or_else(|e| {
-        errors.push(ProviderError {
+        errors.push(RefreshError {
             category: "merged",
             message: e,
         });
@@ -268,7 +268,7 @@ async fn refresh_providers(
 
 fn compute_provider_health(
     registry: &ProviderRegistry,
-    errors: &[ProviderError],
+    errors: &[RefreshError],
 ) -> HashMap<&'static str, bool> {
     let mut health = HashMap::new();
     if registry.coding_agents.values().next().is_some() {

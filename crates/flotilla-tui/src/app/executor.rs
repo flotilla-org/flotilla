@@ -1,47 +1,53 @@
-use std::sync::Arc;
-
 use tracing::info;
 
 use super::ui_state::UiMode;
 use super::App;
-use flotilla_core::config;
-use flotilla_protocol::{CommandResult, ProtoCommand};
+use flotilla_protocol::{Command, CommandResult};
 
-/// Execute a single ProtoCommand against the app state.
+/// Execute a single Command by routing through the daemon handle.
 ///
-/// Commands that modify the daemon-side state (providers, worktrees, etc.) are
-/// routed through `flotilla_core::executor::execute()`.  Commands that modify
-/// only TUI-local state (AddRepo) are handled here directly.
-pub async fn execute(cmd: ProtoCommand, app: &mut App) {
+/// Daemon-level commands (AddRepo, RemoveRepo, Refresh) are dispatched
+/// directly to the daemon. Per-repo commands go through `daemon.execute()`.
+/// Results are interpreted into UI state changes.
+pub async fn execute(cmd: Command, app: &mut App) {
     app.model.status_message = None;
 
-    // Handle AddRepo locally — it needs to update AppModel
-    if let ProtoCommand::AddRepo { ref path } = cmd {
-        let path = path.clone();
-        info!("adding repo {}", path.display());
-        config::save_repo(&path);
-        app.add_repo(path).await;
-        app.switch_tab(app.model.repo_order.len() - 1);
-        config::save_tab_order(&app.model.repo_order);
-        trigger_active_refresh(app);
-        return;
+    let repo = app.model.active_repo_root().clone();
+
+    match cmd {
+        Command::AddRepo { ref path } => {
+            info!("adding repo {}", path.display());
+            if let Err(e) = app.daemon.add_repo(path).await {
+                app.model.status_message = Some(e);
+            }
+            // RepoAdded event will add the tab via handle_daemon_event
+            return;
+        }
+        Command::RemoveRepo { ref path } => {
+            info!("removing repo {}", path.display());
+            if let Err(e) = app.daemon.remove_repo(path).await {
+                app.model.status_message = Some(e);
+            }
+            // RepoRemoved event will update state via handle_daemon_event
+            return;
+        }
+        Command::Refresh => {
+            if let Err(e) = app.daemon.refresh(&repo).await {
+                app.model.status_message = Some(e);
+            }
+            return;
+        }
+        _ => {}
     }
 
-    // Get what we need from the model
-    let repo_root = app.model.active_repo_root().clone();
-    let registry = Arc::clone(&app.model.active().registry);
-    let providers = Arc::clone(&app.model.active().providers);
-
-    let result = flotilla_core::executor::execute(cmd, &repo_root, &registry, &providers).await;
-
-    // Handle result — update UI state
-    handle_result(result, app);
-
-    // Trigger refresh
-    trigger_active_refresh(app);
+    match app.daemon.execute(&repo, cmd).await {
+        Ok(result) => handle_result(result, app),
+        Err(e) => app.model.status_message = Some(e),
+    }
 }
 
-fn handle_result(result: CommandResult, app: &mut App) {
+/// Interpret a CommandResult into UI state changes.
+pub fn handle_result(result: CommandResult, app: &mut App) {
     match result {
         CommandResult::Ok => {}
         CommandResult::WorktreeCreated { branch } => {
@@ -52,14 +58,7 @@ fn handle_result(result: CommandResult, app: &mut App) {
         }
         CommandResult::DeleteInfo(info) => {
             app.ui.mode = UiMode::DeleteConfirm {
-                info: Some(flotilla_core::data::DeleteConfirmInfo {
-                    branch: info.branch,
-                    pr_status: info.pr_status,
-                    merge_commit_sha: info.merge_commit_sha,
-                    unpushed_commits: info.unpushed_commits,
-                    has_uncommitted: info.has_uncommitted,
-                    base_detection_warning: info.base_detection_warning,
-                }),
+                info: Some(info),
                 loading: false,
             };
         }
@@ -67,9 +66,4 @@ fn handle_result(result: CommandResult, app: &mut App) {
             app.model.status_message = Some(message);
         }
     }
-}
-
-/// Trigger an immediate background refresh on the active repo.
-fn trigger_active_refresh(app: &App) {
-    app.model.active().refresh_handle.trigger_refresh();
 }

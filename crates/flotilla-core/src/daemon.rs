@@ -3,7 +3,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use flotilla_protocol::{CommandResult, DaemonEvent, ProtoCommand, RepoInfo, Snapshot};
+use flotilla_protocol::{Command, CommandResult, DaemonEvent, RepoInfo, Snapshot};
 
 /// The boundary between daemon and client.
 /// Both InProcessDaemon and SocketDaemon implement this.
@@ -19,7 +19,7 @@ pub trait DaemonHandle: Send + Sync {
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String>;
 
     /// Execute a command.
-    async fn execute(&self, repo: &Path, command: ProtoCommand) -> Result<CommandResult, String>;
+    async fn execute(&self, repo: &Path, command: Command) -> Result<CommandResult, String>;
 
     /// Trigger an immediate refresh for a repo.
     async fn refresh(&self, repo: &Path) -> Result<(), String>;

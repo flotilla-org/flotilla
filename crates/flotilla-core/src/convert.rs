@@ -5,46 +5,31 @@
 
 use std::path::Path;
 
-use flotilla_protocol::{
-    ProtoCheckoutRef, ProtoError, ProtoWorkItem, ProtoWorkItemIdentity, ProtoWorkItemKind, Snapshot,
-};
+use flotilla_protocol::{CheckoutRef, ProviderError, Snapshot, WorkItem};
 
-use crate::data::{ProviderError, WorkItem, WorkItemIdentity, WorkItemKind};
+use crate::data::{CorrelationResult, RefreshError};
+use crate::providers::correlation::{CorrelatedGroup, ItemKind as CorItemKind};
 use crate::refresh::RefreshSnapshot;
 
-pub fn work_item_kind_to_proto(kind: WorkItemKind) -> ProtoWorkItemKind {
-    match kind {
-        WorkItemKind::Checkout => ProtoWorkItemKind::Checkout,
-        WorkItemKind::Session => ProtoWorkItemKind::Session,
-        WorkItemKind::Pr => ProtoWorkItemKind::Pr,
-        WorkItemKind::RemoteBranch => ProtoWorkItemKind::RemoteBranch,
-        WorkItemKind::Issue => ProtoWorkItemKind::Issue,
-    }
-}
+pub fn correlation_result_to_work_item(
+    item: &CorrelationResult,
+    groups: &[CorrelatedGroup],
+) -> WorkItem {
+    let kind = item.kind();
+    let identity = item.identity();
 
-pub fn work_item_identity_to_proto(identity: &WorkItemIdentity) -> ProtoWorkItemIdentity {
-    match identity {
-        WorkItemIdentity::Checkout(path) => ProtoWorkItemIdentity::Checkout(path.clone()),
-        WorkItemIdentity::ChangeRequest(id) => ProtoWorkItemIdentity::ChangeRequest(id.clone()),
-        WorkItemIdentity::Session(id) => ProtoWorkItemIdentity::Session(id.clone()),
-        WorkItemIdentity::Issue(id) => ProtoWorkItemIdentity::Issue(id.clone()),
-        WorkItemIdentity::RemoteBranch(branch) => {
-            ProtoWorkItemIdentity::RemoteBranch(branch.clone())
-        }
-    }
-}
-
-pub fn work_item_to_proto(item: &WorkItem) -> ProtoWorkItem {
-    let kind = work_item_kind_to_proto(item.kind());
-
-    let identity = work_item_identity_to_proto(&item.identity());
-
-    let checkout = item.checkout().map(|co| ProtoCheckoutRef {
+    let checkout = item.checkout().map(|co| CheckoutRef {
         key: co.key.clone(),
         is_main_worktree: co.is_main_worktree,
     });
 
-    ProtoWorkItem {
+    let debug_group = item
+        .correlation_group_idx()
+        .and_then(|idx| groups.get(idx))
+        .map(format_debug_group)
+        .unwrap_or_default();
+
+    WorkItem {
         kind,
         identity,
         branch: item.branch().map(|s| s.to_string()),
@@ -55,11 +40,33 @@ pub fn work_item_to_proto(item: &WorkItem) -> ProtoWorkItem {
         issue_keys: item.issue_keys().to_vec(),
         workspace_refs: item.workspace_refs().to_vec(),
         is_main_worktree: item.is_main_worktree(),
+        debug_group,
     }
 }
 
-pub fn error_to_proto(error: &ProviderError) -> ProtoError {
-    ProtoError {
+fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("{} correlated items", group.items.len()));
+    for ci in &group.items {
+        let kind_label = match ci.kind {
+            CorItemKind::Checkout => "Checkout",
+            CorItemKind::ChangeRequest => "CR",
+            CorItemKind::CloudSession => "Session",
+            CorItemKind::Workspace => "Workspace",
+        };
+        lines.push(format!(
+            "  {}: {} [{:?}]",
+            kind_label, ci.title, ci.source_key
+        ));
+        for key in &ci.correlation_keys {
+            lines.push(format!("    {key:?}"));
+        }
+    }
+    lines
+}
+
+pub fn error_to_proto(error: &RefreshError) -> ProviderError {
+    ProviderError {
         category: error.category.to_string(),
         message: error.message.clone(),
     }
@@ -69,7 +76,12 @@ pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot) -> Sn
     Snapshot {
         seq,
         repo: repo.to_path_buf(),
-        work_items: refresh.work_items.iter().map(work_item_to_proto).collect(),
+        work_items: refresh
+            .work_items
+            .iter()
+            .map(|item| correlation_result_to_work_item(item, &refresh.correlation_groups))
+            .collect(),
+        providers: (*refresh.providers).clone(),
         provider_health: refresh
             .provider_health
             .iter()
@@ -82,14 +94,13 @@ pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot) -> Sn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{
-        CheckoutRef, CorrelatedAnchor, CorrelatedWorkItem, StandaloneWorkItem, WorkItem,
-    };
+    use crate::data::{CorrelatedAnchor, CorrelatedWorkItem, StandaloneResult};
+    use flotilla_protocol::{WorkItemIdentity, WorkItemKind};
     use std::path::PathBuf;
 
     #[test]
     fn convert_correlated_checkout() {
-        let item = WorkItem::Correlated(CorrelatedWorkItem {
+        let item = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Checkout(CheckoutRef {
                 key: PathBuf::from("/repos/my-project/wt-1"),
                 is_main_worktree: false,
@@ -103,12 +114,12 @@ mod tests {
             correlation_group_idx: 0,
         });
 
-        let proto = work_item_to_proto(&item);
+        let proto = correlation_result_to_work_item(&item, &[]);
 
-        assert_eq!(proto.kind, ProtoWorkItemKind::Checkout);
+        assert_eq!(proto.kind, WorkItemKind::Checkout);
         assert_eq!(
             proto.identity,
-            ProtoWorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1"))
+            WorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1"))
         );
         assert_eq!(proto.branch.as_deref(), Some("feature-login"));
         assert_eq!(proto.description, "Implement login flow");
@@ -126,18 +137,15 @@ mod tests {
 
     #[test]
     fn convert_standalone_issue() {
-        let item = WorkItem::Standalone(StandaloneWorkItem::Issue {
+        let item = CorrelationResult::Standalone(StandaloneResult::Issue {
             key: "42".to_string(),
             description: "Fix the login bug".to_string(),
         });
 
-        let proto = work_item_to_proto(&item);
+        let proto = correlation_result_to_work_item(&item, &[]);
 
-        assert_eq!(proto.kind, ProtoWorkItemKind::Issue);
-        assert_eq!(
-            proto.identity,
-            ProtoWorkItemIdentity::Issue("42".to_string())
-        );
+        assert_eq!(proto.kind, WorkItemKind::Issue);
+        assert_eq!(proto.identity, WorkItemIdentity::Issue("42".to_string()));
         assert_eq!(proto.description, "Fix the login bug");
         assert_eq!(proto.issue_keys, vec!["42"]);
         assert!(proto.branch.is_none());

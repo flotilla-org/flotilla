@@ -11,13 +11,12 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{AppModel, Intent, ProviderStatus, TabId, UiMode, UiState};
+use crate::app::{Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState};
 use crate::event_log::{self, LevelExt};
-use flotilla_core::data::{SectionHeader, TableEntry, WorkItem, WorkItemKind};
-use flotilla_core::providers::correlation::ItemKind as CorItemKind;
-use flotilla_core::providers::types::{ChangeRequestStatus, CorrelationKey, SessionStatus};
+use flotilla_core::data::{GroupEntry, SectionHeader};
+use flotilla_protocol::{ChangeRequestStatus, ProviderData, SessionStatus, WorkItem, WorkItemKind};
 
-pub fn render(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
+pub fn render(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -37,7 +36,7 @@ pub fn render(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
     render_file_picker(ui, frame);
 }
 
-fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
+fn render_tab_bar(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
     let flotilla_label = TabId::FLOTILLA_LABEL;
     let flotilla_style = if ui.mode.is_config() {
         Style::default().bold().fg(Color::Black).bg(Color::White)
@@ -57,7 +56,7 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
     for (i, path) in model.repo_order.iter().enumerate() {
         let rm = &model.repos[path];
         let rui = &ui.repo_ui[path];
-        let name = AppModel::repo_name(path);
+        let name = TuiModel::repo_name(path);
         let is_active = !ui.mode.is_config() && i == model.active_repo;
         let loading = if rm.loading { " ⟳" } else { "" };
         let changed = if rui.has_unseen_changes { "*" } else { "" };
@@ -99,20 +98,20 @@ fn render_tab_bar(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
     frame.render_widget(title, area);
 }
 
-fn active_rui<'a>(model: &AppModel, ui: &'a UiState) -> &'a crate::app::RepoUiState {
+fn active_rui<'a>(model: &TuiModel, ui: &'a UiState) -> &'a crate::app::RepoUiState {
     ui.active_repo_ui(&model.repo_order, model.active_repo)
 }
 
-fn selected_work_item<'a>(model: &AppModel, ui: &'a UiState) -> Option<&'a WorkItem> {
+fn selected_work_item<'a>(model: &TuiModel, ui: &'a UiState) -> Option<&'a WorkItem> {
     let rui = active_rui(model, ui);
     let table_idx = rui.table_state.selected()?;
     match rui.table_view.table_entries.get(table_idx)? {
-        TableEntry::Item(item) => Some(item),
-        TableEntry::Header(_) => None,
+        GroupEntry::Item(item) => Some(item),
+        GroupEntry::Header(_) => None,
     }
 }
 
-fn render_status_bar(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Rect) {
+fn render_status_bar(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Rect) {
     if let Some(err) = &model.status_message {
         let msg = format!(" Error: {}", err);
         let status = Paragraph::new(msg).style(Style::default().fg(Color::Red));
@@ -138,7 +137,7 @@ fn render_status_bar(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Re
             if rui.show_providers {
                 " c:close providers  [/]:switch tab  ?:help  q:quit".into()
             } else if !rui.multi_selected.is_empty() {
-                " enter:create branch  shift+enter:toggle  esc:clear  ?:help  q:quit".into()
+                " enter:create branch  space:toggle  esc:clear  ?:help  q:quit".into()
             } else {
                 let mut s = " enter:open".to_string();
                 if let Some(item) = selected_work_item(model, ui) {
@@ -152,7 +151,7 @@ fn render_status_bar(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Re
                         }
                     }
                 }
-                s.push_str("  space:menu  n:new  r:refresh  shift+enter:select  ?:help  q:quit");
+                s.push_str("  .:menu  n:new  r:refresh  space:select  ?:help  q:quit");
                 s
             }
         }
@@ -162,7 +161,7 @@ fn render_status_bar(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Re
     frame.render_widget(status, area);
 }
 
-fn render_content(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
+fn render_content(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
     if ui.mode.is_config() {
         render_config_screen(model, ui, frame, area);
         return;
@@ -177,96 +176,41 @@ fn render_content(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: R
     render_preview(model, ui, frame, chunks[1]);
 }
 
-fn render_repo_providers(model: &AppModel, _ui: &UiState, frame: &mut Frame, area: Rect) {
+fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, area: Rect) {
     let path = &model.repo_order[model.active_repo];
-    let reg = &model.repos[path].registry;
+    let rm = &model.repos[path];
 
     let mut lines: Vec<Line> = Vec::new();
 
-    let categories: Vec<(&str, Option<String>, Option<ProviderStatus>)> = vec![
-        (
-            "VCS",
-            reg.vcs
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string()),
-            None,
-        ),
-        (
-            "Checkout mgr",
-            reg.checkout_managers
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string()),
-            None,
-        ),
-        (
-            "Code review",
-            reg.code_review
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string()),
-            reg.code_review.iter().next().and_then(|(pname, _)| {
-                model
-                    .provider_statuses
-                    .get(&(path.clone(), "code_review".into(), pname.clone()))
-                    .copied()
-            }),
-        ),
-        (
-            "Issue tracker",
-            reg.issue_trackers
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string()),
-            reg.issue_trackers.iter().next().and_then(|(pname, _)| {
-                model
-                    .provider_statuses
-                    .get(&(path.clone(), "issue_tracker".into(), pname.clone()))
-                    .copied()
-            }),
-        ),
-        (
-            "Coding agent",
-            reg.coding_agents
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string()),
-            reg.coding_agents.iter().next().and_then(|(pname, _)| {
-                model
-                    .provider_statuses
-                    .get(&(path.clone(), "coding_agent".into(), pname.clone()))
-                    .copied()
-            }),
-        ),
-        (
-            "AI utility",
-            reg.ai_utilities
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string()),
-            None,
-        ),
-        (
-            "Workspace mgr",
-            reg.workspace_manager
-                .as_ref()
-                .map(|(_, w)| w.display_name().to_string()),
-            None,
-        ),
+    let categories: Vec<(&str, &str)> = vec![
+        ("VCS", "vcs"),
+        ("Checkout mgr", "checkout_manager"),
+        ("Code review", "code_review"),
+        ("Issue tracker", "issue_tracker"),
+        ("Coding agent", "coding_agent"),
+        ("AI utility", "ai_utility"),
+        ("Workspace mgr", "workspace_manager"),
     ];
 
-    for (category, provider, status) in categories {
-        let value = match (&provider, status) {
+    for (category, key) in categories {
+        let provider_name = rm.provider_names.get(key);
+        let status = provider_name.and_then(|pname| {
+            model
+                .provider_statuses
+                .get(&(path.clone(), key.to_string(), pname.clone()))
+                .copied()
+        });
+
+        let value = match (&provider_name, status) {
             (Some(name), Some(ProviderStatus::Ok)) => format!("{} ✓", name),
             (Some(name), Some(ProviderStatus::Error)) => format!("{} ✗", name),
-            (Some(name), None) => name.clone(),
+            (Some(name), None) => (*name).clone(),
             (None, _) => "—".to_string(),
         };
         let value_style = match status {
             Some(ProviderStatus::Ok) => Style::default().fg(Color::Green),
             Some(ProviderStatus::Error) => Style::default().fg(Color::Red),
-            _ if provider.is_some() => Style::default().fg(Color::White),
+            _ if provider_name.is_some() => Style::default().fg(Color::White),
             _ => Style::default().fg(Color::DarkGray),
         };
         lines.push(Line::from(vec![
@@ -284,7 +228,7 @@ fn render_repo_providers(model: &AppModel, _ui: &UiState, frame: &mut Frame, are
     frame.render_widget(paragraph, area);
 }
 
-fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
+fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
     ui.layout.table_area = area;
 
     let rui = active_rui(model, ui);
@@ -341,15 +285,15 @@ fn render_unified_table(model: &AppModel, ui: &mut UiState, frame: &mut Frame, a
         .table_entries
         .iter()
         .map(|entry| {
-            let is_multi_selected = if let TableEntry::Item(ref item) = entry {
-                rui.multi_selected.contains(&item.identity())
+            let is_multi_selected = if let GroupEntry::Item(ref item) = entry {
+                rui.multi_selected.contains(&item.identity)
             } else {
                 false
             };
 
             match entry {
-                TableEntry::Header(header) => build_header_row(header),
-                TableEntry::Item(item) => {
+                GroupEntry::Header(header) => build_header_row(header),
+                GroupEntry::Item(item) => {
                     let mut row = build_item_row(item, &rm.providers, &col_widths);
                     if is_multi_selected {
                         row = row.style(Style::default().bg(Color::Indexed(236)));
@@ -390,21 +334,20 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
-fn build_item_row<'a>(
-    item: &WorkItem,
-    providers: &std::sync::Arc<flotilla_core::provider_data::ProviderData>,
-    col_widths: &[u16],
-) -> Row<'a> {
-    let (icon, icon_color) = match item.kind() {
+fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u16]) -> Row<'a> {
+    let (icon, icon_color) = match item.kind {
         WorkItemKind::Checkout => {
-            if !item.workspace_refs().is_empty() {
+            if !item.workspace_refs.is_empty() {
                 ("●", Color::Green)
             } else {
                 ("○", Color::Green)
             }
         }
         WorkItemKind::Session => {
-            let session = item.session_key().and_then(|k| providers.sessions.get(k));
+            let session = item
+                .session_key
+                .as_deref()
+                .and_then(|k| providers.sessions.get(k));
             match session.map(|s| &s.status) {
                 Some(SessionStatus::Running) => ("▶", Color::Magenta),
                 Some(SessionStatus::Idle) => ("◆", Color::Magenta),
@@ -419,9 +362,9 @@ fn build_item_row<'a>(
     let desc_width = col_widths.get(1).copied().unwrap_or(15) as usize;
     let branch_width = col_widths.get(2).copied().unwrap_or(25) as usize;
 
-    let description = truncate(item.description(), desc_width);
+    let description = truncate(&item.description, desc_width);
 
-    let wt_indicator = if item.is_main_worktree() {
+    let wt_indicator = if item.is_main_worktree {
         "◆"
     } else if item.checkout_key().is_some() {
         "✓"
@@ -429,17 +372,17 @@ fn build_item_row<'a>(
         ""
     };
 
-    let ws_indicator = match item.workspace_refs().len() {
+    let ws_indicator = match item.workspace_refs.len() {
         0 => String::new(),
         1 => "●".to_string(),
         n => format!("{n}"),
     };
 
-    let branch = item.branch().unwrap_or("—");
+    let branch = item.branch.as_deref().unwrap_or("—");
     let branch_display = truncate(branch, branch_width);
 
-    let pr_display = if let Some(pr_key) = item.pr_key() {
-        if let Some(cr) = providers.change_requests.get(pr_key) {
+    let pr_display = if let Some(ref pr_key) = item.pr_key {
+        if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
             let state_icon = match cr.status {
                 ChangeRequestStatus::Merged => "✓",
                 ChangeRequestStatus::Closed => "✗",
@@ -453,8 +396,8 @@ fn build_item_row<'a>(
         String::new()
     };
 
-    let session_display = if let Some(ses_key) = item.session_key() {
-        if let Some(ses) = providers.sessions.get(ses_key) {
+    let session_display = if let Some(ref ses_key) = item.session_key {
+        if let Some(ses) = providers.sessions.get(ses_key.as_str()) {
             match ses.status {
                 SessionStatus::Running => "▶".to_string(),
                 SessionStatus::Idle => "◆".to_string(),
@@ -468,7 +411,7 @@ fn build_item_row<'a>(
     };
 
     let issues_display = item
-        .issue_keys()
+        .issue_keys
         .iter()
         .filter_map(|k| providers.issues.get(k.as_str()))
         .map(|i| format!("#{}", i.id))
@@ -529,7 +472,7 @@ fn build_item_row<'a>(
     ])
 }
 
-fn render_preview(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Rect) {
+fn render_preview(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Rect) {
     if ui.show_debug {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -542,18 +485,20 @@ fn render_preview(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Rect)
     }
 }
 
-fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Rect) {
+fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Rect) {
     let text = if let Some(item) = selected_work_item(model, ui) {
+        let rm = model.active();
+        let providers = &rm.providers;
         let mut lines = Vec::new();
 
-        lines.push(format!("Description: {}", item.description()));
+        lines.push(format!("Description: {}", item.description));
 
-        if let Some(branch) = item.branch() {
+        if let Some(ref branch) = item.branch {
             lines.push(format!("Branch: {}", branch));
         }
 
         if let Some(wt_key) = item.checkout_key() {
-            if let Some(co) = model.active().providers.checkouts.get(wt_key) {
+            if let Some(co) = providers.checkouts.get(wt_key) {
                 lines.push(format!("Path: {}", co.path.display()));
                 if let Some(commit) = &co.last_commit {
                     let sha = if commit.short_sha.is_empty() {
@@ -576,8 +521,8 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        if let Some(pr_key) = item.pr_key() {
-            if let Some(cr) = model.active().providers.change_requests.get(pr_key) {
+        if let Some(ref pr_key) = item.pr_key {
+            if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
                 lines.push(format!(
                     "{} #{}: {}",
                     model.active_labels().code_review.abbr,
@@ -588,12 +533,12 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        if let Some(ses_key) = item.session_key() {
-            if let Some(ses) = model.active().providers.sessions.get(ses_key) {
+        if let Some(ref ses_key) = item.session_key {
+            if let Some(ses) = providers.sessions.get(ses_key.as_str()) {
                 lines.push(format!("Session: {}", ses.title));
                 lines.push(format!("Status: {:?}", ses.status));
-                if let Some(ref model) = ses.model {
-                    lines.push(format!("Model: {}", model));
+                if let Some(ref model_name) = ses.model {
+                    lines.push(format!("Model: {}", model_name));
                 }
                 if let Some(ref updated) = ses.updated_at {
                     let display = updated.split('T').next().unwrap_or(updated);
@@ -602,8 +547,8 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        for ws_ref in item.workspace_refs() {
-            if let Some(ws) = model.active().providers.workspaces.get(ws_ref.as_str()) {
+        for ws_ref in &item.workspace_refs {
+            if let Some(ws) = providers.workspaces.get(ws_ref.as_str()) {
                 let name = if ws.name.is_empty() {
                     &ws.ws_ref
                 } else {
@@ -613,8 +558,8 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        for issue_key in item.issue_keys() {
-            if let Some(issue) = model.active().providers.issues.get(issue_key.as_str()) {
+        for issue_key in &item.issue_keys {
+            if let Some(issue) = providers.issues.get(issue_key.as_str()) {
                 let labels = issue.labels.join(", ");
                 lines.push(format!("Issue #{}: {} [{}]", issue.id, issue.title, labels));
             }
@@ -631,48 +576,10 @@ fn render_preview_content(model: &AppModel, ui: &UiState, frame: &mut Frame, are
     frame.render_widget(preview, area);
 }
 
-fn format_correlation_key(key: &CorrelationKey) -> String {
-    match key {
-        CorrelationKey::Branch(b) => format!("Branch({})", b),
-        CorrelationKey::CheckoutPath(p) => format!("Path({})", p.display()),
-        CorrelationKey::ChangeRequestRef(provider, id) => format!("CR({}/{})", provider, id),
-        CorrelationKey::SessionRef(provider, id) => format!("Ses({}/{})", provider, id),
-    }
-}
-
-fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: Rect) {
+fn render_debug_panel(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Rect) {
     let text = if let Some(item) = selected_work_item(model, ui) {
-        let active = model.active();
-        if let Some(group_idx) = item.correlation_group_idx() {
-            if let Some(group) = active.correlation_groups.get(group_idx) {
-                let mut lines = Vec::new();
-                lines.push(format!(
-                    "Group #{} ({} items)",
-                    group_idx,
-                    group.items.len()
-                ));
-                lines.push(String::new());
-
-                for ci in &group.items {
-                    let kind_label = match ci.kind {
-                        CorItemKind::Checkout => "Checkout",
-                        CorItemKind::ChangeRequest => "CR",
-                        CorItemKind::CloudSession => "Session",
-                        CorItemKind::Workspace => "Workspace",
-                    };
-                    lines.push(format!(
-                        "{}: {} [key={:?}]",
-                        kind_label, ci.title, ci.source_key
-                    ));
-                    for key in &ci.correlation_keys {
-                        lines.push(format!("  {}", format_correlation_key(key)));
-                    }
-                }
-
-                lines.join("\n")
-            } else {
-                "No group data".into()
-            }
+        if !item.debug_group.is_empty() {
+            item.debug_group.join("\n")
         } else {
             "Not correlated (standalone)".into()
         }
@@ -681,12 +588,12 @@ fn render_debug_panel(model: &AppModel, ui: &UiState, frame: &mut Frame, area: R
     };
 
     let panel = Paragraph::new(text)
-        .block(Block::bordered().title(" Correlation Debug (D to toggle) "))
+        .block(Block::bordered().title(" Debug (D to toggle) "))
         .wrap(Wrap { trim: true });
     frame.render_widget(panel, area);
 }
 
-fn render_action_menu(model: &AppModel, ui: &mut UiState, frame: &mut Frame) {
+fn render_action_menu(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
     let UiMode::ActionMenu { ref items, index } = ui.mode else {
         return;
     };
@@ -746,7 +653,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn render_delete_confirm(model: &AppModel, ui: &UiState, frame: &mut Frame) {
+fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
     let UiMode::DeleteConfirm { ref info, loading } = ui.mode else {
         return;
     };
@@ -842,7 +749,7 @@ fn render_delete_confirm(model: &AppModel, ui: &UiState, frame: &mut Frame) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_help(model: &AppModel, ui: &UiState, frame: &mut Frame) {
+fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
     if !matches!(ui.mode, UiMode::Help) {
         return;
     }
@@ -969,19 +876,20 @@ fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
     frame.render_stateful_widget(list, chunks[1], &mut state);
 }
 
-fn render_config_screen(model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
+fn render_config_screen(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
     render_global_status(model, frame, chunks[0]);
-    render_event_log(model, ui, frame, chunks[1]);
+    render_event_log(ui, frame, chunks[1]);
 }
 
-fn render_global_status(model: &AppModel, frame: &mut Frame, area: Rect) {
+fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
+    // Collect provider names across all repos
     let mut vcs_name: Option<String> = None;
     let mut checkout_name: Option<String> = None;
     let mut code_review_name: Option<String> = None;
@@ -993,66 +901,38 @@ fn render_global_status(model: &AppModel, frame: &mut Frame, area: Rect) {
     let mut coding_agent_status: Option<ProviderStatus> = None;
 
     for path in &model.repo_order {
-        let reg = &model.repos[path].registry;
+        let rm = &model.repos[path];
 
         if vcs_name.is_none() {
-            vcs_name = reg
-                .vcs
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string());
+            vcs_name = rm.provider_names.get("vcs").cloned();
         }
         if checkout_name.is_none() {
-            checkout_name = reg
-                .checkout_managers
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string());
+            checkout_name = rm.provider_names.get("checkout_manager").cloned();
         }
         if code_review_name.is_none() {
-            code_review_name = reg
-                .code_review
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string());
+            code_review_name = rm.provider_names.get("code_review").cloned();
         }
         if issue_tracker_name.is_none() {
-            issue_tracker_name = reg
-                .issue_trackers
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string());
+            issue_tracker_name = rm.provider_names.get("issue_tracker").cloned();
         }
         if coding_agent_name.is_none() {
-            coding_agent_name = reg
-                .coding_agents
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string());
+            coding_agent_name = rm.provider_names.get("coding_agent").cloned();
         }
         if ai_utility_name.is_none() {
-            ai_utility_name = reg
-                .ai_utilities
-                .values()
-                .next()
-                .map(|v| v.display_name().to_string());
+            ai_utility_name = rm.provider_names.get("ai_utility").cloned();
         }
         if workspace_name.is_none() {
-            workspace_name = reg
-                .workspace_manager
-                .as_ref()
-                .map(|(_, w)| w.display_name().to_string());
+            workspace_name = rm.provider_names.get("workspace_manager").cloned();
         }
 
         if coding_agent_status.is_none() {
-            for (pname, _) in reg.coding_agents.iter() {
+            if let Some(pname) = rm.provider_names.get("coding_agent") {
                 if let Some(&status) = model.provider_statuses.get(&(
                     path.clone(),
                     "coding_agent".into(),
                     pname.clone(),
                 )) {
                     coding_agent_status = Some(status);
-                    break;
                 }
             }
         }
@@ -1121,7 +1001,7 @@ fn render_global_status(model: &AppModel, frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_event_log(_model: &AppModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
+fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {
     use event_log::DisplayEntry;
 
     let filter = ui.event_log.filter;
