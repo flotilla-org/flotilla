@@ -171,7 +171,9 @@ impl CorrelationResult {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(co.key.clone()),
-                CorrelatedAnchor::ChangeRequest(key) => WorkItemIdentity::ChangeRequest(key.clone()),
+                CorrelatedAnchor::ChangeRequest(key) => {
+                    WorkItemIdentity::ChangeRequest(key.clone())
+                }
                 CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
             },
             CorrelationResult::Standalone(s) => match s {
