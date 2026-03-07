@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::providers::types::*;
+use crate::providers::CommandRunner;
 use crate::template::WorkspaceTemplate;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -22,55 +23,35 @@ struct TabState {
     created_at: String,
 }
 
-pub struct ZellijWorkspaceManager;
-
-impl Default for ZellijWorkspaceManager {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct ZellijWorkspaceManager {
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl ZellijWorkspaceManager {
-    pub fn new() -> Self {
-        Self
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner }
     }
 
     /// Run `zellij action <args>` and return stdout, or an error on failure.
-    pub async fn zellij_action(args: &[&str]) -> Result<String, String> {
+    async fn zellij_action(&self, args: &[&str]) -> Result<String, String> {
         let mut cmd_args = vec!["action"];
         cmd_args.extend_from_slice(args);
 
-        let output = Command::new("zellij")
-            .args(&cmd_args)
-            .stdin(std::process::Stdio::null())
-            .output()
+        self.runner
+            .run("zellij", &cmd_args, Path::new("."))
             .await
-            .map_err(|e| format!("failed to run zellij action: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return Err(format!(
-                "zellij action {} failed: {}",
-                args.first().unwrap_or(&""),
-                if stderr.is_empty() { &stdout } else { &stderr }
-            ));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .map(|s| s.trim().to_string())
     }
 
     /// Check that `zellij --version` reports >= 0.40.
     /// Parses output like "zellij 0.42.2".
-    pub async fn check_version() -> Result<(), String> {
-        let output = Command::new("zellij")
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .output()
+    pub async fn check_version(runner: &dyn CommandRunner) -> Result<(), String> {
+        let version_str = runner
+            .run("zellij", &["--version"], Path::new("."))
             .await
-            .map_err(|e| format!("failed to run zellij --version: {e}"))?;
-
-        let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            .map_err(|e| format!("failed to run zellij --version: {e}"))?
+            .trim()
+            .to_string();
         let version_part = version_str
             .strip_prefix("zellij ")
             .ok_or_else(|| format!("unexpected zellij version output: {version_str}"))?;
@@ -162,7 +143,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<Workspace>, String> {
-        let output = Self::zellij_action(&["query-tab-names"]).await?;
+        let output = self.zellij_action(&["query-tab-names"]).await?;
         let tab_names: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
 
         // Load state for enrichment, pruning stale entries
@@ -226,7 +207,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         let working_dir = config.working_directory.display().to_string();
 
         // Create new tab
-        Self::zellij_action(&["new-tab", "--name", &config.name, "--cwd", &working_dir]).await?;
+        self.zellij_action(&["new-tab", "--name", &config.name, "--cwd", &working_dir]).await?;
 
         // Small delay to let zellij process the tab creation
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -238,7 +219,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                 if let Some(surface) = pane.surfaces.first() {
                     if !surface.command.is_empty() {
                         let text = format!("{}\n", surface.command);
-                        Self::zellij_action(&["write-chars", &text]).await?;
+                        self.zellij_action(&["write-chars", &text]).await?;
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -247,7 +228,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                 for surface in pane.surfaces.iter().skip(1) {
                     let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
                     Self::append_command_args(&mut args, &surface.command);
-                    Self::zellij_action(&args).await?;
+                    self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             } else {
@@ -258,7 +239,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                     let mut args: Vec<&str> =
                         vec!["new-pane", "-d", direction, "--cwd", &working_dir];
                     Self::append_command_args(&mut args, &surface.command);
-                    Self::zellij_action(&args).await?;
+                    self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
@@ -266,7 +247,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                 for surface in pane.surfaces.iter().skip(1) {
                     let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
                     Self::append_command_args(&mut args, &surface.command);
-                    Self::zellij_action(&args).await?;
+                    self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
@@ -286,7 +267,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                 .sum();
             let moves_back = total_panes.saturating_sub(1).saturating_sub(panes_before);
             for _ in 0..moves_back {
-                Self::zellij_action(&["focus-previous-pane"]).await.ok();
+                self.zellij_action(&["focus-previous-pane"]).await.ok();
             }
         }
 
@@ -324,7 +305,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
         info!("zellij: switching to tab '{ws_ref}'");
-        Self::zellij_action(&["go-to-tab-name", ws_ref]).await?;
+        self.zellij_action(&["go-to-tab-name", ws_ref]).await?;
         Ok(())
     }
 }
