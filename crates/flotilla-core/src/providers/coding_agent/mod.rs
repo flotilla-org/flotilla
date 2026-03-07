@@ -5,7 +5,6 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait CodingAgent: Send + Sync {
-    #[allow(dead_code)]
     fn display_name(&self) -> &str;
     fn section_label(&self) -> &str {
         "Sessions"

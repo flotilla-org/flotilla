@@ -308,7 +308,10 @@ impl App {
 
     pub fn active_ui_mut(&mut self) -> &mut RepoUiState {
         let key = &self.model.repo_order[self.model.active_repo];
-        self.ui.repo_ui.get_mut(key).unwrap()
+        self.ui
+            .repo_ui
+            .get_mut(key)
+            .expect("active repo must have UI state")
     }
 
     pub fn selected_work_item(&self) -> Option<&WorkItem> {
@@ -324,7 +327,11 @@ impl App {
             self.ui.mode = UiMode::Normal;
             self.model.active_repo = idx;
             let key = &self.model.repo_order[idx];
-            self.ui.repo_ui.get_mut(key).unwrap().has_unseen_changes = false;
+            self.ui
+                .repo_ui
+                .get_mut(key)
+                .expect("active repo must have UI state")
+                .has_unseen_changes = false;
         }
     }
 
