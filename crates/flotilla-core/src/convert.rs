@@ -8,9 +8,13 @@ use std::path::Path;
 use flotilla_protocol::{CheckoutRef, ProviderError, Snapshot, WorkItem};
 
 use crate::data::{CorrelationResult, RefreshError};
+use crate::providers::correlation::{CorrelatedGroup, ItemKind as CorItemKind};
 use crate::refresh::RefreshSnapshot;
 
-pub fn correlation_result_to_work_item(item: &CorrelationResult) -> WorkItem {
+pub fn correlation_result_to_work_item(
+    item: &CorrelationResult,
+    groups: &[CorrelatedGroup],
+) -> WorkItem {
     let kind = item.kind();
     let identity = item.identity();
 
@@ -18,6 +22,12 @@ pub fn correlation_result_to_work_item(item: &CorrelationResult) -> WorkItem {
         key: co.key.clone(),
         is_main_worktree: co.is_main_worktree,
     });
+
+    let debug_group = item
+        .correlation_group_idx()
+        .and_then(|idx| groups.get(idx))
+        .map(format_debug_group)
+        .unwrap_or_default();
 
     WorkItem {
         kind,
@@ -30,7 +40,29 @@ pub fn correlation_result_to_work_item(item: &CorrelationResult) -> WorkItem {
         issue_keys: item.issue_keys().to_vec(),
         workspace_refs: item.workspace_refs().to_vec(),
         is_main_worktree: item.is_main_worktree(),
+        debug_group,
     }
+}
+
+fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("{} correlated items", group.items.len()));
+    for ci in &group.items {
+        let kind_label = match ci.kind {
+            CorItemKind::Checkout => "Checkout",
+            CorItemKind::ChangeRequest => "CR",
+            CorItemKind::CloudSession => "Session",
+            CorItemKind::Workspace => "Workspace",
+        };
+        lines.push(format!(
+            "  {}: {} [{:?}]",
+            kind_label, ci.title, ci.source_key
+        ));
+        for key in &ci.correlation_keys {
+            lines.push(format!("    {key:?}"));
+        }
+    }
+    lines
 }
 
 pub fn error_to_proto(error: &RefreshError) -> ProviderError {
@@ -47,7 +79,7 @@ pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot) -> Sn
         work_items: refresh
             .work_items
             .iter()
-            .map(correlation_result_to_work_item)
+            .map(|item| correlation_result_to_work_item(item, &refresh.correlation_groups))
             .collect(),
         providers: (*refresh.providers).clone(),
         provider_health: refresh
@@ -82,7 +114,7 @@ mod tests {
             correlation_group_idx: 0,
         });
 
-        let proto = correlation_result_to_work_item(&item);
+        let proto = correlation_result_to_work_item(&item, &[]);
 
         assert_eq!(proto.kind, WorkItemKind::Checkout);
         assert_eq!(
@@ -110,7 +142,7 @@ mod tests {
             description: "Fix the login bug".to_string(),
         });
 
-        let proto = correlation_result_to_work_item(&item);
+        let proto = correlation_result_to_work_item(&item, &[]);
 
         assert_eq!(proto.kind, WorkItemKind::Issue);
         assert_eq!(proto.identity, WorkItemIdentity::Issue("42".to_string()));

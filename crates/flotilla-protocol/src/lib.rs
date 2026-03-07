@@ -94,6 +94,7 @@ mod tests {
                 issue_keys: vec!["ISSUE-1".to_string()],
                 workspace_refs: vec![],
                 is_main_worktree: false,
+                debug_group: vec![],
             }],
             providers: ProviderData::default(),
             provider_health: HashMap::from([
@@ -192,6 +193,7 @@ mod tests {
             issue_keys: vec!["GH-10".to_string(), "LIN-20".to_string()],
             workspace_refs: vec!["cmux-1".to_string()],
             is_main_worktree: false,
+            debug_group: vec!["2 correlated items".to_string()],
         };
 
         let json = serde_json::to_string(&item).expect("serialize");

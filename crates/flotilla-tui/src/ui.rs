@@ -577,25 +577,11 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
 
 fn render_debug_panel(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Rect) {
     let text = if let Some(item) = selected_work_item(model, ui) {
-        let mut lines = Vec::new();
-        lines.push(format!("Kind: {:?}", item.kind));
-        lines.push(format!("Identity: {:?}", item.identity));
-        if let Some(ref branch) = item.branch {
-            lines.push(format!("Branch: {}", branch));
+        if !item.debug_group.is_empty() {
+            item.debug_group.join("\n")
+        } else {
+            "Not correlated (standalone)".into()
         }
-        if let Some(ref pr_key) = item.pr_key {
-            lines.push(format!("PR key: {}", pr_key));
-        }
-        if let Some(ref session_key) = item.session_key {
-            lines.push(format!("Session key: {}", session_key));
-        }
-        if !item.issue_keys.is_empty() {
-            lines.push(format!("Issues: {:?}", item.issue_keys));
-        }
-        if !item.workspace_refs.is_empty() {
-            lines.push(format!("Workspaces: {:?}", item.workspace_refs));
-        }
-        lines.join("\n")
     } else {
         String::new()
     };

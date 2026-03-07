@@ -81,6 +81,10 @@ pub struct WorkItem {
     pub issue_keys: Vec<String>,
     pub workspace_refs: Vec<String>,
     pub is_main_worktree: bool,
+    /// Pre-formatted debug lines describing the correlation group.
+    /// Empty for standalone items.
+    #[serde(default)]
+    pub debug_group: Vec<String>,
 }
 
 impl WorkItem {
