@@ -56,7 +56,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-coverage-
       - name: Generate coverage report
-        run: cargo +nightly llvm-cov --html --json --output-path target/llvm-cov/html/coverage.json --locked
+        run: |
+          cargo +nightly llvm-cov --html --locked
+          cargo +nightly llvm-cov --json --no-run --locked --output-path target/llvm-cov/html/coverage.json
       - name: Add badge JSON
         run: |
           PERCENT=$(jq -r '.data[0].totals.lines.percent | floor' target/llvm-cov/html/coverage.json)
