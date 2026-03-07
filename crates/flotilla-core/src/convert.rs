@@ -88,6 +88,9 @@ pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot) -> Sn
             .map(|(k, v)| (k.to_string(), *v))
             .collect(),
         errors: refresh.errors.iter().map(error_to_proto).collect(),
+        issue_total: None,
+        issue_has_more: false,
+        issue_search_results: None,
     }
 }
 

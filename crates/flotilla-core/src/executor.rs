@@ -321,10 +321,14 @@ pub async fn execute(
 
         // These are handled at the daemon level (InProcessDaemon / SocketDaemon),
         // not by the per-repo executor. If they reach here, it's a routing bug.
-        Command::AddRepo { .. } | Command::RemoveRepo { .. } | Command::Refresh => {
-            CommandResult::Error {
-                message: "bug: daemon-level command reached per-repo executor".to_string(),
-            }
+        Command::AddRepo { .. }
+        | Command::RemoveRepo { .. }
+        | Command::Refresh
+        | Command::SetIssueViewport { .. }
+        | Command::FetchMoreIssues { .. }
+        | Command::SearchIssues { .. }
+        | Command::ClearIssueSearch { .. } => CommandResult::Error {
+            message: "bug: daemon-level command reached per-repo executor".to_string(),
         }
     }
 }

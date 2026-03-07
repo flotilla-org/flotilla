@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider_data::ProviderData;
+use crate::provider_data::{Issue, ProviderData};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryLabels {
@@ -60,6 +60,12 @@ pub struct Snapshot {
     pub providers: ProviderData,
     pub provider_health: HashMap<String, bool>,
     pub errors: Vec<ProviderError>,
+    #[serde(default)]
+    pub issue_total: Option<u32>,
+    #[serde(default)]
+    pub issue_has_more: bool,
+    #[serde(default)]
+    pub issue_search_results: Option<Vec<Issue>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

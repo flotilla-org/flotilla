@@ -53,6 +53,21 @@ pub enum Command {
         path: PathBuf,
     },
     Refresh,
+    SetIssueViewport {
+        repo: PathBuf,
+        visible_count: usize,
+    },
+    FetchMoreIssues {
+        repo: PathBuf,
+        desired_count: usize,
+    },
+    SearchIssues {
+        repo: PathBuf,
+        query: String,
+    },
+    ClearIssueSearch {
+        repo: PathBuf,
+    },
 }
 
 /// Result returned from command execution.

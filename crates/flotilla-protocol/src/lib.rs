@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 pub use commands::{CheckoutStatus, Command, CommandResult};
 pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
-    CommitInfo, CorrelationKey, Issue, ProviderData, SessionStatus, WorkingTreeStatus, Workspace,
+    CommitInfo, CorrelationKey, Issue, IssuePage, ProviderData, SessionStatus, WorkingTreeStatus,
+    Workspace,
 };
 pub use snapshot::{
     CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem,
@@ -249,6 +250,9 @@ mod tests {
                 category: "github".to_string(),
                 message: "rate limited".to_string(),
             }],
+            issue_total: None,
+            issue_has_more: false,
+            issue_search_results: None,
         };
         let msg = Message::Event {
             event: Box::new(DaemonEvent::Snapshot(Box::new(snapshot))),

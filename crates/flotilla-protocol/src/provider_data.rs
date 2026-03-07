@@ -79,6 +79,13 @@ pub struct Issue {
     pub association_keys: Vec<AssociationKey>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuePage {
+    pub issues: Vec<Issue>,
+    pub total_count: Option<u32>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudAgentSession {
     pub id: String,
