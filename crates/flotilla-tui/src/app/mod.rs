@@ -152,7 +152,7 @@ impl App {
             None => return,
         };
 
-        let old_providers = std::mem::replace(&mut rm.providers, Arc::new(snap.providers.clone()));
+        let old_providers = std::mem::replace(&mut rm.providers, Arc::new(snap.providers));
         rm.provider_health = snap.provider_health.clone();
         rm.loading = false;
 
@@ -163,7 +163,7 @@ impl App {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.sessions.section.clone(),
         };
-        let table_view = data::group_work_items(&snap.work_items, &snap.providers, &section_labels);
+        let table_view = data::group_work_items(&snap.work_items, &rm.providers, &section_labels);
 
         // Provider health -> model-level statuses
         for (kind, healthy) in &rm.provider_health {

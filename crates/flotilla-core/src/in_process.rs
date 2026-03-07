@@ -32,13 +32,6 @@ pub struct InProcessDaemon {
     repos: RwLock<HashMap<PathBuf, RepoState>>,
     repo_order: RwLock<Vec<PathBuf>>,
     event_tx: broadcast::Sender<DaemonEvent>,
-    poll_task: tokio::task::AbortHandle,
-}
-
-impl Drop for InProcessDaemon {
-    fn drop(&mut self) {
-        self.poll_task.abort();
-    }
 }
 
 impl InProcessDaemon {
@@ -70,28 +63,26 @@ impl InProcessDaemon {
             order.push(path);
         }
 
-        // Spawn poll loop first to get the AbortHandle, using a
-        // placeholder Arc that we'll replace via the channel.
-        let (arc_tx, arc_rx) = tokio::sync::oneshot::channel::<Arc<InProcessDaemon>>();
-        let poll_task = tokio::spawn(async move {
-            let d = arc_rx.await.expect("daemon Arc sender dropped");
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                d.poll_snapshots().await;
-            }
-        })
-        .abort_handle();
-
         let daemon = Arc::new(Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
             event_tx,
-            poll_task,
         });
 
-        let _ = arc_tx.send(daemon.clone());
+        // Spawn self-driving poll loop with a Weak reference.
+        // The loop exits naturally when all external Arc owners drop.
+        let weak = Arc::downgrade(&daemon);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match weak.upgrade() {
+                    Some(d) => d.poll_snapshots().await,
+                    None => break,
+                }
+            }
+        });
 
         daemon
     }
