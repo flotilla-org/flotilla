@@ -5,12 +5,12 @@ use flotilla_protocol::{Command, RepoLabels, WorkItem, WorkItemKind};
 pub enum Intent {
     SwitchToWorkspace,
     CreateWorkspace,
-    RemoveWorktree,
-    CreateWorktreeAndWorkspace,
+    RemoveCheckout,
+    CreateCheckoutAndWorkspace,
     GenerateBranchName,
-    OpenPr,
+    OpenChangeRequest,
     OpenIssue,
-    LinkIssuesToPr,
+    LinkIssuesToChangeRequest,
     TeleportSession,
     ArchiveSession,
 }
@@ -20,14 +20,14 @@ impl Intent {
         match self {
             Intent::SwitchToWorkspace => "Switch to workspace".into(),
             Intent::CreateWorkspace => "Create workspace".into(),
-            Intent::RemoveWorktree => format!("Remove {}", labels.checkouts.noun),
-            Intent::CreateWorktreeAndWorkspace => {
+            Intent::RemoveCheckout => format!("Remove {}", labels.checkouts.noun),
+            Intent::CreateCheckoutAndWorkspace => {
                 format!("Create {} + workspace", labels.checkouts.noun)
             }
             Intent::GenerateBranchName => "Generate branch name".into(),
-            Intent::OpenPr => format!("Open {} in browser", labels.code_review.noun),
+            Intent::OpenChangeRequest => format!("Open {} in browser", labels.code_review.noun),
             Intent::OpenIssue => "Open issue in browser".into(),
-            Intent::LinkIssuesToPr => format!("Link issues to {}", labels.code_review.noun),
+            Intent::LinkIssuesToChangeRequest => format!("Link issues to {}", labels.code_review.noun),
             Intent::TeleportSession => "Teleport session".into(),
             Intent::ArchiveSession => "Archive session".into(),
         }
@@ -39,15 +39,15 @@ impl Intent {
             Intent::CreateWorkspace => {
                 item.checkout_key().is_some() && item.workspace_refs.is_empty()
             }
-            Intent::RemoveWorktree => item.checkout_key().is_some() && !item.is_main_worktree,
-            Intent::CreateWorktreeAndWorkspace => {
+            Intent::RemoveCheckout => item.checkout_key().is_some() && !item.is_main_checkout,
+            Intent::CreateCheckoutAndWorkspace => {
                 item.checkout_key().is_none() && item.branch.is_some()
             }
             Intent::GenerateBranchName => item.branch.is_none() && !item.issue_keys.is_empty(),
-            Intent::OpenPr => item.pr_key.is_some(),
+            Intent::OpenChangeRequest => item.change_request_key.is_some(),
             Intent::OpenIssue => !item.issue_keys.is_empty(),
-            Intent::LinkIssuesToPr => {
-                item.pr_key.is_some()
+            Intent::LinkIssuesToChangeRequest => {
+                item.change_request_key.is_some()
                     && item.checkout_key().is_some()
                     && !item.issue_keys.is_empty()
             }
@@ -58,8 +58,8 @@ impl Intent {
 
     pub fn shortcut_hint(&self, labels: &RepoLabels) -> Option<String> {
         match self {
-            Intent::RemoveWorktree => Some(format!("d:remove {}", labels.checkouts.noun)),
-            Intent::OpenPr => Some(format!("p:show {}", labels.code_review.abbr)),
+            Intent::RemoveCheckout => Some(format!("d:remove {}", labels.checkouts.noun)),
+            Intent::OpenChangeRequest => Some(format!("p:show {}", labels.code_review.abbr)),
             _ => None,
         }
     }
@@ -75,24 +75,24 @@ impl Intent {
                         ws_ref: ws_ref.clone(),
                     })
             }
-            Intent::CreateWorkspace => item.checkout_key().map(|p| Command::SwitchWorktree {
-                path: p.to_path_buf(),
+            Intent::CreateWorkspace => item.checkout_key().map(|p| Command::CreateWorkspaceForCheckout {
+                checkout_path: p.to_path_buf(),
             }),
-            Intent::RemoveWorktree => {
-                if item.kind != WorkItemKind::Checkout || item.is_main_worktree {
+            Intent::RemoveCheckout => {
+                if item.kind != WorkItemKind::Checkout || item.is_main_checkout {
                     return None;
                 }
                 let branch = item.branch.as_ref()?.to_string();
-                let worktree_path = item.checkout_key().map(|p| p.to_path_buf());
-                let pr_number = item.pr_key.clone();
-                Some(Command::FetchDeleteInfo {
+                let checkout_path = item.checkout_key().map(|p| p.to_path_buf());
+                let change_request_id = item.change_request_key.clone();
+                Some(Command::FetchCheckoutStatus {
                     branch,
-                    worktree_path,
-                    pr_number,
+                    checkout_path,
+                    change_request_id,
                 })
             }
-            Intent::CreateWorktreeAndWorkspace => {
-                item.branch.as_ref().map(|branch| Command::CreateWorktree {
+            Intent::CreateCheckoutAndWorkspace => {
+                item.branch.as_ref().map(|branch| Command::CreateCheckout {
                     branch: branch.to_string(),
                     create_branch: item.kind != WorkItemKind::RemoteBranch
                         && item.kind != WorkItemKind::Pr,
@@ -108,16 +108,16 @@ impl Intent {
                     None
                 }
             }
-            Intent::OpenPr => item
-                .pr_key
+            Intent::OpenChangeRequest => item
+                .change_request_key
                 .as_ref()
-                .map(|k| Command::OpenPr { id: k.clone() }),
+                .map(|k| Command::OpenChangeRequest { id: k.clone() }),
             Intent::OpenIssue => item
                 .issue_keys
                 .first()
-                .map(|k| Command::OpenIssueBrowser { id: k.clone() }),
-            Intent::LinkIssuesToPr => {
-                let pr_key = item.pr_key.as_ref()?;
+                .map(|k| Command::OpenIssue { id: k.clone() }),
+            Intent::LinkIssuesToChangeRequest => {
+                let pr_key = item.change_request_key.as_ref()?;
                 let co_key = item.checkout_key()?;
                 let providers = &app.model.active().providers;
                 let cr = providers.change_requests.get(pr_key.as_str())?;
@@ -148,8 +148,8 @@ impl Intent {
                 if missing.is_empty() {
                     return None;
                 }
-                Some(Command::LinkIssuesToPr {
-                    pr_id: cr.id.clone(),
+                Some(Command::LinkIssuesToChangeRequest {
+                    change_request_id: cr.id.clone(),
                     issue_ids: missing,
                 })
             }
@@ -170,12 +170,12 @@ impl Intent {
         &[
             Intent::SwitchToWorkspace,
             Intent::CreateWorkspace,
-            Intent::RemoveWorktree,
-            Intent::CreateWorktreeAndWorkspace,
+            Intent::RemoveCheckout,
+            Intent::CreateCheckoutAndWorkspace,
             Intent::GenerateBranchName,
-            Intent::OpenPr,
+            Intent::OpenChangeRequest,
             Intent::OpenIssue,
-            Intent::LinkIssuesToPr,
+            Intent::LinkIssuesToChangeRequest,
             Intent::TeleportSession,
             Intent::ArchiveSession,
         ]
@@ -186,7 +186,7 @@ impl Intent {
             Intent::SwitchToWorkspace,
             Intent::TeleportSession,
             Intent::CreateWorkspace,
-            Intent::CreateWorktreeAndWorkspace,
+            Intent::CreateCheckoutAndWorkspace,
             Intent::GenerateBranchName,
         ]
     }

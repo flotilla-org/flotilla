@@ -8,7 +8,7 @@ use tui_input::Input;
 
 use super::intent::Intent;
 use flotilla_core::data::GroupedWorkItems;
-use flotilla_protocol::DeleteInfo;
+use flotilla_protocol::CheckoutStatus;
 use flotilla_protocol::WorkItemIdentity;
 
 #[derive(Clone)]
@@ -41,7 +41,7 @@ pub enum UiMode {
         selected: usize,
     },
     DeleteConfirm {
-        info: Option<DeleteInfo>,
+        info: Option<CheckoutStatus>,
         loading: bool,
     },
 }
