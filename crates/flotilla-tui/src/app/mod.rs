@@ -327,9 +327,11 @@ impl App {
             self.ui.mode = UiMode::Normal;
             self.model.active_repo = idx;
             let key = &self.model.repo_order[idx];
-            if let Some(rui) = self.ui.repo_ui.get_mut(key) {
-                rui.has_unseen_changes = false;
-            }
+            self.ui
+                .repo_ui
+                .get_mut(key)
+                .expect("active repo must have UI state")
+                .has_unseen_changes = false;
         }
     }
 
