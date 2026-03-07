@@ -153,3 +153,131 @@ impl UiState {
         &self.repo_ui[&repo_order[active_repo]]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── UiMode tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_config_returns_true_only_for_config_variant() {
+        let cases: Vec<(UiMode, bool)> = vec![
+            (UiMode::Normal, false),
+            (UiMode::Help, false),
+            (UiMode::Config, true),
+            (
+                UiMode::ActionMenu {
+                    items: vec![],
+                    index: 0,
+                },
+                false,
+            ),
+            (
+                UiMode::BranchInput {
+                    input: Input::default(),
+                    generating: false,
+                    pending_issue_ids: vec![],
+                },
+                false,
+            ),
+            (
+                UiMode::FilePicker {
+                    input: Input::default(),
+                    dir_entries: vec![],
+                    selected: 0,
+                },
+                false,
+            ),
+            (
+                UiMode::DeleteConfirm {
+                    info: None,
+                    loading: false,
+                },
+                false,
+            ),
+        ];
+        for (mode, expected) in &cases {
+            assert_eq!(mode.is_config(), *expected, "failed for mode variant");
+        }
+    }
+
+    #[test]
+    fn ui_mode_default_is_normal() {
+        assert!(matches!(UiMode::default(), UiMode::Normal));
+    }
+
+    // ── UiState::new tests ────────────────────────────────────────────
+
+    #[test]
+    fn new_with_empty_paths() {
+        let state = UiState::new(&[]);
+        assert!(state.repo_ui.is_empty());
+        assert!(matches!(state.mode, UiMode::Normal));
+        assert!(!state.show_debug);
+    }
+
+    #[test]
+    fn new_with_single_path_creates_one_repo() {
+        let paths = vec![PathBuf::from("/repo/a")];
+        let state = UiState::new(&paths);
+        assert_eq!(state.repo_ui.len(), 1);
+        assert!(state.repo_ui.contains_key(&PathBuf::from("/repo/a")));
+    }
+
+    #[test]
+    fn new_with_multiple_paths_creates_correct_count() {
+        let paths = vec![
+            PathBuf::from("/repo/a"),
+            PathBuf::from("/repo/b"),
+            PathBuf::from("/repo/c"),
+        ];
+        let state = UiState::new(&paths);
+        assert_eq!(state.repo_ui.len(), 3);
+        for p in &paths {
+            assert!(state.repo_ui.contains_key(p));
+        }
+    }
+
+    // ── active_repo_ui tests ──────────────────────────────────────────
+
+    #[test]
+    fn active_repo_ui_returns_repos_for_valid_indices() {
+        let paths = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b")];
+        let state = UiState::new(&paths);
+        for idx in 0..paths.len() {
+            let repo_ui = state.active_repo_ui(&paths, idx);
+            assert_eq!(repo_ui.selected_selectable_idx, None);
+            assert!(!repo_ui.has_unseen_changes);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn active_repo_ui_panics_on_out_of_bounds_index() {
+        let paths = vec![PathBuf::from("/repo/a")];
+        let state = UiState::new(&paths);
+        let _ = state.active_repo_ui(&paths, 5);
+    }
+
+    // ── RepoUiState default tests ─────────────────────────────────────
+
+    #[test]
+    fn repo_ui_state_default() {
+        let state = RepoUiState::default();
+        assert_eq!(state.selected_selectable_idx, None);
+        assert!(!state.has_unseen_changes);
+        assert!(state.multi_selected.is_empty());
+        assert!(!state.show_providers);
+    }
+
+    // ── EventLogUiState default tests ─────────────────────────────────
+
+    #[test]
+    fn event_log_ui_state_default_values() {
+        let state = EventLogUiState::default();
+        assert!(state.selected.is_none());
+        assert_eq!(state.count, 0);
+        assert_eq!(state.filter, tracing::Level::INFO);
+    }
+}

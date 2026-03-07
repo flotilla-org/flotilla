@@ -1,10 +1,16 @@
-use crate::providers::types::*;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
 use tracing::info;
 
-pub struct WtCheckoutManager;
+use crate::providers::types::*;
+use crate::providers::CommandRunner;
+
+pub struct WtCheckoutManager {
+    runner: Arc<dyn CommandRunner>,
+}
 
 #[derive(Debug, Deserialize)]
 struct WtWorktree {
@@ -90,17 +96,9 @@ impl WtWorktree {
     }
 }
 
-use crate::providers::run_cmd;
-
-impl Default for WtCheckoutManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WtCheckoutManager {
-    pub fn new() -> Self {
-        Self
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner }
     }
 
     /// Strip ANSI escape codes that `wt` may append after JSON output.
@@ -127,7 +125,10 @@ impl super::CheckoutManager for WtCheckoutManager {
     }
 
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String> {
-        let output = run_cmd("wt", &["list", "--format=json"], repo_root).await?;
+        let output = self
+            .runner
+            .run("wt", &["list", "--format=json"], repo_root)
+            .await?;
         let json = Self::strip_to_json(&output);
         let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let mut checkouts: Vec<Checkout> =
@@ -136,7 +137,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         // Enrich with issue links from git config
         let futures: Vec<_> = checkouts
             .iter()
-            .map(|co| super::read_branch_issue_links(repo_root, &co.branch))
+            .map(|co| super::read_branch_issue_links(repo_root, &co.branch, &*self.runner))
             .collect();
         let all_links = futures::future::join_all(futures).await;
         for (co, links) in checkouts.iter_mut().zip(all_links) {
@@ -154,13 +155,20 @@ impl super::CheckoutManager for WtCheckoutManager {
     ) -> Result<Checkout, String> {
         info!("wt: creating worktree for {branch} (create_branch={create_branch})");
         if create_branch {
-            run_cmd("wt", &["switch", "--create", branch, "--no-cd"], repo_root).await?;
+            self.runner
+                .run("wt", &["switch", "--create", branch, "--no-cd"], repo_root)
+                .await?;
         } else {
-            run_cmd("wt", &["switch", branch, "--no-cd", "--yes"], repo_root).await?;
+            self.runner
+                .run("wt", &["switch", branch, "--no-cd", "--yes"], repo_root)
+                .await?;
         }
 
         // Look up the path of the newly created worktree
-        let list_output = run_cmd("wt", &["list", "--format=json"], repo_root).await?;
+        let list_output = self
+            .runner
+            .run("wt", &["list", "--format=json"], repo_root)
+            .await?;
         let json = Self::strip_to_json(&list_output);
         let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
 
@@ -176,7 +184,9 @@ impl super::CheckoutManager for WtCheckoutManager {
 
     async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String> {
         info!("wt: removing worktree {branch}");
-        run_cmd("wt", &["remove", branch], repo_root).await?;
+        self.runner
+            .run("wt", &["remove", branch], repo_root)
+            .await?;
         Ok(())
     }
 }

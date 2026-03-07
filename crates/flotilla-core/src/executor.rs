@@ -11,6 +11,7 @@ use tracing::{debug, error, info};
 use crate::provider_data::ProviderData;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::WorkspaceConfig;
+use crate::providers::CommandRunner;
 use crate::{data, providers};
 
 /// Execute a `Command` against the given repo context.
@@ -22,6 +23,7 @@ pub async fn execute(
     repo_root: &Path,
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
+    runner: &dyn CommandRunner,
 ) -> CommandResult {
     match cmd {
         Command::CreateWorkspaceForCheckout { checkout_path } => {
@@ -66,7 +68,7 @@ pub async fn execute(
                 Some(Ok(checkout)) => {
                     // Write issue links to git config
                     if !issue_ids.is_empty() {
-                        write_branch_issue_links(repo_root, &branch, &issue_ids).await;
+                        write_branch_issue_links(repo_root, &branch, &issue_ids, runner).await;
                     }
                     info!("created checkout at {}", checkout.path.display());
                     // Create workspace if manager available
@@ -118,6 +120,7 @@ pub async fn execute(
                 checkout_path.as_deref(),
                 change_request_id.as_deref(),
                 repo_root,
+                runner,
             )
             .await;
             CommandResult::CheckoutStatus(info)
@@ -147,20 +150,21 @@ pub async fn execute(
                 "linking issues {:?} to change request #{change_request_id}",
                 issue_ids
             );
-            let body_result = providers::run_cmd(
-                "gh",
-                &[
-                    "pr",
-                    "view",
-                    &change_request_id,
-                    "--json",
-                    "body",
-                    "--jq",
-                    ".body",
-                ],
-                repo_root,
-            )
-            .await;
+            let body_result = runner
+                .run(
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        &change_request_id,
+                        "--json",
+                        "body",
+                        "--jq",
+                        ".body",
+                    ],
+                    repo_root,
+                )
+                .await;
             match body_result {
                 Ok(current_body) => {
                     let fixes_lines: Vec<String> =
@@ -170,12 +174,13 @@ pub async fn execute(
                     } else {
                         format!("{}\n\n{}", current_body.trim(), fixes_lines.join("\n"))
                     };
-                    let result = providers::run_cmd(
-                        "gh",
-                        &["pr", "edit", &change_request_id, "--body", &new_body],
-                        repo_root,
-                    )
-                    .await;
+                    let result = runner
+                        .run(
+                            "gh",
+                            &["pr", "edit", &change_request_id, "--body", &new_body],
+                            repo_root,
+                        )
+                        .await;
                     match result {
                         Ok(_) => {
                             info!("linked issues to change request #{change_request_id}");
@@ -280,7 +285,7 @@ pub async fn execute(
             checkout_key,
         } => {
             info!("teleporting to session {session_id}");
-            let claude_bin = providers::resolve_claude_path()
+            let claude_bin = providers::resolve_claude_path(runner)
                 .await
                 .unwrap_or_else(|| "claude".into());
             let teleport_cmd = format!("{} --teleport {}", claude_bin, session_id);
@@ -347,7 +352,12 @@ pub(crate) fn workspace_config(
 }
 
 /// Write branch-to-issue links into git config.
-async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)]) {
+async fn write_branch_issue_links(
+    repo_root: &Path,
+    branch: &str,
+    issue_ids: &[(String, String)],
+    runner: &dyn CommandRunner,
+) {
     use std::collections::HashMap;
     let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
     for (provider, id) in issue_ids {
@@ -359,7 +369,10 @@ async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(
     for (provider, ids) in by_provider {
         let key = format!("branch.{branch}.flotilla.issues.{provider}");
         let value = ids.join(",");
-        if let Err(e) = providers::run_cmd("git", &["config", &key, &value], repo_root).await {
+        if let Err(e) = runner
+            .run("git", &["config", &key, &value], repo_root)
+            .await
+        {
             tracing::warn!("failed to write issue link: {e}");
         }
     }

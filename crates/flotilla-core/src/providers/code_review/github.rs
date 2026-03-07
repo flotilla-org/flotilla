@@ -1,5 +1,6 @@
 use crate::providers::github_api::{clamp_per_page, GhApiClient};
 use crate::providers::types::*;
+use crate::providers::CommandRunner;
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ pub struct GitHubCodeReview {
     provider_name: String,
     repo_slug: String,
     api: Arc<GhApiClient>,
+    runner: Arc<dyn CommandRunner>,
 }
 
 #[derive(Debug)]
@@ -20,14 +22,18 @@ struct GhPr {
     is_draft: bool,
 }
 
-use crate::providers::run_cmd;
-
 impl GitHubCodeReview {
-    pub fn new(provider_name: String, repo_slug: String, api: Arc<GhApiClient>) -> Self {
+    pub fn new(
+        provider_name: String,
+        repo_slug: String,
+        api: Arc<GhApiClient>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Self {
         Self {
             provider_name,
             repo_slug,
             api,
+            runner,
         }
     }
 
@@ -185,7 +191,9 @@ impl super::CodeReview for GitHubCodeReview {
     }
 
     async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        run_cmd("gh", &["pr", "view", id, "--web"], repo_root).await?;
+        self.runner
+            .run("gh", &["pr", "view", id, "--web"], repo_root)
+            .await?;
         Ok(())
     }
 

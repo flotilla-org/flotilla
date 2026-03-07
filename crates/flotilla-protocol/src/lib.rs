@@ -2,6 +2,29 @@ pub mod commands;
 pub mod provider_data;
 pub mod snapshot;
 
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
+    /// Assert JSON roundtrip via re-serialization (for types without PartialEq).
+    pub fn assert_json_roundtrip<T: Serialize + DeserializeOwned + std::fmt::Debug>(value: &T) {
+        let json = serde_json::to_string(value).expect("serialize");
+        let decoded: T = serde_json::from_str(&json).expect("deserialize");
+        let json2 = serde_json::to_string(&decoded).expect("re-serialize");
+        assert_eq!(json2, json, "JSON roundtrip mismatch");
+    }
+
+    /// Assert JSON roundtrip via PartialEq (for types that derive it).
+    pub fn assert_roundtrip<T: Serialize + DeserializeOwned + std::fmt::Debug + PartialEq>(
+        value: &T,
+    ) {
+        let json = serde_json::to_string(value).expect("serialize");
+        let decoded: T = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, *value);
+    }
+}
+
 use serde::{Deserialize, Serialize};
 
 pub use commands::{CheckoutStatus, Command, CommandResult};
@@ -241,8 +264,8 @@ mod tests {
                     assert_eq!(snap.work_items.len(), 1);
                     assert_eq!(snap.work_items[0].branch.as_deref(), Some("feature-x"));
                     assert_eq!(snap.work_items[0].kind, WorkItemKind::Checkout);
-                    assert_eq!(snap.provider_health["git"], true);
-                    assert_eq!(snap.provider_health["github"], false);
+                    assert!(snap.provider_health["git"]);
+                    assert!(!snap.provider_health["github"]);
                     assert_eq!(snap.errors.len(), 1);
                     assert_eq!(snap.errors[0].category, "github");
                 }
@@ -250,92 +273,6 @@ mod tests {
             },
             other => panic!("expected Event, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn command_result_variants_roundtrip() {
-        let variants = vec![
-            CommandResult::Ok,
-            CommandResult::CheckoutCreated {
-                branch: "feat-abc".to_string(),
-            },
-            CommandResult::BranchNameGenerated {
-                name: "feat/cool-thing".to_string(),
-                issue_ids: vec![
-                    ("github".to_string(), "42".to_string()),
-                    ("linear".to_string(), "ABC-123".to_string()),
-                ],
-            },
-            CommandResult::CheckoutStatus(CheckoutStatus {
-                branch: "old-branch".to_string(),
-                change_request_status: Some("merged".to_string()),
-                merge_commit_sha: Some("abc123".to_string()),
-                unpushed_commits: vec!["def456".to_string()],
-                has_uncommitted: false,
-                base_detection_warning: None,
-            }),
-            CommandResult::Error {
-                message: "something went wrong".to_string(),
-            },
-        ];
-
-        for variant in &variants {
-            let json = serde_json::to_string(variant).expect("serialize");
-            let deserialized: CommandResult = serde_json::from_str(&json).expect("deserialize");
-            // Verify by re-serializing and comparing JSON
-            let json2 = serde_json::to_string(&deserialized).expect("re-serialize");
-            assert_eq!(json, json2, "roundtrip mismatch for variant");
-        }
-
-        // Also spot-check specific fields
-        if let CommandResult::CheckoutCreated { branch } = &variants[1] {
-            assert_eq!(branch, "feat-abc");
-        }
-        if let CommandResult::CheckoutStatus(info) = &variants[3] {
-            assert_eq!(info.branch, "old-branch");
-            assert_eq!(info.change_request_status.as_deref(), Some("merged"));
-            assert!(!info.has_uncommitted);
-        }
-    }
-
-    #[test]
-    fn work_item_roundtrip() {
-        let item = WorkItem {
-            kind: WorkItemKind::Checkout,
-            identity: WorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1")),
-            branch: Some("feature-login".to_string()),
-            description: "Implement login flow".to_string(),
-            checkout: Some(CheckoutRef {
-                key: PathBuf::from("/repos/my-project/wt-1"),
-                is_main_checkout: false,
-            }),
-            change_request_key: Some("PR#55".to_string()),
-            session_key: Some("sess-abc".to_string()),
-            issue_keys: vec!["GH-10".to_string(), "LIN-20".to_string()],
-            workspace_refs: vec!["cmux-1".to_string()],
-            is_main_checkout: false,
-            debug_group: vec!["2 correlated items".to_string()],
-        };
-
-        let json = serde_json::to_string(&item).expect("serialize");
-        let deserialized: WorkItem = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(deserialized.kind, WorkItemKind::Checkout);
-        assert_eq!(
-            deserialized.identity,
-            WorkItemIdentity::Checkout(PathBuf::from("/repos/my-project/wt-1"))
-        );
-        assert_eq!(deserialized.branch.as_deref(), Some("feature-login"));
-        assert_eq!(deserialized.description, "Implement login flow");
-        assert!(deserialized.checkout.is_some());
-        let checkout = deserialized.checkout.unwrap();
-        assert_eq!(checkout.key, PathBuf::from("/repos/my-project/wt-1"));
-        assert!(!checkout.is_main_checkout);
-        assert_eq!(deserialized.change_request_key.as_deref(), Some("PR#55"));
-        assert_eq!(deserialized.session_key.as_deref(), Some("sess-abc"));
-        assert_eq!(deserialized.issue_keys, vec!["GH-10", "LIN-20"]);
-        assert_eq!(deserialized.workspace_refs, vec!["cmux-1"]);
-        assert!(!deserialized.is_main_checkout);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::convert::snapshot_to_proto;
 use crate::daemon::DaemonHandle;
 use crate::executor;
 use crate::model::{provider_names_from_registry, repo_name, RepoModel};
+use crate::providers::CommandRunner;
 use crate::refresh::RefreshSnapshot;
 
 struct RepoState {
@@ -32,6 +33,7 @@ pub struct InProcessDaemon {
     repos: RwLock<HashMap<PathBuf, RepoState>>,
     repo_order: RwLock<Vec<PathBuf>>,
     event_tx: broadcast::Sender<DaemonEvent>,
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl InProcessDaemon {
@@ -42,6 +44,7 @@ impl InProcessDaemon {
     /// snapshots and broadcasts `DaemonEvent::Snapshot` for each change.
     pub async fn new(repo_paths: Vec<PathBuf>) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let mut repos = HashMap::new();
         let mut order = Vec::new();
 
@@ -49,7 +52,8 @@ impl InProcessDaemon {
             if repos.contains_key(&path) {
                 continue;
             }
-            let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
+            let (registry, repo_slug) =
+                crate::providers::discovery::detect_providers(&path, Arc::clone(&runner)).await;
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
             repos.insert(
@@ -67,6 +71,7 @@ impl InProcessDaemon {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
             event_tx,
+            runner,
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -194,6 +199,7 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn execute(&self, repo: &Path, command: Command) -> Result<CommandResult, String> {
         // Extract the data we need under a read lock, then drop it before the async work
+        let runner = Arc::clone(&self.runner);
         let (registry, providers_data, repo_root) = {
             let repos = self.repos.read().await;
             let state = repos
@@ -206,7 +212,8 @@ impl DaemonHandle for InProcessDaemon {
             )
         };
 
-        let result = executor::execute(command, &repo_root, &registry, &providers_data).await;
+        let result =
+            executor::execute(command, &repo_root, &registry, &providers_data, &*runner).await;
 
         // Trigger a refresh after command execution
         {
@@ -240,7 +247,8 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let (registry, repo_slug) = crate::providers::discovery::detect_providers(&path).await;
+        let (registry, repo_slug) =
+            crate::providers::discovery::detect_providers(&path, Arc::clone(&self.runner)).await;
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
         model.data.loading = true;
 

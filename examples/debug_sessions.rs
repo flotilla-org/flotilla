@@ -6,6 +6,7 @@ use flotilla_core::convert::correlation_result_to_work_item;
 use flotilla_core::data;
 use flotilla_core::providers::discovery::detect_providers;
 use flotilla_core::providers::types::RepoCriteria;
+use flotilla_core::providers::{CommandRunner, ProcessCommandRunner};
 use flotilla_core::refresh::RepoRefreshHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +24,8 @@ async fn main() {
 
     // Step 1: Build registry (same as app startup)
     println!("\n=== Step 1: Build ProviderRegistry ===");
-    let (registry, repo_slug) = detect_providers(&repo_root).await;
+    let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
+    let (registry, repo_slug) = detect_providers(&repo_root, runner).await;
     println!("  checkout_managers: {}", registry.checkout_managers.len());
     println!("  code_review: {}", registry.code_review.len());
     println!("  issue_trackers: {}", registry.issue_trackers.len());

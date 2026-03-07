@@ -2,9 +2,12 @@ pub mod git;
 pub mod git_worktree;
 pub mod wt;
 
-use crate::providers::types::*;
-use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+
+use crate::providers::types::*;
+use crate::providers::CommandRunner;
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
@@ -130,13 +133,18 @@ pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
 
 /// Read issue links from git config for a specific branch.
 /// Returns empty vec if no links or on error (non-fatal).
-pub async fn read_branch_issue_links(repo_root: &Path, branch: &str) -> Vec<AssociationKey> {
+pub async fn read_branch_issue_links(
+    repo_root: &Path,
+    branch: &str,
+    runner: &dyn CommandRunner,
+) -> Vec<AssociationKey> {
     let pattern = format!(
         "branch\\.{}\\.flotilla\\.issues\\.",
         regex_escape_branch(branch)
     );
-    let result =
-        crate::providers::run_cmd("git", &["config", "--get-regexp", &pattern], repo_root).await;
+    let result = runner
+        .run("git", &["config", "--get-regexp", &pattern], repo_root)
+        .await;
     match result {
         Ok(output) => parse_issue_config_output(&output),
         Err(_) => Vec::new(),

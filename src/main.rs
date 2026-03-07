@@ -461,6 +461,7 @@ fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     use flotilla_core::providers::vcs::git::GitVcs;
     use flotilla_core::providers::vcs::Vcs;
+    use flotilla_core::providers::ProcessCommandRunner;
 
     let mut repo_roots: Vec<PathBuf> = Vec::new();
 
@@ -494,7 +495,7 @@ fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     // 3. Auto-detect from cwd — resolve to main repo root (not worktree)
     let cwd = std::env::current_dir().ok();
     if let Some(ref cwd) = cwd {
-        let git = GitVcs::new();
+        let git = GitVcs::new(Arc::new(ProcessCommandRunner));
         if let Some(repo_root) = git.resolve_repo_root(cwd) {
             if !repo_roots.contains(&repo_root) {
                 repo_roots.push(repo_root);
