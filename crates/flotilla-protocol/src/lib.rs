@@ -49,9 +49,75 @@ pub enum Message {
         params: serde_json::Value,
     },
     #[serde(rename = "response")]
-    Response { id: u64, result: CommandResult },
+    Response {
+        id: u64,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     #[serde(rename = "event")]
     Event { event: Box<DaemonEvent> },
+}
+
+/// Parsed response from the wire — before type-specific deserialization.
+#[derive(Debug)]
+pub struct RawResponse {
+    pub ok: bool,
+    pub data: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+impl RawResponse {
+    /// Parse the data payload into the expected type.
+    pub fn parse<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        if !self.ok {
+            return Err(self.error.unwrap_or_else(|| "unknown error".into()));
+        }
+        let data = self.data.ok_or("response missing data field")?;
+        serde_json::from_value(data).map_err(|e| format!("failed to parse response: {e}"))
+    }
+
+    /// Parse a response with no data payload (refresh, add_repo, remove_repo).
+    pub fn parse_empty(self) -> Result<(), String> {
+        if !self.ok {
+            return Err(self.error.unwrap_or_else(|| "unknown error".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Message {
+    /// Build a success response with a serializable payload.
+    pub fn ok_response<T: serde::Serialize>(id: u64, data: &T) -> Self {
+        Message::Response {
+            id,
+            ok: true,
+            data: Some(serde_json::to_value(data).expect("response data must be serializable")),
+            error: None,
+        }
+    }
+
+    /// Build a success response with no payload.
+    pub fn empty_ok_response(id: u64) -> Self {
+        Message::Response {
+            id,
+            ok: true,
+            data: None,
+            error: None,
+        }
+    }
+
+    /// Build an error response.
+    pub fn error_response(id: u64, message: impl Into<String>) -> Self {
+        Message::Response {
+            id,
+            ok: false,
+            data: None,
+            error: Some(message.into()),
+        }
+    }
 }
 
 /// Events pushed from daemon to subscribed clients.
@@ -96,6 +162,61 @@ mod tests {
             }
             other => panic!("expected Request, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn message_response_roundtrip() {
+        // ok=true with data
+        let msg = Message::Response {
+            id: 1,
+            ok: true,
+            data: Some(serde_json::json!({"count": 42})),
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 1);
+                assert!(ok);
+                assert_eq!(data.unwrap()["count"], 42);
+                assert!(error.is_none());
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+        // error=None should not appear in JSON
+        assert!(!json.contains("error"));
+
+        // ok=false with error
+        let msg = Message::Response {
+            id: 2,
+            ok: false,
+            data: None,
+            error: Some("not found".to_string()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 2);
+                assert!(!ok);
+                assert!(data.is_none());
+                assert_eq!(error.as_deref(), Some("not found"));
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+        // data=None should not appear in JSON
+        assert!(!json.contains("data"));
     }
 
     #[test]
@@ -151,6 +272,66 @@ mod tests {
                 other => panic!("expected Snapshot event, got {:?}", other),
             },
             other => panic!("expected Event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ok_response_builds_with_serialized_data() {
+        let data = serde_json::json!({"count": 42, "name": "test"});
+        let msg = Message::ok_response(7, &data);
+        match msg {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 7);
+                assert!(ok);
+                let d = data.expect("should have data");
+                assert_eq!(d["count"], 42);
+                assert_eq!(d["name"], "test");
+                assert!(error.is_none());
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn empty_ok_response_builds_with_no_data() {
+        let msg = Message::empty_ok_response(99);
+        match msg {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 99);
+                assert!(ok);
+                assert!(data.is_none());
+                assert!(error.is_none());
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_response_builds_with_error_message() {
+        let msg = Message::error_response(5, "something went wrong");
+        match msg {
+            Message::Response {
+                id,
+                ok,
+                data,
+                error,
+            } => {
+                assert_eq!(id, 5);
+                assert!(!ok);
+                assert!(data.is_none());
+                assert_eq!(error.as_deref(), Some("something went wrong"));
+            }
+            other => panic!("expected Response, got {:?}", other),
         }
     }
 }

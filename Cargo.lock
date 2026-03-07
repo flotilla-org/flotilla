@@ -1027,12 +1027,16 @@ dependencies = [
  "color-eyre",
  "crossterm 0.28.1",
  "flotilla-core",
+ "flotilla-daemon",
  "flotilla-tui",
  "image",
+ "libc",
  "ratatui 0.30.0",
  "ratatui-image",
+ "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tui-input",
 ]
 
@@ -1060,6 +1064,17 @@ dependencies = [
 [[package]]
 name = "flotilla-daemon"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flotilla-core",
+ "flotilla-protocol",
+ "flotilla-tui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "flotilla-protocol"
@@ -1084,6 +1099,8 @@ dependencies = [
  "image",
  "ratatui 0.30.0",
  "ratatui-image",
+ "serde",
+ "serde_json",
  "time",
  "tokio",
  "tracing",

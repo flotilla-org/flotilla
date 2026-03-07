@@ -80,10 +80,15 @@ struct RepoConfig {
     path: String,
 }
 
-fn config_dir() -> PathBuf {
+/// Base flotilla config directory. Defaults to ~/.config/flotilla/.
+pub fn flotilla_config_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla/repos")
+        .join(".config/flotilla")
+}
+
+fn config_dir() -> PathBuf {
+    flotilla_config_dir().join("repos")
 }
 
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
@@ -146,9 +151,7 @@ pub fn remove_repo(path: &Path) {
 }
 
 fn tab_order_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla/tab-order.json")
+    flotilla_config_dir().join("tab-order.json")
 }
 
 /// Load persisted tab order. Returns None if file doesn't exist or is invalid.
@@ -160,10 +163,7 @@ pub fn load_tab_order() -> Option<Vec<PathBuf>> {
 
 /// Save tab order to disk.
 pub fn save_tab_order(order: &[PathBuf]) {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla");
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(flotilla_config_dir());
     let paths: Vec<&str> = order.iter().filter_map(|p| p.to_str()).collect();
     if let Ok(content) = serde_json::to_string_pretty(&paths) {
         let _ = std::fs::write(tab_order_file(), content);
@@ -172,9 +172,7 @@ pub fn save_tab_order(order: &[PathBuf]) {
 
 /// Load global flotilla config from ~/.config/flotilla/config.toml.
 pub fn load_config() -> FlotillaConfig {
-    let path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla/config.toml");
+    let path = flotilla_config_dir().join("config.toml");
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|content| {
