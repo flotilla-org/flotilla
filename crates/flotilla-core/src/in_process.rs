@@ -155,7 +155,15 @@ impl DaemonHandle for InProcessDaemon {
         let state = repos
             .get(repo)
             .ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-        let snapshot = snapshot_to_proto(repo, state.seq, &state.last_snapshot);
+        let mut snapshot = snapshot_to_proto(repo, state.seq, &state.last_snapshot);
+        // Use the model's suppressed health map (consistent with broadcast path)
+        snapshot.provider_health = state
+            .model
+            .data
+            .provider_health
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
         Ok(snapshot)
     }
 

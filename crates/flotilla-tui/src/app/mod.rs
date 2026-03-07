@@ -290,9 +290,11 @@ impl App {
         self.model.repos.remove(&path);
         self.model.repo_order.retain(|p| p != &path);
         self.ui.repo_ui.remove(&path);
-        if self.model.active_repo >= self.model.repo_order.len()
-            && !self.model.repo_order.is_empty()
-        {
+        if self.model.repo_order.is_empty() {
+            self.should_quit = true;
+            return;
+        }
+        if self.model.active_repo >= self.model.repo_order.len() {
             self.model.active_repo = self.model.repo_order.len() - 1;
         }
     }

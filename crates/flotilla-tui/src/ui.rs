@@ -137,7 +137,7 @@ fn render_status_bar(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Re
             if rui.show_providers {
                 " c:close providers  [/]:switch tab  ?:help  q:quit".into()
             } else if !rui.multi_selected.is_empty() {
-                " enter:create branch  shift+enter:toggle  esc:clear  ?:help  q:quit".into()
+                " enter:create branch  space:toggle  esc:clear  ?:help  q:quit".into()
             } else {
                 let mut s = " enter:open".to_string();
                 if let Some(item) = selected_work_item(model, ui) {
@@ -151,7 +151,7 @@ fn render_status_bar(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Re
                         }
                     }
                 }
-                s.push_str("  space:menu  n:new  r:refresh  shift+enter:select  ?:help  q:quit");
+                s.push_str("  .:menu  n:new  r:refresh  space:select  ?:help  q:quit");
                 s
             }
         }
