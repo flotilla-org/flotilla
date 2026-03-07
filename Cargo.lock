@@ -1074,6 +1074,7 @@ dependencies = [
 name = "flotilla-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "color-eyre",
  "crossterm 0.28.1",
  "dirs",

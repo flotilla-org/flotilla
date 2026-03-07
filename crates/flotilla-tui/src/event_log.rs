@@ -261,3 +261,312 @@ pub fn init() {
         .with(TuiLayer)
         .init();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::Level;
+
+    // ── LevelExt: filter_label ──────────────────────────────────────────
+
+    #[test]
+    fn filter_label_all_variants() {
+        let cases = [
+            (Level::ERROR, "ERROR"),
+            (Level::WARN, "WARN"),
+            (Level::INFO, "INFO"),
+            (Level::DEBUG, "DEBUG"),
+            (Level::TRACE, "TRACE"),
+        ];
+        for (level, expected) in &cases {
+            assert_eq!(
+                level.filter_label(),
+                *expected,
+                "filter_label for {level:?}"
+            );
+        }
+    }
+
+    // ── LevelExt: cycle ─────────────────────────────────────────────────
+
+    #[test]
+    fn cycle_all_variants() {
+        let cases = [
+            (Level::ERROR, Level::WARN),
+            (Level::WARN, Level::INFO),
+            (Level::INFO, Level::DEBUG),
+            (Level::DEBUG, Level::TRACE),
+            (Level::TRACE, Level::ERROR),
+        ];
+        for (input, expected) in &cases {
+            assert_eq!(input.cycle(), *expected, "cycle for {input:?}");
+        }
+    }
+
+    #[test]
+    fn cycle_full_loop_returns_to_start() {
+        let start = Level::ERROR;
+        let result = start.cycle().cycle().cycle().cycle().cycle();
+        assert_eq!(result, start);
+    }
+
+    // ── LevelExt: includes ──────────────────────────────────────────────
+
+    #[test]
+    fn includes_all_variants() {
+        // (filter_level, entry_level, expected)
+        let cases: &[(Level, &[Level], &[Level])] = &[
+            (
+                Level::ERROR,
+                &[Level::ERROR],
+                &[Level::WARN, Level::INFO, Level::DEBUG, Level::TRACE],
+            ),
+            (
+                Level::WARN,
+                &[Level::ERROR, Level::WARN],
+                &[Level::INFO, Level::DEBUG, Level::TRACE],
+            ),
+            (
+                Level::INFO,
+                &[Level::ERROR, Level::WARN, Level::INFO],
+                &[Level::DEBUG, Level::TRACE],
+            ),
+            (
+                Level::DEBUG,
+                &[Level::ERROR, Level::WARN, Level::INFO, Level::DEBUG],
+                &[Level::TRACE],
+            ),
+            (
+                Level::TRACE,
+                &[
+                    Level::ERROR,
+                    Level::WARN,
+                    Level::INFO,
+                    Level::DEBUG,
+                    Level::TRACE,
+                ],
+                &[],
+            ),
+        ];
+        for (filter, included, excluded) in cases {
+            for entry_level in *included {
+                assert!(
+                    filter.includes(entry_level),
+                    "{filter:?} should include {entry_level:?}"
+                );
+            }
+            for entry_level in *excluded {
+                assert!(
+                    !filter.includes(entry_level),
+                    "{filter:?} should exclude {entry_level:?}"
+                );
+            }
+        }
+    }
+
+    // ── capacity_for ────────────────────────────────────────────────────
+
+    #[test]
+    fn capacity_for_all_variants() {
+        let cases = [
+            (Level::ERROR, 100),
+            (Level::WARN, 100),
+            (Level::INFO, 200),
+            (Level::DEBUG, 300),
+            (Level::TRACE, 300),
+        ];
+        for (level, expected) in &cases {
+            assert_eq!(capacity_for(level), *expected, "capacity_for {level:?}");
+        }
+    }
+
+    // ── LevelBucket ─────────────────────────────────────────────────────
+
+    fn make_entry(seq: u64, level: Level, msg: &str) -> LogEntry {
+        LogEntry {
+            seq,
+            hms: (12, 0, 0),
+            level,
+            message: msg.to_string(),
+        }
+    }
+
+    fn snapshot_messages(snap: &[DisplayEntry]) -> Vec<&str> {
+        snap.iter()
+            .filter_map(|e| match e {
+                DisplayEntry::Log(entry) => Some(entry.message.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bucket_push_within_capacity_preserves_all() {
+        let mut bucket = LevelBucket::new(5);
+        for i in 0..5 {
+            bucket.push(make_entry(i, Level::INFO, &format!("msg{i}")));
+        }
+        assert_eq!(bucket.entries.len(), 5);
+        assert_eq!(bucket.entries[0].seq, 0);
+        assert_eq!(bucket.entries[4].seq, 4);
+    }
+
+    #[test]
+    fn bucket_push_beyond_capacity_evicts_oldest() {
+        let mut bucket = LevelBucket::new(3);
+        for i in 0..5 {
+            bucket.push(make_entry(i, Level::INFO, &format!("msg{i}")));
+        }
+        assert_eq!(bucket.entries.len(), 3);
+        // oldest two (seq 0, 1) should be evicted
+        assert_eq!(bucket.entries[0].seq, 2);
+        assert_eq!(bucket.entries[1].seq, 3);
+        assert_eq!(bucket.entries[2].seq, 4);
+    }
+
+    // ── EventLog ────────────────────────────────────────────────────────
+
+    #[test]
+    fn event_log_new_starts_empty() {
+        let log = EventLog::new();
+        assert_eq!(log.next_seq, 0);
+        assert_eq!(log.error.entries.len(), 0);
+        assert_eq!(log.warn.entries.len(), 0);
+        assert_eq!(log.info.entries.len(), 0);
+        assert_eq!(log.debug.entries.len(), 0);
+        assert_eq!(log.trace.entries.len(), 0);
+    }
+
+    #[test]
+    fn event_log_push_routes_to_buckets_and_increments_sequence() {
+        let mut log = EventLog::new();
+        log.push(Level::ERROR, "e".into());
+        log.push(Level::WARN, "w".into());
+        log.push(Level::INFO, "i".into());
+        log.push(Level::DEBUG, "d".into());
+        log.push(Level::TRACE, "t".into());
+
+        assert_eq!(log.error.entries.len(), 1);
+        assert_eq!(log.warn.entries.len(), 1);
+        assert_eq!(log.info.entries.len(), 1);
+        assert_eq!(log.debug.entries.len(), 1);
+        assert_eq!(log.trace.entries.len(), 1);
+
+        assert_eq!(log.error.entries[0].message, "e");
+        assert_eq!(log.warn.entries[0].message, "w");
+        assert_eq!(log.info.entries[0].message, "i");
+        assert_eq!(log.debug.entries[0].message, "d");
+        assert_eq!(log.trace.entries[0].message, "t");
+
+        assert_eq!(log.warn.entries[0].level, Level::WARN);
+        assert_eq!(log.error.entries[0].seq, 0);
+        assert_eq!(log.trace.entries[0].seq, 4);
+        assert_eq!(log.next_seq, 5);
+    }
+
+    // ── EventLog::snapshot ──────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_empty_log_produces_empty_vec() {
+        let log = EventLog::new();
+        let snap = log.snapshot(&Level::TRACE);
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn snapshot_single_level_returns_entries_in_order_without_markers() {
+        let mut log = EventLog::new();
+        log.push(Level::INFO, "first".into());
+        log.push(Level::INFO, "second".into());
+        log.push(Level::INFO, "third".into());
+
+        let snap = log.snapshot(&Level::INFO);
+        assert_eq!(snapshot_messages(&snap), vec!["first", "second", "third"]);
+        assert!(snap
+            .iter()
+            .all(|entry| !matches!(entry, DisplayEntry::RetentionMarker(_))));
+    }
+
+    #[test]
+    fn snapshot_respects_filter_level() {
+        let mut log = EventLog::new();
+        log.push(Level::ERROR, "error".into());
+        log.push(Level::WARN, "warn".into());
+        log.push(Level::INFO, "info".into());
+        log.push(Level::DEBUG, "debug".into());
+        log.push(Level::TRACE, "trace".into());
+
+        // ERROR filter: only ERROR
+        let snap = log.snapshot(&Level::ERROR);
+        assert_eq!(snapshot_messages(&snap), vec!["error"]);
+
+        // WARN filter: ERROR + WARN
+        let snap = log.snapshot(&Level::WARN);
+        assert_eq!(snapshot_messages(&snap), vec!["error", "warn"]);
+
+        // TRACE filter: all
+        let snap = log.snapshot(&Level::TRACE);
+        let log_count = snap
+            .iter()
+            .filter(|e| matches!(e, DisplayEntry::Log(_)))
+            .count();
+        assert_eq!(log_count, 5);
+    }
+
+    #[test]
+    fn snapshot_retention_marker_when_bucket_has_evicted() {
+        let mut log = EventLog::new();
+        // Push one INFO entry with a low seq.
+        log.push(Level::INFO, "early_info".into()); // seq 0
+
+        // Now push 101 ERROR entries (seq 1..101), causing eviction of seq 1.
+        for i in 0..101 {
+            log.push(Level::ERROR, format!("error_{i}"));
+        }
+        // Error bucket now holds seq 2..101 (100 entries), oldest is seq 2.
+        // Info bucket holds seq 0.
+        // Global min is seq 0 (from info).
+        // Error's oldest (seq 2) > global min (0), so a RetentionMarker for ERROR.
+
+        let snap = log.snapshot(&Level::TRACE);
+        let markers: Vec<&tracing::Level> = snap
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::RetentionMarker(level) => Some(level),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            markers.contains(&&Level::ERROR),
+            "Expected a retention marker for ERROR level"
+        );
+    }
+
+    #[test]
+    fn snapshot_mixed_levels_interleaves_entries_by_sequence() {
+        let mut log = EventLog::new();
+        log.push(Level::ERROR, "e1".into()); // seq 0
+        log.push(Level::INFO, "i1".into()); // seq 1
+        log.push(Level::ERROR, "e2".into()); // seq 2
+        log.push(Level::DEBUG, "d1".into()); // seq 3
+        log.push(Level::INFO, "i2".into()); // seq 4
+
+        let snap = log.snapshot(&Level::TRACE);
+        assert_eq!(snapshot_messages(&snap), vec!["e1", "i1", "e2", "d1", "i2"]);
+    }
+
+    // ── EventLog capacity integration ───────────────────────────────────
+
+    #[test]
+    fn event_log_ring_buffer_eviction_integration() {
+        let mut log = EventLog::new();
+        // Push 101 error entries (capacity 100)
+        for i in 0..101u64 {
+            log.push(Level::ERROR, format!("err_{i}"));
+        }
+        assert_eq!(log.error.entries.len(), 100);
+        // First entry should be err_1 (err_0 evicted)
+        assert_eq!(log.error.entries[0].message, "err_1");
+        assert_eq!(log.error.entries[99].message, "err_100");
+    }
+}
