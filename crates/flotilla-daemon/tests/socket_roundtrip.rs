@@ -55,11 +55,11 @@ async fn socket_roundtrip() {
     let snapshot = client.get_state(&repo).await.expect("get_state");
     assert_eq!(snapshot.repo, repo);
 
+    // Subscribe BEFORE refresh to avoid race — event may fire before subscribe
+    let mut rx = client.subscribe();
+
     // refresh — should succeed (triggers a re-scan)
     client.refresh(&repo).await.expect("refresh");
-
-    // Subscribe and wait for a snapshot event from the refresh
-    let mut rx = client.subscribe();
     let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("timeout waiting for event")

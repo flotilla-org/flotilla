@@ -94,7 +94,7 @@ impl Message {
         Message::Response {
             id,
             ok: true,
-            data: Some(serde_json::to_value(data).unwrap_or(serde_json::Value::Null)),
+            data: Some(serde_json::to_value(data).expect("response data must be serializable")),
             error: None,
         }
     }

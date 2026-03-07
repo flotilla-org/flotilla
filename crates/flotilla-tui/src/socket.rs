@@ -157,7 +157,9 @@ impl SocketDaemon {
                 .map_err(|e| format!("failed to flush daemon socket: {e}"))?;
         }
 
-        rx.await
+        tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .map_err(|_| "request timed out after 30s".to_string())?
             .map_err(|_| "request cancelled (sender dropped)".to_string())
     }
 }

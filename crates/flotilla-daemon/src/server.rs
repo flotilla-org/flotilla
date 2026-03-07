@@ -98,6 +98,10 @@ impl DaemonServer {
             }
         });
 
+        // SIGTERM handler
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+
         // Accept loop
         loop {
             tokio::select! {
@@ -129,7 +133,11 @@ impl DaemonServer {
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    info!("received signal — shutting down");
+                    info!("received SIGINT — shutting down");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM — shutting down");
                     break;
                 }
             }
