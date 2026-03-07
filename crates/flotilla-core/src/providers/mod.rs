@@ -14,11 +14,30 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+/// Raw output from a command, preserving stdout/stderr regardless of exit status.
+pub struct CommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
 /// Trait abstracting command execution so providers can be tested without
 /// spawning real processes.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
+    /// Run a command and return stdout on success, stderr on failure.
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String>;
+
+    /// Run a command and return full output regardless of exit status.
+    /// `Err` only if the process could not be spawned at all.
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+    ) -> Result<CommandOutput, String>;
+
+    /// Check if a command is available by running it.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool;
 }
 
@@ -40,6 +59,26 @@ impl CommandRunner for ProcessCommandRunner {
         } else {
             Err(String::from_utf8_lossy(&output.stderr).to_string())
         }
+    }
+
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+    ) -> Result<CommandOutput, String> {
+        let output = tokio::process::Command::new(cmd)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(CommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            success: output.status.success(),
+        })
     }
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {

@@ -147,7 +147,7 @@ pub async fn detect_providers(
     if let Some(ref host) = remote_url.as_deref().and_then(detect_host_from_url) {
         if host == "github" && runner.exists("gh", &["--version"]).await {
             if let Some(slug) = repo_slug.clone() {
-                let api = Arc::new(GhApiClient::new());
+                let api = Arc::new(GhApiClient::new(Arc::clone(&runner)));
                 registry.code_review.insert(
                     "github".to_string(),
                     Arc::new(GitHubCodeReview::new(

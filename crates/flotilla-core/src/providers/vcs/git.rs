@@ -193,6 +193,25 @@ mod tests {
         async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path) -> Result<String, String> {
             self.responses.lock().unwrap().remove(0)
         }
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+        ) -> Result<crate::providers::CommandOutput, String> {
+            match self.run(cmd, args, cwd).await {
+                Ok(stdout) => Ok(crate::providers::CommandOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                }),
+                Err(stderr) => Ok(crate::providers::CommandOutput {
+                    stdout: String::new(),
+                    stderr,
+                    success: false,
+                }),
+            }
+        }
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
             true
         }
