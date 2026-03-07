@@ -476,12 +476,12 @@ impl App {
             KeyCode::Char(']') => self.next_tab(),
             KeyCode::Char('{') => {
                 if !self.ui.mode.is_config() && self.move_tab(-1) {
-                    flotilla_core::config::save_tab_order(&self.model.repo_order);
+                    flotilla_core::config::save_tab_order(None, &self.model.repo_order);
                 }
             }
             KeyCode::Char('}') => {
                 if !self.ui.mode.is_config() && self.move_tab(1) {
-                    flotilla_core::config::save_tab_order(&self.model.repo_order);
+                    flotilla_core::config::save_tab_order(None, &self.model.repo_order);
                 }
             }
             KeyCode::Char('c') => {

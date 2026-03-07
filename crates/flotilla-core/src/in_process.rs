@@ -277,9 +277,9 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Persist to config
-        config::save_repo(&path);
+        config::save_repo(None, &path);
         let order = self.repo_order.read().await;
-        config::save_tab_order(&order);
+        config::save_tab_order(None, &order);
 
         info!("added repo {}", path.display());
         let _ = self
@@ -302,9 +302,9 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Persist to config
-        config::remove_repo(&path);
+        config::remove_repo(None, &path);
         let order = self.repo_order.read().await;
-        config::save_tab_order(&order);
+        config::save_tab_order(None, &order);
 
         info!("removed repo {}", path.display());
         let _ = self.event_tx.send(DaemonEvent::RepoRemoved { path });

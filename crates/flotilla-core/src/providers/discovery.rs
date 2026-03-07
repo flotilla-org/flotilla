@@ -118,7 +118,7 @@ pub async fn detect_providers(repo_root: &Path) -> (ProviderRegistry, Option<Str
     }
 
     // 2. Checkout manager: config-driven provider selection
-    let co_config = config::resolve_checkouts_config(repo_root);
+    let co_config = config::resolve_checkouts_config(None, repo_root);
     match co_config.provider.as_str() {
         "wt" => {
             if command_exists("wt", &["--version"]).await {

@@ -80,10 +80,16 @@ struct RepoConfig {
     path: String,
 }
 
-fn config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla/repos")
+fn config_base(base: Option<&Path>) -> PathBuf {
+    base.map(|b| b.to_path_buf()).unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(".config/flotilla")
+    })
+}
+
+fn config_dir(base: Option<&Path>) -> PathBuf {
+    config_base(base).join("repos")
 }
 
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
@@ -96,8 +102,8 @@ pub fn path_to_slug(path: &Path) -> String {
 }
 
 /// Load all persisted repo paths from config dir, sorted alphabetically by slug.
-pub fn load_repos() -> Vec<PathBuf> {
-    let dir = config_dir();
+pub fn load_repos(base: Option<&Path>) -> Vec<PathBuf> {
+    let dir = config_dir(base);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -120,8 +126,8 @@ pub fn load_repos() -> Vec<PathBuf> {
 }
 
 /// Persist a repo path to config. No-op if already persisted.
-pub fn save_repo(path: &Path) {
-    let dir = config_dir();
+pub fn save_repo(base: Option<&Path>, path: &Path) {
+    let dir = config_dir(base);
     let _ = std::fs::create_dir_all(&dir);
     let slug = path_to_slug(path);
     let file = dir.join(format!("{slug}.toml"));
@@ -137,44 +143,37 @@ pub fn save_repo(path: &Path) {
 }
 
 /// Remove a repo's config file.
-#[allow(dead_code)]
-pub fn remove_repo(path: &Path) {
-    let dir = config_dir();
+pub fn remove_repo(base: Option<&Path>, path: &Path) {
+    let dir = config_dir(base);
     let slug = path_to_slug(path);
     let file = dir.join(format!("{slug}.toml"));
     let _ = std::fs::remove_file(file);
 }
 
-fn tab_order_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla/tab-order.json")
+fn tab_order_file(base: Option<&Path>) -> PathBuf {
+    config_base(base).join("tab-order.json")
 }
 
 /// Load persisted tab order. Returns None if file doesn't exist or is invalid.
-pub fn load_tab_order() -> Option<Vec<PathBuf>> {
-    let content = std::fs::read_to_string(tab_order_file()).ok()?;
+pub fn load_tab_order(base: Option<&Path>) -> Option<Vec<PathBuf>> {
+    let content = std::fs::read_to_string(tab_order_file(base)).ok()?;
     let paths: Vec<String> = serde_json::from_str(&content).ok()?;
     Some(paths.into_iter().map(PathBuf::from).collect())
 }
 
 /// Save tab order to disk.
-pub fn save_tab_order(order: &[PathBuf]) {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla");
+pub fn save_tab_order(base: Option<&Path>, order: &[PathBuf]) {
+    let dir = config_base(base);
     let _ = std::fs::create_dir_all(&dir);
     let paths: Vec<&str> = order.iter().filter_map(|p| p.to_str()).collect();
     if let Ok(content) = serde_json::to_string_pretty(&paths) {
-        let _ = std::fs::write(tab_order_file(), content);
+        let _ = std::fs::write(tab_order_file(base), content);
     }
 }
 
 /// Load global flotilla config from ~/.config/flotilla/config.toml.
-pub fn load_config() -> FlotillaConfig {
-    let path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla/config.toml");
+pub fn load_config(base: Option<&Path>) -> FlotillaConfig {
+    let path = config_base(base).join("config.toml");
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|content| {
@@ -186,10 +185,13 @@ pub fn load_config() -> FlotillaConfig {
 }
 
 /// Resolve checkouts config for a repo: per-repo override > global > defaults.
-pub fn resolve_checkouts_config(repo_root: &std::path::Path) -> CheckoutsConfig {
-    let global = load_config();
+pub fn resolve_checkouts_config(
+    base: Option<&Path>,
+    repo_root: &std::path::Path,
+) -> CheckoutsConfig {
+    let global = load_config(base);
     let slug = path_to_slug(repo_root);
-    let repo_file = config_dir().join(format!("{slug}.toml"));
+    let repo_file = config_dir(base).join(format!("{slug}.toml"));
     if let Ok(content) = std::fs::read_to_string(&repo_file) {
         match toml::from_str::<RepoFileConfig>(&content) {
             Ok(repo_cfg) => {

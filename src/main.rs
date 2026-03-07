@@ -203,7 +203,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
                         MouseEventKind::Up(MouseButton::Left) => {
                             if app.ui.drag.dragging_tab.take().is_some() {
                                 if app.ui.drag.active {
-                                    config::save_tab_order(&app.model.repo_order);
+                                    config::save_tab_order(None, &app.model.repo_order);
                                 }
                                 app.ui.drag.active = false;
                             }
@@ -282,8 +282,8 @@ fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut repo_roots: Vec<PathBuf> = Vec::new();
 
     // 1. Persisted repos in saved tab order
-    let persisted = config::load_repos();
-    let tab_order = config::load_tab_order();
+    let persisted = config::load_repos(None);
+    let tab_order = config::load_tab_order(None);
     if let Some(order) = tab_order {
         for path in &order {
             if persisted.contains(path) && !repo_roots.contains(path) {
@@ -321,9 +321,9 @@ fn resolve_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
 
     // Persist any new repos and save tab order
     for path in &repo_roots {
-        config::save_repo(path);
+        config::save_repo(None, path);
     }
-    config::save_tab_order(&repo_roots);
+    config::save_tab_order(None, &repo_roots);
 
     repo_roots
 }
