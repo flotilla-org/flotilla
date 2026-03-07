@@ -313,7 +313,10 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 
     // Now mutably borrow for stateful render
     let key = &model.repo_order[model.active_repo];
-    let rui = ui.repo_ui.get_mut(key).unwrap();
+    let rui = ui
+        .repo_ui
+        .get_mut(key)
+        .expect("active repo must have UI state");
     frame.render_stateful_widget(table, area, &mut rui.table_state);
 }
 
@@ -353,7 +356,7 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
                 _ => ("○", Color::Magenta),
             }
         }
-        WorkItemKind::Pr => ("⊙", Color::Blue),
+        WorkItemKind::ChangeRequest => ("⊙", Color::Blue),
         WorkItemKind::RemoteBranch => ("⊶", Color::DarkGray),
         WorkItemKind::Issue => ("◇", Color::Yellow),
     };
@@ -363,7 +366,7 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
 
     let description = truncate(&item.description, desc_width);
 
-    let wt_indicator = if item.is_main_worktree {
+    let wt_indicator = if item.is_main_checkout {
         "◆"
     } else if item.checkout_key().is_some() {
         "✓"
@@ -380,7 +383,7 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
     let branch = item.branch.as_deref().unwrap_or("—");
     let branch_display = truncate(branch, branch_width);
 
-    let pr_display = if let Some(ref pr_key) = item.pr_key {
+    let pr_display = if let Some(ref pr_key) = item.change_request_key {
         if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
             let state_icon = match cr.status {
                 ChangeRequestStatus::Merged => "✓",
@@ -520,7 +523,7 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
             }
         }
 
-        if let Some(ref pr_key) = item.pr_key {
+        if let Some(ref pr_key) = item.change_request_key {
             if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
                 lines.push(format!(
                     "{} #{}: {}",
@@ -674,7 +677,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         ]));
         lines.push(Line::from(""));
 
-        if let Some(pr_status) = &info.pr_status {
+        if let Some(pr_status) = &info.change_request_status {
             let (status_text, color) = match pr_status.as_str() {
                 "MERGED" => ("MERGED", Color::Green),
                 "CLOSED" => ("CLOSED", Color::Yellow),
@@ -722,7 +725,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         if !info.has_uncommitted
             && info.unpushed_commits.is_empty()
             && info.base_detection_warning.is_none()
-            && info.pr_status.as_deref() == Some("MERGED")
+            && info.change_request_status.as_deref() == Some("MERGED")
         {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

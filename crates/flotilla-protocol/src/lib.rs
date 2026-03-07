@@ -27,7 +27,7 @@ pub(crate) mod test_helpers {
 
 use serde::{Deserialize, Serialize};
 
-pub use commands::{Command, CommandResult, DeleteInfo};
+pub use commands::{CheckoutStatus, Command, CommandResult};
 pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
     CommitInfo, CorrelationKey, Issue, ProviderData, SessionStatus, WorkingTreeStatus, Workspace,
@@ -110,13 +110,13 @@ mod tests {
                 description: "Feature X".to_string(),
                 checkout: Some(CheckoutRef {
                     key: PathBuf::from("/tmp/my-repo/wt"),
-                    is_main_worktree: false,
+                    is_main_checkout: false,
                 }),
-                pr_key: Some("PR#10".to_string()),
+                change_request_key: Some("PR#10".to_string()),
                 session_key: None,
                 issue_keys: vec!["ISSUE-1".to_string()],
                 workspace_refs: vec![],
-                is_main_worktree: false,
+                is_main_checkout: false,
                 debug_group: vec![],
             }],
             providers: ProviderData::default(),

@@ -38,7 +38,6 @@ pub trait Vcs: Send + Sync {
 
 #[async_trait]
 pub trait CheckoutManager: Send + Sync {
-    #[allow(dead_code)]
     fn display_name(&self) -> &str;
     fn section_label(&self) -> &str {
         "Checkouts"

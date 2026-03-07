@@ -76,11 +76,11 @@ pub struct WorkItem {
     pub branch: Option<String>,
     pub description: String,
     pub checkout: Option<CheckoutRef>,
-    pub pr_key: Option<String>,
+    pub change_request_key: Option<String>,
     pub session_key: Option<String>,
     pub issue_keys: Vec<String>,
     pub workspace_refs: Vec<String>,
-    pub is_main_worktree: bool,
+    pub is_main_checkout: bool,
     /// Pre-formatted debug lines describing the correlation group.
     /// Empty for standalone items.
     #[serde(default)]
@@ -97,7 +97,7 @@ impl WorkItem {
 pub enum WorkItemKind {
     Checkout,
     Session,
-    Pr,
+    ChangeRequest,
     RemoteBranch,
     Issue,
 }
@@ -114,7 +114,7 @@ pub enum WorkItemIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckoutRef {
     pub key: PathBuf,
-    pub is_main_worktree: bool,
+    pub is_main_checkout: bool,
 }
 
 #[cfg(test)]
@@ -224,13 +224,13 @@ mod tests {
                     description: "Feature X".into(),
                     checkout: Some(CheckoutRef {
                         key: PathBuf::from("/repos/project/wt"),
-                        is_main_worktree: false,
+                        is_main_checkout: false,
                     }),
-                    pr_key: None,
+                    change_request_key: None,
                     session_key: None,
                     issue_keys: vec![],
                     workspace_refs: vec![],
-                    is_main_worktree: false,
+                    is_main_checkout: false,
                     debug_group: vec![],
                 },
                 WorkItem {
@@ -239,11 +239,11 @@ mod tests {
                     branch: None,
                     description: "Session one".into(),
                     checkout: None,
-                    pr_key: None,
+                    change_request_key: None,
                     session_key: Some("s1".into()),
                     issue_keys: vec![],
                     workspace_refs: vec![],
-                    is_main_worktree: false,
+                    is_main_checkout: false,
                     debug_group: vec![],
                 },
             ],
@@ -272,11 +272,11 @@ mod tests {
                 branch: None,
                 description: "Fix bug".into(),
                 checkout: None,
-                pr_key: None,
+                change_request_key: None,
                 session_key: None,
                 issue_keys: vec![],
                 workspace_refs: vec![],
-                is_main_worktree: false,
+                is_main_checkout: false,
                 debug_group: vec![],
             },
             WorkItem {
@@ -286,13 +286,13 @@ mod tests {
                 description: "Main".into(),
                 checkout: Some(CheckoutRef {
                     key: PathBuf::from("/repos/main"),
-                    is_main_worktree: true,
+                    is_main_checkout: true,
                 }),
-                pr_key: Some("PR#1".into()),
+                change_request_key: Some("PR#1".into()),
                 session_key: Some("sess-1".into()),
                 issue_keys: vec!["I-1".into(), "I-2".into()],
                 workspace_refs: vec!["ws-1".into()],
-                is_main_worktree: true,
+                is_main_checkout: true,
                 debug_group: vec!["group info".into()],
             },
         ];
@@ -319,11 +319,11 @@ mod tests {
             "branch": null,
             "description": "test",
             "checkout": null,
-            "pr_key": null,
+            "change_request_key": null,
             "session_key": null,
             "issue_keys": [],
             "workspace_refs": [],
-            "is_main_worktree": false
+            "is_main_checkout": false
         }"#;
         let decoded: WorkItem = serde_json::from_str(json).expect("deserialize");
         assert!(decoded.debug_group.is_empty());
@@ -334,7 +334,7 @@ mod tests {
         for kind in [
             WorkItemKind::Checkout,
             WorkItemKind::Session,
-            WorkItemKind::Pr,
+            WorkItemKind::ChangeRequest,
             WorkItemKind::RemoteBranch,
             WorkItemKind::Issue,
         ] {
@@ -358,18 +358,18 @@ mod tests {
         let cases = vec![
             CheckoutRef {
                 key: PathBuf::from("/repos/proj/wt-1"),
-                is_main_worktree: true,
+                is_main_checkout: true,
             },
             CheckoutRef {
                 key: PathBuf::from("/tmp/wt"),
-                is_main_worktree: false,
+                is_main_checkout: false,
             },
         ];
         for case in &cases {
             let json = serde_json::to_string(case).expect("serialize");
             let decoded: CheckoutRef = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(decoded.key, case.key);
-            assert_eq!(decoded.is_main_worktree, case.is_main_worktree);
+            assert_eq!(decoded.is_main_checkout, case.is_main_checkout);
         }
     }
 }

@@ -84,7 +84,7 @@ panes:
         command: tail -f log.txt
         active: false
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         assert_eq!(template.panes.len(), 1);
         let pane = &template.panes[0];
         assert_eq!(pane.name, "editor");
@@ -106,7 +106,7 @@ panes:
 panes:
   - name: minimal
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         assert_eq!(template.panes.len(), 1);
         let pane = &template.panes[0];
         assert_eq!(pane.name, "minimal");
@@ -133,7 +133,7 @@ panes:
         ];
 
         for yaml in invalid_inputs {
-            let result = serde_yaml::from_str::<WorkspaceTemplate>(yaml);
+            let result = serde_yml::from_str::<WorkspaceTemplate>(yaml);
             assert!(result.is_err());
         }
     }
@@ -143,7 +143,7 @@ panes:
         let yaml = r#"
 panes: []
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         assert!(template.panes.is_empty());
     }
 
@@ -172,7 +172,7 @@ panes:
       - command: cargo clippy
         active: false
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         assert_eq!(template.panes.len(), 3);
 
         assert_eq!(template.panes[0].name, "left");
@@ -229,7 +229,7 @@ panes:
       - command: "cd {project_path} && {build_cmd}"
         active: false
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         let mut vars = HashMap::new();
         vars.insert("editor".to_string(), "nvim".to_string());
         vars.insert("project_path".to_string(), "/home/user/project".to_string());
@@ -254,7 +254,7 @@ panes:
     surfaces:
       - command: "{known} and {unknown}"
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         let mut vars = HashMap::new();
         vars.insert("known".to_string(), "resolved".to_string());
 
@@ -273,7 +273,7 @@ panes:
     surfaces:
       - command: "echo hello {world}"
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         let vars = HashMap::new();
 
         let rendered = template.render(&vars);
@@ -303,7 +303,7 @@ panes:
     surfaces:
       - command: "{cmd1} --flag"
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         let mut vars = HashMap::new();
         vars.insert("cmd1".to_string(), "ls".to_string());
         vars.insert("cmd2".to_string(), "pwd".to_string());
@@ -322,7 +322,7 @@ panes:
     surfaces:
       - active: true
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         assert_eq!(template.panes[0].surfaces[0].command, "");
         assert!(template.panes[0].surfaces[0].active);
     }
@@ -337,7 +337,7 @@ panes:
       - name: named
         command: echo named
 "#;
-        let template: WorkspaceTemplate = serde_yaml::from_str(yaml).unwrap();
+        let template: WorkspaceTemplate = serde_yml::from_str(yaml).unwrap();
         assert!(template.panes[0].surfaces[0].name.is_none());
         assert_eq!(template.panes[0].surfaces[1].name.as_deref(), Some("named"));
     }

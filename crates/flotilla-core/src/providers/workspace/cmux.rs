@@ -69,7 +69,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         let parsed: serde_json::Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
         let workspaces = parsed["workspaces"]
             .as_array()
-            .ok_or("no workspaces array")?;
+            .ok_or("cmux list-workspaces: response missing 'workspaces' array")?;
         Ok(workspaces
             .iter()
             .filter_map(|ws| {
@@ -103,8 +103,10 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         info!("cmux: creating workspace '{}'", config.name);
         // Parse template from YAML if provided, otherwise use default
         let template = if let Some(ref yaml) = config.template_yaml {
-            serde_yaml::from_str::<WorkspaceTemplate>(yaml)
-                .unwrap_or_else(|_| WorkspaceTemplate::load_default())
+            serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+                tracing::warn!("cmux: failed to parse workspace template, using default: {e}");
+                WorkspaceTemplate::load_default()
+            })
         } else {
             WorkspaceTemplate::load_default()
         };
@@ -126,14 +128,14 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         let first = panels["surfaces"]
             .as_array()
             .and_then(|s| s.first())
-            .ok_or("no initial surface in new workspace")?;
+            .ok_or("cmux list-panels: no surfaces in new workspace")?;
         let initial_surface = first["ref"]
             .as_str()
-            .ok_or("no ref on initial surface")?
+            .ok_or("cmux list-panels: initial surface missing 'ref'")?
             .to_string();
         let initial_pane = first["pane_ref"]
             .as_str()
-            .ok_or("no pane_ref on initial surface")?
+            .ok_or("cmux list-panels: initial surface missing 'pane_ref'")?
             .to_string();
 
         // Track pane name -> (surface_ref for split targeting, pane_ref for tab creation)

@@ -214,7 +214,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
 
         // Parse template from YAML if provided, otherwise use default
         let template = if let Some(ref yaml) = config.template_yaml {
-            serde_yaml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+            serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
                 warn!("zellij: failed to parse workspace template, using default: {e}");
                 WorkspaceTemplate::load_default()
             })

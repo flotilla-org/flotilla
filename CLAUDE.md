@@ -94,7 +94,7 @@ Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `ChangeReques
 
 `Normal` → `Help` → `Config` → `ActionMenu` → `BranchInput` → `FilePicker` → `DeleteConfirm`
 
-Key bindings: `j/k` navigate, `Enter` execute, `Space` menu, `d` delete, `p` open PR, `n` new branch, `r` refresh, `[/]` switch tabs, `{/}` reorder tabs, `q` quit, `?` help.
+Key bindings: `j/k` navigate, `Enter` execute, `Space` multi-select, `.` action menu, `d` delete, `p` open PR, `n` new branch, `r` refresh, `[/]` switch tabs, `{/}` reorder tabs, `q` quit, `?` help.
 
 ## Config
 

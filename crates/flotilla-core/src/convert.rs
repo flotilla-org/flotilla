@@ -20,7 +20,7 @@ pub fn correlation_result_to_work_item(
 
     let checkout = item.checkout().map(|co| CheckoutRef {
         key: co.key.clone(),
-        is_main_worktree: co.is_main_worktree,
+        is_main_checkout: co.is_main_checkout,
     });
 
     let debug_group = item
@@ -35,11 +35,11 @@ pub fn correlation_result_to_work_item(
         branch: item.branch().map(|s| s.to_string()),
         description: item.description().to_string(),
         checkout,
-        pr_key: item.pr_key().map(|s| s.to_string()),
+        change_request_key: item.change_request_key().map(|s| s.to_string()),
         session_key: item.session_key().map(|s| s.to_string()),
         issue_keys: item.issue_keys().to_vec(),
         workspace_refs: item.workspace_refs().to_vec(),
-        is_main_worktree: item.is_main_worktree(),
+        is_main_checkout: item.is_main_checkout(),
         debug_group,
     }
 }
@@ -103,11 +103,11 @@ mod tests {
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Checkout(CheckoutRef {
                 key: PathBuf::from("/repos/my-project/wt-1"),
-                is_main_worktree: false,
+                is_main_checkout: false,
             }),
             branch: Some("feature-login".to_string()),
             description: "Implement login flow".to_string(),
-            linked_pr: Some("PR#55".to_string()),
+            linked_change_request: Some("PR#55".to_string()),
             linked_session: Some("sess-abc".to_string()),
             linked_issues: vec!["GH-10".to_string(), "LIN-20".to_string()],
             workspace_refs: vec!["cmux-1".to_string()],
@@ -126,13 +126,13 @@ mod tests {
 
         let checkout = proto.checkout.expect("should have checkout ref");
         assert_eq!(checkout.key, PathBuf::from("/repos/my-project/wt-1"));
-        assert!(!checkout.is_main_worktree);
+        assert!(!checkout.is_main_checkout);
 
-        assert_eq!(proto.pr_key.as_deref(), Some("PR#55"));
+        assert_eq!(proto.change_request_key.as_deref(), Some("PR#55"));
         assert_eq!(proto.session_key.as_deref(), Some("sess-abc"));
         assert_eq!(proto.issue_keys, vec!["GH-10", "LIN-20"]);
         assert_eq!(proto.workspace_refs, vec!["cmux-1"]);
-        assert!(!proto.is_main_worktree);
+        assert!(!proto.is_main_checkout);
     }
 
     #[test]
@@ -150,9 +150,9 @@ mod tests {
         assert_eq!(proto.issue_keys, vec!["42"]);
         assert!(proto.branch.is_none());
         assert!(proto.checkout.is_none());
-        assert!(proto.pr_key.is_none());
+        assert!(proto.change_request_key.is_none());
         assert!(proto.session_key.is_none());
         assert!(proto.workspace_refs.is_empty());
-        assert!(!proto.is_main_worktree);
+        assert!(!proto.is_main_checkout);
     }
 }

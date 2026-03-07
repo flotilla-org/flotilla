@@ -5,12 +5,12 @@ use flotilla_protocol::{Command, RepoLabels, WorkItem, WorkItemKind};
 pub enum Intent {
     SwitchToWorkspace,
     CreateWorkspace,
-    RemoveWorktree,
-    CreateWorktreeAndWorkspace,
+    RemoveCheckout,
+    CreateCheckoutAndWorkspace,
     GenerateBranchName,
-    OpenPr,
+    OpenChangeRequest,
     OpenIssue,
-    LinkIssuesToPr,
+    LinkIssuesToChangeRequest,
     TeleportSession,
     ArchiveSession,
 }
@@ -20,14 +20,16 @@ impl Intent {
         match self {
             Intent::SwitchToWorkspace => "Switch to workspace".into(),
             Intent::CreateWorkspace => "Create workspace".into(),
-            Intent::RemoveWorktree => format!("Remove {}", labels.checkouts.noun),
-            Intent::CreateWorktreeAndWorkspace => {
+            Intent::RemoveCheckout => format!("Remove {}", labels.checkouts.noun),
+            Intent::CreateCheckoutAndWorkspace => {
                 format!("Create {} + workspace", labels.checkouts.noun)
             }
             Intent::GenerateBranchName => "Generate branch name".into(),
-            Intent::OpenPr => format!("Open {} in browser", labels.code_review.noun),
+            Intent::OpenChangeRequest => format!("Open {} in browser", labels.code_review.noun),
             Intent::OpenIssue => "Open issue in browser".into(),
-            Intent::LinkIssuesToPr => format!("Link issues to {}", labels.code_review.noun),
+            Intent::LinkIssuesToChangeRequest => {
+                format!("Link issues to {}", labels.code_review.noun)
+            }
             Intent::TeleportSession => "Teleport session".into(),
             Intent::ArchiveSession => "Archive session".into(),
         }
@@ -39,15 +41,15 @@ impl Intent {
             Intent::CreateWorkspace => {
                 item.checkout_key().is_some() && item.workspace_refs.is_empty()
             }
-            Intent::RemoveWorktree => item.checkout_key().is_some() && !item.is_main_worktree,
-            Intent::CreateWorktreeAndWorkspace => {
+            Intent::RemoveCheckout => item.checkout_key().is_some() && !item.is_main_checkout,
+            Intent::CreateCheckoutAndWorkspace => {
                 item.checkout_key().is_none() && item.branch.is_some()
             }
             Intent::GenerateBranchName => item.branch.is_none() && !item.issue_keys.is_empty(),
-            Intent::OpenPr => item.pr_key.is_some(),
+            Intent::OpenChangeRequest => item.change_request_key.is_some(),
             Intent::OpenIssue => !item.issue_keys.is_empty(),
-            Intent::LinkIssuesToPr => {
-                item.pr_key.is_some()
+            Intent::LinkIssuesToChangeRequest => {
+                item.change_request_key.is_some()
                     && item.checkout_key().is_some()
                     && !item.issue_keys.is_empty()
             }
@@ -58,8 +60,8 @@ impl Intent {
 
     pub fn shortcut_hint(&self, labels: &RepoLabels) -> Option<String> {
         match self {
-            Intent::RemoveWorktree => Some(format!("d:remove {}", labels.checkouts.noun)),
-            Intent::OpenPr => Some(format!("p:show {}", labels.code_review.abbr)),
+            Intent::RemoveCheckout => Some(format!("d:remove {}", labels.checkouts.noun)),
+            Intent::OpenChangeRequest => Some(format!("p:show {}", labels.code_review.abbr)),
             _ => None,
         }
     }
@@ -75,27 +77,30 @@ impl Intent {
                         ws_ref: ws_ref.clone(),
                     })
             }
-            Intent::CreateWorkspace => item.checkout_key().map(|p| Command::SwitchWorktree {
-                path: p.to_path_buf(),
-            }),
-            Intent::RemoveWorktree => {
-                if item.kind != WorkItemKind::Checkout || item.is_main_worktree {
+            Intent::CreateWorkspace => {
+                item.checkout_key()
+                    .map(|p| Command::CreateWorkspaceForCheckout {
+                        checkout_path: p.to_path_buf(),
+                    })
+            }
+            Intent::RemoveCheckout => {
+                if item.kind != WorkItemKind::Checkout || item.is_main_checkout {
                     return None;
                 }
                 let branch = item.branch.as_ref()?.to_string();
-                let worktree_path = item.checkout_key().map(|p| p.to_path_buf());
-                let pr_number = item.pr_key.clone();
-                Some(Command::FetchDeleteInfo {
+                let checkout_path = item.checkout_key().map(|p| p.to_path_buf());
+                let change_request_id = item.change_request_key.clone();
+                Some(Command::FetchCheckoutStatus {
                     branch,
-                    worktree_path,
-                    pr_number,
+                    checkout_path,
+                    change_request_id,
                 })
             }
-            Intent::CreateWorktreeAndWorkspace => {
-                item.branch.as_ref().map(|branch| Command::CreateWorktree {
+            Intent::CreateCheckoutAndWorkspace => {
+                item.branch.as_ref().map(|branch| Command::CreateCheckout {
                     branch: branch.to_string(),
                     create_branch: item.kind != WorkItemKind::RemoteBranch
-                        && item.kind != WorkItemKind::Pr,
+                        && item.kind != WorkItemKind::ChangeRequest,
                     issue_ids: Vec::new(),
                 })
             }
@@ -108,19 +113,19 @@ impl Intent {
                     None
                 }
             }
-            Intent::OpenPr => item
-                .pr_key
+            Intent::OpenChangeRequest => item
+                .change_request_key
                 .as_ref()
-                .map(|k| Command::OpenPr { id: k.clone() }),
+                .map(|k| Command::OpenChangeRequest { id: k.clone() }),
             Intent::OpenIssue => item
                 .issue_keys
                 .first()
-                .map(|k| Command::OpenIssueBrowser { id: k.clone() }),
-            Intent::LinkIssuesToPr => {
-                let pr_key = item.pr_key.as_ref()?;
+                .map(|k| Command::OpenIssue { id: k.clone() }),
+            Intent::LinkIssuesToChangeRequest => {
+                let change_request_key = item.change_request_key.as_ref()?;
                 let co_key = item.checkout_key()?;
                 let providers = &app.model.active().providers;
-                let cr = providers.change_requests.get(pr_key.as_str())?;
+                let cr = providers.change_requests.get(change_request_key.as_str())?;
                 let co = providers.checkouts.get(co_key)?;
 
                 // Find issue IDs from checkout that aren't already on the PR
@@ -148,8 +153,8 @@ impl Intent {
                 if missing.is_empty() {
                     return None;
                 }
-                Some(Command::LinkIssuesToPr {
-                    pr_id: cr.id.clone(),
+                Some(Command::LinkIssuesToChangeRequest {
+                    change_request_id: cr.id.clone(),
                     issue_ids: missing,
                 })
             }
@@ -170,12 +175,12 @@ impl Intent {
         &[
             Intent::SwitchToWorkspace,
             Intent::CreateWorkspace,
-            Intent::RemoveWorktree,
-            Intent::CreateWorktreeAndWorkspace,
+            Intent::RemoveCheckout,
+            Intent::CreateCheckoutAndWorkspace,
             Intent::GenerateBranchName,
-            Intent::OpenPr,
+            Intent::OpenChangeRequest,
             Intent::OpenIssue,
-            Intent::LinkIssuesToPr,
+            Intent::LinkIssuesToChangeRequest,
             Intent::TeleportSession,
             Intent::ArchiveSession,
         ]
@@ -186,7 +191,7 @@ impl Intent {
             Intent::SwitchToWorkspace,
             Intent::TeleportSession,
             Intent::CreateWorkspace,
-            Intent::CreateWorktreeAndWorkspace,
+            Intent::CreateCheckoutAndWorkspace,
             Intent::GenerateBranchName,
         ]
     }
@@ -239,11 +244,11 @@ mod tests {
             branch: None,
             description: String::new(),
             checkout: None,
-            pr_key: None,
+            change_request_key: None,
             session_key: None,
             issue_keys: Vec::new(),
             workspace_refs: Vec::new(),
-            is_main_worktree: false,
+            is_main_checkout: false,
             debug_group: Vec::new(),
         }
     }
@@ -257,13 +262,13 @@ mod tests {
             description: format!("checkout {branch}"),
             checkout: Some(CheckoutRef {
                 key: PathBuf::from(path),
-                is_main_worktree: is_main,
+                is_main_checkout: is_main,
             }),
-            pr_key: None,
+            change_request_key: None,
             session_key: None,
             issue_keys: Vec::new(),
             workspace_refs: Vec::new(),
-            is_main_worktree: is_main,
+            is_main_checkout: is_main,
             debug_group: Vec::new(),
         }
     }
@@ -271,16 +276,16 @@ mod tests {
     /// A PR work item with optional checkout.
     fn pr_item(pr_id: &str) -> WorkItem {
         WorkItem {
-            kind: WorkItemKind::Pr,
+            kind: WorkItemKind::ChangeRequest,
             identity: WorkItemIdentity::ChangeRequest(pr_id.into()),
             branch: Some("feat/pr-branch".into()),
             description: format!("PR #{pr_id}"),
             checkout: None,
-            pr_key: Some(pr_id.into()),
+            change_request_key: Some(pr_id.into()),
             session_key: None,
             issue_keys: Vec::new(),
             workspace_refs: Vec::new(),
-            is_main_worktree: false,
+            is_main_checkout: false,
             debug_group: Vec::new(),
         }
     }
@@ -293,11 +298,11 @@ mod tests {
             branch: Some("feat/session-branch".into()),
             description: format!("session {session_id}"),
             checkout: None,
-            pr_key: None,
+            change_request_key: None,
             session_key: Some(session_id.into()),
             issue_keys: Vec::new(),
             workspace_refs: Vec::new(),
-            is_main_worktree: false,
+            is_main_checkout: false,
             debug_group: Vec::new(),
         }
     }
@@ -310,11 +315,11 @@ mod tests {
             branch: Some(branch.into()),
             description: format!("remote {branch}"),
             checkout: None,
-            pr_key: None,
+            change_request_key: None,
             session_key: None,
             issue_keys: Vec::new(),
             workspace_refs: Vec::new(),
-            is_main_worktree: false,
+            is_main_checkout: false,
             debug_group: Vec::new(),
         }
     }
@@ -348,30 +353,30 @@ mod tests {
     #[test]
     fn remove_worktree_needs_checkout_and_not_main() {
         let item = checkout_item("feat/x", "/tmp/feat-x", false);
-        assert!(Intent::RemoveWorktree.is_available(&item));
+        assert!(Intent::RemoveCheckout.is_available(&item));
 
         // Main worktree -> not available
         let main_item = checkout_item("main", "/tmp/main", true);
-        assert!(!Intent::RemoveWorktree.is_available(&main_item));
+        assert!(!Intent::RemoveCheckout.is_available(&main_item));
 
         // No checkout -> not available
         let no_co = bare_item();
-        assert!(!Intent::RemoveWorktree.is_available(&no_co));
+        assert!(!Intent::RemoveCheckout.is_available(&no_co));
     }
 
     #[test]
     fn create_worktree_and_workspace_needs_no_checkout_and_has_branch() {
         // Remote branch: no checkout, has branch -> available
         let item = remote_branch_item("feat/remote");
-        assert!(Intent::CreateWorktreeAndWorkspace.is_available(&item));
+        assert!(Intent::CreateCheckoutAndWorkspace.is_available(&item));
 
         // Has checkout -> not available
         let co_item = checkout_item("feat/x", "/tmp/feat-x", false);
-        assert!(!Intent::CreateWorktreeAndWorkspace.is_available(&co_item));
+        assert!(!Intent::CreateCheckoutAndWorkspace.is_available(&co_item));
 
         // No branch -> not available
         let no_branch = bare_item();
-        assert!(!Intent::CreateWorktreeAndWorkspace.is_available(&no_branch));
+        assert!(!Intent::CreateCheckoutAndWorkspace.is_available(&no_branch));
     }
 
     #[test]
@@ -393,12 +398,12 @@ mod tests {
     }
 
     #[test]
-    fn open_pr_needs_pr_key() {
+    fn open_pr_needs_change_request_key() {
         let pr = pr_item("123");
-        assert!(Intent::OpenPr.is_available(&pr));
+        assert!(Intent::OpenChangeRequest.is_available(&pr));
 
         let no_pr = bare_item();
-        assert!(!Intent::OpenPr.is_available(&no_pr));
+        assert!(!Intent::OpenChangeRequest.is_available(&no_pr));
     }
 
     #[test]
@@ -414,24 +419,24 @@ mod tests {
     fn link_issues_to_pr_needs_pr_checkout_and_issues() {
         // Has PR, checkout, and issues -> available
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
-        item.pr_key = Some("42".into());
+        item.change_request_key = Some("42".into());
         item.issue_keys = vec!["7".into()];
-        assert!(Intent::LinkIssuesToPr.is_available(&item));
+        assert!(Intent::LinkIssuesToChangeRequest.is_available(&item));
 
         // Missing PR -> not available
         let mut no_pr = item.clone();
-        no_pr.pr_key = None;
-        assert!(!Intent::LinkIssuesToPr.is_available(&no_pr));
+        no_pr.change_request_key = None;
+        assert!(!Intent::LinkIssuesToChangeRequest.is_available(&no_pr));
 
         // Missing checkout -> not available
         let mut no_co = item.clone();
         no_co.checkout = None;
-        assert!(!Intent::LinkIssuesToPr.is_available(&no_co));
+        assert!(!Intent::LinkIssuesToChangeRequest.is_available(&no_co));
 
         // Missing issues -> not available
         let mut no_issues = item.clone();
         no_issues.issue_keys = Vec::new();
-        assert!(!Intent::LinkIssuesToPr.is_available(&no_issues));
+        assert!(!Intent::LinkIssuesToChangeRequest.is_available(&no_issues));
     }
 
     #[test]
@@ -471,18 +476,24 @@ mod tests {
             "Switch to workspace"
         );
         assert_eq!(Intent::CreateWorkspace.label(&labels), "Create workspace");
-        assert_eq!(Intent::RemoveWorktree.label(&labels), "Remove item");
+        assert_eq!(Intent::RemoveCheckout.label(&labels), "Remove item");
         assert_eq!(
-            Intent::CreateWorktreeAndWorkspace.label(&labels),
+            Intent::CreateCheckoutAndWorkspace.label(&labels),
             "Create item + workspace"
         );
         assert_eq!(
             Intent::GenerateBranchName.label(&labels),
             "Generate branch name"
         );
-        assert_eq!(Intent::OpenPr.label(&labels), "Open item in browser");
+        assert_eq!(
+            Intent::OpenChangeRequest.label(&labels),
+            "Open item in browser"
+        );
         assert_eq!(Intent::OpenIssue.label(&labels), "Open issue in browser");
-        assert_eq!(Intent::LinkIssuesToPr.label(&labels), "Link issues to item");
+        assert_eq!(
+            Intent::LinkIssuesToChangeRequest.label(&labels),
+            "Link issues to item"
+        );
         assert_eq!(Intent::TeleportSession.label(&labels), "Teleport session");
         assert_eq!(Intent::ArchiveSession.label(&labels), "Archive session");
     }
@@ -490,13 +501,19 @@ mod tests {
     #[test]
     fn label_with_custom_labels() {
         let labels = custom_labels();
-        assert_eq!(Intent::RemoveWorktree.label(&labels), "Remove worktree");
+        assert_eq!(Intent::RemoveCheckout.label(&labels), "Remove worktree");
         assert_eq!(
-            Intent::CreateWorktreeAndWorkspace.label(&labels),
+            Intent::CreateCheckoutAndWorkspace.label(&labels),
             "Create worktree + workspace"
         );
-        assert_eq!(Intent::OpenPr.label(&labels), "Open PR in browser");
-        assert_eq!(Intent::LinkIssuesToPr.label(&labels), "Link issues to PR");
+        assert_eq!(
+            Intent::OpenChangeRequest.label(&labels),
+            "Open PR in browser"
+        );
+        assert_eq!(
+            Intent::LinkIssuesToChangeRequest.label(&labels),
+            "Link issues to PR"
+        );
     }
 
     #[test]
@@ -522,7 +539,7 @@ mod tests {
     fn shortcut_hint_remove_worktree() {
         let labels = default_labels();
         assert_eq!(
-            Intent::RemoveWorktree.shortcut_hint(&labels),
+            Intent::RemoveCheckout.shortcut_hint(&labels),
             Some("d:remove item".into())
         );
     }
@@ -531,7 +548,7 @@ mod tests {
     fn shortcut_hint_open_pr() {
         let labels = default_labels();
         assert_eq!(
-            Intent::OpenPr.shortcut_hint(&labels),
+            Intent::OpenChangeRequest.shortcut_hint(&labels),
             Some("p:show ".into())
         );
     }
@@ -540,11 +557,11 @@ mod tests {
     fn shortcut_hint_with_custom_labels() {
         let labels = custom_labels();
         assert_eq!(
-            Intent::RemoveWorktree.shortcut_hint(&labels),
+            Intent::RemoveCheckout.shortcut_hint(&labels),
             Some("d:remove worktree".into())
         );
         assert_eq!(
-            Intent::OpenPr.shortcut_hint(&labels),
+            Intent::OpenChangeRequest.shortcut_hint(&labels),
             Some("p:show pr".into())
         );
     }
@@ -554,12 +571,14 @@ mod tests {
         let labels = default_labels();
         assert!(Intent::SwitchToWorkspace.shortcut_hint(&labels).is_none());
         assert!(Intent::CreateWorkspace.shortcut_hint(&labels).is_none());
-        assert!(Intent::CreateWorktreeAndWorkspace
+        assert!(Intent::CreateCheckoutAndWorkspace
             .shortcut_hint(&labels)
             .is_none());
         assert!(Intent::GenerateBranchName.shortcut_hint(&labels).is_none());
         assert!(Intent::OpenIssue.shortcut_hint(&labels).is_none());
-        assert!(Intent::LinkIssuesToPr.shortcut_hint(&labels).is_none());
+        assert!(Intent::LinkIssuesToChangeRequest
+            .shortcut_hint(&labels)
+            .is_none());
         assert!(Intent::TeleportSession.shortcut_hint(&labels).is_none());
         assert!(Intent::ArchiveSession.shortcut_hint(&labels).is_none());
     }
@@ -574,12 +593,12 @@ mod tests {
         [
             Intent::SwitchToWorkspace,
             Intent::CreateWorkspace,
-            Intent::RemoveWorktree,
-            Intent::CreateWorktreeAndWorkspace,
+            Intent::RemoveCheckout,
+            Intent::CreateCheckoutAndWorkspace,
             Intent::GenerateBranchName,
-            Intent::OpenPr,
+            Intent::OpenChangeRequest,
             Intent::OpenIssue,
-            Intent::LinkIssuesToPr,
+            Intent::LinkIssuesToChangeRequest,
             Intent::TeleportSession,
             Intent::ArchiveSession,
         ]
@@ -587,12 +606,12 @@ mod tests {
         .map(|v| match v {
             Intent::SwitchToWorkspace => v,
             Intent::CreateWorkspace => v,
-            Intent::RemoveWorktree => v,
-            Intent::CreateWorktreeAndWorkspace => v,
+            Intent::RemoveCheckout => v,
+            Intent::CreateCheckoutAndWorkspace => v,
             Intent::GenerateBranchName => v,
-            Intent::OpenPr => v,
+            Intent::OpenChangeRequest => v,
             Intent::OpenIssue => v,
-            Intent::LinkIssuesToPr => v,
+            Intent::LinkIssuesToChangeRequest => v,
             Intent::TeleportSession => v,
             Intent::ArchiveSession => v,
         })
@@ -620,7 +639,7 @@ mod tests {
             Intent::SwitchToWorkspace,
             Intent::TeleportSession,
             Intent::CreateWorkspace,
-            Intent::CreateWorktreeAndWorkspace,
+            Intent::CreateCheckoutAndWorkspace,
             Intent::GenerateBranchName,
         ];
         assert_eq!(Intent::enter_priority(), &expected);
@@ -727,10 +746,10 @@ mod tests {
         let cmd = Intent::CreateWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::SwitchWorktree { path } => {
-                assert_eq!(path, PathBuf::from("/tmp/feat-x"))
+            Command::CreateWorkspaceForCheckout { checkout_path } => {
+                assert_eq!(checkout_path, PathBuf::from("/tmp/feat-x"))
             }
-            other => panic!("expected SwitchWorktree, got {other:?}"),
+            other => panic!("expected CreateWorkspaceForCheckout, got {other:?}"),
         }
     }
 
@@ -745,20 +764,20 @@ mod tests {
     fn resolve_remove_worktree_checkout_item() {
         let app = stub_app();
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
-        item.pr_key = Some("99".into());
-        let cmd = Intent::RemoveWorktree.resolve(&item, &app);
+        item.change_request_key = Some("99".into());
+        let cmd = Intent::RemoveCheckout.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::FetchDeleteInfo {
+            Command::FetchCheckoutStatus {
                 branch,
-                worktree_path,
-                pr_number,
+                checkout_path,
+                change_request_id,
             } => {
                 assert_eq!(branch, "feat/x");
-                assert_eq!(worktree_path, Some(PathBuf::from("/tmp/feat-x")));
-                assert_eq!(pr_number, Some("99".into()));
+                assert_eq!(checkout_path, Some(PathBuf::from("/tmp/feat-x")));
+                assert_eq!(change_request_id, Some("99".into()));
             }
-            other => panic!("expected FetchDeleteInfo, got {other:?}"),
+            other => panic!("expected FetchCheckoutStatus, got {other:?}"),
         }
     }
 
@@ -766,7 +785,7 @@ mod tests {
     fn resolve_remove_worktree_none_for_main() {
         let app = stub_app();
         let item = checkout_item("main", "/tmp/main", true);
-        assert!(Intent::RemoveWorktree.resolve(&item, &app).is_none());
+        assert!(Intent::RemoveCheckout.resolve(&item, &app).is_none());
     }
 
     #[test]
@@ -776,9 +795,9 @@ mod tests {
         // Even with a checkout path, the kind check prevents resolve
         item.checkout = Some(CheckoutRef {
             key: PathBuf::from("/tmp/pr-co"),
-            is_main_worktree: false,
+            is_main_checkout: false,
         });
-        assert!(Intent::RemoveWorktree.resolve(&item, &app).is_none());
+        assert!(Intent::RemoveCheckout.resolve(&item, &app).is_none());
     }
 
     #[test]
@@ -786,19 +805,21 @@ mod tests {
         let app = stub_app();
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
         item.branch = None; // branch required for FetchDeleteInfo
-        assert!(Intent::RemoveWorktree.resolve(&item, &app).is_none());
+        assert!(Intent::RemoveCheckout.resolve(&item, &app).is_none());
     }
 
     #[test]
-    fn resolve_remove_worktree_without_pr_key() {
+    fn resolve_remove_worktree_without_change_request_key() {
         let app = stub_app();
         let item = checkout_item("feat/x", "/tmp/feat-x", false);
-        let cmd = Intent::RemoveWorktree.resolve(&item, &app).unwrap();
+        let cmd = Intent::RemoveCheckout.resolve(&item, &app).unwrap();
         match cmd {
-            Command::FetchDeleteInfo { pr_number, .. } => {
-                assert_eq!(pr_number, None);
+            Command::FetchCheckoutStatus {
+                change_request_id, ..
+            } => {
+                assert_eq!(change_request_id, None);
             }
-            other => panic!("expected FetchDeleteInfo, got {other:?}"),
+            other => panic!("expected FetchCheckoutStatus, got {other:?}"),
         }
     }
 
@@ -806,10 +827,10 @@ mod tests {
     fn resolve_create_worktree_and_workspace_remote_branch() {
         let app = stub_app();
         let item = remote_branch_item("feat/remote");
-        let cmd = Intent::CreateWorktreeAndWorkspace.resolve(&item, &app);
+        let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateWorktree {
+            Command::CreateCheckout {
                 branch,
                 create_branch,
                 issue_ids,
@@ -819,7 +840,7 @@ mod tests {
                 assert!(!create_branch);
                 assert!(issue_ids.is_empty());
             }
-            other => panic!("expected CreateWorktree, got {other:?}"),
+            other => panic!("expected CreateCheckout, got {other:?}"),
         }
     }
 
@@ -827,10 +848,10 @@ mod tests {
     fn resolve_create_worktree_and_workspace_pr_item() {
         let app = stub_app();
         let item = pr_item("42");
-        let cmd = Intent::CreateWorktreeAndWorkspace.resolve(&item, &app);
+        let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateWorktree {
+            Command::CreateCheckout {
                 branch,
                 create_branch,
                 ..
@@ -839,7 +860,7 @@ mod tests {
                 // Pr kind -> create_branch = false
                 assert!(!create_branch);
             }
-            other => panic!("expected CreateWorktree, got {other:?}"),
+            other => panic!("expected CreateCheckout, got {other:?}"),
         }
     }
 
@@ -847,10 +868,10 @@ mod tests {
     fn resolve_create_worktree_and_workspace_session_item() {
         let app = stub_app();
         let item = session_item("sess-1");
-        let cmd = Intent::CreateWorktreeAndWorkspace.resolve(&item, &app);
+        let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateWorktree {
+            Command::CreateCheckout {
                 branch,
                 create_branch,
                 ..
@@ -859,7 +880,7 @@ mod tests {
                 // Session kind -> create_branch = true (not RemoteBranch or Pr)
                 assert!(create_branch);
             }
-            other => panic!("expected CreateWorktree, got {other:?}"),
+            other => panic!("expected CreateCheckout, got {other:?}"),
         }
     }
 
@@ -867,7 +888,7 @@ mod tests {
     fn resolve_create_worktree_and_workspace_none_without_branch() {
         let app = stub_app();
         let item = bare_item(); // no branch
-        assert!(Intent::CreateWorktreeAndWorkspace
+        assert!(Intent::CreateCheckoutAndWorkspace
             .resolve(&item, &app)
             .is_none());
     }
@@ -898,19 +919,19 @@ mod tests {
     fn resolve_open_pr() {
         let app = stub_app();
         let item = pr_item("123");
-        let cmd = Intent::OpenPr.resolve(&item, &app);
+        let cmd = Intent::OpenChangeRequest.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::OpenPr { id } => assert_eq!(id, "123"),
-            other => panic!("expected OpenPr, got {other:?}"),
+            Command::OpenChangeRequest { id } => assert_eq!(id, "123"),
+            other => panic!("expected OpenChangeRequest, got {other:?}"),
         }
     }
 
     #[test]
-    fn resolve_open_pr_none_without_pr_key() {
+    fn resolve_open_pr_none_without_change_request_key() {
         let app = stub_app();
         let item = bare_item();
-        assert!(Intent::OpenPr.resolve(&item, &app).is_none());
+        assert!(Intent::OpenChangeRequest.resolve(&item, &app).is_none());
     }
 
     #[test]
@@ -921,11 +942,11 @@ mod tests {
         let cmd = Intent::OpenIssue.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::OpenIssueBrowser { id } => {
+            Command::OpenIssue { id } => {
                 // Opens the first issue
                 assert_eq!(id, "7");
             }
-            other => panic!("expected OpenIssueBrowser, got {other:?}"),
+            other => panic!("expected OpenIssue, got {other:?}"),
         }
     }
 
@@ -942,7 +963,7 @@ mod tests {
         let mut item = session_item("sess-42");
         item.checkout = Some(CheckoutRef {
             key: PathBuf::from("/tmp/co"),
-            is_main_worktree: false,
+            is_main_checkout: false,
         });
         let cmd = Intent::TeleportSession.resolve(&item, &app);
         assert!(cmd.is_some());
@@ -1073,9 +1094,9 @@ mod tests {
         // provider data in app.model. With empty ProviderData it returns None.
         let app = stub_app();
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
-        item.pr_key = Some("42".into());
+        item.change_request_key = Some("42".into());
         item.issue_keys = vec!["7".into()];
-        let cmd = Intent::LinkIssuesToPr.resolve(&item, &app);
+        let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app);
         assert!(cmd.is_none());
     }
 
@@ -1085,18 +1106,21 @@ mod tests {
         let app = app_with_pr_and_issues(&["10", "20"]);
 
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
-        item.pr_key = Some("42".into());
+        item.change_request_key = Some("42".into());
         item.issue_keys = vec!["10".into(), "20".into()];
 
-        let cmd = Intent::LinkIssuesToPr.resolve(&item, &app);
+        let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::LinkIssuesToPr { pr_id, issue_ids } => {
-                assert_eq!(pr_id, "42");
+            Command::LinkIssuesToChangeRequest {
+                change_request_id,
+                issue_ids,
+            } => {
+                assert_eq!(change_request_id, "42");
                 // Only issue "20" should be linked ("10" is already on the PR)
                 assert_eq!(issue_ids, vec!["20".to_string()]);
             }
-            other => panic!("expected LinkIssuesToPr, got {other:?}"),
+            other => panic!("expected LinkIssuesToChangeRequest, got {other:?}"),
         }
     }
 
@@ -1106,11 +1130,11 @@ mod tests {
         let app = app_with_pr_and_issues(&["10"]);
 
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
-        item.pr_key = Some("42".into());
+        item.change_request_key = Some("42".into());
         item.issue_keys = vec!["10".into()];
 
         // All issues already linked -> returns None
-        let cmd = Intent::LinkIssuesToPr.resolve(&item, &app);
+        let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app);
         assert!(cmd.is_none());
     }
 
@@ -1120,7 +1144,7 @@ mod tests {
     fn rich_item_has_multiple_intents_available() {
         // A checkout with PR, session, issues, and workspace
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
-        item.pr_key = Some("42".into());
+        item.change_request_key = Some("42".into());
         item.session_key = Some("sess-1".into());
         item.issue_keys = vec!["7".into()];
         item.workspace_refs = vec!["ws-1".into()];
@@ -1131,16 +1155,16 @@ mod tests {
             .collect();
 
         assert!(available.contains(&&Intent::SwitchToWorkspace));
-        assert!(available.contains(&&Intent::OpenPr));
+        assert!(available.contains(&&Intent::OpenChangeRequest));
         assert!(available.contains(&&Intent::OpenIssue));
-        assert!(available.contains(&&Intent::LinkIssuesToPr));
+        assert!(available.contains(&&Intent::LinkIssuesToChangeRequest));
         assert!(available.contains(&&Intent::TeleportSession));
         assert!(available.contains(&&Intent::ArchiveSession));
-        assert!(available.contains(&&Intent::RemoveWorktree));
+        assert!(available.contains(&&Intent::RemoveCheckout));
 
         // These should NOT be available
         assert!(!available.contains(&&Intent::CreateWorkspace)); // has workspace
-        assert!(!available.contains(&&Intent::CreateWorktreeAndWorkspace)); // has checkout
+        assert!(!available.contains(&&Intent::CreateCheckoutAndWorkspace)); // has checkout
         assert!(!available.contains(&&Intent::GenerateBranchName)); // has branch
     }
 
