@@ -214,3 +214,100 @@ pub fn resolve_checkouts_config(
     }
     global.vcs.git.checkouts
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn path_to_slug_strips_leading_slash() {
+        let slug = path_to_slug(Path::new("/Users/alice/dev/myrepo"));
+        assert_eq!(slug, "users-alice-dev-myrepo");
+    }
+
+    #[test]
+    fn save_and_load_repos_roundtrip() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+
+        let repo = base.join("fake-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        save_repo(Some(base), &repo);
+        let repos = load_repos(Some(base));
+        assert_eq!(repos, vec![repo]);
+    }
+
+    #[test]
+    fn save_repo_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        save_repo(Some(base), &repo);
+        save_repo(Some(base), &repo);
+        let repos = load_repos(Some(base));
+        assert_eq!(repos.len(), 1);
+    }
+
+    #[test]
+    fn remove_repo_deletes_config() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        save_repo(Some(base), &repo);
+        assert_eq!(load_repos(Some(base)).len(), 1);
+
+        remove_repo(Some(base), &repo);
+        assert_eq!(load_repos(Some(base)).len(), 0);
+    }
+
+    #[test]
+    fn save_and_load_tab_order_roundtrip() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+
+        let order = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        save_tab_order(Some(base), &order);
+        let loaded = load_tab_order(Some(base)).unwrap();
+        assert_eq!(loaded, order);
+    }
+
+    #[test]
+    fn load_tab_order_returns_none_when_missing() {
+        let dir = tempdir().unwrap();
+        assert!(load_tab_order(Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn load_repos_returns_empty_when_dir_missing() {
+        let dir = tempdir().unwrap();
+        let repos = load_repos(Some(dir.path()));
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn load_config_returns_defaults_when_missing() {
+        let dir = tempdir().unwrap();
+        let cfg = load_config(Some(dir.path()));
+        assert_eq!(cfg.vcs.git.checkouts.provider, "auto");
+    }
+
+    #[test]
+    fn resolve_checkouts_config_uses_global_defaults() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let co = resolve_checkouts_config(Some(base), &repo);
+        assert_eq!(co.provider, "auto");
+        assert!(co.path.contains("{{ repo_path }}"));
+    }
+}
