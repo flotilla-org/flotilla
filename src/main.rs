@@ -18,24 +18,78 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
-/// Flotilla: TUI dashboard for managing development workspaces across terminal multiplexers, source code checkouts and cloud agent services.
+
+/// Flotilla: TUI dashboard for managing development workspaces
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
     /// Git repo roots (repeatable; auto-detected from cwd if omitted)
     #[arg(long)]
     repo_root: Vec<PathBuf>,
+
+    /// Config directory
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+
+    /// Socket path (default: ${config_dir}/flotilla.sock)
+    #[arg(long)]
+    socket: Option<PathBuf>,
+
+    /// Run in embedded mode (no daemon, in-process)
+    #[arg(long)]
+    embedded: bool,
+
+    #[command(subcommand)]
+    command: Option<SubCommand>,
+}
+
+#[derive(clap::Subcommand)]
+enum SubCommand {
+    /// Run the daemon server
+    Daemon {
+        /// Idle timeout in seconds (0 = no timeout)
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
+    /// Print repo list and state
+    Status,
+    /// Stream daemon events to stdout
+    Watch,
+}
+
+impl Cli {
+    fn config_dir(&self) -> PathBuf {
+        self.config_dir
+            .clone()
+            .unwrap_or_else(|| flotilla_core::config::flotilla_config_dir())
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.socket
+            .clone()
+            .unwrap_or_else(|| self.config_dir().join("flotilla.sock"))
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    color_eyre::install()?;
-    event_log::init();
     let cli = Cli::parse();
 
-    let startup = std::time::Instant::now();
-    let repo_roots = resolve_repo_roots(&cli.repo_root);
+    match &cli.command {
+        Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, *timeout).await,
+        Some(SubCommand::Status) => run_status(&cli).await,
+        Some(SubCommand::Watch) => run_watch(&cli).await,
+        None => run_tui(cli).await,
+    }
+}
 
+async fn run_tui(cli: Cli) -> Result<()> {
+    color_eyre::install()?;
+    event_log::init();
+    let startup = std::time::Instant::now();
+
+    // For now, always use embedded mode (socket mode comes in Task 8)
+    let repo_roots = resolve_repo_roots(&cli.repo_root);
     if repo_roots.is_empty() {
         eprintln!("Error: no git repositories found (use --repo-root to specify)");
         std::process::exit(1);
@@ -47,28 +101,16 @@ async fn main() -> Result<()> {
         startup.elapsed()
     );
 
+    let daemon = InProcessDaemon::new(repo_roots).await;
+    info!("daemon started in {:.0?}", startup.elapsed());
+
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
     show_splash(&mut terminal)?;
-    let result = run(&mut terminal, repo_roots).await;
-    execute!(stdout(), DisableMouseCapture)?;
-    ratatui::restore();
-    result
-}
 
-async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) -> Result<()> {
-    let t = std::time::Instant::now();
-
-    // Create the daemon — it runs provider detection and spawns refresh loops
-    let daemon = InProcessDaemon::new(repo_roots).await;
-    info!("daemon started in {:.0?}", t.elapsed());
-
-    // Get initial repo info from daemon
     let repos_info = daemon.list_repos().await.unwrap_or_default();
-
-    // Create the app with daemon handle
     let mut app = app::App::new(
-        daemon.clone() as Arc<dyn flotilla_core::daemon::DaemonHandle>,
+        daemon.clone() as Arc<dyn DaemonHandle>,
         repos_info,
     );
 
@@ -226,7 +268,22 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, repo_roots: Vec<PathBuf>) 
             break;
         }
     }
+
+    execute!(stdout(), DisableMouseCapture)?;
+    ratatui::restore();
     Ok(())
+}
+
+async fn run_daemon(_cli: &Cli, _timeout_secs: u64) -> Result<()> {
+    todo!("Task 7: daemon subcommand")
+}
+
+async fn run_status(_cli: &Cli) -> Result<()> {
+    todo!("Task 9: status subcommand")
+}
+
+async fn run_watch(_cli: &Cli) -> Result<()> {
+    todo!("Task 10: watch subcommand")
 }
 
 fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {

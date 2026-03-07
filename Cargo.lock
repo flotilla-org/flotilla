@@ -1027,12 +1027,15 @@ dependencies = [
  "color-eyre",
  "crossterm 0.28.1",
  "flotilla-core",
+ "flotilla-daemon",
  "flotilla-tui",
  "image",
  "ratatui 0.30.0",
  "ratatui-image",
+ "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tui-input",
 ]
 
