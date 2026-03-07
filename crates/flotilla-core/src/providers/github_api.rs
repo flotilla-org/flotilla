@@ -67,6 +67,11 @@ pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
 #[async_trait]
 pub trait GhApi: Send + Sync {
     async fn get(&self, endpoint: &str, repo_root: &Path) -> Result<String, String>;
+    async fn get_with_headers(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+    ) -> Result<GhApiResponse, String>;
 }
 
 /// Cache entry: ETag + the JSON response body from last 200.
@@ -100,12 +105,8 @@ impl GhApi for GhApiClient {
             .await
             .map(|r| r.body)
     }
-}
 
-impl GhApiClient {
-    /// Fetch a GitHub API endpoint, returning the full parsed response
-    /// including pagination info. Uses ETag-based conditional request caching.
-    pub async fn get_with_headers(
+    async fn get_with_headers(
         &self,
         endpoint: &str,
         repo_root: &Path,

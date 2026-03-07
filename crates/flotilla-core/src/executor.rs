@@ -329,7 +329,7 @@ pub async fn execute(
         | Command::SearchIssues { .. }
         | Command::ClearIssueSearch { .. } => CommandResult::Error {
             message: "bug: daemon-level command reached per-repo executor".to_string(),
-        }
+        },
     }
 }
 
