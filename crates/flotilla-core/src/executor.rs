@@ -1841,8 +1841,7 @@ mod tests {
             config.template_vars.get("main_command"),
             Some(&"claude".to_string())
         );
-        // No template file exists at /nonexistent-repo, so template_yaml
-        // may or may not be set depending on the global config file.
-        // We just verify the other fields are correct.
+        // template_yaml depends on whether ~/.config/flotilla/workspace.yaml
+        // exists on the host, so we don't assert its value.
     }
 }

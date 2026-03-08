@@ -1730,12 +1730,9 @@ mod tests {
     fn group_work_items_prs_sorted_by_id_descending() {
         let providers = ProviderData::default();
         let labels = SectionLabels::default();
-        let mut pr1 = to_proto(&cr_item("1", "PR one"));
-        pr1.change_request_key = Some("1".to_string());
-        let mut pr5 = to_proto(&cr_item("5", "PR five"));
-        pr5.change_request_key = Some("5".to_string());
-        let mut pr3 = to_proto(&cr_item("3", "PR three"));
-        pr3.change_request_key = Some("3".to_string());
+        let pr1 = to_proto(&cr_item("1", "PR one"));
+        let pr5 = to_proto(&cr_item("5", "PR five"));
+        let pr3 = to_proto(&cr_item("3", "PR three"));
 
         let items = vec![pr1, pr5, pr3];
         let result = group_work_items(&items, &providers, &labels);
@@ -1928,12 +1925,9 @@ mod tests {
         );
 
         let labels = SectionLabels::default();
-        let mut si1 = to_proto(&session_item("s-old", "Old"));
-        si1.session_key = Some("s-old".to_string());
-        let mut si2 = to_proto(&session_item("s-new", "New"));
-        si2.session_key = Some("s-new".to_string());
-        let mut si3 = to_proto(&session_item("s-mid", "Mid"));
-        si3.session_key = Some("s-mid".to_string());
+        let si1 = to_proto(&session_item("s-old", "Old"));
+        let si2 = to_proto(&session_item("s-new", "New"));
+        let si3 = to_proto(&session_item("s-mid", "Mid"));
 
         let items = vec![si1, si2, si3];
         let result = group_work_items(&items, &providers, &labels);
