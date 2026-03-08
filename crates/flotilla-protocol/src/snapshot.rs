@@ -68,7 +68,7 @@ pub struct Snapshot {
     pub issue_search_results: Option<Vec<(String, Issue)>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderError {
     pub category: String,
     pub message: String,
