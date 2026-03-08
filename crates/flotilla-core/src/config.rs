@@ -255,102 +255,272 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn path_to_slug_strips_leading_slash() {
-        let slug = path_to_slug(Path::new("/Users/alice/dev/myrepo"));
-        assert_eq!(slug, "users-alice-dev-myrepo");
+    fn make_dir(base: &Path, name: &str) -> PathBuf {
+        let path = base.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_repo_file(base: &Path, filename: &str, content: &str) {
+        let repos_dir = base.join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        std::fs::write(repos_dir.join(filename), content).unwrap();
     }
 
     #[test]
-    fn save_and_load_repos_roundtrip() {
-        let dir = tempdir().unwrap();
-        let base = dir.path();
-
-        let repo = base.join("fake-repo");
-        std::fs::create_dir_all(&repo).unwrap();
-
-        let store = ConfigStore::with_base(base);
-        store.save_repo(&repo);
-        let repos = store.load_repos();
-        assert_eq!(repos, vec![repo]);
+    fn path_to_slug_covers_core_shapes() {
+        let cases = [
+            ("/Users/alice/dev/myrepo", "users-alice-dev-myrepo"),
+            ("relative/path", "relative-path"),
+            ("/Users/Bob Smith/my repo", "users-bob smith-my repo"),
+            ("/opt/my-project_v2.0", "opt-my-project_v2.0"),
+            ("/", ""),
+            (".", "."),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                path_to_slug(Path::new(input)),
+                expected,
+                "unexpected slug for input: {input}"
+            );
+        }
     }
 
     #[test]
-    fn save_repo_is_idempotent() {
+    fn save_repo_roundtrip_is_idempotent_and_removable() {
         let dir = tempdir().unwrap();
         let base = dir.path();
-
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
+        let repo = make_dir(base, "repo");
 
         let store = ConfigStore::with_base(base);
         store.save_repo(&repo);
         store.save_repo(&repo);
-        let repos = store.load_repos();
-        assert_eq!(repos.len(), 1);
-    }
-
-    #[test]
-    fn remove_repo_deletes_config() {
-        let dir = tempdir().unwrap();
-        let base = dir.path();
-
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-
-        let store = ConfigStore::with_base(base);
-        store.save_repo(&repo);
-        assert_eq!(store.load_repos().len(), 1);
+        assert_eq!(store.load_repos(), vec![repo.clone()]);
 
         store.remove_repo(&repo);
-        assert_eq!(store.load_repos().len(), 0);
+        assert!(store.load_repos().is_empty());
     }
 
     #[test]
-    fn save_and_load_tab_order_roundtrip() {
+    fn save_repo_creates_repos_dir_if_missing() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("deep/nested/config");
+        let repo = make_dir(dir.path(), "myrepo");
+
+        let store = ConfigStore::with_base(&base);
+        store.save_repo(&repo);
+
+        assert!(base.join("repos").exists());
+        assert_eq!(store.load_repos(), vec![repo]);
+    }
+
+    #[test]
+    fn load_repos_sorts_and_skips_invalid_entries() {
         let dir = tempdir().unwrap();
         let base = dir.path();
+        let repo_a = make_dir(base, "alpha");
+        let repo_b = make_dir(base, "bravo");
 
         let store = ConfigStore::with_base(base);
-        let order = vec![PathBuf::from("/a"), PathBuf::from("/b")];
-        store.save_tab_order(&order);
-        let loaded = store.load_tab_order().unwrap();
-        assert_eq!(loaded, order);
-    }
+        store.save_repo(&repo_b);
+        store.save_repo(&repo_a);
 
-    #[test]
-    fn load_tab_order_returns_none_when_missing() {
-        let dir = tempdir().unwrap();
-        let store = ConfigStore::with_base(dir.path());
-        assert!(store.load_tab_order().is_none());
+        std::fs::write(base.join("repos").join("notes.txt"), "ignore me").unwrap();
+        write_repo_file(base, "broken.toml", "not valid toml");
+        write_repo_file(base, "missing-path.toml", "[section]\nkey = \"value\"\n");
+        write_repo_file(base, "ghost.toml", "path = \"/nonexistent/ghost\"\n");
+
+        assert_eq!(store.load_repos(), vec![repo_a, repo_b]);
     }
 
     #[test]
     fn load_repos_returns_empty_when_dir_missing() {
         let dir = tempdir().unwrap();
         let store = ConfigStore::with_base(dir.path());
-        let repos = store.load_repos();
-        assert!(repos.is_empty());
+        assert!(store.load_repos().is_empty());
     }
 
     #[test]
-    fn load_config_returns_defaults_when_missing() {
-        let dir = tempdir().unwrap();
-        let store = ConfigStore::with_base(dir.path());
-        let cfg = store.load_config();
-        assert_eq!(cfg.vcs.git.checkouts.provider, "auto");
-    }
-
-    #[test]
-    fn resolve_checkouts_config_uses_global_defaults() {
+    fn tab_order_roundtrip_and_parse_failures() {
         let dir = tempdir().unwrap();
         let base = dir.path();
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
+        let store = ConfigStore::with_base(base);
+
+        assert!(store.load_tab_order().is_none());
+
+        let order = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        store.save_tab_order(&order);
+        assert_eq!(store.load_tab_order(), Some(order));
+
+        std::fs::write(base.join("tab-order.json"), "not json {{{").unwrap();
+        assert!(store.load_tab_order().is_none());
+
+        std::fs::write(base.join("tab-order.json"), r#"{"k":"v"}"#).unwrap();
+        assert!(store.load_tab_order().is_none());
+
+        std::fs::write(base.join("tab-order.json"), "[]").unwrap();
+        assert_eq!(store.load_tab_order(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn save_tab_order_creates_base_dir() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("new/config/dir");
+        let store = ConfigStore::with_base(&base);
+
+        store.save_tab_order(&[PathBuf::from("/a")]);
+        assert!(base.join("tab-order.json").exists());
+    }
+
+    #[test]
+    fn load_config_defaults_overrides_and_parse_fallback() {
+        let root = tempdir().unwrap();
+
+        let missing_store = ConfigStore::with_base(root.path().join("missing"));
+        assert_eq!(
+            missing_store.load_config().vcs.git.checkouts.provider,
+            "auto"
+        );
+
+        let invalid_base = root.path().join("invalid");
+        std::fs::create_dir_all(&invalid_base).unwrap();
+        std::fs::write(invalid_base.join("config.toml"), "this is not valid {{toml").unwrap();
+        let invalid_store = ConfigStore::with_base(&invalid_base);
+        assert_eq!(
+            invalid_store.load_config().vcs.git.checkouts.provider,
+            "auto"
+        );
+
+        let full_base = root.path().join("full");
+        std::fs::create_dir_all(&full_base).unwrap();
+        std::fs::write(
+            full_base.join("config.toml"),
+            "[vcs.git.checkouts]\npath = \"/custom/{{ branch }}\"\nprovider = \"worktree\"\n",
+        )
+        .unwrap();
+        let full_store = ConfigStore::with_base(&full_base);
+        let full_cfg = full_store.load_config();
+        assert_eq!(full_cfg.vcs.git.checkouts.path, "/custom/{{ branch }}");
+        assert_eq!(full_cfg.vcs.git.checkouts.provider, "worktree");
+
+        let partial_base = root.path().join("partial");
+        std::fs::create_dir_all(&partial_base).unwrap();
+        std::fs::write(
+            partial_base.join("config.toml"),
+            "[vcs.git.checkouts]\nprovider = \"worktree\"\n",
+        )
+        .unwrap();
+        let partial_store = ConfigStore::with_base(&partial_base);
+        let partial_cfg = partial_store.load_config();
+        assert_eq!(partial_cfg.vcs.git.checkouts.provider, "worktree");
+        assert_eq!(
+            partial_cfg.vcs.git.checkouts.path,
+            CheckoutsConfig::default_path()
+        );
+    }
+
+    #[test]
+    fn load_config_is_cached() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("config.toml"),
+            "[vcs.git.checkouts]\nprovider = \"first\"\n",
+        )
+        .unwrap();
 
         let store = ConfigStore::with_base(base);
-        let co = store.resolve_checkouts_config(&repo);
-        assert_eq!(co.provider, "auto");
-        assert!(co.path.contains("{{ repo_path }}"));
+        assert_eq!(store.load_config().vcs.git.checkouts.provider, "first");
+
+        std::fs::write(
+            base.join("config.toml"),
+            "[vcs.git.checkouts]\nprovider = \"second\"\n",
+        )
+        .unwrap();
+        assert_eq!(store.load_config().vcs.git.checkouts.provider, "first");
+    }
+
+    #[test]
+    fn resolve_checkouts_config_uses_global_when_repo_file_missing_or_invalid() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("config.toml"),
+            "[vcs.git.checkouts]\npath = \"/global/path\"\nprovider = \"global-prov\"\n",
+        )
+        .unwrap();
+
+        let repo = make_dir(base, "repo");
+        let store = ConfigStore::with_base(base);
+
+        let from_global = store.resolve_checkouts_config(&repo);
+        assert_eq!(from_global.path, "/global/path");
+        assert_eq!(from_global.provider, "global-prov");
+
+        let slug = path_to_slug(&repo);
+        write_repo_file(base, &format!("{slug}.toml"), "{{invalid toml!!!");
+        let from_invalid = store.resolve_checkouts_config(&repo);
+        assert_eq!(from_invalid.path, "/global/path");
+        assert_eq!(from_invalid.provider, "global-prov");
+    }
+
+    #[test]
+    fn resolve_checkouts_config_repo_override_merges_with_global() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("config.toml"),
+            "[vcs.git.checkouts]\npath = \"/global/path\"\nprovider = \"global-prov\"\n",
+        )
+        .unwrap();
+
+        let repo = make_dir(base, "repo");
+        let store = ConfigStore::with_base(base);
+        let slug = path_to_slug(&repo);
+
+        let cases = [
+            (
+                "[vcs.git.checkouts]\npath = \"/repo/path\"\nprovider = \"repo-prov\"\n",
+                "/repo/path",
+                "repo-prov",
+            ),
+            (
+                "[vcs.git.checkouts]\npath = \"/repo/path-only\"\n",
+                "/repo/path-only",
+                "global-prov",
+            ),
+            (
+                "[vcs.git.checkouts]\nprovider = \"repo-only\"\n",
+                "/global/path",
+                "repo-only",
+            ),
+        ];
+
+        for (override_toml, expected_path, expected_provider) in cases {
+            let repo_toml = format!("path = \"{}\"\n{override_toml}", repo.display());
+            write_repo_file(base, &format!("{slug}.toml"), &repo_toml);
+
+            let resolved = store.resolve_checkouts_config(&repo);
+            assert_eq!(resolved.path, expected_path);
+            assert_eq!(resolved.provider, expected_provider);
+        }
+    }
+
+    #[test]
+    fn defaults_and_with_base_are_stable() {
+        let checkouts = CheckoutsConfig::default();
+        assert_eq!(
+            checkouts.path,
+            "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}"
+        );
+        assert_eq!(checkouts.provider, "auto");
+
+        let repo_override = RepoCheckoutsOverride::default();
+        assert!(repo_override.path.is_none());
+        assert!(repo_override.provider.is_none());
+
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::with_base(dir.path());
+        assert_eq!(store.base_path(), dir.path());
     }
 }

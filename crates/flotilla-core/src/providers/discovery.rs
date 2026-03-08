@@ -236,3 +236,467 @@ pub async fn detect_providers(
 
     (registry, repo_slug)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type ResponseMap = HashMap<(String, String), Vec<Result<String, String>>>;
+
+    struct DiscoveryMockRunner {
+        responses: Mutex<ResponseMap>,
+        tool_exists: HashMap<String, bool>,
+        seen_cwds: Mutex<Vec<PathBuf>>,
+        exists_calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl DiscoveryMockRunner {
+        fn new() -> Self {
+            Self {
+                responses: Mutex::new(HashMap::new()),
+                tool_exists: HashMap::new(),
+                seen_cwds: Mutex::new(Vec::new()),
+                exists_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn on_run(mut self, cmd: &str, args: &[&str], response: Result<String, String>) -> Self {
+            let key = (cmd.to_string(), args.join(" "));
+            self.responses
+                .get_mut()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .push(response);
+            self
+        }
+
+        fn tool_exists(mut self, cmd: &str, exists: bool) -> Self {
+            self.tool_exists.insert(cmd.to_string(), exists);
+            self
+        }
+
+        fn saw_cwd(&self, cwd: &Path) -> bool {
+            self.seen_cwds.lock().unwrap().iter().any(|p| p == cwd)
+        }
+
+        fn exists_call_count(&self, cmd: &str) -> usize {
+            self.exists_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(called, _)| called == cmd)
+                .count()
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for DiscoveryMockRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+            self.seen_cwds.lock().unwrap().push(cwd.to_path_buf());
+            let key = (cmd.to_string(), args.join(" "));
+            let mut map = self.responses.lock().unwrap();
+            if let Some(queue) = map.get_mut(&key) {
+                if !queue.is_empty() {
+                    return queue.remove(0);
+                }
+            }
+            Err(format!(
+                "DiscoveryMockRunner: no response for {cmd} {}",
+                args.join(" ")
+            ))
+        }
+
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+        ) -> Result<super::super::CommandOutput, String> {
+            match self.run(cmd, args, cwd).await {
+                Ok(stdout) => Ok(super::super::CommandOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                }),
+                Err(stderr) => Ok(super::super::CommandOutput {
+                    stdout: String::new(),
+                    stderr,
+                    success: false,
+                }),
+            }
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            self.exists_calls
+                .lock()
+                .unwrap()
+                .push((cmd.to_string(), args.join(" ")));
+            self.tool_exists.get(cmd).copied().unwrap_or(false)
+        }
+    }
+
+    fn make_repo_with_git_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        (dir, repo)
+    }
+
+    fn make_repo_with_git_file() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        std::fs::write(repo.join(".git"), "gitdir: /some/path\n").unwrap();
+        (dir, repo)
+    }
+
+    fn temp_config(dir: &tempfile::TempDir) -> ConfigStore {
+        ConfigStore::with_base(dir.path().join("config-base"))
+    }
+
+    fn config_with_provider(
+        dir: &tempfile::TempDir,
+        repo_root: &Path,
+        provider: &str,
+    ) -> ConfigStore {
+        let base = dir.path().join("config-base");
+        let repos_dir = base.join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let slug = crate::config::path_to_slug(repo_root);
+        let repo_file = repos_dir.join(format!("{slug}.toml"));
+        let content = format!(
+            "path = \"{}\"\n[vcs.git.checkouts]\nprovider = \"{}\"\n",
+            repo_root.display(),
+            provider
+        );
+        std::fs::write(repo_file, content).unwrap();
+        ConfigStore::with_base(base)
+    }
+
+    #[test]
+    fn extract_repo_slug_cases() {
+        let cases: [(&str, Option<&str>); 12] = [
+            ("git@github.com:owner/repo.git", Some("owner/repo")),
+            ("git@github.com:owner/repo", Some("owner/repo")),
+            ("https://github.com/owner/repo.git", Some("owner/repo")),
+            ("http://github.com/owner/repo", Some("owner/repo")),
+            ("https://github.com/owner/repo/", Some("owner/repo")),
+            (
+                "git@myserver.example.com:team/project.git",
+                Some("team/project"),
+            ),
+            ("https://github.com/org/sub/repo.git", Some("org/sub/repo")),
+            ("git@github.com:repo", None),
+            ("https://github.com/", None),
+            ("https://github.com/owner", None),
+            ("ftp://github.com/owner/repo.git", None),
+            ("   ", None),
+        ];
+        for (url, expected) in cases {
+            let expected = expected.map(str::to_string);
+            assert_eq!(
+                extract_repo_slug(url),
+                expected,
+                "unexpected slug for: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_host_from_url_cases() {
+        let cases: [(&str, Option<&str>); 6] = [
+            ("git@github.com:owner/repo.git", Some("github")),
+            ("https://GitHub.com/owner/repo", Some("github")),
+            ("http://github.com/owner/repo", Some("github")),
+            ("https://gitlab.mycompany.com/org/project", Some("gitlab")),
+            ("https://bitbucket.org/owner/repo", None),
+            ("", None),
+        ];
+        for (url, expected) in cases {
+            let expected = expected.map(str::to_string);
+            assert_eq!(
+                detect_host_from_url(url),
+                expected,
+                "unexpected host for: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn first_remote_uses_first_success_and_trims_url() {
+        let repo_root = Path::new("/tmp/repo-root");
+        let runner = DiscoveryMockRunner::new()
+            .on_run("git", &["remote"], Ok(" upstream \norigin\n".to_string()))
+            .on_run(
+                "git",
+                &["remote", "get-url", "upstream"],
+                Ok("  https://github.com/upstream/repo.git  \n".to_string()),
+            );
+        let url = first_remote_url(repo_root, &runner).await;
+        assert_eq!(
+            url,
+            Some("https://github.com/upstream/repo.git".to_string())
+        );
+        assert!(runner.saw_cwd(repo_root));
+    }
+
+    #[tokio::test]
+    async fn first_remote_skips_failed_remote_and_uses_next() {
+        let runner = DiscoveryMockRunner::new()
+            .on_run(
+                "git",
+                &["remote"],
+                Ok("bad-remote\ngood-remote\n".to_string()),
+            )
+            .on_run(
+                "git",
+                &["remote", "get-url", "bad-remote"],
+                Err("no such remote".to_string()),
+            )
+            .on_run(
+                "git",
+                &["remote", "get-url", "good-remote"],
+                Ok("https://github.com/owner/repo.git\n".to_string()),
+            );
+        let url = first_remote_url(Path::new("/tmp"), &runner).await;
+        assert_eq!(url, Some("https://github.com/owner/repo.git".to_string()));
+    }
+
+    #[tokio::test]
+    async fn first_remote_returns_none_when_listing_fails_or_empty() {
+        let cases = [
+            DiscoveryMockRunner::new().on_run(
+                "git",
+                &["remote"],
+                Err("fatal: not a git repository".to_string()),
+            ),
+            DiscoveryMockRunner::new().on_run("git", &["remote"], Ok(String::new())),
+            DiscoveryMockRunner::new().on_run("git", &["remote"], Ok("\n\n".to_string())),
+        ];
+        for runner in cases {
+            assert_eq!(first_remote_url(Path::new("/tmp"), &runner).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_providers_without_git_has_no_vcs_but_has_checkout_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let config = temp_config(&dir);
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Err("not a repo".to_string()))
+                .tool_exists("wt", false)
+                .tool_exists("gh", false)
+                .tool_exists("claude", false),
+        );
+
+        let (registry, slug) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.vcs.is_empty());
+        assert!(!registry.checkout_managers.is_empty());
+        assert_eq!(slug, None);
+    }
+
+    #[tokio::test]
+    async fn detect_providers_git_file_counts_as_vcs() {
+        let (dir, repo) = make_repo_with_git_file();
+        let config = temp_config(&dir);
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Err("no remotes".to_string()))
+                .tool_exists("wt", false)
+                .tool_exists("gh", false)
+                .tool_exists("claude", false),
+        );
+        let (registry, _) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.vcs.contains_key("git"));
+    }
+
+    #[tokio::test]
+    async fn detect_providers_github_with_gh_registers_review_and_issues() {
+        let (dir, repo) = make_repo_with_git_dir();
+        let config = temp_config(&dir);
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Ok("origin\n".to_string()))
+                .on_run(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    Ok("git@github.com:owner/repo.git\n".to_string()),
+                )
+                .tool_exists("wt", false)
+                .tool_exists("gh", true)
+                .tool_exists("claude", false),
+        );
+
+        let (registry, slug) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.code_review.contains_key("github"));
+        assert!(registry.issue_trackers.contains_key("github"));
+        assert_eq!(slug, Some("owner/repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn detect_providers_github_without_gh_skips_review_and_issues() {
+        let (dir, repo) = make_repo_with_git_dir();
+        let config = temp_config(&dir);
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Ok("origin\n".to_string()))
+                .on_run(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    Ok("git@github.com:owner/repo.git\n".to_string()),
+                )
+                .tool_exists("wt", false)
+                .tool_exists("gh", false)
+                .tool_exists("claude", false),
+        );
+
+        let (registry, slug) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.code_review.is_empty());
+        assert!(registry.issue_trackers.is_empty());
+        assert_eq!(slug, Some("owner/repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn detect_providers_github_with_unparseable_slug_skips_review_and_issues() {
+        let (dir, repo) = make_repo_with_git_dir();
+        let config = temp_config(&dir);
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Ok("origin\n".to_string()))
+                .on_run(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    Ok("https://github.com/\n".to_string()),
+                )
+                .tool_exists("wt", false)
+                .tool_exists("gh", true)
+                .tool_exists("claude", false),
+        );
+
+        let (registry, slug) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.code_review.is_empty());
+        assert!(registry.issue_trackers.is_empty());
+        assert_eq!(slug, None);
+    }
+
+    #[tokio::test]
+    async fn detect_providers_non_github_remote_skips_github_providers() {
+        let (dir, repo) = make_repo_with_git_dir();
+        let config = temp_config(&dir);
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Ok("origin\n".to_string()))
+                .on_run(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    Ok("https://bitbucket.org/owner/repo.git\n".to_string()),
+                )
+                .tool_exists("wt", false)
+                .tool_exists("gh", true)
+                .tool_exists("claude", false),
+        );
+
+        let (registry, slug) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.code_review.is_empty());
+        assert!(registry.issue_trackers.is_empty());
+        assert_eq!(slug, Some("owner/repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn detect_providers_claude_registration_depends_on_binary() {
+        for (has_claude, should_register) in [(true, true), (false, false)] {
+            let (dir, repo) = make_repo_with_git_dir();
+            let config = temp_config(&dir);
+            let runner: Arc<dyn CommandRunner> = Arc::new(
+                DiscoveryMockRunner::new()
+                    .on_run("git", &["remote"], Err("no remotes".to_string()))
+                    .tool_exists("wt", false)
+                    .tool_exists("gh", false)
+                    .tool_exists("claude", has_claude),
+            );
+
+            let (registry, _) = detect_providers(&repo, &config, runner).await;
+            assert_eq!(
+                registry.coding_agents.contains_key("claude"),
+                should_register
+            );
+            assert_eq!(
+                registry.ai_utilities.contains_key("claude"),
+                should_register
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_providers_checkout_config_paths_probe_wt_as_expected() {
+        let (dir, repo) = make_repo_with_git_dir();
+
+        let config = config_with_provider(&dir, &repo, "git");
+        let runner = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Err("no remotes".to_string()))
+                .tool_exists("wt", true)
+                .tool_exists("gh", false)
+                .tool_exists("claude", false),
+        );
+        let runner_dyn: Arc<dyn CommandRunner> = runner.clone();
+        let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
+        assert!(!registry.checkout_managers.is_empty());
+        assert_eq!(runner.exists_call_count("wt"), 0);
+
+        let config = config_with_provider(&dir, &repo, "wt");
+        let runner = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Err("no remotes".to_string()))
+                .tool_exists("wt", false)
+                .tool_exists("gh", false)
+                .tool_exists("claude", false),
+        );
+        let runner_dyn: Arc<dyn CommandRunner> = runner.clone();
+        let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
+        assert!(!registry.checkout_managers.is_empty());
+        assert_eq!(runner.exists_call_count("wt"), 1);
+
+        let config = temp_config(&dir);
+        let runner = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Err("no remotes".to_string()))
+                .tool_exists("wt", true)
+                .tool_exists("gh", false)
+                .tool_exists("claude", false),
+        );
+        let runner_dyn: Arc<dyn CommandRunner> = runner.clone();
+        let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
+        assert!(!registry.checkout_managers.is_empty());
+        assert_eq!(runner.exists_call_count("wt"), 1);
+    }
+
+    #[tokio::test]
+    async fn detect_providers_uses_first_remote_for_slug_and_host() {
+        let (dir, repo) = make_repo_with_git_dir();
+        let config = temp_config(&dir);
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Ok("upstream\norigin\n".to_string()))
+                .on_run(
+                    "git",
+                    &["remote", "get-url", "upstream"],
+                    Ok("https://github.com/upstream/repo.git\n".to_string()),
+                )
+                .tool_exists("wt", false)
+                .tool_exists("gh", true)
+                .tool_exists("claude", false),
+        );
+
+        let (registry, slug) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.code_review.contains_key("github"));
+        assert!(registry.issue_trackers.contains_key("github"));
+        assert_eq!(slug, Some("upstream/repo".to_string()));
+    }
+}
