@@ -63,6 +63,39 @@ pub fn diff_provider_data(prev: &ProviderData, curr: &ProviderData) -> Vec<Chang
     changes
 }
 
+/// Apply an `EntryOp` to an IndexMap entry.
+fn apply_op<K, V>(map: &mut IndexMap<K, V>, key: K, op: EntryOp<V>)
+where
+    K: Eq + Hash,
+{
+    match op {
+        EntryOp::Added(v) | EntryOp::Updated(v) => {
+            map.insert(key, v);
+        }
+        EntryOp::Removed => {
+            map.swap_remove(&key);
+        }
+    }
+}
+
+/// Apply a list of `Change`s to a `ProviderData` snapshot, mutating it in place.
+pub fn apply_changes(pd: &mut ProviderData, changes: Vec<Change>) {
+    for change in changes {
+        match change {
+            Change::Checkout { key, op } => apply_op(&mut pd.checkouts, key, op),
+            Change::ChangeRequest { key, op } => apply_op(&mut pd.change_requests, key, op),
+            Change::Issue { key, op } => apply_op(&mut pd.issues, key, op),
+            Change::Session { key, op } => apply_op(&mut pd.sessions, key, op),
+            Change::Workspace { key, op } => apply_op(&mut pd.workspaces, key, op),
+            Change::Branch { key, op } => apply_op(&mut pd.branches, key, op),
+            // WorkItem and ProviderHealth are snapshot-level, not ProviderData-level.
+            // They'll be handled at a higher layer.
+            Change::WorkItem { .. } | Change::ProviderHealth { .. } | Change::ErrorsChanged(_) => {
+            }
+        }
+    }
+}
+
 /// Diff two work item lists, producing `Change::WorkItem` entries.
 ///
 /// Work items are keyed by `WorkItemIdentity`. The input slices are converted
@@ -417,5 +450,95 @@ mod tests {
             },
         );
         assert!(diff_provider_data(&pd, &pd).is_empty());
+    }
+
+    // --- apply_changes roundtrip tests ---
+
+    /// Helper: verify diff + apply roundtrip.
+    fn assert_roundtrip(prev: &ProviderData, curr: &ProviderData) {
+        let changes = diff_provider_data(prev, curr);
+        let mut result = prev.clone();
+        apply_changes(&mut result, changes);
+        assert_eq!(&result, curr);
+    }
+
+    #[test]
+    fn roundtrip_empty_to_populated() {
+        let prev = ProviderData::default();
+        let mut curr = ProviderData::default();
+        curr.checkouts
+            .insert(PathBuf::from("/wt/feat"), checkout("feat"));
+        curr.change_requests
+            .insert("1".into(), change_request("pr"));
+        curr.issues.insert("10".into(), issue("bug"));
+        curr.sessions.insert("s1".into(), session("sess"));
+        curr.workspaces.insert("w1".into(), workspace("dev"));
+        curr.branches.insert(
+            "main".into(),
+            Branch {
+                status: BranchStatus::Remote,
+            },
+        );
+        assert_roundtrip(&prev, &curr);
+    }
+
+    #[test]
+    fn roundtrip_populated_to_empty() {
+        let mut prev = ProviderData::default();
+        prev.checkouts
+            .insert(PathBuf::from("/wt/feat"), checkout("feat"));
+        prev.issues.insert("10".into(), issue("bug"));
+        prev.sessions.insert("s1".into(), session("sess"));
+        let curr = ProviderData::default();
+        assert_roundtrip(&prev, &curr);
+    }
+
+    #[test]
+    fn roundtrip_mixed_changes() {
+        let mut prev = ProviderData::default();
+        prev.checkouts
+            .insert(PathBuf::from("/wt/main"), checkout("main"));
+        prev.issues.insert("1".into(), issue("old bug"));
+        prev.sessions.insert("s1".into(), session("session 1"));
+
+        let mut curr = ProviderData::default();
+        curr.checkouts
+            .insert(PathBuf::from("/wt/main"), checkout("main")); // unchanged
+        curr.issues.insert("1".into(), issue("new bug")); // updated
+        curr.workspaces.insert("w1".into(), workspace("dev")); // added
+        // sessions removed
+
+        assert_roundtrip(&prev, &curr);
+    }
+
+    #[test]
+    fn roundtrip_identical() {
+        let mut pd = ProviderData::default();
+        pd.checkouts
+            .insert(PathBuf::from("/wt/main"), checkout("main"));
+        pd.branches.insert(
+            "feat".into(),
+            Branch {
+                status: BranchStatus::Merged,
+            },
+        );
+        assert_roundtrip(&pd, &pd);
+    }
+
+    #[test]
+    fn apply_added_then_removed() {
+        let mut pd = ProviderData::default();
+        let changes = vec![
+            Change::Issue {
+                key: "1".into(),
+                op: EntryOp::Added(issue("task")),
+            },
+            Change::Issue {
+                key: "1".into(),
+                op: EntryOp::Removed,
+            },
+        ];
+        apply_changes(&mut pd, changes);
+        assert!(pd.issues.is_empty());
     }
 }
