@@ -24,13 +24,15 @@ pub async fn execute(
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
     runner: &dyn CommandRunner,
+    config_base: &Path,
 ) -> CommandResult {
     match cmd {
         Command::CreateWorkspaceForCheckout { checkout_path } => {
             if let Some(co) = providers_data.checkouts.get(&checkout_path).cloned() {
                 info!("entering workspace for {}", co.branch);
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                    let config = workspace_config(repo_root, &co.branch, &co.path, "claude");
+                    let config =
+                        workspace_config(repo_root, &co.branch, &co.path, "claude", config_base);
                     if let Err(e) = ws_mgr.create_workspace(&config).await {
                         return CommandResult::Error { message: e };
                     }
@@ -73,7 +75,13 @@ pub async fn execute(
                     info!("created checkout at {}", checkout.path.display());
                     // Create workspace if manager available
                     if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                        let config = workspace_config(repo_root, &branch, &checkout.path, "claude");
+                        let config = workspace_config(
+                            repo_root,
+                            &branch,
+                            &checkout.path,
+                            "claude",
+                            config_base,
+                        );
                         if let Err(e) = ws_mgr.create_workspace(&config).await {
                             // Checkout was created but workspace failed — report as error
                             // but the checkout still exists
@@ -304,7 +312,8 @@ pub async fn execute(
             if let Some(path) = wt_path {
                 let name = branch.as_deref().unwrap_or("session");
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                    let config = workspace_config(repo_root, name, &path, &teleport_cmd);
+                    let config =
+                        workspace_config(repo_root, name, &path, &teleport_cmd, config_base);
                     if let Err(e) = ws_mgr.create_workspace(&config).await {
                         // Unlike CreateCheckout, teleport fails entirely if the workspace
                         // can't be created — the checkout may already have existed.
@@ -339,10 +348,11 @@ pub(crate) fn workspace_config(
     name: &str,
     working_dir: &Path,
     main_command: &str,
+    config_base: &Path,
 ) -> WorkspaceConfig {
     let tmpl_path = repo_root.join(".flotilla/workspace.yaml");
     let template_yaml = std::fs::read_to_string(&tmpl_path).ok().or_else(|| {
-        let global_path = dirs::home_dir()?.join(".config/flotilla/workspace.yaml");
+        let global_path = config_base.join("workspace.yaml");
         std::fs::read_to_string(global_path).ok()
     });
     let mut template_vars = std::collections::HashMap::new();
@@ -650,6 +660,10 @@ mod tests {
         PathBuf::from("/tmp/test-repo")
     }
 
+    fn config_base() -> PathBuf {
+        PathBuf::from("/tmp/test-config")
+    }
+
     fn make_checkout(branch: &str, path: &str) -> Checkout {
         Checkout {
             branch: branch.to_string(),
@@ -705,6 +719,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -732,6 +747,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -752,6 +768,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -784,6 +801,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -812,6 +830,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -835,6 +854,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -858,6 +878,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -886,6 +907,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -916,6 +938,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -947,6 +970,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -977,6 +1001,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1011,6 +1036,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1040,6 +1066,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1068,6 +1095,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1091,6 +1119,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1132,6 +1161,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1160,6 +1190,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1182,6 +1213,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1205,6 +1237,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1227,6 +1260,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1253,6 +1287,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1276,6 +1311,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1296,6 +1332,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1324,6 +1361,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1352,6 +1390,7 @@ mod tests {
             &registry,
             &empty_data(),
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1379,6 +1418,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1410,6 +1450,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1436,6 +1477,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1474,6 +1516,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1506,6 +1549,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1534,6 +1578,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1572,6 +1617,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1604,6 +1650,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1645,6 +1692,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1675,6 +1723,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1697,6 +1746,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1731,6 +1781,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1766,6 +1817,7 @@ mod tests {
             &registry,
             &data,
             &runner,
+            &config_base(),
         )
         .await;
 
@@ -1808,7 +1860,8 @@ mod tests {
         ];
 
         for cmd in daemon_commands {
-            let result = execute(cmd, &repo_root(), &registry, &data, &runner).await;
+            let result =
+                execute(cmd, &repo_root(), &registry, &data, &runner, &config_base()).await;
             match &result {
                 CommandResult::Error { message } => {
                     assert!(
@@ -1827,12 +1880,12 @@ mod tests {
 
     #[test]
     fn workspace_config_builds_correct_struct() {
-        // Use a non-existent repo root so no template file is found
         let config = workspace_config(
             Path::new("/nonexistent-repo"),
             "my-branch",
             Path::new("/repo/wt"),
             "claude",
+            &config_base(),
         );
 
         assert_eq!(config.name, "my-branch");
@@ -1841,7 +1894,9 @@ mod tests {
             config.template_vars.get("main_command"),
             Some(&"claude".to_string())
         );
-        // template_yaml depends on whether ~/.config/flotilla/workspace.yaml
-        // exists on the host, so we don't assert its value.
+        assert!(
+            config.template_yaml.is_none(),
+            "no template file should exist at test paths"
+        );
     }
 }
