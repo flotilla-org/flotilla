@@ -776,6 +776,72 @@ impl DaemonHandle for InProcessDaemon {
         Ok(())
     }
 
+    async fn replay_since(
+        &self,
+        last_seen: &HashMap<PathBuf, u64>,
+    ) -> Result<Vec<DaemonEvent>, String> {
+        let repos = self.repos.read().await;
+        let order = self.repo_order.read().await;
+        let mut events = Vec::new();
+
+        for path in order.iter() {
+            let Some(state) = repos.get(path) else {
+                continue;
+            };
+            let snapshot = || {
+                build_repo_snapshot(
+                    path,
+                    state.seq,
+                    &state.last_snapshot,
+                    &state.model.data.provider_health,
+                    &state.issue_cache,
+                    &state.search_results,
+                )
+            };
+
+            match last_seen.get(path) {
+                Some(&client_seq) => {
+                    // Try to find the client's seq in the delta log and replay from there
+                    let replay_start = state
+                        .delta_log
+                        .iter()
+                        .position(|entry| entry.prev_seq == client_seq);
+
+                    if let Some(start_idx) = replay_start {
+                        // Replay delta entries
+                        for entry in state.delta_log.iter().skip(start_idx) {
+                            let issue_snapshot = snapshot();
+                            events.push(DaemonEvent::SnapshotDelta(Box::new(
+                                flotilla_protocol::SnapshotDelta {
+                                    seq: entry.seq,
+                                    prev_seq: entry.prev_seq,
+                                    repo: path.clone(),
+                                    changes: entry.changes.clone(),
+                                    issue_total: issue_snapshot.issue_total,
+                                    issue_has_more: issue_snapshot.issue_has_more,
+                                    issue_search_results: issue_snapshot
+                                        .issue_search_results
+                                        .clone(),
+                                },
+                            )));
+                        }
+                    } else if client_seq == state.seq {
+                        // Client is up to date — no replay needed
+                    } else {
+                        // Seq not in delta log — send full snapshot
+                        events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
+                    }
+                }
+                None => {
+                    // Client has never seen this repo — send full snapshot
+                    events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
     async fn remove_repo(&self, path: &Path) -> Result<(), String> {
         let path = path.to_path_buf();
 

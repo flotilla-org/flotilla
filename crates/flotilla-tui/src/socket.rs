@@ -369,4 +369,17 @@ impl DaemonHandle for SocketDaemon {
             .await?;
         resp.parse_empty()
     }
+
+    async fn replay_since(
+        &self,
+        last_seen: &HashMap<PathBuf, u64>,
+    ) -> Result<Vec<DaemonEvent>, String> {
+        let resp = self
+            .request(
+                "replay_since",
+                serde_json::json!({ "last_seen": last_seen }),
+            )
+            .await?;
+        resp.parse::<Vec<DaemonEvent>>()
+    }
 }

@@ -698,6 +698,12 @@ mod tests {
         async fn remove_repo(&self, _path: &Path) -> Result<(), String> {
             Ok(())
         }
+        async fn replay_since(
+            &self,
+            _last_seen: &std::collections::HashMap<PathBuf, u64>,
+        ) -> Result<Vec<DaemonEvent>, String> {
+            Ok(vec![])
+        }
     }
 
     fn stub_app() -> App {
