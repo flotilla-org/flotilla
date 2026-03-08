@@ -70,7 +70,7 @@ impl GitHubCodeReview {
         issues
     }
 
-    fn gh_pr_to_change_request(&self, pr: &GhPr) -> ChangeRequest {
+    fn gh_pr_to_change_request(&self, pr: &GhPr) -> (String, ChangeRequest) {
         let id = pr.number.to_string();
         let correlation_keys = vec![
             CorrelationKey::Branch(pr.head_ref_name.clone()),
@@ -95,15 +95,17 @@ impl GitHubCodeReview {
             Self::parse_state(&pr.state)
         };
 
-        ChangeRequest {
+        (
             id,
-            title: pr.title.clone(),
-            branch: pr.head_ref_name.clone(),
-            status,
-            body: pr.body.clone(),
-            correlation_keys,
-            association_keys,
-        }
+            ChangeRequest {
+                title: pr.title.clone(),
+                branch: pr.head_ref_name.clone(),
+                status,
+                body: pr.body.clone(),
+                correlation_keys,
+                association_keys,
+            },
+        )
     }
 }
 
@@ -127,7 +129,7 @@ impl super::CodeReview for GitHubCodeReview {
         &self,
         repo_root: &Path,
         limit: usize,
-    ) -> Result<Vec<ChangeRequest>, String> {
+    ) -> Result<Vec<(String, ChangeRequest)>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!(
             "repos/{}/pulls?state=open&per_page={}",
@@ -164,7 +166,7 @@ impl super::CodeReview for GitHubCodeReview {
         &self,
         repo_root: &Path,
         id: &str,
-    ) -> Result<ChangeRequest, String> {
+    ) -> Result<(String, ChangeRequest), String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
         let body = self.api.get(&endpoint, repo_root).await?;
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;

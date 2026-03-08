@@ -160,7 +160,7 @@ impl Intent {
                     return None;
                 }
                 Some(Command::LinkIssuesToChangeRequest {
-                    change_request_id: cr.id.clone(),
+                    change_request_id: change_request_key.clone(),
                     issue_ids: missing,
                 })
             }
@@ -1062,7 +1062,6 @@ mod tests {
         providers.change_requests.insert(
             "42".into(),
             ChangeRequest {
-                id: "42".into(),
                 title: "Fix bug".into(),
                 branch: "feat/x".into(),
                 status: ChangeRequestStatus::Open,
@@ -1077,7 +1076,6 @@ mod tests {
             co_path.clone(),
             Checkout {
                 branch: "feat/x".into(),
-                path: co_path.clone(),
                 is_trunk: false,
                 trunk_ahead_behind: None,
                 remote_ahead_behind: None,

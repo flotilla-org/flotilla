@@ -64,35 +64,38 @@ struct WtCommit {
 }
 
 impl WtWorktree {
-    fn into_checkout(self) -> Checkout {
+    fn into_checkout(self) -> (PathBuf, Checkout) {
+        let path = self.path;
         let correlation_keys = vec![
             CorrelationKey::Branch(self.branch.clone()),
-            CorrelationKey::CheckoutPath(self.path.clone()),
+            CorrelationKey::CheckoutPath(path.clone()),
         ];
-        Checkout {
-            branch: self.branch,
-            path: self.path,
-            is_trunk: self.is_main,
-            trunk_ahead_behind: self.main.map(|m| AheadBehind {
-                ahead: m.ahead,
-                behind: m.behind,
-            }),
-            remote_ahead_behind: self.remote.map(|r| AheadBehind {
-                ahead: r.ahead,
-                behind: r.behind,
-            }),
-            working_tree: self.working_tree.map(|w| WorkingTreeStatus {
-                staged: if w.staged { 1 } else { 0 },
-                modified: if w.modified { 1 } else { 0 },
-                untracked: if w.untracked { 1 } else { 0 },
-            }),
-            last_commit: self.commit.map(|c| CommitInfo {
-                short_sha: c.short_sha.unwrap_or_default(),
-                message: c.message.unwrap_or_default(),
-            }),
-            correlation_keys,
-            association_keys: Vec::new(),
-        }
+        (
+            path,
+            Checkout {
+                branch: self.branch,
+                is_trunk: self.is_main,
+                trunk_ahead_behind: self.main.map(|m| AheadBehind {
+                    ahead: m.ahead,
+                    behind: m.behind,
+                }),
+                remote_ahead_behind: self.remote.map(|r| AheadBehind {
+                    ahead: r.ahead,
+                    behind: r.behind,
+                }),
+                working_tree: self.working_tree.map(|w| WorkingTreeStatus {
+                    staged: if w.staged { 1 } else { 0 },
+                    modified: if w.modified { 1 } else { 0 },
+                    untracked: if w.untracked { 1 } else { 0 },
+                }),
+                last_commit: self.commit.map(|c| CommitInfo {
+                    short_sha: c.short_sha.unwrap_or_default(),
+                    message: c.message.unwrap_or_default(),
+                }),
+                correlation_keys,
+                association_keys: Vec::new(),
+            },
+        )
     }
 }
 
@@ -124,23 +127,23 @@ impl super::CheckoutManager for WtCheckoutManager {
         "WT"
     }
 
-    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String> {
+    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
         let output = self
             .runner
             .run("wt", &["list", "--format=json"], repo_root)
             .await?;
         let json = Self::strip_to_json(&output);
         let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let mut checkouts: Vec<Checkout> =
+        let mut checkouts: Vec<(PathBuf, Checkout)> =
             worktrees.into_iter().map(|wt| wt.into_checkout()).collect();
 
         // Enrich with issue links from git config
         let futures: Vec<_> = checkouts
             .iter()
-            .map(|co| super::read_branch_issue_links(repo_root, &co.branch, &*self.runner))
+            .map(|(_, co)| super::read_branch_issue_links(repo_root, &co.branch, &*self.runner))
             .collect();
         let all_links = futures::future::join_all(futures).await;
-        for (co, links) in checkouts.iter_mut().zip(all_links) {
+        for ((_, co), links) in checkouts.iter_mut().zip(all_links) {
             co.association_keys = links;
         }
 
@@ -152,7 +155,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         repo_root: &Path,
         branch: &str,
         create_branch: bool,
-    ) -> Result<Checkout, String> {
+    ) -> Result<(PathBuf, Checkout), String> {
         info!("wt: creating worktree for {branch} (create_branch={create_branch})");
         if create_branch {
             self.runner

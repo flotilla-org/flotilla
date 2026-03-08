@@ -40,8 +40,8 @@ impl IssueCache {
 
     pub fn merge_page(&mut self, page: IssuePage) {
         let entries = Arc::make_mut(&mut self.entries);
-        for issue in page.issues {
-            entries.insert(issue.id.clone(), issue);
+        for (id, issue) in page.issues {
+            entries.insert(id, issue);
         }
         self.next_page += 1;
         self.has_more = page.has_more;
@@ -63,11 +63,11 @@ impl IssueCache {
             .collect()
     }
 
-    pub fn add_pinned(&mut self, issues: Vec<Issue>) {
+    pub fn add_pinned(&mut self, issues: Vec<(String, Issue)>) {
         let entries = Arc::make_mut(&mut self.entries);
-        for issue in issues {
-            self.pinned.insert(issue.id.clone());
-            entries.insert(issue.id.clone(), issue);
+        for (id, issue) in issues {
+            self.pinned.insert(id.clone());
+            entries.insert(id, issue);
         }
     }
 
@@ -81,13 +81,15 @@ impl IssueCache {
 mod tests {
     use super::*;
 
-    fn issue(id: &str) -> Issue {
-        Issue {
-            id: id.to_string(),
-            title: format!("Issue {}", id),
-            labels: vec![],
-            association_keys: vec![],
-        }
+    fn issue(id: &str) -> (String, Issue) {
+        (
+            id.to_string(),
+            Issue {
+                title: format!("Issue {}", id),
+                labels: vec![],
+                association_keys: vec![],
+            },
+        )
     }
 
     #[test]

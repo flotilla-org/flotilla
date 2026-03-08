@@ -65,7 +65,7 @@ pub struct Snapshot {
     #[serde(default)]
     pub issue_has_more: bool,
     #[serde(default)]
-    pub issue_search_results: Option<Vec<Issue>>,
+    pub issue_search_results: Option<Vec<(String, Issue)>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

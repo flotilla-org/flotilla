@@ -446,17 +446,12 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
         .iter()
         .filter_map(|wi| wi.branch().map(|b| b.to_string()))
         .collect();
-    let merged_set: HashSet<&str> = providers
-        .merged_branches
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    for b in &providers.remote_branches {
-        if b.as_str() != "HEAD"
+    for (b, branch_info) in &providers.branches {
+        if branch_info.status == flotilla_protocol::BranchStatus::Remote
+            && b.as_str() != "HEAD"
             && b.as_str() != "main"
             && b.as_str() != "master"
             && !known_branches.contains(b.as_str())
-            && !merged_set.contains(b.as_str())
         {
             work_items.push(CorrelationResult::Standalone(
                 StandaloneResult::RemoteBranch { branch: b.clone() },
@@ -780,7 +775,6 @@ mod tests {
         let p = PathBuf::from(path);
         Checkout {
             branch: branch.to_string(),
-            path: p.clone(),
             is_trunk,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
@@ -794,9 +788,8 @@ mod tests {
         }
     }
 
-    fn make_change_request(id: &str, title: &str, branch: &str) -> ChangeRequest {
+    fn make_change_request(_id: &str, title: &str, branch: &str) -> ChangeRequest {
         ChangeRequest {
-            id: id.to_string(),
             title: title.to_string(),
             branch: branch.to_string(),
             status: ChangeRequestStatus::Open,
@@ -816,7 +809,6 @@ mod tests {
             id.to_string(),
         ));
         CloudAgentSession {
-            id: id.to_string(),
             title: title.to_string(),
             status: SessionStatus::Running,
             model: None,
@@ -825,9 +817,8 @@ mod tests {
         }
     }
 
-    fn make_issue(id: &str, title: &str) -> Issue {
+    fn make_issue(_id: &str, title: &str) -> Issue {
         Issue {
-            id: id.to_string(),
             title: title.to_string(),
             labels: vec![],
             association_keys: vec![],
@@ -835,13 +826,12 @@ mod tests {
     }
 
     fn make_workspace(
-        ws_ref: &str,
+        _ws_ref: &str,
         name: &str,
         directories: Vec<PathBuf>,
         correlation_keys: Vec<CorrelationKey>,
     ) -> Workspace {
         Workspace {
-            ws_ref: ws_ref.to_string(),
             name: name.to_string(),
             directories,
             correlation_keys,
@@ -1399,9 +1389,12 @@ mod tests {
     #[test]
     fn correlate_remote_branches_appear_as_standalone() {
         let mut providers = new_providers();
-        providers
-            .remote_branches
-            .push("feature/remote-only".to_string());
+        providers.branches.insert(
+            "feature/remote-only".to_string(),
+            flotilla_protocol::delta::Branch {
+                status: flotilla_protocol::BranchStatus::Remote,
+            },
+        );
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1412,12 +1405,21 @@ mod tests {
     #[test]
     fn correlate_remote_branches_excludes_head_main_master() {
         let mut providers = new_providers();
-        providers.remote_branches.push("HEAD".to_string());
-        providers.remote_branches.push("main".to_string());
-        providers.remote_branches.push("master".to_string());
+        let remote = flotilla_protocol::delta::Branch {
+            status: flotilla_protocol::BranchStatus::Remote,
+        };
         providers
-            .remote_branches
-            .push("feature/visible".to_string());
+            .branches
+            .insert("HEAD".to_string(), remote.clone());
+        providers
+            .branches
+            .insert("main".to_string(), remote.clone());
+        providers
+            .branches
+            .insert("master".to_string(), remote.clone());
+        providers
+            .branches
+            .insert("feature/visible".to_string(), remote);
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1433,7 +1435,12 @@ mod tests {
             make_checkout("feat-z", "/tmp/feat-z", false),
         );
         // Same branch also in remote
-        providers.remote_branches.push("feat-z".to_string());
+        providers.branches.insert(
+            "feat-z".to_string(),
+            flotilla_protocol::delta::Branch {
+                status: flotilla_protocol::BranchStatus::Remote,
+            },
+        );
 
         let (items, _) = correlate(&providers);
         // Should only have the checkout, not a duplicate remote
@@ -1445,10 +1452,14 @@ mod tests {
     }
 
     #[test]
-    fn correlate_remote_branches_excludes_merged() {
+    fn correlate_merged_branches_excluded() {
         let mut providers = new_providers();
-        providers.remote_branches.push("already-merged".to_string());
-        providers.merged_branches.push("already-merged".to_string());
+        providers.branches.insert(
+            "already-merged".to_string(),
+            flotilla_protocol::delta::Branch {
+                status: flotilla_protocol::BranchStatus::Merged,
+            },
+        );
 
         let (items, _) = correlate(&providers);
         assert!(items.is_empty());
@@ -1849,7 +1860,6 @@ mod tests {
         providers.sessions.insert(
             "s-old".to_string(),
             CloudAgentSession {
-                id: "s-old".to_string(),
                 title: "Old".to_string(),
                 status: SessionStatus::Idle,
                 model: None,
@@ -1860,7 +1870,6 @@ mod tests {
         providers.sessions.insert(
             "s-new".to_string(),
             CloudAgentSession {
-                id: "s-new".to_string(),
                 title: "New".to_string(),
                 status: SessionStatus::Running,
                 model: None,
@@ -1871,7 +1880,6 @@ mod tests {
         providers.sessions.insert(
             "s-mid".to_string(),
             CloudAgentSession {
-                id: "s-mid".to_string(),
                 title: "Mid".to_string(),
                 status: SessionStatus::Running,
                 model: None,
@@ -1959,9 +1967,12 @@ mod tests {
             .issues
             .insert("55".to_string(), make_issue("55", "Improve docs"));
         // remote-only branch
-        providers
-            .remote_branches
-            .push("experiment/alpha".to_string());
+        providers.branches.insert(
+            "experiment/alpha".to_string(),
+            flotilla_protocol::delta::Branch {
+                status: flotilla_protocol::BranchStatus::Remote,
+            },
+        );
 
         let (work_items, _) = correlate(&providers);
 

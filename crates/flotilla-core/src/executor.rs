@@ -31,8 +31,13 @@ pub async fn execute(
             if let Some(co) = providers_data.checkouts.get(&checkout_path).cloned() {
                 info!("entering workspace for {}", co.branch);
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                    let config =
-                        workspace_config(repo_root, &co.branch, &co.path, "claude", config_base);
+                    let config = workspace_config(
+                        repo_root,
+                        &co.branch,
+                        &checkout_path,
+                        "claude",
+                        config_base,
+                    );
                     if let Err(e) = ws_mgr.create_workspace(&config).await {
                         return CommandResult::Error { message: e };
                     }
@@ -67,18 +72,18 @@ pub async fn execute(
                 None
             };
             match checkout_result {
-                Some(Ok(checkout)) => {
+                Some(Ok((checkout_path, _checkout))) => {
                     // Write issue links to git config
                     if !issue_ids.is_empty() {
                         write_branch_issue_links(repo_root, &branch, &issue_ids, runner).await;
                     }
-                    info!("created checkout at {}", checkout.path.display());
+                    info!("created checkout at {}", checkout_path.display());
                     // Create workspace if manager available
                     if let Some((_, ws_mgr)) = &registry.workspace_manager {
                         let config = workspace_config(
                             repo_root,
                             &branch,
-                            &checkout.path,
+                            &checkout_path,
                             "claude",
                             config_base,
                         );
@@ -232,8 +237,12 @@ pub async fn execute(
         Command::GenerateBranchName { issue_keys } => {
             let issues: Vec<(String, String)> = issue_keys
                 .iter()
-                .filter_map(|k| providers_data.issues.get(k.as_str()))
-                .map(|issue| (issue.id.clone(), issue.title.clone()))
+                .filter_map(|k| {
+                    providers_data
+                        .issues
+                        .get(k.as_str())
+                        .map(|issue| (k.clone(), issue.title.clone()))
+                })
                 .collect();
 
             // Collect (provider_name, issue_id) pairs for the created branch
@@ -298,14 +307,14 @@ pub async fn execute(
                 .unwrap_or_else(|| "claude".into());
             let teleport_cmd = format!("{} --teleport {}", claude_bin, session_id);
             let wt_path = if let Some(ref key) = checkout_key {
-                providers_data.checkouts.get(key).map(|co| co.path.clone())
+                providers_data.checkouts.get(key).map(|_| key.clone())
             } else if let Some(branch_name) = &branch {
                 let checkout_result = if let Some(cm) = registry.checkout_managers.values().next() {
                     cm.create_checkout(repo_root, branch_name, false).await.ok()
                 } else {
                     None
                 };
-                checkout_result.map(|c| c.path)
+                checkout_result.map(|(path, _)| path)
             } else {
                 None
             };
@@ -414,24 +423,26 @@ mod tests {
 
     /// A mock CheckoutManager that returns a canned checkout or error.
     struct MockCheckoutManager {
-        create_result: tokio::sync::Mutex<Option<Result<Checkout, String>>>,
+        create_result: tokio::sync::Mutex<Option<Result<(PathBuf, Checkout), String>>>,
         remove_result: tokio::sync::Mutex<Option<Result<(), String>>>,
     }
 
     impl MockCheckoutManager {
         fn succeeding(branch: &str, path: &str) -> Self {
             Self {
-                create_result: tokio::sync::Mutex::new(Some(Ok(Checkout {
-                    branch: branch.to_string(),
-                    path: PathBuf::from(path),
-                    is_trunk: false,
-                    trunk_ahead_behind: None,
-                    remote_ahead_behind: None,
-                    working_tree: None,
-                    last_commit: None,
-                    correlation_keys: vec![],
-                    association_keys: vec![],
-                }))),
+                create_result: tokio::sync::Mutex::new(Some(Ok((
+                    PathBuf::from(path),
+                    Checkout {
+                        branch: branch.to_string(),
+                        is_trunk: false,
+                        trunk_ahead_behind: None,
+                        remote_ahead_behind: None,
+                        working_tree: None,
+                        last_commit: None,
+                        correlation_keys: vec![],
+                        association_keys: vec![],
+                    },
+                )))),
                 remove_result: tokio::sync::Mutex::new(Some(Ok(()))),
             }
         }
@@ -449,7 +460,10 @@ mod tests {
         fn display_name(&self) -> &str {
             "mock-checkout"
         }
-        async fn list_checkouts(&self, _repo_root: &Path) -> Result<Vec<Checkout>, String> {
+        async fn list_checkouts(
+            &self,
+            _repo_root: &Path,
+        ) -> Result<Vec<(PathBuf, Checkout)>, String> {
             Ok(vec![])
         }
         async fn create_checkout(
@@ -457,7 +471,7 @@ mod tests {
             _repo_root: &Path,
             _branch: &str,
             _create_branch: bool,
-        ) -> Result<Checkout, String> {
+        ) -> Result<(PathBuf, Checkout), String> {
             self.create_result
                 .lock()
                 .await
@@ -500,18 +514,23 @@ mod tests {
         fn display_name(&self) -> &str {
             "mock-ws"
         }
-        async fn list_workspaces(&self) -> Result<Vec<Workspace>, String> {
+        async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
             Ok(vec![])
         }
-        async fn create_workspace(&self, _config: &WorkspaceConfig) -> Result<Workspace, String> {
+        async fn create_workspace(
+            &self,
+            _config: &WorkspaceConfig,
+        ) -> Result<(String, Workspace), String> {
             let result = self.create_result.lock().await;
             match &*result {
-                Ok(()) => Ok(Workspace {
-                    ws_ref: "mock-ref".to_string(),
-                    name: "mock".to_string(),
-                    directories: vec![],
-                    correlation_keys: vec![],
-                }),
+                Ok(()) => Ok((
+                    "mock-ref".to_string(),
+                    Workspace {
+                        name: "mock".to_string(),
+                        directories: vec![],
+                        correlation_keys: vec![],
+                    },
+                )),
                 Err(e) => Err(e.clone()),
             }
         }
@@ -533,14 +552,14 @@ mod tests {
             &self,
             _repo_root: &Path,
             _limit: usize,
-        ) -> Result<Vec<ChangeRequest>, String> {
+        ) -> Result<Vec<(String, ChangeRequest)>, String> {
             Ok(vec![])
         }
         async fn get_change_request(
             &self,
             _repo_root: &Path,
             _id: &str,
-        ) -> Result<ChangeRequest, String> {
+        ) -> Result<(String, ChangeRequest), String> {
             Err("not implemented".to_string())
         }
         async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
@@ -567,7 +586,7 @@ mod tests {
             &self,
             _repo_root: &Path,
             _limit: usize,
-        ) -> Result<Vec<Issue>, String> {
+        ) -> Result<Vec<(String, Issue)>, String> {
             Ok(vec![])
         }
         async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
@@ -602,7 +621,7 @@ mod tests {
         async fn list_sessions(
             &self,
             _criteria: &RepoCriteria,
-        ) -> Result<Vec<CloudAgentSession>, String> {
+        ) -> Result<Vec<(String, CloudAgentSession)>, String> {
             Ok(vec![])
         }
         async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
@@ -664,10 +683,9 @@ mod tests {
         PathBuf::from("/tmp/test-config")
     }
 
-    fn make_checkout(branch: &str, path: &str) -> Checkout {
+    fn make_checkout(branch: &str, _path: &str) -> Checkout {
         Checkout {
             branch: branch.to_string(),
-            path: PathBuf::from(path),
             is_trunk: false,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
@@ -678,9 +696,8 @@ mod tests {
         }
     }
 
-    fn make_session(id: &str) -> CloudAgentSession {
+    fn make_session(_id: &str) -> CloudAgentSession {
         CloudAgentSession {
-            id: id.to_string(),
             title: "test session".to_string(),
             status: SessionStatus::Running,
             model: None,
@@ -689,9 +706,8 @@ mod tests {
         }
     }
 
-    fn make_issue(id: &str, title: &str) -> Issue {
+    fn make_issue(_id: &str, title: &str) -> Issue {
         Issue {
-            id: id.to_string(),
             title: title.to_string(),
             labels: vec![],
             association_keys: vec![],

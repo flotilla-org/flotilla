@@ -198,7 +198,7 @@ mod tests {
         async fn list_checkouts(
             &self,
             _: &Path,
-        ) -> Result<Vec<crate::providers::types::Checkout>, String> {
+        ) -> Result<Vec<(PathBuf, crate::providers::types::Checkout)>, String> {
             Ok(vec![])
         }
         async fn create_checkout(
@@ -206,7 +206,7 @@ mod tests {
             _: &Path,
             _: &str,
             _: bool,
-        ) -> Result<crate::providers::types::Checkout, String> {
+        ) -> Result<(PathBuf, crate::providers::types::Checkout), String> {
             Err("stub".into())
         }
         async fn remove_checkout(&self, _: &Path, _: &str) -> Result<(), String> {
@@ -233,14 +233,14 @@ mod tests {
             &self,
             _: &Path,
             _: usize,
-        ) -> Result<Vec<crate::providers::types::ChangeRequest>, String> {
+        ) -> Result<Vec<(String, crate::providers::types::ChangeRequest)>, String> {
             Ok(vec![])
         }
         async fn get_change_request(
             &self,
             _: &Path,
             _: &str,
-        ) -> Result<crate::providers::types::ChangeRequest, String> {
+        ) -> Result<(String, crate::providers::types::ChangeRequest), String> {
             Err("stub".into())
         }
         async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
@@ -274,7 +274,7 @@ mod tests {
             &self,
             _: &Path,
             _: usize,
-        ) -> Result<Vec<crate::providers::types::Issue>, String> {
+        ) -> Result<Vec<(String, crate::providers::types::Issue)>, String> {
             Ok(vec![])
         }
         async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
@@ -300,7 +300,7 @@ mod tests {
         async fn list_sessions(
             &self,
             _: &RepoCriteria,
-        ) -> Result<Vec<crate::providers::types::CloudAgentSession>, String> {
+        ) -> Result<Vec<(String, crate::providers::types::CloudAgentSession)>, String> {
             Ok(vec![])
         }
         async fn archive_session(&self, _: &str) -> Result<(), String> {
@@ -328,13 +328,15 @@ mod tests {
         fn display_name(&self) -> &str {
             "StubWM"
         }
-        async fn list_workspaces(&self) -> Result<Vec<crate::providers::types::Workspace>, String> {
+        async fn list_workspaces(
+            &self,
+        ) -> Result<Vec<(String, crate::providers::types::Workspace)>, String> {
             Ok(vec![])
         }
         async fn create_workspace(
             &self,
             _: &crate::providers::types::WorkspaceConfig,
-        ) -> Result<crate::providers::types::Workspace, String> {
+        ) -> Result<(String, crate::providers::types::Workspace), String> {
             Err("stub".into())
         }
         async fn select_workspace(&self, _: &str) -> Result<(), String> {

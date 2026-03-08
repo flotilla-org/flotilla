@@ -144,7 +144,7 @@ impl GitCheckoutManager {
         branch: &str,
         is_trunk: bool,
         default_branch: &str,
-    ) -> Checkout {
+    ) -> (PathBuf, Checkout) {
         let correlation_keys = vec![
             CorrelationKey::Branch(branch.to_string()),
             CorrelationKey::CheckoutPath(path.to_path_buf()),
@@ -204,17 +204,19 @@ impl GitCheckoutManager {
             async { super::read_branch_issue_links(path, branch, &*self.runner).await },
         );
 
-        Checkout {
-            branch: branch.to_string(),
-            path: path.to_path_buf(),
-            is_trunk,
-            trunk_ahead_behind: trunk_ab,
-            remote_ahead_behind: remote_ab,
-            working_tree: wt_status,
-            last_commit: commit,
-            correlation_keys,
-            association_keys: issue_links,
-        }
+        (
+            path.to_path_buf(),
+            Checkout {
+                branch: branch.to_string(),
+                is_trunk,
+                trunk_ahead_behind: trunk_ab,
+                remote_ahead_behind: remote_ab,
+                working_tree: wt_status,
+                last_commit: commit,
+                correlation_keys,
+                association_keys: issue_links,
+            },
+        )
     }
 }
 
@@ -242,7 +244,7 @@ impl super::CheckoutManager for GitCheckoutManager {
         "WT"
     }
 
-    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String> {
+    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
         let output = self
             .runner
             .run("git", &["worktree", "list", "--porcelain"], repo_root)
@@ -265,7 +267,7 @@ impl super::CheckoutManager for GitCheckoutManager {
         repo_root: &Path,
         branch: &str,
         _create_branch: bool,
-    ) -> Result<Checkout, String> {
+    ) -> Result<(PathBuf, Checkout), String> {
         let wt_path = self.render_worktree_path(repo_root, branch)?;
         info!(
             "git: creating worktree for {branch} at {}",

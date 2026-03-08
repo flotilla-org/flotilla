@@ -49,11 +49,14 @@ fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
 fn inject_issues(
     base_providers: &ProviderData,
     cache: &IssueCache,
-    search_results: &Option<Vec<Issue>>,
+    search_results: &Option<Vec<(String, Issue)>>,
 ) -> ProviderData {
     let mut providers = base_providers.clone();
     if let Some(ref results) = search_results {
-        providers.issues = results.iter().map(|i| (i.id.clone(), i.clone())).collect();
+        providers.issues = results
+            .iter()
+            .map(|(id, i)| (id.clone(), i.clone()))
+            .collect();
     } else {
         providers.issues = (*cache.to_index_map()).clone();
     }
@@ -67,7 +70,7 @@ fn build_repo_snapshot(
     base: &RefreshSnapshot,
     health: &HashMap<&'static str, bool>,
     cache: &IssueCache,
-    search_results: &Option<Vec<Issue>>,
+    search_results: &Option<Vec<(String, Issue)>>,
 ) -> Snapshot {
     let providers = Arc::new(inject_issues(&base.providers, cache, search_results));
     let (work_items, correlation_groups) = crate::data::correlate(&providers);
@@ -91,7 +94,7 @@ struct RepoState {
     seq: u64,
     last_snapshot: Arc<RefreshSnapshot>,
     issue_cache: IssueCache,
-    search_results: Option<Vec<Issue>>,
+    search_results: Option<Vec<(String, Issue)>>,
     /// Serializes issue fetch operations for this repo to prevent concurrent page skips.
     issue_fetch_mutex: Arc<Mutex<()>>,
 }

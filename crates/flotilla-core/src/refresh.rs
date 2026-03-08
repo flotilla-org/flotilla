@@ -178,7 +178,6 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|co| (co.path.clone(), co))
         .collect();
     pd.change_requests = crs
         .unwrap_or_else(|e| {
@@ -189,7 +188,6 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|cr| (cr.id.clone(), cr))
         .collect();
     pd.workspaces = workspaces
         .unwrap_or_else(|e| {
@@ -200,7 +198,6 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|ws| (ws.ws_ref.clone(), ws))
         .collect();
     pd.sessions = sessions
         .unwrap_or_else(|e| {
@@ -211,22 +208,40 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|s| (s.id.clone(), s))
         .collect();
-    pd.remote_branches = branches.unwrap_or_else(|e| {
-        errors.push(RefreshError {
-            category: "branches",
-            message: e,
+    {
+        use flotilla_protocol::delta::{Branch, BranchStatus};
+        let remote = branches.unwrap_or_else(|e| {
+            errors.push(RefreshError {
+                category: "branches",
+                message: e,
+            });
+            Vec::new()
         });
-        Vec::new()
-    });
-    pd.merged_branches = merged.unwrap_or_else(|e| {
-        errors.push(RefreshError {
-            category: "merged",
-            message: e,
+        let merged_names = merged.unwrap_or_else(|e| {
+            errors.push(RefreshError {
+                category: "merged",
+                message: e,
+            });
+            Vec::new()
         });
-        Vec::new()
-    });
+        for name in remote {
+            pd.branches.insert(
+                name,
+                Branch {
+                    status: BranchStatus::Remote,
+                },
+            );
+        }
+        for name in merged_names {
+            pd.branches.insert(
+                name,
+                Branch {
+                    status: BranchStatus::Merged,
+                },
+            );
+        }
+    }
 
     errors
 }

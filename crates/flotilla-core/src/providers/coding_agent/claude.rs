@@ -253,7 +253,7 @@ impl super::CodingAgent for ClaudeCodingAgent {
     async fn list_sessions(
         &self,
         criteria: &RepoCriteria,
-    ) -> Result<Vec<CloudAgentSession>, String> {
+    ) -> Result<Vec<(String, CloudAgentSession)>, String> {
         // Check instance cache
         let cached = {
             let cache = self.sessions_cache.lock().unwrap();
@@ -324,9 +324,10 @@ impl super::CodingAgent for ClaudeCodingAgent {
                     Some(s.session_context.model.clone())
                 };
 
+                let id = s.id.clone();
                 let mut correlation_keys = vec![CorrelationKey::SessionRef(
                     provider_name.clone(),
-                    s.id.clone(),
+                    id.clone(),
                 )];
 
                 // Add branch correlation key if available
@@ -338,14 +339,16 @@ impl super::CodingAgent for ClaudeCodingAgent {
                     correlation_keys.push(CorrelationKey::Branch(clean));
                 }
 
-                CloudAgentSession {
-                    id: s.id,
-                    title: s.title,
-                    status,
-                    model,
-                    updated_at: Some(s.updated_at.clone()),
-                    correlation_keys,
-                }
+                (
+                    id,
+                    CloudAgentSession {
+                        title: s.title,
+                        status,
+                        model,
+                        updated_at: Some(s.updated_at.clone()),
+                        correlation_keys,
+                    },
+                )
             })
             .collect())
     }
