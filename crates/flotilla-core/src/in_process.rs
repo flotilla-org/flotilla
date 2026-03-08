@@ -91,6 +91,48 @@ fn build_repo_snapshot(
     snapshot
 }
 
+/// Choose whether to broadcast a full snapshot or a delta.
+///
+/// Sends a full snapshot when:
+/// - This is the first broadcast (prev_seq == 0)
+/// - The delta has no changes (shouldn't happen, but avoids empty deltas)
+/// - The serialized delta is larger than the serialized full snapshot
+///
+/// Otherwise sends a delta.
+fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
+    // First broadcast or empty delta → always send full
+    if delta.prev_seq == 0 || delta.changes.is_empty() {
+        return DaemonEvent::SnapshotFull(Box::new(snapshot));
+    }
+
+    let snapshot_delta = flotilla_protocol::SnapshotDelta {
+        seq: delta.seq,
+        prev_seq: delta.prev_seq,
+        repo: snapshot.repo.clone(),
+        changes: delta.changes,
+        issue_total: snapshot.issue_total,
+        issue_has_more: snapshot.issue_has_more,
+        issue_search_results: snapshot.issue_search_results.clone(),
+    };
+
+    // Compare serialized sizes — if delta is larger, send full
+    let delta_size = serde_json::to_string(&snapshot_delta).map(|s| s.len());
+    let full_size = serde_json::to_string(&snapshot).map(|s| s.len());
+
+    match (delta_size, full_size) {
+        (Ok(d), Ok(f)) if d < f => {
+            debug!(
+                "delta ({d} bytes) smaller than full ({f} bytes), sending delta"
+            );
+            DaemonEvent::SnapshotDelta(Box::new(snapshot_delta))
+        }
+        _ => {
+            debug!("sending full snapshot (delta not smaller)");
+            DaemonEvent::SnapshotFull(Box::new(snapshot))
+        }
+    }
+}
+
 /// Maximum number of delta entries retained per repo.
 const DELTA_LOG_CAPACITY: usize = 16;
 
@@ -185,7 +227,7 @@ impl InProcessDaemon {
     ///
     /// Returns `Arc<Self>` because a background poll task is spawned that
     /// holds a reference. The poll loop checks every 100ms for new refresh
-    /// snapshots and broadcasts `DaemonEvent::Snapshot` for each change.
+    /// snapshots and broadcasts delta or full events for each change.
     pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
@@ -249,7 +291,7 @@ impl InProcessDaemon {
     ///
     /// For each repo whose background refresh has produced a new snapshot,
     /// update internal state, increment the sequence number, and broadcast
-    /// a `DaemonEvent::Snapshot`.
+    /// a `DaemonEvent::SnapshotFull` or `DaemonEvent::SnapshotDelta`.
     ///
     /// Called automatically by the background poll loop spawned in `new()`.
     async fn poll_snapshots(&self) {
@@ -352,10 +394,8 @@ impl InProcessDaemon {
             state.seq += 1;
             state.last_snapshot = snapshot;
 
-            // Still broadcast full snapshot for now (Task 14 will switch to delta)
-            let _ = self
-                .event_tx
-                .send(DaemonEvent::Snapshot(Box::new(proto_snapshot)));
+            let event = choose_event(proto_snapshot, delta_entry);
+            let _ = self.event_tx.send(event);
         }
 
         // After broadcasting, check for linked issues that aren't cached yet
@@ -553,18 +593,9 @@ impl InProcessDaemon {
             &proto_snapshot.work_items,
             &proto_snapshot.provider_health,
         );
-        if !delta_entry.changes.is_empty() {
-            debug!(
-                "repo {}: issue broadcast delta with {} changes",
-                repo.display(),
-                delta_entry.changes.len()
-            );
-        }
 
-        // Still broadcast full snapshot for now (Task 14 will switch to delta)
-        let _ = self
-            .event_tx
-            .send(DaemonEvent::Snapshot(Box::new(proto_snapshot)));
+        let event = choose_event(proto_snapshot, delta_entry);
+        let _ = self.event_tx.send(event);
     }
 }
 

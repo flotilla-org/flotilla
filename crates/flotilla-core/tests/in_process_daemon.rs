@@ -18,10 +18,14 @@ async fn daemon_broadcasts_snapshots() {
         .expect("recv error");
 
     match event {
-        DaemonEvent::Snapshot(snap) => {
+        DaemonEvent::SnapshotFull(snap) => {
             assert_eq!(snap.repo, repo);
             assert!(snap.seq > 0);
         }
-        other => panic!("expected Snapshot, got {:?}", other),
+        DaemonEvent::SnapshotDelta(delta) => {
+            assert_eq!(delta.repo, repo);
+            assert!(delta.seq > 0);
+        }
+        other => panic!("expected SnapshotFull or SnapshotDelta, got {:?}", other),
     }
 }

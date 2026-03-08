@@ -127,8 +127,13 @@ impl Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum DaemonEvent {
-    #[serde(rename = "snapshot")]
-    Snapshot(Box<Snapshot>),
+    /// Full snapshot — sent on initial connect, after seq gaps, or when delta
+    /// would be larger than the full snapshot.
+    #[serde(rename = "snapshot_full")]
+    SnapshotFull(Box<Snapshot>),
+    /// Incremental delta — sent when only a subset of data changed.
+    #[serde(rename = "snapshot_delta")]
+    SnapshotDelta(Box<SnapshotDelta>),
     #[serde(rename = "repo_added")]
     RepoAdded(Box<RepoInfo>),
     #[serde(rename = "repo_removed")]
@@ -140,6 +145,19 @@ pub enum DaemonEvent {
         repo: std::path::PathBuf,
         result: commands::CommandResult,
     },
+}
+
+/// A delta update for a repo snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotDelta {
+    pub seq: u64,
+    pub prev_seq: u64,
+    pub repo: std::path::PathBuf,
+    pub changes: Vec<Change>,
+    /// Issue metadata (not part of delta log, but needed by TUI).
+    pub issue_total: Option<u32>,
+    pub issue_has_more: bool,
+    pub issue_search_results: Option<Vec<(String, Issue)>>,
 }
 
 #[cfg(test)]
@@ -257,13 +275,13 @@ mod tests {
             issue_search_results: None,
         };
         let msg = Message::Event {
-            event: Box::new(DaemonEvent::Snapshot(Box::new(snapshot))),
+            event: Box::new(DaemonEvent::SnapshotFull(Box::new(snapshot))),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
             Message::Event { event } => match *event {
-                DaemonEvent::Snapshot(snap) => {
+                DaemonEvent::SnapshotFull(snap) => {
                     let snap = *snap;
                     assert_eq!(snap.seq, 7);
                     assert_eq!(snap.repo, PathBuf::from("/tmp/my-repo"));
