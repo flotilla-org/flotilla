@@ -4,6 +4,7 @@ use std::sync::{LazyLock, Mutex};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 
 /// Entry returned to the UI. Either a real log line or a retention marker.
@@ -257,8 +258,12 @@ pub fn init() {
         .with_ansi(false)
         .with_target(false);
 
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::DEBUG.into())
+        .from_env_lossy();
+
     tracing_subscriber::registry()
-        .with(LevelFilter::DEBUG)
+        .with(filter)
         .with(file_layer)
         .with(TuiLayer)
         .init();

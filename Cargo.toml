@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive"] }
 tui-input = "0.10"
 tracing = { workspace = true }
 serde_json = { workspace = true }
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "0.25.9"
 libc = "0.2"

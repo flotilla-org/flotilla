@@ -121,7 +121,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     };
 
     let mut terminal = ratatui::init();
-    show_splash(&mut terminal)?;
+    show_splash(&mut terminal).await?;
     execute!(stdout(), EnableMouseCapture)?;
 
     let repos_info = daemon.list_repos().await.unwrap_or_default();
@@ -343,9 +343,12 @@ async fn connect_or_spawn(
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     // Initialize logging to stderr (no TUI here)
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into())
+        .from_env_lossy();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(filter)
         .init();
 
     let socket_path = cli.socket_path();
@@ -429,7 +432,7 @@ async fn run_watch(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+async fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     use ratatui_image::{
         picker::{cap_parser::QueryStdioOptions, Picker},
         StatefulImage,
@@ -470,14 +473,8 @@ fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         f.render_stateful_widget(widget, area, &mut protocol);
     })?;
 
-    let visible_deadline = std::time::Instant::now() + min_visible;
-    loop {
-        let remaining = visible_deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(50)));
-    }
+    tokio::time::sleep(min_visible).await;
+
     // Drop any queued startup input (e.g. launch Enter key) so it doesn't
     // trigger immediate actions in the main event loop.
     while crossterm::event::poll(Duration::from_millis(0))? {
