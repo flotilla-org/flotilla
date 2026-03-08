@@ -121,8 +121,8 @@ async fn run_tui(cli: Cli) -> Result<()> {
     };
 
     let mut terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture)?;
     show_splash(&mut terminal)?;
+    execute!(stdout(), EnableMouseCapture)?;
 
     let repos_info = daemon.list_repos().await.unwrap_or_default();
     let mut app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config));
@@ -345,6 +345,7 @@ async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     // Initialize logging to stderr (no TUI here)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::DEBUG)
         .init();
 
     let socket_path = cli.socket_path();
@@ -429,45 +430,58 @@ async fn run_watch(cli: &Cli) -> Result<()> {
 }
 
 fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-    use ratatui_image::{picker::Picker, StatefulImage};
+    use ratatui_image::{
+        picker::{cap_parser::QueryStdioOptions, Picker},
+        StatefulImage,
+    };
 
-    let img_bytes = include_bytes!("../assets/splash.png");
+    let img_bytes = include_bytes!("../assets/splash.webp");
     let dyn_img = image::load_from_memory(img_bytes)
         .map_err(|e| color_eyre::eyre::eyre!("splash image: {e}"))?;
-
     let img_w = dyn_img.width() as f64;
     let img_h = dyn_img.height() as f64;
 
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let query_timeout_ms = std::env::var("FLOTILLA_SPLASH_QUERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(120);
+    let mut query_options = QueryStdioOptions::default();
+    query_options.timeout = Duration::from_millis(query_timeout_ms);
+    let picker = Picker::from_query_stdio_with_options(query_options)
+        .unwrap_or_else(|_| Picker::halfblocks());
+
     let mut protocol = picker.new_resize_protocol(dyn_img);
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(700);
+    // Guarantee a minimum visible time after first render (not just after splash setup).
+    let min_visible = Duration::from_millis(700);
+    terminal.draw(|f| {
+        use ratatui::layout::{Constraint, Flex, Layout};
+        let area = f.area();
+        let scale = (area.width as f64 / img_w).min(area.height as f64 * 2.0 / img_h);
+        let rw = (img_w * scale) as u16;
+        let rh = (img_h * scale / 2.0) as u16;
+        let [area] = Layout::horizontal([Constraint::Length(rw.min(area.width))])
+            .flex(Flex::Center)
+            .areas(area);
+        let [area] = Layout::vertical([Constraint::Length(rh.min(area.height))])
+            .flex(Flex::Center)
+            .areas(area);
+        let widget = StatefulImage::default();
+        f.render_stateful_widget(widget, area, &mut protocol);
+    })?;
 
+    let visible_deadline = std::time::Instant::now() + min_visible;
     loop {
-        terminal.draw(|f| {
-            use ratatui::layout::{Constraint, Flex, Layout};
-            let area = f.area();
-            let scale = (area.width as f64 / img_w).min(area.height as f64 * 2.0 / img_h);
-            let rw = (img_w * scale) as u16;
-            let rh = (img_h * scale / 2.0) as u16;
-            let [area] = Layout::horizontal([Constraint::Length(rw.min(area.width))])
-                .flex(Flex::Center)
-                .areas(area);
-            let [area] = Layout::vertical([Constraint::Length(rh.min(area.height))])
-                .flex(Flex::Center)
-                .areas(area);
-            let widget = StatefulImage::default();
-            f.render_stateful_widget(widget, area, &mut protocol);
-        })?;
-
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = visible_deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
-        if crossterm::event::poll(remaining.min(Duration::from_millis(50)))? {
-            let _ = crossterm::event::read()?;
-            break;
-        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    // Drop any queued startup input (e.g. launch Enter key) so it doesn't
+    // trigger immediate actions in the main event loop.
+    while crossterm::event::poll(Duration::from_millis(0))? {
+        let _ = crossterm::event::read()?;
     }
     Ok(())
 }

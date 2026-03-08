@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -257,6 +258,7 @@ pub fn init() {
         .with_target(false);
 
     tracing_subscriber::registry()
+        .with(LevelFilter::DEBUG)
         .with(file_layer)
         .with(TuiLayer)
         .init();

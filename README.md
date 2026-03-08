@@ -5,7 +5,7 @@
 
 Development fleet management. Agents, branches, PRs, and workspaces across every repo in one view.
 
-![splash](assets/splash.png)
+![splash](assets/splash.webp)
 
 ![screenshot](assets/screenshot.png)
 
