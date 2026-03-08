@@ -551,8 +551,15 @@ impl DaemonHandle for InProcessDaemon {
             )
         };
 
-        let result =
-            executor::execute(command, &repo_root, &registry, &providers_data, &*runner).await;
+        let result = executor::execute(
+            command,
+            &repo_root,
+            &registry,
+            &providers_data,
+            &*runner,
+            self.config.base_path(),
+        )
+        .await;
 
         // Trigger a refresh after command execution
         {

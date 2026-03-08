@@ -128,6 +128,11 @@ impl ConfigStore {
         }
     }
 
+    /// The base config directory path.
+    pub fn base_path(&self) -> &Path {
+        &self.base
+    }
+
     fn repos_dir(&self) -> PathBuf {
         self.base.join("repos")
     }
