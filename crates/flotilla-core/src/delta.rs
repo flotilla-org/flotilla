@@ -99,6 +99,9 @@ pub fn apply_changes(pd: &mut ProviderData, changes: Vec<Change>) {
 ///
 /// Work items are keyed by `WorkItemIdentity`. The input slices are converted
 /// to IndexMaps internally for O(n) diffing.
+///
+/// Not currently called in production — kept for the client-side materialization
+/// path (delta replay on reconnect) planned in later PRs.
 pub fn diff_work_items(prev: &[WorkItem], curr: &[WorkItem]) -> Vec<Change> {
     let prev_map: IndexMap<WorkItemIdentity, WorkItem> = prev
         .iter()

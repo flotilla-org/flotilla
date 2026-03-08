@@ -143,7 +143,6 @@ struct RepoState {
     issue_fetch_mutex: Arc<Mutex<()>>,
     /// Last broadcast provider data (with injected issues), used for delta computation.
     last_broadcast_providers: ProviderData,
-    /// Last broadcast work items, used for delta computation.
     /// Last broadcast provider health, used for delta computation.
     last_broadcast_health: HashMap<String, bool>,
     /// Bounded delta log for replay on client reconnect.
