@@ -322,8 +322,8 @@ impl App {
             match change {
                 flotilla_protocol::Change::ProviderHealth {
                     provider,
-                    op: flotilla_protocol::EntryOp::Added(v)
-                    | flotilla_protocol::EntryOp::Updated(v),
+                    op:
+                        flotilla_protocol::EntryOp::Added(v) | flotilla_protocol::EntryOp::Updated(v),
                 } => {
                     rm.provider_health.insert(provider.clone(), *v);
                 }

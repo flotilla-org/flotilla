@@ -300,6 +300,50 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_delta_event_roundtrip() {
+        let delta = SnapshotDelta {
+            seq: 3,
+            prev_seq: 2,
+            repo: PathBuf::from("/tmp/my-repo"),
+            changes: vec![
+                Change::Branch {
+                    key: "feat-x".into(),
+                    op: EntryOp::Added(Branch {
+                        status: BranchStatus::Remote,
+                    }),
+                },
+                Change::Issue {
+                    key: "42".into(),
+                    op: EntryOp::Removed,
+                },
+            ],
+            issue_total: Some(100),
+            issue_has_more: true,
+            issue_search_results: None,
+        };
+        let msg = Message::Event {
+            event: Box::new(DaemonEvent::SnapshotDelta(Box::new(delta))),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Event { event } => match *event {
+                DaemonEvent::SnapshotDelta(d) => {
+                    assert_eq!(d.seq, 3);
+                    assert_eq!(d.prev_seq, 2);
+                    assert_eq!(d.repo, PathBuf::from("/tmp/my-repo"));
+                    assert_eq!(d.changes.len(), 2);
+                    assert_eq!(d.issue_total, Some(100));
+                    assert!(d.issue_has_more);
+                    assert!(d.issue_search_results.is_none());
+                }
+                other => panic!("expected SnapshotDelta, got {:?}", other),
+            },
+            other => panic!("expected Event, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn ok_response_builds_with_serialized_data() {
         let data = serde_json::json!({"count": 42, "name": "test"});
         let msg = Message::ok_response(7, &data);

@@ -90,8 +90,7 @@ pub fn apply_changes(pd: &mut ProviderData, changes: Vec<Change>) {
             Change::Branch { key, op } => apply_op(&mut pd.branches, key, op),
             // WorkItem and ProviderHealth are snapshot-level, not ProviderData-level.
             // They'll be handled at a higher layer.
-            Change::WorkItem { .. } | Change::ProviderHealth { .. } | Change::ErrorsChanged(_) => {
-            }
+            Change::WorkItem { .. } | Change::ProviderHealth { .. } | Change::ErrorsChanged(_) => {}
         }
     }
 }
@@ -189,8 +188,7 @@ mod tests {
     #[test]
     fn empty_to_entries_all_added() {
         let prev: IndexMap<String, i32> = IndexMap::new();
-        let curr: IndexMap<String, i32> =
-            IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
+        let curr: IndexMap<String, i32> = IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
         let changes = diff_indexmap(&prev, &curr);
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0], ("a".into(), EntryOp::Added(1)));
@@ -199,8 +197,7 @@ mod tests {
 
     #[test]
     fn entries_to_empty_all_removed() {
-        let prev: IndexMap<String, i32> =
-            IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
+        let prev: IndexMap<String, i32> = IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
         let curr: IndexMap<String, i32> = IndexMap::new();
         let changes = diff_indexmap(&prev, &curr);
         assert_eq!(changes.len(), 2);
@@ -210,17 +207,14 @@ mod tests {
 
     #[test]
     fn identical_no_changes() {
-        let map: IndexMap<String, i32> =
-            IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
+        let map: IndexMap<String, i32> = IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
         assert!(diff_indexmap(&map, &map).is_empty());
     }
 
     #[test]
     fn mixed_add_update_remove() {
-        let prev: IndexMap<String, i32> =
-            IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
-        let curr: IndexMap<String, i32> =
-            IndexMap::from([("a".into(), 10), ("c".into(), 3)]);
+        let prev: IndexMap<String, i32> = IndexMap::from([("a".into(), 1), ("b".into(), 2)]);
+        let curr: IndexMap<String, i32> = IndexMap::from([("a".into(), 10), ("c".into(), 3)]);
         let changes = diff_indexmap(&prev, &curr);
         assert_eq!(changes.len(), 3);
         assert!(changes.contains(&("a".into(), EntryOp::Updated(10))));
@@ -257,7 +251,10 @@ mod tests {
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::Checkout { key, op: EntryOp::Added(co) } => {
+            Change::Checkout {
+                key,
+                op: EntryOp::Added(co),
+            } => {
                 assert_eq!(key, &PathBuf::from("/wt/feat"));
                 assert_eq!(co.branch, "feat");
             }
@@ -274,7 +271,10 @@ mod tests {
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::Checkout { key, op: EntryOp::Removed } => {
+            Change::Checkout {
+                key,
+                op: EntryOp::Removed,
+            } => {
                 assert_eq!(key, &PathBuf::from("/wt/old"));
             }
             other => panic!("unexpected change: {other:?}"),
@@ -292,7 +292,10 @@ mod tests {
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::ChangeRequest { key, op: EntryOp::Updated(cr) } => {
+            Change::ChangeRequest {
+                key,
+                op: EntryOp::Updated(cr),
+            } => {
                 assert_eq!(key, "42");
                 assert_eq!(cr.title, "new title");
             }
@@ -319,8 +322,12 @@ mod tests {
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 2);
         // One added, one removed
-        let added = changes.iter().any(|c| matches!(c, Change::Branch { key, op: EntryOp::Added(_) } if key == "new-branch"));
-        let removed = changes.iter().any(|c| matches!(c, Change::Branch { key, op: EntryOp::Removed } if key == "old-branch"));
+        let added = changes.iter().any(
+            |c| matches!(c, Change::Branch { key, op: EntryOp::Added(_) } if key == "new-branch"),
+        );
+        let removed = changes.iter().any(
+            |c| matches!(c, Change::Branch { key, op: EntryOp::Removed } if key == "old-branch"),
+        );
         assert!(added, "expected new-branch Added");
         assert!(removed, "expected old-branch Removed");
     }
@@ -338,7 +345,7 @@ mod tests {
             .insert(PathBuf::from("/wt/main"), checkout("main")); // unchanged
         curr.issues.insert("1".into(), issue("bug fix")); // updated title
         curr.workspaces.insert("w1".into(), workspace("dev")); // added
-        // sessions removed
+                                                               // sessions removed
 
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 3);
@@ -388,8 +395,14 @@ mod tests {
         let changes = diff_work_items(&[], &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::WorkItem { identity, op: EntryOp::Added(wi) } => {
-                assert_eq!(identity, &flotilla_protocol::WorkItemIdentity::Session("s1".into()));
+            Change::WorkItem {
+                identity,
+                op: EntryOp::Added(wi),
+            } => {
+                assert_eq!(
+                    identity,
+                    &flotilla_protocol::WorkItemIdentity::Session("s1".into())
+                );
                 assert_eq!(wi.description, "new session");
             }
             other => panic!("unexpected: {other:?}"),
@@ -404,8 +417,10 @@ mod tests {
         )];
         let changes = diff_work_items(&prev, &[]);
         assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::WorkItem { identity, op: EntryOp::Removed }
-            if *identity == flotilla_protocol::WorkItemIdentity::Issue("i1".into())));
+        assert!(
+            matches!(&changes[0], Change::WorkItem { identity, op: EntryOp::Removed }
+            if *identity == flotilla_protocol::WorkItemIdentity::Issue("i1".into()))
+        );
     }
 
     #[test]
@@ -416,7 +431,10 @@ mod tests {
         let changes = diff_work_items(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::WorkItem { identity, op: EntryOp::Updated(wi) } => {
+            Change::WorkItem {
+                identity,
+                op: EntryOp::Updated(wi),
+            } => {
                 assert_eq!(identity, &id);
                 assert_eq!(wi.description, "new desc");
             }
@@ -506,7 +524,7 @@ mod tests {
             .insert(PathBuf::from("/wt/main"), checkout("main")); // unchanged
         curr.issues.insert("1".into(), issue("new bug")); // updated
         curr.workspaces.insert("w1".into(), workspace("dev")); // added
-        // sessions removed
+                                                               // sessions removed
 
         assert_roundtrip(&prev, &curr);
     }
