@@ -73,7 +73,7 @@ where
             map.insert(key, v);
         }
         EntryOp::Removed => {
-            map.swap_remove(&key);
+            map.shift_remove(&key);
         }
     }
 }

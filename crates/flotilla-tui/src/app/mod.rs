@@ -213,62 +213,8 @@ impl App {
             }
         }
 
-        // Store table view on UI state and restore selection by identity
         if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
-            // Save current selection identity
-            let prev_identity = rui
-                .selected_selectable_idx
-                .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
-                .and_then(|ti| match rui.table_view.table_entries.get(ti) {
-                    Some(GroupEntry::Item(item)) => Some(item.identity.clone()),
-                    _ => None,
-                });
-
-            rui.table_view = table_view;
-
-            // Restore selection by identity
-            if rui.table_view.selectable_indices.is_empty() {
-                rui.selected_selectable_idx = None;
-                rui.table_state.select(None);
-            } else if let Some(ref identity) = prev_identity {
-                let found =
-                    rui.table_view
-                        .selectable_indices
-                        .iter()
-                        .enumerate()
-                        .find(|(_, &ti)| {
-                            matches!(
-                                rui.table_view.table_entries.get(ti),
-                                Some(GroupEntry::Item(item)) if item.identity == *identity
-                            )
-                        });
-                if let Some((si, &ti)) = found {
-                    rui.selected_selectable_idx = Some(si);
-                    rui.table_state.select(Some(ti));
-                } else {
-                    // Item was removed — select first
-                    rui.selected_selectable_idx = Some(0);
-                    rui.table_state
-                        .select(Some(rui.table_view.selectable_indices[0]));
-                }
-            } else {
-                rui.selected_selectable_idx = Some(0);
-                rui.table_state
-                    .select(Some(rui.table_view.selectable_indices[0]));
-            }
-
-            // Clean up stale multi-select identities
-            let current_identities: std::collections::HashSet<flotilla_protocol::WorkItemIdentity> =
-                rui.table_view
-                    .table_entries
-                    .iter()
-                    .filter_map(|e| match e {
-                        GroupEntry::Item(item) => Some(item.identity.clone()),
-                        _ => None,
-                    })
-                    .collect();
-            rui.multi_selected
-                .retain(|id| current_identities.contains(id));
+            rui.update_table_view(table_view);
         }
 
         // Log errors, suppressing "issues disabled" since the daemon handles that
@@ -388,58 +334,8 @@ impl App {
             }
         }
 
-        // Store table view and restore selection (same as apply_snapshot)
         if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
-            let prev_identity = rui
-                .selected_selectable_idx
-                .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
-                .and_then(|ti| match rui.table_view.table_entries.get(ti) {
-                    Some(GroupEntry::Item(item)) => Some(item.identity.clone()),
-                    _ => None,
-                });
-
-            rui.table_view = table_view;
-
-            if rui.table_view.selectable_indices.is_empty() {
-                rui.selected_selectable_idx = None;
-                rui.table_state.select(None);
-            } else if let Some(ref identity) = prev_identity {
-                let found =
-                    rui.table_view
-                        .selectable_indices
-                        .iter()
-                        .enumerate()
-                        .find(|(_, &ti)| {
-                            matches!(
-                                rui.table_view.table_entries.get(ti),
-                                Some(GroupEntry::Item(item)) if item.identity == *identity
-                            )
-                        });
-                if let Some((si, &ti)) = found {
-                    rui.selected_selectable_idx = Some(si);
-                    rui.table_state.select(Some(ti));
-                } else {
-                    rui.selected_selectable_idx = Some(0);
-                    rui.table_state
-                        .select(Some(rui.table_view.selectable_indices[0]));
-                }
-            } else {
-                rui.selected_selectable_idx = Some(0);
-                rui.table_state
-                    .select(Some(rui.table_view.selectable_indices[0]));
-            }
-
-            let current_identities: std::collections::HashSet<flotilla_protocol::WorkItemIdentity> =
-                rui.table_view
-                    .table_entries
-                    .iter()
-                    .filter_map(|e| match e {
-                        GroupEntry::Item(item) => Some(item.identity.clone()),
-                        _ => None,
-                    })
-                    .collect();
-            rui.multi_selected
-                .retain(|id| current_identities.contains(id));
+            rui.update_table_view(table_view);
         }
     }
 
