@@ -68,14 +68,14 @@ pub struct Snapshot {
     pub issue_search_results: Option<Vec<(String, Issue)>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderError {
     pub category: String,
     pub message: String,
 }
 
 /// Serializable work item — flattened from the core WorkItem enum.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub kind: WorkItemKind,
     pub identity: WorkItemIdentity,
@@ -117,7 +117,7 @@ pub enum WorkItemIdentity {
     RemoteBranch(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckoutRef {
     pub key: PathBuf,
     pub is_main_checkout: bool,

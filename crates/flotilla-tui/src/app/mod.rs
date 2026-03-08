@@ -15,7 +15,7 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{self, GroupEntry, SectionLabels};
 use flotilla_protocol::{
-    Command, DaemonEvent, ProviderData, RepoInfo, RepoLabels, Snapshot, WorkItem,
+    Command, DaemonEvent, ProviderData, RepoInfo, RepoLabels, Snapshot, SnapshotDelta, WorkItem,
 };
 use std::collections::VecDeque;
 
@@ -61,7 +61,7 @@ pub struct TuiRepoModel {
 
 /// TUI-side domain model. Mirrors the shape of core's `AppModel` but without
 /// daemon-internal fields (registry, refresh handles). Populated from
-/// `DaemonHandle::list_repos()` and updated by `DaemonEvent::Snapshot`.
+/// `DaemonHandle::list_repos()` and updated by daemon snapshot events.
 pub struct TuiModel {
     pub repos: HashMap<PathBuf, TuiRepoModel>,
     pub repo_order: Vec<PathBuf>,
@@ -153,7 +153,8 @@ impl App {
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
-            DaemonEvent::Snapshot(snap) => self.apply_snapshot(*snap),
+            DaemonEvent::SnapshotFull(snap) => self.apply_snapshot(*snap),
+            DaemonEvent::SnapshotDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoRemoved { path } => self.handle_repo_removed(&path),
             DaemonEvent::CommandResult { result, .. } => {
@@ -212,62 +213,8 @@ impl App {
             }
         }
 
-        // Store table view on UI state and restore selection by identity
         if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
-            // Save current selection identity
-            let prev_identity = rui
-                .selected_selectable_idx
-                .and_then(|si| rui.table_view.selectable_indices.get(si).copied())
-                .and_then(|ti| match rui.table_view.table_entries.get(ti) {
-                    Some(GroupEntry::Item(item)) => Some(item.identity.clone()),
-                    _ => None,
-                });
-
-            rui.table_view = table_view;
-
-            // Restore selection by identity
-            if rui.table_view.selectable_indices.is_empty() {
-                rui.selected_selectable_idx = None;
-                rui.table_state.select(None);
-            } else if let Some(ref identity) = prev_identity {
-                let found =
-                    rui.table_view
-                        .selectable_indices
-                        .iter()
-                        .enumerate()
-                        .find(|(_, &ti)| {
-                            matches!(
-                                rui.table_view.table_entries.get(ti),
-                                Some(GroupEntry::Item(item)) if item.identity == *identity
-                            )
-                        });
-                if let Some((si, &ti)) = found {
-                    rui.selected_selectable_idx = Some(si);
-                    rui.table_state.select(Some(ti));
-                } else {
-                    // Item was removed — select first
-                    rui.selected_selectable_idx = Some(0);
-                    rui.table_state
-                        .select(Some(rui.table_view.selectable_indices[0]));
-                }
-            } else {
-                rui.selected_selectable_idx = Some(0);
-                rui.table_state
-                    .select(Some(rui.table_view.selectable_indices[0]));
-            }
-
-            // Clean up stale multi-select identities
-            let current_identities: std::collections::HashSet<flotilla_protocol::WorkItemIdentity> =
-                rui.table_view
-                    .table_entries
-                    .iter()
-                    .filter_map(|e| match e {
-                        GroupEntry::Item(item) => Some(item.identity.clone()),
-                        _ => None,
-                    })
-                    .collect();
-            rui.multi_selected
-                .retain(|id| current_identities.contains(id));
+            rui.update_table_view(table_view);
         }
 
         // Log errors, suppressing "issues disabled" since the daemon handles that
@@ -295,6 +242,100 @@ impl App {
                 repo: path,
                 visible_count: visible.max(20),
             });
+        }
+    }
+
+    fn apply_delta(&mut self, delta: SnapshotDelta) {
+        let path = delta.repo;
+        let rm = match self.model.repos.get_mut(&path) {
+            Some(rm) => rm,
+            None => return,
+        };
+
+        // Apply provider data changes
+        let mut providers = (*rm.providers).clone();
+        flotilla_core::delta::apply_changes(&mut providers, delta.changes.clone());
+        rm.providers = Arc::new(providers);
+
+        // Update issue metadata
+        rm.issue_has_more = delta.issue_has_more;
+        rm.issue_total = delta.issue_total;
+        rm.issue_search_active = delta.issue_search_results.is_some();
+        rm.issue_fetch_pending = false;
+
+        // Apply provider health changes from the delta
+        for change in &delta.changes {
+            match change {
+                flotilla_protocol::Change::ProviderHealth {
+                    provider,
+                    op:
+                        flotilla_protocol::EntryOp::Added(v) | flotilla_protocol::EntryOp::Updated(v),
+                } => {
+                    rm.provider_health.insert(provider.clone(), *v);
+                }
+                flotilla_protocol::Change::ProviderHealth {
+                    provider,
+                    op: flotilla_protocol::EntryOp::Removed,
+                } => {
+                    rm.provider_health.remove(provider);
+                }
+                _ => {}
+            }
+        }
+
+        // Re-correlate and rebuild table view
+        let (work_items, correlation_groups) = data::correlate(&rm.providers);
+        let proto_work_items: Vec<WorkItem> = work_items
+            .iter()
+            .map(|wi| {
+                flotilla_core::convert::correlation_result_to_work_item(wi, &correlation_groups)
+            })
+            .collect();
+
+        let section_labels = SectionLabels {
+            checkouts: rm.labels.checkouts.section.clone(),
+            code_review: rm.labels.code_review.section.clone(),
+            issues: rm.labels.issues.section.clone(),
+            sessions: rm.labels.sessions.section.clone(),
+        };
+        let table_view = data::group_work_items(&proto_work_items, &rm.providers, &section_labels);
+
+        // Provider health -> model-level statuses
+        for (kind, healthy) in &rm.provider_health {
+            let provider_name = rm.provider_names.get(kind.as_str()).cloned();
+            if let Some(pname) = provider_name {
+                let key = (path.clone(), kind.clone(), pname);
+                let status = if *healthy {
+                    ProviderStatus::Ok
+                } else {
+                    ProviderStatus::Error
+                };
+                self.model.provider_statuses.insert(key, status);
+            }
+        }
+
+        // Change detection badge — any non-empty delta on inactive tab
+        let has_data_changes = delta.changes.iter().any(|c| {
+            !matches!(
+                c,
+                flotilla_protocol::Change::ProviderHealth { .. }
+                    | flotilla_protocol::Change::ErrorsChanged(_)
+            )
+        });
+        if has_data_changes {
+            let active_idx = self.model.active_repo;
+            let i = self.model.repo_order.iter().position(|p| p == &path);
+            if let Some(idx) = i {
+                if idx != active_idx {
+                    if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
+                        rui.has_unseen_changes = true;
+                    }
+                }
+            }
+        }
+
+        if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
+            rui.update_table_view(table_view);
         }
     }
 

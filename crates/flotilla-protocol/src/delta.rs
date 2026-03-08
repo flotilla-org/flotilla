@@ -71,6 +71,14 @@ pub enum Change {
     ErrorsChanged(Vec<ProviderError>),
 }
 
+/// A single entry in the per-repo delta log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaEntry {
+    pub seq: u64,
+    pub prev_seq: u64,
+    pub changes: Vec<Change>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

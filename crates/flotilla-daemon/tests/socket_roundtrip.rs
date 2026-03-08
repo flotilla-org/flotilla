@@ -68,10 +68,13 @@ async fn socket_roundtrip() {
         .await
         .expect("timeout waiting for event")
         .expect("recv");
-    // The refresh should produce a Snapshot event
+    // The refresh should produce a snapshot event (full or delta)
     assert!(
-        matches!(event, DaemonEvent::Snapshot(_)),
-        "expected Snapshot event, got {:?}",
+        matches!(
+            event,
+            DaemonEvent::SnapshotFull(_) | DaemonEvent::SnapshotDelta(_)
+        ),
+        "expected snapshot event, got {:?}",
         event
     );
 
