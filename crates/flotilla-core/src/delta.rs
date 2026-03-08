@@ -5,7 +5,7 @@ use std::hash::Hash;
 
 use indexmap::IndexMap;
 
-use flotilla_protocol::{Change, EntryOp, ProviderData};
+use flotilla_protocol::{Change, EntryOp, ProviderData, WorkItem, WorkItemIdentity};
 
 /// Diff two IndexMaps, producing `(key, EntryOp)` pairs for all differences.
 ///
@@ -61,6 +61,25 @@ pub fn diff_provider_data(prev: &ProviderData, curr: &ProviderData) -> Vec<Chang
     }
 
     changes
+}
+
+/// Diff two work item lists, producing `Change::WorkItem` entries.
+///
+/// Work items are keyed by `WorkItemIdentity`. The input slices are converted
+/// to IndexMaps internally for O(n) diffing.
+pub fn diff_work_items(prev: &[WorkItem], curr: &[WorkItem]) -> Vec<Change> {
+    let prev_map: IndexMap<WorkItemIdentity, WorkItem> = prev
+        .iter()
+        .map(|wi| (wi.identity.clone(), wi.clone()))
+        .collect();
+    let curr_map: IndexMap<WorkItemIdentity, WorkItem> = curr
+        .iter()
+        .map(|wi| (wi.identity.clone(), wi.clone()))
+        .collect();
+    diff_indexmap(&prev_map, &curr_map)
+        .into_iter()
+        .map(|(identity, op)| Change::WorkItem { identity, op })
+        .collect()
 }
 
 #[cfg(test)]
@@ -302,6 +321,83 @@ mod tests {
         assert!(has_issue_update, "expected issue Updated");
         assert!(has_ws_add, "expected workspace Added");
         assert!(has_session_remove, "expected session Removed");
+    }
+
+    fn work_item(identity: WorkItemIdentity, desc: &str) -> flotilla_protocol::WorkItem {
+        flotilla_protocol::WorkItem {
+            kind: flotilla_protocol::WorkItemKind::Checkout,
+            identity,
+            branch: None,
+            description: desc.into(),
+            checkout: None,
+            change_request_key: None,
+            session_key: None,
+            issue_keys: vec![],
+            workspace_refs: vec![],
+            is_main_checkout: false,
+            debug_group: vec![],
+        }
+    }
+
+    // --- diff_work_items tests ---
+
+    #[test]
+    fn diff_work_items_empty() {
+        assert!(diff_work_items(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn diff_work_items_added() {
+        let curr = vec![work_item(
+            flotilla_protocol::WorkItemIdentity::Session("s1".into()),
+            "new session",
+        )];
+        let changes = diff_work_items(&[], &curr);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            Change::WorkItem { identity, op: EntryOp::Added(wi) } => {
+                assert_eq!(identity, &flotilla_protocol::WorkItemIdentity::Session("s1".into()));
+                assert_eq!(wi.description, "new session");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_work_items_removed() {
+        let prev = vec![work_item(
+            flotilla_protocol::WorkItemIdentity::Issue("i1".into()),
+            "old issue",
+        )];
+        let changes = diff_work_items(&prev, &[]);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(&changes[0], Change::WorkItem { identity, op: EntryOp::Removed }
+            if *identity == flotilla_protocol::WorkItemIdentity::Issue("i1".into())));
+    }
+
+    #[test]
+    fn diff_work_items_updated() {
+        let id = flotilla_protocol::WorkItemIdentity::Checkout(PathBuf::from("/wt"));
+        let prev = vec![work_item(id.clone(), "old desc")];
+        let curr = vec![work_item(id.clone(), "new desc")];
+        let changes = diff_work_items(&prev, &curr);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            Change::WorkItem { identity, op: EntryOp::Updated(wi) } => {
+                assert_eq!(identity, &id);
+                assert_eq!(wi.description, "new desc");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_work_items_unchanged() {
+        let items = vec![work_item(
+            flotilla_protocol::WorkItemIdentity::RemoteBranch("feat".into()),
+            "remote branch",
+        )];
+        assert!(diff_work_items(&items, &items).is_empty());
     }
 
     #[test]
