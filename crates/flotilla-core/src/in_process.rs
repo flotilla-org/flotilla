@@ -3,7 +3,7 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use crate::refresh::RefreshSnapshot;
 
 /// Extract issue IDs referenced by association keys on change requests and checkouts.
 fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
-    let mut ids = std::collections::HashSet::new();
+    let mut ids = HashSet::new();
     for cr in providers.change_requests.values() {
         for key in &cr.association_keys {
             let AssociationKey::IssueRef(_, issue_id) = key;
@@ -376,7 +376,12 @@ impl InProcessDaemon {
                     if missing.is_empty() {
                         return None;
                     }
-                    Some((path.clone(), missing, Arc::clone(&state.model.registry)))
+                    Some((
+                        path.clone(),
+                        missing,
+                        Arc::clone(&state.model.registry),
+                        Arc::clone(&state.issue_fetch_mutex),
+                    ))
                 })
                 .collect()
         };
@@ -385,8 +390,25 @@ impl InProcessDaemon {
             return;
         }
 
-        // Phase 2: fetch outside locks, then update cache and re-broadcast
-        for (path, missing, registry) in fetch_tasks {
+        // Phase 2: fetch outside locks, then update cache and re-broadcast.
+        // Acquire the per-repo issue_fetch_mutex to avoid redundant API calls
+        // if ensure_issues_cached is running concurrently.
+        for (path, missing, registry, fetch_mutex) in fetch_tasks {
+            let _guard = fetch_mutex.lock().await;
+
+            // Re-check missing after acquiring mutex — ensure_issues_cached may
+            // have already fetched some of these while we waited.
+            let missing = {
+                let repos = self.repos.read().await;
+                let Some(state) = repos.get(&path) else {
+                    continue;
+                };
+                state.issue_cache.missing_ids(&missing)
+            };
+            if missing.is_empty() {
+                continue;
+            }
+
             let Some(tracker) = registry.issue_trackers.values().next() else {
                 continue;
             };
