@@ -294,7 +294,7 @@ pub async fn execute(
                 .unwrap_or_else(|| "claude".into());
             let teleport_cmd = format!("{} --teleport {}", claude_bin, session_id);
             let wt_path = if let Some(ref key) = checkout_key {
-                Some(key.clone())
+                providers_data.checkouts.get(key).map(|_| key.clone())
             } else if let Some(branch_name) = &branch {
                 let checkout_result = if let Some(cm) = registry.checkout_managers.values().next() {
                     cm.create_checkout(repo_root, branch_name, false).await.ok()
