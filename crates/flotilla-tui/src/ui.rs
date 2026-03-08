@@ -321,6 +321,19 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
         .get_mut(key)
         .expect("active repo must have UI state");
     frame.render_stateful_widget(table, area, &mut rui.table_state);
+
+    // Ratatui scrolls just enough to show the selected row, but section headers
+    // sit one row above the first item in each section.  If the offset lands
+    // right after a header, back it up so the header stays visible.
+    let offset = rui.table_state.offset();
+    if offset > 0
+        && matches!(
+            rui.table_view.table_entries.get(offset - 1),
+            Some(GroupEntry::Header(_))
+        )
+    {
+        *rui.table_state.offset_mut() = offset - 1;
+    }
 }
 
 fn build_header_row(header: &SectionHeader) -> Row<'static> {

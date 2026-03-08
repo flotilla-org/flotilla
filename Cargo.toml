@@ -26,11 +26,11 @@ flotilla-core = { path = "crates/flotilla-core" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 flotilla-tui = { path = "crates/flotilla-tui" }
 ratatui = "0.30"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-tui-input = "0.10"
+tui-input = "0.15"
 tracing = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
