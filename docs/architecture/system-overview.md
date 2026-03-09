@@ -59,6 +59,26 @@ The TUI keeps local UI concerns such as active repo, selection, input mode,
 unseen-change badges, and in-flight command display. It does not own provider
 discovery, refresh orchestration, or the canonical issue cache.
 
+## Concurrency Model
+
+Each repo gets its own background refresh task. The concurrency topology is:
+
+1. **Refresh task** (one per repo): waits on either a 10-second timer tick or a
+   `Notify` signal (manual refresh, post-command refresh), then fetches all
+   provider data in parallel via `tokio::join!`, runs correlation, and publishes
+   an `Arc<RefreshSnapshot>` through a `tokio::sync::watch` channel.
+2. **Daemon poll loop**: reads from each repo's watch receiver, injects cached
+   issues, re-correlates, computes snapshot or delta, and broadcasts a
+   `DaemonEvent` through a `tokio::sync::broadcast` channel.
+3. **Client event loop**: receives daemon events through the broadcast channel,
+   applies snapshots or deltas, and redraws.
+
+`Arc<ProviderData>` wraps the provider snapshot so receivers share the data
+without cloning. Selection is stabilized across table rebuilds using
+`WorkItemIdentity` (an enum over checkout path, change request key, session key,
+etc.) — the UI saves the selected identity before a rebuild, scans the new table
+for a match, and falls back to index 0 if not found.
+
 ## Repo Lifecycle
 
 ### Provider detection
@@ -70,7 +90,8 @@ different remote hosts, checkout strategies, or available providers.
 
 Each repo refreshes on a 10-second interval and on demand. Refresh gathers
 provider data in parallel, computes correlation groups, and publishes a new
-`RefreshSnapshot`.
+`RefreshSnapshot`. Manual refresh and post-command refresh both poke a `Notify`
+rather than calling the refresh function inline.
 
 ### Snapshot publication
 
@@ -92,6 +113,16 @@ Current model:
 Issue viewport and issue search commands are handled inline today because they
 mutate daemon-owned cache state rather than producing a long-running
 user-visible command result.
+
+## Testability
+
+All provider implementations take an `Arc<dyn CommandRunner>` for CLI
+interaction. `CommandRunner` has three methods (`run`, `run_output`, `exists`)
+and a production implementation (`ProcessCommandRunner`) that shells out via
+`tokio::process::Command`. Tests substitute a `MockRunner` (simple queue-based)
+or `DiscoveryMockRunner` (per-command response maps with call tracking).
+`detect_providers()` receives a single `Arc<dyn CommandRunner>` and clones it
+into every provider it creates.
 
 ## Why The System Is Shaped This Way
 

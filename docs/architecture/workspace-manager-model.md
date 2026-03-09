@@ -32,21 +32,28 @@ formats can still be layered on later.
 
 ## Current Adapters
 
-Implemented adapters:
+Detection is based primarily on the current shell environment so Flotilla
+prefers the terminal multiplexer it is actually running inside.
 
-- `cmux`
-- `tmux`
-- `zellij`
+| Flotilla concept | cmux | tmux | zellij |
+|---|---|---|---|
+| **Workspace** | workspace | window | tab |
+| **Pane** | pane (split) | pane (split) | pane (split) |
+| **Surface** | surface (tab in pane) | extra split (degraded) | stacked pane |
+| **Multi-surface** | native tabs | becomes additional splits (warning logged) | native stacking |
+| **Detection** | `CMUX_SOCKET_PATH` | `TMUX` | `ZELLIJ` |
+| **Version req** | none | none | >= 0.40 |
+| **State file** | none | `~/.config/flotilla/tmux/{session}/state.toml` | `~/.config/flotilla/zellij/{session}/state.toml` |
 
-Detection is based primarily on the current shell environment
-(`CMUX_SOCKET_PATH`, `ZELLIJ`, `TMUX`) so Flotilla prefers the terminal
-environment it is actually running inside.
+tmux has no tabbed or stacked pane concept, so multiple surfaces in a single
+pane degrade to additional splits. This is a known mismatch, not the desired
+behavior.
 
 ## Multi-Checkout Gap
 
 A workspace manager (cmux, tmux, zellij) reports its workspaces with a list of directories. Each directory becomes a `CorrelationKey::CheckoutPath`, which the correlation engine uses to merge items into groups.
 
-When a workspace references multiple checkout paths, those paths can pull multiple distinct checkouts into a single correlation group. The resulting `WorkItem` can only represent one checkout (one `worktree_idx`). Today we pick the first checkout encountered and discard others.
+When a workspace references multiple checkout paths, those paths can pull multiple distinct checkouts into a single correlation group. The resulting `WorkItem` can only represent one checkout (one `CheckoutRef`). Today we pick the first checkout encountered and discard others.
 
 This means: if a user has a cmux workspace with panes open in two different worktrees, only one worktree's data appears on the correlated row.
 

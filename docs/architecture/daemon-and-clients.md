@@ -84,8 +84,9 @@ branch-name generation, or workspace setup.
 Clients should keep only presentation state that is not part of the shared
 system model, for example:
 
-- focus and selection
-- per-client input modes
+- focus and selection (stabilized via `WorkItemIdentity` across rebuilds)
+- per-client input modes and intents (intents are a UI concept; the daemon sees
+  only `Command` values)
 - unseen-change badges
 - status text
 - in-flight command rendering
@@ -93,6 +94,21 @@ system model, for example:
 One current mismatch is search: issue search results still ride in shared
 snapshot state, even though search is semantically client-local. That is a
 known cleanup target, not a pattern to copy.
+
+## Design Decisions
+
+- **In-process mode never goes away.** Embedded mode is the simplest deployment
+  and avoids socket overhead. Socket mode adds multi-client support but does not
+  replace embedded mode.
+- **No automatic reconnection.** If the daemon dies, the TUI exits with an
+  error and the user restarts. This is a deliberate simplicity choice.
+- **Clients receive work items, not raw provider data.** The daemon performs
+  correlation so clients stay thin. This was a deliberate choice over pushing
+  raw provider data to clients and correlating per-frontend.
+- **The architecture reached its current shape via a Strangler Fig migration**:
+  (1) define the daemon boundary in-process, (2) add a socket server,
+  (3) add delta snapshots, (4) multi-host (future). Intermediate structure from
+  earlier steps may still be visible in the code.
 
 ## Current Pressure
 
