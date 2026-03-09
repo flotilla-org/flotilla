@@ -101,8 +101,7 @@ fn selected_item_preview() {
         make_work_item_cr("99", "Build analytics dashboard"),
     ];
 
-    let mut harness =
-        TestHarness::single_repo("my-project").with_provider_data(providers, items);
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
