@@ -120,24 +120,39 @@ async fn run_tui(cli: Cli) -> Result<()> {
 
     // Spawn daemon init on a separate task so it runs concurrently with the splash
     // (show_splash uses blocking crossterm::event::poll calls).
+    let daemon_log_path = cli.config_dir().join("daemon.log");
     let config_clone = Arc::clone(&config);
     let daemon_task = tokio::spawn(async move {
-        let daemon: Arc<dyn DaemonHandle> = if embedded {
+        let daemon: Result<Arc<dyn DaemonHandle>, String> = if embedded {
             let d = InProcessDaemon::new(repo_roots, config_clone).await;
-            d as Arc<dyn DaemonHandle>
+            Ok(d as Arc<dyn DaemonHandle>)
         } else {
             let socket_path = cli.socket_path();
             connect_or_spawn(&socket_path, &cli)
                 .await
-                .map_err(|e| color_eyre::eyre::eyre!(e))
-                .expect("failed to connect to daemon")
+                .map(|d| d as Arc<dyn DaemonHandle>)
         };
-        info!("daemon ready in {:.0?}", startup.elapsed());
         daemon
     });
 
     show_splash(&mut terminal).await?;
-    let daemon = daemon_task.await.expect("daemon init panicked");
+    let daemon = match daemon_task.await {
+        Ok(Ok(daemon)) => {
+            info!("daemon ready in {:.0?}", startup.elapsed());
+            daemon
+        }
+        Ok(Err(e)) => {
+            ratatui::restore();
+            eprintln!("Error: {e}");
+            eprintln!("  Check daemon log at {}", daemon_log_path.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            ratatui::restore();
+            eprintln!("Error: daemon initialization panicked: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let daemon_rx = daemon.subscribe();
     let repos_info = daemon.list_repos().await.unwrap_or_default();
@@ -354,16 +369,19 @@ async fn connect_or_spawn(
     cmd.spawn()
         .map_err(|e| format!("failed to spawn daemon: {e}"))?;
 
-    // Retry connection with backoff
-    let delays = [50, 100, 200, 400, 800];
-    for delay_ms in delays {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    // Retry connection with 50ms polling and a 10s deadline.
+    // Inspired by zellij's infinite-poll approach but with a timeout so we
+    // don't hang forever if the daemon binary is broken.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
         if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
             return Ok(daemon);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("timed out waiting for daemon to start (10s)".into());
+        }
     }
-
-    Err("timed out waiting for daemon to start".into())
 }
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {

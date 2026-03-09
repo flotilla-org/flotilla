@@ -90,11 +90,12 @@ pub fn flotilla_config_dir() -> PathBuf {
 
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
 pub fn path_to_slug(path: &Path) -> String {
-    path.to_string_lossy()
-        .to_lowercase()
-        .replace('/', "-")
-        .trim_start_matches('-')
-        .to_string()
+    let raw = path.to_string_lossy().to_lowercase();
+    let slug: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    slug.trim_matches('-').to_string()
 }
 
 /// Owns the config base path and caches the global `FlotillaConfig`.
@@ -272,10 +273,10 @@ mod tests {
         let cases = [
             ("/Users/alice/dev/myrepo", "users-alice-dev-myrepo"),
             ("relative/path", "relative-path"),
-            ("/Users/Bob Smith/my repo", "users-bob smith-my repo"),
-            ("/opt/my-project_v2.0", "opt-my-project_v2.0"),
+            ("/Users/Bob Smith/my repo", "users-bob-smith-my-repo"),
+            ("/opt/my-project_v2.0", "opt-my-project-v2-0"),
             ("/", ""),
-            (".", "."),
+            (".", ""),
         ];
         for (input, expected) in cases {
             assert_eq!(

@@ -252,7 +252,7 @@ pub async fn execute(
                     .keys()
                     .next()
                     .cloned()
-                    .unwrap_or_else(|| "github".to_string());
+                    .unwrap_or_else(|| "issues".to_string());
                 issues
                     .iter()
                     .map(|(id, _title)| (provider.clone(), id.clone()))
@@ -1505,7 +1505,7 @@ mod tests {
         )
         .await;
 
-        assert_branch_name_generated(result, "issue-42", &[("github", "42")]);
+        assert_branch_name_generated(result, "issue-42", &[("issues", "42")]);
     }
 
     #[tokio::test]
@@ -1526,8 +1526,8 @@ mod tests {
         )
         .await;
 
-        // No issue tracker registered, defaults to "github"
-        assert_branch_name_generated(result, "issue-7", &[("github", "7")]);
+        // No issue tracker registered, defaults to "issues"
+        assert_branch_name_generated(result, "issue-7", &[("issues", "7")]);
     }
 
     #[tokio::test]

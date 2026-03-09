@@ -67,8 +67,10 @@ fn inject_issues(
             .iter()
             .map(|(id, i)| (id.clone(), i.clone()))
             .collect();
-    } else {
+    } else if !cache.is_empty() {
         providers.issues = (*cache.to_index_map()).clone();
+    } else {
+        providers.issues.clear();
     }
     providers
 }
