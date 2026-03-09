@@ -1095,6 +1095,7 @@ dependencies = [
  "ratatui-image",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tracing",

@@ -3,6 +3,8 @@ mod file_picker;
 pub mod intent;
 mod key_handlers;
 mod navigation;
+#[cfg(test)]
+mod test_support;
 pub mod ui_state;
 
 use std::collections::HashMap;

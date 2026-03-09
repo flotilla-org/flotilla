@@ -206,9 +206,10 @@ impl Intent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_protocol::{
-        CategoryLabels, CheckoutRef, RepoLabels, WorkItem, WorkItemIdentity, WorkItemKind,
+    use crate::app::test_support::{
+        bare_item, checkout_item, pr_item, remote_branch_item, session_item, stub_app,
     };
+    use flotilla_protocol::{CategoryLabels, CheckoutRef, RepoLabels};
     use std::path::PathBuf;
 
     // ── Helpers ──
@@ -239,94 +240,6 @@ mod tests {
                 noun: "session".into(),
                 abbr: "sess".into(),
             },
-        }
-    }
-
-    /// Bare work item with no associated data — standalone issue-like item.
-    fn bare_item() -> WorkItem {
-        WorkItem {
-            kind: WorkItemKind::Issue,
-            identity: WorkItemIdentity::Issue("1".into()),
-            branch: None,
-            description: String::new(),
-            checkout: None,
-            change_request_key: None,
-            session_key: None,
-            issue_keys: Vec::new(),
-            workspace_refs: Vec::new(),
-            is_main_checkout: false,
-            debug_group: Vec::new(),
-        }
-    }
-
-    /// A checkout work item with a branch and checkout path.
-    fn checkout_item(branch: &str, path: &str, is_main: bool) -> WorkItem {
-        WorkItem {
-            kind: WorkItemKind::Checkout,
-            identity: WorkItemIdentity::Checkout(PathBuf::from(path)),
-            branch: Some(branch.into()),
-            description: format!("checkout {branch}"),
-            checkout: Some(CheckoutRef {
-                key: PathBuf::from(path),
-                is_main_checkout: is_main,
-            }),
-            change_request_key: None,
-            session_key: None,
-            issue_keys: Vec::new(),
-            workspace_refs: Vec::new(),
-            is_main_checkout: is_main,
-            debug_group: Vec::new(),
-        }
-    }
-
-    /// A PR work item with optional checkout.
-    fn pr_item(pr_id: &str) -> WorkItem {
-        WorkItem {
-            kind: WorkItemKind::ChangeRequest,
-            identity: WorkItemIdentity::ChangeRequest(pr_id.into()),
-            branch: Some("feat/pr-branch".into()),
-            description: format!("PR #{pr_id}"),
-            checkout: None,
-            change_request_key: Some(pr_id.into()),
-            session_key: None,
-            issue_keys: Vec::new(),
-            workspace_refs: Vec::new(),
-            is_main_checkout: false,
-            debug_group: Vec::new(),
-        }
-    }
-
-    /// A session work item.
-    fn session_item(session_id: &str) -> WorkItem {
-        WorkItem {
-            kind: WorkItemKind::Session,
-            identity: WorkItemIdentity::Session(session_id.into()),
-            branch: Some("feat/session-branch".into()),
-            description: format!("session {session_id}"),
-            checkout: None,
-            change_request_key: None,
-            session_key: Some(session_id.into()),
-            issue_keys: Vec::new(),
-            workspace_refs: Vec::new(),
-            is_main_checkout: false,
-            debug_group: Vec::new(),
-        }
-    }
-
-    /// A remote-branch work item (no checkout, has branch).
-    fn remote_branch_item(branch: &str) -> WorkItem {
-        WorkItem {
-            kind: WorkItemKind::RemoteBranch,
-            identity: WorkItemIdentity::RemoteBranch(branch.into()),
-            branch: Some(branch.into()),
-            description: format!("remote {branch}"),
-            checkout: None,
-            change_request_key: None,
-            session_key: None,
-            issue_keys: Vec::new(),
-            workspace_refs: Vec::new(),
-            is_main_checkout: false,
-            debug_group: Vec::new(),
         }
     }
 
@@ -656,72 +569,9 @@ mod tests {
 
     // ── resolve tests ──
     //
-    // resolve() requires &App which needs a DaemonHandle trait object. Since
-    // async_trait is not a direct dependency of flotilla-tui, we build a stub
-    use flotilla_core::daemon::DaemonHandle;
-    use flotilla_protocol::{DaemonEvent, ProviderData, RepoInfo, Snapshot};
-    use std::path::Path;
+    // resolve() requires &App so we use the shared TUI test harness.
+    use flotilla_protocol::ProviderData;
     use std::sync::Arc;
-    use tokio::sync::broadcast;
-
-    struct StubDaemon {
-        tx: broadcast::Sender<DaemonEvent>,
-    }
-
-    impl StubDaemon {
-        fn new() -> Self {
-            let (tx, _) = broadcast::channel(1);
-            Self { tx }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl DaemonHandle for StubDaemon {
-        fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-            self.tx.subscribe()
-        }
-        async fn get_state(&self, _repo: &Path) -> Result<Snapshot, String> {
-            Err("stub".into())
-        }
-        async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-            Ok(vec![])
-        }
-        async fn execute(&self, _repo: &Path, _command: Command) -> Result<u64, String> {
-            Ok(1)
-        }
-        async fn refresh(&self, _repo: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn add_repo(&self, _path: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn remove_repo(&self, _path: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn replay_since(
-            &self,
-            _last_seen: &std::collections::HashMap<PathBuf, u64>,
-        ) -> Result<Vec<DaemonEvent>, String> {
-            Ok(vec![])
-        }
-    }
-
-    fn stub_app() -> App {
-        let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
-        let repo_path = PathBuf::from("/tmp/test-repo");
-        let repos_info = vec![RepoInfo {
-            path: repo_path,
-            name: "test-repo".into(),
-            labels: default_labels(),
-            provider_names: std::collections::HashMap::new(),
-            provider_health: std::collections::HashMap::new(),
-            loading: false,
-        }];
-        let config = Arc::new(flotilla_core::config::ConfigStore::with_base(
-            "/tmp/flotilla-test",
-        ));
-        App::new(daemon, repos_info, config)
-    }
 
     #[test]
     fn resolve_switch_to_workspace() {
@@ -1049,20 +899,7 @@ mod tests {
             AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey,
         };
 
-        let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
-        let repo_path = PathBuf::from("/tmp/test-repo");
-        let repos_info = vec![RepoInfo {
-            path: repo_path.clone(),
-            name: "test-repo".into(),
-            labels: default_labels(),
-            provider_names: std::collections::HashMap::new(),
-            provider_health: std::collections::HashMap::new(),
-            loading: false,
-        }];
-        let config = Arc::new(flotilla_core::config::ConfigStore::with_base(
-            "/tmp/flotilla-test",
-        ));
-        let mut app = App::new(daemon, repos_info, config);
+        let mut app = stub_app();
 
         let mut providers = ProviderData::default();
         providers.change_requests.insert(

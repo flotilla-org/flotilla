@@ -491,3 +491,919 @@ impl App {
         self.resolve_and_push(intent, &item);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::{
+        checkout_item, key, setup_selectable_table as setup_table, stub_app,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use flotilla_protocol::{CheckoutStatus, Command, WorkItemIdentity};
+    use std::path::PathBuf;
+    use tui_input::Input;
+
+    fn make_work_item(id: &str) -> flotilla_protocol::WorkItem {
+        checkout_item(&format!("feat/{id}"), &format!("/tmp/{id}"), false)
+    }
+
+    fn delete_confirm_mode(branch: &str) -> UiMode {
+        UiMode::DeleteConfirm {
+            info: Some(CheckoutStatus {
+                branch: branch.into(),
+                change_request_status: None,
+                merge_commit_sha: None,
+                unpushed_commits: vec![],
+                has_uncommitted: false,
+                base_detection_warning: None,
+            }),
+            loading: false,
+        }
+    }
+
+    // ── handle_key — top-level dispatch ──────────────────────────────
+
+    #[test]
+    fn question_mark_toggles_help_from_normal() {
+        let mut app = stub_app();
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.ui.mode, UiMode::Help));
+    }
+
+    #[test]
+    fn question_mark_toggles_help_back_to_normal() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Help;
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn question_mark_in_other_modes_does_not_toggle() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::OpenChangeRequest],
+            index: 0,
+        };
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
+    }
+
+    #[test]
+    fn handle_key_clears_status_message() {
+        let mut app = stub_app();
+        app.model.status_message = Some("old status".into());
+        // Any key should clear status
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(app.model.status_message.is_none());
+    }
+
+    #[test]
+    fn esc_in_help_returns_to_normal() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Help;
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    // ── handle_config_key ────────────────────────────────────────────
+
+    #[test]
+    fn config_q_quits() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn config_esc_quits() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn config_j_navigates_event_log_down() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.ui.event_log.count = 5;
+        app.ui.event_log.selected = Some(0);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.ui.event_log.selected, Some(1));
+    }
+
+    #[test]
+    fn config_k_navigates_event_log_up() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.ui.event_log.count = 5;
+        app.ui.event_log.selected = Some(3);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.ui.event_log.selected, Some(2));
+    }
+
+    #[test]
+    fn config_j_when_no_selection_jumps_to_last() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.ui.event_log.count = 5;
+        app.ui.event_log.selected = None;
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.ui.event_log.selected, Some(4));
+    }
+
+    #[test]
+    fn config_j_at_end_stays() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.ui.event_log.count = 3;
+        app.ui.event_log.selected = Some(2);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.ui.event_log.selected, Some(2));
+    }
+
+    #[test]
+    fn config_k_at_zero_stays() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.ui.event_log.count = 5;
+        app.ui.event_log.selected = Some(0);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.ui.event_log.selected, Some(0));
+    }
+
+    #[test]
+    fn config_bracket_switches_tabs() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        // ] in Config mode should switch to Normal mode + first repo
+        app.handle_key(key(KeyCode::Char(']')));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.model.active_repo, 0);
+
+        // [ from first repo (index 0) goes back to Config
+        app.handle_key(key(KeyCode::Char('[')));
+        assert!(matches!(app.ui.mode, UiMode::Config));
+    }
+
+    // ── handle_normal_key ────────────────────────────────────────────
+
+    #[test]
+    fn normal_q_quits() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn normal_esc_clears_providers_first() {
+        let mut app = stub_app();
+        app.active_ui_mut().show_providers = true;
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.active_ui().show_providers);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn normal_esc_clears_multi_select_second() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a")]);
+        app.active_ui_mut()
+            .multi_selected
+            .insert(WorkItemIdentity::Checkout(PathBuf::from("/tmp/a")));
+        assert!(!app.active_ui().multi_selected.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.active_ui().multi_selected.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn normal_esc_quits_when_nothing_to_clear() {
+        let mut app = stub_app();
+        // show_providers is false, multi_selected is empty
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn normal_n_enters_branch_input() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::BranchInput {
+                generating: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn normal_d_dispatches_remove_checkout() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a")]);
+        app.handle_key(key(KeyCode::Char('d')));
+        // RemoveCheckout resolves to FetchCheckoutStatus, then sets DeleteConfirm mode
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::DeleteConfirm { loading: true, .. }
+        ));
+        let cmd = app.proto_commands.take_next().unwrap();
+        assert!(matches!(cmd, Command::FetchCheckoutStatus { .. }));
+    }
+
+    #[test]
+    fn normal_d_noop_on_main_checkout() {
+        let mut app = stub_app();
+        let mut item = make_work_item("main");
+        item.is_main_checkout = true;
+        item.checkout.as_mut().unwrap().is_main_checkout = true;
+        setup_table(&mut app, vec![item]);
+        app.handle_key(key(KeyCode::Char('d')));
+        // Should NOT dispatch — main checkout is not removable
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    #[test]
+    fn normal_big_d_toggles_debug() {
+        let mut app = stub_app();
+        assert!(!app.ui.show_debug);
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert!(app.ui.show_debug);
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert!(!app.ui.show_debug);
+    }
+
+    #[test]
+    fn normal_slash_enters_issue_search() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+    }
+
+    #[test]
+    fn normal_c_toggles_providers() {
+        let mut app = stub_app();
+        assert!(!app.active_ui().show_providers);
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.active_ui().show_providers);
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(!app.active_ui().show_providers);
+    }
+
+    #[test]
+    fn normal_dot_opens_action_menu() {
+        let mut app = stub_app();
+        // Need an item with available intents — a checkout item can CreateWorkspace
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        app.handle_key(key(KeyCode::Char('.')));
+        assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
+    }
+
+    // ── handle_menu_key ──────────────────────────────────────────────
+
+    #[test]
+    fn menu_esc_returns_to_normal() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
+            index: 0,
+        };
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn menu_j_advances_index() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
+            index: 0,
+        };
+        app.handle_key(key(KeyCode::Char('j')));
+        match app.ui.mode {
+            UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
+            _ => panic!("expected ActionMenu"),
+        }
+    }
+
+    #[test]
+    fn menu_k_decrements_index() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
+            index: 1,
+        };
+        app.handle_key(key(KeyCode::Char('k')));
+        match app.ui.mode {
+            UiMode::ActionMenu { index, .. } => assert_eq!(index, 0),
+            _ => panic!("expected ActionMenu"),
+        }
+    }
+
+    #[test]
+    fn menu_j_stays_at_end() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
+            index: 1,
+        };
+        app.handle_key(key(KeyCode::Char('j')));
+        match app.ui.mode {
+            UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
+            _ => panic!("expected ActionMenu"),
+        }
+    }
+
+    #[test]
+    fn menu_k_stays_at_zero() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
+            index: 0,
+        };
+        app.handle_key(key(KeyCode::Char('k')));
+        match app.ui.mode {
+            UiMode::ActionMenu { index, .. } => assert_eq!(index, 0),
+            _ => panic!("expected ActionMenu"),
+        }
+    }
+
+    // ── handle_branch_input_key ──────────────────────────────────────
+
+    #[test]
+    fn branch_input_esc_returns_to_normal() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::BranchInput {
+            input: Input::from("my-branch"),
+            generating: false,
+            pending_issue_ids: vec![],
+        };
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn branch_input_enter_creates_checkout() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::BranchInput {
+            input: Input::from("my-branch"),
+            generating: false,
+            pending_issue_ids: vec![],
+        };
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::CreateCheckout {
+                branch,
+                create_branch,
+                issue_ids,
+            } => {
+                assert_eq!(branch, "my-branch");
+                assert!(create_branch);
+                assert!(issue_ids.is_empty());
+            }
+            other => panic!("expected CreateCheckout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn branch_input_enter_with_pending_issues() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::BranchInput {
+            input: Input::from("feat/issue-42"),
+            generating: false,
+            pending_issue_ids: vec![("github".into(), "42".into())],
+        };
+        app.handle_key(key(KeyCode::Enter));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::CreateCheckout { issue_ids, .. } => {
+                assert_eq!(issue_ids, vec![("github".into(), "42".into())]);
+            }
+            other => panic!("expected CreateCheckout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn branch_input_enter_empty_does_not_create() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::BranchInput {
+            input: Input::default(),
+            generating: false,
+            pending_issue_ids: vec![],
+        };
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    #[test]
+    fn branch_input_ignored_while_generating() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::BranchInput {
+            input: Input::from("partial"),
+            generating: true,
+            pending_issue_ids: vec![],
+        };
+        // Enter should be ignored
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::BranchInput {
+                generating: true,
+                ..
+            }
+        ));
+        assert!(app.proto_commands.take_next().is_none());
+
+        // Esc should also be ignored
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::BranchInput {
+                generating: true,
+                ..
+            }
+        ));
+    }
+
+    // ── handle_issue_search_key ──────────────────────────────────────
+
+    #[test]
+    fn issue_search_esc_clears_and_returns() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::IssueSearch {
+            input: Input::from("some query"),
+        };
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::ClearIssueSearch { repo } => {
+                assert_eq!(repo, PathBuf::from("/tmp/test-repo"));
+            }
+            other => panic!("expected ClearIssueSearch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn issue_search_enter_submits_query() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::IssueSearch {
+            input: Input::from("bug fix"),
+        };
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::SearchIssues { repo, query } => {
+                assert_eq!(repo, PathBuf::from("/tmp/test-repo"));
+                assert_eq!(query, "bug fix");
+            }
+            other => panic!("expected SearchIssues, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn issue_search_enter_empty_no_command() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::IssueSearch {
+            input: Input::default(),
+        };
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    // ── handle_delete_confirm_key ────────────────────────────────────
+
+    #[test]
+    fn delete_confirm_y_sends_remove_checkout() {
+        let mut app = stub_app();
+        app.ui.mode = delete_confirm_mode("feat/x");
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::RemoveCheckout { branch } => {
+                assert_eq!(branch, "feat/x");
+            }
+            other => panic!("expected RemoveCheckout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_confirm_enter_sends_remove_checkout() {
+        let mut app = stub_app();
+        app.ui.mode = delete_confirm_mode("feat/y");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::RemoveCheckout { branch } => {
+                assert_eq!(branch, "feat/y");
+            }
+            other => panic!("expected RemoveCheckout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_confirm_ignores_while_loading() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::DeleteConfirm {
+            info: None,
+            loading: true,
+        };
+        app.handle_key(key(KeyCode::Char('y')));
+        // Should still be in DeleteConfirm mode
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::DeleteConfirm { loading: true, .. }
+        ));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    #[test]
+    fn delete_confirm_esc_cancels() {
+        let mut app = stub_app();
+        app.ui.mode = delete_confirm_mode("feat/z");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    #[test]
+    fn delete_confirm_n_cancels() {
+        let mut app = stub_app();
+        app.ui.mode = delete_confirm_mode("feat/z");
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    // ── open_action_menu ─────────────────────────────────────────────
+
+    #[test]
+    fn open_action_menu_builds_filtered_list() {
+        let mut app = stub_app();
+        // A checkout item without workspace — CreateWorkspace + RemoveCheckout should be available
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        app.open_action_menu();
+        match &app.ui.mode {
+            UiMode::ActionMenu { items, index } => {
+                assert_eq!(*index, 0);
+                assert!(!items.is_empty());
+                // CreateWorkspace should be available (checkout with no workspace)
+                assert!(items.contains(&Intent::CreateWorkspace));
+                // RemoveCheckout should be available (non-main checkout with branch)
+                assert!(items.contains(&Intent::RemoveCheckout));
+                // SwitchToWorkspace should NOT be available (no workspace_refs)
+                assert!(!items.contains(&Intent::SwitchToWorkspace));
+            }
+            other => panic!(
+                "expected ActionMenu, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn open_action_menu_noop_when_no_selection() {
+        let mut app = stub_app();
+        // No items in table, no selection
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        app.open_action_menu();
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    // ── action_enter ─────────────────────────────────────────────────
+
+    #[test]
+    fn action_enter_dispatches_first_priority() {
+        let mut app = stub_app();
+        // A checkout item with no workspace — enter_priority: SwitchToWorkspace
+        // (unavail), TeleportSession (unavail), CreateWorkspace (available!)
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        app.action_enter();
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::CreateWorkspaceForCheckout { checkout_path } => {
+                assert_eq!(checkout_path, PathBuf::from("/tmp/a"));
+            }
+            other => panic!("expected CreateWorkspaceForCheckout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn action_enter_noop_when_no_selection() {
+        let mut app = stub_app();
+        // No items in table
+        app.action_enter();
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    #[test]
+    fn action_enter_with_workspace_switches() {
+        let mut app = stub_app();
+        let mut item = make_work_item("a");
+        item.workspace_refs = vec!["my-workspace".into()];
+        setup_table(&mut app, vec![item]);
+        app.action_enter();
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::SelectWorkspace { ws_ref } => {
+                assert_eq!(ws_ref, "my-workspace");
+            }
+            other => panic!("expected SelectWorkspace, got {:?}", other),
+        }
+    }
+
+    // ── dispatch_if_available ────────────────────────────────────────
+
+    #[test]
+    fn dispatch_if_available_pushes_command_when_available() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        // CreateWorkspace is available for a checkout item without workspace
+        app.dispatch_if_available(Intent::CreateWorkspace);
+        let cmd = app.proto_commands.take_next().unwrap();
+        assert!(matches!(cmd, Command::CreateWorkspaceForCheckout { .. }));
+    }
+
+    #[test]
+    fn dispatch_if_available_noop_when_unavailable() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        // SwitchToWorkspace is NOT available (no workspace_refs)
+        app.dispatch_if_available(Intent::SwitchToWorkspace);
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    #[test]
+    fn dispatch_if_available_noop_when_no_selection() {
+        let mut app = stub_app();
+        // No items in table
+        app.dispatch_if_available(Intent::CreateWorkspace);
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    // ── resolve_and_push ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_and_push_sets_delete_confirm_for_remove_checkout() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        app.resolve_and_push(Intent::RemoveCheckout, &item);
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::DeleteConfirm { loading: true, .. }
+        ));
+        let cmd = app.proto_commands.take_next().unwrap();
+        assert!(matches!(cmd, Command::FetchCheckoutStatus { .. }));
+    }
+
+    #[test]
+    fn resolve_and_push_sets_branch_input_for_generate_branch_name() {
+        let mut app = stub_app();
+        let mut item = make_work_item("a");
+        item.issue_keys = vec!["ISSUE-1".into()];
+        app.resolve_and_push(Intent::GenerateBranchName, &item);
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::BranchInput {
+                generating: true,
+                ..
+            }
+        ));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::GenerateBranchName { issue_keys } => {
+                assert_eq!(issue_keys, vec!["ISSUE-1".to_string()]);
+            }
+            other => panic!("expected GenerateBranchName, got {:?}", other),
+        }
+    }
+
+    // ── execute_menu_action ──────────────────────────────────────────
+
+    #[test]
+    fn execute_menu_action_dispatches_selected_intent() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::CreateWorkspace, Intent::RemoveCheckout],
+            index: 0,
+        };
+        app.execute_menu_action();
+        let cmd = app.proto_commands.take_next().unwrap();
+        assert!(matches!(cmd, Command::CreateWorkspaceForCheckout { .. }));
+    }
+
+    #[test]
+    fn menu_enter_resets_to_normal_for_simple_actions() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::CreateWorkspace],
+            index: 0,
+        };
+        app.handle_key(key(KeyCode::Enter));
+        // CreateWorkspace doesn't change the mode itself, so handle_menu_key resets to Normal
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn menu_enter_preserves_delete_confirm_mode() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        setup_table(&mut app, vec![item]);
+        app.ui.mode = UiMode::ActionMenu {
+            items: vec![Intent::RemoveCheckout],
+            index: 0,
+        };
+        app.handle_key(key(KeyCode::Enter));
+        // RemoveCheckout sets DeleteConfirm mode, which should be preserved
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::DeleteConfirm { loading: true, .. }
+        ));
+    }
+
+    // ── j/k navigation in normal mode ────────────────────────────────
+
+    #[test]
+    fn normal_j_selects_next() {
+        let mut app = stub_app();
+        setup_table(
+            &mut app,
+            vec![
+                make_work_item("a"),
+                make_work_item("b"),
+                make_work_item("c"),
+            ],
+        );
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(2));
+    }
+
+    #[test]
+    fn normal_k_selects_prev() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
+        // Move to second item first
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
+    }
+
+    // ── action_enter_multi_select ────────────────────────────────────
+
+    #[test]
+    fn action_enter_multi_select_generates_branch_name() {
+        let mut app = stub_app();
+        let mut item_a = make_work_item("a");
+        item_a.issue_keys = vec!["ISSUE-1".into()];
+        let mut item_b = make_work_item("b");
+        item_b.issue_keys = vec!["ISSUE-2".into()];
+        setup_table(&mut app, vec![item_a, item_b]);
+
+        // Multi-select both items
+        app.active_ui_mut()
+            .multi_selected
+            .insert(WorkItemIdentity::Checkout(PathBuf::from("/tmp/a")));
+        app.active_ui_mut()
+            .multi_selected
+            .insert(WorkItemIdentity::Checkout(PathBuf::from("/tmp/b")));
+
+        app.action_enter();
+
+        // Should set BranchInput with generating=true
+        assert!(matches!(
+            app.ui.mode,
+            UiMode::BranchInput {
+                generating: true,
+                ..
+            }
+        ));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::GenerateBranchName { issue_keys } => {
+                assert!(issue_keys.contains(&"ISSUE-1".to_string()));
+                assert!(issue_keys.contains(&"ISSUE-2".to_string()));
+            }
+            other => panic!("expected GenerateBranchName, got {:?}", other),
+        }
+        // Multi-select should be cleared
+        assert!(app.active_ui().multi_selected.is_empty());
+    }
+
+    #[test]
+    fn action_enter_multi_select_without_issues_clears() {
+        let mut app = stub_app();
+        let item_a = make_work_item("a"); // no issue_keys
+        setup_table(&mut app, vec![item_a]);
+
+        app.active_ui_mut()
+            .multi_selected
+            .insert(WorkItemIdentity::Checkout(PathBuf::from("/tmp/a")));
+
+        app.action_enter();
+
+        // No issues, so no GenerateBranchName — stays in Normal, multi_selected cleared
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
+        assert!(app.active_ui().multi_selected.is_empty());
+    }
+
+    // ── delete_confirm_y_with_no_info ────────────────────────────────
+
+    #[test]
+    fn delete_confirm_y_with_no_info_does_not_push_command() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::DeleteConfirm {
+            info: None,
+            loading: false,
+        };
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        // No info means no branch to extract, so no command pushed
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    // ── open_action_menu with change request item ────────────────────
+
+    #[test]
+    fn open_action_menu_includes_open_change_request() {
+        let mut app = stub_app();
+        let mut item = make_work_item("a");
+        item.change_request_key = Some("PR#10".into());
+        setup_table(&mut app, vec![item]);
+        app.open_action_menu();
+        match &app.ui.mode {
+            UiMode::ActionMenu { items, .. } => {
+                assert!(items.contains(&Intent::OpenChangeRequest));
+            }
+            other => panic!(
+                "expected ActionMenu, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    // ── space toggles multi-select ───────────────────────────────────
+
+    #[test]
+    fn space_toggles_multi_select() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a")]);
+        assert!(app.active_ui().multi_selected.is_empty());
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(!app.active_ui().multi_selected.is_empty());
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.active_ui().multi_selected.is_empty());
+    }
+
+    // ── normal p dispatches open change request ──────────────────────
+
+    #[test]
+    fn normal_p_opens_change_request() {
+        let mut app = stub_app();
+        let mut item = make_work_item("a");
+        item.change_request_key = Some("PR#42".into());
+        setup_table(&mut app, vec![item]);
+        app.handle_key(key(KeyCode::Char('p')));
+        let cmd = app.proto_commands.take_next().unwrap();
+        match cmd {
+            Command::OpenChangeRequest { id } => {
+                assert_eq!(id, "PR#42");
+            }
+            other => panic!("expected OpenChangeRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normal_p_noop_without_change_request() {
+        let mut app = stub_app();
+        let item = make_work_item("a"); // no change_request_key
+        setup_table(&mut app, vec![item]);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+}
