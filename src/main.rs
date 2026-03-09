@@ -151,11 +151,14 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     };
 
-    // Forward --repo-root paths to the daemon
-    for root in &cli_repo_roots {
-        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        if let Err(e) = daemon.add_repo(&canonical).await {
-            info!("failed to add repo {}: {e}", canonical.display());
+    // Forward --repo-root paths to the daemon (socket mode only;
+    // in-process mode already received them via InProcessDaemon::new).
+    if !embedded {
+        for root in &cli_repo_roots {
+            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            if let Err(e) = daemon.add_repo(&canonical).await {
+                info!("failed to add repo {}: {e}", canonical.display());
+            }
         }
     }
 
@@ -393,7 +396,11 @@ async fn connect_or_spawn(
     // Append ".lock" to the full filename to avoid aliasing when the socket
     // path already ends in ".lock" (with_extension would replace it).
     let lock_path = PathBuf::from(format!("{}.lock", socket_path.display()));
-    let lock_file = match acquire_spawn_lock(&lock_path) {
+    let lock_path_clone = lock_path.clone();
+    let lock_result = tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
+        .await
+        .map_err(|e| format!("spawn_blocking: {e}"))?;
+    let lock_file = match lock_result {
         Ok(Some(file)) => Some(file),
         Ok(None) => {
             // Another process spawned the daemon — retry connect.
@@ -405,12 +412,7 @@ async fn connect_or_spawn(
             None
         }
         Err(e) => {
-            // Lock failed — log and proceed without lock. This is the tmux
-            // fallback (client_get_lock returns -1 → proceed with server_start).
-            // Race is possible but the failure mode is benign (second daemon
-            // fails to bind and exits).
-            info!("spawn lock failed: {e}");
-            None
+            return Err(format!("spawn lock failed: {e}"));
         }
     };
 
@@ -421,8 +423,10 @@ async fn connect_or_spawn(
         // Spawn daemon process
         let spawn_result = spawn_daemon(cli);
         if let Err(e) = spawn_result {
-            drop(lock_file);
-            let _ = std::fs::remove_file(&lock_path);
+            if lock_file.is_some() {
+                drop(lock_file);
+                let _ = std::fs::remove_file(&lock_path);
+            }
             return Err(e);
         }
     }
@@ -432,14 +436,18 @@ async fn connect_or_spawn(
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
-            // Release lock and clean up lock file
-            drop(lock_file);
-            let _ = std::fs::remove_file(&lock_path);
+            // Release lock and clean up lock file (only if we hold it)
+            if lock_file.is_some() {
+                drop(lock_file);
+                let _ = std::fs::remove_file(&lock_path);
+            }
             return Ok(daemon);
         }
         if tokio::time::Instant::now() >= deadline {
-            drop(lock_file);
-            let _ = std::fs::remove_file(&lock_path);
+            if lock_file.is_some() {
+                drop(lock_file);
+                let _ = std::fs::remove_file(&lock_path);
+            }
             return Err("timed out waiting for daemon to start (10s)".into());
         }
     }
