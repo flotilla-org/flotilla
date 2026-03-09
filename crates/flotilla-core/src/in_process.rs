@@ -618,25 +618,60 @@ impl InProcessDaemon {
                 None => continue,
             };
 
+            // Record timestamp *before* the API call so the next `since`
+            // window overlaps rather than gaps — avoids missing updates
+            // that land on GitHub during the request.
+            let refresh_ts = now_iso8601();
+
             match tracker.list_issues_changed_since(&path, &since, 50).await {
                 Ok(changeset) => {
                     if changeset.has_more {
-                        // Too many changes — skip incremental, do a full re-fetch
+                        // Too many changes — skip incremental, do a full re-fetch.
+                        // Don't reset until we have data to replace it with,
+                        // so transient API failures don't wipe the UI.
                         drop(_guard);
-                        {
+                        let first_page = {
+                            let reg = {
+                                let repos = self.repos.read().await;
+                                repos.get(&path).map(|s| Arc::clone(&s.model.registry))
+                            };
+                            if let Some(reg) = reg {
+                                if let Some(t) = reg.issue_trackers.values().next() {
+                                    t.list_issues_page(&path, 1, 50).await.ok()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        if first_page.is_some() {
+                            // First page succeeded — safe to reset and refill
+                            {
+                                let mut repos = self.repos.write().await;
+                                if let Some(state) = repos.get_mut(&path) {
+                                    state.issue_cache.reset();
+                                    if let Some(page) = first_page {
+                                        state.issue_cache.merge_page(page);
+                                    }
+                                }
+                            }
+                            // Continue fetching remaining pages
+                            self.ensure_issues_cached(&path, prev_count).await;
+                            {
+                                let mut repos = self.repos.write().await;
+                                if let Some(state) = repos.get_mut(&path) {
+                                    state.issue_cache.mark_refreshed(refresh_ts.clone());
+                                }
+                            }
+                            self.broadcast_snapshot(&path).await;
+                        } else {
+                            // Fetch failed — keep existing cache, just update timestamp
                             let mut repos = self.repos.write().await;
                             if let Some(state) = repos.get_mut(&path) {
-                                state.issue_cache.reset();
+                                state.issue_cache.mark_refreshed(refresh_ts.clone());
                             }
                         }
-                        self.ensure_issues_cached(&path, prev_count).await;
-                        {
-                            let mut repos = self.repos.write().await;
-                            if let Some(state) = repos.get_mut(&path) {
-                                state.issue_cache.mark_refreshed(now_iso8601());
-                            }
-                        }
-                        self.broadcast_snapshot(&path).await;
                     } else {
                         let has_changes =
                             !changeset.updated.is_empty() || !changeset.closed_ids.is_empty();
@@ -644,7 +679,7 @@ impl InProcessDaemon {
                             let mut repos = self.repos.write().await;
                             if let Some(state) = repos.get_mut(&path) {
                                 state.issue_cache.apply_changeset(changeset);
-                                state.issue_cache.mark_refreshed(now_iso8601());
+                                state.issue_cache.mark_refreshed(refresh_ts);
                             }
                         }
                         if has_changes {
@@ -806,26 +841,42 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {
-        let prev_count = {
-            let mut repos = self.repos.write().await;
+        let (prev_count, registry) = {
+            let repos = self.repos.read().await;
             let state = repos
-                .get_mut(repo)
+                .get(repo)
                 .ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            let count = state.issue_cache.len();
-            state.issue_cache.reset();
             state.model.refresh_handle.trigger_refresh();
-            count
+            (state.issue_cache.len(), Arc::clone(&state.model.registry))
         };
 
         if prev_count > 0 {
-            self.ensure_issues_cached(repo, prev_count).await;
-            {
-                let mut repos = self.repos.write().await;
-                if let Some(state) = repos.get_mut(repo) {
-                    state.issue_cache.mark_refreshed(now_iso8601());
+            // Fetch page 1 before resetting, so failures don't wipe the UI.
+            let first_page = if let Some(t) = registry.issue_trackers.values().next() {
+                t.list_issues_page(repo, 1, 50).await.ok()
+            } else {
+                None
+            };
+
+            if first_page.is_some() {
+                {
+                    let mut repos = self.repos.write().await;
+                    if let Some(state) = repos.get_mut(repo) {
+                        state.issue_cache.reset();
+                        if let Some(page) = first_page {
+                            state.issue_cache.merge_page(page);
+                        }
+                    }
                 }
+                self.ensure_issues_cached(repo, prev_count).await;
+                {
+                    let mut repos = self.repos.write().await;
+                    if let Some(state) = repos.get_mut(repo) {
+                        state.issue_cache.mark_refreshed(now_iso8601());
+                    }
+                }
+                self.broadcast_snapshot(repo).await;
             }
-            self.broadcast_snapshot(repo).await;
         }
 
         Ok(())

@@ -196,10 +196,14 @@ impl super::IssueTracker for GitHubIssueTracker {
             }
         }
 
+        // Use the filtered issue count (not raw pagination which includes PRs)
+        // to decide whether there are more changes. If we got a full page of
+        // actual issues, there are likely more pages of changes.
+        let issue_count = updated.len() + closed_ids.len();
         Ok(IssueChangeset {
             updated,
             closed_ids,
-            has_more: response.has_next_page,
+            has_more: response.has_next_page && issue_count >= per_page,
         })
     }
 
@@ -323,5 +327,34 @@ mod tests {
         assert_eq!(changeset.updated.len(), 1);
         assert_eq!(changeset.updated[0].0, "1");
         assert!(changeset.closed_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_since_has_more_ignores_pr_heavy_pages() {
+        // Page is full (has_next_page) but all items are PRs — has_more should be false
+        // because the filtered issue count is 0, not >= per_page.
+        let body = r#"[
+            {"number": 10, "title": "PR A", "state": "open", "labels": [], "pull_request": {"url": "..."}},
+            {"number": 11, "title": "PR B", "state": "open", "labels": [], "pull_request": {"url": "..."}}
+        ]"#;
+        let tracker = mock_tracker(vec![Ok(GhApiResponse {
+            status: 200,
+            etag: None,
+            body: body.to_string(),
+            has_next_page: true,
+            total_count: None,
+        })]);
+
+        let changeset = tracker
+            .list_issues_changed_since(Path::new("/tmp/repo"), "2026-03-09T00:00:00Z", 2)
+            .await
+            .unwrap();
+
+        assert!(changeset.updated.is_empty());
+        assert!(changeset.closed_ids.is_empty());
+        assert!(
+            !changeset.has_more,
+            "should not escalate when all items are PRs"
+        );
     }
 }
