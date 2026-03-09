@@ -75,7 +75,11 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
-                if self.active_ui().show_providers {
+                if self.active_ui().active_search_query.is_some() {
+                    let repo = self.model.active_repo_root().clone();
+                    self.proto_commands.push(Command::ClearIssueSearch { repo });
+                    self.active_ui_mut().active_search_query = None;
+                } else if self.active_ui().show_providers {
                     self.active_ui_mut().show_providers = false;
                 } else if !self.active_ui().multi_selected.is_empty() {
                     self.active_ui_mut().multi_selected.clear();
@@ -419,6 +423,7 @@ impl App {
             KeyCode::Esc => {
                 let repo = self.model.active_repo_root().clone();
                 self.proto_commands.push(Command::ClearIssueSearch { repo });
+                self.active_ui_mut().active_search_query = None;
                 self.ui.mode = UiMode::Normal;
             }
             KeyCode::Enter => {
@@ -429,8 +434,11 @@ impl App {
                 };
                 if !query.is_empty() {
                     let repo = self.model.active_repo_root().clone();
-                    self.proto_commands
-                        .push(Command::SearchIssues { repo, query });
+                    self.proto_commands.push(Command::SearchIssues {
+                        repo,
+                        query: query.clone(),
+                    });
+                    self.active_ui_mut().active_search_query = Some(query);
                 }
                 self.ui.mode = UiMode::Normal;
             }

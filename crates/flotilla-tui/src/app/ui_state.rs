@@ -64,6 +64,7 @@ pub struct RepoUiState {
     pub has_unseen_changes: bool,
     pub multi_selected: HashSet<WorkItemIdentity>,
     pub show_providers: bool,
+    pub active_search_query: Option<String>,
 }
 
 impl RepoUiState {

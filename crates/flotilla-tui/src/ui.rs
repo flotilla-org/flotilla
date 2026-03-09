@@ -172,6 +172,8 @@ fn render_status_bar(
         UiMode::Normal => {
             if rui.show_providers {
                 " c:close providers  [/]:switch tab  ?:help  q:quit".into()
+            } else if let Some(q) = rui.active_search_query.as_deref() {
+                format!(" search: \"{q}\"  /:new search  esc:clear  ?:help  q:quit")
             } else if !rui.multi_selected.is_empty() {
                 " enter:create branch  space:toggle  esc:clear  ?:help  q:quit".into()
             } else {
