@@ -31,7 +31,7 @@ pub fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 /// Return (icon, color) for a work item based on its kind, workspace status,
 /// and optional session status.
 pub fn work_item_icon(
-    kind: WorkItemKind,
+    kind: &WorkItemKind,
     has_workspace: bool,
     session_status: Option<&SessionStatus>,
 ) -> (&'static str, Color) {
@@ -148,6 +148,12 @@ mod tests {
     }
 
     #[test]
+    fn truncate_max_one() {
+        // max=1 means 0 chars + ellipsis
+        assert_eq!(truncate("hello", 1), "…");
+    }
+
+    #[test]
     fn popup_area_centered() {
         let area = Rect::new(0, 0, 100, 50);
         let popup = popup_area(area, 50, 50);
@@ -160,14 +166,14 @@ mod tests {
 
     #[test]
     fn work_item_icon_checkout_with_workspace() {
-        let (icon, color) = work_item_icon(WorkItemKind::Checkout, true, None);
+        let (icon, color) = work_item_icon(&WorkItemKind::Checkout, true, None);
         assert_eq!(icon, "●");
         assert_eq!(color, Color::Green);
     }
 
     #[test]
     fn work_item_icon_checkout_without_workspace() {
-        let (icon, color) = work_item_icon(WorkItemKind::Checkout, false, None);
+        let (icon, color) = work_item_icon(&WorkItemKind::Checkout, false, None);
         assert_eq!(icon, "○");
         assert_eq!(color, Color::Green);
     }
@@ -175,7 +181,7 @@ mod tests {
     #[test]
     fn work_item_icon_session_running() {
         let (icon, color) =
-            work_item_icon(WorkItemKind::Session, false, Some(&SessionStatus::Running));
+            work_item_icon(&WorkItemKind::Session, false, Some(&SessionStatus::Running));
         assert_eq!(icon, "▶");
         assert_eq!(color, Color::Magenta);
     }
@@ -183,35 +189,35 @@ mod tests {
     #[test]
     fn work_item_icon_session_idle() {
         let (icon, color) =
-            work_item_icon(WorkItemKind::Session, false, Some(&SessionStatus::Idle));
+            work_item_icon(&WorkItemKind::Session, false, Some(&SessionStatus::Idle));
         assert_eq!(icon, "◆");
         assert_eq!(color, Color::Magenta);
     }
 
     #[test]
     fn work_item_icon_session_none() {
-        let (icon, color) = work_item_icon(WorkItemKind::Session, false, None);
+        let (icon, color) = work_item_icon(&WorkItemKind::Session, false, None);
         assert_eq!(icon, "○");
         assert_eq!(color, Color::Magenta);
     }
 
     #[test]
     fn work_item_icon_change_request() {
-        let (icon, color) = work_item_icon(WorkItemKind::ChangeRequest, false, None);
+        let (icon, color) = work_item_icon(&WorkItemKind::ChangeRequest, false, None);
         assert_eq!(icon, "⊙");
         assert_eq!(color, Color::Blue);
     }
 
     #[test]
     fn work_item_icon_remote_branch() {
-        let (icon, color) = work_item_icon(WorkItemKind::RemoteBranch, false, None);
+        let (icon, color) = work_item_icon(&WorkItemKind::RemoteBranch, false, None);
         assert_eq!(icon, "⊶");
         assert_eq!(color, Color::DarkGray);
     }
 
     #[test]
     fn work_item_icon_issue() {
-        let (icon, color) = work_item_icon(WorkItemKind::Issue, false, None);
+        let (icon, color) = work_item_icon(&WorkItemKind::Issue, false, None);
         assert_eq!(icon, "◇");
         assert_eq!(color, Color::Yellow);
     }

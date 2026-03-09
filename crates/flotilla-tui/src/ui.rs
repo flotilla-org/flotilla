@@ -392,7 +392,7 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
         .and_then(|k| providers.sessions.get(k))
         .map(|s| &s.status);
     let (icon, icon_color) = ui_helpers::work_item_icon(
-        item.kind.clone(),
+        &item.kind,
         !item.workspace_refs.is_empty(),
         session_status,
     );
