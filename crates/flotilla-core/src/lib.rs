@@ -10,5 +10,4 @@ pub mod model;
 pub mod provider_data;
 pub mod providers;
 pub mod refresh;
-pub mod shpool_daemon;
 pub mod template;
