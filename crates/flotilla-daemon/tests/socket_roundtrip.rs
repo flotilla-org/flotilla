@@ -37,7 +37,8 @@ async fn socket_roundtrip() {
         let _ = server.run().await;
     });
 
-    // Wait for socket to appear
+    // Wait for socket to appear.
+    // Note: sandboxed environments can introduce extra startup latency here.
     for _ in 0..20 {
         if socket_path.exists() {
             break;
