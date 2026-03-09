@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,6 +47,8 @@ impl SocketDaemon {
             Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashSet<PathBuf>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
 
@@ -63,6 +65,7 @@ impl SocketDaemon {
         let reader_writer = Arc::clone(&writer);
         let reader_next_id = Arc::clone(&next_id);
         let reader_local_seqs = Arc::clone(&local_seqs);
+        let reader_recovering = Arc::clone(&recovering);
         let reader_event_tx = event_tx.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(read_half);
@@ -99,6 +102,7 @@ impl SocketDaemon {
                                 handle_event(
                                     event,
                                     &reader_local_seqs,
+                                    &reader_recovering,
                                     &reader_event_tx,
                                     &reader_writer,
                                     &reader_pending,
@@ -209,6 +213,7 @@ async fn send_request(
 fn handle_event(
     event: DaemonEvent,
     local_seqs: &Arc<SeqMap>,
+    recovering: &Arc<std::sync::Mutex<HashSet<PathBuf>>>,
     event_tx: &broadcast::Sender<DaemonEvent>,
     writer: &Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
     pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>>,
@@ -230,22 +235,17 @@ fn handle_event(
             let _ = event_tx.send(event);
         }
         DaemonEvent::SnapshotDelta(delta) => {
-            let local_seqs_clone = Arc::clone(local_seqs);
             let repo = delta.repo.clone();
             let prev_seq = delta.prev_seq;
             let seq = delta.seq;
-            let event_tx = event_tx.clone();
-            let writer = Arc::clone(writer);
-            let pending = Arc::clone(pending);
-            let next_id = Arc::clone(next_id);
 
             // Check seq under sync lock, then spawn only if recovery needed.
-            let local_seq = local_seqs_clone.read().unwrap().get(&repo).copied();
+            let local_seq = local_seqs.read().unwrap().get(&repo).copied();
 
             match local_seq {
                 Some(ls) if prev_seq == ls => {
                     // Happy path: apply delta (sync lock, no spawn needed)
-                    local_seqs_clone.write().unwrap().insert(repo.clone(), seq);
+                    local_seqs.write().unwrap().insert(repo.clone(), seq);
                     debug!(
                         "applied delta for {} (seq {} → {})",
                         repo.display(),
@@ -254,42 +254,51 @@ fn handle_event(
                     );
                     let _ = event_tx.send(event);
                 }
-                Some(ls) => {
-                    // Seq gap — spawn recovery (async work)
-                    warn!(
-                        "seq gap for {} (local={}, delta prev_seq={}), requesting replay",
-                        repo.display(),
-                        ls,
-                        prev_seq
-                    );
+                _ => {
+                    // Seq gap or unknown repo — spawn recovery if not already in progress.
+                    // Guard prevents concurrent recoveries for the same repo from
+                    // interleaving stale replay events with newer state.
+                    let already_recovering = !recovering.lock().unwrap().insert(repo.clone());
+                    if already_recovering {
+                        debug!(
+                            "recovery already in progress for {}, skipping",
+                            repo.display()
+                        );
+                        return;
+                    }
+
+                    if let Some(ls) = local_seq {
+                        warn!(
+                            "seq gap for {} (local={}, delta prev_seq={}), requesting replay",
+                            repo.display(),
+                            ls,
+                            prev_seq
+                        );
+                    } else {
+                        warn!(
+                            "received delta for unknown repo {}, requesting replay",
+                            repo.display()
+                        );
+                    }
+
+                    let local_seqs = Arc::clone(local_seqs);
+                    let recovering = Arc::clone(recovering);
+                    let event_tx = event_tx.clone();
+                    let writer = Arc::clone(writer);
+                    let pending = Arc::clone(pending);
+                    let next_id = Arc::clone(next_id);
+
                     tokio::spawn(async move {
                         recover_from_gap(
                             &repo,
-                            &local_seqs_clone,
+                            &local_seqs,
                             &event_tx,
                             &writer,
                             &pending,
                             &next_id,
                         )
                         .await;
-                    });
-                }
-                None => {
-                    // No local state for this repo — spawn recovery
-                    warn!(
-                        "received delta for unknown repo {}, requesting replay",
-                        repo.display()
-                    );
-                    tokio::spawn(async move {
-                        recover_from_gap(
-                            &repo,
-                            &local_seqs_clone,
-                            &event_tx,
-                            &writer,
-                            &pending,
-                            &next_id,
-                        )
-                        .await;
+                        recovering.lock().unwrap().remove(&repo);
                     });
                 }
             }
