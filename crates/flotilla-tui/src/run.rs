@@ -16,6 +16,10 @@ use std::time::Duration;
 /// Takes ownership of a fully-constructed `App` (with daemon already connected)
 /// and the ratatui terminal.  On return the terminal is restored.
 pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App) -> Result<()> {
+    // Subscribe before replay so events emitted between replay and the event
+    // loop are buffered rather than silently dropped.
+    let daemon_rx = app.daemon.subscribe();
+
     // Get initial state via replay_since (works for both in-process and socket).
     let replay_events = app
         .daemon
@@ -25,8 +29,6 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     for event in replay_events {
         app.handle_daemon_event(event);
     }
-
-    let daemon_rx = app.daemon.subscribe();
 
     execute!(stdout(), EnableMouseCapture)?;
     let mut events = event::EventHandler::new(Duration::from_millis(250));
