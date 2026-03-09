@@ -170,18 +170,11 @@ impl App {
                 description,
             } => {
                 tracing::info!("command {command_id} started: {description}");
-                self.in_flight.insert(
-                    command_id,
-                    InFlightCommand {
-                        repo,
-                        description,
-                    },
-                );
+                self.in_flight
+                    .insert(command_id, InFlightCommand { repo, description });
             }
             DaemonEvent::CommandFinished {
-                command_id,
-                result,
-                ..
+                command_id, result, ..
             } => {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
                     tracing::info!("command {command_id} finished");

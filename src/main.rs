@@ -153,7 +153,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     events.attach_daemon(daemon_rx);
 
     loop {
-        terminal.draw(|f| ui::render(&app.model, &mut app.ui, f))?;
+        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
 
         if let Some(evt) = events.next().await {
             match evt {
