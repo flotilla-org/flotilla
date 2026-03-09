@@ -391,11 +391,8 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
         .as_deref()
         .and_then(|k| providers.sessions.get(k))
         .map(|s| &s.status);
-    let (icon, icon_color) = ui_helpers::work_item_icon(
-        &item.kind,
-        !item.workspace_refs.is_empty(),
-        session_status,
-    );
+    let (icon, icon_color) =
+        ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
 
     let desc_width = col_widths.get(1).copied().unwrap_or(15) as usize;
     let branch_width = col_widths.get(2).copied().unwrap_or(25) as usize;
