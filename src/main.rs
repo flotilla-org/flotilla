@@ -2,12 +2,22 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_tui::app;
+use flotilla_tui::event;
 use flotilla_tui::event_log;
+use flotilla_tui::event_log::LevelExt;
+use flotilla_tui::socket::SocketDaemon;
+use flotilla_tui::ui;
 
 use clap::Parser;
 use color_eyre::Result;
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
+};
+use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 /// Flotilla: TUI dashboard for managing development workspaces
@@ -87,7 +97,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     // Resolve repos before splash (fast — just reads config files).
     let embedded = cli.embedded;
     let repo_roots = if embedded {
-        let roots = flotilla_core::config::resolve_repo_roots(&cli.repo_root, &config);
+        let roots = resolve_repo_roots(&cli.repo_root, &config);
         if roots.is_empty() {
             ratatui::restore();
             eprintln!("Error: no git repositories found (use --repo-root to specify)");
@@ -100,83 +110,522 @@ async fn run_tui(cli: Cli) -> Result<()> {
         );
         roots
     } else {
+        if !cli.repo_root.is_empty() {
+            eprintln!(
+                "Warning: --repo-root is ignored in socket mode (repos are managed by the daemon)"
+            );
+        }
         vec![]
     };
 
-    let cli_repo_roots = cli.repo_root.clone();
-
     // Spawn daemon init on a separate task so it runs concurrently with the splash
     // (show_splash uses blocking crossterm::event::poll calls).
-    let daemon_log_path = cli.config_dir().join("daemon.log");
     let config_clone = Arc::clone(&config);
     let daemon_task = tokio::spawn(async move {
-        let daemon: Result<Arc<dyn DaemonHandle>, String> = if embedded {
+        let daemon: Arc<dyn DaemonHandle> = if embedded {
             let d = InProcessDaemon::new(repo_roots, config_clone).await;
-            Ok(d as Arc<dyn DaemonHandle>)
+            d as Arc<dyn DaemonHandle>
         } else {
             let socket_path = cli.socket_path();
-            flotilla_tui::socket::connect_or_spawn(
-                &socket_path,
-                &cli.config_dir(),
-                cli.config_dir.as_deref(),
-                cli.socket.as_deref(),
-            )
-            .await
-            .map(|d| d as Arc<dyn DaemonHandle>)
+            connect_or_spawn(&socket_path, &cli)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!(e))
+                .expect("failed to connect to daemon")
         };
+        info!("daemon ready in {:.0?}", startup.elapsed());
         daemon
     });
 
-    flotilla_tui::splash::show_splash(&mut terminal).await?;
-    let daemon = match daemon_task.await {
-        Ok(Ok(daemon)) => {
-            info!("daemon ready in {:.0?}", startup.elapsed());
-            daemon
+    show_splash(&mut terminal).await?;
+    let daemon = daemon_task.await.expect("daemon init panicked");
+
+    let daemon_rx = daemon.subscribe();
+    let repos_info = daemon.list_repos().await.unwrap_or_default();
+    let mut app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config));
+
+    // Get initial state via replay_since (works for both in-process and socket).
+    let replay_events = daemon
+        .replay_since(&std::collections::HashMap::new())
+        .await
+        .unwrap_or_default();
+    for event in replay_events {
+        app.handle_daemon_event(event);
+    }
+
+    execute!(stdout(), EnableMouseCapture)?;
+    let mut events = event::EventHandler::new(Duration::from_millis(250));
+    events.attach_daemon(daemon_rx);
+
+    terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
+
+    loop {
+        // ── Wait for the first event (blocking) ──
+        let first = match events.next().await {
+            Some(evt) => evt,
+            None => break,
+        };
+
+        // ── Drain all pending events ──
+        let mut batch = vec![first];
+        while let Some(evt) = events.try_next() {
+            batch.push(evt);
         }
-        Ok(Err(e)) => {
-            ratatui::restore();
-            eprintln!("Error: {e}");
-            eprintln!("  Check daemon log at {}", daemon_log_path.display());
-            std::process::exit(1);
+
+        // ── Coalesce ──
+        let mut scroll_delta: i32 = 0;
+        let mut last_scroll_pos: Option<(u16, u16)> = None;
+        let mut last_drag: Option<crossterm::event::MouseEvent> = None;
+        let mut other_events: Vec<event::Event> = Vec::new();
+
+        for evt in batch {
+            match &evt {
+                event::Event::Mouse(m) => match m.kind {
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        scroll_delta += 1;
+                        last_scroll_pos = Some((m.column, m.row));
+                    }
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        scroll_delta -= 1;
+                        last_scroll_pos = Some((m.column, m.row));
+                    }
+                    crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                        last_drag = Some(*m);
+                    }
+                    _ => other_events.push(evt),
+                },
+                event::Event::Tick => {} // discard ticks
+                _ => other_events.push(evt),
+            }
         }
-        Err(e) => {
-            ratatui::restore();
-            eprintln!("Error: daemon initialization panicked: {e}");
-            std::process::exit(1);
+
+        // ── Process all non-coalesced events in order ──
+        for evt in other_events {
+            match evt {
+                event::Event::Daemon(daemon_evt) => {
+                    app.handle_daemon_event(daemon_evt);
+                }
+                event::Event::Key(k) => {
+                    let is_normal = matches!(app.ui.mode, app::UiMode::Normal);
+                    if k.code == crossterm::event::KeyCode::Char('r') && is_normal {
+                        let repo = app.model.active_repo_root().clone();
+                        let daemon = app.daemon.clone();
+                        tokio::spawn(async move {
+                            let _ = daemon.refresh(&repo).await;
+                        });
+                    } else {
+                        app.handle_key(k);
+                    }
+                }
+                event::Event::Mouse(m) => {
+                    use crossterm::event::{MouseButton, MouseEventKind};
+                    match m.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let x = m.column;
+                            let y = m.row;
+                            let mut tab_clicked = false;
+
+                            let ef = app.ui.layout.event_log_filter_area;
+                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height
+                            {
+                                app.ui.event_log.filter = app.ui.event_log.filter.cycle();
+                                app.ui.event_log.count = 0;
+                                tab_clicked = true;
+                            }
+
+                            if !tab_clicked {
+                                let hit = app
+                                    .ui
+                                    .layout
+                                    .tab_areas
+                                    .iter()
+                                    .find(|(_, r)| {
+                                        x >= r.x
+                                            && x < r.x + r.width
+                                            && y >= r.y
+                                            && y < r.y + r.height
+                                    })
+                                    .map(|(id, _)| id.clone());
+
+                                match hit {
+                                    Some(app::TabId::Flotilla) => {
+                                        app.ui.mode = app::UiMode::Config;
+                                        app.ui.drag.dragging_tab = None;
+                                        tab_clicked = true;
+                                    }
+                                    Some(app::TabId::Repo(i)) => {
+                                        app.switch_tab(i);
+                                        app.ui.drag.dragging_tab = Some(i);
+                                        app.ui.drag.start_x = x;
+                                        app.ui.drag.active = false;
+                                        tab_clicked = true;
+                                    }
+                                    Some(app::TabId::Gear) if !app.ui.mode.is_config() => {
+                                        let sp = app.active_ui().show_providers;
+                                        app.active_ui_mut().show_providers = !sp;
+                                        tab_clicked = true;
+                                    }
+                                    Some(app::TabId::Add) => {
+                                        let mut input = tui_input::Input::default();
+                                        if let Some(parent) = app.model.active_repo_root().parent()
+                                        {
+                                            let parent_str = format!("{}/", parent.display());
+                                            input = tui_input::Input::from(parent_str.as_str());
+                                        }
+                                        app.ui.mode = app::UiMode::FilePicker {
+                                            input,
+                                            dir_entries: Vec::new(),
+                                            selected: 0,
+                                        };
+                                        app.refresh_dir_listing();
+                                        tab_clicked = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !tab_clicked {
+                                app.ui.drag.dragging_tab = None;
+                                app.handle_mouse(m);
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if app.ui.drag.dragging_tab.take().is_some() {
+                                if app.ui.drag.active {
+                                    app.config.save_tab_order(&app.model.repo_order);
+                                }
+                                app.ui.drag.active = false;
+                            }
+                        }
+                        _ => {
+                            app.handle_mouse(m);
+                        }
+                    }
+                }
+                event::Event::Tick => {} // already filtered out
+            }
         }
+
+        // ── Apply coalesced drag (latest position only) ──
+        if let Some(drag_m) = last_drag {
+            if let Some(dragging_idx) = app.ui.drag.dragging_tab {
+                if !app.ui.drag.active {
+                    let dx = (drag_m.column as i16 - app.ui.drag.start_x as i16).unsigned_abs();
+                    if dx >= 2 {
+                        app.ui.drag.active = true;
+                    }
+                }
+                if app.ui.drag.active {
+                    for (id, r) in &app.ui.layout.tab_areas {
+                        if let app::TabId::Repo(i) = *id {
+                            if drag_m.column >= r.x
+                                && drag_m.column < r.x + r.width
+                                && drag_m.row >= r.y
+                                && drag_m.row < r.y + r.height
+                                && i != dragging_idx
+                            {
+                                app.model.repo_order.swap(dragging_idx, i);
+                                app.model.active_repo = i;
+                                app.ui.drag.dragging_tab = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                app.handle_mouse(drag_m);
+            }
+        }
+
+        // ── Apply coalesced scroll ──
+        if scroll_delta != 0 {
+            let (col, row) = last_scroll_pos.unwrap_or((0, 0));
+            let abs = scroll_delta.unsigned_abs() as usize;
+            let kind = if scroll_delta > 0 {
+                crossterm::event::MouseEventKind::ScrollDown
+            } else {
+                crossterm::event::MouseEventKind::ScrollUp
+            };
+            let synthetic = crossterm::event::MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+            for _ in 0..abs {
+                app.handle_mouse(synthetic);
+            }
+        }
+
+        // ── Process queued commands ──
+        while let Some(cmd) = app.proto_commands.take_next() {
+            app::executor::dispatch(cmd, &mut app).await;
+        }
+
+        // ── Draw once ──
+        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    execute!(stdout(), DisableMouseCapture)?;
+    ratatui::restore();
+    Ok(())
+}
+
+async fn connect_or_spawn(
+    socket_path: &std::path::Path,
+    cli: &Cli,
+) -> Result<Arc<SocketDaemon>, String> {
+    // Try to connect to existing daemon
+    if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+        return Ok(daemon);
+    }
+
+    // Clean up stale socket
+    let _ = std::fs::remove_file(socket_path);
+
+    // Spawn daemon process
+    let exe = std::env::current_exe().map_err(|e| format!("can't find self: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon");
+    if let Some(ref config_dir) = cli.config_dir {
+        cmd.arg("--config-dir").arg(config_dir);
+    }
+    if let Some(ref socket) = cli.socket {
+        cmd.arg("--socket").arg(socket);
+    }
+    // Detach: own session so Ctrl-C doesn't kill daemon with TUI
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    // Redirect stdio, log stderr to file for debugging
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    let log_file = cli.config_dir().join("daemon.log");
+    let _ = std::fs::create_dir_all(cli.config_dir());
+    let stderr = std::fs::File::create(&log_file)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+    cmd.stderr(stderr);
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+
+    // Retry connection with backoff
+    let delays = [50, 100, 200, 400, 800];
+    for delay_ms in delays {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+            return Ok(daemon);
+        }
+    }
+
+    Err("timed out waiting for daemon to start".into())
+}
+
+async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
+    // Initialize logging to stderr (no TUI here)
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into())
+        .from_env_lossy();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
+
+    let socket_path = cli.socket_path();
+    let timeout = if timeout_secs == 0 {
+        Duration::from_secs(u64::MAX)
+    } else {
+        Duration::from_secs(timeout_secs)
     };
 
-    // Forward --repo-root paths to the daemon (socket mode only;
-    // in-process mode already received them via InProcessDaemon::new).
-    if !embedded {
-        for root in &cli_repo_roots {
-            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-            if let Err(e) = daemon.add_repo(&canonical).await {
-                info!("failed to add repo {}: {e}", canonical.display());
+    // Load repos from config
+    let config = Arc::new(ConfigStore::new());
+    let repo_roots = config.load_repos();
+    info!("starting daemon with {} repo(s)", repo_roots.len());
+
+    let server =
+        flotilla_daemon::server::DaemonServer::new(repo_roots, config, socket_path, timeout).await;
+
+    server.run().await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_status(cli: &Cli) -> Result<()> {
+    let socket_path = cli.socket_path();
+    let daemon = SocketDaemon::connect(&socket_path)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("cannot connect to daemon: {e}"))?;
+
+    let repos = daemon
+        .list_repos()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+
+    if repos.is_empty() {
+        println!("No repos tracked.");
+        return Ok(());
+    }
+
+    for repo in &repos {
+        let name = &repo.name;
+        let path = repo.path.display();
+        let health: Vec<String> = repo
+            .provider_health
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", if *v { "ok" } else { "error" }))
+            .collect();
+        let loading = if repo.loading { " (loading)" } else { "" };
+        println!("{name}{loading}  {path}");
+        if !health.is_empty() {
+            println!("  providers: {}", health.join(", "));
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_watch(cli: &Cli) -> Result<()> {
+    let socket_path = cli.socket_path();
+    let daemon = SocketDaemon::connect(&socket_path)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("cannot connect to daemon: {e}"))?;
+
+    let mut rx = daemon.subscribe();
+    println!("watching events (Ctrl-C to stop)...");
+
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let json =
+                    serde_json::to_string_pretty(&event).unwrap_or_else(|_| format!("{event:?}"));
+                println!("{json}");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("warning: skipped {n} events");
+            }
+            Err(_) => {
+                eprintln!("daemon disconnected");
+                break;
             }
         }
     }
 
-    let repos_info = daemon.list_repos().await.unwrap_or_default();
-    let app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config));
-
-    flotilla_tui::run::run_event_loop(terminal, app).await
+    Ok(())
 }
 
-async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
-    flotilla_daemon::cli::run(&cli.socket_path(), timeout_secs)
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e))
+async fn show_splash(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+    use ratatui_image::{
+        picker::{cap_parser::QueryStdioOptions, Picker},
+        StatefulImage,
+    };
+
+    let img_bytes = include_bytes!("../assets/splash.webp");
+    let dyn_img = image::load_from_memory(img_bytes)
+        .map_err(|e| color_eyre::eyre::eyre!("splash image: {e}"))?;
+    let img_w = dyn_img.width() as f64;
+    let img_h = dyn_img.height() as f64;
+
+    let query_timeout_ms = std::env::var("FLOTILLA_SPLASH_QUERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(120);
+    let mut query_options = QueryStdioOptions::default();
+    query_options.timeout = Duration::from_millis(query_timeout_ms);
+    let picker = Picker::from_query_stdio_with_options(query_options)
+        .unwrap_or_else(|_| Picker::halfblocks());
+
+    let mut protocol = picker.new_resize_protocol(dyn_img);
+
+    // Drain stale terminal responses left by Picker::from_query_stdio()
+    while crossterm::event::poll(Duration::from_millis(10))? {
+        let _ = crossterm::event::read()?;
+    }
+
+    // Guarantee a minimum visible time after first render (not just after splash setup).
+    let min_visible = Duration::from_millis(700);
+    terminal.draw(|f| {
+        use ratatui::layout::{Constraint, Flex, Layout};
+        let area = f.area();
+        let scale = (area.width as f64 / img_w).min(area.height as f64 * 2.0 / img_h);
+        let rw = (img_w * scale) as u16;
+        let rh = (img_h * scale / 2.0) as u16;
+        let [area] = Layout::horizontal([Constraint::Length(rw.min(area.width))])
+            .flex(Flex::Center)
+            .areas(area);
+        let [area] = Layout::vertical([Constraint::Length(rh.min(area.height))])
+            .flex(Flex::Center)
+            .areas(area);
+        let widget = StatefulImage::default();
+        f.render_stateful_widget(widget, area, &mut protocol);
+    })?;
+
+    tokio::time::sleep(min_visible).await;
+
+    // Drop any queued startup input (e.g. launch Enter key) so it doesn't
+    // trigger immediate actions in the main event loop.
+    while crossterm::event::poll(Duration::from_millis(0))? {
+        let _ = crossterm::event::read()?;
+    }
+    Ok(())
 }
 
-async fn run_status(cli: &Cli) -> Result<()> {
-    flotilla_tui::cli::run_status(&cli.socket_path())
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e))
-}
+/// Collect repo roots: persisted (in saved tab order) first, then CLI args, then auto-detect from cwd.
+/// Persists any new repos and saves tab order.
+fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBuf> {
+    use flotilla_core::providers::vcs::git::GitVcs;
+    use flotilla_core::providers::vcs::Vcs;
+    use flotilla_core::providers::ProcessCommandRunner;
 
-async fn run_watch(cli: &Cli) -> Result<()> {
-    flotilla_tui::cli::run_watch(&cli.socket_path())
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e))
+    let mut repo_roots: Vec<PathBuf> = Vec::new();
+
+    // 1. Persisted repos in saved tab order
+    let persisted = config.load_repos();
+    let tab_order = config.load_tab_order();
+    if let Some(order) = tab_order {
+        for path in &order {
+            if persisted.contains(path) && !repo_roots.contains(path) {
+                repo_roots.push(path.clone());
+            }
+        }
+        // Any persisted repos not in the order file go at the end
+        for path in &persisted {
+            if !repo_roots.contains(path) {
+                repo_roots.push(path.clone());
+            }
+        }
+    } else {
+        repo_roots.extend(persisted);
+    }
+
+    // 2. CLI args (appended after persisted)
+    for root in cli_roots {
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if !repo_roots.contains(&canonical) {
+            repo_roots.push(canonical);
+        }
+    }
+
+    // 3. Auto-detect from cwd — resolve to main repo root (not worktree)
+    let cwd = std::env::current_dir().ok();
+    if let Some(ref cwd) = cwd {
+        let git = GitVcs::new(Arc::new(ProcessCommandRunner));
+        if let Some(repo_root) = git.resolve_repo_root(cwd) {
+            if !repo_roots.contains(&repo_root) {
+                repo_roots.push(repo_root);
+            }
+        }
+    }
+
+    // Persist any new repos and save tab order
+    for path in &repo_roots {
+        config.save_repo(path);
+    }
+    config.save_tab_order(&repo_roots);
+
+    repo_roots
 }

@@ -81,4 +81,9 @@ impl EventHandler {
     pub async fn next(&mut self) -> Option<Event> {
         self.rx.recv().await
     }
+
+    /// Non-blocking: returns the next queued event if one is available.
+    pub fn try_next(&mut self) -> Option<Event> {
+        self.rx.try_recv().ok()
+    }
 }

@@ -34,10 +34,50 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     let mut events = event::EventHandler::new(Duration::from_millis(250));
     events.attach_daemon(daemon_rx);
 
-    loop {
-        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
+    // Initial draw before entering the event loop
+    terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
 
-        if let Some(evt) = events.next().await {
+    loop {
+        // ── Wait for the first event (blocking) ──
+        let first = match events.next().await {
+            Some(evt) => evt,
+            None => break,
+        };
+
+        // ── Drain all pending events ──
+        let mut batch = vec![first];
+        while let Some(evt) = events.try_next() {
+            batch.push(evt);
+        }
+
+        // ── Coalesce ──
+        // Scroll: accumulate net delta. Ticks: discard.
+        // Drags are NOT coalesced — each position triggers an adjacent-tab swap,
+        // and the sequence must be preserved (including ordering relative to MouseUp).
+        let mut scroll_delta: i32 = 0;
+        let mut last_scroll_pos: Option<(u16, u16)> = None;
+        let mut other_events: Vec<Event> = Vec::new();
+
+        for evt in batch {
+            match &evt {
+                Event::Mouse(m) => match m.kind {
+                    MouseEventKind::ScrollDown => {
+                        scroll_delta += 1;
+                        last_scroll_pos = Some((m.column, m.row));
+                    }
+                    MouseEventKind::ScrollUp => {
+                        scroll_delta -= 1;
+                        last_scroll_pos = Some((m.column, m.row));
+                    }
+                    _ => other_events.push(evt),
+                },
+                Event::Tick => {} // discard ticks
+                _ => other_events.push(evt),
+            }
+        }
+
+        // ── Process all non-coalesced events in order ──
+        for evt in other_events {
             match evt {
                 Event::Daemon(daemon_evt) => {
                     app.handle_daemon_event(daemon_evt);
@@ -45,7 +85,6 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 Event::Key(k) => {
                     let is_normal = matches!(app.ui.mode, UiMode::Normal);
                     if k.code == KeyCode::Char('r') && is_normal {
-                        // Trigger immediate refresh on active repo via daemon
                         let repo = app.model.active_repo_root().clone();
                         let daemon = app.daemon.clone();
                         tokio::spawn(async move {
@@ -64,7 +103,10 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 
                             // Check event log filter area (click cycles level)
                             let ef = app.ui.layout.event_log_filter_area;
-                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height
+                            if x >= ef.x
+                                && x < ef.x + ef.width
+                                && y >= ef.y
+                                && y < ef.y + ef.height
                             {
                                 app.ui.event_log.filter = app.ui.event_log.filter.cycle();
                                 app.ui.event_log.count = 0;
@@ -106,10 +148,13 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                                     }
                                     Some(TabId::Add) => {
                                         let mut input = tui_input::Input::default();
-                                        if let Some(parent) = app.model.active_repo_root().parent()
+                                        if let Some(parent) =
+                                            app.model.active_repo_root().parent()
                                         {
-                                            let parent_str = format!("{}/", parent.display());
-                                            input = tui_input::Input::from(parent_str.as_str());
+                                            let parent_str =
+                                                format!("{}/", parent.display());
+                                            input =
+                                                tui_input::Input::from(parent_str.as_str());
                                         }
                                         app.ui.mode = UiMode::FilePicker {
                                             input,
@@ -170,14 +215,37 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                         }
                     }
                 }
-                Event::Tick => {}
+                Event::Tick => {} // already filtered out
             }
         }
 
-        // Process proto command queue — routed through daemon-side executor
+        // ── Apply coalesced scroll ──
+        if scroll_delta != 0 {
+            let (col, row) = last_scroll_pos.unwrap_or((0, 0));
+            let abs = scroll_delta.unsigned_abs() as usize;
+            let kind = if scroll_delta > 0 {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            };
+            let synthetic = crossterm::event::MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+            for _ in 0..abs {
+                app.handle_mouse(synthetic);
+            }
+        }
+
+        // ── Process queued commands ──
         while let Some(cmd) = app.proto_commands.take_next() {
             app::executor::dispatch(cmd, &mut app).await;
         }
+
+        // ── Draw once ──
+        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
 
         if app.should_quit {
             break;
