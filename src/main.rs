@@ -9,7 +9,6 @@ use clap::Parser;
 use color_eyre::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::info;
 
 /// Flotilla: TUI dashboard for managing development workspaces
@@ -143,31 +142,9 @@ async fn run_tui(cli: Cli) -> Result<()> {
 }
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
-    // Initialize logging to stderr (no TUI here)
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into())
-        .from_env_lossy();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .init();
-
-    let socket_path = cli.socket_path();
-    let timeout = if timeout_secs == 0 {
-        Duration::from_secs(u64::MAX)
-    } else {
-        Duration::from_secs(timeout_secs)
-    };
-
-    // Load repos from config
-    let config = Arc::new(ConfigStore::new());
-    let repo_roots = config.load_repos();
-    info!("starting daemon with {} repo(s)", repo_roots.len());
-
-    let server =
-        flotilla_daemon::server::DaemonServer::new(repo_roots, config, socket_path, timeout).await;
-
-    server.run().await.map_err(|e| color_eyre::eyre::eyre!(e))
+    flotilla_daemon::cli::run(&cli.socket_path(), timeout_secs)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 async fn run_status(cli: &Cli) -> Result<()> {
