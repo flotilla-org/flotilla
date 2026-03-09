@@ -8,20 +8,21 @@
 
 **Tech Stack:** ratatui `TestBackend`, `insta` crate, `flotilla-core::data::group_work_items`
 
+**Note:** `crates/flotilla-tui/src/app/test_support.rs` (from #162) has work item builders (`checkout_item`, `pr_item`, etc.) but is `#[cfg(test)] pub(crate)` — not accessible from integration tests. Our `test_fixtures.rs` duplicates the work item builders we need and adds `ProviderData` builders and the `TestHarness` that `test_support` doesn't have.
+
 ---
 
 ### Task 1: Add `insta` dev-dependency
 
 **Files:**
-- Modify: `crates/flotilla-tui/Cargo.toml:27-28`
+- Modify: `crates/flotilla-tui/Cargo.toml:28-30`
 
 **Step 1: Add insta to dev-dependencies**
-
-In `crates/flotilla-tui/Cargo.toml`, add `insta` to `[dev-dependencies]`:
 
 ```toml
 [dev-dependencies]
 async-trait = { workspace = true }
+tempfile = "3"
 insta = "1"
 ```
 
@@ -39,14 +40,13 @@ git commit -m "chore: add insta dev-dependency for TUI snapshot tests (#96)"
 
 ---
 
-### Task 2: Create test harness with buffer-to-string rendering
+### Task 2: Create test harness and first snapshot tests
 
 **Files:**
 - Create: `crates/flotilla-tui/tests/test_fixtures.rs`
+- Create: `crates/flotilla-tui/tests/snapshots.rs`
 
-**Step 1: Write the test harness**
-
-This module provides `TestHarness` — a builder that creates `TuiModel`, `UiState`, and `HashMap<u64, InFlightCommand>`, then renders into a `TestBackend` and returns the buffer as a string.
+**Step 1: Write test_fixtures.rs**
 
 ```rust
 use std::collections::HashMap;
@@ -58,9 +58,9 @@ use ratatui::Terminal;
 
 use flotilla_core::data::{group_work_items, SectionLabels};
 use flotilla_protocol::{
-    ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue,
-    ProviderData, RepoInfo, RepoLabels, SessionStatus, WorkItem, WorkItemIdentity, WorkItemKind,
-    CheckoutRef,
+    ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CloudAgentSession, CorrelationKey,
+    Issue, ProviderData, RepoInfo, RepoLabels, SessionStatus, WorkItem, WorkItemIdentity,
+    WorkItemKind,
 };
 use flotilla_tui::app::{InFlightCommand, ProviderStatus, TuiModel, UiMode, UiState};
 use flotilla_tui::ui;
@@ -68,7 +68,6 @@ use flotilla_tui::ui;
 const TERM_WIDTH: u16 = 120;
 const TERM_HEIGHT: u16 = 30;
 
-/// Reusable test harness for TUI rendering snapshot tests.
 pub struct TestHarness {
     pub model: TuiModel,
     pub ui: UiState,
@@ -76,7 +75,6 @@ pub struct TestHarness {
 }
 
 impl TestHarness {
-    /// Create a harness with no repos (empty state).
     pub fn empty() -> Self {
         let model = TuiModel::from_repo_info(vec![]);
         let ui = UiState::new(&[]);
@@ -87,7 +85,6 @@ impl TestHarness {
         }
     }
 
-    /// Create a harness with one repo containing no work items.
     pub fn single_repo(name: &str) -> Self {
         let path = PathBuf::from(format!("/test/{name}"));
         let info = RepoInfo {
@@ -107,7 +104,6 @@ impl TestHarness {
         }
     }
 
-    /// Create a harness with multiple repos.
     pub fn multi_repo(names: &[&str]) -> Self {
         let mut infos = Vec::new();
         let mut paths = Vec::new();
@@ -132,19 +128,16 @@ impl TestHarness {
         }
     }
 
-    /// Set the UI mode.
     pub fn with_mode(mut self, mode: UiMode) -> Self {
         self.ui.mode = mode;
         self
     }
 
-    /// Set a status message on the model.
     pub fn with_status_message(mut self, msg: &str) -> Self {
         self.model.status_message = Some(msg.to_string());
         self
     }
 
-    /// Add a provider status entry.
     pub fn with_provider_status(
         mut self,
         repo_name: &str,
@@ -159,8 +152,8 @@ impl TestHarness {
         self
     }
 
-    /// Populate the active repo with work items from the given ProviderData.
-    /// This runs group_work_items to build the table view, matching real app behavior.
+    /// Populate the active repo with work items and provider data.
+    /// Runs group_work_items to build the table view, matching real app behavior.
     pub fn with_provider_data(mut self, providers: ProviderData, items: Vec<WorkItem>) -> Self {
         let path = self.model.repo_order[0].clone();
         let labels = &self.model.repos[&path].labels;
@@ -181,7 +174,6 @@ impl TestHarness {
         self
     }
 
-    /// Render into a TestBackend and return the buffer contents as a string.
     pub fn render_to_string(&mut self) -> String {
         let backend = TestBackend::new(TERM_WIDTH, TERM_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -193,7 +185,6 @@ impl TestHarness {
     }
 }
 
-/// Convert a ratatui Buffer to a plain-text string (one line per row, trailing spaces trimmed).
 fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
     let area = buffer.area;
     let mut result = String::new();
@@ -203,14 +194,12 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
             let cell = &buffer[(x, y)];
             line.push_str(cell.symbol());
         }
-        // Trim trailing whitespace per line for cleaner snapshots
         result.push_str(line.trim_end());
         result.push('\n');
     }
     result
 }
 
-/// Standard labels for tests — mimics what a typical repo setup provides.
 fn test_labels() -> RepoLabels {
     RepoLabels {
         checkouts: flotilla_protocol::CategoryLabels {
@@ -236,7 +225,7 @@ fn test_labels() -> RepoLabels {
     }
 }
 
-// ── Convenience builders for test data ──────────────────────────────────
+// ── ProviderData builders (not in test_support.rs) ────────────────────
 
 pub fn make_checkout(branch: &str, path: &str, is_trunk: bool) -> (PathBuf, Checkout) {
     (
@@ -292,6 +281,8 @@ pub fn make_session(id: &str, title: &str, status: SessionStatus) -> (String, Cl
     )
 }
 
+// ── WorkItem builders (mirrors test_support.rs, needed for integration tests) ─
+
 pub fn make_work_item_checkout(branch: &str, path: &str) -> WorkItem {
     WorkItem {
         kind: WorkItemKind::Checkout,
@@ -344,31 +335,14 @@ pub fn make_work_item_issue(id: &str, title: &str) -> WorkItem {
 }
 ```
 
-**Step 2: Verify it compiles**
-
-Run: `cargo check -p flotilla-tui --tests`
-Expected: compiles (the file is only compiled when tests reference it)
-
-**Step 3: Commit**
-
-```bash
-git add crates/flotilla-tui/tests/test_fixtures.rs
-git commit -m "test: add TestHarness for TUI rendering snapshot tests (#96)"
-```
-
----
-
-### Task 3: Write first snapshot test — empty state
-
-**Files:**
-- Create: `crates/flotilla-tui/tests/snapshots.rs`
-
-**Step 1: Write the empty state test**
+**Step 2: Write snapshots.rs with first three tests**
 
 ```rust
 mod test_fixtures;
 
-use test_fixtures::TestHarness;
+use flotilla_protocol::{ProviderData, SessionStatus};
+use flotilla_tui::app::{ProviderStatus, UiMode};
+use test_fixtures::*;
 
 #[test]
 fn empty_state() {
@@ -376,73 +350,13 @@ fn empty_state() {
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
-```
 
-**Step 2: Run the test — it will fail because no snapshot exists yet**
-
-Run: `cargo test -p flotilla-tui --test snapshots empty_state`
-Expected: FAIL with "new snapshot" message from insta
-
-**Step 3: Review and accept the snapshot**
-
-Run: `cargo insta review` (or check the `.snap.new` file, rename to `.snap`)
-Verify the output looks reasonable — the tab bar and status bar should render even with no repos.
-
-**Step 4: Run test again to confirm it passes**
-
-Run: `cargo test -p flotilla-tui --test snapshots empty_state`
-Expected: PASS
-
-**Step 5: Commit**
-
-```bash
-git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: empty state snapshot test (#96)"
-```
-
----
-
-### Task 4: Single repo with empty table snapshot
-
-**Files:**
-- Modify: `crates/flotilla-tui/tests/snapshots.rs`
-
-**Step 1: Add the test**
-
-```rust
 #[test]
 fn single_repo_empty_table() {
     let mut harness = TestHarness::single_repo("my-project");
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
-```
-
-**Step 2: Run, review, accept**
-
-Run: `cargo test -p flotilla-tui --test snapshots single_repo_empty_table`
-Then: `cargo insta review`
-Verify: tab bar shows "my-project", table area is empty, status bar shows normal mode hints.
-
-**Step 3: Commit**
-
-```bash
-git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: single repo empty table snapshot (#96)"
-```
-
----
-
-### Task 5: Single repo with populated work items
-
-**Files:**
-- Modify: `crates/flotilla-tui/tests/snapshots.rs`
-
-**Step 1: Add the test**
-
-```rust
-use test_fixtures::*;
-use flotilla_protocol::{ProviderData, SessionStatus};
 
 #[test]
 fn single_repo_with_items() {
@@ -462,34 +376,37 @@ fn single_repo_with_items() {
         make_work_item_issue("10", "Users need authentication"),
     ];
 
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_provider_data(providers, items);
+    let mut harness =
+        TestHarness::single_repo("my-project").with_provider_data(providers, items);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
 ```
 
-**Step 2: Run, review, accept**
+**Step 3: Run tests, review and accept snapshots**
 
-Run: `cargo test -p flotilla-tui --test snapshots single_repo_with_items`
-Then: `cargo insta review`
-Verify: table shows section headers ("Worktrees", "Pull Requests", "Issues") with items underneath, preview panel shows selected item details.
+Run: `cargo test -p flotilla-tui --test snapshots`
+Then: `cargo insta review` or manually rename `.snap.new` → `.snap`
+Verify each snapshot looks reasonable.
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
-git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: populated work items snapshot (#96)"
+git add crates/flotilla-tui/Cargo.toml Cargo.lock \
+    crates/flotilla-tui/tests/test_fixtures.rs \
+    crates/flotilla-tui/tests/snapshots.rs \
+    crates/flotilla-tui/tests/snapshots/
+git commit -m "test: TUI snapshot test harness with initial tests (#96)"
 ```
 
 ---
 
-### Task 6: Tab bar with multiple repos
+### Task 3: Tab bar, status bar, and help screen snapshots
 
 **Files:**
 - Modify: `crates/flotilla-tui/tests/snapshots.rs`
 
-**Step 1: Add the test**
+**Step 1: Add three tests**
 
 ```rust
 #[test]
@@ -498,29 +415,7 @@ fn tab_bar_multiple_repos() {
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
-```
 
-**Step 2: Run, review, accept**
-
-Verify: tab bar shows "⚓ flotilla", "alpha", "beta", "gamma" tabs plus [+] and gear icons.
-
-**Step 3: Commit**
-
-```bash
-git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: multi-repo tab bar snapshot (#96)"
-```
-
----
-
-### Task 7: Status bar with error message
-
-**Files:**
-- Modify: `crates/flotilla-tui/tests/snapshots.rs`
-
-**Step 1: Add the test**
-
-```rust
 #[test]
 fn status_bar_with_error() {
     let mut harness = TestHarness::single_repo("my-project")
@@ -528,35 +423,10 @@ fn status_bar_with_error() {
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
-```
-
-**Step 2: Run, review, accept**
-
-Verify: bottom status bar shows the error message.
-
-**Step 3: Commit**
-
-```bash
-git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: status bar error message snapshot (#96)"
-```
-
----
-
-### Task 8: Help screen
-
-**Files:**
-- Modify: `crates/flotilla-tui/tests/snapshots.rs`
-
-**Step 1: Add the test**
-
-```rust
-use flotilla_tui::app::UiMode;
 
 #[test]
 fn help_screen() {
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_mode(UiMode::Help);
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::Help);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -564,66 +434,45 @@ fn help_screen() {
 
 **Step 2: Run, review, accept**
 
-Verify: help overlay renders with keybinding descriptions (j/k, Enter, q, etc.).
+Run: `cargo test -p flotilla-tui --test snapshots`
+Then: `cargo insta review`
+Verify: tab bar shows all repo names; error shows in status bar; help overlay has keybindings.
 
 **Step 3: Commit**
 
 ```bash
 git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: help screen snapshot (#96)"
+git commit -m "test: tab bar, status bar, and help screen snapshots (#96)"
 ```
 
 ---
 
-### Task 9: Action menu
+### Task 4: Action menu, config screen, and preview panel snapshots
 
 **Files:**
 - Modify: `crates/flotilla-tui/tests/snapshots.rs`
 
-**Step 1: Add the test**
+**Step 1: Add three tests**
+
+Note: `Intent` variants are: `SwitchToWorkspace`, `CreateWorkspace`, `RemoveCheckout`, `CreateCheckoutAndWorkspace`, `GenerateBranchName`, `OpenChangeRequest`, `OpenIssue`, `LinkIssuesToChangeRequest`, `TeleportSession`, `ArchiveSession`. Pick a representative subset.
 
 ```rust
-use flotilla_tui::app::intent::Intent;
+use flotilla_tui::app::Intent;
 
 #[test]
 fn action_menu() {
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_mode(UiMode::ActionMenu {
-            items: vec![
-                Intent::Refresh,
-                Intent::OpenInBrowser,
-                Intent::NewBranch,
-            ],
-            index: 0,
-        });
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::ActionMenu {
+        items: vec![
+            Intent::CreateWorkspace,
+            Intent::OpenChangeRequest,
+            Intent::RemoveCheckout,
+        ],
+        index: 0,
+    });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
-```
 
-Note: check that `Intent::Refresh`, `Intent::OpenInBrowser`, and `Intent::NewBranch` are the correct variant names. Read `crates/flotilla-tui/src/app/intent.rs` to verify available variants before implementing.
-
-**Step 2: Run, review, accept**
-
-Verify: popup menu renders centered with action items listed, first item highlighted.
-
-**Step 3: Commit**
-
-```bash
-git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: action menu snapshot (#96)"
-```
-
----
-
-### Task 10: Config screen
-
-**Files:**
-- Modify: `crates/flotilla-tui/tests/snapshots.rs`
-
-**Step 1: Add the test**
-
-```rust
 #[test]
 fn config_screen() {
     let mut harness = TestHarness::single_repo("my-project")
@@ -633,35 +482,12 @@ fn config_screen() {
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
-```
 
-**Step 2: Run, review, accept**
-
-Verify: config view renders with provider status indicators.
-
-**Step 3: Commit**
-
-```bash
-git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: config screen snapshot (#96)"
-```
-
----
-
-### Task 11: Selected item preview
-
-**Files:**
-- Modify: `crates/flotilla-tui/tests/snapshots.rs`
-
-**Step 1: Add the test**
-
-This test creates work items and ensures the first one is selected, so the preview panel renders its details.
-
-```rust
 #[test]
 fn selected_item_preview() {
     let mut providers = ProviderData::default();
-    let (path, checkout) = make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
+    let (path, checkout) =
+        make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
     providers.checkouts.insert(path, checkout);
     let (id, cr) = make_change_request("99", "Build analytics dashboard", "feat-dashboard");
     providers.change_requests.insert(id, cr);
@@ -671,9 +497,8 @@ fn selected_item_preview() {
         make_work_item_cr("99", "Build analytics dashboard"),
     ];
 
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_provider_data(providers, items);
-    // Selection defaults to first selectable item via update_table_view
+    let mut harness =
+        TestHarness::single_repo("my-project").with_provider_data(providers, items);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -681,42 +506,31 @@ fn selected_item_preview() {
 
 **Step 2: Run, review, accept**
 
-Verify: right panel shows details for the selected work item (branch, checkout path, etc.).
+Run: `cargo test -p flotilla-tui --test snapshots`
+Then: `cargo insta review`
+Verify: action menu popup renders; config shows provider statuses; preview shows selected item details.
 
 **Step 3: Commit**
 
 ```bash
 git add crates/flotilla-tui/tests/snapshots.rs crates/flotilla-tui/tests/snapshots/
-git commit -m "test: selected item preview snapshot (#96)"
+git commit -m "test: action menu, config screen, and preview snapshots (#96)"
 ```
 
 ---
 
-### Task 12: Final verification and cleanup
+### Task 5: Final verification
 
 **Step 1: Run all snapshot tests**
 
 Run: `cargo test -p flotilla-tui --test snapshots`
-Expected: all tests pass
+Expected: all 9 tests pass
 
-**Step 2: Run full test suite**
+**Step 2: Run full test suite + lint**
 
-Run: `cargo test --locked`
-Expected: all tests pass
+Run: `cargo fmt && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
+Expected: all pass, no warnings
 
-**Step 3: Run clippy**
+**Step 3: Commit any fixups**
 
-Run: `cargo clippy --all-targets --locked -- -D warnings`
-Expected: no warnings
-
-**Step 4: Run fmt**
-
-Run: `cargo fmt --check`
-Expected: no formatting issues
-
-**Step 5: Final commit if any fixups needed**
-
-```bash
-git add -A
-git commit -m "test: TUI rendering snapshot tests (#96)"
-```
+Only if needed from clippy/fmt.
