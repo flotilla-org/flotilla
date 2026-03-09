@@ -13,7 +13,8 @@ pub async fn run(socket_path: &Path, timeout_secs: u64) -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
-        .init();
+        .try_init()
+        .ok();
 
     let timeout = if timeout_secs == 0 {
         Duration::from_secs(u64::MAX)
