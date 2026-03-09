@@ -1,46 +1,104 @@
 interactions:
-  # wt list --format=json returns two worktrees with trailing ANSI codes
-  - channel: command
-    cmd: wt
-    args: ["list", "--format=json"]
-    cwd: "{repo}"
-    stdout: |
-      [
-        {
-          "branch": "main",
-          "path": "{repo}",
-          "is_main": true,
-          "is_current": false,
-          "main": null,
-          "remote": null,
-          "working_tree": null,
-          "commit": {"short_sha": "abc1234", "message": "Initial commit"}
+- channel: command
+  cmd: wt
+  args:
+  - list
+  - '--format=json'
+  cwd: '{repo}'
+  stdout: |
+    [
+      {
+        "branch": "main",
+        "path": "{repo}",
+        "kind": "worktree",
+        "commit": {
+          "sha": "e0eeb7d842fd739ad99b040d72d04aa11bfcc675",
+          "short_sha": "e0eeb7d",
+          "message": "Initial commit",
+          "timestamp": 1773058918
         },
-        {
-          "branch": "feature/foo",
-          "path": "{repo}.wt/feature-foo",
-          "is_main": false,
-          "is_current": true,
-          "main": {"ahead": 3, "behind": 1},
-          "remote": {"name": "origin", "branch": "feature/foo", "ahead": 0, "behind": 0},
-          "working_tree": {"staged": true, "modified": false, "untracked": true},
-          "commit": {"short_sha": "def5678", "message": "Add feature"}
-        }
-      ]\u001b[0m
-    exit_code: 0
-
-  # git config for main branch — no issue links configured
-  - channel: command
-    cmd: git
-    args: ["config", "--get-regexp", 'branch\.main\.flotilla\.issues\.']
-    cwd: "{repo}"
-    stderr: ""
-    exit_code: 1
-
-  # git config for feature/foo branch — no issue links configured
-  - channel: command
-    cmd: git
-    args: ["config", "--get-regexp", 'branch\.feature/foo\.flotilla\.issues\.']
-    cwd: "{repo}"
-    stderr: ""
-    exit_code: 1
+        "working_tree": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "diff": {
+            "added": 0,
+            "deleted": 0
+          }
+        },
+        "main_state": "is_main",
+        "remote": {
+          "name": "origin",
+          "branch": "main",
+          "ahead": 0,
+          "behind": 0
+        },
+        "worktree": {
+          "detached": false
+        },
+        "is_main": true,
+        "is_current": true,
+        "is_previous": true,
+        "statusline": "main  \u001b[2m^\u001b[22m\u001b[2m|\u001b[22m",
+        "symbols": "^|"
+      },
+      {
+        "branch": "feature/foo",
+        "path": "{repo}.feature-foo",
+        "kind": "worktree",
+        "commit": {
+          "sha": "e0eeb7d842fd739ad99b040d72d04aa11bfcc675",
+          "short_sha": "e0eeb7d",
+          "message": "Initial commit",
+          "timestamp": 1773058918
+        },
+        "working_tree": {
+          "staged": true,
+          "modified": true,
+          "untracked": true,
+          "renamed": false,
+          "deleted": false,
+          "diff": {
+            "added": 2,
+            "deleted": 1
+          }
+        },
+        "main_state": "same_commit",
+        "main": {
+          "ahead": 0,
+          "behind": 0
+        },
+        "worktree": {
+          "detached": false
+        },
+        "is_main": false,
+        "is_current": false,
+        "is_previous": false,
+        "statusline": "feature/foo  \u001b[36m+\u001b[39m\u001b[36m!\u001b[39m\u001b[36m?\u001b[39m\u001b[2m–\u001b[22m  @\u001b[32m+2\u001b[0m \u001b[31m-1\u001b[0m",
+        "symbols": "+!?–"
+      }
+    ]
+  stderr: null
+  exit_code: 0
+- channel: command
+  cmd: git
+  args:
+  - config
+  - '--get-regexp'
+  - branch\.main\.flotilla\.issues\.
+  cwd: '{repo}'
+  stdout: null
+  stderr: ''
+  exit_code: 1
+- channel: command
+  cmd: git
+  args:
+  - config
+  - '--get-regexp'
+  - branch\.feature/foo\.flotilla\.issues\.
+  cwd: '{repo}'
+  stdout: null
+  stderr: ''
+  exit_code: 1

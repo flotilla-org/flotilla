@@ -197,126 +197,282 @@ impl super::CheckoutManager for WtCheckoutManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::replay::{Masks, ReplaySession};
+    use crate::providers::replay;
     use crate::providers::vcs::CheckoutManager;
 
-    fn repo_masks() -> Masks {
-        let mut m = Masks::new();
-        m.add("/test/repo", "{repo}");
-        m
+    // ── Setup helpers (only called in record mode) ──
+
+    /// Run a git command in `repo`, panicking on failure.
+    fn git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
-    #[tokio::test]
-    async fn replay_list_checkouts() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/wt_list.yaml"
-            ),
-            repo_masks(),
+    /// Run a wt command in `repo`, panicking on failure.
+    fn wt(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("wt")
+            .args(args)
+            .current_dir(repo)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "wt {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
         );
-        let runner = Arc::new(session.command_runner());
+    }
+
+    /// Create a temp git repo cloned from a bare remote, with a feature branch
+    /// worktree. Returns (tempdir_guard, canonical_repo_path).
+    ///
+    /// Layout after setup:
+    /// - `<tmp>/remote.git` — bare remote
+    /// - `<tmp>/repo`       — main worktree (the clone)
+    /// - `<tmp>/repo.feature-foo` — feature worktree created by `wt`
+    ///
+    /// The feature worktree has staged, modified, and untracked changes.
+    fn setup_list() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let remote = base.join("remote.git");
+        let repo = base.join("repo");
+
+        // Create bare remote and clone it
+        git(&base, &["init", "--bare", remote.to_str().unwrap()]);
+        git(
+            &base,
+            &["clone", remote.to_str().unwrap(), repo.to_str().unwrap()],
+        );
+        git(&repo, &["config", "user.email", "test@test.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+
+        // Initial commit on main
+        std::fs::write(repo.join("README.md"), "# Test repo\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "Initial commit"]);
+        git(&repo, &["push", "origin", "main"]);
+
+        // Create feature worktree via wt
+        wt(&repo, &["switch", "--create", "feature/foo", "--no-cd"]);
+
+        // Make some changes in the feature worktree for working_tree status
+        let feature_path = base.join("repo.feature-foo");
+        // Staged change
+        std::fs::write(feature_path.join("staged.txt"), "staged content").unwrap();
+        git(&feature_path, &["add", "staged.txt"]);
+        // Modified tracked file
+        std::fs::write(feature_path.join("README.md"), "modified\n").unwrap();
+        // Untracked file
+        std::fs::write(feature_path.join("untracked.txt"), "untracked").unwrap();
+
+        (dir, repo)
+    }
+
+    /// Create a temp git repo cloned from a bare remote. No extra worktrees.
+    /// Used for create_checkout and remove_checkout tests.
+    fn setup_base_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let remote = base.join("remote.git");
+        let repo = base.join("repo");
+
+        git(&base, &["init", "--bare", remote.to_str().unwrap()]);
+        git(
+            &base,
+            &["clone", remote.to_str().unwrap(), repo.to_str().unwrap()],
+        );
+        git(&repo, &["config", "user.email", "test@test.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "# Test\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "Initial commit"]);
+        git(&repo, &["push", "origin", "main"]);
+
+        (dir, repo)
+    }
+
+    /// Create a base repo with a feature worktree ready to be removed.
+    fn setup_remove() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = setup_base_repo();
+        wt(&repo, &["switch", "--create", "feat-remove", "--no-cd"]);
+        (dir, repo)
+    }
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/src/providers/vcs/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
+    }
+
+    // ── Record/replay tests ──
+
+    #[tokio::test]
+    async fn record_replay_list_checkouts() {
+        let recording = replay::is_recording();
+        let temp = if recording { Some(setup_list()) } else { None };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("wt_list.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
         let mgr = WtCheckoutManager::new(runner);
-        let checkouts = mgr.list_checkouts(Path::new("/test/repo")).await.unwrap();
+        let checkouts = mgr.list_checkouts(&repo_path).await.unwrap();
 
         assert_eq!(checkouts.len(), 2);
 
-        // First worktree: main
-        let (path0, co0) = &checkouts[0];
-        assert_eq!(path0, Path::new("/test/repo"));
-        assert_eq!(co0.branch, "main");
-        assert!(co0.is_trunk);
-        assert!(co0.trunk_ahead_behind.is_none());
-        assert!(co0.remote_ahead_behind.is_none());
-        assert!(co0.working_tree.is_none());
-        let commit0 = co0.last_commit.as_ref().unwrap();
-        assert_eq!(commit0.short_sha, "abc1234");
-        assert_eq!(commit0.message, "Initial commit");
-        // No issue links configured
-        assert!(co0.association_keys.is_empty());
+        // Find main worktree
+        let (path_main, co_main) = checkouts
+            .iter()
+            .find(|(_, co)| co.branch == "main")
+            .expect("should have main worktree");
+        assert_eq!(path_main, &repo_path);
+        assert!(co_main.is_trunk);
+        // main has remote tracking since we cloned
+        assert!(co_main.remote_ahead_behind.is_some());
+        let commit_main = co_main
+            .last_commit
+            .as_ref()
+            .expect("main should have commit");
+        assert!(!commit_main.short_sha.is_empty());
+        assert_eq!(commit_main.message, "Initial commit");
+        assert!(co_main.association_keys.is_empty());
 
-        // Second worktree: feature/foo
-        let (path1, co1) = &checkouts[1];
-        assert_eq!(path1, Path::new("/test/repo.wt/feature-foo"));
-        assert_eq!(co1.branch, "feature/foo");
-        assert!(!co1.is_trunk);
-        let trunk_ab = co1.trunk_ahead_behind.as_ref().unwrap();
-        assert_eq!(trunk_ab.ahead, 3);
-        assert_eq!(trunk_ab.behind, 1);
-        let remote_ab = co1.remote_ahead_behind.as_ref().unwrap();
-        assert_eq!(remote_ab.ahead, 0);
-        assert_eq!(remote_ab.behind, 0);
-        let wt_status = co1.working_tree.as_ref().unwrap();
+        // Find feature worktree
+        let (path_feat, co_feat) = checkouts
+            .iter()
+            .find(|(_, co)| co.branch == "feature/foo")
+            .expect("should have feature/foo worktree");
+        assert!(!co_feat.is_trunk);
+        // The worktree path should be a sibling of the repo
+        assert!(
+            path_feat.to_str().unwrap().contains("feature-foo"),
+            "feature worktree path should contain feature-foo: {}",
+            path_feat.display()
+        );
+        // trunk ahead/behind should be present
+        let trunk_ab = co_feat
+            .trunk_ahead_behind
+            .as_ref()
+            .expect("feature should have trunk ahead/behind");
+        assert_eq!(trunk_ab.ahead, 0);
+        assert_eq!(trunk_ab.behind, 0);
+        // working tree status: staged, modified, untracked
+        let wt_status = co_feat
+            .working_tree
+            .as_ref()
+            .expect("feature should have working tree status");
         assert_eq!(wt_status.staged, 1);
-        assert_eq!(wt_status.modified, 0);
+        assert_eq!(wt_status.modified, 1);
         assert_eq!(wt_status.untracked, 1);
-        let commit1 = co1.last_commit.as_ref().unwrap();
-        assert_eq!(commit1.short_sha, "def5678");
-        assert_eq!(commit1.message, "Add feature");
-        // No issue links configured
-        assert!(co1.association_keys.is_empty());
+        let commit_feat = co_feat
+            .last_commit
+            .as_ref()
+            .expect("feature should have commit");
+        assert!(!commit_feat.short_sha.is_empty());
+        assert!(co_feat.association_keys.is_empty());
 
-        // Correlation keys present
-        assert!(co1
+        // Correlation keys
+        assert!(co_feat
             .correlation_keys
             .contains(&CorrelationKey::Branch("feature/foo".to_string())));
-        assert!(co1
+        assert!(co_feat
             .correlation_keys
-            .contains(&CorrelationKey::CheckoutPath(PathBuf::from(
-                "/test/repo.wt/feature-foo"
-            ))));
+            .contains(&CorrelationKey::CheckoutPath(path_feat.clone())));
 
-        session.assert_complete();
+        session.finish();
     }
 
     #[tokio::test]
-    async fn replay_create_checkout() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/wt_create.yaml"
-            ),
-            repo_masks(),
-        );
-        let runner = Arc::new(session.command_runner());
+    async fn record_replay_create_checkout() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(setup_base_repo())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("wt_create.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
         let mgr = WtCheckoutManager::new(runner);
         let (path, checkout) = mgr
-            .create_checkout(Path::new("/test/repo"), "new-feature", true)
+            .create_checkout(&repo_path, "new-feature", true)
             .await
             .unwrap();
 
-        assert_eq!(path, Path::new("/test/repo.wt/new-feature"));
+        assert!(
+            path.to_str().unwrap().contains("new-feature"),
+            "created worktree path should contain new-feature: {}",
+            path.display()
+        );
         assert_eq!(checkout.branch, "new-feature");
         assert!(!checkout.is_trunk);
-        let trunk_ab = checkout.trunk_ahead_behind.as_ref().unwrap();
+        let trunk_ab = checkout
+            .trunk_ahead_behind
+            .as_ref()
+            .expect("new branch should have trunk ahead/behind");
         assert_eq!(trunk_ab.ahead, 0);
         assert_eq!(trunk_ab.behind, 0);
-        assert!(checkout.remote_ahead_behind.is_none());
-        let wt_status = checkout.working_tree.as_ref().unwrap();
+        let wt_status = checkout
+            .working_tree
+            .as_ref()
+            .expect("new branch should have working tree status");
         assert_eq!(wt_status.staged, 0);
         assert_eq!(wt_status.modified, 0);
         assert_eq!(wt_status.untracked, 0);
-        // association_keys empty since create_checkout doesn't call read_branch_issue_links
         assert!(checkout.association_keys.is_empty());
 
-        session.assert_complete();
+        session.finish();
     }
 
     #[tokio::test]
-    async fn replay_remove_checkout() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/wt_remove.yaml"
-            ),
-            repo_masks(),
-        );
-        let runner = Arc::new(session.command_runner());
+    async fn record_replay_remove_checkout() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(setup_remove())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("wt_remove.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
         let mgr = WtCheckoutManager::new(runner);
-        mgr.remove_checkout(Path::new("/test/repo"), "feature/foo")
+        mgr.remove_checkout(&repo_path, "feat-remove")
             .await
             .unwrap();
 
-        session.assert_complete();
+        session.finish();
     }
 }
