@@ -3,6 +3,10 @@ name = "flotilla-daemon"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+skip-no-sandbox-tests = []
+
 [dependencies]
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }

@@ -10,9 +10,7 @@ use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 use flotilla_core::daemon::DaemonHandle;
-use flotilla_protocol::{
-    Command, CommandResult, DaemonEvent, Message, RawResponse, RepoInfo, Snapshot,
-};
+use flotilla_protocol::{Command, DaemonEvent, Message, RawResponse, RepoInfo, Snapshot};
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
 /// operations (no async work while holding the lock), and using a sync lock
@@ -308,7 +306,9 @@ fn handle_event(
             local_seqs.write().unwrap().remove(path);
             let _ = event_tx.send(event);
         }
-        DaemonEvent::RepoAdded(_) | DaemonEvent::CommandResult { .. } => {
+        DaemonEvent::RepoAdded(_)
+        | DaemonEvent::CommandStarted { .. }
+        | DaemonEvent::CommandFinished { .. } => {
             let _ = event_tx.send(event);
         }
     }
@@ -400,14 +400,14 @@ impl DaemonHandle for SocketDaemon {
         resp.parse::<Vec<RepoInfo>>()
     }
 
-    async fn execute(&self, repo: &Path, command: Command) -> Result<CommandResult, String> {
+    async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
         let resp = self
             .request(
                 "execute",
                 serde_json::json!({ "repo": repo, "command": command }),
             )
             .await?;
-        resp.parse::<CommandResult>()
+        resp.parse::<u64>()
     }
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {

@@ -138,10 +138,15 @@ pub enum DaemonEvent {
     RepoAdded(Box<RepoInfo>),
     #[serde(rename = "repo_removed")]
     RepoRemoved { path: std::path::PathBuf },
-    /// Async command completion notification for socket subscribers (Step 2).
-    /// Not emitted in the in-process path where results are returned directly.
-    #[serde(rename = "command_result")]
-    CommandResult {
+    #[serde(rename = "command_started")]
+    CommandStarted {
+        command_id: u64,
+        repo: std::path::PathBuf,
+        description: String,
+    },
+    #[serde(rename = "command_finished")]
+    CommandFinished {
+        command_id: u64,
         repo: std::path::PathBuf,
         result: commands::CommandResult,
     },
@@ -400,6 +405,57 @@ mod tests {
                 assert_eq!(error.as_deref(), Some("something went wrong"));
             }
             other => panic!("expected Response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn daemon_event_command_started_roundtrip() {
+        let event = DaemonEvent::CommandStarted {
+            command_id: 42,
+            repo: PathBuf::from("/tmp/repo"),
+            description: "Creating checkout...".to_string(),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            DaemonEvent::CommandStarted {
+                command_id,
+                repo,
+                description,
+            } => {
+                assert_eq!(command_id, 42);
+                assert_eq!(repo, PathBuf::from("/tmp/repo"));
+                assert_eq!(description, "Creating checkout...");
+            }
+            other => panic!("expected CommandStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn daemon_event_command_finished_roundtrip() {
+        let event = DaemonEvent::CommandFinished {
+            command_id: 42,
+            repo: PathBuf::from("/tmp/repo"),
+            result: CommandResult::CheckoutCreated {
+                branch: "feat-x".into(),
+            },
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            DaemonEvent::CommandFinished {
+                command_id,
+                repo,
+                result,
+            } => {
+                assert_eq!(command_id, 42);
+                assert_eq!(repo, PathBuf::from("/tmp/repo"));
+                match result {
+                    CommandResult::CheckoutCreated { branch } => assert_eq!(branch, "feat-x"),
+                    other => panic!("expected CheckoutCreated, got {:?}", other),
+                }
+            }
+            other => panic!("expected CommandFinished, got {:?}", other),
         }
     }
 }
