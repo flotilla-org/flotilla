@@ -581,6 +581,9 @@ impl InProcessDaemon {
     /// Incremental issue refresh: fetch issues changed since last refresh,
     /// apply changeset to cache, and broadcast if anything changed.
     async fn refresh_issues_incremental(&self) {
+        // Minimum interval between incremental refreshes (seconds).
+        const MIN_INTERVAL_SECS: i64 = 30;
+
         let tasks: Vec<_> = {
             let repos = self.repos.read().await;
             repos
@@ -589,6 +592,13 @@ impl InProcessDaemon {
                     let since = state.issue_cache.last_refreshed_at.as_ref()?;
                     if state.model.registry.issue_trackers.is_empty() {
                         return None;
+                    }
+                    // Skip if refreshed too recently
+                    if let Ok(last) = chrono::DateTime::parse_from_rfc3339(since) {
+                        let elapsed = chrono::Utc::now().signed_duration_since(last).num_seconds();
+                        if elapsed < MIN_INTERVAL_SECS {
+                            return None;
+                        }
                     }
                     Some((
                         path.clone(),
@@ -610,20 +620,8 @@ impl InProcessDaemon {
 
             match tracker.list_issues_changed_since(&path, &since, 50).await {
                 Ok(changeset) => {
-                    let escalate = changeset.has_more;
-                    let has_changes =
-                        !changeset.updated.is_empty() || !changeset.closed_ids.is_empty();
-
-                    {
-                        let mut repos = self.repos.write().await;
-                        if let Some(state) = repos.get_mut(&path) {
-                            state.issue_cache.apply_changeset(changeset);
-                            state.issue_cache.mark_refreshed(now_iso8601());
-                        }
-                    }
-
-                    if escalate {
-                        // Too many changes — fall back to full re-fetch
+                    if changeset.has_more {
+                        // Too many changes — skip incremental, do a full re-fetch
                         drop(_guard);
                         {
                             let mut repos = self.repos.write().await;
@@ -639,8 +637,19 @@ impl InProcessDaemon {
                             }
                         }
                         self.broadcast_snapshot(&path).await;
-                    } else if has_changes {
-                        self.broadcast_snapshot(&path).await;
+                    } else {
+                        let has_changes =
+                            !changeset.updated.is_empty() || !changeset.closed_ids.is_empty();
+                        {
+                            let mut repos = self.repos.write().await;
+                            if let Some(state) = repos.get_mut(&path) {
+                                state.issue_cache.apply_changeset(changeset);
+                                state.issue_cache.mark_refreshed(now_iso8601());
+                            }
+                        }
+                        if has_changes {
+                            self.broadcast_snapshot(&path).await;
+                        }
                     }
                 }
                 Err(e) => {

@@ -167,9 +167,10 @@ impl super::IssueTracker for GitHubIssueTracker {
         per_page: usize,
     ) -> Result<IssueChangeset, String> {
         let per_page = clamp_per_page(per_page);
+        let encoded_since = urlencoding::encode(since);
         let endpoint = format!(
             "repos/{}/issues?state=all&since={}&sort=updated&direction=desc&per_page={}",
-            self.repo_slug, since, per_page
+            self.repo_slug, encoded_since, per_page
         );
         let response = self.api.get_with_headers(&endpoint, repo_root).await?;
         let items: Vec<serde_json::Value> =
