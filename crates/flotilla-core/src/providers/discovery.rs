@@ -247,6 +247,11 @@ mod tests {
 
     type ResponseMap = HashMap<(String, String), Vec<Result<String, String>>>;
 
+    struct DiscoveryMockRunnerBuilder {
+        responses: ResponseMap,
+        tool_exists: HashMap<String, bool>,
+    }
+
     struct DiscoveryMockRunner {
         responses: Mutex<ResponseMap>,
         tool_exists: HashMap<String, bool>,
@@ -255,23 +260,18 @@ mod tests {
     }
 
     impl DiscoveryMockRunner {
-        fn new() -> Self {
-            Self {
-                responses: Mutex::new(HashMap::new()),
+        fn new() -> DiscoveryMockRunnerBuilder {
+            DiscoveryMockRunnerBuilder {
+                responses: HashMap::new(),
                 tool_exists: HashMap::new(),
-                seen_cwds: Mutex::new(Vec::new()),
-                exists_calls: Mutex::new(Vec::new()),
             }
         }
+    }
 
+    impl DiscoveryMockRunnerBuilder {
         fn on_run(mut self, cmd: &str, args: &[&str], response: Result<String, String>) -> Self {
             let key = (cmd.to_string(), args.join(" "));
-            self.responses
-                .get_mut()
-                .unwrap()
-                .entry(key)
-                .or_default()
-                .push(response);
+            self.responses.entry(key).or_default().push(response);
             self
         }
 
@@ -280,6 +280,17 @@ mod tests {
             self
         }
 
+        fn build(self) -> DiscoveryMockRunner {
+            DiscoveryMockRunner {
+                responses: Mutex::new(self.responses),
+                tool_exists: self.tool_exists,
+                seen_cwds: Mutex::new(Vec::new()),
+                exists_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DiscoveryMockRunner {
         fn saw_cwd(&self, cwd: &Path) -> bool {
             self.seen_cwds.lock().unwrap().iter().any(|p| p == cwd)
         }
@@ -435,7 +446,8 @@ mod tests {
                 "git",
                 &["remote", "get-url", "upstream"],
                 Ok("  https://github.com/upstream/repo.git  \n".to_string()),
-            );
+            )
+            .build();
         let url = first_remote_url(repo_root, &runner).await;
         assert_eq!(
             url,
@@ -461,7 +473,8 @@ mod tests {
                 "git",
                 &["remote", "get-url", "good-remote"],
                 Ok("https://github.com/owner/repo.git\n".to_string()),
-            );
+            )
+            .build();
         let url = first_remote_url(Path::new("/tmp"), &runner).await;
         assert_eq!(url, Some("https://github.com/owner/repo.git".to_string()));
     }
@@ -469,17 +482,27 @@ mod tests {
     #[tokio::test]
     async fn first_remote_returns_none_when_listing_fails_or_empty() {
         let cases = [
-            DiscoveryMockRunner::new().on_run(
-                "git",
-                &["remote"],
-                Err("fatal: not a git repository".to_string()),
-            ),
-            DiscoveryMockRunner::new().on_run("git", &["remote"], Ok(String::new())),
-            DiscoveryMockRunner::new().on_run("git", &["remote"], Ok("\n\n".to_string())),
+            DiscoveryMockRunner::new()
+                .on_run(
+                    "git",
+                    &["remote"],
+                    Err("fatal: not a git repository".to_string()),
+                )
+                .build(),
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Ok(String::new()))
+                .build(),
+            DiscoveryMockRunner::new()
+                .on_run("git", &["remote"], Ok("\n\n".to_string()))
+                .build(),
         ];
         for runner in cases {
             assert_eq!(first_remote_url(Path::new("/tmp"), &runner).await, None);
         }
+    }
+
+    fn discovery_runner() -> DiscoveryMockRunnerBuilder {
+        DiscoveryMockRunner::new()
     }
 
     #[tokio::test]
@@ -488,11 +511,12 @@ mod tests {
         let repo = dir.path().to_path_buf();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Err("not a repo".to_string()))
                 .tool_exists("wt", false)
                 .tool_exists("gh", false)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
 
         let (registry, slug) = detect_providers(&repo, &config, runner).await;
@@ -506,11 +530,12 @@ mod tests {
         let (dir, repo) = make_repo_with_git_file();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Err("no remotes".to_string()))
                 .tool_exists("wt", false)
                 .tool_exists("gh", false)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
         let (registry, _) = detect_providers(&repo, &config, runner).await;
         assert!(registry.vcs.contains_key("git"));
@@ -521,7 +546,7 @@ mod tests {
         let (dir, repo) = make_repo_with_git_dir();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Ok("origin\n".to_string()))
                 .on_run(
                     "git",
@@ -530,7 +555,8 @@ mod tests {
                 )
                 .tool_exists("wt", false)
                 .tool_exists("gh", true)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
 
         let (registry, slug) = detect_providers(&repo, &config, runner).await;
@@ -544,7 +570,7 @@ mod tests {
         let (dir, repo) = make_repo_with_git_dir();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Ok("origin\n".to_string()))
                 .on_run(
                     "git",
@@ -553,7 +579,8 @@ mod tests {
                 )
                 .tool_exists("wt", false)
                 .tool_exists("gh", false)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
 
         let (registry, slug) = detect_providers(&repo, &config, runner).await;
@@ -567,7 +594,7 @@ mod tests {
         let (dir, repo) = make_repo_with_git_dir();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Ok("origin\n".to_string()))
                 .on_run(
                     "git",
@@ -576,7 +603,8 @@ mod tests {
                 )
                 .tool_exists("wt", false)
                 .tool_exists("gh", true)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
 
         let (registry, slug) = detect_providers(&repo, &config, runner).await;
@@ -590,7 +618,7 @@ mod tests {
         let (dir, repo) = make_repo_with_git_dir();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Ok("origin\n".to_string()))
                 .on_run(
                     "git",
@@ -599,7 +627,8 @@ mod tests {
                 )
                 .tool_exists("wt", false)
                 .tool_exists("gh", true)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
 
         let (registry, slug) = detect_providers(&repo, &config, runner).await;
@@ -614,11 +643,12 @@ mod tests {
             let (dir, repo) = make_repo_with_git_dir();
             let config = temp_config(&dir);
             let runner: Arc<dyn CommandRunner> = Arc::new(
-                DiscoveryMockRunner::new()
+                discovery_runner()
                     .on_run("git", &["remote"], Err("no remotes".to_string()))
                     .tool_exists("wt", false)
                     .tool_exists("gh", false)
-                    .tool_exists("claude", has_claude),
+                    .tool_exists("claude", has_claude)
+                    .build(),
             );
 
             let (registry, _) = detect_providers(&repo, &config, runner).await;
@@ -634,42 +664,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_providers_checkout_config_paths_probe_wt_as_expected() {
+    async fn detect_providers_config_git_skips_wt_probe() {
         let (dir, repo) = make_repo_with_git_dir();
-
         let config = config_with_provider(&dir, &repo, "git");
         let runner = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Err("no remotes".to_string()))
                 .tool_exists("wt", true)
                 .tool_exists("gh", false)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
         let runner_dyn: Arc<dyn CommandRunner> = runner.clone();
         let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
         assert!(!registry.checkout_managers.is_empty());
         assert_eq!(runner.exists_call_count("wt"), 0);
+    }
 
+    #[tokio::test]
+    async fn detect_providers_config_wt_probes_wt_binary() {
+        let (dir, repo) = make_repo_with_git_dir();
         let config = config_with_provider(&dir, &repo, "wt");
         let runner = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Err("no remotes".to_string()))
                 .tool_exists("wt", false)
                 .tool_exists("gh", false)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
         let runner_dyn: Arc<dyn CommandRunner> = runner.clone();
         let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
         assert!(!registry.checkout_managers.is_empty());
         assert_eq!(runner.exists_call_count("wt"), 1);
+    }
 
+    #[tokio::test]
+    async fn detect_providers_config_auto_probes_wt_binary() {
+        let (dir, repo) = make_repo_with_git_dir();
         let config = temp_config(&dir);
         let runner = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Err("no remotes".to_string()))
                 .tool_exists("wt", true)
                 .tool_exists("gh", false)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
         let runner_dyn: Arc<dyn CommandRunner> = runner.clone();
         let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
@@ -682,7 +722,7 @@ mod tests {
         let (dir, repo) = make_repo_with_git_dir();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
-            DiscoveryMockRunner::new()
+            discovery_runner()
                 .on_run("git", &["remote"], Ok("upstream\norigin\n".to_string()))
                 .on_run(
                     "git",
@@ -691,7 +731,8 @@ mod tests {
                 )
                 .tool_exists("wt", false)
                 .tool_exists("gh", true)
-                .tool_exists("claude", false),
+                .tool_exists("claude", false)
+                .build(),
         );
 
         let (registry, slug) = detect_providers(&repo, &config, runner).await;

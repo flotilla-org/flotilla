@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn load_config_defaults_overrides_and_parse_fallback() {
+    fn load_config_missing_or_invalid_returns_defaults() {
         let root = tempdir().unwrap();
 
         let missing_store = ConfigStore::with_base(root.path().join("missing"));
@@ -390,33 +390,34 @@ mod tests {
             invalid_store.load_config().vcs.git.checkouts.provider,
             "auto"
         );
+    }
 
-        let full_base = root.path().join("full");
-        std::fs::create_dir_all(&full_base).unwrap();
+    #[test]
+    fn load_config_parses_full_overrides() {
+        let dir = tempdir().unwrap();
         std::fs::write(
-            full_base.join("config.toml"),
+            dir.path().join("config.toml"),
             "[vcs.git.checkouts]\npath = \"/custom/{{ branch }}\"\nprovider = \"worktree\"\n",
         )
         .unwrap();
-        let full_store = ConfigStore::with_base(&full_base);
-        let full_cfg = full_store.load_config();
-        assert_eq!(full_cfg.vcs.git.checkouts.path, "/custom/{{ branch }}");
-        assert_eq!(full_cfg.vcs.git.checkouts.provider, "worktree");
+        let store = ConfigStore::with_base(dir.path());
+        let cfg = store.load_config();
+        assert_eq!(cfg.vcs.git.checkouts.path, "/custom/{{ branch }}");
+        assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
+    }
 
-        let partial_base = root.path().join("partial");
-        std::fs::create_dir_all(&partial_base).unwrap();
+    #[test]
+    fn load_config_partial_override_keeps_defaults() {
+        let dir = tempdir().unwrap();
         std::fs::write(
-            partial_base.join("config.toml"),
+            dir.path().join("config.toml"),
             "[vcs.git.checkouts]\nprovider = \"worktree\"\n",
         )
         .unwrap();
-        let partial_store = ConfigStore::with_base(&partial_base);
-        let partial_cfg = partial_store.load_config();
-        assert_eq!(partial_cfg.vcs.git.checkouts.provider, "worktree");
-        assert_eq!(
-            partial_cfg.vcs.git.checkouts.path,
-            CheckoutsConfig::default_path()
-        );
+        let store = ConfigStore::with_base(dir.path());
+        let cfg = store.load_config();
+        assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
+        assert_eq!(cfg.vcs.git.checkouts.path, CheckoutsConfig::default_path());
     }
 
     #[test]
@@ -507,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_and_with_base_are_stable() {
+    fn defaults_have_expected_values_and_base_path_roundtrips() {
         let checkouts = CheckoutsConfig::default();
         assert_eq!(
             checkouts.path,
