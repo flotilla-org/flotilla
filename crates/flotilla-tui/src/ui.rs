@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Flex, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{
@@ -15,8 +15,9 @@ use std::collections::HashMap;
 
 use crate::app::{InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState};
 use crate::event_log::{self, LevelExt};
+use crate::ui_helpers;
 use flotilla_core::data::{GroupEntry, SectionHeader};
-use flotilla_protocol::{ChangeRequestStatus, ProviderData, SessionStatus, WorkItem, WorkItemKind};
+use flotilla_protocol::{ProviderData, WorkItem};
 
 pub fn render(
     model: &TuiModel,
@@ -385,59 +386,30 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
 }
 
 fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u16]) -> Row<'a> {
-    let (icon, icon_color) = match item.kind {
-        WorkItemKind::Checkout => {
-            if !item.workspace_refs.is_empty() {
-                ("●", Color::Green)
-            } else {
-                ("○", Color::Green)
-            }
-        }
-        WorkItemKind::Session => {
-            let session = item
-                .session_key
-                .as_deref()
-                .and_then(|k| providers.sessions.get(k));
-            match session.map(|s| &s.status) {
-                Some(SessionStatus::Running) => ("▶", Color::Magenta),
-                Some(SessionStatus::Idle) => ("◆", Color::Magenta),
-                _ => ("○", Color::Magenta),
-            }
-        }
-        WorkItemKind::ChangeRequest => ("⊙", Color::Blue),
-        WorkItemKind::RemoteBranch => ("⊶", Color::DarkGray),
-        WorkItemKind::Issue => ("◇", Color::Yellow),
-    };
+    let session_status = item
+        .session_key
+        .as_deref()
+        .and_then(|k| providers.sessions.get(k))
+        .map(|s| &s.status);
+    let (icon, icon_color) =
+        ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
 
     let desc_width = col_widths.get(1).copied().unwrap_or(15) as usize;
     let branch_width = col_widths.get(2).copied().unwrap_or(25) as usize;
 
-    let description = truncate(&item.description, desc_width);
+    let description = ui_helpers::truncate(&item.description, desc_width);
 
-    let wt_indicator = if item.is_main_checkout {
-        "◆"
-    } else if item.checkout_key().is_some() {
-        "✓"
-    } else {
-        ""
-    };
+    let wt_indicator =
+        ui_helpers::checkout_indicator(item.is_main_checkout, item.checkout_key().is_some());
 
-    let ws_indicator = match item.workspace_refs.len() {
-        0 => String::new(),
-        1 => "●".to_string(),
-        n => format!("{n}"),
-    };
+    let ws_indicator = ui_helpers::workspace_indicator(item.workspace_refs.len());
 
     let branch = item.branch.as_deref().unwrap_or("—");
-    let branch_display = truncate(branch, branch_width);
+    let branch_display = ui_helpers::truncate(branch, branch_width);
 
     let pr_display = if let Some(ref pr_key) = item.change_request_key {
         if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
-            let state_icon = match cr.status {
-                ChangeRequestStatus::Merged => "✓",
-                ChangeRequestStatus::Closed => "✗",
-                _ => "",
-            };
+            let state_icon = ui_helpers::change_request_status_icon(&cr.status);
             format!("#{}{}", pr_key, state_icon)
         } else {
             String::new()
@@ -448,11 +420,7 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
 
     let session_display = if let Some(ref ses_key) = item.session_key {
         if let Some(ses) = providers.sessions.get(ses_key.as_str()) {
-            match ses.status {
-                SessionStatus::Running => "▶".to_string(),
-                SessionStatus::Idle => "◆".to_string(),
-                SessionStatus::Archived => "○".to_string(),
-            }
+            ui_helpers::session_status_display(&ses.status).to_string()
         } else {
             String::new()
         }
@@ -469,20 +437,7 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
 
     let git_display = if let Some(wt_key) = item.checkout_key() {
         if let Some(co) = providers.checkouts.get(wt_key) {
-            let mut s = String::new();
-            if co.working_tree.as_ref().is_some_and(|w| w.modified > 0) {
-                s.push('M');
-            }
-            if co.working_tree.as_ref().is_some_and(|w| w.staged > 0) {
-                s.push('S');
-            }
-            if co.working_tree.as_ref().is_some_and(|w| w.untracked > 0) {
-                s.push('?');
-            }
-            if co.trunk_ahead_behind.as_ref().is_some_and(|m| m.ahead > 0) {
-                s.push('↑');
-            }
-            s
+            ui_helpers::git_status_display(co)
         } else {
             String::new()
         }
@@ -650,7 +605,7 @@ fn render_action_menu(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
         return;
     };
 
-    let area = popup_area(frame.area(), 40, 40);
+    let area = ui_helpers::popup_area(frame.area(), 40, 40);
     ui.layout.menu_area = area;
     frame.render_widget(Clear, area);
 
@@ -681,7 +636,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
         return;
     };
 
-    let area = popup_area(frame.area(), 50, 20);
+    let area = ui_helpers::popup_area(frame.area(), 50, 20);
     frame.render_widget(Clear, area);
 
     let inner = Block::bordered().title(" New Branch ");
@@ -710,7 +665,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         return;
     };
 
-    let area = popup_area(frame.area(), 60, 50);
+    let area = ui_helpers::popup_area(frame.area(), 60, 50);
     frame.render_widget(Clear, area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -806,7 +761,7 @@ fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         return;
     }
 
-    let area = popup_area(frame.area(), 60, 70);
+    let area = ui_helpers::popup_area(frame.area(), 60, 70);
     frame.render_widget(Clear, area);
 
     let labels = model.active_labels();
@@ -871,7 +826,7 @@ fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
         return;
     };
 
-    let area = popup_area(frame.area(), 60, 60);
+    let area = ui_helpers::popup_area(frame.area(), 60, 60);
     ui.layout.file_picker_area = area;
     frame.render_widget(Clear, area);
 
@@ -1121,27 +1076,4 @@ fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {
     let mut state = ListState::default();
     state.select(ui.event_log.selected);
     frame.render_stateful_widget(list, area, &mut state);
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let char_count: usize = s.chars().count();
-    if char_count <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
-}
-
-fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let [area] = Layout::vertical([Constraint::Percentage(percent_y)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [area] = Layout::horizontal([Constraint::Percentage(percent_x)])
-        .flex(Flex::Center)
-        .areas(area);
-    area
 }
