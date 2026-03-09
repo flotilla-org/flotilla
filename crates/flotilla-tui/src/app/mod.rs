@@ -3,6 +3,8 @@ mod file_picker;
 pub mod intent;
 mod key_handlers;
 mod navigation;
+#[doc(hidden)]
+pub mod test_builders;
 #[cfg(test)]
 mod test_support;
 pub mod ui_state;

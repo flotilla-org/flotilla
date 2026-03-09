@@ -7,12 +7,16 @@ use ratatui::Terminal;
 
 use flotilla_core::data::{group_work_items, SectionLabels};
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CloudAgentSession,
-    CorrelationKey, Issue, ProviderData, RepoInfo, RepoLabels, SessionStatus, WorkItem,
-    WorkItemIdentity, WorkItemKind,
+    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
+    CorrelationKey, Issue, ProviderData, RepoLabels, SessionStatus, WorkItem,
 };
 use flotilla_tui::app::{InFlightCommand, ProviderStatus, TuiModel, UiMode, UiState};
 use flotilla_tui::ui;
+
+// Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
+pub use flotilla_tui::app::test_builders::{
+    bare_item, checkout_item, issue_item, pr_item, remote_branch_item, repo_info, session_item,
+};
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
@@ -50,7 +54,7 @@ impl TestHarness {
 
     /// Multiple repos by name, all with empty data.
     pub fn multi_repo(names: &[&str]) -> Self {
-        let infos: Vec<RepoInfo> = names.iter().map(|n| test_repo_info(n)).collect();
+        let infos = names.iter().map(|n| test_repo_info(n)).collect();
         let model = TuiModel::from_repo_info(infos);
         let ui = UiState::new(&model.repo_order);
         Self {
@@ -120,15 +124,8 @@ impl TestHarness {
     }
 }
 
-fn test_repo_info(name: &str) -> RepoInfo {
-    RepoInfo {
-        path: PathBuf::from(format!("/test/{name}")),
-        name: name.to_string(),
-        labels: test_labels(),
-        provider_names: HashMap::new(),
-        provider_health: HashMap::new(),
-        loading: false,
-    }
+fn test_repo_info(name: &str) -> flotilla_protocol::RepoInfo {
+    repo_info(format!("/test/{name}"), name, test_labels())
 }
 
 fn test_labels() -> RepoLabels {
@@ -165,13 +162,12 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
             let cell = &buffer[(x, y)];
             line.push_str(cell.symbol());
         }
-        // Trim trailing whitespace per line
         lines.push(line.trim_end().to_string());
     }
     lines.join("\n")
 }
 
-// ── Provider data builders ──────────────────────────────────────────────
+// ── Provider data builders (unique to snapshot tests) ───────────────────
 
 pub fn make_checkout(branch: &str, path: &str, is_trunk: bool) -> (PathBuf, Checkout) {
     let key = PathBuf::from(path);
@@ -223,55 +219,25 @@ pub fn make_session(id: &str, title: &str, status: SessionStatus) -> (String, Cl
     (id.to_string(), session)
 }
 
-// ── WorkItem builders ───────────────────────────────────────────────────
+// ── WorkItem builders (thin wrappers over test_support where possible) ──
 
+/// Checkout work item. Delegates to test_support::checkout_item.
 pub fn make_work_item_checkout(branch: &str, path: &str) -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(PathBuf::from(path)),
-        branch: Some(branch.to_string()),
-        description: format!("checkout {branch}"),
-        checkout: Some(CheckoutRef {
-            key: PathBuf::from(path),
-            is_main_checkout: false,
-        }),
-        change_request_key: None,
-        session_key: None,
-        issue_keys: vec![],
-        workspace_refs: vec![],
-        is_main_checkout: false,
-        debug_group: vec![],
-    }
+    checkout_item(branch, path, false)
 }
 
+/// Change request work item with custom title (test_support::pr_item uses generic titles).
 pub fn make_work_item_cr(id: &str, title: &str) -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::ChangeRequest,
-        identity: WorkItemIdentity::ChangeRequest(id.to_string()),
-        branch: None,
-        description: title.to_string(),
-        checkout: None,
-        change_request_key: Some(id.to_string()),
-        session_key: None,
-        issue_keys: vec![],
-        workspace_refs: vec![],
-        is_main_checkout: false,
-        debug_group: vec![],
-    }
+    let mut item = pr_item(id);
+    item.description = title.to_string();
+    item.branch = None;
+    item
 }
 
+/// Issue work item with custom title and issue_keys set (test_support::issue_item omits keys).
 pub fn make_work_item_issue(id: &str, title: &str) -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::Issue,
-        identity: WorkItemIdentity::Issue(id.to_string()),
-        branch: None,
-        description: title.to_string(),
-        checkout: None,
-        change_request_key: None,
-        session_key: None,
-        issue_keys: vec![id.to_string()],
-        workspace_refs: vec![],
-        is_main_checkout: false,
-        debug_group: vec![],
-    }
+    let mut item = issue_item(id);
+    item.description = title.to_string();
+    item.issue_keys = vec![id.to_string()];
+    item
 }
