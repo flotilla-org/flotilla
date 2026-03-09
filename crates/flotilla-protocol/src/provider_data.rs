@@ -110,6 +110,35 @@ pub enum SessionStatus {
     Archived,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ManagedTerminalId {
+    pub checkout: String,
+    pub role: String,
+    pub index: u32,
+}
+
+impl std::fmt::Display for ManagedTerminalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}/{}", self.checkout, self.role, self.index)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalStatus {
+    Running,
+    Disconnected,
+    Exited(i32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedTerminal {
+    pub id: ManagedTerminalId,
+    pub role: String,
+    pub command: String,
+    pub working_directory: PathBuf,
+    pub status: TerminalStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub name: String,
@@ -126,6 +155,7 @@ pub struct ProviderData {
     pub sessions: IndexMap<String, CloudAgentSession>,
     pub branches: IndexMap<String, crate::delta::Branch>,
     pub workspaces: IndexMap<String, Workspace>,
+    pub managed_terminals: IndexMap<String, ManagedTerminal>,
 }
 
 #[cfg(test)]
@@ -323,6 +353,33 @@ mod tests {
     }
 
     #[test]
+    fn managed_terminal_roundtrip() {
+        use crate::test_helpers::assert_roundtrip;
+
+        let id = ManagedTerminalId {
+            checkout: "my-feature".into(),
+            role: "shell".into(),
+            index: 0,
+        };
+        assert_roundtrip(&id);
+
+        let terminal = ManagedTerminal {
+            id: id.clone(),
+            role: "shell".into(),
+            command: "$SHELL".into(),
+            working_directory: PathBuf::from("/Users/dev/project"),
+            status: TerminalStatus::Running,
+        };
+        assert_roundtrip(&terminal);
+
+        // Test all status variants
+        assert_roundtrip(&TerminalStatus::Running);
+        assert_roundtrip(&TerminalStatus::Disconnected);
+        assert_roundtrip(&TerminalStatus::Exited(0));
+        assert_roundtrip(&TerminalStatus::Exited(1));
+    }
+
+    #[test]
     fn provider_data_default() {
         let pd = ProviderData::default();
         assert!(pd.checkouts.is_empty());
@@ -331,6 +388,7 @@ mod tests {
         assert!(pd.sessions.is_empty());
         assert!(pd.branches.is_empty());
         assert!(pd.workspaces.is_empty());
+        assert!(pd.managed_terminals.is_empty());
     }
 
     #[test]

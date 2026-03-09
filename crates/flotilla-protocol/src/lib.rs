@@ -32,8 +32,8 @@ pub use commands::{CheckoutStatus, Command, CommandResult};
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
-    CommitInfo, CorrelationKey, Issue, IssueChangeset, IssuePage, ProviderData, SessionStatus,
-    WorkingTreeStatus, Workspace,
+    CommitInfo, CorrelationKey, Issue, IssueChangeset, IssuePage, ManagedTerminal,
+    ManagedTerminalId, ProviderData, SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use snapshot::{
     CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem,
