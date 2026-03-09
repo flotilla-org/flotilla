@@ -123,6 +123,12 @@ impl TuiModel {
     }
 }
 
+/// A command that has been dispatched to the daemon and is awaiting completion.
+pub struct InFlightCommand {
+    pub repo: PathBuf,
+    pub description: String,
+}
+
 /// Log provider errors and format them into a status message.
 ///
 /// Suppresses "issues disabled" messages since the daemon handles those.
@@ -150,6 +156,7 @@ pub struct App {
     pub model: TuiModel,
     pub ui: UiState,
     pub proto_commands: CommandQueue,
+    pub in_flight: HashMap<u64, InFlightCommand>,
     pub should_quit: bool,
 }
 
@@ -167,6 +174,7 @@ impl App {
             model,
             ui,
             proto_commands: Default::default(),
+            in_flight: HashMap::new(),
             should_quit: false,
         }
     }
@@ -179,9 +187,22 @@ impl App {
             DaemonEvent::SnapshotDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoRemoved { path } => self.handle_repo_removed(&path),
-            DaemonEvent::CommandResult { result, .. } => {
-                // Not used in-process (results returned directly from execute)
-                executor::handle_result(result, self);
+            DaemonEvent::CommandStarted {
+                command_id,
+                repo,
+                description,
+            } => {
+                tracing::info!("command {command_id} started: {description}");
+                self.in_flight
+                    .insert(command_id, InFlightCommand { repo, description });
+            }
+            DaemonEvent::CommandFinished {
+                command_id, result, ..
+            } => {
+                if let Some(_cmd) = self.in_flight.remove(&command_id) {
+                    tracing::info!("command {command_id} finished");
+                    executor::handle_result(result, self);
+                }
             }
         }
     }

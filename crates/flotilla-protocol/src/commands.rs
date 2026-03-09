@@ -70,6 +70,31 @@ pub enum Command {
     },
 }
 
+impl Command {
+    pub fn description(&self) -> &'static str {
+        match self {
+            Command::CreateWorkspaceForCheckout { .. } => "Creating workspace...",
+            Command::SelectWorkspace { .. } => "Switching workspace...",
+            Command::CreateCheckout { .. } => "Creating checkout...",
+            Command::RemoveCheckout { .. } => "Removing checkout...",
+            Command::FetchCheckoutStatus { .. } => "Fetching checkout status...",
+            Command::OpenChangeRequest { .. } => "Opening in browser...",
+            Command::OpenIssue { .. } => "Opening in browser...",
+            Command::LinkIssuesToChangeRequest { .. } => "Linking issues...",
+            Command::ArchiveSession { .. } => "Archiving session...",
+            Command::GenerateBranchName { .. } => "Generating branch name...",
+            Command::TeleportSession { .. } => "Teleporting session...",
+            Command::AddRepo { .. } => "Adding repository...",
+            Command::RemoveRepo { .. } => "Removing repository...",
+            Command::Refresh => "Refreshing...",
+            Command::SetIssueViewport { .. } => "Loading issues...",
+            Command::FetchMoreIssues { .. } => "Fetching issues...",
+            Command::SearchIssues { .. } => "Searching issues...",
+            Command::ClearIssueSearch { .. } => "Clearing search...",
+        }
+    }
+}
+
 /// Result returned from command execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -242,5 +267,67 @@ mod tests {
             base_detection_warning: Some("ambiguous base".into()),
         };
         assert_json_roundtrip(&info);
+    }
+
+    #[test]
+    fn command_description_covers_all_variants() {
+        let cases: Vec<Command> = vec![
+            Command::CreateWorkspaceForCheckout {
+                checkout_path: PathBuf::from("/tmp"),
+            },
+            Command::SelectWorkspace { ws_ref: "x".into() },
+            Command::CreateCheckout {
+                branch: "b".into(),
+                create_branch: true,
+                issue_ids: vec![],
+            },
+            Command::RemoveCheckout { branch: "b".into() },
+            Command::FetchCheckoutStatus {
+                branch: "b".into(),
+                checkout_path: None,
+                change_request_id: None,
+            },
+            Command::OpenChangeRequest { id: "1".into() },
+            Command::OpenIssue { id: "1".into() },
+            Command::LinkIssuesToChangeRequest {
+                change_request_id: "1".into(),
+                issue_ids: vec![],
+            },
+            Command::ArchiveSession {
+                session_id: "s".into(),
+            },
+            Command::GenerateBranchName { issue_keys: vec![] },
+            Command::TeleportSession {
+                session_id: "s".into(),
+                branch: None,
+                checkout_key: None,
+            },
+            Command::AddRepo {
+                path: PathBuf::from("/tmp"),
+            },
+            Command::RemoveRepo {
+                path: PathBuf::from("/tmp"),
+            },
+            Command::Refresh,
+            Command::SetIssueViewport {
+                repo: PathBuf::from("/tmp"),
+                visible_count: 10,
+            },
+            Command::FetchMoreIssues {
+                repo: PathBuf::from("/tmp"),
+                desired_count: 10,
+            },
+            Command::SearchIssues {
+                repo: PathBuf::from("/tmp"),
+                query: "q".into(),
+            },
+            Command::ClearIssueSearch {
+                repo: PathBuf::from("/tmp"),
+            },
+        ];
+        for cmd in cases {
+            let desc = cmd.description();
+            assert!(!desc.is_empty(), "empty description for {:?}", cmd);
+        }
     }
 }

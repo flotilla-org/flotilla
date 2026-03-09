@@ -11,12 +11,19 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState};
+use std::collections::HashMap;
+
+use crate::app::{InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState};
 use crate::event_log::{self, LevelExt};
 use flotilla_core::data::{GroupEntry, SectionHeader};
 use flotilla_protocol::{ChangeRequestStatus, ProviderData, SessionStatus, WorkItem, WorkItemKind};
 
-pub fn render(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
+pub fn render(
+    model: &TuiModel,
+    ui: &mut UiState,
+    in_flight: &HashMap<u64, InFlightCommand>,
+    frame: &mut Frame,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -28,7 +35,7 @@ pub fn render(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
 
     render_tab_bar(model, ui, frame, chunks[0]);
     render_content(model, ui, frame, chunks[1]);
-    render_status_bar(model, ui, frame, chunks[2]);
+    render_status_bar(model, ui, in_flight, frame, chunks[2]);
     render_action_menu(model, ui, frame);
     render_input_popup(ui, frame);
     render_delete_confirm(model, ui, frame);
@@ -111,10 +118,35 @@ fn selected_work_item<'a>(model: &TuiModel, ui: &'a UiState) -> Option<&'a WorkI
     }
 }
 
-fn render_status_bar(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: Rect) {
+fn render_status_bar(
+    model: &TuiModel,
+    ui: &UiState,
+    in_flight: &HashMap<u64, InFlightCommand>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     if let Some(err) = &model.status_message {
         let msg = format!(" Error: {}", err);
         let status = Paragraph::new(msg).style(Style::default().fg(Color::Red));
+        frame.render_widget(status, area);
+        return;
+    }
+
+    // Show in-flight command progress for the active repo
+    let active_repo = &model.repo_order[model.active_repo];
+    let active_cmds: Vec<&str> = in_flight
+        .values()
+        .filter(|cmd| &cmd.repo == active_repo)
+        .map(|cmd| cmd.description.as_str())
+        .collect();
+
+    if !active_cmds.is_empty() {
+        let msg = if active_cmds.len() == 1 {
+            format!(" {}", active_cmds[0])
+        } else {
+            format!(" {} ({} commands)", active_cmds[0], active_cmds.len())
+        };
+        let status = Paragraph::new(msg).style(Style::default().fg(Color::Yellow));
         frame.render_widget(status, area);
         return;
     }

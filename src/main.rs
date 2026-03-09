@@ -157,7 +157,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     events.attach_daemon(daemon_rx);
 
     loop {
-        terminal.draw(|f| ui::render(&app.model, &mut app.ui, f))?;
+        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
 
         if let Some(evt) = events.next().await {
             match evt {
@@ -299,7 +299,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
 
         // Process proto command queue — routed through daemon-side executor
         while let Some(cmd) = app.proto_commands.take_next() {
-            app::executor::execute(cmd, &mut app).await;
+            app::executor::dispatch(cmd, &mut app).await;
         }
 
         if app.should_quit {
