@@ -210,6 +210,50 @@ impl ReplaySession {
             );
         }
     }
+
+    /// Returns true if this session is in recording mode.
+    pub fn is_recording(&self) -> bool {
+        self.inner.lock().unwrap().recording
+    }
+
+    /// Save if recording, assert_complete if replaying.
+    pub fn finish(&self) {
+        if self.is_recording() {
+            self.save();
+        } else {
+            self.assert_complete();
+        }
+    }
+}
+
+/// Check whether `RECORD=1` environment variable is set.
+pub fn is_recording() -> bool {
+    std::env::var("RECORD").is_ok()
+}
+
+/// Create a `ReplaySession` that either records or replays.
+/// In record mode: creates a recording session (fixture will be written on `finish()`).
+/// In replay mode: loads canned interactions from the fixture file.
+pub fn test_session(fixture_path: &str, masks: Masks) -> ReplaySession {
+    if is_recording() {
+        ReplaySession::recording(fixture_path, masks)
+    } else {
+        ReplaySession::from_file(fixture_path, masks)
+    }
+}
+
+/// Create a `CommandRunner` for a test session.
+/// In record mode: wraps `ProcessCommandRunner` with recording.
+/// In replay mode: returns a `ReplayRunner`.
+pub fn test_runner(session: &ReplaySession) -> Arc<dyn CommandRunner> {
+    if session.is_recording() {
+        Arc::new(RecordingRunner::new(
+            session.clone(),
+            Arc::new(super::ProcessCommandRunner),
+        ))
+    } else {
+        Arc::new(session.command_runner())
+    }
 }
 
 /// A `CommandRunner` that replays canned responses from a `ReplaySession`.
@@ -479,6 +523,101 @@ impl CommandRunner for RecordingRunner {
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.inner.exists(cmd, args).await
+    }
+}
+
+/// A `GhApi` that delegates to a real GhApi and records all interactions.
+pub struct RecordingGhApi {
+    session: ReplaySession,
+    inner: Arc<dyn GhApi>,
+}
+
+impl RecordingGhApi {
+    pub fn new(session: ReplaySession, inner: Arc<dyn GhApi>) -> Self {
+        Self { session, inner }
+    }
+}
+
+#[async_trait]
+impl GhApi for RecordingGhApi {
+    async fn get(&self, endpoint: &str, repo_root: &Path) -> Result<String, String> {
+        let result = self.inner.get(endpoint, repo_root).await;
+
+        match &result {
+            Ok(body) => {
+                self.session.record(Interaction::GhApi {
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    status: 200,
+                    body: body.clone(),
+                    headers: HashMap::new(),
+                });
+            }
+            Err(err) => {
+                self.session.record(Interaction::GhApi {
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    status: 500,
+                    body: err.clone(),
+                    headers: HashMap::new(),
+                });
+            }
+        }
+
+        result
+    }
+
+    async fn get_with_headers(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+    ) -> Result<GhApiResponse, String> {
+        let result = self.inner.get_with_headers(endpoint, repo_root).await;
+
+        match &result {
+            Ok(resp) => {
+                let mut headers = HashMap::new();
+                if let Some(ref etag) = resp.etag {
+                    headers.insert("etag".to_string(), etag.clone());
+                }
+                if resp.has_next_page {
+                    headers.insert("has_next_page".to_string(), "true".to_string());
+                }
+                if let Some(count) = resp.total_count {
+                    headers.insert("total_count".to_string(), count.to_string());
+                }
+                self.session.record(Interaction::GhApi {
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    status: resp.status,
+                    body: resp.body.clone(),
+                    headers,
+                });
+            }
+            Err(err) => {
+                self.session.record(Interaction::GhApi {
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    status: 500,
+                    body: err.clone(),
+                    headers: HashMap::new(),
+                });
+            }
+        }
+
+        result
+    }
+}
+
+/// Create a `GhApi` for a test session.
+/// In record mode: wraps a real `GhApiClient` with recording.
+/// In replay mode: returns a `ReplayGhApi`.
+pub fn test_gh_api(session: &ReplaySession, runner: &Arc<dyn CommandRunner>) -> Arc<dyn GhApi> {
+    if session.is_recording() {
+        let real_api = Arc::new(super::github_api::GhApiClient::new(Arc::clone(runner)));
+        Arc::new(RecordingGhApi::new(session.clone(), real_api))
+    } else {
+        Arc::new(session.gh_api())
     }
 }
 

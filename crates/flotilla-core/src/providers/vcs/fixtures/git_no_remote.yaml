@@ -2,11 +2,8 @@ interactions:
 - channel: command
   cmd: git
   args:
-  - rev-list
-  - '--count'
-  - '--left-right'
-  - feature...main
+  - remote
   cwd: '{repo}'
-  stdout: "1\t2\n"
+  stdout: ''
   stderr: null
   exit_code: 0

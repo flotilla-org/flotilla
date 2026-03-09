@@ -172,203 +172,296 @@ impl super::Vcs for GitVcs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::testing::MockRunner;
+    use crate::providers::replay;
     use crate::providers::vcs::Vcs;
-    use std::sync::Arc;
+
+    // ── Setup helpers (only called in record mode) ──
+
+    /// Run a git command in `repo`, panicking on failure.
+    fn git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Create a temp git repo with branches: main, feature/foo, fix-bar.
+    /// Two commits on main, so commit_log has something to show.
+    fn setup_branches() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@test.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "Initial commit"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "Add feature"]);
+        git(&repo, &["branch", "feature/foo"]);
+        git(&repo, &["branch", "fix-bar"]);
+        (dir, repo)
+    }
+
+    /// Create a temp git repo with a local bare remote containing branches.
+    fn setup_remote_branches() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(dir.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@test.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git(&repo, &["push", "origin", "main"]);
+        git(&repo, &["branch", "feature/foo"]);
+        git(&repo, &["push", "origin", "feature/foo"]);
+        (dir, repo)
+    }
+
+    /// Create a temp git repo with a feature branch ahead/behind main.
+    fn setup_ahead_behind() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@test.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "Base"]);
+        git(&repo, &["branch", "feature"]);
+        // main gets 2 more commits
+        git(&repo, &["commit", "--allow-empty", "-m", "Main 1"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "Main 2"]);
+        // feature gets 1 commit
+        git(&repo, &["checkout", "feature"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "Feature 1"]);
+        git(&repo, &["checkout", "main"]);
+        (dir, repo)
+    }
+
+    /// Create a temp git repo with modified, staged, and untracked files.
+    fn setup_working_tree() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@test.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        // Create and commit a file so we can modify it
+        std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-m", "add tracked file"]);
+        // Modified: change committed file
+        std::fs::write(repo.join("tracked.txt"), "modified").unwrap();
+        // Staged: add a new file
+        std::fs::write(repo.join("staged.txt"), "new content").unwrap();
+        git(&repo, &["add", "staged.txt"]);
+        // Untracked: create a file without adding
+        std::fs::write(repo.join("untracked.txt"), "untracked").unwrap();
+        (dir, repo)
+    }
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/src/providers/vcs/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
+    }
+
+    // ── Record/replay tests ──
 
     #[tokio::test]
-    async fn list_local_branches_parses_output() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(
-            "main\nfeature/foo\nfix-bar\n".to_string()
-        )]));
+    async fn record_replay_list_local_branches() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(setup_branches())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("git_branches.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
         let vcs = GitVcs::new(runner);
-        let branches = vcs.list_local_branches(Path::new("/fake")).await.unwrap();
+        let branches = vcs.list_local_branches(&repo_path).await.unwrap();
+
         assert_eq!(branches.len(), 3);
-        assert_eq!(branches[0].name, "main");
-        assert!(branches[0].is_trunk);
-        assert_eq!(branches[1].name, "feature/foo");
-        assert!(!branches[1].is_trunk);
-        assert_eq!(branches[2].name, "fix-bar");
-        assert!(!branches[2].is_trunk);
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"main"));
+        assert!(names.contains(&"feature/foo"));
+        assert!(names.contains(&"fix-bar"));
+        let main = branches.iter().find(|b| b.name == "main").unwrap();
+        assert!(main.is_trunk);
+        let feature = branches.iter().find(|b| b.name == "feature/foo").unwrap();
+        assert!(!feature.is_trunk);
+
+        session.finish();
     }
 
     #[tokio::test]
-    async fn working_tree_status_parses_porcelain() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(
-            "M  src/main.rs\n?? new.rs\n".to_string()
-        )]));
+    async fn record_replay_list_remote_branches() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(setup_remote_branches())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("git_remote_branches.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
         let vcs = GitVcs::new(runner);
-        let status = vcs
-            .working_tree_status(Path::new("/fake"), Path::new("/fake"))
+        let branches = vcs.list_remote_branches(&repo_path).await.unwrap();
+
+        assert_eq!(branches.len(), 2);
+        assert!(branches.contains(&"main".to_string()));
+        assert!(branches.contains(&"feature/foo".to_string()));
+
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn record_replay_commit_log() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(setup_branches())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("git_log.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
+        let vcs = GitVcs::new(runner);
+        let log = vcs.commit_log(&repo_path, "main", 5).await.unwrap();
+
+        assert_eq!(log.len(), 2);
+        // Most recent first
+        assert_eq!(log[0].message, "Add feature");
+        assert_eq!(log[1].message, "Initial commit");
+        assert!(!log[0].short_sha.is_empty());
+
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn record_replay_ahead_behind() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(setup_ahead_behind())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("git_ahead_behind.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
+        let vcs = GitVcs::new(runner);
+        let ab = vcs
+            .ahead_behind(&repo_path, "feature", "main")
             .await
             .unwrap();
+
+        // feature has 1 commit not in main, main has 2 not in feature
+        assert_eq!(ab.ahead, 1);
+        assert_eq!(ab.behind, 2);
+
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn record_replay_working_tree_status() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(setup_working_tree())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("git_working_tree.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
+        let vcs = GitVcs::new(runner);
+        let status = vcs
+            .working_tree_status(&repo_path, &repo_path)
+            .await
+            .unwrap();
+
+        assert_eq!(status.modified, 1);
         assert_eq!(status.staged, 1);
         assert_eq!(status.untracked, 1);
-        assert_eq!(status.modified, 0);
+
+        session.finish();
     }
 
     #[tokio::test]
-    async fn commit_log_parses_oneline() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(
-            "abc1234 Initial commit\ndef5678 Add feature\n".to_string(),
-        )]));
-        let vcs = GitVcs::new(runner);
-        let log = vcs
-            .commit_log(Path::new("/fake"), "main", 10)
-            .await
-            .unwrap();
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[0].short_sha, "abc1234");
-        assert_eq!(log[0].message, "Initial commit");
-        assert_eq!(log[1].short_sha, "def5678");
-        assert_eq!(log[1].message, "Add feature");
-    }
+    async fn record_replay_list_remote_branches_no_remote() {
+        let recording = replay::is_recording();
+        let temp = if recording {
+            // Repo with no remote configured
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().to_path_buf();
+            git(&repo, &["init", "-b", "main"]);
+            git(&repo, &["config", "user.email", "test@test.com"]);
+            git(&repo, &["config", "user.name", "Test"]);
+            git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+            Some((dir, repo))
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
 
-    #[tokio::test]
-    async fn ahead_behind_parses_count() {
-        let runner = Arc::new(MockRunner::new(vec![Ok("3\t5\n".to_string())]));
-        let vcs = GitVcs::new(runner);
-        let ab = vcs
-            .ahead_behind(Path::new("/fake"), "feature", "main")
-            .await
-            .unwrap();
-        assert_eq!(ab.ahead, 3);
-        assert_eq!(ab.behind, 5);
-    }
+        let mut masks = replay::Masks::new();
+        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        let session = replay::test_session(&fixture("git_no_remote.yaml"), masks);
+        let runner = replay::test_runner(&session);
 
-    #[tokio::test]
-    async fn list_remote_branches_no_remote() {
-        let runner = Arc::new(MockRunner::new(vec![
-            Ok("".to_string()), // git remote returns empty
-        ]));
         let vcs = GitVcs::new(runner);
-        let branches = vcs.list_remote_branches(Path::new("/fake")).await.unwrap();
+        let branches = vcs.list_remote_branches(&repo_path).await.unwrap();
         assert!(branches.is_empty());
-    }
 
-    // ── replay-based tests ──────────────────────────────────────────
-
-    use crate::providers::replay::{Masks, ReplaySession};
-
-    fn repo_masks() -> Masks {
-        let mut m = Masks::new();
-        m.add("/test/repo", "{repo}");
-        m
-    }
-
-    fn checkout_masks() -> Masks {
-        let mut m = Masks::new();
-        m.add("/test/checkout", "{checkout}");
-        m
-    }
-
-    #[tokio::test]
-    async fn replay_list_local_branches() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/git_branches.yaml"
-            ),
-            repo_masks(),
-        );
-        let runner = Arc::new(session.command_runner());
-        let vcs = GitVcs::new(runner);
-        let branches = vcs
-            .list_local_branches(Path::new("/test/repo"))
-            .await
-            .unwrap();
-        assert_eq!(branches.len(), 3);
-        assert_eq!(branches[0].name, "main");
-        assert!(branches[0].is_trunk);
-        assert_eq!(branches[1].name, "feature/foo");
-        assert!(!branches[1].is_trunk);
-        assert_eq!(branches[2].name, "fix-bar");
-        assert!(!branches[2].is_trunk);
-        session.assert_complete();
-    }
-
-    #[tokio::test]
-    async fn replay_list_remote_branches() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/git_remote_branches.yaml"
-            ),
-            repo_masks(),
-        );
-        let runner = Arc::new(session.command_runner());
-        let vcs = GitVcs::new(runner);
-        let branches = vcs
-            .list_remote_branches(Path::new("/test/repo"))
-            .await
-            .unwrap();
-        assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0], "main");
-        assert_eq!(branches[1], "feature/foo");
-        session.assert_complete();
-    }
-
-    #[tokio::test]
-    async fn replay_commit_log() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/git_log.yaml"
-            ),
-            repo_masks(),
-        );
-        let runner = Arc::new(session.command_runner());
-        let vcs = GitVcs::new(runner);
-        let log = vcs
-            .commit_log(Path::new("/test/repo"), "main", 5)
-            .await
-            .unwrap();
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[0].short_sha, "abc1234");
-        assert_eq!(log[0].message, "Initial commit");
-        assert_eq!(log[1].short_sha, "def5678");
-        assert_eq!(log[1].message, "Add feature");
-        session.assert_complete();
-    }
-
-    #[tokio::test]
-    async fn replay_ahead_behind() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/git_ahead_behind.yaml"
-            ),
-            repo_masks(),
-        );
-        let runner = Arc::new(session.command_runner());
-        let vcs = GitVcs::new(runner);
-        let ab = vcs
-            .ahead_behind(Path::new("/test/repo"), "feature", "main")
-            .await
-            .unwrap();
-        assert_eq!(ab.ahead, 3);
-        assert_eq!(ab.behind, 5);
-        session.assert_complete();
-    }
-
-    #[tokio::test]
-    async fn replay_working_tree_status() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/vcs/fixtures/git_working_tree.yaml"
-            ),
-            checkout_masks(),
-        );
-        let runner = Arc::new(session.command_runner());
-        let vcs = GitVcs::new(runner);
-        let status = vcs
-            .working_tree_status(Path::new("/test/repo"), Path::new("/test/checkout"))
-            .await
-            .unwrap();
-        assert_eq!(status.modified, 1); // " M src/main.rs"
-        assert_eq!(status.staged, 1); // "A  new.rs"
-        assert_eq!(status.untracked, 1); // "?? tmp.txt"
-        session.assert_complete();
+        session.finish();
     }
 }

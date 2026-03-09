@@ -1,13 +1,20 @@
 interactions:
-  - channel: command
-    cmd: git
-    args: ["remote"]
-    cwd: "{repo}"
-    stdout: "origin\n"
-    exit_code: 0
-  - channel: command
-    cmd: git
-    args: ["ls-remote", "--heads", "origin"]
-    cwd: "{repo}"
-    stdout: "abc123\trefs/heads/main\ndef456\trefs/heads/feature/foo\n"
-    exit_code: 0
+- channel: command
+  cmd: git
+  args:
+  - remote
+  cwd: '{repo}'
+  stdout: |
+    origin
+  stderr: null
+  exit_code: 0
+- channel: command
+  cmd: git
+  args:
+  - ls-remote
+  - '--heads'
+  - origin
+  cwd: '{repo}'
+  stdout: "753e289e047513b1a44f21b530e8c2a4f925a41d\trefs/heads/feature/foo\n753e289e047513b1a44f21b530e8c2a4f925a41d\trefs/heads/main\n"
+  stderr: null
+  exit_code: 0

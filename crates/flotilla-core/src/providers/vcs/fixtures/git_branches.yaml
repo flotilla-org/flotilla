@@ -1,7 +1,14 @@
 interactions:
-  - channel: command
-    cmd: git
-    args: ["branch", "--list", "--format=%(refname:short)"]
-    cwd: "{repo}"
-    stdout: "main\nfeature/foo\nfix-bar\n"
-    exit_code: 0
+- channel: command
+  cmd: git
+  args:
+  - branch
+  - '--list'
+  - '--format=%(refname:short)'
+  cwd: '{repo}'
+  stdout: |
+    feature/foo
+    fix-bar
+    main
+  stderr: null
+  exit_code: 0
