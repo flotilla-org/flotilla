@@ -431,6 +431,12 @@ mod tests {
     fn enter_on_added_git_repo_navigates_into_it() {
         // When is_git_repo=true AND is_added=true, the code skips the AddRepo
         // branch and falls through to the is_dir branch, navigating into it.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("existing-repo");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::create_dir(sub.join(".git")).unwrap();
+
+        let base = format!("{}/", tmp.path().display());
         let mut app = stub_app();
         let entries = vec![DirEntry {
             name: "existing-repo".to_string(),
@@ -438,7 +444,7 @@ mod tests {
             is_git_repo: true,
             is_added: true,
         }];
-        enter_file_picker(&mut app, "/some/path/", entries);
+        enter_file_picker(&mut app, &base, entries);
 
         app.handle_file_picker_key(key(KeyCode::Enter));
 
@@ -449,7 +455,7 @@ mod tests {
             ..
         } = app.ui.mode
         {
-            assert_eq!(input.value(), "/some/path/existing-repo/");
+            assert_eq!(input.value(), format!("{base}existing-repo/"));
             assert_eq!(selected, 0);
         } else {
             panic!("expected FilePicker mode");

@@ -499,6 +499,20 @@ mod tests {
         checkout_item(&format!("feat/{id}"), &format!("/tmp/{id}"), false)
     }
 
+    fn delete_confirm_mode(branch: &str) -> UiMode {
+        UiMode::DeleteConfirm {
+            info: Some(CheckoutStatus {
+                branch: branch.into(),
+                change_request_status: None,
+                merge_commit_sha: None,
+                unpushed_commits: vec![],
+                has_uncommitted: false,
+                base_detection_warning: None,
+            }),
+            loading: false,
+        }
+    }
+
     // ── handle_key — top-level dispatch ──────────────────────────────
 
     #[test]
@@ -965,17 +979,7 @@ mod tests {
     #[test]
     fn delete_confirm_y_sends_remove_checkout() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: Some(CheckoutStatus {
-                branch: "feat/x".into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: false,
-                base_detection_warning: None,
-            }),
-            loading: false,
-        };
+        app.ui.mode = delete_confirm_mode("feat/x");
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
@@ -990,17 +994,7 @@ mod tests {
     #[test]
     fn delete_confirm_enter_sends_remove_checkout() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: Some(CheckoutStatus {
-                branch: "feat/y".into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: false,
-                base_detection_warning: None,
-            }),
-            loading: false,
-        };
+        app.ui.mode = delete_confirm_mode("feat/y");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
@@ -1031,17 +1025,7 @@ mod tests {
     #[test]
     fn delete_confirm_esc_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: Some(CheckoutStatus {
-                branch: "feat/z".into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: false,
-                base_detection_warning: None,
-            }),
-            loading: false,
-        };
+        app.ui.mode = delete_confirm_mode("feat/z");
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());
@@ -1050,17 +1034,7 @@ mod tests {
     #[test]
     fn delete_confirm_n_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: Some(CheckoutStatus {
-                branch: "feat/z".into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: false,
-                base_detection_warning: None,
-            }),
-            loading: false,
-        };
+        app.ui.mode = delete_confirm_mode("feat/z");
         app.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());

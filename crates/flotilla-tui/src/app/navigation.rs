@@ -353,8 +353,8 @@ mod tests {
     #[test]
     fn select_next_triggers_fetch_when_near_bottom() {
         let mut app = stub_app_with_repos(1);
-        // 6 items: positions 0-5. When at position 1, next+5 = 2+5 = 7 >= 6.
-        // But we need issue_has_more=true and issue_fetch_pending=false.
+        // 6 items: positions 0-5. After two select_next calls we're at
+        // position 1, and 1+5 = 6 >= 6 triggers the fetch.
         set_active_table_view(&mut app, issue_table_entries(6));
 
         let repo = app.model.repo_order[0].clone();
@@ -363,7 +363,7 @@ mod tests {
             rm.issue_fetch_pending = false;
         }
 
-        // Navigate to near the bottom (position 1, so next=2, 2+5=7 >= 6)
+        // Navigate to position 1 (next=1, 1+5=6 >= 6 triggers fetch)
         app.select_next(); // None -> 0
         app.select_next(); // 0 -> 1
 
