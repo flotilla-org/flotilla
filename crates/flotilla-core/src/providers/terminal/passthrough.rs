@@ -27,10 +27,10 @@ impl TerminalPool for PassthroughTerminalPool {
     async fn attach_command(
         &self,
         _id: &ManagedTerminalId,
-        _command: &str,
+        command: &str,
         _cwd: &std::path::Path,
     ) -> Result<String, String> {
-        Err("passthrough pool: no attach command available".into())
+        Ok(command.to_string())
     }
 
     async fn kill_terminal(&self, _id: &ManagedTerminalId) -> Result<(), String> {
@@ -64,16 +64,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passthrough_attach_command_returns_error() {
+    async fn passthrough_attach_command_passes_through() {
         let pool = PassthroughTerminalPool;
         let id = ManagedTerminalId {
             checkout: "test".into(),
             role: "shell".into(),
             index: 0,
         };
-        assert!(pool
+        let result = pool
             .attach_command(&id, "bash", "/tmp".as_ref())
             .await
-            .is_err());
+            .unwrap();
+        assert_eq!(result, "bash");
     }
 }

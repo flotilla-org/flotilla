@@ -13,7 +13,7 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::terminal::TerminalPool;
 use crate::providers::types::WorkspaceConfig;
 use crate::providers::CommandRunner;
-use crate::template::{parse_template, ParsedTemplate};
+use crate::template::{self, WorkspaceTemplate};
 use crate::{data, providers};
 
 /// Execute a `Command` against the given repo context.
@@ -362,19 +362,18 @@ pub async fn execute(
     }
 }
 
-/// If a terminal pool is available and the config has a V2 template, resolve
-/// terminal sessions through the pool. Each terminal content entry is ensured
-/// running and its attach command is stored in `config.resolved_commands`.
+/// Resolve terminal sessions through the pool. Each terminal content entry is
+/// ensured running and its attach command is stored in `config.resolved_commands`.
 async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn TerminalPool) {
-    let yaml = match config.template_yaml {
-        Some(ref y) => y.clone(),
-        None => return,
+    let tmpl = if let Some(ref yaml) = config.template_yaml {
+        serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+            warn!("failed to parse workspace template, using default: {e}");
+            template::default_template()
+        })
+    } else {
+        template::default_template()
     };
-    let v2 = match parse_template(&yaml) {
-        Ok(ParsedTemplate::V2(v2)) => v2,
-        _ => return,
-    };
-    let rendered = v2.render(&config.template_vars);
+    let rendered = tmpl.render(&config.template_vars);
     let mut resolved = Vec::new();
     for entry in &rendered.content {
         if entry.content_type != "terminal" {

@@ -5,9 +5,7 @@ pub mod zellij;
 use std::collections::HashMap;
 
 use crate::providers::types::{Workspace, WorkspaceConfig};
-use crate::template::{
-    self, PaneTemplate, ParsedTemplate, SurfaceTemplate, WorkspaceTemplate, WorkspaceTemplateV2,
-};
+use crate::template::{self, PaneLayout, PaneTemplate, SurfaceTemplate, WorkspaceTemplate};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -21,41 +19,32 @@ pub trait WorkspaceManager: Send + Sync {
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String>;
 }
 
-/// Resolve a `WorkspaceConfig` into a rendered V1 `WorkspaceTemplate`.
+/// Resolve a `WorkspaceConfig` into a `PaneLayout` for workspace managers.
 ///
-/// When `resolved_commands` is set (from terminal pool), builds a V1 template
-/// from the V2 layout slots using the resolved attach commands. Otherwise,
-/// parses the template YAML as V1 and renders it with template vars.
-pub(crate) fn resolve_template(config: &WorkspaceConfig) -> WorkspaceTemplate {
-    if let Some(ref resolved) = config.resolved_commands {
-        if let Some(ref yaml) = config.template_yaml {
-            if let Ok(ParsedTemplate::V2(v2)) = template::parse_template(yaml) {
-                return build_v1_from_resolved(&v2, resolved);
-            }
-        }
-    }
-    // Standard V1 path
-    let template = if let Some(ref yaml) = config.template_yaml {
+/// Parses the template YAML as a `WorkspaceTemplate` (content + layout format),
+/// then builds panes from resolved commands. Falls back to the default template
+/// when no YAML is provided or parsing fails.
+pub(crate) fn resolve_template(config: &WorkspaceConfig) -> PaneLayout {
+    let tmpl = if let Some(ref yaml) = config.template_yaml {
         serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
             tracing::warn!("failed to parse workspace template, using default: {e}");
-            WorkspaceTemplate::load_default()
+            template::default_template()
         })
     } else {
-        WorkspaceTemplate::load_default()
+        template::default_template()
     };
-    template.render(&config.template_vars)
+
+    let resolved = config.resolved_commands.as_deref().unwrap_or(&[]);
+    build_pane_layout(&tmpl, resolved)
 }
 
-/// Build a V1 `WorkspaceTemplate` from V2 layout slots and resolved commands.
+/// Build a `PaneLayout` from layout slots and resolved commands.
 ///
 /// Each layout slot becomes a pane. Resolved commands for a given role are
 /// consumed in order, with overflow commands becoming additional surfaces
 /// (tabs) within the slot's pane. Slots with no resolved commands get an
 /// empty surface.
-fn build_v1_from_resolved(
-    v2: &WorkspaceTemplateV2,
-    resolved: &[(String, String)],
-) -> WorkspaceTemplate {
+fn build_pane_layout(tmpl: &WorkspaceTemplate, resolved: &[(String, String)]) -> PaneLayout {
     // Group resolved commands by role, preserving order
     let mut role_cmds: HashMap<&str, Vec<&str>> = HashMap::new();
     for (role, cmd) in resolved {
@@ -66,7 +55,7 @@ fn build_v1_from_resolved(
     }
 
     let mut panes = Vec::new();
-    for slot in &v2.layout {
+    for slot in &tmpl.layout {
         let cmds = role_cmds.get(slot.slot.as_str());
         let surfaces = if let Some(cmds) = cmds {
             cmds.iter()
@@ -92,17 +81,17 @@ fn build_v1_from_resolved(
         });
     }
 
-    WorkspaceTemplate { panes }
+    PaneLayout { panes }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::{ContentEntry, LayoutSlot, WorkspaceTemplateV2};
+    use crate::template::{ContentEntry, LayoutSlot, WorkspaceTemplate};
 
     #[test]
-    fn build_v1_from_resolved_maps_layout_to_panes() {
-        let v2 = WorkspaceTemplateV2 {
+    fn build_pane_layout_maps_layout_to_panes() {
+        let tmpl = WorkspaceTemplate {
             content: vec![
                 ContentEntry {
                     role: "shell".into(),
@@ -142,29 +131,29 @@ mod tests {
             ("agent".into(), "shpool attach flotilla/feat/agent/1".into()),
         ];
 
-        let template = build_v1_from_resolved(&v2, &resolved);
-        assert_eq!(template.panes.len(), 2);
+        let layout = build_pane_layout(&tmpl, &resolved);
+        assert_eq!(layout.panes.len(), 2);
 
         // First pane: shell slot
-        assert_eq!(template.panes[0].name, "shell");
-        assert!(template.panes[0].split.is_none());
-        assert!(template.panes[0].focus);
-        assert_eq!(template.panes[0].surfaces.len(), 1);
-        assert!(template.panes[0].surfaces[0].command.contains("shell/0"));
+        assert_eq!(layout.panes[0].name, "shell");
+        assert!(layout.panes[0].split.is_none());
+        assert!(layout.panes[0].focus);
+        assert_eq!(layout.panes[0].surfaces.len(), 1);
+        assert!(layout.panes[0].surfaces[0].command.contains("shell/0"));
 
         // Second pane: agent slot with 2 surfaces (overflow as tabs)
-        assert_eq!(template.panes[1].name, "agent");
-        assert_eq!(template.panes[1].split.as_deref(), Some("right"));
-        assert!(!template.panes[1].focus);
-        assert_eq!(template.panes[1].surfaces.len(), 2);
-        assert!(template.panes[1].surfaces[0].command.contains("agent/0"));
-        assert!(template.panes[1].surfaces[1].command.contains("agent/1"));
+        assert_eq!(layout.panes[1].name, "agent");
+        assert_eq!(layout.panes[1].split.as_deref(), Some("right"));
+        assert!(!layout.panes[1].focus);
+        assert_eq!(layout.panes[1].surfaces.len(), 2);
+        assert!(layout.panes[1].surfaces[0].command.contains("agent/0"));
+        assert!(layout.panes[1].surfaces[1].command.contains("agent/1"));
     }
 
     #[test]
-    fn build_v1_from_resolved_handles_gap() {
+    fn build_pane_layout_handles_gap() {
         // Layout slot with no matching resolved commands
-        let v2 = WorkspaceTemplateV2 {
+        let tmpl = WorkspaceTemplate {
             content: vec![],
             layout: vec![LayoutSlot {
                 slot: "missing".into(),
@@ -177,10 +166,10 @@ mod tests {
         };
         let resolved: Vec<(String, String)> = vec![];
 
-        let template = build_v1_from_resolved(&v2, &resolved);
-        assert_eq!(template.panes.len(), 1);
+        let layout = build_pane_layout(&tmpl, &resolved);
+        assert_eq!(layout.panes.len(), 1);
         // Gap: should have a single surface with empty command
-        assert_eq!(template.panes[0].surfaces.len(), 1);
-        assert!(template.panes[0].surfaces[0].command.is_empty());
+        assert_eq!(layout.panes[0].surfaces.len(), 1);
+        assert!(layout.panes[0].surfaces[0].command.is_empty());
     }
 }

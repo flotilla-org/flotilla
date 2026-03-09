@@ -234,7 +234,7 @@ pub async fn detect_providers(
         }
     }
 
-    // 7. Terminal pool: prefer shpool if available
+    // 7. Terminal pool: prefer shpool if available, fall back to passthrough
     if runner.exists("shpool", &["version"]).await {
         let shpool_socket = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("~/.config"))
@@ -247,6 +247,12 @@ pub async fn detect_providers(
             )),
         ));
         info!("{repo_name}: Terminal pool → shpool");
+    } else {
+        registry.terminal_pool = Some((
+            "passthrough".into(),
+            Arc::new(crate::providers::terminal::passthrough::PassthroughTerminalPool),
+        ));
+        info!("{repo_name}: Terminal pool → passthrough (no persistence)");
     }
 
     (registry, repo_slug)
