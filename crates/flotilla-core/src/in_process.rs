@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,9 +13,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::info;
 
-use flotilla_protocol::{
-    AssociationKey, Command, CommandResult, DaemonEvent, Issue, RepoInfo, Snapshot,
-};
+use flotilla_protocol::{AssociationKey, Command, DaemonEvent, Issue, RepoInfo, Snapshot};
 
 use flotilla_protocol::ProviderData;
 
@@ -102,6 +101,7 @@ pub struct InProcessDaemon {
     event_tx: broadcast::Sender<DaemonEvent>,
     config: Arc<ConfigStore>,
     runner: Arc<dyn CommandRunner>,
+    next_command_id: AtomicU64,
 }
 
 impl InProcessDaemon {
@@ -145,6 +145,7 @@ impl InProcessDaemon {
             event_tx,
             config,
             runner,
+            next_command_id: AtomicU64::new(1),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -503,24 +504,25 @@ impl DaemonHandle for InProcessDaemon {
         Ok(result)
     }
 
-    async fn execute(&self, repo: &Path, command: Command) -> Result<CommandResult, String> {
-        // Handle daemon-level issue commands directly
+    async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
+        let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+
+        // Issue commands: execute inline (already backgrounded by TUI), return ID
         match &command {
             Command::SetIssueViewport { visible_count, .. } => {
-                // Fetch enough to fill the visible area with some buffer
                 self.ensure_issues_cached(repo, *visible_count * 2).await;
                 self.broadcast_snapshot(repo).await;
-                return Ok(CommandResult::Ok);
+                return Ok(id);
             }
             Command::FetchMoreIssues { desired_count, .. } => {
                 self.ensure_issues_cached(repo, *desired_count).await;
                 self.broadcast_snapshot(repo).await;
-                return Ok(CommandResult::Ok);
+                return Ok(id);
             }
             Command::SearchIssues { query, .. } => {
                 self.search_issues(repo, query).await;
                 self.broadcast_snapshot(repo).await;
-                return Ok(CommandResult::Ok);
+                return Ok(id);
             }
             Command::ClearIssueSearch { .. } => {
                 let mut repos = self.repos.write().await;
@@ -529,14 +531,24 @@ impl DaemonHandle for InProcessDaemon {
                 }
                 drop(repos);
                 self.broadcast_snapshot(repo).await;
-                return Ok(CommandResult::Ok);
+                return Ok(id);
             }
-            _ => {} // fall through to executor
+            _ => {}
         }
 
-        // Extract the data we need under a read lock, then drop it before the async work
+        // Broadcast started
+        let description = command.description().to_string();
+        let repo_path = repo.to_path_buf();
+        let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            command_id: id,
+            repo: repo_path.clone(),
+            description,
+        });
+
+        // Gather what the spawned task needs
         let runner = Arc::clone(&self.runner);
-        let (registry, providers_data, repo_root) = {
+        let event_tx = self.event_tx.clone();
+        let (registry, providers_data, refresh_trigger) = {
             let repos = self.repos.read().await;
             let state = repos
                 .get(repo)
@@ -544,22 +556,25 @@ impl DaemonHandle for InProcessDaemon {
             (
                 Arc::clone(&state.model.registry),
                 Arc::clone(&state.model.data.providers),
-                repo.to_path_buf(),
+                Arc::clone(&state.model.refresh_handle.refresh_trigger),
             )
         };
 
-        let result =
-            executor::execute(command, &repo_root, &registry, &providers_data, &*runner).await;
+        tokio::spawn(async move {
+            let result =
+                executor::execute(command, &repo_path, &registry, &providers_data, &*runner).await;
 
-        // Trigger a refresh after command execution
-        {
-            let repos = self.repos.read().await;
-            if let Some(state) = repos.get(repo) {
-                state.model.refresh_handle.trigger_refresh();
-            }
-        }
+            // Trigger a refresh after command execution
+            refresh_trigger.notify_one();
 
-        Ok(result)
+            let _ = event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                repo: repo_path,
+                result,
+            });
+        });
+
+        Ok(id)
     }
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {

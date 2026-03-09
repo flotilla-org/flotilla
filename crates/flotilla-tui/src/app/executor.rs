@@ -56,12 +56,16 @@ pub async fn execute(cmd: Command, app: &mut App) {
     }
 
     match app.daemon.execute(&repo, cmd).await {
-        Ok(result) => handle_result(result, app),
+        Ok(_command_id) => {
+            // Result will arrive via CommandFinished event
+        }
         Err(e) => app.model.status_message = Some(e),
     }
 }
 
 /// Interpret a CommandResult into UI state changes.
+///
+/// Called when a `CommandFinished` event arrives from the daemon.
 pub fn handle_result(result: CommandResult, app: &mut App) {
     match result {
         CommandResult::Ok => {}

@@ -291,7 +291,7 @@ async fn dispatch_request(
                 Err(e) => return Message::error_response(id, e),
             };
             match daemon.execute(&repo, command).await {
-                Ok(result) => Message::ok_response(id, &result),
+                Ok(command_id) => Message::ok_response(id, &command_id),
                 Err(e) => Message::error_response(id, e),
             }
         }

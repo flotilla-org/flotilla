@@ -10,9 +10,7 @@ use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{error, warn};
 
 use flotilla_core::daemon::DaemonHandle;
-use flotilla_protocol::{
-    Command, CommandResult, DaemonEvent, Message, RawResponse, RepoInfo, Snapshot,
-};
+use flotilla_protocol::{Command, DaemonEvent, Message, RawResponse, RepoInfo, Snapshot};
 
 pub struct SocketDaemon {
     writer: Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
@@ -182,14 +180,14 @@ impl DaemonHandle for SocketDaemon {
         resp.parse::<Vec<RepoInfo>>()
     }
 
-    async fn execute(&self, repo: &Path, command: Command) -> Result<CommandResult, String> {
+    async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
         let resp = self
             .request(
                 "execute",
                 serde_json::json!({ "repo": repo, "command": command }),
             )
             .await?;
-        resp.parse::<CommandResult>()
+        resp.parse::<u64>()
     }
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {

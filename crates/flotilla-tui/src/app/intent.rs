@@ -659,7 +659,7 @@ mod tests {
     // resolve() requires &App which needs a DaemonHandle trait object. Since
     // async_trait is not a direct dependency of flotilla-tui, we build a stub
     use flotilla_core::daemon::DaemonHandle;
-    use flotilla_protocol::{CommandResult, DaemonEvent, ProviderData, RepoInfo, Snapshot};
+    use flotilla_protocol::{DaemonEvent, ProviderData, RepoInfo, Snapshot};
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::broadcast;
@@ -686,8 +686,8 @@ mod tests {
         async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
             Ok(vec![])
         }
-        async fn execute(&self, _repo: &Path, _command: Command) -> Result<CommandResult, String> {
-            Ok(CommandResult::Ok)
+        async fn execute(&self, _repo: &Path, _command: Command) -> Result<u64, String> {
+            Ok(1)
         }
         async fn refresh(&self, _repo: &Path) -> Result<(), String> {
             Ok(())
