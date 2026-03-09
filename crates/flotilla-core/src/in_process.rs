@@ -120,6 +120,7 @@ fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
         prev_seq: delta.prev_seq,
         repo: snapshot.repo.clone(),
         changes: delta.changes,
+        work_items: snapshot.work_items.clone(),
         issue_total: snapshot.issue_total,
         issue_has_more: snapshot.issue_has_more,
         issue_search_results: snapshot.issue_search_results.clone(),
@@ -1013,25 +1014,10 @@ impl DaemonHandle for InProcessDaemon {
                         .iter()
                         .position(|entry| entry.prev_seq == client_seq);
 
-                    if let Some(start_idx) = replay_start {
-                        // Capture issue metadata once — it doesn't change per-entry
-                        let issue_snapshot = snapshot();
-                        // Replay delta entries
-                        for entry in state.delta_log.iter().skip(start_idx) {
-                            events.push(DaemonEvent::SnapshotDelta(Box::new(
-                                flotilla_protocol::SnapshotDelta {
-                                    seq: entry.seq,
-                                    prev_seq: entry.prev_seq,
-                                    repo: path.clone(),
-                                    changes: entry.changes.clone(),
-                                    issue_total: issue_snapshot.issue_total,
-                                    issue_has_more: issue_snapshot.issue_has_more,
-                                    issue_search_results: issue_snapshot
-                                        .issue_search_results
-                                        .clone(),
-                                },
-                            )));
-                        }
+                    if let Some(_start_idx) = replay_start {
+                        // Delta log entries don't carry work_items, so replay
+                        // as full snapshot instead of sending incomplete deltas.
+                        events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
                     } else if client_seq == state.seq {
                         // Client is up to date — no replay needed
                     } else {

@@ -316,22 +316,14 @@ impl App {
             }
         }
 
-        // Re-correlate and rebuild table view
-        let (work_items, correlation_groups) = data::correlate(&rm.providers);
-        let proto_work_items: Vec<WorkItem> = work_items
-            .iter()
-            .map(|wi| {
-                flotilla_core::convert::correlation_result_to_work_item(wi, &correlation_groups)
-            })
-            .collect();
-
+        // Use daemon's pre-correlated work items directly (no re-correlation)
         let section_labels = SectionLabels {
             checkouts: rm.labels.checkouts.section.clone(),
             code_review: rm.labels.code_review.section.clone(),
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.sessions.section.clone(),
         };
-        let table_view = data::group_work_items(&proto_work_items, &rm.providers, &section_labels);
+        let table_view = data::group_work_items(&delta.work_items, &rm.providers, &section_labels);
 
         // Provider health -> model-level statuses
         for (kind, healthy) in &rm.provider_health {

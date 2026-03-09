@@ -159,6 +159,8 @@ pub struct SnapshotDelta {
     pub prev_seq: u64,
     pub repo: std::path::PathBuf,
     pub changes: Vec<Change>,
+    /// Pre-correlated work items from the daemon (avoids re-correlation on TUI side).
+    pub work_items: Vec<snapshot::WorkItem>,
     /// Issue metadata (not part of delta log, but needed by TUI).
     pub issue_total: Option<u32>,
     pub issue_has_more: bool,
@@ -322,6 +324,7 @@ mod tests {
                     op: EntryOp::Removed,
                 },
             ],
+            work_items: vec![],
             issue_total: Some(100),
             issue_has_more: true,
             issue_search_results: None,
