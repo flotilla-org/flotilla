@@ -523,7 +523,7 @@ mod tests {
                 "new-session",
                 "-d",
                 "-s",
-                "flotilla-test-tmux",
+                "flotilla-test-tmux-ws",
                 "-x",
                 "80",
                 "-y",
@@ -536,7 +536,7 @@ mod tests {
 
     fn teardown_tmux_ws_session() {
         let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", "flotilla-test-tmux"])
+            .args(["kill-session", "-t", "flotilla-test-tmux-ws"])
             .status();
 
         // Clean up state files created by create_workspace
@@ -544,7 +544,7 @@ mod tests {
             let state_dir = config_dir
                 .join("flotilla")
                 .join("tmux")
-                .join("flotilla-test-tmux");
+                .join("flotilla-test-tmux-ws");
             let _ = std::fs::remove_dir_all(&state_dir);
         }
     }

@@ -39,7 +39,7 @@ interactions:
   - '#{session_name}'
   cwd: '.'
   stdout: |
-    flotilla-test-tmux
+    flotilla-test-tmux-ws
   stderr: null
   exit_code: 0
 - channel: command
@@ -82,7 +82,7 @@ interactions:
   - '#{session_name}'
   cwd: '.'
   stdout: |
-    flotilla-test-tmux
+    flotilla-test-tmux-ws
   stderr: null
   exit_code: 0
 - channel: command
@@ -140,6 +140,6 @@ interactions:
   - '#{session_name}'
   cwd: '.'
   stdout: |
-    flotilla-test-tmux
+    flotilla-test-tmux-ws
   stderr: null
   exit_code: 0

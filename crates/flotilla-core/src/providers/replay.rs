@@ -17,9 +17,9 @@ pub enum Interaction {
         cmd: String,
         args: Vec<String>,
         cwd: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         stdout: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         stderr: Option<String>,
         #[serde(default)]
         exit_code: i32,
@@ -53,6 +53,8 @@ impl Masks {
     }
 
     /// Add a substitution: concrete value → placeholder.
+    /// More specific (longer) values must be added before shorter prefixes
+    /// to avoid partial replacement during masking.
     pub fn add(&mut self, concrete: impl Into<String>, placeholder: impl Into<String>) {
         self.substitutions
             .push((concrete.into(), placeholder.into()));
@@ -532,6 +534,9 @@ impl CommandRunner for RecordingRunner {
         result
     }
 
+    /// Delegates to the real runner without recording. `ReplayRunner::exists()`
+    /// always returns `true`, so the recording/replay asymmetry is intentional:
+    /// `exists()` gates capability checks, not provider data.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.inner.exists(cmd, args).await
     }
