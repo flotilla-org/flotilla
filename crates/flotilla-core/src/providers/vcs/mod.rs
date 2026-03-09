@@ -51,13 +51,13 @@ pub trait CheckoutManager: Send + Sync {
     fn abbreviation(&self) -> &str {
         "CO"
     }
-    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<Checkout>, String>;
+    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String>;
     async fn create_checkout(
         &self,
         repo_root: &Path,
         branch: &str,
         create_branch: bool,
-    ) -> Result<Checkout, String>;
+    ) -> Result<(PathBuf, Checkout), String>;
     async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String>;
 }
 

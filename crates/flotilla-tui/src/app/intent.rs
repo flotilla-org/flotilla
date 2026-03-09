@@ -160,7 +160,7 @@ impl Intent {
                     return None;
                 }
                 Some(Command::LinkIssuesToChangeRequest {
-                    change_request_id: cr.id.clone(),
+                    change_request_id: change_request_key.clone(),
                     issue_ids: missing,
                 })
             }
@@ -698,6 +698,12 @@ mod tests {
         async fn remove_repo(&self, _path: &Path) -> Result<(), String> {
             Ok(())
         }
+        async fn replay_since(
+            &self,
+            _last_seen: &std::collections::HashMap<PathBuf, u64>,
+        ) -> Result<Vec<DaemonEvent>, String> {
+            Ok(vec![])
+        }
     }
 
     fn stub_app() -> App {
@@ -1062,7 +1068,6 @@ mod tests {
         providers.change_requests.insert(
             "42".into(),
             ChangeRequest {
-                id: "42".into(),
                 title: "Fix bug".into(),
                 branch: "feat/x".into(),
                 status: ChangeRequestStatus::Open,
@@ -1077,7 +1082,6 @@ mod tests {
             co_path.clone(),
             Checkout {
                 branch: "feat/x".into(),
-                path: co_path.clone(),
                 is_trunk: false,
                 trunk_ahead_behind: None,
                 remote_ahead_behind: None,

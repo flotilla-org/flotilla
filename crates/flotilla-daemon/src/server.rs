@@ -329,6 +329,21 @@ async fn dispatch_request(
             }
         }
 
+        "replay_since" => {
+            let last_seen: std::collections::HashMap<std::path::PathBuf, u64> = params
+                .get("last_seen")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_else(|| {
+                    warn!("replay_since: failed to parse last_seen, returning full snapshots");
+                    std::collections::HashMap::new()
+                });
+            match daemon.replay_since(&last_seen).await {
+                Ok(events) => Message::ok_response(id, &events),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
+
         unknown => Message::error_response(id, format!("unknown method: {unknown}")),
     }
 }

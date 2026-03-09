@@ -49,7 +49,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         "cmux Workspaces"
     }
 
-    async fn list_workspaces(&self) -> Result<Vec<Workspace>, String> {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let output = self.cmux_cmd(&["--json", "list-workspaces"]).await?;
         let parsed: serde_json::Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
         let workspaces = parsed["workspaces"]
@@ -74,17 +74,22 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
                     .map(|d| CorrelationKey::CheckoutPath(d.clone()))
                     .collect();
 
-                Some(Workspace {
+                Some((
                     ws_ref,
-                    name,
-                    directories,
-                    correlation_keys,
-                })
+                    Workspace {
+                        name,
+                        directories,
+                        correlation_keys,
+                    },
+                ))
             })
             .collect())
     }
 
-    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<Workspace, String> {
+    async fn create_workspace(
+        &self,
+        config: &WorkspaceConfig,
+    ) -> Result<(String, Workspace), String> {
         info!("cmux: creating workspace '{}'", config.name);
         // Parse template from YAML if provided, otherwise use default
         let template = if let Some(ref yaml) = config.template_yaml {
@@ -262,12 +267,14 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
             .collect();
 
         info!("cmux: workspace '{}' ready ({ws_ref})", config.name);
-        Ok(Workspace {
+        Ok((
             ws_ref,
-            name: config.name.clone(),
-            directories,
-            correlation_keys,
-        })
+            Workspace {
+                name: config.name.clone(),
+                directories,
+                correlation_keys,
+            },
+        ))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +37,8 @@ async fn socket_roundtrip() {
         let _ = server.run().await;
     });
 
-    // Wait for socket to appear
+    // Wait for socket to appear.
+    // Note: sandboxed environments can introduce extra startup latency here.
     for _ in 0..20 {
         if socket_path.exists() {
             break;
@@ -68,11 +70,34 @@ async fn socket_roundtrip() {
         .await
         .expect("timeout waiting for event")
         .expect("recv");
-    // The refresh should produce a Snapshot event
+    // The refresh should produce a snapshot event (full or delta)
     assert!(
-        matches!(event, DaemonEvent::Snapshot(_)),
-        "expected Snapshot event, got {:?}",
+        matches!(
+            event,
+            DaemonEvent::SnapshotFull(_) | DaemonEvent::SnapshotDelta(_)
+        ),
+        "expected snapshot event, got {:?}",
         event
+    );
+
+    // replay_since with current seq — should return empty (up to date)
+    let snapshot = client.get_state(&repo).await.expect("get_state");
+    let last_seen = HashMap::from([(repo.clone(), snapshot.seq)]);
+    let replay = client.replay_since(&last_seen).await.expect("replay_since");
+    assert!(
+        replay.is_empty(),
+        "should be empty when up to date, got {} events",
+        replay.len()
+    );
+
+    // replay_since with bogus seq — should return full snapshot
+    let last_seen = HashMap::from([(repo.clone(), 999999)]);
+    let replay = client.replay_since(&last_seen).await.expect("replay_since");
+    assert_eq!(replay.len(), 1, "should get one full snapshot");
+    assert!(
+        matches!(&replay[0], DaemonEvent::SnapshotFull(snap) if snap.repo == repo),
+        "expected SnapshotFull, got {:?}",
+        replay[0]
     );
 
     // Clean up

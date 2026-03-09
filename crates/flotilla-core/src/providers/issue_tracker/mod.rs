@@ -16,7 +16,11 @@ pub trait IssueTracker: Send + Sync {
     fn abbreviation(&self) -> &str {
         "#"
     }
-    async fn list_issues(&self, repo_root: &Path, limit: usize) -> Result<Vec<Issue>, String>;
+    async fn list_issues(
+        &self,
+        repo_root: &Path,
+        limit: usize,
+    ) -> Result<Vec<(String, Issue)>, String>;
     async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String>;
 
     async fn list_issues_page(
@@ -46,7 +50,7 @@ pub trait IssueTracker: Send + Sync {
         &self,
         _repo_root: &Path,
         _ids: &[String],
-    ) -> Result<Vec<Issue>, String> {
+    ) -> Result<Vec<(String, Issue)>, String> {
         Ok(vec![])
     }
 
@@ -55,7 +59,7 @@ pub trait IssueTracker: Send + Sync {
         _repo_root: &Path,
         _query: &str,
         _limit: usize,
-    ) -> Result<Vec<Issue>, String> {
+    ) -> Result<Vec<(String, Issue)>, String> {
         Ok(vec![])
     }
 }

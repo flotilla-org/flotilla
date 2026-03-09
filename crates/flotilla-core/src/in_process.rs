@@ -3,7 +3,7 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,15 +11,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, Mutex, RwLock};
-use tracing::info;
+use tracing::{debug, info};
 
-use flotilla_protocol::{AssociationKey, Command, DaemonEvent, Issue, RepoInfo, Snapshot};
+use flotilla_protocol::{
+    AssociationKey, Command, DaemonEvent, DeltaEntry, Issue, ProviderError, RepoInfo, Snapshot,
+};
 
 use flotilla_protocol::ProviderData;
 
 use crate::config::ConfigStore;
 use crate::convert::snapshot_to_proto;
 use crate::daemon::DaemonHandle;
+use crate::delta;
 use crate::executor;
 use crate::issue_cache::IssueCache;
 use crate::model::{provider_names_from_registry, repo_name, RepoModel};
@@ -48,11 +51,14 @@ fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
 fn inject_issues(
     base_providers: &ProviderData,
     cache: &IssueCache,
-    search_results: &Option<Vec<Issue>>,
+    search_results: &Option<Vec<(String, Issue)>>,
 ) -> ProviderData {
     let mut providers = base_providers.clone();
     if let Some(ref results) = search_results {
-        providers.issues = results.iter().map(|i| (i.id.clone(), i.clone())).collect();
+        providers.issues = results
+            .iter()
+            .map(|(id, i)| (id.clone(), i.clone()))
+            .collect();
     } else {
         providers.issues = (*cache.to_index_map()).clone();
     }
@@ -66,7 +72,7 @@ fn build_repo_snapshot(
     base: &RefreshSnapshot,
     health: &HashMap<&'static str, bool>,
     cache: &IssueCache,
-    search_results: &Option<Vec<Issue>>,
+    search_results: &Option<Vec<(String, Issue)>>,
 ) -> Snapshot {
     let providers = Arc::new(inject_issues(&base.providers, cache, search_results));
     let (work_items, correlation_groups) = crate::data::correlate(&providers);
@@ -85,14 +91,126 @@ fn build_repo_snapshot(
     snapshot
 }
 
+/// Choose whether to broadcast a full snapshot or a delta.
+///
+/// Sends a full snapshot when:
+/// - This is the first broadcast (prev_seq == 0)
+/// - The delta has no changes (shouldn't happen, but avoids empty deltas)
+/// - The serialized delta is larger than the serialized full snapshot
+///
+/// Otherwise sends a delta.
+fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
+    // First broadcast or empty delta → always send full
+    if delta.prev_seq == 0 || delta.changes.is_empty() {
+        return DaemonEvent::SnapshotFull(Box::new(snapshot));
+    }
+
+    let snapshot_delta = flotilla_protocol::SnapshotDelta {
+        seq: delta.seq,
+        prev_seq: delta.prev_seq,
+        repo: snapshot.repo.clone(),
+        changes: delta.changes,
+        issue_total: snapshot.issue_total,
+        issue_has_more: snapshot.issue_has_more,
+        issue_search_results: snapshot.issue_search_results.clone(),
+    };
+
+    // Compare serialized sizes — if delta is larger, send full
+    let delta_size = serde_json::to_string(&snapshot_delta).map(|s| s.len());
+    let full_size = serde_json::to_string(&snapshot).map(|s| s.len());
+
+    match (delta_size, full_size) {
+        (Ok(d), Ok(f)) if d < f => {
+            debug!("delta ({d} bytes) smaller than full ({f} bytes), sending delta");
+            DaemonEvent::SnapshotDelta(Box::new(snapshot_delta))
+        }
+        _ => {
+            debug!("sending full snapshot (delta not smaller)");
+            DaemonEvent::SnapshotFull(Box::new(snapshot))
+        }
+    }
+}
+
+/// Maximum number of delta entries retained per repo.
+const DELTA_LOG_CAPACITY: usize = 16;
+
 struct RepoState {
     model: RepoModel,
     seq: u64,
     last_snapshot: Arc<RefreshSnapshot>,
     issue_cache: IssueCache,
-    search_results: Option<Vec<Issue>>,
+    search_results: Option<Vec<(String, Issue)>>,
     /// Serializes issue fetch operations for this repo to prevent concurrent page skips.
     issue_fetch_mutex: Arc<Mutex<()>>,
+    /// Last broadcast provider data (with injected issues), used for delta computation.
+    last_broadcast_providers: ProviderData,
+    /// Last broadcast provider health, used for delta computation.
+    last_broadcast_health: HashMap<String, bool>,
+    /// Last broadcast errors, used for delta computation.
+    last_broadcast_errors: Vec<ProviderError>,
+    /// Bounded delta log for replay on client reconnect.
+    delta_log: VecDeque<DeltaEntry>,
+}
+
+impl RepoState {
+    /// Compute a delta from the last broadcast state to the new state,
+    /// append to the delta log, and update tracking fields.
+    fn record_delta(
+        &mut self,
+        new_providers: &ProviderData,
+        new_health: &HashMap<String, bool>,
+        new_errors: &[ProviderError],
+    ) -> DeltaEntry {
+        let mut changes = delta::diff_provider_data(&self.last_broadcast_providers, new_providers);
+
+        // Diff provider health
+        for (key, &val) in new_health {
+            match self.last_broadcast_health.get(key) {
+                Some(&prev) if prev == val => {}
+                Some(_) => changes.push(flotilla_protocol::Change::ProviderHealth {
+                    provider: key.clone(),
+                    op: flotilla_protocol::EntryOp::Updated(val),
+                }),
+                None => changes.push(flotilla_protocol::Change::ProviderHealth {
+                    provider: key.clone(),
+                    op: flotilla_protocol::EntryOp::Added(val),
+                }),
+            }
+        }
+        for key in self.last_broadcast_health.keys() {
+            if !new_health.contains_key(key) {
+                changes.push(flotilla_protocol::Change::ProviderHealth {
+                    provider: key.clone(),
+                    op: flotilla_protocol::EntryOp::Removed,
+                });
+            }
+        }
+
+        // Diff errors
+        if let Some(error_change) = delta::diff_errors(&self.last_broadcast_errors, new_errors) {
+            changes.push(error_change);
+        }
+
+        let prev_seq = self.seq;
+        let entry = DeltaEntry {
+            seq: self.seq + 1,
+            prev_seq,
+            changes,
+        };
+
+        // Append to bounded log
+        self.delta_log.push_back(entry.clone());
+        if self.delta_log.len() > DELTA_LOG_CAPACITY {
+            self.delta_log.pop_front();
+        }
+
+        // Update tracking state
+        self.last_broadcast_providers = new_providers.clone();
+        self.last_broadcast_health = new_health.clone();
+        self.last_broadcast_errors = new_errors.to_vec();
+
+        entry
+    }
 }
 
 pub struct InProcessDaemon {
@@ -109,7 +227,7 @@ impl InProcessDaemon {
     ///
     /// Returns `Arc<Self>` because a background poll task is spawned that
     /// holds a reference. The poll loop checks every 100ms for new refresh
-    /// snapshots and broadcasts `DaemonEvent::Snapshot` for each change.
+    /// snapshots and broadcasts delta or full events for each change.
     pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
@@ -134,6 +252,10 @@ impl InProcessDaemon {
                     issue_cache: IssueCache::new(),
                     search_results: None,
                     issue_fetch_mutex: Arc::new(Mutex::new(())),
+                    last_broadcast_providers: ProviderData::default(),
+                    last_broadcast_health: HashMap::new(),
+                    last_broadcast_errors: Vec::new(),
+                    delta_log: VecDeque::new(),
                 },
             );
             order.push(path);
@@ -170,7 +292,7 @@ impl InProcessDaemon {
     ///
     /// For each repo whose background refresh has produced a new snapshot,
     /// update internal state, increment the sequence number, and broadcast
-    /// a `DaemonEvent::Snapshot`.
+    /// a `DaemonEvent::SnapshotFull` or `DaemonEvent::SnapshotDelta`.
     ///
     /// Called automatically by the background poll loop spawned in `new()`.
     async fn poll_snapshots(&self) {
@@ -243,10 +365,8 @@ impl InProcessDaemon {
             state.model.data.correlation_groups = re_snapshot.correlation_groups.clone();
             state.model.data.provider_health = snapshot.provider_health.clone();
             state.model.data.loading = false;
-            state.seq += 1;
-            state.last_snapshot = snapshot;
 
-            let mut proto_snapshot = snapshot_to_proto(&path, state.seq, &re_snapshot);
+            let mut proto_snapshot = snapshot_to_proto(&path, state.seq + 1, &re_snapshot);
             proto_snapshot.provider_health = state
                 .model
                 .data
@@ -257,9 +377,26 @@ impl InProcessDaemon {
             proto_snapshot.issue_total = issue_total;
             proto_snapshot.issue_has_more = issue_has_more;
             proto_snapshot.issue_search_results = search_results;
-            let _ = self
-                .event_tx
-                .send(DaemonEvent::Snapshot(Box::new(proto_snapshot)));
+
+            // Compute and log delta before updating seq
+            let delta_entry = state.record_delta(
+                &proto_snapshot.providers,
+                &proto_snapshot.provider_health,
+                &proto_snapshot.errors,
+            );
+            debug!(
+                "repo {}: delta seq {} → {} with {} changes",
+                path.display(),
+                delta_entry.prev_seq,
+                delta_entry.seq,
+                delta_entry.changes.len()
+            );
+
+            state.seq += 1;
+            state.last_snapshot = snapshot;
+
+            let event = choose_event(proto_snapshot, delta_entry);
+            let _ = self.event_tx.send(event);
         }
 
         // After broadcasting, check for linked issues that aren't cached yet
@@ -437,23 +574,30 @@ impl InProcessDaemon {
 
     /// Re-build and broadcast a snapshot for the given repo using current cache state.
     async fn broadcast_snapshot(&self, repo: &Path) {
-        let repos = self.repos.read().await;
-        let Some(state) = repos.get(repo) else {
+        let mut repos = self.repos.write().await;
+        let Some(state) = repos.get_mut(repo) else {
             return;
         };
 
         let proto_snapshot = build_repo_snapshot(
             repo,
-            state.seq,
+            state.seq + 1,
             &state.last_snapshot,
             &state.model.data.provider_health,
             &state.issue_cache,
             &state.search_results,
         );
 
-        let _ = self
-            .event_tx
-            .send(DaemonEvent::Snapshot(Box::new(proto_snapshot)));
+        // Compute and log delta
+        let delta_entry = state.record_delta(
+            &proto_snapshot.providers,
+            &proto_snapshot.provider_health,
+            &proto_snapshot.errors,
+        );
+        state.seq += 1;
+
+        let event = choose_event(proto_snapshot, delta_entry);
+        let _ = self.event_tx.send(event);
     }
 }
 
@@ -555,6 +699,7 @@ impl DaemonHandle for InProcessDaemon {
         // Broadcast started after repo validation (ensures no orphaned CommandStarted)
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
+        let config_base = self.config.base_path().to_path_buf();
         let _ = self.event_tx.send(DaemonEvent::CommandStarted {
             command_id: id,
             repo: repo_path.clone(),
@@ -562,8 +707,15 @@ impl DaemonHandle for InProcessDaemon {
         });
 
         tokio::spawn(async move {
-            let result =
-                executor::execute(command, &repo_path, &registry, &providers_data, &*runner).await;
+            let result = executor::execute(
+                command,
+                &repo_path,
+                &registry,
+                &providers_data,
+                &*runner,
+                &config_base,
+            )
+            .await;
 
             // Trigger a refresh after command execution
             refresh_trigger.notify_one();
@@ -638,6 +790,10 @@ impl DaemonHandle for InProcessDaemon {
                     issue_cache: IssueCache::new(),
                     search_results: None,
                     issue_fetch_mutex: Arc::new(Mutex::new(())),
+                    last_broadcast_providers: ProviderData::default(),
+                    last_broadcast_health: HashMap::new(),
+                    last_broadcast_errors: Vec::new(),
+                    delta_log: VecDeque::new(),
                 },
             );
             order.push(path.clone());
@@ -654,6 +810,73 @@ impl DaemonHandle for InProcessDaemon {
             .send(DaemonEvent::RepoAdded(Box::new(repo_info)));
 
         Ok(())
+    }
+
+    async fn replay_since(
+        &self,
+        last_seen: &HashMap<PathBuf, u64>,
+    ) -> Result<Vec<DaemonEvent>, String> {
+        let repos = self.repos.read().await;
+        let order = self.repo_order.read().await;
+        let mut events = Vec::new();
+
+        for path in order.iter() {
+            let Some(state) = repos.get(path) else {
+                continue;
+            };
+            let snapshot = || {
+                build_repo_snapshot(
+                    path,
+                    state.seq,
+                    &state.last_snapshot,
+                    &state.model.data.provider_health,
+                    &state.issue_cache,
+                    &state.search_results,
+                )
+            };
+
+            match last_seen.get(path) {
+                Some(&client_seq) => {
+                    // Try to find the client's seq in the delta log and replay from there
+                    let replay_start = state
+                        .delta_log
+                        .iter()
+                        .position(|entry| entry.prev_seq == client_seq);
+
+                    if let Some(start_idx) = replay_start {
+                        // Capture issue metadata once — it doesn't change per-entry
+                        let issue_snapshot = snapshot();
+                        // Replay delta entries
+                        for entry in state.delta_log.iter().skip(start_idx) {
+                            events.push(DaemonEvent::SnapshotDelta(Box::new(
+                                flotilla_protocol::SnapshotDelta {
+                                    seq: entry.seq,
+                                    prev_seq: entry.prev_seq,
+                                    repo: path.clone(),
+                                    changes: entry.changes.clone(),
+                                    issue_total: issue_snapshot.issue_total,
+                                    issue_has_more: issue_snapshot.issue_has_more,
+                                    issue_search_results: issue_snapshot
+                                        .issue_search_results
+                                        .clone(),
+                                },
+                            )));
+                        }
+                    } else if client_seq == state.seq {
+                        // Client is up to date — no replay needed
+                    } else {
+                        // Seq not in delta log — send full snapshot
+                        events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
+                    }
+                }
+                None => {
+                    // Client has never seen this repo — send full snapshot
+                    events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
+                }
+            }
+        }
+
+        Ok(events)
     }
 
     async fn remove_repo(&self, path: &Path) -> Result<(), String> {

@@ -110,7 +110,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         "tmux Workspaces"
     }
 
-    async fn list_workspaces(&self) -> Result<Vec<Workspace>, String> {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let output = self
             .tmux_cmd(&["list-windows", "-F", "#{window_name}"])
             .await?;
@@ -148,19 +148,24 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
                     directories.push(path);
                 }
 
-                Workspace {
-                    ws_ref: name.to_string(),
-                    name: name.to_string(),
-                    directories,
-                    correlation_keys,
-                }
+                (
+                    name.to_string(),
+                    Workspace {
+                        name: name.to_string(),
+                        directories,
+                        correlation_keys,
+                    },
+                )
             })
             .collect();
 
         Ok(workspaces)
     }
 
-    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<Workspace, String> {
+    async fn create_workspace(
+        &self,
+        config: &WorkspaceConfig,
+    ) -> Result<(String, Workspace), String> {
         info!("tmux: creating workspace '{}'", config.name);
 
         let template = if let Some(ref yaml) = config.template_yaml {
@@ -286,12 +291,14 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
             .collect();
 
         info!("tmux: workspace '{}' ready", config.name);
-        Ok(Workspace {
-            ws_ref: config.name.clone(),
-            name: config.name.clone(),
-            directories,
-            correlation_keys,
-        })
+        Ok((
+            config.name.clone(),
+            Workspace {
+                name: config.name.clone(),
+                directories,
+                correlation_keys,
+            },
+        ))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {

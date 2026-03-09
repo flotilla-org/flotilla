@@ -18,7 +18,7 @@ pub trait CodingAgent: Send + Sync {
     async fn list_sessions(
         &self,
         criteria: &RepoCriteria,
-    ) -> Result<Vec<CloudAgentSession>, String>;
+    ) -> Result<Vec<(String, CloudAgentSession)>, String>;
     async fn archive_session(&self, session_id: &str) -> Result<(), String>;
     #[allow(dead_code)]
     async fn attach_command(&self, session_id: &str) -> Result<String, String>;

@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -30,4 +31,16 @@ pub trait DaemonHandle: Send + Sync {
 
     /// Remove a repo from tracking.
     async fn remove_repo(&self, path: &Path) -> Result<(), String>;
+
+    /// Get replay events for repos based on last-seen sequence numbers.
+    ///
+    /// For each repo in `last_seen`, checks the delta log:
+    /// - If replayable: returns `SnapshotDelta` events for each missing entry
+    /// - If not replayable (seq too old or unknown): returns `SnapshotFull`
+    ///
+    /// Repos not in `last_seen` get a `SnapshotFull`.
+    async fn replay_since(
+        &self,
+        last_seen: &HashMap<PathBuf, u64>,
+    ) -> Result<Vec<DaemonEvent>, String>;
 }

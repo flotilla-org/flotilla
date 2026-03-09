@@ -30,7 +30,7 @@ impl GitHubIssueTracker {
     }
 }
 
-fn parse_issue(provider_name: &str, v: &serde_json::Value) -> Option<Issue> {
+fn parse_issue(provider_name: &str, v: &serde_json::Value) -> Option<(String, Issue)> {
     let number = v["number"].as_i64()?;
     let title = v["title"].as_str()?.to_string();
     let labels: Vec<String> = v["labels"]
@@ -46,12 +46,14 @@ fn parse_issue(provider_name: &str, v: &serde_json::Value) -> Option<Issue> {
         provider_name.to_string(),
         id.clone(),
     )];
-    Some(Issue {
+    Some((
         id,
-        title,
-        labels,
-        association_keys,
-    })
+        Issue {
+            title,
+            labels,
+            association_keys,
+        },
+    ))
 }
 
 #[async_trait]
@@ -60,7 +62,11 @@ impl super::IssueTracker for GitHubIssueTracker {
         "GitHub Issues"
     }
 
-    async fn list_issues(&self, repo_root: &Path, limit: usize) -> Result<Vec<Issue>, String> {
+    async fn list_issues(
+        &self,
+        repo_root: &Path,
+        limit: usize,
+    ) -> Result<Vec<(String, Issue)>, String> {
         let page = self.list_issues_page(repo_root, 1, limit).await?;
         Ok(page.issues)
     }
@@ -80,7 +86,7 @@ impl super::IssueTracker for GitHubIssueTracker {
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
 
-        let issues: Vec<Issue> = items
+        let issues: Vec<(String, Issue)> = items
             .into_iter()
             .filter(|v| {
                 !v.as_object()
@@ -101,7 +107,7 @@ impl super::IssueTracker for GitHubIssueTracker {
         &self,
         repo_root: &Path,
         ids: &[String],
-    ) -> Result<Vec<Issue>, String> {
+    ) -> Result<Vec<(String, Issue)>, String> {
         let futs: Vec<_> = ids
             .iter()
             .map(|id| {
@@ -135,7 +141,7 @@ impl super::IssueTracker for GitHubIssueTracker {
         repo_root: &Path,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<Issue>, String> {
+    ) -> Result<Vec<(String, Issue)>, String> {
         let per_page = clamp_per_page(limit);
         let raw_query = format!("repo:{} is:issue is:open {}", self.repo_slug, query);
         let encoded_query = urlencoding::encode(&raw_query);

@@ -281,14 +281,29 @@ refactor: extract id key from ChangeRequest value type
 
 ### Task 4: Extract `id` from Issue
 
+**Larger scope than Tasks 2-3** because PR #113 added `IssueCache`, `IssuePage`, and new `IssueTracker` methods that all use `issue.id`.
+
 **Files:**
-- Modify: `crates/flotilla-protocol/src/provider_data.rs` — remove `id` field
+- Modify: `crates/flotilla-protocol/src/provider_data.rs` — remove `id` field from `Issue`
+- Modify: `crates/flotilla-protocol/src/provider_data.rs` — `IssuePage.issues` becomes `Vec<(String, Issue)>` or `IndexMap<String, Issue>`
 - Modify: `crates/flotilla-core/src/refresh.rs:227` — adjust map construction
 - Modify: `crates/flotilla-core/src/executor.rs:228` — use map key
 - Modify: `crates/flotilla-tui/src/ui.rs:419,566` — use map key
-- Modify: provider trait `IssueTracker::list_issues` and `github.rs` impl
+- Modify: `crates/flotilla-core/src/issue_cache.rs` — `merge_page`, `add_pinned` need IDs from tuple/key not `issue.id`
+- Modify: `crates/flotilla-core/src/in_process.rs` — `inject_issues` uses `i.id.clone()` to key the IndexMap; `collect_linked_issue_ids` unaffected (uses AssociationKey)
+- Modify: provider trait `IssueTracker` — `list_issues`, `list_issues_page`, `fetch_issues_by_id`, `search_issues` return types
+- Modify: `crates/flotilla-core/src/providers/issue_tracker/github.rs` — impl changes
 
-Same pattern. `IssueTracker::list_issues` returns `Vec<(String, Issue)>`. Places that use `issue.id` switch to the map key, which is already available as `issue_key` or `k` in the lookup context.
+**Key changes beyond the standard pattern:**
+
+1. `IssueTracker::list_issues` → `Vec<(String, Issue)>`
+2. `IssueTracker::list_issues_page` → `IssuePage` with `issues: Vec<(String, Issue)>` (or change `IssuePage.issues` to `IndexMap<String, Issue>`)
+3. `IssueTracker::fetch_issues_by_id` → `Vec<(String, Issue)>`
+4. `IssueTracker::search_issues` → `Vec<(String, Issue)>`
+5. `IssueCache::merge_page` — insert using tuple key instead of `issue.id.clone()`
+6. `IssueCache::add_pinned` — takes `Vec<(String, Issue)>` instead of `Vec<Issue>`
+7. `inject_issues` — search results stored as `Vec<(String, Issue)>` or keyed; map construction uses tuple key
+8. `Snapshot.issue_search_results: Option<Vec<Issue>>` → `Option<Vec<(String, Issue)>>` or `Option<IndexMap<String, Issue>>`
 
 **Run tests, commit:**
 
@@ -604,6 +619,8 @@ feat: apply provider data deltas to materialized state
 ### Task 13: Add DeltaEntry and delta log to RepoState
 
 Add `VecDeque<DeltaEntry>` to `RepoState` in `crates/flotilla-core/src/in_process.rs`. Compute deltas in `poll_snapshots` alongside current full snapshot broadcast (emit both for now).
+
+**Note (PR #113 impact):** `poll_snapshots` now has a multi-phase structure: collect changes under write lock, correlate outside lock, apply and broadcast under write lock, then `fetch_missing_linked_issues`. Issue data comes from `IssueCache` via `inject_issues`, not directly from provider refresh. Deltas should diff the injected (cache-merged) providers, not the raw refresh providers. Issue-specific commands (`SetIssueViewport`, `FetchMoreIssues`, `SearchIssues`, `ClearIssueSearch`) also trigger `broadcast_snapshot` — these paths need delta computation too. `issue_total`, `issue_has_more`, `issue_search_results` are snapshot metadata, not part of the delta log.
 
 ### Task 14: Switch broadcast to SnapshotDelta
 

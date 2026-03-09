@@ -178,7 +178,6 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|co| (co.path.clone(), co))
         .collect();
     pd.change_requests = crs
         .unwrap_or_else(|e| {
@@ -189,7 +188,6 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|cr| (cr.id.clone(), cr))
         .collect();
     pd.workspaces = workspaces
         .unwrap_or_else(|e| {
@@ -200,7 +198,6 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|ws| (ws.ws_ref.clone(), ws))
         .collect();
     pd.sessions = sessions
         .unwrap_or_else(|e| {
@@ -211,22 +208,40 @@ async fn refresh_providers(
             Vec::new()
         })
         .into_iter()
-        .map(|s| (s.id.clone(), s))
         .collect();
-    pd.remote_branches = branches.unwrap_or_else(|e| {
-        errors.push(RefreshError {
-            category: "branches",
-            message: e,
+    {
+        use flotilla_protocol::delta::{Branch, BranchStatus};
+        let remote = branches.unwrap_or_else(|e| {
+            errors.push(RefreshError {
+                category: "branches",
+                message: e,
+            });
+            Vec::new()
         });
-        Vec::new()
-    });
-    pd.merged_branches = merged.unwrap_or_else(|e| {
-        errors.push(RefreshError {
-            category: "merged",
-            message: e,
+        let merged_names = merged.unwrap_or_else(|e| {
+            errors.push(RefreshError {
+                category: "merged",
+                message: e,
+            });
+            Vec::new()
         });
-        Vec::new()
-    });
+        for name in remote {
+            pd.branches.insert(
+                name,
+                Branch {
+                    status: BranchStatus::Remote,
+                },
+            );
+        }
+        for name in merged_names {
+            pd.branches.insert(
+                name,
+                Branch {
+                    status: BranchStatus::Merged,
+                },
+            );
+        }
+    }
 
     errors
 }
@@ -251,4 +266,579 @@ fn compute_provider_health(
         );
     }
     health
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::providers::code_review::CodeReview;
+    use crate::providers::coding_agent::CodingAgent;
+    use crate::providers::types::*;
+    use crate::providers::vcs::{CheckoutManager, Vcs};
+    use crate::providers::workspace::WorkspaceManager;
+
+    struct MockCheckoutManager {
+        result: Result<Vec<(PathBuf, Checkout)>, String>,
+    }
+
+    impl MockCheckoutManager {
+        fn ok(checkouts: Vec<(PathBuf, Checkout)>) -> Self {
+            Self {
+                result: Ok(checkouts),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            Self {
+                result: Err(msg.to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CheckoutManager for MockCheckoutManager {
+        fn display_name(&self) -> &str {
+            "mock-checkout"
+        }
+
+        async fn list_checkouts(
+            &self,
+            _repo_root: &Path,
+        ) -> Result<Vec<(PathBuf, Checkout)>, String> {
+            self.result.clone()
+        }
+
+        async fn create_checkout(
+            &self,
+            _repo_root: &Path,
+            _branch: &str,
+            _create_branch: bool,
+        ) -> Result<(PathBuf, Checkout), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn remove_checkout(&self, _repo_root: &Path, _branch: &str) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+    }
+
+    struct MockCodeReview {
+        change_requests_result: Result<Vec<(String, ChangeRequest)>, String>,
+        merged_result: Result<Vec<String>, String>,
+    }
+
+    impl MockCodeReview {
+        fn ok(change_requests: Vec<(String, ChangeRequest)>, merged_branches: Vec<String>) -> Self {
+            Self {
+                change_requests_result: Ok(change_requests),
+                merged_result: Ok(merged_branches),
+            }
+        }
+
+        fn failing(change_requests_msg: &str, merged_msg: &str) -> Self {
+            Self {
+                change_requests_result: Err(change_requests_msg.to_string()),
+                merged_result: Err(merged_msg.to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CodeReview for MockCodeReview {
+        fn display_name(&self) -> &str {
+            "mock-cr"
+        }
+
+        async fn list_change_requests(
+            &self,
+            _repo_root: &Path,
+            _limit: usize,
+        ) -> Result<Vec<(String, ChangeRequest)>, String> {
+            self.change_requests_result.clone()
+        }
+
+        async fn get_change_request(
+            &self,
+            _repo_root: &Path,
+            _id: &str,
+        ) -> Result<(String, ChangeRequest), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn list_merged_branch_names(
+            &self,
+            _repo_root: &Path,
+            _limit: usize,
+        ) -> Result<Vec<String>, String> {
+            self.merged_result.clone()
+        }
+    }
+
+    struct MockCodingAgent {
+        result: Result<Vec<(String, CloudAgentSession)>, String>,
+    }
+
+    impl MockCodingAgent {
+        fn ok(sessions: Vec<(String, CloudAgentSession)>) -> Self {
+            Self {
+                result: Ok(sessions),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            Self {
+                result: Err(msg.to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CodingAgent for MockCodingAgent {
+        fn display_name(&self) -> &str {
+            "mock-agent"
+        }
+
+        async fn list_sessions(
+            &self,
+            _criteria: &RepoCriteria,
+        ) -> Result<Vec<(String, CloudAgentSession)>, String> {
+            self.result.clone()
+        }
+
+        async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn attach_command(&self, _session_id: &str) -> Result<String, String> {
+            Ok("mock --attach".to_string())
+        }
+    }
+
+    struct MockVcs {
+        result: Result<Vec<String>, String>,
+    }
+
+    impl MockVcs {
+        fn ok(branches: Vec<String>) -> Self {
+            Self {
+                result: Ok(branches),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            Self {
+                result: Err(msg.to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Vcs for MockVcs {
+        fn display_name(&self) -> &str {
+            "mock-vcs"
+        }
+
+        fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
+            None
+        }
+
+        async fn list_local_branches(&self, _repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
+            Ok(vec![])
+        }
+
+        async fn list_remote_branches(&self, _repo_root: &Path) -> Result<Vec<String>, String> {
+            self.result.clone()
+        }
+
+        async fn commit_log(
+            &self,
+            _repo_root: &Path,
+            _branch: &str,
+            _limit: usize,
+        ) -> Result<Vec<CommitInfo>, String> {
+            Ok(vec![])
+        }
+
+        async fn ahead_behind(
+            &self,
+            _repo_root: &Path,
+            _branch: &str,
+            _reference: &str,
+        ) -> Result<AheadBehind, String> {
+            Ok(AheadBehind {
+                ahead: 0,
+                behind: 0,
+            })
+        }
+
+        async fn working_tree_status(
+            &self,
+            _repo_root: &Path,
+            _checkout_path: &Path,
+        ) -> Result<WorkingTreeStatus, String> {
+            Ok(WorkingTreeStatus::default())
+        }
+    }
+
+    struct MockWorkspaceManager {
+        result: Result<Vec<(String, Workspace)>, String>,
+    }
+
+    impl MockWorkspaceManager {
+        fn ok(workspaces: Vec<(String, Workspace)>) -> Self {
+            Self {
+                result: Ok(workspaces),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            Self {
+                result: Err(msg.to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceManager for MockWorkspaceManager {
+        fn display_name(&self) -> &str {
+            "mock-ws"
+        }
+
+        async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+            self.result.clone()
+        }
+
+        async fn create_workspace(
+            &self,
+            _config: &WorkspaceConfig,
+        ) -> Result<(String, Workspace), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from("/tmp/test-repo")
+    }
+
+    fn criteria() -> RepoCriteria {
+        RepoCriteria::default()
+    }
+
+    fn make_checkout(branch: &str) -> Checkout {
+        Checkout {
+            branch: branch.to_string(),
+            is_trunk: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
+            association_keys: vec![],
+        }
+    }
+
+    fn make_change_request(title: &str, branch: &str) -> ChangeRequest {
+        ChangeRequest {
+            title: title.to_string(),
+            branch: branch.to_string(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
+            association_keys: vec![],
+        }
+    }
+
+    fn make_session(title: &str, session_id: &str) -> CloudAgentSession {
+        CloudAgentSession {
+            title: title.to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: None,
+            correlation_keys: vec![CorrelationKey::SessionRef(
+                "mock".to_string(),
+                session_id.to_string(),
+            )],
+        }
+    }
+
+    fn make_workspace(name: &str) -> Workspace {
+        Workspace {
+            name: name.to_string(),
+            directories: vec![],
+            correlation_keys: vec![],
+        }
+    }
+
+    fn refresh_error(category: &'static str) -> RefreshError {
+        RefreshError {
+            category,
+            message: format!("{category} failure"),
+        }
+    }
+
+    async fn wait_for_snapshot(
+        rx: &mut tokio::sync::watch::Receiver<Arc<RefreshSnapshot>>,
+    ) -> Arc<RefreshSnapshot> {
+        tokio::time::timeout(Duration::from_secs(2), rx.changed())
+            .await
+            .expect("timed out waiting for snapshot")
+            .expect("snapshot channel closed");
+        rx.borrow().clone()
+    }
+
+    #[test]
+    fn refresh_snapshot_default_is_empty() {
+        let snap = RefreshSnapshot::default();
+        assert!(snap.work_items.is_empty());
+        assert!(snap.correlation_groups.is_empty());
+        assert!(snap.errors.is_empty());
+        assert!(snap.provider_health.is_empty());
+        assert!(snap.providers.checkouts.is_empty());
+        assert!(snap.providers.change_requests.is_empty());
+        assert!(snap.providers.sessions.is_empty());
+        assert!(snap.providers.branches.is_empty());
+        assert!(snap.providers.workspaces.is_empty());
+    }
+
+    #[test]
+    fn compute_provider_health_empty_registry_returns_empty() {
+        let health = compute_provider_health(&ProviderRegistry::new(), &[]);
+        assert!(health.is_empty());
+    }
+
+    #[test]
+    fn compute_provider_health_maps_error_categories() {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .coding_agents
+            .insert("claude".to_string(), Arc::new(MockCodingAgent::ok(vec![])));
+        registry.code_review.insert(
+            "github".to_string(),
+            Arc::new(MockCodeReview::ok(vec![], vec![])),
+        );
+
+        let cases = vec![
+            (vec![], true, true),
+            (vec![refresh_error("sessions")], false, true),
+            (vec![refresh_error("PRs")], true, false),
+            (vec![refresh_error("merged")], true, false),
+            (vec![refresh_error("checkouts")], true, true),
+            (
+                vec![refresh_error("sessions"), refresh_error("PRs")],
+                false,
+                false,
+            ),
+        ];
+
+        for (errors, expected_coding, expected_review) in cases {
+            let health = compute_provider_health(&registry, &errors);
+            assert_eq!(health.get("coding_agent"), Some(&expected_coding));
+            assert_eq!(health.get("code_review"), Some(&expected_review));
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_empty_registry_produces_empty_data() {
+        let mut pd = ProviderData::default();
+        let errors =
+            refresh_providers(&mut pd, &repo_root(), &ProviderRegistry::new(), &criteria()).await;
+
+        assert!(errors.is_empty());
+        assert!(pd.checkouts.is_empty());
+        assert!(pd.change_requests.is_empty());
+        assert!(pd.sessions.is_empty());
+        assert!(pd.branches.is_empty());
+        assert!(pd.workspaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_populates_all_provider_data_and_merged_wins_branch_conflict() {
+        use flotilla_protocol::delta::BranchStatus;
+
+        let mut registry = ProviderRegistry::new();
+        registry.checkout_managers.insert(
+            "wt".to_string(),
+            Arc::new(MockCheckoutManager::ok(vec![(
+                PathBuf::from("/tmp/wt/feat-a"),
+                make_checkout("feat-a"),
+            )])),
+        );
+        registry.code_review.insert(
+            "github".to_string(),
+            Arc::new(MockCodeReview::ok(
+                vec![(
+                    "42".to_string(),
+                    make_change_request("Add feature", "feat-a"),
+                )],
+                vec!["shared".to_string()],
+            )),
+        );
+        registry.coding_agents.insert(
+            "claude".to_string(),
+            Arc::new(MockCodingAgent::ok(vec![(
+                "sess-1".to_string(),
+                make_session("Debug", "sess-1"),
+            )])),
+        );
+        registry.vcs.insert(
+            "git".to_string(),
+            Arc::new(MockVcs::ok(vec![
+                "remote-only".to_string(),
+                "shared".to_string(),
+            ])),
+        );
+        registry.workspace_manager = Some((
+            "cmux".to_string(),
+            Arc::new(MockWorkspaceManager::ok(vec![(
+                "ws-1".to_string(),
+                make_workspace("dev"),
+            )])),
+        ));
+
+        let mut pd = ProviderData::default();
+        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
+
+        assert!(errors.is_empty());
+        assert_eq!(pd.checkouts.len(), 1);
+        assert_eq!(pd.change_requests.len(), 1);
+        assert_eq!(pd.sessions.len(), 1);
+        assert_eq!(pd.workspaces.len(), 1);
+        assert_eq!(pd.branches.len(), 2);
+        assert_eq!(
+            pd.branches.get("remote-only").unwrap().status,
+            BranchStatus::Remote
+        );
+        assert_eq!(
+            pd.branches.get("shared").unwrap().status,
+            BranchStatus::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_checkout_errors() {
+        let mut registry = ProviderRegistry::new();
+        registry.checkout_managers.insert(
+            "wt".to_string(),
+            Arc::new(MockCheckoutManager::failing("checkout failed")),
+        );
+
+        let mut pd = ProviderData::default();
+        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
+
+        assert!(errors.iter().any(|e| e.category == "checkouts"));
+        assert!(pd.checkouts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_collects_multiple_errors_and_preserves_successful_providers() {
+        let mut registry = ProviderRegistry::new();
+        registry.checkout_managers.insert(
+            "wt".to_string(),
+            Arc::new(MockCheckoutManager::ok(vec![(
+                PathBuf::from("/tmp/wt/feat-a"),
+                make_checkout("feat-a"),
+            )])),
+        );
+        registry.code_review.insert(
+            "github".to_string(),
+            Arc::new(MockCodeReview::failing("pr fail", "merged fail")),
+        );
+        registry.coding_agents.insert(
+            "claude".to_string(),
+            Arc::new(MockCodingAgent::failing("sessions fail")),
+        );
+        registry.vcs.insert(
+            "git".to_string(),
+            Arc::new(MockVcs::failing("branches fail")),
+        );
+        registry.workspace_manager = Some((
+            "cmux".to_string(),
+            Arc::new(MockWorkspaceManager::failing("workspaces fail")),
+        ));
+
+        let mut pd = ProviderData::default();
+        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
+
+        let categories: HashSet<&str> = errors.iter().map(|e| e.category).collect();
+        for expected in ["PRs", "merged", "sessions", "branches", "workspaces"] {
+            assert!(
+                categories.contains(expected),
+                "missing error category: {expected}"
+            );
+        }
+
+        assert_eq!(pd.checkouts.len(), 1);
+        assert!(pd.change_requests.is_empty());
+        assert!(pd.sessions.is_empty());
+        assert!(pd.branches.is_empty());
+        assert!(pd.workspaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_produces_initial_snapshot() {
+        let handle = RepoRefreshHandle::spawn(
+            repo_root(),
+            Arc::new(ProviderRegistry::new()),
+            criteria(),
+            Duration::from_secs(3600),
+        );
+
+        let mut rx = handle.snapshot_rx.clone();
+        let snapshot = wait_for_snapshot(&mut rx).await;
+        assert!(snapshot.errors.is_empty());
+        assert!(snapshot.work_items.is_empty());
+        assert!(snapshot.provider_health.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_failing_provider_sets_error_and_unhealthy_health() {
+        let mut registry = ProviderRegistry::new();
+        registry.coding_agents.insert(
+            "claude".to_string(),
+            Arc::new(MockCodingAgent::failing("agent offline")),
+        );
+
+        let handle = RepoRefreshHandle::spawn(
+            repo_root(),
+            Arc::new(registry),
+            criteria(),
+            Duration::from_secs(3600),
+        );
+
+        let mut rx = handle.snapshot_rx.clone();
+        let snapshot = wait_for_snapshot(&mut rx).await;
+        assert!(snapshot.errors.iter().any(|e| e.category == "sessions"));
+        assert_eq!(snapshot.provider_health.get("coding_agent"), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn trigger_refresh_produces_another_snapshot() {
+        let handle = RepoRefreshHandle::spawn(
+            repo_root(),
+            Arc::new(ProviderRegistry::new()),
+            criteria(),
+            Duration::from_secs(3600),
+        );
+
+        let mut rx = handle.snapshot_rx.clone();
+        wait_for_snapshot(&mut rx).await;
+
+        handle.trigger_refresh();
+        let snapshot = wait_for_snapshot(&mut rx).await;
+        assert!(snapshot.errors.is_empty());
+    }
 }
