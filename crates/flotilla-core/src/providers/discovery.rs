@@ -180,7 +180,11 @@ pub async fn detect_providers(
 
     // 4. Coding agents: Cursor (gate on CURSOR_API_KEY to avoid false positives
     //    from unrelated binaries also named `agent`)
-    if std::env::var("CURSOR_API_KEY").is_ok() && runner.exists("agent", &["--version"]).await {
+    if std::env::var("CURSOR_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        && runner.exists("agent", &["--version"]).await
+    {
         registry.coding_agents.insert(
             "cursor".to_string(),
             Arc::new(CursorCodingAgent::new("cursor".to_string())),

@@ -216,6 +216,7 @@ impl super::CodingAgent for CursorCodingAgent {
                         title,
                         status: a.session_status(),
                         model: None,
+                        // Cursor API has no updatedAt; createdAt is the best proxy.
                         updated_at: if a.created_at.is_empty() {
                             None
                         } else {
