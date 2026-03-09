@@ -1,8 +1,8 @@
-mod test_fixtures;
+mod support;
 
 use flotilla_protocol::{ProviderData, SessionStatus};
 use flotilla_tui::app::{Intent, ProviderStatus, UiMode};
-use test_fixtures::*;
+use support::*;
 
 #[test]
 fn empty_state() {
