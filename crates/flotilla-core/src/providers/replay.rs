@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+
+use super::{CommandOutput, CommandRunner};
+
 /// A single recorded interaction with an external system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "channel")]
@@ -184,6 +188,11 @@ impl ReplaySession {
         }
     }
 
+    /// Create a `ReplayRunner` that replays command interactions from this session.
+    pub fn command_runner(&self) -> ReplayRunner {
+        ReplayRunner::new(self.clone())
+    }
+
     /// Check that all interactions were consumed.
     pub fn assert_complete(&self) {
         let inner = self.inner.lock().unwrap();
@@ -194,6 +203,85 @@ impl ReplaySession {
                 "ReplaySession: {remaining} unconsumed interactions remaining"
             );
         }
+    }
+}
+
+/// A `CommandRunner` that replays canned responses from a `ReplaySession`.
+pub struct ReplayRunner {
+    session: ReplaySession,
+}
+
+impl ReplayRunner {
+    pub fn new(session: ReplaySession) -> Self {
+        Self { session }
+    }
+}
+
+#[async_trait]
+impl CommandRunner for ReplayRunner {
+    async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path) -> Result<String, String> {
+        let interaction = self.session.next("command");
+        let Interaction::Command {
+            cmd: expected_cmd,
+            args: expected_args,
+            stdout,
+            stderr,
+            exit_code,
+            ..
+        } = interaction
+        else {
+            panic!("ReplayRunner: expected command interaction");
+        };
+
+        assert_eq!(cmd, expected_cmd, "ReplayRunner: command mismatch");
+        let actual_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            actual_args, expected_args,
+            "ReplayRunner: args mismatch for '{cmd}'"
+        );
+
+        if exit_code == 0 {
+            Ok(stdout.unwrap_or_default())
+        } else {
+            Err(stderr.unwrap_or_default())
+        }
+    }
+
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        _cwd: &Path,
+    ) -> Result<CommandOutput, String> {
+        let interaction = self.session.next("command");
+        let Interaction::Command {
+            cmd: expected_cmd,
+            args: expected_args,
+            stdout,
+            stderr,
+            exit_code,
+            ..
+        } = interaction
+        else {
+            panic!("ReplayRunner: expected command interaction");
+        };
+
+        assert_eq!(cmd, expected_cmd, "ReplayRunner: command mismatch");
+        let actual_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            actual_args, expected_args,
+            "ReplayRunner: args mismatch for '{cmd}'"
+        );
+
+        Ok(CommandOutput {
+            stdout: stdout.unwrap_or_default(),
+            stderr: stderr.unwrap_or_default(),
+            success: exit_code == 0,
+        })
+    }
+
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        true
     }
 }
 
@@ -310,6 +398,41 @@ mod tests {
         let yaml = serde_yml::to_string(&log).unwrap();
         let parsed: InteractionLog = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(parsed.interactions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replay_runner_with_git_vcs() {
+        let yaml = r#"
+interactions:
+  - channel: command
+    cmd: git
+    args: ["branch", "--list", "--format=%(refname:short)"]
+    cwd: "{repo}"
+    stdout: "main\nfeature/foo\n"
+    exit_code: 0
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.yaml");
+        std::fs::write(&path, yaml).unwrap();
+
+        let mut masks = Masks::new();
+        masks.add("/test/repo", "{repo}");
+        let session = ReplaySession::from_file(&path, masks);
+        let runner = Arc::new(session.command_runner());
+
+        use crate::providers::vcs::git::GitVcs;
+        use crate::providers::vcs::Vcs;
+        let git = GitVcs::new(runner);
+        let branches = git
+            .list_local_branches(Path::new("/test/repo"))
+            .await
+            .unwrap();
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert!(branches[0].is_trunk);
+        assert_eq!(branches[1].name, "feature/foo");
+        assert!(!branches[1].is_trunk);
     }
 
     #[test]
