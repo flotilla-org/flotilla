@@ -94,3 +94,93 @@ fn build_v1_from_resolved(
 
     WorkspaceTemplate { panes }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::template::{ContentEntry, LayoutSlot, WorkspaceTemplateV2};
+
+    #[test]
+    fn build_v1_from_resolved_maps_layout_to_panes() {
+        let v2 = WorkspaceTemplateV2 {
+            content: vec![
+                ContentEntry {
+                    role: "shell".into(),
+                    content_type: "terminal".into(),
+                    command: "bash".into(),
+                    count: None,
+                },
+                ContentEntry {
+                    role: "agent".into(),
+                    content_type: "terminal".into(),
+                    command: "claude".into(),
+                    count: Some(2),
+                },
+            ],
+            layout: vec![
+                LayoutSlot {
+                    slot: "shell".into(),
+                    split: None,
+                    parent: None,
+                    overflow: None,
+                    gap: None,
+                    focus: true,
+                },
+                LayoutSlot {
+                    slot: "agent".into(),
+                    split: Some("right".into()),
+                    parent: None,
+                    overflow: Some("tab".into()),
+                    gap: None,
+                    focus: false,
+                },
+            ],
+        };
+        let resolved = vec![
+            ("shell".into(), "shpool attach flotilla/feat/shell/0".into()),
+            ("agent".into(), "shpool attach flotilla/feat/agent/0".into()),
+            ("agent".into(), "shpool attach flotilla/feat/agent/1".into()),
+        ];
+
+        let template = build_v1_from_resolved(&v2, &resolved);
+        assert_eq!(template.panes.len(), 2);
+
+        // First pane: shell slot
+        assert_eq!(template.panes[0].name, "shell");
+        assert!(template.panes[0].split.is_none());
+        assert!(template.panes[0].focus);
+        assert_eq!(template.panes[0].surfaces.len(), 1);
+        assert!(template.panes[0].surfaces[0].command.contains("shell/0"));
+
+        // Second pane: agent slot with 2 surfaces (overflow as tabs)
+        assert_eq!(template.panes[1].name, "agent");
+        assert_eq!(template.panes[1].split.as_deref(), Some("right"));
+        assert!(!template.panes[1].focus);
+        assert_eq!(template.panes[1].surfaces.len(), 2);
+        assert!(template.panes[1].surfaces[0].command.contains("agent/0"));
+        assert!(template.panes[1].surfaces[1].command.contains("agent/1"));
+    }
+
+    #[test]
+    fn build_v1_from_resolved_handles_gap() {
+        // Layout slot with no matching resolved commands
+        let v2 = WorkspaceTemplateV2 {
+            content: vec![],
+            layout: vec![LayoutSlot {
+                slot: "missing".into(),
+                split: None,
+                parent: None,
+                overflow: None,
+                gap: None,
+                focus: false,
+            }],
+        };
+        let resolved: Vec<(String, String)> = vec![];
+
+        let template = build_v1_from_resolved(&v2, &resolved);
+        assert_eq!(template.panes.len(), 1);
+        // Gap: should have a single surface with empty command
+        assert_eq!(template.panes[0].surfaces.len(), 1);
+        assert!(template.panes[0].surfaces[0].command.is_empty());
+    }
+}
