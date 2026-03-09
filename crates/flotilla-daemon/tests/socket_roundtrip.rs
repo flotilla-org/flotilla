@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,6 +77,26 @@ async fn socket_roundtrip() {
         ),
         "expected snapshot event, got {:?}",
         event
+    );
+
+    // replay_since with current seq — should return empty (up to date)
+    let snapshot = client.get_state(&repo).await.expect("get_state");
+    let last_seen = HashMap::from([(repo.clone(), snapshot.seq)]);
+    let replay = client.replay_since(&last_seen).await.expect("replay_since");
+    assert!(
+        replay.is_empty(),
+        "should be empty when up to date, got {} events",
+        replay.len()
+    );
+
+    // replay_since with bogus seq — should return full snapshot
+    let last_seen = HashMap::from([(repo.clone(), 999999)]);
+    let replay = client.replay_since(&last_seen).await.expect("replay_since");
+    assert_eq!(replay.len(), 1, "should get one full snapshot");
+    assert!(
+        matches!(&replay[0], DaemonEvent::SnapshotFull(snap) if snap.repo == repo),
+        "expected SnapshotFull, got {:?}",
+        replay[0]
     );
 
     // Clean up

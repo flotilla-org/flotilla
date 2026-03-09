@@ -139,14 +139,18 @@ async fn run_tui(cli: Cli) -> Result<()> {
     show_splash(&mut terminal).await?;
     let daemon = daemon_task.await.expect("daemon init panicked");
 
-    // Subscribe and trigger a refresh for each repo so we get data immediately
-    // (the daemon's first refresh may have already been broadcast during the splash).
     let daemon_rx = daemon.subscribe();
     let repos_info = daemon.list_repos().await.unwrap_or_default();
-    for ri in &repos_info {
-        let _ = daemon.refresh(&ri.path).await;
-    }
     let mut app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config));
+
+    // Get initial state via replay_since (works for both in-process and socket).
+    let replay_events = daemon
+        .replay_since(&std::collections::HashMap::new())
+        .await
+        .unwrap_or_default();
+    for event in replay_events {
+        app.handle_daemon_event(event);
+    }
 
     execute!(stdout(), EnableMouseCapture)?;
     let mut events = event::EventHandler::new(Duration::from_millis(250));
