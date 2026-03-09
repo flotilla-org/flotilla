@@ -90,11 +90,23 @@ pub fn flotilla_config_dir() -> PathBuf {
 
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
 pub fn path_to_slug(path: &Path) -> String {
-    path.to_string_lossy()
-        .to_lowercase()
-        .replace('/', "-")
-        .trim_start_matches('-')
-        .to_string()
+    let raw = path.to_string_lossy().to_lowercase();
+    let mut prev_hyphen = false;
+    let slug: String = raw
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                prev_hyphen = false;
+                Some(c)
+            } else if !prev_hyphen {
+                prev_hyphen = true;
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect();
+    slug.trim_matches('-').to_string()
 }
 
 /// Owns the config base path and caches the global `FlotillaConfig`.
@@ -272,8 +284,9 @@ mod tests {
         let cases = [
             ("/Users/alice/dev/myrepo", "users-alice-dev-myrepo"),
             ("relative/path", "relative-path"),
-            ("/Users/Bob Smith/my repo", "users-bob smith-my repo"),
+            ("/Users/Bob Smith/my repo", "users-bob-smith-my-repo"),
             ("/opt/my-project_v2.0", "opt-my-project_v2.0"),
+            ("/tmp/my__project", "tmp-my__project"),
             ("/", ""),
             (".", "."),
         ];

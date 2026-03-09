@@ -110,34 +110,57 @@ async fn run_tui(cli: Cli) -> Result<()> {
         );
         roots
     } else {
-        if !cli.repo_root.is_empty() {
-            eprintln!(
-                "Warning: --repo-root is ignored in socket mode (repos are managed by the daemon)"
-            );
-        }
         vec![]
     };
 
+    let cli_repo_roots = cli.repo_root.clone();
+
     // Spawn daemon init on a separate task so it runs concurrently with the splash
     // (show_splash uses blocking crossterm::event::poll calls).
+    let daemon_log_path = cli.config_dir().join("daemon.log");
     let config_clone = Arc::clone(&config);
     let daemon_task = tokio::spawn(async move {
-        let daemon: Arc<dyn DaemonHandle> = if embedded {
+        let daemon: Result<Arc<dyn DaemonHandle>, String> = if embedded {
             let d = InProcessDaemon::new(repo_roots, config_clone).await;
-            d as Arc<dyn DaemonHandle>
+            Ok(d as Arc<dyn DaemonHandle>)
         } else {
             let socket_path = cli.socket_path();
             connect_or_spawn(&socket_path, &cli)
                 .await
-                .map_err(|e| color_eyre::eyre::eyre!(e))
-                .expect("failed to connect to daemon")
+                .map(|d| d as Arc<dyn DaemonHandle>)
         };
-        info!("daemon ready in {:.0?}", startup.elapsed());
         daemon
     });
 
     show_splash(&mut terminal).await?;
-    let daemon = daemon_task.await.expect("daemon init panicked");
+    let daemon = match daemon_task.await {
+        Ok(Ok(daemon)) => {
+            info!("daemon ready in {:.0?}", startup.elapsed());
+            daemon
+        }
+        Ok(Err(e)) => {
+            ratatui::restore();
+            eprintln!("Error: {e}");
+            eprintln!("  Check daemon log at {}", daemon_log_path.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            ratatui::restore();
+            eprintln!("Error: daemon initialization panicked: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Forward --repo-root paths to the daemon (socket mode only;
+    // in-process mode already received them via InProcessDaemon::new).
+    if !embedded {
+        for root in &cli_repo_roots {
+            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            if let Err(e) = daemon.add_repo(&canonical).await {
+                info!("failed to add repo {}: {e}", canonical.display());
+            }
+        }
+    }
 
     let daemon_rx = daemon.subscribe();
     let repos_info = daemon.list_repos().await.unwrap_or_default();
@@ -312,6 +335,53 @@ async fn run_tui(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Acquire the daemon spawn lock (flock-based, like tmux).
+///
+/// Returns:
+/// - `Ok(Some(file))` — lock acquired, caller should spawn the daemon
+/// - `Ok(None)` — another process is spawning; we blocked until they released
+/// - `Err(_)` — lock file couldn't be opened
+fn acquire_spawn_lock(lock_path: &std::path::Path) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::io::AsRawFd;
+
+    // Ensure parent directory exists (e.g. first run with custom --config-dir).
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| format!("lock open: {e}"))?;
+
+    // Non-blocking try: are we the first?
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // We got the lock — we're the spawner.
+        return Ok(Some(file));
+    }
+
+    // Another process holds the lock — block until they release it.
+    // The OS releases the lock automatically if the holder dies.
+    // Loop on EINTR like tmux does (client_get_lock).
+    loop {
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if ret == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("flock: {err}"));
+        }
+    }
+    // Lock released — the other process's daemon should be running now.
+    // Drop the lock immediately; we won't spawn.
+    drop(file);
+    Ok(None)
+}
+
 async fn connect_or_spawn(
     socket_path: &std::path::Path,
     cli: &Cli,
@@ -321,10 +391,69 @@ async fn connect_or_spawn(
         return Ok(daemon);
     }
 
-    // Clean up stale socket
-    let _ = std::fs::remove_file(socket_path);
+    // Acquire spawn lock (tmux-style flock). The loser blocks until the
+    // winner's daemon is ready, then retries connect.
+    // Append ".lock" to the full filename to avoid aliasing when the socket
+    // path already ends in ".lock" (with_extension would replace it).
+    let lock_path = PathBuf::from(format!("{}.lock", socket_path.display()));
+    let lock_path_clone = lock_path.clone();
+    let lock_result = tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
+        .await
+        .map_err(|e| format!("spawn_blocking: {e}"))?;
+    let lock_file = match lock_result {
+        Ok(Some(file)) => Some(file),
+        Ok(None) => {
+            // Another process spawned the daemon — retry connect.
+            // (tmux's "goto retry" after flock releases.)
+            if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+                return Ok(daemon);
+            }
+            // Their daemon didn't come up — fall through to spawn our own.
+            None
+        }
+        Err(e) => {
+            return Err(format!("spawn lock failed: {e}"));
+        }
+    };
 
-    // Spawn daemon process
+    {
+        // Clean up stale socket
+        let _ = std::fs::remove_file(socket_path);
+
+        // Spawn daemon process
+        let spawn_result = spawn_daemon(cli);
+        if let Err(e) = spawn_result {
+            if lock_file.is_some() {
+                drop(lock_file);
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            return Err(e);
+        }
+    }
+
+    // Poll for connection with a 10s deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+            // Release lock and clean up lock file (only if we hold it)
+            if lock_file.is_some() {
+                drop(lock_file);
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            return Ok(daemon);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if lock_file.is_some() {
+                drop(lock_file);
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            return Err("timed out waiting for daemon to start (10s)".into());
+        }
+    }
+}
+
+fn spawn_daemon(cli: &Cli) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("can't find self: {e}"))?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("daemon");
@@ -353,17 +482,7 @@ async fn connect_or_spawn(
     cmd.stderr(stderr);
     cmd.spawn()
         .map_err(|e| format!("failed to spawn daemon: {e}"))?;
-
-    // Retry connection with backoff
-    let delays = [50, 100, 200, 400, 800];
-    for delay_ms in delays {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
-            return Ok(daemon);
-        }
-    }
-
-    Err("timed out waiting for daemon to start".into())
+    Ok(())
 }
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
