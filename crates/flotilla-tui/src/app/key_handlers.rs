@@ -487,116 +487,16 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use flotilla_core::config::ConfigStore;
-    use flotilla_core::daemon::DaemonHandle;
-    use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-    use flotilla_protocol::{
-        CheckoutRef, CheckoutStatus, Command, DaemonEvent, RepoInfo, RepoLabels, Snapshot,
-        WorkItem, WorkItemIdentity, WorkItemKind,
+    use crate::app::test_support::{
+        checkout_item, key, setup_selectable_table as setup_table, stub_app,
     };
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use tokio::sync::broadcast;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use flotilla_protocol::{CheckoutStatus, Command, WorkItemIdentity};
+    use std::path::PathBuf;
     use tui_input::Input;
 
-    struct StubDaemon {
-        tx: broadcast::Sender<DaemonEvent>,
-    }
-
-    impl StubDaemon {
-        fn new() -> Self {
-            let (tx, _) = broadcast::channel(1);
-            Self { tx }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl DaemonHandle for StubDaemon {
-        fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-            self.tx.subscribe()
-        }
-        async fn get_state(&self, _: &Path) -> Result<Snapshot, String> {
-            Err("stub".into())
-        }
-        async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-            Ok(vec![])
-        }
-        async fn execute(&self, _: &Path, _: Command) -> Result<u64, String> {
-            Ok(1)
-        }
-        async fn refresh(&self, _: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn add_repo(&self, _: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn remove_repo(&self, _: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn replay_since(
-            &self,
-            _: &HashMap<PathBuf, u64>,
-        ) -> Result<Vec<DaemonEvent>, String> {
-            Ok(vec![])
-        }
-    }
-
-    fn stub_app() -> App {
-        let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
-        let repo_path = PathBuf::from("/tmp/test-repo");
-        let repos_info = vec![RepoInfo {
-            path: repo_path,
-            name: "test-repo".into(),
-            labels: RepoLabels::default(),
-            provider_names: HashMap::new(),
-            provider_health: HashMap::new(),
-            loading: false,
-        }];
-        let config = Arc::new(ConfigStore::with_base("/tmp/flotilla-test"));
-        App::new(daemon, repos_info, config)
-    }
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn make_work_item(id: &str) -> WorkItem {
-        WorkItem {
-            kind: WorkItemKind::Checkout,
-            identity: WorkItemIdentity::Checkout(PathBuf::from(format!("/tmp/{id}"))),
-            branch: Some(format!("feat/{id}")),
-            description: format!("item {id}"),
-            checkout: Some(CheckoutRef {
-                key: PathBuf::from(format!("/tmp/{id}")),
-                is_main_checkout: false,
-            }),
-            change_request_key: None,
-            session_key: None,
-            issue_keys: Vec::new(),
-            workspace_refs: Vec::new(),
-            is_main_checkout: false,
-            debug_group: Vec::new(),
-        }
-    }
-
-    /// Set up the active repo's table view with selectable work items.
-    fn setup_table(app: &mut App, items: Vec<WorkItem>) {
-        let repo_key = app.model.repo_order[app.model.active_repo].clone();
-        let rui = app.ui.repo_ui.get_mut(&repo_key).unwrap();
-        let mut entries = Vec::new();
-        let mut selectable = Vec::new();
-        for (i, item) in items.into_iter().enumerate() {
-            selectable.push(i);
-            entries.push(GroupEntry::Item(Box::new(item)));
-        }
-        rui.table_view = GroupedWorkItems {
-            table_entries: entries,
-            selectable_indices: selectable,
-        };
-        rui.selected_selectable_idx = Some(0);
-        rui.table_state.select(Some(0));
+    fn make_work_item(id: &str) -> flotilla_protocol::WorkItem {
+        checkout_item(&format!("feat/{id}"), &format!("/tmp/{id}"), false)
     }
 
     // ── handle_key — top-level dispatch ──────────────────────────────
@@ -810,15 +710,9 @@ mod tests {
     fn normal_big_d_toggles_debug() {
         let mut app = stub_app();
         assert!(!app.ui.show_debug);
-        app.handle_key(KeyEvent::new(
-            KeyCode::Char('D'),
-            KeyModifiers::SHIFT,
-        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
         assert!(app.ui.show_debug);
-        app.handle_key(KeyEvent::new(
-            KeyCode::Char('D'),
-            KeyModifiers::SHIFT,
-        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
         assert!(!app.ui.show_debug);
     }
 
@@ -1192,7 +1086,10 @@ mod tests {
                 // SwitchToWorkspace should NOT be available (no workspace_refs)
                 assert!(!items.contains(&Intent::SwitchToWorkspace));
             }
-            other => panic!("expected ActionMenu, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected ActionMenu, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -1370,7 +1267,11 @@ mod tests {
         let mut app = stub_app();
         setup_table(
             &mut app,
-            vec![make_work_item("a"), make_work_item("b"), make_work_item("c")],
+            vec![
+                make_work_item("a"),
+                make_work_item("b"),
+                make_work_item("c"),
+            ],
         );
         assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
         app.handle_key(key(KeyCode::Char('j')));
@@ -1382,10 +1283,7 @@ mod tests {
     #[test]
     fn normal_k_selects_prev() {
         let mut app = stub_app();
-        setup_table(
-            &mut app,
-            vec![make_work_item("a"), make_work_item("b")],
-        );
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
         // Move to second item first
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
@@ -1480,7 +1378,10 @@ mod tests {
             UiMode::ActionMenu { items, .. } => {
                 assert!(items.contains(&Intent::OpenChangeRequest));
             }
-            other => panic!("expected ActionMenu, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected ActionMenu, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 

@@ -217,94 +217,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::ui_state::DirEntry;
-    use flotilla_core::config::ConfigStore;
-    use flotilla_core::daemon::DaemonHandle;
-    use flotilla_protocol::{Command, DaemonEvent, RepoInfo, RepoLabels, Snapshot};
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use tokio::sync::broadcast;
-
-    struct StubDaemon {
-        tx: broadcast::Sender<DaemonEvent>,
-    }
-    impl StubDaemon {
-        fn new() -> Self {
-            let (tx, _) = broadcast::channel(1);
-            Self { tx }
-        }
-    }
-    #[async_trait::async_trait]
-    impl DaemonHandle for StubDaemon {
-        fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-            self.tx.subscribe()
-        }
-        async fn get_state(&self, _: &Path) -> Result<Snapshot, String> {
-            Err("stub".into())
-        }
-        async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-            Ok(vec![])
-        }
-        async fn execute(&self, _: &Path, _: Command) -> Result<u64, String> {
-            Ok(1)
-        }
-        async fn refresh(&self, _: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn add_repo(&self, _: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn remove_repo(&self, _: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn replay_since(
-            &self,
-            _: &HashMap<PathBuf, u64>,
-        ) -> Result<Vec<DaemonEvent>, String> {
-            Ok(vec![])
-        }
-    }
-
-    fn stub_app() -> super::super::App {
-        let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
-        let repo_path = PathBuf::from("/tmp/test-repo");
-        let repos_info = vec![RepoInfo {
-            path: repo_path,
-            name: "test-repo".into(),
-            labels: RepoLabels::default(),
-            provider_names: HashMap::new(),
-            provider_health: HashMap::new(),
-            loading: false,
-        }];
-        let config = Arc::new(ConfigStore::with_base("/tmp/flotilla-test"));
-        super::super::App::new(daemon, repos_info, config)
-    }
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
-    }
-
-    fn enter_file_picker(
-        app: &mut super::super::App,
-        path: &str,
-        entries: Vec<DirEntry>,
-    ) {
-        app.ui.mode = UiMode::FilePicker {
-            input: Input::from(path),
-            dir_entries: entries,
-            selected: 0,
-        };
-    }
-
-    fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
-        DirEntry {
-            name: name.to_string(),
-            is_dir: true,
-            is_git_repo,
-            is_added,
-        }
-    }
+    use crate::app::test_support::{
+        default_repo_model, dir_entry, enter_file_picker, key, stub_app,
+    };
+    use flotilla_protocol::{Command, RepoLabels};
+    use tui_input::Input;
 
     // ── handle_file_picker_key tests ─────────────────────────────────
 
@@ -659,7 +576,10 @@ mod tests {
         } = app.ui.mode
         {
             let names: Vec<&str> = dir_entries.iter().map(|e| e.name.as_str()).collect();
-            assert!(!names.contains(&".hidden"), "hidden dirs should be filtered");
+            assert!(
+                !names.contains(&".hidden"),
+                "hidden dirs should be filtered"
+            );
             assert!(names.contains(&"visible"));
             assert_eq!(dir_entries.len(), 1);
         } else {
@@ -687,12 +607,12 @@ mod tests {
         {
             let names: Vec<&str> = dir_entries.iter().map(|e| e.name.as_str()).collect();
             // Case-insensitive prefix match: both "Foo" and "foobar" match "foo"
-            assert!(names.contains(&"Foo"), "Foo should match (case-insensitive)");
-            assert!(names.contains(&"foobar"), "foobar should match");
             assert!(
-                !names.contains(&"baz"),
-                "baz should not match prefix 'foo'"
+                names.contains(&"Foo"),
+                "Foo should match (case-insensitive)"
             );
+            assert!(names.contains(&"foobar"), "foobar should match");
+            assert!(!names.contains(&"baz"), "baz should not match prefix 'foo'");
             assert_eq!(dir_entries.len(), 2);
         } else {
             panic!("expected FilePicker mode");
@@ -739,21 +659,9 @@ mod tests {
 
         // Add the canonical path of repo_dir to model.repos so it's "already added"
         let canonical = std::fs::canonicalize(&repo_dir).unwrap();
-        app.model.repos.insert(
-            canonical,
-            crate::app::TuiRepoModel {
-                providers: Arc::new(flotilla_protocol::ProviderData::default()),
-                labels: RepoLabels::default(),
-                provider_names: HashMap::new(),
-                provider_health: HashMap::new(),
-                loading: false,
-                issue_has_more: false,
-                issue_total: None,
-                issue_search_active: false,
-                issue_fetch_pending: false,
-                issue_initial_requested: false,
-            },
-        );
+        app.model
+            .repos
+            .insert(canonical, default_repo_model(RepoLabels::default()));
 
         let dir_path = format!("{}/", tmp.path().to_string_lossy());
         enter_file_picker(&mut app, &dir_path, vec![]);

@@ -151,116 +151,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-
-    use ratatui::layout::Rect;
-    use tokio::sync::broadcast;
-
-    use flotilla_core::config::ConfigStore;
-    use flotilla_core::daemon::DaemonHandle;
-    use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-    use flotilla_protocol::{
-        Command, DaemonEvent, RepoInfo, RepoLabels, Snapshot, WorkItem, WorkItemIdentity,
-        WorkItemKind,
+    use crate::app::test_support::{
+        issue_item, issue_table_entries, set_active_table_view, stub_app_with_repos,
     };
-
-    // ── Stub daemon ──────────────────────────────────────────────────
-
-    struct StubDaemon {
-        tx: broadcast::Sender<DaemonEvent>,
-    }
-
-    impl StubDaemon {
-        fn new() -> Self {
-            let (tx, _) = broadcast::channel(1);
-            Self { tx }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl DaemonHandle for StubDaemon {
-        fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-            self.tx.subscribe()
-        }
-        async fn get_state(&self, _repo: &Path) -> Result<Snapshot, String> {
-            Err("stub".into())
-        }
-        async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-            Ok(vec![])
-        }
-        async fn execute(&self, _repo: &Path, _command: Command) -> Result<u64, String> {
-            Ok(1)
-        }
-        async fn refresh(&self, _repo: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn add_repo(&self, _path: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn remove_repo(&self, _path: &Path) -> Result<(), String> {
-            Ok(())
-        }
-        async fn replay_since(
-            &self,
-            _last_seen: &HashMap<PathBuf, u64>,
-        ) -> Result<Vec<DaemonEvent>, String> {
-            Ok(vec![])
-        }
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────────
-
-    fn stub_app_with_repos(count: usize) -> App {
-        let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
-        let mut repos_info = Vec::new();
-        for i in 0..count {
-            repos_info.push(RepoInfo {
-                path: PathBuf::from(format!("/tmp/repo-{i}")),
-                name: format!("repo-{i}"),
-                labels: RepoLabels::default(),
-                provider_names: HashMap::new(),
-                provider_health: HashMap::new(),
-                loading: false,
-            });
-        }
-        let config = Arc::new(ConfigStore::with_base("/tmp/flotilla-test"));
-        App::new(daemon, repos_info, config)
-    }
-
-    fn make_table_entries(count: usize) -> GroupedWorkItems {
-        let mut entries = Vec::new();
-        let mut selectable = Vec::new();
-        for i in 0..count {
-            selectable.push(i);
-            entries.push(GroupEntry::Item(Box::new(WorkItem {
-                kind: WorkItemKind::Issue,
-                identity: WorkItemIdentity::Issue(format!("{i}")),
-                branch: None,
-                description: format!("Item {i}"),
-                checkout: None,
-                change_request_key: None,
-                session_key: None,
-                issue_keys: Vec::new(),
-                workspace_refs: Vec::new(),
-                is_main_checkout: false,
-                debug_group: Vec::new(),
-            })));
-        }
-        GroupedWorkItems {
-            table_entries: entries,
-            selectable_indices: selectable,
-        }
-    }
-
-    /// Install table entries on the active repo's UI state.
-    fn set_table_view(app: &mut App, table_view: GroupedWorkItems) {
-        let key = app.model.repo_order[app.model.active_repo].clone();
-        let rui = app.ui.repo_ui.get_mut(&key).unwrap();
-        rui.table_view = table_view;
-    }
+    use flotilla_core::data::{GroupEntry, GroupedWorkItems};
+    use flotilla_protocol::{Command, WorkItemIdentity};
+    use ratatui::layout::Rect;
 
     // ── switch_tab tests ─────────────────────────────────────────────
 
@@ -419,7 +315,7 @@ mod tests {
     #[test]
     fn select_next_from_none_selects_first() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         assert_eq!(app.active_ui().selected_selectable_idx, None);
         app.select_next();
         assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
@@ -428,7 +324,7 @@ mod tests {
     #[test]
     fn select_next_advances_selection() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         app.select_next(); // None -> 0
         app.select_next(); // 0 -> 1
         assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
@@ -437,7 +333,7 @@ mod tests {
     #[test]
     fn select_next_stays_at_end() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(3));
+        set_active_table_view(&mut app, issue_table_entries(3));
         // Select each item in order
         app.select_next(); // None -> 0
         app.select_next(); // 0 -> 1
@@ -449,7 +345,7 @@ mod tests {
     #[test]
     fn select_next_noop_on_empty_table() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(0));
+        set_active_table_view(&mut app, issue_table_entries(0));
         app.select_next();
         assert_eq!(app.active_ui().selected_selectable_idx, None);
     }
@@ -459,7 +355,7 @@ mod tests {
         let mut app = stub_app_with_repos(1);
         // 6 items: positions 0-5. When at position 1, next+5 = 2+5 = 7 >= 6.
         // But we need issue_has_more=true and issue_fetch_pending=false.
-        set_table_view(&mut app, make_table_entries(6));
+        set_active_table_view(&mut app, issue_table_entries(6));
 
         let repo = app.model.repo_order[0].clone();
         if let Some(rm) = app.model.repos.get_mut(&repo) {
@@ -495,7 +391,7 @@ mod tests {
     #[test]
     fn select_prev_from_none_selects_first() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         assert_eq!(app.active_ui().selected_selectable_idx, None);
         app.select_prev();
         assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
@@ -504,7 +400,7 @@ mod tests {
     #[test]
     fn select_prev_decrements_selection() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         // Navigate to position 2
         app.select_next(); // None -> 0
         app.select_next(); // 0 -> 1
@@ -516,7 +412,7 @@ mod tests {
     #[test]
     fn select_prev_stays_at_zero() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         app.select_next(); // None -> 0
         app.select_prev(); // 0 -> 0 (stays)
         assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
@@ -525,7 +421,7 @@ mod tests {
     #[test]
     fn select_prev_noop_on_empty_table() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(0));
+        set_active_table_view(&mut app, issue_table_entries(0));
         app.select_prev();
         assert_eq!(app.active_ui().selected_selectable_idx, None);
     }
@@ -535,7 +431,7 @@ mod tests {
     #[test]
     fn row_at_mouse_outside_table_returns_none() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         // Set a known table area
         app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
         // Click outside: x before table
@@ -551,7 +447,7 @@ mod tests {
     #[test]
     fn row_at_mouse_header_rows_return_none() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
         // Row 0 and row 1 (header rows, y=10 and y=11) should return None
         assert!(app.row_at_mouse(15, 10).is_none());
@@ -561,7 +457,7 @@ mod tests {
     #[test]
     fn row_at_mouse_valid_row_returns_selectable_index() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(5));
+        set_active_table_view(&mut app, issue_table_entries(5));
         app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
         // y=12 means row_in_table=2, data_row=0, offset=0, actual_row=0
         // selectable_indices = [0,1,2,3,4], so position of 0 is 0
@@ -578,37 +474,13 @@ mod tests {
         // Create entries with a gap: selectable indices are [0, 2] (skip 1 = header)
         let table_view = GroupedWorkItems {
             table_entries: vec![
-                GroupEntry::Item(Box::new(WorkItem {
-                    kind: WorkItemKind::Issue,
-                    identity: WorkItemIdentity::Issue("0".into()),
-                    branch: None,
-                    description: "Item 0".into(),
-                    checkout: None,
-                    change_request_key: None,
-                    session_key: None,
-                    issue_keys: Vec::new(),
-                    workspace_refs: Vec::new(),
-                    is_main_checkout: false,
-                    debug_group: Vec::new(),
-                })),
+                GroupEntry::Item(Box::new(issue_item("0"))),
                 GroupEntry::Header(flotilla_core::data::SectionHeader("Section".into())),
-                GroupEntry::Item(Box::new(WorkItem {
-                    kind: WorkItemKind::Issue,
-                    identity: WorkItemIdentity::Issue("2".into()),
-                    branch: None,
-                    description: "Item 2".into(),
-                    checkout: None,
-                    change_request_key: None,
-                    session_key: None,
-                    issue_keys: Vec::new(),
-                    workspace_refs: Vec::new(),
-                    is_main_checkout: false,
-                    debug_group: Vec::new(),
-                })),
+                GroupEntry::Item(Box::new(issue_item("2"))),
             ],
             selectable_indices: vec![0, 2],
         };
-        set_table_view(&mut app, table_view);
+        set_active_table_view(&mut app, table_view);
         app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
         // y=12 -> data_row=0 -> actual_row=0, which IS in selectable_indices
         assert_eq!(app.row_at_mouse(15, 12), Some(0));
@@ -623,7 +495,7 @@ mod tests {
     #[test]
     fn toggle_adds_to_multi_selected() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(3));
+        set_active_table_view(&mut app, issue_table_entries(3));
         // Select first item
         app.select_next(); // None -> 0
         assert!(app.active_ui().multi_selected.is_empty());
@@ -637,9 +509,9 @@ mod tests {
     #[test]
     fn toggle_removes_from_multi_selected() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(3));
+        set_active_table_view(&mut app, issue_table_entries(3));
         app.select_next(); // None -> 0
-        // Toggle on
+                           // Toggle on
         app.toggle_multi_select();
         assert!(app
             .active_ui()
@@ -657,7 +529,7 @@ mod tests {
     #[test]
     fn toggle_noop_when_no_selection() {
         let mut app = stub_app_with_repos(1);
-        set_table_view(&mut app, make_table_entries(3));
+        set_active_table_view(&mut app, issue_table_entries(3));
         // selected_selectable_idx is None
         app.toggle_multi_select();
         assert!(app.active_ui().multi_selected.is_empty());
