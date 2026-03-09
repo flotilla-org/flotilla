@@ -227,8 +227,9 @@ impl ReplaySession {
 }
 
 /// Check whether `RECORD=1` environment variable is set.
+/// Only the value "1" triggers recording; "0", "false", etc. do not.
 pub fn is_recording() -> bool {
-    std::env::var("RECORD").is_ok()
+    std::env::var("RECORD").ok().as_deref() == Some("1")
 }
 
 /// Create a `ReplaySession` that either records or replays.
@@ -269,15 +270,15 @@ impl ReplayRunner {
 
 #[async_trait]
 impl CommandRunner for ReplayRunner {
-    async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path) -> Result<String, String> {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
         let interaction = self.session.next("command");
         let Interaction::Command {
             cmd: expected_cmd,
             args: expected_args,
+            cwd: expected_cwd,
             stdout,
             stderr,
             exit_code,
-            ..
         } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
@@ -288,6 +289,11 @@ impl CommandRunner for ReplayRunner {
         assert_eq!(
             actual_args, expected_args,
             "ReplayRunner: args mismatch for '{cmd}'"
+        );
+        let actual_cwd = cwd.to_string_lossy();
+        assert_eq!(
+            actual_cwd, expected_cwd,
+            "ReplayRunner: cwd mismatch for '{cmd}'"
         );
 
         if exit_code == 0 {
@@ -301,16 +307,16 @@ impl CommandRunner for ReplayRunner {
         &self,
         cmd: &str,
         args: &[&str],
-        _cwd: &Path,
+        cwd: &Path,
     ) -> Result<CommandOutput, String> {
         let interaction = self.session.next("command");
         let Interaction::Command {
             cmd: expected_cmd,
             args: expected_args,
+            cwd: expected_cwd,
             stdout,
             stderr,
             exit_code,
-            ..
         } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
@@ -321,6 +327,11 @@ impl CommandRunner for ReplayRunner {
         assert_eq!(
             actual_args, expected_args,
             "ReplayRunner: args mismatch for '{cmd}'"
+        );
+        let actual_cwd = cwd.to_string_lossy();
+        assert_eq!(
+            actual_cwd, expected_cwd,
+            "ReplayRunner: cwd mismatch for '{cmd}'"
         );
 
         Ok(CommandOutput {
