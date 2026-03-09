@@ -25,11 +25,26 @@ struct TabState {
 
 pub struct ZellijWorkspaceManager {
     runner: Arc<dyn CommandRunner>,
+    /// Optional override for the session name. When `None`, falls back to
+    /// the `ZELLIJ_SESSION_NAME` environment variable.
+    session_name_override: Option<String>,
 }
 
 impl ZellijWorkspaceManager {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            session_name_override: None,
+        }
+    }
+
+    /// Create a manager targeting a specific session name, avoiding the need
+    /// to read `ZELLIJ_SESSION_NAME` from the process environment.
+    pub fn with_session_name(runner: Arc<dyn CommandRunner>, session_name: String) -> Self {
+        Self {
+            runner,
+            session_name_override: Some(session_name),
+        }
     }
 
     /// Run `zellij action <args>` and return stdout, or an error on failure.
@@ -76,8 +91,12 @@ impl ZellijWorkspaceManager {
         Ok(())
     }
 
-    /// Return the current Zellij session name from the environment.
-    pub fn session_name() -> Result<String, String> {
+    /// Return the current Zellij session name, preferring the override if set,
+    /// otherwise falling back to the `ZELLIJ_SESSION_NAME` environment variable.
+    pub fn session_name(&self) -> Result<String, String> {
+        if let Some(ref name) = self.session_name_override {
+            return Ok(name.clone());
+        }
         std::env::var("ZELLIJ_SESSION_NAME").map_err(|_| {
             "not running inside a zellij session (ZELLIJ_SESSION_NAME not set)".to_string()
         })
@@ -147,7 +166,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         let tab_names: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
 
         // Load state for enrichment, pruning stale entries
-        let (session, mut state) = match Self::session_name() {
+        let (session, mut state) = match self.session_name() {
             Ok(s) => {
                 let st = Self::load_state(&s);
                 (Some(s), st)
@@ -278,7 +297,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         }
 
         // Save state
-        if let Ok(session) = Self::session_name() {
+        if let Ok(session) = self.session_name() {
             let mut state = Self::load_state(&session);
             let timestamp = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -490,11 +509,6 @@ mod tests {
     }
 
     fn setup_zellij_ws_session() {
-        // Set ZELLIJ_SESSION_NAME BEFORE creating the runner so it inherits the env
-        unsafe {
-            std::env::set_var("ZELLIJ_SESSION_NAME", "flotilla-test-zj-ws");
-        }
-
         // Create a tmux session to host zellij
         let status = std::process::Command::new("tmux")
             .args([
@@ -548,11 +562,6 @@ mod tests {
             .args(["delete-session", "flotilla-test-zj-ws", "--force"])
             .status();
 
-        // Remove ZELLIJ_SESSION_NAME env var
-        unsafe {
-            std::env::remove_var("ZELLIJ_SESSION_NAME");
-        }
-
         // Clean up state files created by create_workspace
         if let Some(config_dir) = dirs::config_dir() {
             let state_dir = config_dir
@@ -575,7 +584,10 @@ mod tests {
             replay::test_session(&fixture("zellij_workspaces.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = ZellijWorkspaceManager::new(runner.clone());
+        let mgr = ZellijWorkspaceManager::with_session_name(
+            runner.clone(),
+            "flotilla-test-zj-ws".to_string(),
+        );
 
         // Create workspace "feat-123"
         let config1 = WorkspaceConfig {
@@ -637,11 +649,6 @@ mod tests {
     }
 
     fn setup_zellij_session() {
-        // Set ZELLIJ_SESSION_NAME so zellij action commands target our session
-        unsafe {
-            std::env::set_var("ZELLIJ_SESSION_NAME", "flotilla-test-zj");
-        }
-
         // Create a tmux session to host zellij
         let status = std::process::Command::new("tmux")
             .args([
@@ -697,11 +704,6 @@ mod tests {
         let _ = std::process::Command::new("zellij")
             .args(["delete-session", "flotilla-test-zj", "--force"])
             .status();
-
-        // Remove ZELLIJ_SESSION_NAME env var
-        unsafe {
-            std::env::remove_var("ZELLIJ_SESSION_NAME");
-        }
     }
 
     #[tokio::test]
@@ -715,7 +717,7 @@ mod tests {
         let session = replay::test_session(&fixture("zellij_list.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = ZellijWorkspaceManager::new(runner);
+        let mgr = ZellijWorkspaceManager::with_session_name(runner, "flotilla-test-zj".to_string());
         let workspaces = mgr.list_workspaces().await.unwrap();
 
         assert_eq!(workspaces.len(), 2);
