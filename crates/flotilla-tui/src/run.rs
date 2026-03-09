@@ -1,0 +1,188 @@
+use crate::app::{self, App, TabId, UiMode};
+use crate::event::{self, Event};
+use crate::event_log::LevelExt;
+use crate::ui;
+
+use color_eyre::Result;
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyCode, MouseButton, MouseEventKind,
+};
+use crossterm::execute;
+use std::io::stdout;
+use std::time::Duration;
+
+/// Run the TUI event loop: replay initial state, then process events until quit.
+///
+/// Takes ownership of a fully-constructed `App` (with daemon already connected)
+/// and the ratatui terminal.  On return the terminal is restored.
+pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App) -> Result<()> {
+    // Get initial state via replay_since (works for both in-process and socket).
+    let replay_events = app
+        .daemon
+        .replay_since(&std::collections::HashMap::new())
+        .await
+        .unwrap_or_default();
+    for event in replay_events {
+        app.handle_daemon_event(event);
+    }
+
+    let daemon_rx = app.daemon.subscribe();
+
+    execute!(stdout(), EnableMouseCapture)?;
+    let mut events = event::EventHandler::new(Duration::from_millis(250));
+    events.attach_daemon(daemon_rx);
+
+    loop {
+        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
+
+        if let Some(evt) = events.next().await {
+            match evt {
+                Event::Daemon(daemon_evt) => {
+                    app.handle_daemon_event(daemon_evt);
+                }
+                Event::Key(k) => {
+                    let is_normal = matches!(app.ui.mode, UiMode::Normal);
+                    if k.code == KeyCode::Char('r') && is_normal {
+                        // Trigger immediate refresh on active repo via daemon
+                        let repo = app.model.active_repo_root().clone();
+                        let daemon = app.daemon.clone();
+                        tokio::spawn(async move {
+                            let _ = daemon.refresh(&repo).await;
+                        });
+                    } else {
+                        app.handle_key(k);
+                    }
+                }
+                Event::Mouse(m) => {
+                    match m.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let x = m.column;
+                            let y = m.row;
+                            let mut tab_clicked = false;
+
+                            // Check event log filter area (click cycles level)
+                            let ef = app.ui.layout.event_log_filter_area;
+                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height
+                            {
+                                app.ui.event_log.filter = app.ui.event_log.filter.cycle();
+                                app.ui.event_log.count = 0;
+                                tab_clicked = true;
+                            }
+
+                            // Check which tab area was clicked
+                            if !tab_clicked {
+                                let hit = app
+                                    .ui
+                                    .layout
+                                    .tab_areas
+                                    .iter()
+                                    .find(|(_, r)| {
+                                        x >= r.x
+                                            && x < r.x + r.width
+                                            && y >= r.y
+                                            && y < r.y + r.height
+                                    })
+                                    .map(|(id, _)| id.clone());
+
+                                match hit {
+                                    Some(TabId::Flotilla) => {
+                                        app.ui.mode = UiMode::Config;
+                                        app.ui.drag.dragging_tab = None;
+                                        tab_clicked = true;
+                                    }
+                                    Some(TabId::Repo(i)) => {
+                                        app.switch_tab(i);
+                                        app.ui.drag.dragging_tab = Some(i);
+                                        app.ui.drag.start_x = x;
+                                        app.ui.drag.active = false;
+                                        tab_clicked = true;
+                                    }
+                                    Some(TabId::Gear) if !app.ui.mode.is_config() => {
+                                        let sp = app.active_ui().show_providers;
+                                        app.active_ui_mut().show_providers = !sp;
+                                        tab_clicked = true;
+                                    }
+                                    Some(TabId::Add) => {
+                                        let mut input = tui_input::Input::default();
+                                        if let Some(parent) = app.model.active_repo_root().parent()
+                                        {
+                                            let parent_str = format!("{}/", parent.display());
+                                            input = tui_input::Input::from(parent_str.as_str());
+                                        }
+                                        app.ui.mode = UiMode::FilePicker {
+                                            input,
+                                            dir_entries: Vec::new(),
+                                            selected: 0,
+                                        };
+                                        app.refresh_dir_listing();
+                                        tab_clicked = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !tab_clicked {
+                                app.ui.drag.dragging_tab = None;
+                                app.handle_mouse(m);
+                            }
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(dragging_idx) = app.ui.drag.dragging_tab {
+                                if !app.ui.drag.active {
+                                    let dx = (m.column as i16 - app.ui.drag.start_x as i16)
+                                        .unsigned_abs();
+                                    if dx >= 2 {
+                                        app.ui.drag.active = true;
+                                    }
+                                }
+                                if app.ui.drag.active {
+                                    for (id, r) in &app.ui.layout.tab_areas {
+                                        if let TabId::Repo(i) = *id {
+                                            if m.column >= r.x
+                                                && m.column < r.x + r.width
+                                                && m.row >= r.y
+                                                && m.row < r.y + r.height
+                                                && i != dragging_idx
+                                            {
+                                                app.model.repo_order.swap(dragging_idx, i);
+                                                app.model.active_repo = i;
+                                                app.ui.drag.dragging_tab = Some(i);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                app.handle_mouse(m);
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if app.ui.drag.dragging_tab.take().is_some() {
+                                if app.ui.drag.active {
+                                    app.config.save_tab_order(&app.model.repo_order);
+                                }
+                                app.ui.drag.active = false;
+                            }
+                        }
+                        _ => {
+                            app.handle_mouse(m);
+                        }
+                    }
+                }
+                Event::Tick => {}
+            }
+        }
+
+        // Process proto command queue — routed through daemon-side executor
+        while let Some(cmd) = app.proto_commands.take_next() {
+            app::executor::dispatch(cmd, &mut app).await;
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    execute!(stdout(), DisableMouseCapture)?;
+    ratatui::restore();
+    Ok(())
+}

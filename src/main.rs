@@ -2,19 +2,11 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_tui::app;
-use flotilla_tui::event;
 use flotilla_tui::event_log;
-use flotilla_tui::event_log::LevelExt;
 use flotilla_tui::socket::SocketDaemon;
-use flotilla_tui::ui;
 
 use clap::Parser;
 use color_eyre::Result;
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-};
-use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -144,177 +136,10 @@ async fn run_tui(cli: Cli) -> Result<()> {
     flotilla_tui::splash::show_splash(&mut terminal).await?;
     let daemon = daemon_task.await.expect("daemon init panicked");
 
-    let daemon_rx = daemon.subscribe();
     let repos_info = daemon.list_repos().await.unwrap_or_default();
-    let mut app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config));
+    let app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config));
 
-    // Get initial state via replay_since (works for both in-process and socket).
-    let replay_events = daemon
-        .replay_since(&std::collections::HashMap::new())
-        .await
-        .unwrap_or_default();
-    for event in replay_events {
-        app.handle_daemon_event(event);
-    }
-
-    execute!(stdout(), EnableMouseCapture)?;
-    let mut events = event::EventHandler::new(Duration::from_millis(250));
-    events.attach_daemon(daemon_rx);
-
-    loop {
-        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, f))?;
-
-        if let Some(evt) = events.next().await {
-            match evt {
-                event::Event::Daemon(daemon_evt) => {
-                    app.handle_daemon_event(daemon_evt);
-                }
-                event::Event::Key(k) => {
-                    let is_normal = matches!(app.ui.mode, app::UiMode::Normal);
-                    if k.code == crossterm::event::KeyCode::Char('r') && is_normal {
-                        // Trigger immediate refresh on active repo via daemon
-                        let repo = app.model.active_repo_root().clone();
-                        let daemon = app.daemon.clone();
-                        tokio::spawn(async move {
-                            let _ = daemon.refresh(&repo).await;
-                        });
-                    } else {
-                        app.handle_key(k);
-                    }
-                }
-                event::Event::Mouse(m) => {
-                    use crossterm::event::{MouseButton, MouseEventKind};
-                    match m.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let x = m.column;
-                            let y = m.row;
-                            let mut tab_clicked = false;
-
-                            // Check event log filter area (click cycles level)
-                            let ef = app.ui.layout.event_log_filter_area;
-                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height
-                            {
-                                app.ui.event_log.filter = app.ui.event_log.filter.cycle();
-                                app.ui.event_log.count = 0;
-                                tab_clicked = true;
-                            }
-
-                            // Check which tab area was clicked
-                            if !tab_clicked {
-                                let hit = app
-                                    .ui
-                                    .layout
-                                    .tab_areas
-                                    .iter()
-                                    .find(|(_, r)| {
-                                        x >= r.x
-                                            && x < r.x + r.width
-                                            && y >= r.y
-                                            && y < r.y + r.height
-                                    })
-                                    .map(|(id, _)| id.clone());
-
-                                match hit {
-                                    Some(app::TabId::Flotilla) => {
-                                        app.ui.mode = app::UiMode::Config;
-                                        app.ui.drag.dragging_tab = None;
-                                        tab_clicked = true;
-                                    }
-                                    Some(app::TabId::Repo(i)) => {
-                                        app.switch_tab(i);
-                                        app.ui.drag.dragging_tab = Some(i);
-                                        app.ui.drag.start_x = x;
-                                        app.ui.drag.active = false;
-                                        tab_clicked = true;
-                                    }
-                                    Some(app::TabId::Gear) if !app.ui.mode.is_config() => {
-                                        let sp = app.active_ui().show_providers;
-                                        app.active_ui_mut().show_providers = !sp;
-                                        tab_clicked = true;
-                                    }
-                                    Some(app::TabId::Add) => {
-                                        let mut input = tui_input::Input::default();
-                                        if let Some(parent) = app.model.active_repo_root().parent()
-                                        {
-                                            let parent_str = format!("{}/", parent.display());
-                                            input = tui_input::Input::from(parent_str.as_str());
-                                        }
-                                        app.ui.mode = app::UiMode::FilePicker {
-                                            input,
-                                            dir_entries: Vec::new(),
-                                            selected: 0,
-                                        };
-                                        app.refresh_dir_listing();
-                                        tab_clicked = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if !tab_clicked {
-                                app.ui.drag.dragging_tab = None;
-                                app.handle_mouse(m);
-                            }
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            if let Some(dragging_idx) = app.ui.drag.dragging_tab {
-                                if !app.ui.drag.active {
-                                    let dx = (m.column as i16 - app.ui.drag.start_x as i16)
-                                        .unsigned_abs();
-                                    if dx >= 2 {
-                                        app.ui.drag.active = true;
-                                    }
-                                }
-                                if app.ui.drag.active {
-                                    for (id, r) in &app.ui.layout.tab_areas {
-                                        if let app::TabId::Repo(i) = *id {
-                                            if m.column >= r.x
-                                                && m.column < r.x + r.width
-                                                && m.row >= r.y
-                                                && m.row < r.y + r.height
-                                                && i != dragging_idx
-                                            {
-                                                app.model.repo_order.swap(dragging_idx, i);
-                                                app.model.active_repo = i;
-                                                app.ui.drag.dragging_tab = Some(i);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                app.handle_mouse(m);
-                            }
-                        }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            if app.ui.drag.dragging_tab.take().is_some() {
-                                if app.ui.drag.active {
-                                    app.config.save_tab_order(&app.model.repo_order);
-                                }
-                                app.ui.drag.active = false;
-                            }
-                        }
-                        _ => {
-                            app.handle_mouse(m);
-                        }
-                    }
-                }
-                event::Event::Tick => {}
-            }
-        }
-
-        // Process proto command queue — routed through daemon-side executor
-        while let Some(cmd) = app.proto_commands.take_next() {
-            app::executor::dispatch(cmd, &mut app).await;
-        }
-
-        if app.should_quit {
-            break;
-        }
-    }
-
-    execute!(stdout(), DisableMouseCapture)?;
-    ratatui::restore();
-    Ok(())
+    flotilla_tui::run::run_event_loop(terminal, app).await
 }
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
