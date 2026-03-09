@@ -91,9 +91,20 @@ pub fn flotilla_config_dir() -> PathBuf {
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
 pub fn path_to_slug(path: &Path) -> String {
     let raw = path.to_string_lossy().to_lowercase();
+    let mut prev_hyphen = false;
     let slug: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                prev_hyphen = false;
+                Some(c)
+            } else if !prev_hyphen {
+                prev_hyphen = true;
+                Some('-')
+            } else {
+                None
+            }
+        })
         .collect();
     slug.trim_matches('-').to_string()
 }
@@ -275,6 +286,7 @@ mod tests {
             ("relative/path", "relative-path"),
             ("/Users/Bob Smith/my repo", "users-bob-smith-my-repo"),
             ("/opt/my-project_v2.0", "opt-my-project-v2-0"),
+            ("/tmp/my__project", "tmp-my-project"),
             ("/", ""),
             (".", ""),
         ];
