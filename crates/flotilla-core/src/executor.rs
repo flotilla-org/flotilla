@@ -368,6 +368,9 @@ fn session_provider_key<'a>(session: &'a CloudAgentSession, session_id: &str) ->
             _ => None,
         })
         .or_else(|| {
+            // Fallback: if the exact session ID wasn't found (shouldn't happen in
+            // practice since sessions are keyed by ID), return any SessionRef's
+            // provider so we still route to the right coding-agent implementation.
             session.correlation_keys.iter().find_map(|k| match k {
                 CorrelationKey::SessionRef(provider, _) => Some(provider.as_str()),
                 _ => None,

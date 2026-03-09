@@ -246,6 +246,8 @@ mod tests {
         let cases = [
             ("github.com/owner/repo", Some("owner/repo")),
             ("https://github.com/owner/repo.git", Some("owner/repo")),
+            ("git@github.com:owner/repo.git", Some("owner/repo")),
+            ("git@github.com:owner/repo", Some("owner/repo")),
             ("owner/repo", Some("owner/repo")),
             ("", None),
             ("repo-only", None),

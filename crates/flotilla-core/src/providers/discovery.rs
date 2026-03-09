@@ -178,8 +178,9 @@ pub async fn detect_providers(
         // TODO: GitLab support
     }
 
-    // 4. Coding agents
-    if runner.exists("agent", &["--version"]).await {
+    // 4. Coding agents: Cursor (gate on CURSOR_API_KEY to avoid false positives
+    //    from unrelated binaries also named `agent`)
+    if std::env::var("CURSOR_API_KEY").is_ok() && runner.exists("agent", &["--version"]).await {
         registry.coding_agents.insert(
             "cursor".to_string(),
             Arc::new(CursorCodingAgent::new("cursor".to_string())),
@@ -675,8 +676,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_providers_cursor_registration_depends_on_binary() {
-        for (has_cursor, should_register) in [(true, true), (false, false)] {
+    async fn detect_providers_cursor_registration_depends_on_binary_and_api_key() {
+        // With CURSOR_API_KEY set and agent binary present → registered
+        std::env::set_var("CURSOR_API_KEY", "test-key");
+        {
             let (dir, repo) = make_repo_with_git_dir();
             let config = temp_config(&dir);
             let runner: Arc<dyn CommandRunner> = Arc::new(
@@ -684,16 +687,47 @@ mod tests {
                     .on_run("git", &["remote"], Err("no remotes".to_string()))
                     .tool_exists("wt", false)
                     .tool_exists("gh", false)
-                    .tool_exists("agent", has_cursor)
+                    .tool_exists("agent", true)
                     .tool_exists("claude", false)
                     .build(),
             );
-
             let (registry, _) = detect_providers(&repo, &config, runner).await;
-            assert_eq!(
-                registry.coding_agents.contains_key("cursor"),
-                should_register
+            assert!(registry.coding_agents.contains_key("cursor"));
+        }
+        std::env::remove_var("CURSOR_API_KEY");
+
+        // Without CURSOR_API_KEY, agent binary alone is not enough
+        {
+            let (dir, repo) = make_repo_with_git_dir();
+            let config = temp_config(&dir);
+            let runner: Arc<dyn CommandRunner> = Arc::new(
+                discovery_runner()
+                    .on_run("git", &["remote"], Err("no remotes".to_string()))
+                    .tool_exists("wt", false)
+                    .tool_exists("gh", false)
+                    .tool_exists("agent", true)
+                    .tool_exists("claude", false)
+                    .build(),
             );
+            let (registry, _) = detect_providers(&repo, &config, runner).await;
+            assert!(!registry.coding_agents.contains_key("cursor"));
+        }
+
+        // Without agent binary → not registered regardless of env var
+        {
+            let (dir, repo) = make_repo_with_git_dir();
+            let config = temp_config(&dir);
+            let runner: Arc<dyn CommandRunner> = Arc::new(
+                discovery_runner()
+                    .on_run("git", &["remote"], Err("no remotes".to_string()))
+                    .tool_exists("wt", false)
+                    .tool_exists("gh", false)
+                    .tool_exists("agent", false)
+                    .tool_exists("claude", false)
+                    .build(),
+            );
+            let (registry, _) = detect_providers(&repo, &config, runner).await;
+            assert!(!registry.coding_agents.contains_key("cursor"));
         }
     }
 
