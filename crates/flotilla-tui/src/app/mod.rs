@@ -156,8 +156,22 @@ impl App {
             DaemonEvent::Snapshot(snap) => self.apply_snapshot(*snap),
             DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoRemoved { path } => self.handle_repo_removed(&path),
-            DaemonEvent::CommandResult { result, .. } => {
-                // Not used in-process (results returned directly from execute)
+            DaemonEvent::CommandStarted {
+                command_id,
+                repo,
+                description,
+            } => {
+                tracing::debug!(
+                    "command {command_id} started on {}: {description}",
+                    repo.display()
+                );
+            }
+            DaemonEvent::CommandFinished {
+                command_id,
+                repo,
+                result,
+            } => {
+                tracing::debug!("command {command_id} finished on {}", repo.display());
                 executor::handle_result(result, self);
             }
         }
