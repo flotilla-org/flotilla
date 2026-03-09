@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 pub use commands::{CheckoutStatus, Command, CommandResult};
 pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
-    CommitInfo, CorrelationKey, Issue, IssuePage, ProviderData, SessionStatus, WorkingTreeStatus,
-    Workspace,
+    CommitInfo, CorrelationKey, Issue, IssueChangeset, IssuePage, ProviderData, SessionStatus,
+    WorkingTreeStatus, Workspace,
 };
 pub use snapshot::{
     CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem,

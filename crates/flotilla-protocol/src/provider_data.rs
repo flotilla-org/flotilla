@@ -87,6 +87,13 @@ pub struct IssuePage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueChangeset {
+    pub updated: Vec<Issue>,
+    pub closed_ids: Vec<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudAgentSession {
     pub id: String,
     pub title: String,
@@ -337,6 +344,29 @@ mod tests {
         assert!(pd.remote_branches.is_empty());
         assert!(pd.merged_branches.is_empty());
         assert!(pd.workspaces.is_empty());
+    }
+
+    #[test]
+    fn issue_changeset_roundtrip() {
+        let changeset = IssueChangeset {
+            updated: vec![Issue {
+                id: "42".into(),
+                title: "Updated issue".into(),
+                labels: vec!["bug".into()],
+                association_keys: vec![],
+            }],
+            closed_ids: vec!["7".into(), "13".into()],
+            has_more: false,
+        };
+        assert_roundtrip(&changeset);
+
+        // Empty changeset
+        let empty = IssueChangeset {
+            updated: vec![],
+            closed_ids: vec![],
+            has_more: false,
+        };
+        assert_roundtrip(&empty);
     }
 
     #[test]
