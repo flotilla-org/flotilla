@@ -129,11 +129,24 @@ async fn refresh_providers(
     };
 
     let sessions_fut = async {
-        if let Some(ca) = registry.coding_agents.values().next() {
-            ca.list_sessions(criteria).await
-        } else {
-            Ok(vec![])
+        if registry.coding_agents.is_empty() {
+            return (vec![], vec![]);
         }
+        let results = futures::future::join_all(registry.coding_agents.iter().map(|(name, ca)| {
+            let provider = name.clone();
+            async move { (provider, ca.list_sessions(criteria).await) }
+        }))
+        .await;
+
+        let mut sessions = Vec::new();
+        let mut session_errors = Vec::new();
+        for (provider, result) in results {
+            match result {
+                Ok(mut entries) => sessions.append(&mut entries),
+                Err(e) => session_errors.push(format!("{provider}: {e}")),
+            }
+        }
+        (sessions, session_errors)
     };
 
     let branches_fut = async {
@@ -160,7 +173,7 @@ async fn refresh_providers(
         }
     };
 
-    let (checkouts, crs, sessions, branches, merged, workspaces) = tokio::join!(
+    let (checkouts, crs, sessions_bundle, branches, merged, workspaces) = tokio::join!(
         checkouts_fut,
         cr_fut,
         sessions_fut,
@@ -199,16 +212,14 @@ async fn refresh_providers(
         })
         .into_iter()
         .collect();
-    pd.sessions = sessions
-        .unwrap_or_else(|e| {
-            errors.push(RefreshError {
-                category: "sessions",
-                message: e,
-            });
-            Vec::new()
-        })
-        .into_iter()
-        .collect();
+    let (sessions, session_errors) = sessions_bundle;
+    if !session_errors.is_empty() {
+        errors.push(RefreshError {
+            category: "sessions",
+            message: session_errors.join("; "),
+        });
+    }
+    pd.sessions = sessions.into_iter().collect();
     {
         use flotilla_protocol::delta::{Branch, BranchStatus};
         let remote = branches.unwrap_or_else(|e| {

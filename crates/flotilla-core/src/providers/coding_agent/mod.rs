@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod cursor;
 
 use crate::providers::types::{CloudAgentSession, RepoCriteria};
 use async_trait::async_trait;
