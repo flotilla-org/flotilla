@@ -29,6 +29,10 @@ use crate::model::{provider_names_from_registry, repo_name, RepoModel};
 use crate::providers::CommandRunner;
 use crate::refresh::RefreshSnapshot;
 
+/// Returned by `execute()` for commands that run inline without lifecycle events.
+/// Callers must not treat this as a real command ID for in-flight tracking.
+const INLINE_COMMAND_ID: u64 = 0;
+
 /// Extract issue IDs referenced by association keys on change requests and checkouts.
 fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
     let mut ids = HashSet::new();
@@ -649,23 +653,23 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
-        // Issue commands: execute inline (already backgrounded by TUI).
-        // No command ID or lifecycle events — these are internal cache operations.
+        // Issue commands: execute inline, no lifecycle events.
+        // These are synchronous cache operations that return immediately.
         match &command {
             Command::SetIssueViewport { visible_count, .. } => {
                 self.ensure_issues_cached(repo, *visible_count * 2).await;
                 self.broadcast_snapshot(repo).await;
-                return Ok(0);
+                return Ok(INLINE_COMMAND_ID);
             }
             Command::FetchMoreIssues { desired_count, .. } => {
                 self.ensure_issues_cached(repo, *desired_count).await;
                 self.broadcast_snapshot(repo).await;
-                return Ok(0);
+                return Ok(INLINE_COMMAND_ID);
             }
             Command::SearchIssues { query, .. } => {
                 self.search_issues(repo, query).await;
                 self.broadcast_snapshot(repo).await;
-                return Ok(0);
+                return Ok(INLINE_COMMAND_ID);
             }
             Command::ClearIssueSearch { .. } => {
                 let mut repos = self.repos.write().await;
@@ -674,7 +678,7 @@ impl DaemonHandle for InProcessDaemon {
                 }
                 drop(repos);
                 self.broadcast_snapshot(repo).await;
-                return Ok(0);
+                return Ok(INLINE_COMMAND_ID);
             }
             _ => {}
         }

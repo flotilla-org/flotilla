@@ -201,8 +201,8 @@ impl App {
             } => {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
                     tracing::info!("command {command_id} finished");
+                    executor::handle_result(result, self);
                 }
-                executor::handle_result(result, self);
             }
         }
     }
