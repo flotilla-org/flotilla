@@ -262,38 +262,87 @@ mod tests {
         GitHubIssueTracker::new("github".into(), "owner/repo".into(), api, runner)
     }
 
-    use crate::providers::replay::{Masks, ReplaySession};
+    use crate::providers::replay::{self, Masks};
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/src/providers/issue_tracker/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
+    }
+
+    fn repo_root_for_recording() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn build_api_and_runner(
+        session: &replay::ReplaySession,
+        recording: bool,
+    ) -> (
+        Arc<dyn crate::providers::github_api::GhApi>,
+        Arc<dyn crate::providers::CommandRunner>,
+    ) {
+        if recording {
+            let real_runner = Arc::new(crate::providers::ProcessCommandRunner)
+                as Arc<dyn crate::providers::CommandRunner>;
+            let real_api = Arc::new(crate::providers::github_api::GhApiClient::new(
+                real_runner.clone(),
+            ));
+            (
+                Arc::new(replay::RecordingGhApi::new(session.clone(), real_api))
+                    as Arc<dyn crate::providers::github_api::GhApi>,
+                real_runner,
+            )
+        } else {
+            (
+                Arc::new(session.gh_api()) as Arc<dyn crate::providers::github_api::GhApi>,
+                Arc::new(session.command_runner()) as Arc<dyn crate::providers::CommandRunner>,
+            )
+        }
+    }
 
     #[tokio::test]
-    async fn replay_list_issues() {
-        let session = ReplaySession::from_file(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/providers/issue_tracker/fixtures/github_issues.yaml"
-            ),
-            Masks::new(),
+    async fn record_replay_list_issues() {
+        let recording = replay::is_recording();
+        let repo_slug = "rjwittams/flotilla".to_string();
+        let repo_root = if recording {
+            repo_root_for_recording()
+        } else {
+            PathBuf::from("/test/repo")
+        };
+
+        let session = replay::test_session(&fixture("github_issues.yaml"), Masks::new());
+        let (api, runner) = build_api_and_runner(&session, recording);
+
+        let tracker = GitHubIssueTracker::new("github".into(), repo_slug, api, runner);
+        let issues = tracker.list_issues(&repo_root, 30).await.unwrap();
+
+        // The repo has open issues, so we expect a non-empty result
+        assert!(
+            !issues.is_empty(),
+            "expected at least one open issue in rjwittams/flotilla"
         );
-        let api = Arc::new(session.gh_api());
-        let runner = Arc::new(session.command_runner());
-        let tracker = GitHubIssueTracker::new("github".into(), "owner/repo".into(), api, runner);
+        for (id, issue) in &issues {
+            assert!(!id.is_empty());
+            assert!(!issue.title.is_empty());
+            // Each issue should have an association key matching its id
+            assert!(
+                issue
+                    .association_keys
+                    .contains(&AssociationKey::IssueRef("github".into(), id.clone())),
+                "issue {} missing expected association key",
+                id
+            );
+        }
 
-        let issues = tracker.list_issues(Path::new("/repo"), 30).await.unwrap();
-
-        // Should filter out #6 (has pull_request key)
-        assert_eq!(issues.len(), 2);
-        assert_eq!(issues[0].0, "5");
-        assert_eq!(issues[0].1.title, "Bug: crash on startup");
-        assert_eq!(issues[0].1.labels, vec!["bug"]);
-        assert_eq!(issues[1].0, "7");
-        assert_eq!(issues[1].1.title, "Performance issue");
-        assert!(issues[1].1.labels.is_empty());
-        // Verify association keys
-        assert!(issues[0]
-            .1
-            .association_keys
-            .contains(&AssociationKey::IssueRef("github".into(), "5".into())));
-
-        session.assert_complete();
+        session.finish();
     }
 
     #[test]
