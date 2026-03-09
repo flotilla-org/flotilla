@@ -1,0 +1,24 @@
+interactions:
+- channel: command
+  cmd: tmux
+  args:
+  - list-windows
+  - '-F'
+  - '#{window_name}'
+  cwd: '.'
+  stdout: |
+    main-work
+    feature-branch
+  stderr: null
+  exit_code: 0
+- channel: command
+  cmd: tmux
+  args:
+  - display-message
+  - '-p'
+  - '#{session_name}'
+  cwd: '.'
+  stdout: |
+    flotilla-test-tmux
+  stderr: null
+  exit_code: 0

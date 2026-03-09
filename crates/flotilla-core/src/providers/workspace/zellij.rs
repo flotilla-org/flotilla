@@ -477,4 +477,118 @@ mod tests {
             .retain(|name, _| live_names.contains(name.as_str()));
         assert_eq!(state.tabs.len(), 2);
     }
+
+    use crate::providers::replay;
+    use crate::providers::workspace::WorkspaceManager;
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/src/providers/workspace/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
+    }
+
+    fn setup_zellij_session() {
+        // Set ZELLIJ_SESSION_NAME so zellij action commands target our session
+        unsafe {
+            std::env::set_var("ZELLIJ_SESSION_NAME", "flotilla-test-zj");
+        }
+
+        // Create a tmux session to host zellij
+        let status = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                "zellij-host",
+                "-x",
+                "80",
+                "-y",
+                "24",
+            ])
+            .status()
+            .expect("failed to create tmux host session");
+        assert!(status.success(), "tmux new-session for zellij host failed");
+
+        // Start zellij inside the tmux session
+        std::process::Command::new("tmux")
+            .args([
+                "send-keys",
+                "-t",
+                "zellij-host",
+                "zellij --session flotilla-test-zj",
+                "Enter",
+            ])
+            .status()
+            .expect("failed to send zellij start command");
+
+        // Wait for zellij to start up
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        // Create a second tab named "feature-tab"
+        let status = std::process::Command::new("zellij")
+            .args(["action", "new-tab", "--name", "feature-tab"])
+            .env("ZELLIJ_SESSION_NAME", "flotilla-test-zj")
+            .status()
+            .expect("failed to create zellij tab");
+        assert!(status.success(), "zellij action new-tab failed");
+
+        // Small delay for tab creation
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    fn teardown_zellij_session() {
+        // Kill the tmux host session (this also kills zellij running inside it)
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", "zellij-host"])
+            .status();
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Force-delete the zellij session
+        let _ = std::process::Command::new("zellij")
+            .args(["delete-session", "flotilla-test-zj", "--force"])
+            .status();
+
+        // Remove ZELLIJ_SESSION_NAME env var
+        unsafe {
+            std::env::remove_var("ZELLIJ_SESSION_NAME");
+        }
+    }
+
+    #[tokio::test]
+    async fn record_replay_list_workspaces() {
+        let recording = replay::is_recording();
+
+        if recording {
+            setup_zellij_session();
+        }
+
+        let session = replay::test_session(&fixture("zellij_list.yaml"), replay::Masks::new());
+        let runner = replay::test_runner(&session);
+
+        let mgr = ZellijWorkspaceManager::new(runner);
+        let workspaces = mgr.list_workspaces().await.unwrap();
+
+        assert_eq!(workspaces.len(), 2);
+        let names: Vec<&str> = workspaces.iter().map(|w| w.1.name.as_str()).collect();
+        assert!(names.contains(&"Tab #1"), "expected 'Tab #1' in {names:?}");
+        assert!(
+            names.contains(&"feature-tab"),
+            "expected 'feature-tab' in {names:?}"
+        );
+
+        // No state file exists, so directories and correlation_keys should be empty
+        for (_key, ws) in &workspaces {
+            assert!(ws.directories.is_empty());
+            assert!(ws.correlation_keys.is_empty());
+        }
+
+        if recording {
+            teardown_zellij_session();
+        }
+
+        session.finish();
+    }
 }

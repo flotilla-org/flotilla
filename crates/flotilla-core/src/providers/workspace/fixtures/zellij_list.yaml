@@ -1,0 +1,12 @@
+interactions:
+- channel: command
+  cmd: zellij
+  args:
+  - action
+  - query-tab-names
+  cwd: '.'
+  stdout: |
+    Tab #1
+    feature-tab
+  stderr: null
+  exit_code: 0

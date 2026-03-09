@@ -463,4 +463,95 @@ mod tests {
             .retain(|name, _| live_names.contains(name.as_str()));
         assert_eq!(state.windows.len(), 2);
     }
+
+    use crate::providers::replay;
+    use crate::providers::workspace::WorkspaceManager;
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/src/providers/workspace/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
+    }
+
+    fn setup_tmux_session() {
+        // Create a headless tmux session with two named windows
+        let status = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                "flotilla-test-tmux",
+                "-x",
+                "80",
+                "-y",
+                "24",
+            ])
+            .status()
+            .expect("failed to create tmux session");
+        assert!(status.success(), "tmux new-session failed");
+
+        let status = std::process::Command::new("tmux")
+            .args(["rename-window", "-t", "flotilla-test-tmux:0", "main-work"])
+            .status()
+            .expect("failed to rename tmux window");
+        assert!(status.success(), "tmux rename-window failed");
+
+        let status = std::process::Command::new("tmux")
+            .args([
+                "new-window",
+                "-t",
+                "flotilla-test-tmux",
+                "-n",
+                "feature-branch",
+            ])
+            .status()
+            .expect("failed to create tmux window");
+        assert!(status.success(), "tmux new-window failed");
+    }
+
+    fn teardown_tmux_session() {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", "flotilla-test-tmux"])
+            .status();
+    }
+
+    #[tokio::test]
+    async fn record_replay_list_workspaces() {
+        let recording = replay::is_recording();
+
+        if recording {
+            setup_tmux_session();
+        }
+
+        let session = replay::test_session(&fixture("tmux_list.yaml"), replay::Masks::new());
+        let runner = replay::test_runner(&session);
+
+        let mgr = TmuxWorkspaceManager::new(runner);
+        let workspaces = mgr.list_workspaces().await.unwrap();
+
+        assert_eq!(workspaces.len(), 2);
+        let names: Vec<&str> = workspaces.iter().map(|w| w.1.name.as_str()).collect();
+        assert!(
+            names.contains(&"main-work"),
+            "expected 'main-work' in {names:?}"
+        );
+        assert!(
+            names.contains(&"feature-branch"),
+            "expected 'feature-branch' in {names:?}"
+        );
+
+        // No state file exists, so directories and correlation_keys should be empty
+        for (_key, ws) in &workspaces {
+            assert!(ws.directories.is_empty());
+            assert!(ws.correlation_keys.is_empty());
+        }
+
+        if recording {
+            teardown_tmux_session();
+        }
+
+        session.finish();
+    }
 }
