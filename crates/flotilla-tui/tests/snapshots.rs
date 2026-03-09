@@ -1,6 +1,7 @@
 mod test_fixtures;
 
 use flotilla_protocol::{ProviderData, SessionStatus};
+use flotilla_tui::app::UiMode;
 use test_fixtures::*;
 
 #[test]
@@ -36,6 +37,28 @@ fn single_repo_with_items() {
     ];
 
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn tab_bar_multiple_repos() {
+    let mut harness = TestHarness::multi_repo(&["alpha", "beta", "gamma"]);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn status_bar_with_error() {
+    let mut harness = TestHarness::single_repo("my-project")
+        .with_status_message("GitHub API rate limit exceeded");
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn help_screen() {
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::Help);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }

@@ -49,7 +49,6 @@ impl TestHarness {
     }
 
     /// Multiple repos by name, all with empty data.
-    #[allow(dead_code)]
     pub fn multi_repo(names: &[&str]) -> Self {
         let infos: Vec<RepoInfo> = names.iter().map(|n| test_repo_info(n)).collect();
         let model = TuiModel::from_repo_info(infos);
@@ -62,14 +61,12 @@ impl TestHarness {
     }
 
     /// Set the UI mode.
-    #[allow(dead_code)]
     pub fn with_mode(mut self, mode: UiMode) -> Self {
         self.ui.mode = mode;
         self
     }
 
     /// Set a status message on the model.
-    #[allow(dead_code)]
     pub fn with_status_message(mut self, msg: &str) -> Self {
         self.model.status_message = Some(msg.to_string());
         self
