@@ -16,6 +16,11 @@ pub trait TerminalPool: Send + Sync {
         command: &str,
         cwd: &Path,
     ) -> Result<(), String>;
-    async fn attach_command(&self, id: &ManagedTerminalId) -> Result<String, String>;
+    async fn attach_command(
+        &self,
+        id: &ManagedTerminalId,
+        command: &str,
+        cwd: &Path,
+    ) -> Result<String, String>;
     async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String>;
 }

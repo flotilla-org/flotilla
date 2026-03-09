@@ -47,9 +47,13 @@ impl ShpoolTerminalPool {
             }
             let index: u32 = parts[2].parse().unwrap_or(0);
 
-            let status = match session["status"].as_str() {
-                Some("attached") => TerminalStatus::Running,
-                Some("disconnected") => TerminalStatus::Disconnected,
+            let status_str = session["status"]
+                .as_str()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let status = match status_str.as_str() {
+                "attached" => TerminalStatus::Running,
+                "disconnected" => TerminalStatus::Disconnected,
                 _ => TerminalStatus::Disconnected,
             };
 
@@ -98,54 +102,35 @@ impl TerminalPool for ShpoolTerminalPool {
 
     async fn ensure_running(
         &self,
+        _id: &ManagedTerminalId,
+        _command: &str,
+        _cwd: &Path,
+    ) -> Result<(), String> {
+        // No-op: shpool creates sessions on first `attach`. The actual session
+        // creation happens when the workspace manager runs the attach_command.
+        Ok(())
+    }
+
+    async fn attach_command(
+        &self,
         id: &ManagedTerminalId,
         command: &str,
         cwd: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let session_name = format!("flotilla/{id}");
         let socket_path_str = self.socket_path.display().to_string();
         let cwd_str = cwd.display().to_string();
-
-        // Try to attach in background mode -- creates session if new, reuses if exists
-        let result = self
-            .runner
-            .run(
-                "shpool",
-                &[
-                    "--socket",
-                    &socket_path_str,
-                    "attach",
-                    "--background",
-                    "--cmd",
-                    command,
-                    "--dir",
-                    &cwd_str,
-                    &session_name,
-                ],
-                Path::new("/"),
-            )
-            .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("already attached") || e.contains("busy") => {
-                // Session already exists and is attached -- that's fine
-                Ok(())
-            }
-            Err(e) => Err(format!(
-                "shpool ensure_running failed for {session_name}: {e}"
-            )),
+        fn sq(s: &str) -> String {
+            format!("'{}'", s.replace('\'', "'\\''"))
         }
-    }
-
-    async fn attach_command(&self, id: &ManagedTerminalId) -> Result<String, String> {
-        let session_name = format!("flotilla/{id}");
-        let socket_path_str = self.socket_path.display().to_string();
-        // Use the same shell quoting approach as CmuxWorkspaceManager
+        // shpool attach creates the session if it doesn't exist (using --cmd/--dir),
+        // or reattaches if it does (ignoring --cmd/--dir).
         Ok(format!(
-            "shpool --socket '{}' attach '{}'",
-            socket_path_str.replace('\'', "'\\''"),
-            session_name.replace('\'', "'\\''"),
+            "shpool --socket {} attach --cmd {} --dir {} {}",
+            sq(&socket_path_str),
+            sq(command),
+            sq(&cwd_str),
+            sq(&session_name),
         ))
     }
 
@@ -175,17 +160,17 @@ mod tests {
                 {
                     "name": "flotilla/my-feature/shell/0",
                     "started_at_unix_ms": 1709900000000,
-                    "status": "attached"
+                    "status": "Attached"
                 },
                 {
                     "name": "flotilla/my-feature/agent/0",
                     "started_at_unix_ms": 1709900001000,
-                    "status": "disconnected"
+                    "status": "Disconnected"
                 },
                 {
                     "name": "user-manual-session",
                     "started_at_unix_ms": 1709900002000,
-                    "status": "attached"
+                    "status": "Attached"
                 }
             ]
         }"#;
@@ -216,10 +201,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_running_calls_shpool_attach_background() {
-        let runner = Arc::new(MockRunner::new(vec![
-            Ok("".into()), // shpool attach --background succeeds
-        ]));
+    async fn ensure_running_is_noop() {
+        let runner = Arc::new(MockRunner::new(vec![]));
         let pool = ShpoolTerminalPool::new(runner, PathBuf::from("/tmp/test.sock"));
         let id = ManagedTerminalId {
             checkout: "feat".into(),
@@ -233,7 +216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_command_returns_shpool_attach() {
+    async fn attach_command_includes_cmd_and_dir() {
         let runner = Arc::new(MockRunner::new(vec![]));
         let pool = ShpoolTerminalPool::new(runner, PathBuf::from("/tmp/test.sock"));
         let id = ManagedTerminalId {
@@ -241,9 +224,16 @@ mod tests {
             role: "shell".into(),
             index: 0,
         };
-        let cmd = pool.attach_command(&id).await.unwrap();
+        let cmd = pool
+            .attach_command(&id, "bash", Path::new("/home/dev"))
+            .await
+            .unwrap();
         assert!(cmd.contains("shpool"));
         assert!(cmd.contains("attach"));
+        assert!(cmd.contains("--cmd"));
+        assert!(cmd.contains("bash"));
+        assert!(cmd.contains("--dir"));
+        assert!(cmd.contains("/home/dev"));
         assert!(cmd.contains("flotilla/feat/shell/0"));
     }
 

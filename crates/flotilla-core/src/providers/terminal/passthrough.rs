@@ -24,7 +24,12 @@ impl TerminalPool for PassthroughTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(&self, _id: &ManagedTerminalId) -> Result<String, String> {
+    async fn attach_command(
+        &self,
+        _id: &ManagedTerminalId,
+        _command: &str,
+        _cwd: &std::path::Path,
+    ) -> Result<String, String> {
         Err("passthrough pool: no attach command available".into())
     }
 
@@ -66,6 +71,6 @@ mod tests {
             role: "shell".into(),
             index: 0,
         };
-        assert!(pool.attach_command(&id).await.is_err());
+        assert!(pool.attach_command(&id, "bash", "/tmp".as_ref()).await.is_err());
     }
 }

@@ -394,7 +394,10 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
                 warn!("failed to ensure terminal {id}: {e}");
                 continue;
             }
-            match terminal_pool.attach_command(&id).await {
+            match terminal_pool
+                .attach_command(&id, &entry.command, &config.working_directory)
+                .await
+            {
                 Ok(cmd) => resolved.push((entry.role.clone(), cmd)),
                 Err(e) => warn!("failed to get attach command for {id}: {e}"),
             }
