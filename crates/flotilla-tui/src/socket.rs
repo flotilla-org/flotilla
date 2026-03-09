@@ -288,7 +288,6 @@ fn handle_event(
 
                     tokio::spawn(async move {
                         recover_from_gap(
-                            &repo,
                             &local_seqs,
                             &event_tx,
                             &writer,
@@ -317,15 +316,18 @@ fn handle_event(
 /// Recover from a seq gap by calling `replay_since` with the stale seq,
 /// updating local seq tracking, and forwarding replay events to the TUI.
 async fn recover_from_gap(
-    repo: &Path,
     local_seqs: &SeqMap,
     event_tx: &broadcast::Sender<DaemonEvent>,
     writer: &Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
     pending: &Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>,
     next_id: &AtomicU64,
 ) {
-    let stale_seq = local_seqs.read().unwrap().get(repo).copied().unwrap_or(0);
-    let last_seen = HashMap::from([(repo.to_path_buf(), stale_seq)]);
+    let last_seen = {
+        let seqs = local_seqs.read().unwrap();
+        seqs.iter()
+            .map(|(path, &seq)| (path.clone(), seq))
+            .collect::<HashMap<_, _>>()
+    };
 
     let resp = send_request(
         writer,
@@ -339,43 +341,31 @@ async fn recover_from_gap(
     match resp {
         Ok(raw) => match raw.parse::<Vec<DaemonEvent>>() {
             Ok(events) => {
-                debug!(
-                    "gap recovery: got {} replay events for {}",
-                    events.len(),
-                    repo.display()
-                );
-                for event in events {
-                    // Update local seq from replay events
-                    match &event {
-                        DaemonEvent::SnapshotFull(snap) if snap.repo == repo => {
-                            local_seqs
-                                .write()
-                                .unwrap()
-                                .insert(repo.to_path_buf(), snap.seq);
+                debug!("gap recovery: got {} replay events", events.len());
+                {
+                    let mut seqs = local_seqs.write().unwrap();
+                    for event in &events {
+                        match event {
+                            DaemonEvent::SnapshotFull(snap) => {
+                                seqs.insert(snap.repo.clone(), snap.seq);
+                            }
+                            DaemonEvent::SnapshotDelta(delta) => {
+                                seqs.insert(delta.repo.clone(), delta.seq);
+                            }
+                            _ => {}
                         }
-                        DaemonEvent::SnapshotDelta(delta) if delta.repo == repo => {
-                            local_seqs
-                                .write()
-                                .unwrap()
-                                .insert(repo.to_path_buf(), delta.seq);
-                        }
-                        _ => {}
                     }
+                }
+                for event in events {
                     let _ = event_tx.send(event);
                 }
             }
             Err(e) => {
-                error!(
-                    "gap recovery: failed to parse replay events for {}: {e}",
-                    repo.display()
-                );
+                error!("gap recovery: failed to parse replay events: {e}");
             }
         },
         Err(e) => {
-            error!(
-                "gap recovery: failed replay_since for {}: {e}",
-                repo.display()
-            );
+            error!("gap recovery: replay_since request failed: {e}");
         }
     }
 }
