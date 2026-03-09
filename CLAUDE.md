@@ -34,6 +34,7 @@ User actions flow: **Intent → Command → Executor → Provider call → Refre
 |-------|------|
 | `flotilla-core` | Providers, correlation, refresh, executor, config, `DaemonHandle` trait, `InProcessDaemon` |
 | `flotilla-protocol` | Serde-only types: commands, results, snapshots, events, envelope |
+| `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering, input handling, event loop, thin executor wrapper |
 | `flotilla-daemon` | Socket server (Step 2, placeholder) |
 | `flotilla` (root) | Thin `src/main.rs` entry point |

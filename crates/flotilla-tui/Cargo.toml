@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+flotilla-client = { path = "../flotilla-client" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 tokio = { workspace = true }
@@ -23,7 +24,6 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 time = { version = "0.3.47", features = ["local-offset"] }
 futures = "0.3"
-libc = "0.2"
 
 [dev-dependencies]
 async-trait = { workspace = true }

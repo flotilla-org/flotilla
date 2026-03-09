@@ -45,7 +45,7 @@ async fn socket_roundtrip() {
     // existence in slower/sandboxed environments.
     let connect_deadline = Instant::now() + Duration::from_secs(10);
     let client = loop {
-        match flotilla_tui::socket::SocketDaemon::connect(&socket_path).await {
+        match flotilla_client::SocketDaemon::connect(&socket_path).await {
             Ok(client) => break client,
             Err(connect_err) => {
                 if server_handle.is_finished() {

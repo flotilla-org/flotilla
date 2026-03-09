@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/flotilla-client",
     "crates/flotilla-core",
     "crates/flotilla-protocol",
     "crates/flotilla-daemon",

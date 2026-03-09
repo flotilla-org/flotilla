@@ -19,5 +19,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
-flotilla-tui = { path = "../flotilla-tui" }
+flotilla-client = { path = "../flotilla-client" }
 flotilla-protocol = { path = "../flotilla-protocol" }
