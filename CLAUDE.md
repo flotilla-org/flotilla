@@ -107,3 +107,24 @@ Stored in `~/.config/flotilla/`:
 - `tab-order.json` — array of repo paths
 
 Workspace templates: `.flotilla/workspace.yaml` in repo root.
+
+## Issue Labels
+
+Use these labels when creating or triaging issues. Combine as appropriate (e.g. `bug` + `ui`, or `from-review` + `refactor` + `quick-win`).
+
+| Label | Use for |
+|-------|---------|
+| `bug` | Something broken or incorrect |
+| `enhancement` | New feature or improvement to existing feature |
+| `refactor` | Code restructuring for maintainability |
+| `ui` | UI/UX and rendering changes |
+| `testing` | Test coverage and testing infrastructure |
+| `infrastructure` | Build, CI, and tooling |
+| `integration` | New provider or tool integration |
+| `vision` | Long-term direction, ambitious features |
+| `documentation` | Docs improvements |
+| `from-review` | Issue filed from PR review feedback |
+| `quick-win` | Small, well-scoped tasks suitable for agent batches |
+| `good first issue` | Good for newcomers |
+| `duplicate` | Already exists |
+| `wontfix` | Will not be worked on |
