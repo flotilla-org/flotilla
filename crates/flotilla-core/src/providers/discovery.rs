@@ -6,6 +6,7 @@ use crate::config::ConfigStore;
 use crate::providers::ai_utility::claude::ClaudeAiUtility;
 use crate::providers::code_review::github::GitHubCodeReview;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
+use crate::providers::coding_agent::codex::CodexCodingAgent;
 use crate::providers::coding_agent::cursor::CursorCodingAgent;
 use crate::providers::github_api::GhApiClient;
 use crate::providers::issue_tracker::github::GitHubIssueTracker;
@@ -193,6 +194,18 @@ pub async fn detect_providers(
             )),
         );
         info!(%repo_name, "Cloud agent → Cursor Cloud Agents");
+    }
+
+    // 4b. Cloud agent: Codex (gated on auth file, not binary — provider uses API directly)
+    if super::coding_agent::codex::codex_auth_file_exists() {
+        registry.cloud_agents.insert(
+            "codex".to_string(),
+            Arc::new(CodexCodingAgent::new(
+                "codex".to_string(),
+                Arc::new(crate::providers::ReqwestHttpClient::new()),
+            )),
+        );
+        info!(%repo_name, "Cloud agent → Codex");
     }
 
     // 5. Cloud agent: Claude Code Web & AI utility
@@ -810,6 +823,51 @@ mod tests {
         let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
         assert!(!registry.checkout_managers.is_empty());
         assert_eq!(runner.exists_call_count("wt"), 1);
+    }
+
+    #[tokio::test]
+    async fn detect_providers_codex_registration_depends_on_auth_file() {
+        // With auth.json present → registered
+        let codex_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            codex_dir.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t","account_id":"a"}}"#,
+        )
+        .unwrap();
+        std::env::set_var("CODEX_HOME", codex_dir.path());
+        {
+            let (dir, repo) = make_repo_with_git_dir();
+            let config = temp_config(&dir);
+            let runner: Arc<dyn CommandRunner> = Arc::new(
+                discovery_runner()
+                    .on_run("git", &["remote"], Err("no remotes".to_string()))
+                    .tool_exists("wt", false)
+                    .tool_exists("gh", false)
+                    .tool_exists("claude", false)
+                    .build(),
+            );
+            let (registry, _) = detect_providers(&repo, &config, runner).await;
+            assert!(registry.cloud_agents.contains_key("codex"));
+        }
+
+        // Without auth.json → not registered
+        std::fs::remove_file(codex_dir.path().join("auth.json")).unwrap();
+        {
+            let (dir, repo) = make_repo_with_git_dir();
+            let config = temp_config(&dir);
+            let runner: Arc<dyn CommandRunner> = Arc::new(
+                discovery_runner()
+                    .on_run("git", &["remote"], Err("no remotes".to_string()))
+                    .tool_exists("wt", false)
+                    .tool_exists("gh", false)
+                    .tool_exists("claude", false)
+                    .build(),
+            );
+            let (registry, _) = detect_providers(&repo, &config, runner).await;
+            assert!(!registry.cloud_agents.contains_key("codex"));
+        }
+
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[tokio::test]
