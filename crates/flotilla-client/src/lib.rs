@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -46,8 +46,8 @@ impl SocketDaemon {
             Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashSet<PathBuf>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
 
@@ -254,25 +254,39 @@ pub async fn connect_or_spawn(
     // Append ".lock" to the full filename to avoid aliasing when the socket
     // path already ends in ".lock" (with_extension would replace it).
     let lock_path = PathBuf::from(format!("{}.lock", socket_path.display()));
-    let lock_path_clone = lock_path.clone();
-    let lock_result = tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
-        .await
-        .map_err(|e| format!("spawn_blocking: {e}"))?;
-    let lock_file = match lock_result {
-        Ok(Some(file)) => Some(file),
-        Ok(None) => {
-            // Another process spawned the daemon — retry connect.
-            // (tmux's "goto retry" after flock releases.)
-            if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
-                return Ok(daemon);
+    const MAX_LOCK_RETRIES: u32 = 3;
+    let mut lock_file = None;
+    for attempt in 0..MAX_LOCK_RETRIES {
+        let lock_path_clone = lock_path.clone();
+        let lock_result = tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
+            .await
+            .map_err(|e| format!("spawn_blocking: {e}"))?;
+        match lock_result {
+            Ok(Some(file)) => {
+                lock_file = Some(file);
+                break;
             }
-            // Their daemon didn't come up — fall through to spawn our own.
-            None
+            Ok(None) => {
+                // Another process spawned the daemon — retry connect.
+                if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+                    return Ok(daemon);
+                }
+                // Their daemon didn't come up — retry lock acquisition rather than
+                // falling through to spawn without mutual exclusion.
+                if attempt + 1 < MAX_LOCK_RETRIES {
+                    warn!(
+                        "connect after lock wait failed (attempt {}), retrying lock",
+                        attempt + 1
+                    );
+                    continue;
+                }
+                warn!("connect after lock wait failed after {MAX_LOCK_RETRIES} attempts, spawning");
+            }
+            Err(e) => {
+                return Err(format!("spawn lock failed: {e}"));
+            }
         }
-        Err(e) => {
-            return Err(format!("spawn lock failed: {e}"));
-        }
-    };
+    }
 
     {
         // Clean up stale socket
@@ -368,7 +382,7 @@ async fn send_request(
 fn handle_event(
     event: DaemonEvent,
     local_seqs: &Arc<SeqMap>,
-    recovering: &Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    recovering: &Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>>,
     event_tx: &broadcast::Sender<DaemonEvent>,
     writer: &Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
     pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>>,
@@ -411,16 +425,21 @@ fn handle_event(
                 }
                 _ => {
                     // Seq gap or unknown repo — spawn recovery if not already in progress.
-                    // Guard prevents concurrent recoveries for the same repo from
-                    // interleaving stale replay events with newer state.
-                    let already_recovering = !recovering.lock().unwrap().insert(repo.clone());
-                    if already_recovering {
+                    // If recovery is already running, buffer this delta so it can be
+                    // re-processed after recovery completes (prevents permanent staleness
+                    // when a live delta arrives during the recovery window).
+                    let mut guard = recovering.lock().unwrap();
+                    if let Some(buf) = guard.get_mut(&repo) {
                         debug!(
-                            "recovery already in progress for {}, skipping",
-                            repo.display()
+                            "recovery in progress for {}, buffering delta (seq {})",
+                            repo.display(),
+                            seq
                         );
+                        buf.push(event);
                         return;
                     }
+                    guard.insert(repo.clone(), Vec::new());
+                    drop(guard);
 
                     if let Some(ls) = local_seq {
                         warn!(
@@ -445,7 +464,20 @@ fn handle_event(
 
                     tokio::spawn(async move {
                         recover_from_gap(&local_seqs, &event_tx, &writer, &pending, &next_id).await;
-                        recovering.lock().unwrap().remove(&repo);
+                        // Drain buffered deltas and re-process. Any that still
+                        // show a gap will trigger a fresh recovery cycle.
+                        let buffered = recovering.lock().unwrap().remove(&repo).unwrap_or_default();
+                        for buffered_event in buffered {
+                            handle_event(
+                                buffered_event,
+                                &local_seqs,
+                                &recovering,
+                                &event_tx,
+                                &writer,
+                                &pending,
+                                &next_id,
+                            );
+                        }
                     });
                 }
             }
