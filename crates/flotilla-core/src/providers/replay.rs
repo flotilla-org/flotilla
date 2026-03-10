@@ -33,6 +33,26 @@ pub enum Interaction {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         headers: HashMap<String, String>,
     },
+    #[serde(rename = "http")]
+    Http {
+        method: String,
+        url: String,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        request_headers: HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_body: Option<String>,
+        status: u16,
+        response_body: String,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        response_headers: HashMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: String,
+    pub headers: HashMap<String, String>,
 }
 
 /// Top-level YAML document.
@@ -157,6 +177,7 @@ impl ReplaySession {
         let actual_channel = match &interaction {
             Interaction::Command { .. } => "command",
             Interaction::GhApi { .. } => "gh_api",
+            Interaction::Http { .. } => "http",
         };
         assert_eq!(
             actual_channel, expected_channel,
@@ -199,6 +220,11 @@ impl ReplaySession {
     /// Create a `ReplayGhApi` that replays gh_api interactions from this session.
     pub fn gh_api(&self) -> ReplayGhApi {
         ReplayGhApi::new(self.clone())
+    }
+
+    /// Create a `ReplayHttp` that replays generic HTTP interactions.
+    pub fn http(&self) -> ReplayHttp {
+        ReplayHttp::new(self.clone())
     }
 
     /// Check that all interactions were consumed.
@@ -353,6 +379,63 @@ pub struct ReplayGhApi {
     session: ReplaySession,
 }
 
+/// A generic HTTP replayer for request/response style tests.
+pub struct ReplayHttp {
+    session: ReplaySession,
+}
+
+impl ReplayHttp {
+    pub fn new(session: ReplaySession) -> Self {
+        Self { session }
+    }
+
+    pub async fn request(
+        &self,
+        method: &str,
+        url: &str,
+        request_headers: &HashMap<String, String>,
+        request_body: Option<&str>,
+    ) -> Result<HttpResponse, String> {
+        let interaction = self.session.next("http");
+        let Interaction::Http {
+            method: expected_method,
+            url: expected_url,
+            request_headers: expected_headers,
+            request_body: expected_body,
+            status,
+            response_body,
+            response_headers,
+        } = interaction
+        else {
+            panic!("ReplayHttp: expected http interaction");
+        };
+
+        assert_eq!(
+            method, expected_method,
+            "ReplayHttp: method mismatch for URL '{url}'"
+        );
+        assert_eq!(
+            url, expected_url,
+            "ReplayHttp: URL mismatch for method '{method}'"
+        );
+        assert_eq!(
+            request_headers, &expected_headers,
+            "ReplayHttp: request headers mismatch for '{method} {url}'"
+        );
+        assert_eq!(
+            request_body.map(|s| s.to_string()),
+            expected_body,
+            "ReplayHttp: request body mismatch for '{method} {url}'"
+        );
+
+        Ok(HttpResponse {
+            status,
+            body: response_body,
+            headers: response_headers,
+        })
+    }
+}
+
 impl ReplayGhApi {
     pub fn new(session: ReplaySession) -> Self {
         Self { session }
@@ -459,6 +542,29 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             status: *status,
             body: masks.unmask(body),
             headers: headers
+                .iter()
+                .map(|(k, v)| (k.clone(), masks.unmask(v)))
+                .collect(),
+        },
+        Interaction::Http {
+            method,
+            url,
+            request_headers,
+            request_body,
+            status,
+            response_body,
+            response_headers,
+        } => Interaction::Http {
+            method: method.clone(),
+            url: masks.unmask(url),
+            request_headers: request_headers
+                .iter()
+                .map(|(k, v)| (k.clone(), masks.unmask(v)))
+                .collect(),
+            request_body: request_body.as_ref().map(|s| masks.unmask(s)),
+            status: *status,
+            response_body: masks.unmask(response_body),
+            response_headers: response_headers
                 .iter()
                 .map(|(k, v)| (k.clone(), masks.unmask(v)))
                 .collect(),
@@ -666,6 +772,29 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             status: *status,
             body: masks.mask(body),
             headers: headers
+                .iter()
+                .map(|(k, v)| (k.clone(), masks.mask(v)))
+                .collect(),
+        },
+        Interaction::Http {
+            method,
+            url,
+            request_headers,
+            request_body,
+            status,
+            response_body,
+            response_headers,
+        } => Interaction::Http {
+            method: method.clone(),
+            url: masks.mask(url),
+            request_headers: request_headers
+                .iter()
+                .map(|(k, v)| (k.clone(), masks.mask(v)))
+                .collect(),
+            request_body: request_body.as_ref().map(|s| masks.mask(s)),
+            status: *status,
+            response_body: masks.mask(response_body),
+            response_headers: response_headers
                 .iter()
                 .map(|(k, v)| (k.clone(), masks.mask(v)))
                 .collect(),
@@ -936,5 +1065,39 @@ interactions:
 
             session.assert_complete();
         }
+    }
+
+    #[tokio::test]
+    async fn replay_http_request_round_trip() {
+        let yaml = r#"
+interactions:
+  - channel: http
+    method: GET
+    url: "https://example.test/v1/sessions"
+    request_headers:
+      authorization: "Bearer token-1"
+      anthropic-version: "2023-06-01"
+    status: 200
+    response_body: '{"data":[]}'
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("http.yaml");
+        std::fs::write(&path, yaml).unwrap();
+
+        let session = ReplaySession::from_file(&path, Masks::new());
+        let http = session.http();
+        let headers = HashMap::from([
+            ("authorization".to_string(), "Bearer token-1".to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ]);
+
+        let response = http
+            .request("GET", "https://example.test/v1/sessions", &headers, None)
+            .await
+            .expect("http request should replay");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"data":[]}"#);
+        assert!(response.headers.is_empty());
+        session.assert_complete();
     }
 }

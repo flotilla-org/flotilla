@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use reqwest;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -141,6 +142,50 @@ fn session_url_for(base_url: &str, session_id: &str) -> String {
     )
 }
 
+struct HttpResponse {
+    status: u16,
+    body: String,
+}
+
+#[async_trait]
+trait ClaudeHttp: Send + Sync {
+    async fn request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        json_body: Option<serde_json::Value>,
+    ) -> Result<HttpResponse, String>;
+}
+
+struct ReqwestClaudeHttp;
+
+#[async_trait]
+impl ClaudeHttp for ReqwestClaudeHttp {
+    async fn request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        json_body: Option<serde_json::Value>,
+    ) -> Result<HttpResponse, String> {
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|e| format!("invalid HTTP method '{method}': {e}"))?;
+        let client = reqwest::Client::new();
+        let mut req = client.request(method, url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        if let Some(body) = json_body.as_ref() {
+            req = req.json(body);
+        }
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Ok(HttpResponse { status, body })
+    }
+}
+
 // ---------- auth helpers ----------
 
 async fn read_oauth_token_from_keychain(runner: &dyn CommandRunner) -> Result<OAuthToken, String> {
@@ -188,6 +233,20 @@ fn invalidate_auth_cache() {
 }
 
 impl ClaudeCodingAgent {
+    fn request_headers(access_token: &str) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "authorization".to_string(),
+                format!("Bearer {access_token}"),
+            ),
+            (
+                "anthropic-beta".to_string(),
+                "ccr-byoc-2025-07-29".to_string(),
+            ),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ])
+    }
+
     /// Fetch all non-archived sessions from the API, sorted by updated_at descending.
     /// Returns empty list on auth errors (insufficient scopes, expired token) to
     /// degrade gracefully instead of spamming errors on every refresh cycle.
@@ -199,12 +258,20 @@ impl ClaudeCodingAgent {
         runner: &dyn CommandRunner,
         base_url: &str,
     ) -> Result<Vec<WebSession>, String> {
-        match Self::fetch_sessions_inner_with_base(runner, base_url).await {
+        Self::fetch_sessions_with_http(runner, &ReqwestClaudeHttp, base_url).await
+    }
+
+    async fn fetch_sessions_with_http(
+        runner: &dyn CommandRunner,
+        http: &dyn ClaudeHttp,
+        base_url: &str,
+    ) -> Result<Vec<WebSession>, String> {
+        match Self::fetch_sessions_inner_with_http(runner, http, base_url).await {
             Ok(sessions) => Ok(sessions),
             Err(e) if e.contains("authentication") || e.contains("missing field `data`") => {
                 debug!("session fetch failed, clearing auth cache and retrying: {e}");
                 invalidate_auth_cache();
-                match Self::fetch_sessions_inner_with_base(runner, base_url).await {
+                match Self::fetch_sessions_inner_with_http(runner, http, base_url).await {
                     Ok(sessions) => Ok(sessions),
                     Err(e) if e.contains("authentication") => {
                         if !AUTH_WARNED.swap(true, Ordering::Relaxed) {
@@ -220,36 +287,31 @@ impl ClaudeCodingAgent {
         }
     }
 
-    async fn fetch_sessions_inner_with_base(
+    async fn fetch_sessions_inner_with_http(
         runner: &dyn CommandRunner,
+        http: &dyn ClaudeHttp,
         base_url: &str,
     ) -> Result<Vec<WebSession>, String> {
         let token = get_oauth_token(runner).await?;
         let access_token = token.access_token;
+        let headers = Self::request_headers(&access_token);
+        let resp = http
+            .request("GET", &sessions_url_for(base_url), &headers, None)
+            .await?;
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(sessions_url_for(base_url))
-            .bearer_auth(&access_token)
-            .header("anthropic-beta", "ccr-byoc-2025-07-29")
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let status = resp.status();
+        let status = resp.status;
         if status == 401 || status == 403 {
             return Err(format!("authentication error (HTTP {status})"));
         }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("session fetch failed (HTTP {status}): {body}"));
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "session fetch failed (HTTP {status}): {}",
+                resp.body
+            ));
         }
 
-        let resp: SessionsResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("session parse error: {e}"))?;
+        let resp: SessionsResponse =
+            serde_json::from_str(&resp.body).map_err(|e| format!("session parse error: {e}"))?;
 
         let mut sessions: Vec<WebSession> = resp
             .data
@@ -265,28 +327,38 @@ impl ClaudeCodingAgent {
         session_id: &str,
         base_url: &str,
     ) -> Result<(), String> {
+        self.archive_session_with_http(session_id, base_url, &ReqwestClaudeHttp)
+            .await
+    }
+
+    async fn archive_session_with_http(
+        &self,
+        session_id: &str,
+        base_url: &str,
+        http: &dyn ClaudeHttp,
+    ) -> Result<(), String> {
         info!("archiving session {session_id}");
         let token = get_oauth_token(&*self.runner).await?;
         let access_token = token.access_token;
 
         let url = session_url_for(base_url, session_id);
-        let client = reqwest::Client::new();
-        let resp = client
-            .patch(&url)
-            .bearer_auth(&access_token)
-            .header("anthropic-beta", "ccr-byoc-2025-07-29")
-            .header("anthropic-version", "2023-06-01")
-            .json(&serde_json::json!({"session_status": "archived"}))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        let headers = Self::request_headers(&access_token);
+        let resp = http
+            .request(
+                "PATCH",
+                &url,
+                &headers,
+                Some(serde_json::json!({"session_status": "archived"})),
+            )
+            .await?;
 
-        if resp.status().is_success() {
+        if (200..300).contains(&resp.status) {
             Ok(())
         } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            Err(format!("archive session failed (HTTP {status}): {body}"))
+            Err(format!(
+                "archive session failed (HTTP {}): {}",
+                resp.status, resp.body
+            ))
         }
     }
 }
@@ -416,138 +488,61 @@ impl super::CodingAgent for ClaudeCodingAgent {
 mod tests {
     use super::*;
     use crate::providers::coding_agent::CodingAgent;
-    use std::collections::{HashMap, VecDeque};
+    use crate::providers::replay;
+    use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
 
     static TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
-    #[derive(Debug, Clone)]
-    struct TestResponse {
-        status: u16,
-        body: String,
+    struct ReplayClaudeHttp {
+        session: replay::ReplaySession,
+        replay_http: replay::ReplayHttp,
     }
 
-    #[derive(Debug, Clone)]
-    struct CapturedRequest {
-        method: String,
-        path: String,
-        headers: HashMap<String, String>,
-        body: String,
-    }
-
-    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
-    }
-
-    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> CapturedRequest {
-        let mut buf = Vec::new();
-        let mut read_buf = [0u8; 1024];
-        let header_end = loop {
-            let n = stream.read(&mut read_buf).await.expect("read request");
-            assert!(n > 0, "unexpected EOF before headers");
-            buf.extend_from_slice(&read_buf[..n]);
-            if let Some(pos) = find_bytes(&buf, b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-
-        let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let mut lines = header_text.split("\r\n").filter(|line| !line.is_empty());
-        let request_line = lines.next().expect("missing request line");
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_string();
-        let path = parts.next().unwrap_or_default().to_string();
-
-        let mut headers = HashMap::new();
-        let mut content_length = 0usize;
-        for line in lines {
-            if let Some((k, v)) = line.split_once(':') {
-                let key = k.trim().to_ascii_lowercase();
-                let value = v.trim().to_string();
-                if key == "content-length" {
-                    content_length = value.parse().unwrap_or(0);
-                }
-                headers.insert(key, value);
+    impl ReplayClaudeHttp {
+        fn new(interactions: Vec<replay::Interaction>) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fixture_path = dir.path().join("claude_http.yaml");
+            let log = replay::InteractionLog { interactions };
+            let yaml = serde_yml::to_string(&log).expect("serialize interactions");
+            std::fs::write(&fixture_path, yaml).expect("write fixture");
+            let session = replay::ReplaySession::from_file(&fixture_path, replay::Masks::new());
+            let replay_http = session.http();
+            Self {
+                session,
+                replay_http,
             }
         }
 
-        while buf.len() < header_end + content_length {
-            let n = stream.read(&mut read_buf).await.expect("read request body");
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&read_buf[..n]);
-        }
-
-        let body = String::from_utf8_lossy(&buf[header_end..]).to_string();
-        CapturedRequest {
-            method,
-            path,
-            headers,
-            body,
+        fn assert_complete(&self) {
+            self.session.assert_complete();
         }
     }
 
-    fn status_text(status: u16) -> &'static str {
-        match status {
-            200 => "OK",
-            201 => "Created",
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            500 => "Internal Server Error",
-            _ => "Unknown",
+    #[async_trait::async_trait]
+    impl ClaudeHttp for ReplayClaudeHttp {
+        async fn request(
+            &self,
+            method: &str,
+            url: &str,
+            headers: &HashMap<String, String>,
+            json_body: Option<serde_json::Value>,
+        ) -> Result<HttpResponse, String> {
+            let response = self
+                .replay_http
+                .request(
+                    method,
+                    url,
+                    headers,
+                    json_body.as_ref().map(|v| v.to_string()).as_deref(),
+                )
+                .await?;
+            Ok(HttpResponse {
+                status: response.status,
+                body: response.body,
+            })
         }
-    }
-
-    async fn spawn_test_server(
-        responses: Vec<TestResponse>,
-    ) -> (
-        String,
-        Arc<Mutex<Vec<CapturedRequest>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let queued = Arc::new(Mutex::new(VecDeque::from(responses)));
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let queued_clone = Arc::clone(&queued);
-        let captured_clone = Arc::clone(&captured);
-
-        let task = tokio::spawn(async move {
-            loop {
-                let response = {
-                    let mut guard = queued_clone.lock().unwrap();
-                    guard.pop_front()
-                };
-                let Some(response) = response else {
-                    break;
-                };
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                let request = read_http_request(&mut stream).await;
-                captured_clone.lock().unwrap().push(request);
-
-                let status = response.status;
-                let body = response.body;
-                let wire = format!(
-                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    status,
-                    status_text(status),
-                    body.len(),
-                    body
-                );
-                stream
-                    .write_all(wire.as_bytes())
-                    .await
-                    .expect("write response");
-            }
-        });
-
-        (base_url, captured, task)
     }
 
     fn now_epoch_secs() -> i64 {
@@ -580,6 +575,29 @@ mod tests {
 
     fn mock_runner_arc(responses: Vec<Result<String, String>>) -> Arc<dyn CommandRunner> {
         Arc::new(mock_runner(responses))
+    }
+
+    fn interaction_headers(token: &str) -> HashMap<String, String> {
+        ClaudeCodingAgent::request_headers(token)
+    }
+
+    fn http_interaction(
+        method: &str,
+        url: String,
+        token: &str,
+        request_body: Option<String>,
+        status: u16,
+        response_body: String,
+    ) -> replay::Interaction {
+        replay::Interaction::Http {
+            method: method.to_string(),
+            url,
+            request_headers: interaction_headers(token),
+            request_body,
+            status,
+            response_body,
+            response_headers: HashMap::new(),
+        }
     }
 
     #[tokio::test]
@@ -638,26 +656,25 @@ mod tests {
             ]
         })
         .to_string();
-        let (base_url, captured, server_task) =
-            spawn_test_server(vec![TestResponse { status: 200, body }]).await;
+        let base_url = "https://api.test";
+        let replay_http = ReplayClaudeHttp::new(vec![http_interaction(
+            "GET",
+            sessions_url_for(base_url),
+            "abc123",
+            None,
+            200,
+            body,
+        )]);
 
-        let sessions = ClaudeCodingAgent::fetch_sessions_inner_with_base(&runner, &base_url)
-            .await
-            .expect("fetch sessions");
-        server_task.await.expect("server task");
+        let sessions =
+            ClaudeCodingAgent::fetch_sessions_inner_with_http(&runner, &replay_http, base_url)
+                .await
+                .expect("fetch sessions");
+        replay_http.assert_complete();
 
         assert_eq!(sessions.len(), 2, "archived sessions should be filtered");
         assert_eq!(sessions[0].id, "new", "sessions should be sorted desc");
         assert_eq!(sessions[1].id, "old");
-
-        let captured = captured.lock().unwrap();
-        let req = captured.first().expect("captured request");
-        assert_eq!(req.method, "GET");
-        assert_eq!(req.path, "/v1/sessions");
-        assert_eq!(
-            req.headers.get("authorization").map(String::as_str),
-            Some("Bearer abc123")
-        );
     }
 
     #[tokio::test]
@@ -668,35 +685,33 @@ mod tests {
             Ok(token_json("expired", now_epoch_secs() + 3600)),
             Ok(token_json("fresh", now_epoch_secs() + 3600)),
         ]);
-        let (base_url, captured, server_task) = spawn_test_server(vec![
-            TestResponse {
-                status: 401,
-                body: "{}".to_string(),
-            },
-            TestResponse {
-                status: 200,
-                body: serde_json::json!({"data":[{"id":"s1","title":"Recovered","session_status":"running","updated_at":"2026-03-02T00:00:00Z","session_context":{"model":"","outcomes":[]}}]}).to_string(),
-            },
-        ])
-        .await;
+        let base_url = "https://api.test";
+        let replay_http = ReplayClaudeHttp::new(vec![
+            http_interaction(
+                "GET",
+                sessions_url_for(base_url),
+                "expired",
+                None,
+                401,
+                "{}".to_string(),
+            ),
+            http_interaction(
+                "GET",
+                sessions_url_for(base_url),
+                "fresh",
+                None,
+                200,
+                serde_json::json!({"data":[{"id":"s1","title":"Recovered","session_status":"running","updated_at":"2026-03-02T00:00:00Z","session_context":{"model":"","outcomes":[]}}]}).to_string(),
+            ),
+        ]);
 
-        let sessions = ClaudeCodingAgent::fetch_sessions_with_base(&runner, &base_url)
+        let sessions = ClaudeCodingAgent::fetch_sessions_with_http(&runner, &replay_http, base_url)
             .await
             .expect("retry should succeed");
-        server_task.await.expect("server task");
+        replay_http.assert_complete();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s1");
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.len(), 2);
-        assert_eq!(
-            captured[0].headers.get("authorization").map(String::as_str),
-            Some("Bearer expired")
-        );
-        assert_eq!(
-            captured[1].headers.get("authorization").map(String::as_str),
-            Some("Bearer fresh")
-        );
     }
 
     #[tokio::test]
@@ -707,34 +722,32 @@ mod tests {
             Ok(token_json("bad-1", now_epoch_secs() + 3600)),
             Ok(token_json("bad-2", now_epoch_secs() + 3600)),
         ]);
-        let (base_url, captured, server_task) = spawn_test_server(vec![
-            TestResponse {
-                status: 403,
-                body: "{}".to_string(),
-            },
-            TestResponse {
-                status: 401,
-                body: "{}".to_string(),
-            },
-        ])
-        .await;
+        let base_url = "https://api.test";
+        let replay_http = ReplayClaudeHttp::new(vec![
+            http_interaction(
+                "GET",
+                sessions_url_for(base_url),
+                "bad-1",
+                None,
+                403,
+                "{}".to_string(),
+            ),
+            http_interaction(
+                "GET",
+                sessions_url_for(base_url),
+                "bad-2",
+                None,
+                401,
+                "{}".to_string(),
+            ),
+        ]);
 
-        let sessions = ClaudeCodingAgent::fetch_sessions_with_base(&runner, &base_url)
+        let sessions = ClaudeCodingAgent::fetch_sessions_with_http(&runner, &replay_http, base_url)
             .await
             .expect("auth failures should degrade gracefully");
-        server_task.await.expect("server task");
+        replay_http.assert_complete();
 
         assert!(sessions.is_empty());
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.len(), 2);
-        assert_eq!(
-            captured[0].headers.get("authorization").map(String::as_str),
-            Some("Bearer bad-1")
-        );
-        assert_eq!(
-            captured[1].headers.get("authorization").map(String::as_str),
-            Some("Bearer bad-2")
-        );
     }
 
     #[tokio::test]
@@ -829,39 +842,38 @@ mod tests {
             Ok(token_json("archive-token", now_epoch_secs() + 3600)),
         ]);
         let agent = ClaudeCodingAgent::new("claude".into(), runner);
-        let (base_url, captured, server_task) = spawn_test_server(vec![
-            TestResponse {
-                status: 200,
-                body: "{}".to_string(),
-            },
-            TestResponse {
-                status: 500,
-                body: "boom".to_string(),
-            },
-        ])
-        .await;
+        let base_url = "https://api.test";
+        let replay_http = ReplayClaudeHttp::new(vec![
+            http_interaction(
+                "PATCH",
+                session_url_for(base_url, "s-ok"),
+                "archive-token",
+                Some(serde_json::json!({"session_status":"archived"}).to_string()),
+                200,
+                "{}".to_string(),
+            ),
+            http_interaction(
+                "PATCH",
+                session_url_for(base_url, "s-fail"),
+                "archive-token",
+                Some(serde_json::json!({"session_status":"archived"}).to_string()),
+                500,
+                "boom".to_string(),
+            ),
+        ]);
 
         agent
-            .archive_session_with_base("s-ok", &base_url)
+            .archive_session_with_http("s-ok", base_url, &replay_http)
             .await
             .expect("first archive should succeed");
         let err = agent
-            .archive_session_with_base("s-fail", &base_url)
+            .archive_session_with_http("s-fail", base_url, &replay_http)
             .await
             .expect_err("second archive should fail");
-        server_task.await.expect("server task");
+        replay_http.assert_complete();
 
         assert!(err.contains("HTTP 500"));
         assert!(err.contains("boom"));
-
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].method, "PATCH");
-        assert_eq!(captured[0].path, "/v1/sessions/s-ok");
-        assert!(
-            captured[0].body.contains("\"session_status\":\"archived\""),
-            "archive payload should include archived status"
-        );
     }
 
     #[tokio::test]
