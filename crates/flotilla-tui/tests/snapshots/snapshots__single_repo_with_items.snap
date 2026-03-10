@@ -4,15 +4,15 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: checkout feat-login              │
+│      Path     Description     Branch   WT  WS  PR   SS   Issues Git  ││Description: checkout feat-login              │
 │      ── Checkouts ──                                                 ││Branch: feat-login                            │
-│▸  ○     feat-lo checkout fe feat-login ✓                             ││Path: /test/my-project/feat-login             │
+│▸  ○       fea checkout feat-l feat-log ✓                             ││Path: /test/my-project/feat-login             │
 │      ── Sessions ──                                                  ││                                              │
-│   ◆             session s1  feat/sessi              ◆                ││                                              │
+│   ◆           session s1      feat/ses              ◆                ││                                              │
 │      ── Pull Requests ──                                             ││                                              │
-│   ⊙             Add login p feat-login         #42                   ││                                              │
+│   ⊙           Add login page  feat-log         #42                   ││                                              │
 │      ── Issues ──                                                    ││                                              │
-│   ◇             Users need  —                            #10         ││                                              │
+│   ◇           Users need auth —                          #10         ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
