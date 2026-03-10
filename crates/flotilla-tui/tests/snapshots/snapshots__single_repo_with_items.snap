@@ -4,15 +4,15 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path     Description     Branch          WT  WS  PR  SS  Iss Git││Description: checkout feat-login              │
-│               ── Checkouts ──                                        ││Branch: feat-login                            │
-│▸  ○  feat-log checkout feat-… feat-login      ✓                      ││Path: /test/my-project/feat-login             │
-│               ── Sessions ──                                         ││                                              │
-│   ◆           session s1      feat/session-b…             ◆          ││                                              │
-│               ── Pull Request                                        ││                                              │
-│   ⊙           Add login page  feat-login              #42            ││                                              │
-│               ── Issues ──                                           ││                                              │
-│   ◇           Users need aut… —                               #10    ││                                              │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: checkout feat-login              │
+│      ── Checkouts ──                                                 ││Branch: feat-login                            │
+│▸  ○     feat-lo checkout fe feat-login ✓                             ││Path: /test/my-project/feat-login             │
+│      ── Sessions ──                                                  ││                                              │
+│   ◆             session s1  feat/sessi              ◆                ││                                              │
+│      ── Pull Requests ──                                             ││                                              │
+│   ⊙             Add login p feat-login         #42                   ││                                              │
+│      ── Issues ──                                                    ││                                              │
+│   ◇             Users need  —                            #10         ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

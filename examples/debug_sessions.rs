@@ -31,7 +31,7 @@ async fn main() {
     println!("  checkout_managers: {}", registry.checkout_managers.len());
     println!("  code_review: {}", registry.code_review.len());
     println!("  issue_trackers: {}", registry.issue_trackers.len());
-    println!("  coding_agents: {}", registry.coding_agents.len());
+    println!("  cloud_agents: {}", registry.cloud_agents.len());
     println!("  vcs: {}", registry.vcs.len());
     println!(
         "  workspace_manager: {}",

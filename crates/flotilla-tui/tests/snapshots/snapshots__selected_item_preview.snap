@@ -4,11 +4,11 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path     Description     Branch          WT  WS  PR  SS  Iss Git││Description: checkout feat-dashboard          │
-│               ── Checkouts ──                                        ││Branch: feat-dashboard                        │
-│▸  ○  feat-das checkout feat-… feat-dashboard  ✓                      ││Path: /test/my-project/feat-dashboard         │
-│               ── Pull Request                                        ││                                              │
-│   ⊙           Build analytic… feat-dashboard          #99            ││                                              │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: checkout feat-dashboard          │
+│      ── Checkouts ──                                                 ││Branch: feat-dashboard                        │
+│▸  ○  feat-dashb checkout fe feat-dashb ✓                             ││Path: /test/my-project/feat-dashboard         │
+│      ── Pull Requests ──                                             ││                                              │
+│   ⊙             Build analy feat-dashb         #99                   ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

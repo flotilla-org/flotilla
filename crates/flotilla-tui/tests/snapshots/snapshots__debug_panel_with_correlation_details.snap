@@ -4,9 +4,9 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Description     Branch          WT  WS  PR   SS   Issues   Git  ││Description: Feature branch checkout          │
-│      ── Worktrees ──                                                 ││Branch: feat-xyz                              │
-│▸  ○  Feature branch… feat-xyz        ✓                               ││                                              │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: Feature branch checkout          │
+│      ── Checkouts ──                                                 ││Branch: feat-xyz                              │
+│▸  ○       feat- Feature bra feat-xyz   ✓                             ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

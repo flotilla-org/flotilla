@@ -13,7 +13,7 @@ The registry currently supports:
 - `CheckoutManager`
 - `CodeReview`
 - `IssueTracker`
-- `CodingAgent`
+- `CloudAgentService`
 - `AiUtility`
 - one selected `WorkspaceManager`
 
@@ -30,7 +30,7 @@ Provider detection is environment-first. The pipeline runs in a fixed order:
    A per-repo config can force `"wt"` or `"git"`.
 3. **Remote host**: inferred from the first git remote URL. GitHub providers are
    enabled when the host matches and the `gh` CLI is available.
-4. **Coding agent / AI utility**: enabled when the `claude` CLI is found in
+4. **Cloud agent / AI utility**: enabled when the `claude` CLI is found in
    PATH or at `~/.claude/local/claude`.
 5. **Workspace manager**: detected from environment variables that prove the
    process is running inside a terminal multiplexer, in priority order:

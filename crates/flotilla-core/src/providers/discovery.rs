@@ -75,7 +75,7 @@ pub fn extract_repo_slug(url: &str) -> Option<String> {
 /// 1. VCS: check for .git (directory or file — worktrees use a file)
 /// 2. Checkout manager: check for `wt` CLI
 /// 3. Remote host: parse git remote URL -> GitHub/GitLab, check for `gh` CLI
-/// 4. Coding agents: check for Cursor `agent` and `claude` CLI
+/// 4. Cloud agents: check for Cursor `agent` and `claude` CLI
 /// 5. AI utility: check for `claude` CLI
 /// 6. Workspace manager: check for cmux binary
 pub async fn detect_providers(
@@ -178,23 +178,26 @@ pub async fn detect_providers(
         // TODO: GitLab support
     }
 
-    // 4. Coding agents: Cursor (gate on CURSOR_API_KEY to avoid false positives
+    // 4. Cloud agents: Cursor (gate on CURSOR_API_KEY to avoid false positives
     //    from unrelated binaries also named `agent`)
     if std::env::var("CURSOR_API_KEY")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
         && runner.exists("agent", &["--version"]).await
     {
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "cursor".to_string(),
-            Arc::new(CursorCodingAgent::new("cursor".to_string())),
+            Arc::new(CursorCodingAgent::new(
+                "cursor".to_string(),
+                Arc::new(crate::providers::ReqwestHttpClient::new()),
+            )),
         );
-        info!("{repo_name}: Coding agent → Cursor Agents");
+        info!("{repo_name}: Cloud agent → Cursor Cloud Agents");
     }
 
-    // 5. Claude coding agent & AI utility
+    // 5. Cloud agent: Claude Code Web & AI utility
     if let Some(claude_bin) = resolve_claude_path(&*runner).await {
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
             Arc::new(ClaudeCodingAgent::new(
                 "claude".to_string(),
@@ -206,7 +209,7 @@ pub async fn detect_providers(
             "claude".to_string(),
             Arc::new(ClaudeAiUtility::new(claude_bin, Arc::clone(&runner))),
         );
-        info!("{repo_name}: Coding agent → Claude Sessions");
+        info!("{repo_name}: Cloud agent → Claude Code Web");
         info!("{repo_name}: AI utility → Claude");
     }
 
@@ -689,7 +692,7 @@ mod tests {
 
             let (registry, _) = detect_providers(&repo, &config, runner).await;
             assert_eq!(
-                registry.coding_agents.contains_key("claude"),
+                registry.cloud_agents.contains_key("claude"),
                 should_register
             );
             assert_eq!(
@@ -716,7 +719,7 @@ mod tests {
                     .build(),
             );
             let (registry, _) = detect_providers(&repo, &config, runner).await;
-            assert!(registry.coding_agents.contains_key("cursor"));
+            assert!(registry.cloud_agents.contains_key("cursor"));
         }
         std::env::remove_var("CURSOR_API_KEY");
 
@@ -734,7 +737,7 @@ mod tests {
                     .build(),
             );
             let (registry, _) = detect_providers(&repo, &config, runner).await;
-            assert!(!registry.coding_agents.contains_key("cursor"));
+            assert!(!registry.cloud_agents.contains_key("cursor"));
         }
 
         // Without agent binary → not registered regardless of env var
@@ -751,7 +754,7 @@ mod tests {
                     .build(),
             );
             let (registry, _) = detect_providers(&repo, &config, runner).await;
-            assert!(!registry.coding_agents.contains_key("cursor"));
+            assert!(!registry.cloud_agents.contains_key("cursor"));
         }
     }
 

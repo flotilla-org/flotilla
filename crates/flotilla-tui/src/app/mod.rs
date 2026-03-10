@@ -53,7 +53,7 @@ impl CommandQueue {
 pub struct TuiRepoModel {
     pub providers: Arc<ProviderData>,
     pub labels: RepoLabels,
-    pub provider_names: HashMap<String, String>,
+    pub provider_names: HashMap<String, Vec<String>>,
     pub provider_health: HashMap<String, bool>,
     pub loading: bool,
     pub issue_has_more: bool,
@@ -237,15 +237,16 @@ impl App {
 
         // Provider health -> model-level statuses
         for (kind, healthy) in &rm.provider_health {
-            let provider_name = rm.provider_names.get(kind.as_str()).cloned();
-            if let Some(pname) = provider_name {
-                let key = (path.clone(), kind.clone(), pname);
+            if let Some(pnames) = rm.provider_names.get(kind.as_str()) {
                 let status = if *healthy {
                     ProviderStatus::Ok
                 } else {
                     ProviderStatus::Error
                 };
-                self.model.provider_statuses.insert(key, status);
+                for pname in pnames {
+                    let key = (path.clone(), kind.clone(), pname.clone());
+                    self.model.provider_statuses.insert(key, status);
+                }
             }
         }
 
@@ -331,15 +332,16 @@ impl App {
 
         // Provider health -> model-level statuses
         for (kind, healthy) in &rm.provider_health {
-            let provider_name = rm.provider_names.get(kind.as_str()).cloned();
-            if let Some(pname) = provider_name {
-                let key = (path.clone(), kind.clone(), pname);
+            if let Some(pnames) = rm.provider_names.get(kind.as_str()) {
                 let status = if *healthy {
                     ProviderStatus::Ok
                 } else {
                     ProviderStatus::Error
                 };
-                self.model.provider_statuses.insert(key, status);
+                for pname in pnames {
+                    let key = (path.clone(), kind.clone(), pname.clone());
+                    self.model.provider_statuses.insert(key, status);
+                }
             }
         }
 

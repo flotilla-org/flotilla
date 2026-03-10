@@ -225,7 +225,7 @@ pub async fn execute(
             if let Some(session) = providers_data.sessions.get(session_id.as_str()) {
                 info!("archiving session {session_id}");
                 if let Some(key) = session_provider_key(session, &session_id) {
-                    if let Some(ca) = registry.coding_agents.get(key) {
+                    if let Some(ca) = registry.cloud_agents.get(key) {
                         match ca.archive_session(&session_id).await {
                             Ok(()) => CommandResult::Ok,
                             Err(e) => CommandResult::Error { message: e },
@@ -445,7 +445,7 @@ async fn resolve_attach_command(
         .ok_or_else(|| format!("Cannot determine provider for session {session_id}"))?;
 
     let ca = registry
-        .coding_agents
+        .cloud_agents
         .get(provider_key)
         .ok_or_else(|| format!("No coding agent provider: {provider_key}"))?;
 
@@ -510,7 +510,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::providers::code_review::CodeReview;
-    use crate::providers::coding_agent::CodingAgent;
+    use crate::providers::coding_agent::CloudAgentService;
     use crate::providers::issue_tracker::IssueTracker;
     use crate::providers::testing::MockRunner;
     use crate::providers::types::*;
@@ -695,13 +695,13 @@ mod tests {
         }
     }
 
-    /// A mock CodingAgent provider.
-    struct MockCodingAgent {
+    /// A mock CloudAgentService provider.
+    struct MockCloudAgent {
         archive_result: tokio::sync::Mutex<Result<(), String>>,
         attach_command: String,
     }
 
-    impl MockCodingAgent {
+    impl MockCloudAgent {
         fn succeeding() -> Self {
             Self {
                 archive_result: tokio::sync::Mutex::new(Ok(())),
@@ -725,7 +725,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CodingAgent for MockCodingAgent {
+    impl CloudAgentService for MockCloudAgent {
         fn display_name(&self) -> &str {
             "mock-agent"
         }
@@ -937,14 +937,13 @@ mod tests {
     #[tokio::test]
     async fn archive_session_uses_provider_from_session_ref() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCodingAgent::failing("wrong provider")),
+            Arc::new(MockCloudAgent::failing("wrong provider")),
         );
-        registry.coding_agents.insert(
-            "cursor".to_string(),
-            Arc::new(MockCodingAgent::succeeding()),
-        );
+        registry
+            .cloud_agents
+            .insert("cursor".to_string(), Arc::new(MockCloudAgent::succeeding()));
         let mut data = empty_data();
         data.sessions
             .insert("sess-1".to_string(), make_session_for("cursor", "sess-1"));
@@ -1547,10 +1546,9 @@ mod tests {
     #[tokio::test]
     async fn archive_session_success() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
-            "claude".to_string(),
-            Arc::new(MockCodingAgent::succeeding()),
-        );
+        registry
+            .cloud_agents
+            .insert("claude".to_string(), Arc::new(MockCloudAgent::succeeding()));
         let mut data = empty_data();
         data.sessions
             .insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
@@ -1572,9 +1570,9 @@ mod tests {
     #[tokio::test]
     async fn archive_session_agent_fails() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCodingAgent::failing("archive failed")),
+            Arc::new(MockCloudAgent::failing("archive failed")),
         );
         let mut data = empty_data();
         data.sessions
@@ -1734,9 +1732,9 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_with_checkout_key() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCodingAgent::with_attach("claude --teleport")), // base; mock appends session_id
+            Arc::new(MockCloudAgent::with_attach("claude --teleport")), // base; mock appends session_id
         );
         registry.workspace_manager = Some((
             "cmux".to_string(),
@@ -1768,13 +1766,13 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_uses_provider_specific_attach_command() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCodingAgent::with_attach("claude --teleport")),
+            Arc::new(MockCloudAgent::with_attach("claude --teleport")),
         );
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "cursor".to_string(),
-            Arc::new(MockCodingAgent::with_attach("agent --resume")),
+            Arc::new(MockCloudAgent::with_attach("agent --resume")),
         );
         registry.workspace_manager = Some((
             "cmux".to_string(),
@@ -1811,10 +1809,9 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_with_branch_creates_checkout() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
-            "claude".to_string(),
-            Arc::new(MockCodingAgent::succeeding()),
-        );
+        registry
+            .cloud_agents
+            .insert("claude".to_string(), Arc::new(MockCloudAgent::succeeding()));
         registry.checkout_managers.insert(
             "wt".to_string(),
             Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")),
@@ -1846,10 +1843,9 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_no_path_no_branch() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
-            "claude".to_string(),
-            Arc::new(MockCodingAgent::succeeding()),
-        );
+        registry
+            .cloud_agents
+            .insert("claude".to_string(), Arc::new(MockCloudAgent::succeeding()));
         let mut data = empty_data();
         data.sessions
             .insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
@@ -1873,10 +1869,9 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_ws_manager_fails() {
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
-            "claude".to_string(),
-            Arc::new(MockCodingAgent::succeeding()),
-        );
+        registry
+            .cloud_agents
+            .insert("claude".to_string(), Arc::new(MockCloudAgent::succeeding()));
         registry.workspace_manager = Some((
             "cmux".to_string(),
             Arc::new(MockWorkspaceManager::failing("ws failed")),
@@ -1908,10 +1903,9 @@ mod tests {
     async fn teleport_session_uses_session_as_name_when_no_branch() {
         // When checkout_key is present but branch is None, uses "session" as name.
         let mut registry = empty_registry();
-        registry.coding_agents.insert(
-            "claude".to_string(),
-            Arc::new(MockCodingAgent::succeeding()),
-        );
+        registry
+            .cloud_agents
+            .insert("claude".to_string(), Arc::new(MockCloudAgent::succeeding()));
         registry.workspace_manager = Some((
             "cmux".to_string(),
             Arc::new(MockWorkspaceManager::succeeding()),

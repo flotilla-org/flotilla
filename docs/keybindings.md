@@ -54,5 +54,5 @@ The action menu (Space or right-click) shows context-sensitive options based on 
 | Generate branch name | Issue with no branch (uses AI) |
 | Open PR in browser | Item has an associated PR |
 | Open issue in browser | Item has associated issues |
-| Teleport session | Coding agent session (opens in terminal) |
-| Archive session | Coding agent session (marks as archived) |
+| Teleport session | Cloud agent session (opens in terminal) |
+| Archive session | Cloud agent session (marks as archived) |

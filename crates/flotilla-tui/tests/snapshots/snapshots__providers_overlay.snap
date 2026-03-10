@@ -1,18 +1,19 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 282
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ✕ ┐┌ Preview ─────────────────────────────────────┐
-│VCS             Git                                                   ││                                              │
-│Checkout mgr    Git Worktrees                                         ││                                              │
-│Code review     GitHub ✗                                              ││                                              │
-│Issue tracker   —                                                     ││                                              │
-│Coding agent    Claude ✓                                              ││                                              │
-│AI utility      —                                                     ││                                              │
-│Workspace mgr   —                                                     ││                                              │
-│Terminal pool   —                                                     ││                                              │
-│                                                                      ││                                              │
+│Role             Provider                 Status                      ││                                              │
+│VCS              Git                                                  ││                                              │
+│Checkout mgr     Git Worktrees                                        ││                                              │
+│Code review      GitHub                   ✗                           ││                                              │
+│Issue tracker    —                                                    ││                                              │
+│Cloud agents     Claude                   ✓                           ││                                              │
+│AI utility       —                                                    ││                                              │
+│Workspace mgr    —                                                    ││                                              │
+│Terminal pool    —                                                    ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

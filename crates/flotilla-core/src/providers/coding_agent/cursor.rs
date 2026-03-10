@@ -1,21 +1,25 @@
 use async_trait::async_trait;
-use reqwest;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::providers::types::*;
-
-/// Guard so the "sessions unavailable" warning is emitted only once per process.
-static AUTH_WARNED: AtomicBool = AtomicBool::new(false);
+use crate::providers::HttpClient;
 
 pub struct CursorCodingAgent {
     provider_name: String,
+    http: Arc<dyn HttpClient>,
+    auth_warned: AtomicBool,
 }
 
 impl CursorCodingAgent {
-    pub fn new(provider_name: String) -> Self {
-        Self { provider_name }
+    pub fn new(provider_name: String, http: Arc<dyn HttpClient>) -> Self {
+        Self {
+            provider_name,
+            http,
+            auth_warned: AtomicBool::new(false),
+        }
     }
 
     fn api_key() -> Result<String, String> {
@@ -26,9 +30,8 @@ impl CursorCodingAgent {
             .ok_or_else(|| "CURSOR_API_KEY is not set".to_string())
     }
 
-    async fn fetch_agents() -> Result<Vec<CursorAgent>, String> {
+    async fn fetch_agents(&self) -> Result<Vec<CursorAgent>, String> {
         let api_key = Self::api_key()?;
-        let client = reqwest::Client::new();
         let mut cursor: Option<String> = None;
         let mut all_agents = Vec::new();
 
@@ -40,24 +43,22 @@ impl CursorCodingAgent {
                 url.push_str(&urlencoding::encode(c));
             }
 
-            let resp = client
-                .get(url)
+            let request = super::REQUEST_FACTORY
+                .get(&url)
                 .basic_auth(&api_key, None::<&str>)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
+                .build()
+                .map_err(|e| format!("request build error: {e}"))?;
+            let resp = self.http.execute(request).await?;
+            let status = resp.status().as_u16();
             if status == 401 || status == 403 {
                 return Err(format!("authentication error (HTTP {status})"));
             }
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+            if !resp.status().is_success() {
+                let body = String::from_utf8_lossy(resp.body()).to_string();
                 return Err(format!("agent list failed (HTTP {status}): {body}"));
             }
 
-            let page: ListAgentsResponse = resp
-                .json()
-                .await
+            let page: ListAgentsResponse = serde_json::from_slice(resp.body())
                 .map_err(|e| format!("agent list parse error: {e}"))?;
             all_agents.extend(page.agents);
             cursor = page.next_cursor;
@@ -168,19 +169,19 @@ fn repo_slug_from_cursor_repository(repository: &str) -> Option<String> {
 }
 
 #[async_trait]
-impl super::CodingAgent for CursorCodingAgent {
+impl super::CloudAgentService for CursorCodingAgent {
     fn display_name(&self) -> &str {
-        "Cursor Agents"
+        "Cursor Cloud Agents"
     }
 
     async fn list_sessions(
         &self,
         criteria: &RepoCriteria,
     ) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        let agents = match Self::fetch_agents().await {
+        let agents = match self.fetch_agents().await {
             Ok(agents) => agents,
             Err(e) if e.contains("CURSOR_API_KEY is not set") || e.contains("authentication") => {
-                if !AUTH_WARNED.swap(true, Ordering::Relaxed) {
+                if !self.auth_warned.swap(true, Ordering::Relaxed) {
                     warn!("Cursor sessions unavailable: set CURSOR_API_KEY");
                 }
                 return Ok(vec![]);

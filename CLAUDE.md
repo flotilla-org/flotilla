@@ -73,7 +73,7 @@ Each trait lives in `crates/flotilla-core/src/providers/<category>/mod.rs` with 
 - **Vcs** + **CheckoutManager** (`vcs/git.rs`, `vcs/wt.rs`)
 - **CodeReview** (`code_review/github.rs`)
 - **IssueTracker** (`issue_tracker/github.rs`)
-- **CodingAgent** (`coding_agent/claude.rs`)
+- **CloudAgentService** (`coding_agent/claude.rs`)
 - **AiUtility** (`ai_utility/claude.rs`)
 - **WorkspaceManager** (`workspace/cmux.rs`)
 
