@@ -95,7 +95,7 @@ pub async fn detect_providers(
             "git".to_string(),
             Arc::new(GitVcs::new(Arc::clone(&runner))),
         );
-        info!("{repo_name}: VCS → git");
+        info!(%repo_name, "VCS → git");
     }
 
     // 2. Checkout manager: config-driven provider selection
@@ -107,10 +107,10 @@ pub async fn detect_providers(
                     "git".to_string(),
                     Arc::new(WtCheckoutManager::new(Arc::clone(&runner))),
                 );
-                info!("{repo_name}: Checkout mgr → wt (forced)");
+                info!(%repo_name, "Checkout mgr → wt (forced)");
             } else {
                 tracing::warn!(
-                    "{repo_name}: provider = \"wt\" but wt not found in PATH, falling back to git"
+                    %repo_name, "provider = \"wt\" but wt not found in PATH, falling back to git"
                 );
                 registry.checkout_managers.insert(
                     "git".to_string(),
@@ -123,7 +123,7 @@ pub async fn detect_providers(
                 "git".to_string(),
                 Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
             );
-            info!("{repo_name}: Checkout mgr → git (forced)");
+            info!(%repo_name, "Checkout mgr → git (forced)");
         }
         _ => {
             // Auto: try wt first, fall back to git
@@ -132,13 +132,13 @@ pub async fn detect_providers(
                     "git".to_string(),
                     Arc::new(WtCheckoutManager::new(Arc::clone(&runner))),
                 );
-                info!("{repo_name}: Checkout mgr → wt");
+                info!(%repo_name, "Checkout mgr → wt");
             } else {
                 registry.checkout_managers.insert(
                     "git".to_string(),
                     Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
                 );
-                info!("{repo_name}: Checkout mgr → git (fallback)");
+                info!(%repo_name, "Checkout mgr → git (fallback)");
             }
         }
     }
@@ -169,10 +169,10 @@ pub async fn detect_providers(
                         Arc::clone(&runner),
                     )),
                 );
-                info!("{repo_name}: Code review → GitHub");
-                info!("{repo_name}: Issue tracker → GitHub");
+                info!(%repo_name, "Code review → GitHub");
+                info!(%repo_name, "Issue tracker → GitHub");
             } else {
-                warn!("{repo_name}: GitHub detected but could not determine repo slug — skipping GitHub providers");
+                warn!(%repo_name, "GitHub detected but could not determine repo slug — skipping GitHub providers");
             }
         }
         // TODO: GitLab support
@@ -192,7 +192,7 @@ pub async fn detect_providers(
                 Arc::new(crate::providers::ReqwestHttpClient::new()),
             )),
         );
-        info!("{repo_name}: Cloud agent → Cursor Cloud Agents");
+        info!(%repo_name, "Cloud agent → Cursor Cloud Agents");
     }
 
     // 5. Cloud agent: Claude Code Web & AI utility
@@ -209,8 +209,8 @@ pub async fn detect_providers(
             "claude".to_string(),
             Arc::new(ClaudeAiUtility::new(claude_bin, Arc::clone(&runner))),
         );
-        info!("{repo_name}: Cloud agent → Claude Code Web");
-        info!("{repo_name}: AI utility → Claude");
+        info!(%repo_name, "Cloud agent → Claude Code Web");
+        info!(%repo_name, "AI utility → Claude");
     }
 
     // 6. Workspace manager: prefer env-var detection (proves we're *inside* the terminal)
@@ -222,7 +222,7 @@ pub async fn detect_providers(
                 "cmux".to_string(),
                 Arc::new(CmuxWorkspaceManager::new(Arc::clone(&runner))),
             ));
-            info!("{repo_name}: Workspace mgr → cmux");
+            info!(%repo_name, "Workspace mgr → cmux");
         }
     } else if std::env::var("ZELLIJ").is_ok() {
         if ZellijWorkspaceManager::check_version(&*runner)
@@ -233,14 +233,14 @@ pub async fn detect_providers(
                 "zellij".to_string(),
                 Arc::new(ZellijWorkspaceManager::new(Arc::clone(&runner))),
             ));
-            info!("{repo_name}: Workspace mgr → zellij");
+            info!(%repo_name, "Workspace mgr → zellij");
         }
     } else if std::env::var("TMUX").is_ok() {
         registry.workspace_manager = Some((
             "tmux".to_string(),
             Arc::new(TmuxWorkspaceManager::new(Arc::clone(&runner))),
         ));
-        info!("{repo_name}: Workspace mgr → tmux");
+        info!(%repo_name, "Workspace mgr → tmux");
     } else {
         // Fallback: cmux binary exists but not running inside cmux
         let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
@@ -249,7 +249,7 @@ pub async fn detect_providers(
                 "cmux".to_string(),
                 Arc::new(CmuxWorkspaceManager::new(Arc::clone(&runner))),
             ));
-            info!("{repo_name}: Workspace mgr → cmux (binary found, not running inside cmux)");
+            info!(%repo_name, "Workspace mgr → cmux (binary found, not running inside cmux)");
         }
     }
 
@@ -263,13 +263,13 @@ pub async fn detect_providers(
                 shpool_socket,
             )),
         ));
-        info!("{repo_name}: Terminal pool → shpool");
+        info!(%repo_name, "Terminal pool → shpool");
     } else {
         registry.terminal_pool = Some((
             "passthrough".into(),
             Arc::new(crate::providers::terminal::passthrough::PassthroughTerminalPool),
         ));
-        info!("{repo_name}: Terminal pool → passthrough (no persistence)");
+        info!(%repo_name, "Terminal pool → passthrough (no persistence)");
     }
 
     (registry, repo_slug)

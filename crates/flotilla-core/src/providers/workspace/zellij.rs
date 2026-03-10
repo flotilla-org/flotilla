@@ -86,7 +86,7 @@ impl ZellijWorkspaceManager {
             return Err(format!("zellij >= 0.40 required, found {version_part}"));
         }
 
-        info!("zellij version {version_part} OK");
+        info!(version = %version_part, "zellij version OK");
         Ok(())
     }
 
@@ -125,7 +125,7 @@ impl ZellijWorkspaceManager {
         match toml::from_str(&contents) {
             Ok(state) => state,
             Err(e) => {
-                tracing::warn!("corrupt zellij state file, treating as empty: {e}");
+                tracing::warn!(err = %e, "corrupt zellij state file, treating as empty");
                 ZellijState::default()
             }
         }
@@ -214,7 +214,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         &self,
         config: &WorkspaceConfig,
     ) -> Result<(String, Workspace), String> {
-        info!("zellij: creating workspace '{}'", config.name);
+        info!(workspace = %config.name, "zellij: creating workspace");
 
         let rendered = super::resolve_template(config);
         let working_dir = config.working_directory.display().to_string();
@@ -308,7 +308,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
             .map(|d| CorrelationKey::CheckoutPath(d.clone()))
             .collect();
 
-        info!("zellij: workspace '{}' ready", config.name);
+        info!(workspace = %config.name, "zellij: workspace ready");
         Ok((
             config.name.clone(),
             Workspace {
@@ -320,7 +320,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        info!("zellij: switching to tab '{ws_ref}'");
+        info!(%ws_ref, "zellij: switching to tab");
         self.zellij_action(&["go-to-tab-name", ws_ref]).await?;
         Ok(())
     }

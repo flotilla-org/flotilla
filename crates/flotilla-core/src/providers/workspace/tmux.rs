@@ -69,7 +69,7 @@ impl TmuxWorkspaceManager {
         match toml::from_str(&contents) {
             Ok(state) => state,
             Err(e) => {
-                warn!("corrupt tmux state file, treating as empty: {e}");
+                warn!(err = %e, "corrupt tmux state file, treating as empty");
                 TmuxState::default()
             }
         }
@@ -165,7 +165,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         &self,
         config: &WorkspaceConfig,
     ) -> Result<(String, Workspace), String> {
-        info!("tmux: creating workspace '{}'", config.name);
+        info!(workspace = %config.name, "tmux: creating workspace");
 
         let rendered = super::resolve_template(config);
         let working_dir = config.working_directory.display().to_string();
@@ -186,10 +186,10 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
             // Warn if multiple surfaces — tmux doesn't support tabbed/stacked panes
             if pane.surfaces.len() > 1 {
                 warn!(
-                    "tmux: pane '{}' has {} surfaces; tmux does not support tabbed/stacked panes, \
-                     extra surfaces will be created as additional splits",
-                    pane.name,
-                    pane.surfaces.len()
+                    pane = %pane.name,
+                    surfaces = pane.surfaces.len(),
+                    "tmux: pane has multiple surfaces; tmux does not support tabbed/stacked panes, \
+                     extra surfaces will be created as additional splits"
                 );
             }
 
@@ -280,7 +280,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
             .map(|d| CorrelationKey::CheckoutPath(d.clone()))
             .collect();
 
-        info!("tmux: workspace '{}' ready", config.name);
+        info!(workspace = %config.name, "tmux: workspace ready");
         Ok((
             config.name.clone(),
             Workspace {
@@ -292,7 +292,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        info!("tmux: switching to window '{ws_ref}'");
+        info!(%ws_ref, "tmux: switching to window");
         self.tmux_cmd(&["select-window", "-t", ws_ref]).await?;
         Ok(())
     }

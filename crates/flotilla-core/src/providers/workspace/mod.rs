@@ -27,7 +27,7 @@ pub trait WorkspaceManager: Send + Sync {
 pub(crate) fn resolve_template(config: &WorkspaceConfig) -> PaneLayout {
     let tmpl = if let Some(ref yaml) = config.template_yaml {
         serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
-            tracing::warn!("failed to parse workspace template, using default: {e}");
+            tracing::warn!(err = %e, "failed to parse workspace template, using default");
             template::default_template()
         })
     } else {

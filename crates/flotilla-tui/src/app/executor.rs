@@ -18,7 +18,7 @@ pub async fn dispatch(cmd: Command, app: &mut App) {
 
     match cmd {
         Command::AddRepo { ref path } => {
-            info!("adding repo {}", path.display());
+            info!(path = %path.display(), "adding repo");
             if let Err(e) = app.daemon.add_repo(path).await {
                 app.model.status_message = Some(e);
             }
@@ -26,7 +26,7 @@ pub async fn dispatch(cmd: Command, app: &mut App) {
             return;
         }
         Command::RemoveRepo { ref path } => {
-            info!("removing repo {}", path.display());
+            info!(path = %path.display(), "removing repo");
             if let Err(e) = app.daemon.remove_repo(path).await {
                 app.model.status_message = Some(e);
             }
@@ -72,7 +72,7 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
     match result {
         CommandResult::Ok => {}
         CommandResult::CheckoutCreated { branch } => {
-            info!("created checkout {branch}");
+            info!(%branch, "created checkout");
         }
         CommandResult::BranchNameGenerated { name, issue_ids } => {
             app.prefill_branch_input(&name, issue_ids);

@@ -153,7 +153,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         branch: &str,
         create_branch: bool,
     ) -> Result<(PathBuf, Checkout), String> {
-        info!("wt: creating worktree for {branch} (create_branch={create_branch})");
+        info!(%branch, %create_branch, "wt: creating worktree");
         if create_branch {
             self.runner
                 .run("wt", &["switch", "--create", branch, "--no-cd"], repo_root)
@@ -174,7 +174,7 @@ impl super::CheckoutManager for WtCheckoutManager {
 
         for wt in worktrees {
             if wt.branch == branch || wt.branch.ends_with(&format!("/{branch}")) {
-                info!("wt: created {branch} at {}", wt.path.display());
+                info!(%branch, path = %wt.path.display(), "wt: created worktree");
                 return Ok(wt.into_checkout());
             }
         }
@@ -183,7 +183,7 @@ impl super::CheckoutManager for WtCheckoutManager {
     }
 
     async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String> {
-        info!("wt: removing worktree {branch}");
+        info!(%branch, "wt: removing worktree");
         self.runner
             .run("wt", &["remove", branch], repo_root)
             .await?;

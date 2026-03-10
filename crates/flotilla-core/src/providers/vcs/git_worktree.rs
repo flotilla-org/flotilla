@@ -267,8 +267,7 @@ impl super::CheckoutManager for GitCheckoutManager {
     ) -> Result<(PathBuf, Checkout), String> {
         let wt_path = self.render_worktree_path(repo_root, branch)?;
         info!(
-            "git: creating worktree for {branch} at {}",
-            wt_path.display()
+            %branch, path = %wt_path.display(), "git: creating worktree"
         );
 
         let wt_str = wt_path
@@ -309,7 +308,7 @@ impl super::CheckoutManager for GitCheckoutManager {
                 format!("origin/{default_branch}")
             } else {
                 tracing::warn!(
-                    "fetch origin/{default_branch} failed, branching from local {default_branch}"
+                    %default_branch, "fetch from origin failed, branching from local"
                 );
                 default_branch.clone()
             };
@@ -329,7 +328,7 @@ impl super::CheckoutManager for GitCheckoutManager {
     }
 
     async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String> {
-        info!("git: removing worktree for {branch}");
+        info!(%branch, "git: removing worktree");
 
         let output = self
             .runner
@@ -359,7 +358,7 @@ impl super::CheckoutManager for GitCheckoutManager {
                 .run("git", &["branch", "-D", branch], repo_root)
                 .await
             {
-                tracing::warn!("failed to delete branch {branch}: {e}");
+                tracing::warn!(%branch, err = %e, "failed to delete branch");
             }
         }
 

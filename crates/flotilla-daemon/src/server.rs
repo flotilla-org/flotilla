@@ -68,7 +68,7 @@ impl DaemonServer {
         let listener = UnixListener::bind(&self.socket_path)
             .map_err(|e| format!("failed to bind socket: {e}"))?;
 
-        info!("daemon listening on {}", self.socket_path.display());
+        info!(path = %self.socket_path.display(), "daemon listening");
 
         let daemon = self.daemon;
         let client_count = self.client_count;
@@ -93,8 +93,8 @@ impl DaemonServer {
                 }
 
                 info!(
-                    "no clients connected, waiting {} seconds before shutdown",
-                    idle_timeout.as_secs()
+                    timeout_secs = idle_timeout.as_secs(),
+                    "no clients connected, waiting before shutdown"
                 );
 
                 // Race: timeout vs client count change
@@ -125,7 +125,7 @@ impl DaemonServer {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             let count = client_count.fetch_add(1, Ordering::SeqCst) + 1;
-                            info!("client connected (total: {count})");
+                            info!(%count, "client connected");
                             client_notify.notify_one();
 
                             let daemon = Arc::clone(&daemon);
@@ -136,12 +136,12 @@ impl DaemonServer {
                             tokio::spawn(async move {
                                 handle_client(stream, daemon, shutdown_rx).await;
                                 let count = client_count.fetch_sub(1, Ordering::SeqCst) - 1;
-                                info!("client disconnected (total: {count})");
+                                info!(%count, "client disconnected");
                                 client_notify.notify_one();
                             });
                         }
                         Err(e) => {
-                            error!("failed to accept connection: {e}");
+                            error!(err = %e, "failed to accept connection");
                         }
                     }
                 }
@@ -164,7 +164,7 @@ impl DaemonServer {
 
         // Clean up socket file on shutdown
         if let Err(e) = std::fs::remove_file(&socket_path) {
-            warn!("failed to remove socket file on shutdown: {e}");
+            warn!(err = %e, "failed to remove socket file on shutdown");
         }
 
         info!("daemon server stopped");
@@ -210,7 +210,7 @@ async fn handle_client(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("event subscriber lagged, skipped {n} events");
+                    warn!(skipped = n, "event subscriber lagged");
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     break;
@@ -229,7 +229,7 @@ async fn handle_client(
                         let msg: Message = match serde_json::from_str(&line) {
                             Ok(m) => m,
                             Err(e) => {
-                                warn!("failed to parse message: {e}");
+                                warn!(err = %e, "failed to parse message");
                                 continue;
                             }
                         };
@@ -242,7 +242,7 @@ async fn handle_client(
                                 }
                             }
                             other => {
-                                warn!("unexpected message type from client: {:?}", other);
+                                warn!(msg = ?other, "unexpected message type from client");
                             }
                         }
                     }
@@ -251,7 +251,7 @@ async fn handle_client(
                         break;
                     }
                     Err(e) => {
-                        error!("error reading from client: {e}");
+                        error!(err = %e, "error reading from client");
                         break;
                     }
                 }

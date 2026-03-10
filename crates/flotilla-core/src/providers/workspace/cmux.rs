@@ -89,7 +89,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         &self,
         config: &WorkspaceConfig,
     ) -> Result<(String, Workspace), String> {
-        info!("cmux: creating workspace '{}'", config.name);
+        info!(workspace = %config.name, "cmux: creating workspace");
 
         let rendered = super::resolve_template(config);
 
@@ -256,7 +256,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
             .map(|d| CorrelationKey::CheckoutPath(d.clone()))
             .collect();
 
-        info!("cmux: workspace '{}' ready ({ws_ref})", config.name);
+        info!(workspace = %config.name, %ws_ref, "cmux: workspace ready");
         Ok((
             ws_ref,
             Workspace {
@@ -268,7 +268,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        info!("cmux: switching to workspace {ws_ref}");
+        info!(%ws_ref, "cmux: switching to workspace");
         self.cmux_cmd(&["select-workspace", "--workspace", ws_ref])
             .await?;
         Ok(())

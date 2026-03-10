@@ -43,7 +43,7 @@ impl super::AiUtility for ClaudeAiUtility {
                 if branch.is_empty() {
                     Err("claude returned empty output".to_string())
                 } else {
-                    info!("ai: suggested '{branch}'");
+                    info!(%branch, "ai: suggested branch name");
                     Ok(branch)
                 }
             }
