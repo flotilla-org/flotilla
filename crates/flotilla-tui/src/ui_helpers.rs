@@ -138,12 +138,16 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
         .unwrap_or(0);
     let ideal_padding = main_display.len().saturating_sub(repo_name_len);
 
+    // Cap padding so it never exceeds half the column — leaves room for the name
+    // even after the caller truncates.  Crucially this is independent of the name
+    // length, so every worktree at the same depth gets identical indentation.
+    let padding = ideal_padding.min(col_width / 2);
+
     // Under repo root (e.g. .worktrees/feat-auth, sub/dir)
     if let Ok(rel) = path.strip_prefix(repo_root) {
         let s = rel.to_string_lossy();
         if !s.is_empty() {
             let name = s.into_owned();
-            let padding = ideal_padding.min(col_width.saturating_sub(name.len()));
             return format!("{:padding$}{name}", "");
         }
     }
@@ -164,7 +168,6 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
                 .strip_prefix(&root_name)
                 .unwrap_or(&path_name)
                 .to_string();
-            let padding = ideal_padding.min(col_width.saturating_sub(name.len()));
             return format!("{:padding$}{name}", "");
         }
     }
@@ -419,19 +422,19 @@ mod tests {
 
     #[test]
     fn shorten_path_worktree_narrow_column() {
-        // Narrow column — padding shrinks so name still fits.
+        // Narrow column — padding is consistent (capped at col/2), caller truncates.
         let root = Path::new("/dev/project");
         let wt = Path::new("/dev/project/.worktrees/feat-auth");
-        // name = ".worktrees/feat-auth" (20 chars), col = 22, padding = 2
-        assert_eq!(shorten_path(wt, root, 22), "  .worktrees/feat-auth");
+        // ideal_padding = 5, col/2 = 11 → padding = 5 (same as wide)
+        assert_eq!(shorten_path(wt, root, 22), "     .worktrees/feat-auth");
     }
 
     #[test]
     fn shorten_path_worktree_very_narrow() {
-        // Very narrow — no padding, name alone.
+        // Very narrow — padding capped at col/2 = 5, still consistent indent.
         let root = Path::new("/dev/project");
         let wt = Path::new("/dev/project/.worktrees/feat-auth");
-        assert_eq!(shorten_path(wt, root, 10), ".worktrees/feat-auth");
+        assert_eq!(shorten_path(wt, root, 10), "     .worktrees/feat-auth");
     }
 
     #[test]

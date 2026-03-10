@@ -327,9 +327,9 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 
     let widths = [
         Constraint::Length(3), // icon
-        Constraint::Min(6),    // Path (capped at 30 after layout)
-        Constraint::Fill(1),   // Description (absorbs remaining space)
-        Constraint::Min(8),    // Branch (shrinks before fixed columns)
+        Constraint::Fill(1),   // Path
+        Constraint::Fill(2),   // Description
+        Constraint::Fill(1),   // Branch
         Constraint::Length(3), // WT
         Constraint::Length(3), // WS
         Constraint::Length(4), // PR
@@ -340,11 +340,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 
     let inner_width = area.width.saturating_sub(2 + HIGHLIGHT_SYMBOL_WIDTH);
     let col_areas = Layout::horizontal(widths).split(Rect::new(0, 0, inner_width, 1));
-    let mut col_widths: Vec<u16> = col_areas.iter().map(|r| r.width).collect();
-    // Cap Path column (index 1) at 30 — ratatui doesn't support Min+Max on one column.
-    if col_widths.len() > 1 {
-        col_widths[1] = col_widths[1].min(30);
-    }
+    let col_widths: Vec<u16> = col_areas.iter().map(|r| r.width).collect();
 
     // Build rows from active repo (immutable borrows)
     let rm = model.active();
