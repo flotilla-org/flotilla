@@ -28,6 +28,7 @@ async fn main() {
             Arc::new(ClaudeCodingAgent::new(
                 "claude".to_string(),
                 Arc::new(flotilla_core::providers::ProcessCommandRunner),
+                Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
             )),
         ),
         (

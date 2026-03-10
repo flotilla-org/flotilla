@@ -421,60 +421,17 @@ mod tests {
     use super::*;
     use crate::providers::coding_agent::CodingAgent;
     use crate::providers::replay;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
 
     static TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
-    struct ReplayClaudeHttp {
-        session: replay::ReplaySession,
-        replay_http: replay::ReplayHttp,
-    }
-
-    impl ReplayClaudeHttp {
-        fn new(interactions: Vec<replay::Interaction>) -> Self {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let fixture_path = dir.path().join("claude_http.yaml");
-            let log = replay::InteractionLog { interactions };
-            let yaml = serde_yml::to_string(&log).expect("serialize interactions");
-            std::fs::write(&fixture_path, yaml).expect("write fixture");
-            let session = replay::ReplaySession::from_file(&fixture_path, replay::Masks::new());
-            let replay_http = session.http();
-            Self {
-                session,
-                replay_http,
-            }
-        }
-
-        fn assert_complete(&self) {
-            self.session.assert_complete();
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ClaudeHttp for ReplayClaudeHttp {
-        async fn request(
-            &self,
-            method: &str,
-            url: &str,
-            headers: &HashMap<String, String>,
-            json_body: Option<serde_json::Value>,
-        ) -> Result<HttpResponse, String> {
-            let response = self
-                .replay_http
-                .request(
-                    method,
-                    url,
-                    headers,
-                    json_body.as_ref().map(|v| v.to_string()).as_deref(),
-                )
-                .await?;
-            Ok(HttpResponse {
-                status: response.status,
-                body: response.body,
-            })
-        }
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/src/providers/coding_agent/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
     }
 
     fn now_epoch_secs() -> i64 {
@@ -499,44 +456,24 @@ mod tests {
         AUTH_WARNED.store(false, Ordering::Relaxed);
     }
 
-    fn mock_runner(
-        responses: Vec<Result<String, String>>,
-    ) -> crate::providers::testing::MockRunner {
-        crate::providers::testing::MockRunner::new(responses)
+    fn mock_runner(responses: Vec<Result<String, String>>) -> Arc<dyn CommandRunner> {
+        Arc::new(crate::providers::testing::MockRunner::new(responses))
     }
 
-    fn mock_runner_arc(responses: Vec<Result<String, String>>) -> Arc<dyn CommandRunner> {
-        Arc::new(mock_runner(responses))
-    }
-
-    fn interaction_headers(token: &str) -> HashMap<String, String> {
-        ClaudeCodingAgent::request_headers(token)
-    }
-
-    fn http_interaction(
-        method: &str,
-        url: String,
-        token: &str,
-        request_body: Option<String>,
-        status: u16,
-        response_body: String,
-    ) -> replay::Interaction {
-        replay::Interaction::Http {
-            method: method.to_string(),
-            url,
-            request_headers: interaction_headers(token),
-            request_body,
-            status,
-            response_body,
-            response_headers: HashMap::new(),
-        }
+    fn make_agent(
+        runner: Arc<dyn CommandRunner>,
+        http: Arc<dyn crate::providers::HttpClient>,
+    ) -> ClaudeCodingAgent {
+        ClaudeCodingAgent::new("claude".into(), runner, http)
     }
 
     #[tokio::test]
     async fn oauth_token_is_cached_until_near_expiry() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
-        let runner = mock_runner(vec![Ok(token_json("token-1", now_epoch_secs() + 3600))]);
+        let runner = crate::providers::testing::MockRunner::new(vec![
+            Ok(token_json("token-1", now_epoch_secs() + 3600)),
+        ]);
         let token1 = get_oauth_token(&runner).await.expect("first token");
         let token2 = get_oauth_token(&runner).await.expect("cached token");
         assert_eq!(token1.access_token, "token-1");
@@ -547,7 +484,7 @@ mod tests {
     async fn oauth_token_refreshes_when_expiring_soon() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
-        let runner = mock_runner(vec![
+        let runner = crate::providers::testing::MockRunner::new(vec![
             Ok(token_json("old-token", now_epoch_secs() + 10)),
             Ok(token_json("new-token", now_epoch_secs() + 3600)),
         ]);
@@ -561,48 +498,21 @@ mod tests {
     async fn fetch_sessions_inner_filters_archived_sorts_and_sends_auth_header() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
-        let runner = mock_runner(vec![Ok(token_json("abc123", now_epoch_secs() + 3600))]);
-        let body = serde_json::json!({
-            "data": [
-                {
-                    "id": "old",
-                    "title": "Older",
-                    "session_status": "running",
-                    "updated_at": "2026-03-01T00:00:00Z",
-                    "session_context": {"model": "opus", "outcomes": []}
-                },
-                {
-                    "id": "skip",
-                    "title": "Archived",
-                    "session_status": "archived",
-                    "updated_at": "2026-03-03T00:00:00Z",
-                    "session_context": {"model": "opus", "outcomes": []}
-                },
-                {
-                    "id": "new",
-                    "title": "Newer",
-                    "session_status": "idle",
-                    "updated_at": "2026-03-02T00:00:00Z",
-                    "session_context": {"model": "sonnet", "outcomes": []}
-                }
-            ]
-        })
-        .to_string();
-        let base_url = "https://api.test";
-        let replay_http = ReplayClaudeHttp::new(vec![http_interaction(
-            "GET",
-            sessions_url_for(base_url),
-            "abc123",
-            None,
-            200,
-            body,
-        )]);
 
-        let sessions =
-            ClaudeCodingAgent::fetch_sessions_inner_with_http(&runner, &replay_http, base_url)
-                .await
-                .expect("fetch sessions");
-        replay_http.assert_complete();
+        let runner = mock_runner(vec![
+            Ok(token_json("abc123", now_epoch_secs() + 3600)),
+        ]);
+        let session = replay::ReplaySession::from_file(
+            fixture("claude_sessions.yaml"),
+            replay::Masks::new(),
+        );
+        let http = replay::test_http_client(&session);
+        let agent = make_agent(runner, http);
+
+        let sessions = agent.fetch_sessions_inner("https://api.test")
+            .await
+            .expect("fetch sessions");
+        session.assert_complete();
 
         assert_eq!(sessions.len(), 2, "archived sessions should be filtered");
         assert_eq!(sessions[0].id, "new", "sessions should be sorted desc");
@@ -613,34 +523,22 @@ mod tests {
     async fn fetch_sessions_retries_after_auth_error() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
+
         let runner = mock_runner(vec![
             Ok(token_json("expired", now_epoch_secs() + 3600)),
             Ok(token_json("fresh", now_epoch_secs() + 3600)),
         ]);
-        let base_url = "https://api.test";
-        let replay_http = ReplayClaudeHttp::new(vec![
-            http_interaction(
-                "GET",
-                sessions_url_for(base_url),
-                "expired",
-                None,
-                401,
-                "{}".to_string(),
-            ),
-            http_interaction(
-                "GET",
-                sessions_url_for(base_url),
-                "fresh",
-                None,
-                200,
-                serde_json::json!({"data":[{"id":"s1","title":"Recovered","session_status":"running","updated_at":"2026-03-02T00:00:00Z","session_context":{"model":"","outcomes":[]}}]}).to_string(),
-            ),
-        ]);
+        let session = replay::ReplaySession::from_file(
+            fixture("claude_auth_retry.yaml"),
+            replay::Masks::new(),
+        );
+        let http = replay::test_http_client(&session);
+        let agent = make_agent(runner, http);
 
-        let sessions = ClaudeCodingAgent::fetch_sessions_with_http(&runner, &replay_http, base_url)
+        let sessions = agent.fetch_sessions("https://api.test")
             .await
             .expect("retry should succeed");
-        replay_http.assert_complete();
+        session.assert_complete();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s1");
@@ -650,34 +548,22 @@ mod tests {
     async fn fetch_sessions_returns_empty_after_second_auth_error() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
+
         let runner = mock_runner(vec![
             Ok(token_json("bad-1", now_epoch_secs() + 3600)),
             Ok(token_json("bad-2", now_epoch_secs() + 3600)),
         ]);
-        let base_url = "https://api.test";
-        let replay_http = ReplayClaudeHttp::new(vec![
-            http_interaction(
-                "GET",
-                sessions_url_for(base_url),
-                "bad-1",
-                None,
-                403,
-                "{}".to_string(),
-            ),
-            http_interaction(
-                "GET",
-                sessions_url_for(base_url),
-                "bad-2",
-                None,
-                401,
-                "{}".to_string(),
-            ),
-        ]);
+        let session = replay::ReplaySession::from_file(
+            fixture("claude_auth_failure.yaml"),
+            replay::Masks::new(),
+        );
+        let http = replay::test_http_client(&session);
+        let agent = make_agent(runner, http);
 
-        let sessions = ClaudeCodingAgent::fetch_sessions_with_http(&runner, &replay_http, base_url)
+        let sessions = agent.fetch_sessions("https://api.test")
             .await
             .expect("auth failures should degrade gracefully");
-        replay_http.assert_complete();
+        session.assert_complete();
 
         assert!(sessions.is_empty());
     }
@@ -686,8 +572,11 @@ mod tests {
     async fn list_sessions_uses_cache_and_maps_fields() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
-        let runner = mock_runner_arc(vec![]);
-        let agent = ClaudeCodingAgent::new("claude".into(), runner);
+
+        let runner = mock_runner(vec![]);
+        let http: Arc<dyn crate::providers::HttpClient> =
+            Arc::new(crate::providers::ReqwestHttpClient::new());
+        let agent = make_agent(runner, http);
         {
             let mut cache = agent.sessions_cache.lock().unwrap();
             cache.sessions = vec![
@@ -766,43 +655,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_session_sends_patch_and_returns_error_on_failure() {
+    async fn archive_session_succeeds() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
-        let runner = mock_runner_arc(vec![
-            Ok(token_json("archive-token", now_epoch_secs() + 3600)),
-            Ok(token_json("archive-token", now_epoch_secs() + 3600)),
-        ]);
-        let agent = ClaudeCodingAgent::new("claude".into(), runner);
-        let base_url = "https://api.test";
-        let replay_http = ReplayClaudeHttp::new(vec![
-            http_interaction(
-                "PATCH",
-                session_url_for(base_url, "s-ok"),
-                "archive-token",
-                Some(serde_json::json!({"session_status":"archived"}).to_string()),
-                200,
-                "{}".to_string(),
-            ),
-            http_interaction(
-                "PATCH",
-                session_url_for(base_url, "s-fail"),
-                "archive-token",
-                Some(serde_json::json!({"session_status":"archived"}).to_string()),
-                500,
-                "boom".to_string(),
-            ),
-        ]);
 
-        agent
-            .archive_session_with_http("s-ok", base_url, &replay_http)
+        let runner = mock_runner(vec![
+            Ok(token_json("archive-token", now_epoch_secs() + 3600)),
+        ]);
+        let session = replay::ReplaySession::from_file(
+            fixture("claude_archive_ok.yaml"),
+            replay::Masks::new(),
+        );
+        let http = replay::test_http_client(&session);
+        let agent = make_agent(runner, http);
+
+        agent.archive_session_inner("s-ok", "https://api.test")
             .await
-            .expect("first archive should succeed");
-        let err = agent
-            .archive_session_with_http("s-fail", base_url, &replay_http)
+            .expect("archive should succeed");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn archive_session_returns_error_on_failure() {
+        let _test_lock = TEST_LOCK.lock().await;
+        reset_auth_state();
+
+        let runner = mock_runner(vec![
+            Ok(token_json("archive-token", now_epoch_secs() + 3600)),
+        ]);
+        let session = replay::ReplaySession::from_file(
+            fixture("claude_archive_fail.yaml"),
+            replay::Masks::new(),
+        );
+        let http = replay::test_http_client(&session);
+        let agent = make_agent(runner, http);
+
+        let err = agent.archive_session_inner("s-fail", "https://api.test")
             .await
-            .expect_err("second archive should fail");
-        replay_http.assert_complete();
+            .expect_err("archive should fail");
+        session.assert_complete();
 
         assert!(err.contains("HTTP 500"));
         assert!(err.contains("boom"));
@@ -811,12 +702,11 @@ mod tests {
     #[tokio::test]
     async fn attach_command_formats_teleport_command() {
         let _test_lock = TEST_LOCK.lock().await;
-        let runner = mock_runner_arc(vec![]);
-        let agent = ClaudeCodingAgent::new("claude".into(), runner);
-        let cmd = agent
-            .attach_command("abc123")
-            .await
-            .expect("attach command");
+        let runner = mock_runner(vec![]);
+        let http: Arc<dyn crate::providers::HttpClient> =
+            Arc::new(crate::providers::ReqwestHttpClient::new());
+        let agent = make_agent(runner, http);
+        let cmd = agent.attach_command("abc123").await.expect("attach command");
         assert_eq!(cmd, "claude --teleport abc123");
     }
 }
