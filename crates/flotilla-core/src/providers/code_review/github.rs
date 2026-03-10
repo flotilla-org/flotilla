@@ -248,44 +248,26 @@ mod tests {
 
     fn build_api_and_runner(
         session: &replay::Session,
-        recording: bool,
     ) -> (
         Arc<dyn crate::providers::github_api::GhApi>,
         Arc<dyn crate::providers::CommandRunner>,
     ) {
-        if recording {
-            let real_runner = Arc::new(crate::providers::ProcessCommandRunner)
-                as Arc<dyn crate::providers::CommandRunner>;
-            let real_api = Arc::new(crate::providers::github_api::GhApiClient::new(
-                real_runner.clone(),
-            ));
-            (
-                Arc::new(replay::RecordingGhApi::new(session.clone(), real_api))
-                    as Arc<dyn crate::providers::github_api::GhApi>,
-                real_runner,
-            )
-        } else {
-            (
-                Arc::new(replay::ReplayGhApi::new(session.clone()))
-                    as Arc<dyn crate::providers::github_api::GhApi>,
-                Arc::new(replay::ReplayRunner::new(session.clone()))
-                    as Arc<dyn crate::providers::CommandRunner>,
-            )
-        }
+        let runner = replay::test_runner(session);
+        let api = replay::test_gh_api(session, &runner);
+        (api, runner)
     }
 
     #[tokio::test]
     async fn record_replay_list_change_requests() {
-        let recording = replay::is_recording();
         let repo_slug = "rjwittams/flotilla".to_string();
-        let repo_root = if recording {
+
+        let session = replay::test_session(&fixture("github_prs.yaml"), Masks::new());
+        let repo_root = if session.is_recording() {
             repo_root_for_recording()
         } else {
             PathBuf::from("/test/repo")
         };
-
-        let session = replay::test_session(&fixture("github_prs.yaml"), Masks::new());
-        let (api, runner) = build_api_and_runner(&session, recording);
+        let (api, runner) = build_api_and_runner(&session);
 
         let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
         let prs = provider
@@ -305,16 +287,15 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_list_merged_branch_names() {
-        let recording = replay::is_recording();
         let repo_slug = "rjwittams/flotilla".to_string();
-        let repo_root = if recording {
+
+        let session = replay::test_session(&fixture("github_merged.yaml"), Masks::new());
+        let repo_root = if session.is_recording() {
             repo_root_for_recording()
         } else {
             PathBuf::from("/test/repo")
         };
-
-        let session = replay::test_session(&fixture("github_merged.yaml"), Masks::new());
-        let (api, runner) = build_api_and_runner(&session, recording);
+        let (api, runner) = build_api_and_runner(&session);
 
         let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
         let branches = provider

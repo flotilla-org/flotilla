@@ -501,7 +501,7 @@ mod tests {
             .fetch_sessions_inner("https://api.test")
             .await
             .expect("fetch sessions");
-        session.assert_complete();
+        session.finish();
 
         assert_eq!(sessions.len(), 2, "archived sessions should be filtered");
         assert_eq!(sessions[0].id, "new", "sessions should be sorted desc");
@@ -526,7 +526,7 @@ mod tests {
             .fetch_sessions("https://api.test")
             .await
             .expect("retry should succeed");
-        session.assert_complete();
+        session.finish();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s1");
@@ -550,7 +550,7 @@ mod tests {
             .fetch_sessions("https://api.test")
             .await
             .expect("auth failures should degrade gracefully");
-        session.assert_complete();
+        session.finish();
 
         assert!(sessions.is_empty());
     }
@@ -664,7 +664,7 @@ mod tests {
             .archive_session_inner("s-ok", "https://api.test")
             .await
             .expect("archive should succeed");
-        session.assert_complete();
+        session.finish();
     }
 
     #[tokio::test]
@@ -685,7 +685,7 @@ mod tests {
             .archive_session_inner("s-fail", "https://api.test")
             .await
             .expect_err("archive should fail");
-        session.assert_complete();
+        session.finish();
 
         assert!(err.contains("HTTP 500"));
         assert!(err.contains("boom"));
