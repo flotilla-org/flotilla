@@ -80,7 +80,6 @@ fn build_repo_snapshot(
     path: &Path,
     seq: u64,
     base: &RefreshSnapshot,
-    health: &HashMap<(&'static str, String), bool>,
     cache: &IssueCache,
     search_results: &Option<Vec<(String, Issue)>>,
 ) -> Snapshot {
@@ -94,7 +93,6 @@ fn build_repo_snapshot(
         provider_health: base.provider_health.clone(),
     };
     let mut snapshot = snapshot_to_proto(path, seq, &re_snapshot);
-    snapshot.provider_health = crate::convert::health_to_proto(health);
     snapshot.issue_total = cache.total_count;
     snapshot.issue_has_more = cache.has_more;
     snapshot.issue_search_results = search_results.clone();
@@ -759,7 +757,6 @@ impl InProcessDaemon {
             repo,
             state.seq + 1,
             &state.last_snapshot,
-            &state.model.data.provider_health,
             &state.issue_cache,
             &state.search_results,
         );
@@ -794,7 +791,6 @@ impl DaemonHandle for InProcessDaemon {
             repo,
             state.seq,
             &state.last_snapshot,
-            &state.model.data.provider_health,
             &state.issue_cache,
             &state.search_results,
         ))
@@ -1035,7 +1031,6 @@ impl DaemonHandle for InProcessDaemon {
                     path,
                     state.seq,
                     &state.last_snapshot,
-                    &state.model.data.provider_health,
                     &state.issue_cache,
                     &state.search_results,
                 )
