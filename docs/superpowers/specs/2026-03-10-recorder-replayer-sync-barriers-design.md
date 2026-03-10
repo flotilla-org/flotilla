@@ -6,7 +6,7 @@ Issue: #183
 
 The replay framework has two structural limitations:
 
-1. `ReplaySession` handles both recording and replaying in a single struct gated by a `recording: bool` flag, coupling two distinct concerns.
+1. The old `Session` struct handled both recording and replaying in a single struct gated by a `recording: bool` flag, coupling two distinct concerns.
 2. Interactions must be consumed in exact fixture order. This is fragile when providers make concurrent requests via `tokio::join!` — the order between independent calls is non-deterministic.
 
 ## Design
@@ -114,7 +114,7 @@ Adapters remain split as today (`ReplayRunner`/`RecordingRunner`, etc.). The cha
 
 - Replay adapters call `session.next(ChannelLabel::Command("git".into()))` instead of `session.next("command")`. The label is derived from the request being made.
 - Recording adapters call `session.record(interaction)` as before. The recorder derives the label from the interaction when organizing into rounds.
-- Factory functions change signature from `&ReplaySession` to `&Session`.
+- Factory functions accept `&Session`.
 
 ### YAML Format
 
@@ -156,7 +156,7 @@ The loader detects which format by checking for `rounds:` vs `interactions:` at 
 
 - Existing fixtures work unchanged — flat `interactions:` is treated as a single round.
 - Existing test code works unchanged — no `barrier()` calls means single-round behavior, which is more permissive than today (cross-channel reordering allowed).
-- Factory function call sites need mechanical update from `&ReplaySession` to `&Session`.
+- Factory function call sites accept `&Session`.
 - Test helper functions like `build_api_and_runner` (in `code_review/github.rs` and `issue_tracker/github.rs`) also need signature updates.
 - Re-recording an existing test (`RECORD=1`) will produce the new `rounds:` format (single round) rather than the old flat `interactions:` format. Both are supported on load.
 

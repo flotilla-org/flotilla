@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Separate `ReplaySession` into distinct `Recorder` and `Replayer` types, and add round-based sync barriers with per-channel FIFO queues for resilient concurrent test fixtures.
+**Goal:** Replace the old monolithic session struct with distinct `Recorder` and `Replayer` types, and add round-based sync barriers with per-channel FIFO queues for resilient concurrent test fixtures.
 
-**Architecture:** `ReplaySession` is replaced by a `Session` enum wrapping `Recorder` or `Replayer`. The `Replayer` organizes interactions into rounds, each containing per-channel FIFO queues keyed by `ChannelLabel`. Within a round, channels are independently consumable; barriers separate rounds. Existing flat YAML fixtures load as a single round.
+**Architecture:** The old session struct is replaced by a `Session` enum wrapping `Recorder` or `Replayer`. The `Replayer` organizes interactions into rounds, each containing per-channel FIFO queues keyed by `ChannelLabel`. Within a round, channels are independently consumable; barriers separate rounds. Existing flat YAML fixtures load as a single round.
 
 **Tech Stack:** Rust, serde/serde_yml, std::collections (HashMap, VecDeque), std::sync (Arc, Mutex)
 
@@ -16,9 +16,9 @@
 
 | File | Role |
 |------|------|
-| `crates/flotilla-core/src/providers/replay.rs` | Main file — replace `ReplaySession`/`SessionInner` with `ChannelLabel`, `Round`, `Recorder`, `Replayer`, `Session` enum. Keep adapters (`ReplayRunner`, `RecordingRunner`, etc.) updated to use `Session`. Keep `Masks`, `Interaction`, mask/unmask helpers unchanged. |
+| `crates/flotilla-core/src/providers/replay.rs` | Main file — replaced old monolithic session struct with `ChannelLabel`, `Round`, `Recorder`, `Replayer`, `Session` enum. Adapters (`ReplayRunner`, `RecordingRunner`, etc.) updated to use `Session`. `Masks`, `Interaction`, mask/unmask helpers unchanged. |
 
-All other files are **call-site updates** — changing `&ReplaySession` to `&Session` and `ReplaySession::from_file` to `Session` constructors:
+All other files are **call-site updates** — changing to `&Session` and `Session` constructors:
 
 | File | Changes |
 |------|---------|
@@ -883,7 +883,7 @@ impl Session {
 
 - [ ] **Step 4: Update adapter field types and factory functions together**
 
-**Important:** Steps 4 and 5 are interdependent — the factory functions pass `Session` to adapter constructors, and the adapters must accept `Session`. Do both in one pass. First update all adapter struct fields from `session: ReplaySession` to `session: Session` (Step 5), then update the factory functions below.
+**Important:** Steps 4 and 5 are interdependent — the factory functions pass `Session` to adapter constructors, and the adapters must accept `Session`. Do both in one pass. First update all adapter struct fields to `session: Session` (Step 5), then update the factory functions below.
 
 Replace `test_session`, `test_runner`, `test_gh_api`, `test_http_client`:
 
@@ -932,9 +932,9 @@ pub fn test_http_client(session: &Session) -> Arc<dyn super::HttpClient> {
 }
 ```
 
-- [ ] **Step 5: Update adapters to hold `Session` instead of `ReplaySession`**
+- [ ] **Step 5: Update adapters to hold `Session`**
 
-Change field types in `ReplayRunner`, `ReplayGhApi`, `ReplayHttpClient`, `RecordingRunner`, `RecordingGhApi`, `RecordingHttpClient` from `session: ReplaySession` to `session: Session`.
+Change field types in `ReplayRunner`, `ReplayGhApi`, `ReplayHttpClient`, `RecordingRunner`, `RecordingGhApi`, `RecordingHttpClient` to `session: Session`.
 
 Update `ReplayRunner` to call `self.session.next(&ChannelLabel::Command(cmd.to_string()))` instead of `self.session.next("command")`.
 
@@ -944,9 +944,9 @@ Update `ReplayHttpClient` to derive the label from the request URL host and call
 
 Update `RecordingRunner`, `RecordingGhApi`, `RecordingHttpClient` to call `self.session.record(...)` (unchanged API, just different type).
 
-- [ ] **Step 6: Remove old `ReplaySession` and `SessionInner`**
+- [ ] **Step 6: Remove old session structs**
 
-Delete the `ReplaySession` struct, `SessionInner` struct, and all their methods. The `Session` enum now provides all functionality.
+Delete the old session struct and its inner struct, along with all their methods. The `Session` enum now provides all functionality.
 
 Keep `InteractionLog` (still needed for flat YAML format compat and for `RoundLog`).
 
@@ -958,27 +958,27 @@ Expected: PASS
 - [ ] **Step 8: Run all replay module tests**
 
 Run: `cargo test --locked -p flotilla-core replay`
-Expected: Several older tests will fail because they still reference `ReplaySession::from_file`. These will be fixed in the next task.
+Expected: Several older tests will fail because they still reference the old session API. These will be fixed in the next task.
 
 - [ ] **Step 9a: Update session/runner tests**
 
 Update `replay_session_serves_in_order`, `replay_runner_with_git_vcs`, `record_then_replay`:
-- `ReplaySession::from_file(&path, masks)` → `Session::replaying(&path, masks)`
-- `session.command_runner()` → `ReplayRunner::new(session.clone())`
-- `ReplaySession::recording(...)` → `Session::recording(...)`
-- `session.next("command")` → `session.next(&ChannelLabel::Command("git".into()))`
+- Use `Session::replaying(&path, masks)` instead of the old from-file constructor
+- Use `ReplayRunner::new(session.clone())` instead of `session.command_runner()`
+- Use `Session::recording(...)` instead of the old recording constructor
+- Use `session.next(&ChannelLabel::Command("git".into()))` instead of string-based next
 
 - [ ] **Step 9b: Update GhApi tests**
 
 Update `replay_gh_api_get`, `replay_gh_api_get_non_2xx_returns_err`, `replay_gh_api_get_with_headers`, `replay_gh_api_get_with_headers_no_pagination`:
-- `ReplaySession::from_file(...)` → `Session::replaying(...)`
-- `session.gh_api()` → `ReplayGhApi::new(session.clone())`
+- Use `Session::replaying(...)` instead of the old from-file constructor
+- Use `ReplayGhApi::new(session.clone())` instead of `session.gh_api()`
 
 - [ ] **Step 9c: Update HTTP and YAML tests**
 
 Update `replay_http_client_round_trip`, `yaml_round_trip`:
-- `ReplaySession::from_file(...)` → `Session::replaying(...)`
-- `session.http_client()` → `ReplayHttpClient::new(session.clone())`
+- Use `Session::replaying(...)` instead of the old from-file constructor
+- Use `ReplayHttpClient::new(session.clone())` instead of `session.http_client()`
 - `yaml_round_trip` may need no changes if it only tests `InteractionLog` serialization
 
 - [ ] **Step 10: Run all replay module tests**
@@ -1011,7 +1011,7 @@ Most call sites (`git.rs`, `wt.rs`, `tmux.rs`, `zellij.rs`, `claude.rs`) use `te
 
 - [ ] **Step 1: Rewrite `build_api_and_runner` in `code_review/github.rs`**
 
-Change signature from `session: &replay::ReplaySession` to `session: &replay::Session`. Replace the function body to use factory functions instead of calling methods on session:
+Change signature to `session: &replay::Session`. Replace the function body to use factory functions instead of calling methods on session:
 
 ```rust
 fn build_api_and_runner(
