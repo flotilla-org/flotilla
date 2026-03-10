@@ -95,6 +95,57 @@ impl CommandRunner for ProcessCommandRunner {
     }
 }
 
+/// Trait abstracting HTTP request execution so providers can be tested
+/// without making real network calls.
+///
+/// Uses reqwest::Request as input (callers build with the reqwest builder API)
+/// and returns http::Response<bytes::Bytes> (the standard Rust HTTP type that
+/// reqwest is built on, trivially constructable in tests).
+#[async_trait]
+pub trait HttpClient: Send + Sync {
+    async fn execute(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<http::Response<bytes::Bytes>, String>;
+}
+
+/// Production implementation that delegates to `reqwest::Client`.
+pub struct ReqwestHttpClient {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttpClient {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for ReqwestHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl HttpClient for ReqwestHttpClient {
+    async fn execute(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<http::Response<bytes::Bytes>, String> {
+        let resp = self.client.execute(request).await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.bytes().await.map_err(|e| e.to_string())?;
+        let mut builder = http::Response::builder().status(status);
+        for (name, value) in headers.iter() {
+            builder = builder.header(name, value);
+        }
+        builder.body(body).map_err(|e| e.to_string())
+    }
+}
+
 /// Resolve the path to the `claude` CLI binary.
 /// Checks PATH first, then known installation locations.
 pub async fn resolve_claude_path(runner: &dyn CommandRunner) -> Option<String> {
