@@ -142,7 +142,7 @@ fn test_repo_info(name: &str) -> flotilla_protocol::RepoInfo {
 fn test_labels() -> RepoLabels {
     RepoLabels {
         checkouts: CategoryLabels {
-            section: "Worktrees".into(),
+            section: "Checkouts".into(),
             noun: "worktree".into(),
             abbr: "WT".into(),
         },

@@ -1857,7 +1857,7 @@ mod tests {
     fn group_work_items_uses_custom_labels() {
         let providers = new_providers();
         let labels = SectionLabels {
-            checkouts: "Worktrees".into(),
+            checkouts: "Checkouts".into(),
             code_review: "Pull Requests".into(),
             issues: "Tickets".into(),
             sessions: "Agents".into(),
@@ -1873,7 +1873,7 @@ mod tests {
         let headers = header_titles(&result.table_entries);
         assert_eq!(
             headers,
-            vec!["Worktrees", "Agents", "Pull Requests", "Tickets"]
+            vec!["Checkouts", "Agents", "Pull Requests", "Tickets"]
         );
     }
 

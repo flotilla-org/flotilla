@@ -234,9 +234,6 @@ impl super::CheckoutManager for GitCheckoutManager {
         "git"
     }
 
-    fn section_label(&self) -> &str {
-        "Worktrees"
-    }
     fn item_noun(&self) -> &str {
         "worktree"
     }

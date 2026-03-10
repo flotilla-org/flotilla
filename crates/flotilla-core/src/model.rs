@@ -189,9 +189,6 @@ mod tests {
         fn display_name(&self) -> &str {
             "StubCM"
         }
-        fn section_label(&self) -> &str {
-            "Worktrees"
-        }
         fn item_noun(&self) -> &str {
             "worktree"
         }
@@ -387,7 +384,7 @@ mod tests {
         let reg = full_registry();
         let labels = labels_from_registry(&reg);
 
-        assert_eq!(labels.checkouts.section, "Worktrees");
+        assert_eq!(labels.checkouts.section, "Checkouts");
         assert_eq!(labels.checkouts.noun, "worktree");
         assert_eq!(labels.checkouts.abbr, "WT");
 
@@ -416,7 +413,7 @@ mod tests {
         let labels = labels_from_registry(&reg);
 
         // Populated providers have real labels.
-        assert_eq!(labels.checkouts.section, "Worktrees");
+        assert_eq!(labels.checkouts.section, "Checkouts");
         assert_eq!(labels.sessions.section, "Claude Sessions");
 
         // Missing providers fall back to defaults.
@@ -505,7 +502,7 @@ mod tests {
             Some("owner/repo".to_string()),
         );
 
-        assert_eq!(model.labels.checkouts.section, "Worktrees");
+        assert_eq!(model.labels.checkouts.section, "Checkouts");
         assert_eq!(model.labels.code_review.section, "Pull Requests");
         assert_eq!(model.labels.issues.section, "GitHub Issues");
         assert_eq!(model.labels.sessions.section, "Claude Sessions");

@@ -4,9 +4,9 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Description     Branch          WT  WS  PR   SS   Issues   Git  ││Description: Refactor auth module             │
-│      ── Pull Request                                                 ││Branch: feat-auth                             │
-│▸  ⊙  Refactor auth … feat-auth               #77                     ││PR #77: Refactor auth module                  │
+│      Path     Description     Branch          WT  WS  PR  SS  Iss Git││Description: Refactor auth module             │
+│               ── Pull Request                                        ││Branch: feat-auth                             │
+│▸  ⊙           Refactor auth … feat-auth               #77            ││PR #77: Refactor auth module                  │
 │                                                                      ││State: Open                                   │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

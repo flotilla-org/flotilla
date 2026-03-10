@@ -117,9 +117,6 @@ impl super::CheckoutManager for WtCheckoutManager {
         "wt"
     }
 
-    fn section_label(&self) -> &str {
-        "Worktrees"
-    }
     fn item_noun(&self) -> &str {
         "worktree"
     }

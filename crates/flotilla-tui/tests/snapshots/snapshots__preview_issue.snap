@@ -4,9 +4,9 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Description     Branch          WT  WS  PR   SS   Issues   Git  ││Description: Fix login timeout bug            │
-│      ── Issues ──                                                    ││Issue #25: Fix login timeout bug []           │
-│▸  ◇  Fix login time… —                                 #25           ││                                              │
+│      Path     Description     Branch          WT  WS  PR  SS  Iss Git││Description: Fix login timeout bug            │
+│               ── Issues ──                                           ││Issue #25: Fix login timeout bug []           │
+│▸  ◇           Fix login time… —                               #25    ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

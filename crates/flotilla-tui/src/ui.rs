@@ -12,6 +12,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::app::{InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState};
 use crate::event_log::{self, LevelExt};
@@ -288,6 +289,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
     let labels = model.active_labels();
     let header = Row::new(vec![
         Cell::from(""),
+        Cell::from("Path"),
         Cell::from("Description"),
         Cell::from("Branch"),
         Cell::from(labels.checkouts.abbr.as_str()),
@@ -302,6 +304,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 
     let widths = [
         Constraint::Length(3),
+        Constraint::Length(16),
         Constraint::Min(15),
         Constraint::Length(25),
         Constraint::Length(3),
@@ -333,7 +336,8 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
             match entry {
                 GroupEntry::Header(header) => build_header_row(header),
                 GroupEntry::Item(item) => {
-                    let mut row = build_item_row(item, &rm.providers, &col_widths);
+                    let mut row =
+                        build_item_row(item, &rm.providers, &col_widths, model.active_repo_root());
                     if is_multi_selected {
                         row = row.style(Style::default().bg(Color::Indexed(236)));
                     }
@@ -376,6 +380,7 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
     let style = Style::default().fg(Color::Yellow).bold();
     Row::new(vec![
         Cell::from(""),
+        Cell::from(""),
         Cell::from(Span::styled(format!("── {} ──", header), style)),
         Cell::from(""),
         Cell::from(""),
@@ -388,7 +393,12 @@ fn build_header_row(header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
-fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u16]) -> Row<'a> {
+fn build_item_row<'a>(
+    item: &WorkItem,
+    providers: &ProviderData,
+    col_widths: &[u16],
+    repo_root: &Path,
+) -> Row<'a> {
     let session_status = item
         .session_key
         .as_deref()
@@ -397,8 +407,15 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
     let (icon, icon_color) =
         ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
 
-    let desc_width = col_widths.get(1).copied().unwrap_or(15) as usize;
-    let branch_width = col_widths.get(2).copied().unwrap_or(25) as usize;
+    let path_width = col_widths.get(1).copied().unwrap_or(16) as usize;
+    let desc_width = col_widths.get(2).copied().unwrap_or(15) as usize;
+    let branch_width = col_widths.get(3).copied().unwrap_or(25) as usize;
+
+    let path_display = item
+        .checkout_key()
+        .map(|p| ui_helpers::shorten_path(p, repo_root))
+        .unwrap_or_default();
+    let path_display = ui_helpers::truncate(&path_display, path_width);
 
     let description = ui_helpers::truncate(&item.description, desc_width);
 
@@ -452,6 +469,10 @@ fn build_item_row<'a>(item: &WorkItem, providers: &ProviderData, col_widths: &[u
         Cell::from(Span::styled(
             format!(" {icon}"),
             Style::default().fg(icon_color),
+        )),
+        Cell::from(Span::styled(
+            path_display,
+            Style::default().fg(Color::DarkGray),
         )),
         Cell::from(description),
         Cell::from(Span::styled(
