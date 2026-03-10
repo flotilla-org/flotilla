@@ -18,7 +18,7 @@ pub struct RefreshSnapshot {
     pub work_items: Vec<CorrelationResult>,
     pub correlation_groups: Vec<CorrelatedGroup>,
     pub errors: Vec<RefreshError>,
-    pub provider_health: HashMap<&'static str, bool>,
+    pub provider_health: HashMap<(&'static str, String), bool>,
 }
 
 impl Default for RefreshSnapshot {
@@ -195,6 +195,7 @@ async fn refresh_providers(
         .unwrap_or_else(|e| {
             errors.push(RefreshError {
                 category: "checkouts",
+                provider: String::new(),
                 message: e,
             });
             Vec::new()
@@ -205,6 +206,7 @@ async fn refresh_providers(
         .unwrap_or_else(|e| {
             errors.push(RefreshError {
                 category: "PRs",
+                provider: String::new(),
                 message: e,
             });
             Vec::new()
@@ -215,6 +217,7 @@ async fn refresh_providers(
         .unwrap_or_else(|e| {
             errors.push(RefreshError {
                 category: "workspaces",
+                provider: String::new(),
                 message: e,
             });
             Vec::new()
@@ -225,6 +228,7 @@ async fn refresh_providers(
         .unwrap_or_else(|e| {
             errors.push(RefreshError {
                 category: "terminals",
+                provider: String::new(),
                 message: e,
             });
             Vec::new()
@@ -236,6 +240,7 @@ async fn refresh_providers(
     if !session_errors.is_empty() {
         errors.push(RefreshError {
             category: "sessions",
+            provider: String::new(),
             message: session_errors.join("; "),
         });
     }
@@ -245,6 +250,7 @@ async fn refresh_providers(
         let remote = branches.unwrap_or_else(|e| {
             errors.push(RefreshError {
                 category: "branches",
+                provider: String::new(),
                 message: e,
             });
             Vec::new()
@@ -252,6 +258,7 @@ async fn refresh_providers(
         let merged_names = merged.unwrap_or_else(|e| {
             errors.push(RefreshError {
                 category: "merged",
+                provider: String::new(),
                 message: e,
             });
             Vec::new()
@@ -280,17 +287,17 @@ async fn refresh_providers(
 fn compute_provider_health(
     registry: &ProviderRegistry,
     errors: &[RefreshError],
-) -> HashMap<&'static str, bool> {
+) -> HashMap<(&'static str, String), bool> {
     let mut health = HashMap::new();
     if registry.cloud_agents.values().next().is_some() {
         health.insert(
-            "cloud_agent",
+            ("cloud_agent", String::new()),
             !errors.iter().any(|e| e.category == "sessions"),
         );
     }
     if registry.code_review.values().next().is_some() {
         health.insert(
-            "code_review",
+            ("code_review", String::new()),
             !errors
                 .iter()
                 .any(|e| e.category == "PRs" || e.category == "merged"),
@@ -298,7 +305,7 @@ fn compute_provider_health(
     }
     if registry.terminal_pool.is_some() {
         health.insert(
-            "terminal_pool",
+            ("terminal_pool", String::new()),
             !errors.iter().any(|e| e.category == "terminals"),
         );
     }
@@ -623,6 +630,7 @@ mod tests {
     fn refresh_error(category: &'static str) -> RefreshError {
         RefreshError {
             category,
+            provider: String::new(),
             message: format!("{category} failure"),
         }
     }
@@ -683,8 +691,14 @@ mod tests {
 
         for (errors, expected_coding, expected_review) in cases {
             let health = compute_provider_health(&registry, &errors);
-            assert_eq!(health.get("cloud_agent"), Some(&expected_coding));
-            assert_eq!(health.get("code_review"), Some(&expected_review));
+            assert_eq!(
+                health.get(&("cloud_agent", String::new())),
+                Some(&expected_coding)
+            );
+            assert_eq!(
+                health.get(&("code_review", String::new())),
+                Some(&expected_review)
+            );
         }
     }
 
@@ -859,7 +873,12 @@ mod tests {
         let mut rx = handle.snapshot_rx.clone();
         let snapshot = wait_for_snapshot(&mut rx).await;
         assert!(snapshot.errors.iter().any(|e| e.category == "sessions"));
-        assert_eq!(snapshot.provider_health.get("cloud_agent"), Some(&false));
+        assert_eq!(
+            snapshot
+                .provider_health
+                .get(&("cloud_agent", String::new())),
+            Some(&false)
+        );
     }
 
     #[tokio::test]
