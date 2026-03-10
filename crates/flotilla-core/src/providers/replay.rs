@@ -58,28 +58,32 @@ pub enum ChannelLabel {
     Http(String),
 }
 
+impl ChannelLabel {
+    /// Extract host from a URL via simple string parsing.
+    /// "https://api.example.com/v1/foo" → "api.example.com"
+    pub fn http_from_url(url: &str) -> Self {
+        let host = url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split('/')
+            .next()
+            .unwrap_or(url)
+            .split(':')
+            .next()
+            .unwrap_or(url)
+            .to_string();
+        ChannelLabel::Http(host)
+    }
+}
+
 impl Interaction {
     /// Derive the channel label from interaction data.
     pub fn channel_label(&self) -> ChannelLabel {
         match self {
             Interaction::Command { cmd, .. } => ChannelLabel::Command(cmd.clone()),
             Interaction::GhApi { endpoint, .. } => ChannelLabel::GhApi(endpoint.clone()),
-            Interaction::Http { url, .. } => {
-                // Extract host from URL via simple string parsing
-                // "https://api.example.com/v1/foo" → "api.example.com"
-                let host = url
-                    .split("://")
-                    .nth(1)
-                    .unwrap_or(url)
-                    .split('/')
-                    .next()
-                    .unwrap_or(url)
-                    .split(':')
-                    .next()
-                    .unwrap_or(url)
-                    .to_string();
-                ChannelLabel::Http(host)
-            }
+            Interaction::Http { url, .. } => ChannelLabel::http_from_url(url),
         }
     }
 }
@@ -536,19 +540,8 @@ impl super::HttpClient for ReplayHttpClient {
         &self,
         request: reqwest::Request,
     ) -> Result<http::Response<bytes::Bytes>, String> {
-        let url_str = request.url().as_str();
-        let host = url_str
-            .split("://")
-            .nth(1)
-            .unwrap_or(url_str)
-            .split('/')
-            .next()
-            .unwrap_or(url_str)
-            .split(':')
-            .next()
-            .unwrap_or(url_str)
-            .to_string();
-        let interaction = self.session.next(&ChannelLabel::Http(host));
+        let label = ChannelLabel::http_from_url(request.url().as_str());
+        let interaction = self.session.next(&label);
         let Interaction::Http {
             method: expected_method,
             url: expected_url,
