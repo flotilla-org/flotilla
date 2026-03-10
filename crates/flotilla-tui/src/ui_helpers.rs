@@ -124,15 +124,13 @@ pub fn shorten_path(path: &Path, repo_root: &Path) -> String {
     if path == repo_root {
         return ".".to_string();
     }
-    let relative = path
+    let rel = path
         .strip_prefix(repo_root)
         .unwrap_or(path)
         .to_string_lossy();
-    let relative = relative.as_ref();
-    if let Some(rest) = relative.strip_prefix(".worktrees/") {
-        rest.to_string()
-    } else {
-        relative.to_string()
+    match rel.strip_prefix(".worktrees/") {
+        Some(name) => name.to_string(),
+        None => rel.into_owned(),
     }
 }
 
@@ -364,6 +362,13 @@ mod tests {
         let root = Path::new("/home/user/project");
         let sub = Path::new("/home/user/project/sub/dir");
         assert_eq!(shorten_path(sub, root), "sub/dir");
+    }
+
+    #[test]
+    fn shorten_path_nested_worktree() {
+        let root = Path::new("/home/user/project");
+        let wt = Path::new("/home/user/project/.worktrees/group/feat-auth");
+        assert_eq!(shorten_path(wt, root), "group/feat-auth");
     }
 
     #[test]

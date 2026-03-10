@@ -304,7 +304,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 
     let widths = [
         Constraint::Length(3),
-        Constraint::Length(16),
+        Constraint::Length(14),
         Constraint::Min(15),
         Constraint::Length(25),
         Constraint::Length(3),
@@ -407,7 +407,7 @@ fn build_item_row<'a>(
     let (icon, icon_color) =
         ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
 
-    let path_width = col_widths.get(1).copied().unwrap_or(16) as usize;
+    let path_width = col_widths.get(1).copied().unwrap_or(14) as usize;
     let desc_width = col_widths.get(2).copied().unwrap_or(15) as usize;
     let branch_width = col_widths.get(3).copied().unwrap_or(25) as usize;
 

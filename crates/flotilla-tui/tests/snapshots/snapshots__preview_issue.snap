@@ -1,5 +1,6 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 149
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
