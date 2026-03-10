@@ -283,7 +283,7 @@ mod tests {
     }
 
     fn build_api_and_runner(
-        session: &replay::ReplaySession,
+        session: &replay::Session,
         recording: bool,
     ) -> (
         Arc<dyn crate::providers::github_api::GhApi>,
@@ -302,8 +302,10 @@ mod tests {
             )
         } else {
             (
-                Arc::new(session.gh_api()) as Arc<dyn crate::providers::github_api::GhApi>,
-                Arc::new(session.command_runner()) as Arc<dyn crate::providers::CommandRunner>,
+                Arc::new(replay::ReplayGhApi::new(session.clone()))
+                    as Arc<dyn crate::providers::github_api::GhApi>,
+                Arc::new(replay::ReplayRunner::new(session.clone()))
+                    as Arc<dyn crate::providers::CommandRunner>,
             )
         }
     }
