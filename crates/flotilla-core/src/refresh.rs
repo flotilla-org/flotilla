@@ -321,7 +321,9 @@ fn compute_provider_health(
         health.insert(("cloud_agent", name), !has_error);
     }
 
-    for cr in registry.code_review.values() {
+    // Only emit health for the first code_review provider — refresh_providers
+    // only queries .values().next(), so additional providers are never exercised.
+    if let Some(cr) = registry.code_review.values().next() {
         let name = cr.display_name().to_string();
         let has_error = errors
             .iter()

@@ -144,8 +144,16 @@ fn format_error_status(errors: &[ProviderError], repo_path: &Path) -> Option<Str
         if e.category == "issues" && e.message.contains("has disabled issues") {
             continue;
         }
-        tracing::error!("{name}: {}: {}", e.category, e.message);
-        all_errors.push(format!("{name}: {}: {}", e.category, e.message));
+        let provider_suffix = if e.provider.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", e.provider)
+        };
+        tracing::error!("{name}: {}{provider_suffix}: {}", e.category, e.message);
+        all_errors.push(format!(
+            "{name}: {}{provider_suffix}: {}",
+            e.category, e.message
+        ));
     }
     if all_errors.is_empty() {
         None
