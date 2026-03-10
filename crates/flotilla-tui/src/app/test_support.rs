@@ -6,14 +6,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-use flotilla_protocol::{
-    CheckoutRef, Command, DaemonEvent, RepoInfo, RepoLabels, Snapshot, WorkItem, WorkItemIdentity,
-    WorkItemKind,
-};
+use flotilla_protocol::{Command, DaemonEvent, RepoInfo, RepoLabels, Snapshot, WorkItem};
 use tokio::sync::broadcast;
 use tui_input::Input;
 
 use super::{App, DirEntry, TuiRepoModel, UiMode};
+
+// Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
+pub(crate) use super::test_builders::*;
 
 struct StubDaemon {
     tx: broadcast::Sender<DaemonEvent>,
@@ -100,106 +100,6 @@ pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-pub(crate) fn bare_item() -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::Issue,
-        identity: WorkItemIdentity::Issue("1".into()),
-        branch: None,
-        description: String::new(),
-        checkout: None,
-        change_request_key: None,
-        session_key: None,
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: false,
-        debug_group: Vec::new(),
-    }
-}
-
-pub(crate) fn issue_item(id: impl Into<String>) -> WorkItem {
-    let id = id.into();
-    WorkItem {
-        kind: WorkItemKind::Issue,
-        identity: WorkItemIdentity::Issue(id.clone()),
-        branch: None,
-        description: format!("Item {id}"),
-        checkout: None,
-        change_request_key: None,
-        session_key: None,
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: false,
-        debug_group: Vec::new(),
-    }
-}
-
-pub(crate) fn checkout_item(branch: &str, path: &str, is_main: bool) -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(PathBuf::from(path)),
-        branch: Some(branch.into()),
-        description: format!("checkout {branch}"),
-        checkout: Some(CheckoutRef {
-            key: PathBuf::from(path),
-            is_main_checkout: is_main,
-        }),
-        change_request_key: None,
-        session_key: None,
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: is_main,
-        debug_group: Vec::new(),
-    }
-}
-
-pub(crate) fn pr_item(pr_id: &str) -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::ChangeRequest,
-        identity: WorkItemIdentity::ChangeRequest(pr_id.into()),
-        branch: Some("feat/pr-branch".into()),
-        description: format!("PR #{pr_id}"),
-        checkout: None,
-        change_request_key: Some(pr_id.into()),
-        session_key: None,
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: false,
-        debug_group: Vec::new(),
-    }
-}
-
-pub(crate) fn session_item(session_id: &str) -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::Session,
-        identity: WorkItemIdentity::Session(session_id.into()),
-        branch: Some("feat/session-branch".into()),
-        description: format!("session {session_id}"),
-        checkout: None,
-        change_request_key: None,
-        session_key: Some(session_id.into()),
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: false,
-        debug_group: Vec::new(),
-    }
-}
-
-pub(crate) fn remote_branch_item(branch: &str) -> WorkItem {
-    WorkItem {
-        kind: WorkItemKind::RemoteBranch,
-        identity: WorkItemIdentity::RemoteBranch(branch.into()),
-        branch: Some(branch.into()),
-        description: format!("remote {branch}"),
-        checkout: None,
-        change_request_key: None,
-        session_key: None,
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: false,
-        debug_group: Vec::new(),
-    }
-}
-
 pub(crate) fn grouped_items(items: Vec<WorkItem>) -> GroupedWorkItems {
     let selectable_indices = (0..items.len()).collect();
     let table_entries = items
@@ -261,15 +161,4 @@ fn stub_app_with_repo_infos(repos_info: Vec<RepoInfo>) -> App {
     let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
     let config = Arc::new(ConfigStore::with_base("/tmp/flotilla-test"));
     App::new(daemon, repos_info, config)
-}
-
-fn repo_info(path: impl Into<PathBuf>, name: impl Into<String>, labels: RepoLabels) -> RepoInfo {
-    RepoInfo {
-        path: path.into(),
-        name: name.into(),
-        labels,
-        provider_names: HashMap::new(),
-        provider_health: HashMap::new(),
-        loading: false,
-    }
 }

@@ -1,0 +1,35 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 63
+expression: output
+---
+ ⚓  flotilla  | my-project | [+]
+┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
+│      Description     Branch          WT  WS  PR   SS   Issues   Git  ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                       ┌ Help ────────────────────────────────────────────────────────────────┐                       │
+│                       │Navigation                                                            │                       │
+│                       │j/k or ↑/↓      Navigate list                                         │                       │
+│                       │Click            Select item                                          │                       │
+│                       │Scroll wheel     Navigate list                                        │                       │
+│                       │                                                                      │                       │
+│                       │Actions                                                               │                       │
+│                       │Enter            Open workspace (switch/create as needed)             │                       │
+│                       │Double-click     Same as Enter                                        │                       │
+│                       │.                Action menu (all available actions)                  │                       │
+│                       │Right-click      Action menu                                          │                       │
+│                       │n                New branch (enter name, creates worktree)            │                       │
+│                       │d                Remove worktree (with safety check)                  │                       │
+│                       │p                Show PR in browser                                   │                       │
+│                       │r                Refresh data                                         │                       │
+│                       │                                                                      │                       │
+│                       │Multi-select (issues)                                                 │                       │
+│                       │Space            Toggle selection on current item                     │                       │
+│                       │Enter            Generate branch name for all selected                │                       │
+│                       │Esc              Clear selection                                      │                       │
+│                       └──────────────────────────────────────────────────────────────────────┘                       │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+ ?:close help  esc:close help

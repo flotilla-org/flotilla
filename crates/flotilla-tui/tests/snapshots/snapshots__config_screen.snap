@@ -1,0 +1,34 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+expression: output
+---
+ ⚓  flotilla  | my-project | [+]
+┌──────────────────────────────────────────────────────────────────────┐┌ Event Log ───────────────────────────── INFO ┐
+│── Provider Factories ──                                              ││                                              │
+│VCS             Git                                                   ││                                              │
+│Checkout mgr    Git Worktrees                                         ││                                              │
+│Code review     GitHub                                                ││                                              │
+│Issue tracker   GitHub                                                ││                                              │
+│Coding agent    Claude                                                ││                                              │
+│AI utility      —                                                     ││                                              │
+│Workspace mgr   —                                                     ││                                              │
+│Terminal pool   —                                                     ││                                              │
+│                                                                      ││                                              │
+│── Coding Agent Status ──                                             ││                                              │
+│Claude          ✓ authenticated                                       ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+ j/k:scroll log  [/]:switch tab  ?:help  q:quit

@@ -1,0 +1,34 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+expression: output
+---
+ ⚓  flotilla  | my-project | [+]
+┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
+│      Description     Branch          WT  WS  PR   SS   Issues   Git  ││Description: checkout feat-login              │
+│      ── Worktrees ──                                                 ││Branch: feat-login                            │
+│▸  ○  checkout feat-… feat-login      ✓                               ││Path: /test/my-project/feat-login             │
+│      ── Sessions ──                                                  ││                                              │
+│   ◆  session s1      feat/session-b…              ◆                  ││                                              │
+│      ── Pull Request                                                 ││                                              │
+│   ⊙  Add login page  feat-login              #42                     ││                                              │
+│      ── Issues ──                                                    ││                                              │
+│   ◇  Users need aut… —                                 #10           ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+ enter:open  d:remove worktree  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit
