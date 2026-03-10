@@ -95,7 +95,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
         .map(|v| v.display_name().into())
         .collect();
     if !cas.is_empty() {
-        names.insert("coding_agent".into(), cas);
+        names.insert("cloud_agent".into(), cas);
     }
     let ais: Vec<String> = registry
         .ai_utilities
@@ -481,7 +481,7 @@ mod tests {
             &vec!["StubIT".to_string()]
         );
         assert_eq!(
-            names.get("coding_agent").unwrap(),
+            names.get("cloud_agent").unwrap(),
             &vec!["StubCA".to_string()]
         );
         assert_eq!(

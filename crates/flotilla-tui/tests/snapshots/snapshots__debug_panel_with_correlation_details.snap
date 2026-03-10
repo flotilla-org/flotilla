@@ -1,13 +1,12 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 298
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path        Description Branch      WT  WS  PR   SS   Issu Git  ││Description: Feature branch checkout          │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: Feature branch checkout          │
 │      ── Checkouts ──                                                 ││Branch: feat-xyz                              │
-│▸  ○        feat- Feature bra feat-xyz    ✓                           ││                                              │
+│▸  ○       feat- Feature bra feat-xyz   ✓                             ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

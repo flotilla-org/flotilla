@@ -1,13 +1,12 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 160
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path        Description Branch      WT  WS  PR   SS   Issu Git  ││Description: Fix login timeout bug            │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: Fix login timeout bug            │
 │      ── Issues ──                                                    ││Issue #25: Fix login timeout bug []           │
-│▸  ◇              Fix login t —                             #25       ││                                              │
+│▸  ◇             Fix login t —                            #25         ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

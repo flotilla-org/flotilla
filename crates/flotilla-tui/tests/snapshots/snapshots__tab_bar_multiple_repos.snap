@@ -4,7 +4,7 @@ expression: output
 ---
  ⚓  flotilla  | alpha | beta | gamma | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path        Description Branch      WT  WS  PR   SS   Issu Git  ││                                              │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

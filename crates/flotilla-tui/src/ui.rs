@@ -20,6 +20,9 @@ use crate::ui_helpers;
 use flotilla_core::data::{GroupEntry, SectionHeader};
 use flotilla_protocol::{ProviderData, WorkItem};
 
+const HIGHLIGHT_SYMBOL: &str = "▸ ";
+const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
+
 pub fn render(
     model: &TuiModel,
     ui: &mut UiState,
@@ -224,7 +227,7 @@ fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, are
         ("Checkout mgr", "checkout_manager"),
         ("Code review", "code_review"),
         ("Issue tracker", "issue_tracker"),
-        ("Cloud agents", "coding_agent"),
+        ("Cloud agents", "cloud_agent"),
         ("AI utility", "ai_utility"),
         ("Workspace mgr", "workspace_manager"),
         ("Terminal pool", "terminal_pool"),
@@ -324,20 +327,24 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 
     let widths = [
         Constraint::Length(3), // icon
-        Constraint::Min(6),    // Path (shrinks first when tight)
+        Constraint::Min(6),    // Path (capped at 30 after layout)
         Constraint::Fill(1),   // Description (absorbs remaining space)
         Constraint::Min(8),    // Branch (shrinks before fixed columns)
         Constraint::Length(3), // WT
         Constraint::Length(3), // WS
         Constraint::Length(4), // PR
         Constraint::Length(4), // SS
-        Constraint::Length(4), // Issues
+        Constraint::Length(6), // Issues
         Constraint::Length(5), // Git
     ];
 
-    let inner_width = area.width.saturating_sub(4);
+    let inner_width = area.width.saturating_sub(2 + HIGHLIGHT_SYMBOL_WIDTH);
     let col_areas = Layout::horizontal(widths).split(Rect::new(0, 0, inner_width, 1));
-    let col_widths: Vec<u16> = col_areas.iter().map(|r| r.width).collect();
+    let mut col_widths: Vec<u16> = col_areas.iter().map(|r| r.width).collect();
+    // Cap Path column (index 1) at 30 — ratatui doesn't support Min+Max on one column.
+    if col_widths.len() > 1 {
+        col_widths[1] = col_widths[1].min(30);
+    }
 
     // Build rows from active repo (immutable borrows)
     let rm = model.active();
@@ -371,7 +378,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
         .header(header)
         .block(Block::bordered().title_top(Line::from(" ⚙ ").right_aligned()))
         .row_highlight_style(Style::default().bg(Color::DarkGray).bold())
-        .highlight_symbol("▸ ")
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
         .highlight_spacing(HighlightSpacing::Always);
 
     // Now mutably borrow for stateful render
@@ -387,8 +394,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
     // the title text on top, starting from after the icon column.
     let offset = rui.table_state.offset();
     let visible_rows = area.height.saturating_sub(3) as usize; // borders + column header
-                                                               // left border (1) + highlight symbol (2) + icon column + column spacing (1)
-    let header_x = area.x + 1 + 2 + col_widths[0] + 1;
+    let header_x = area.x + 1 + HIGHLIGHT_SYMBOL_WIDTH + col_widths[0] + 1; // border + highlight + icon + spacing
     let header_w = (area.x + area.width).saturating_sub(header_x + 1); // up to right border
     let header_style = Style::default().fg(Color::Yellow).bold();
 
@@ -964,7 +970,7 @@ fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
         ("Checkout mgr", "checkout_manager"),
         ("Code review", "code_review"),
         ("Issue tracker", "issue_tracker"),
-        ("Cloud agents", "coding_agent"),
+        ("Cloud agents", "cloud_agent"),
         ("AI utility", "ai_utility"),
         ("Workspace mgr", "workspace_manager"),
         ("Terminal pool", "terminal_pool"),

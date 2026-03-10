@@ -284,7 +284,7 @@ fn compute_provider_health(
     let mut health = HashMap::new();
     if registry.cloud_agents.values().next().is_some() {
         health.insert(
-            "coding_agent",
+            "cloud_agent",
             !errors.iter().any(|e| e.category == "sessions"),
         );
     }
@@ -683,7 +683,7 @@ mod tests {
 
         for (errors, expected_coding, expected_review) in cases {
             let health = compute_provider_health(&registry, &errors);
-            assert_eq!(health.get("coding_agent"), Some(&expected_coding));
+            assert_eq!(health.get("cloud_agent"), Some(&expected_coding));
             assert_eq!(health.get("code_review"), Some(&expected_review));
         }
     }
@@ -859,7 +859,7 @@ mod tests {
         let mut rx = handle.snapshot_rx.clone();
         let snapshot = wait_for_snapshot(&mut rx).await;
         assert!(snapshot.errors.iter().any(|e| e.category == "sessions"));
-        assert_eq!(snapshot.provider_health.get("coding_agent"), Some(&false));
+        assert_eq!(snapshot.provider_health.get("cloud_agent"), Some(&false));
     }
 
     #[tokio::test]

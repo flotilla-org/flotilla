@@ -1,15 +1,14 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 127
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path        Description Branch      WT  WS  PR   SS   Issu Git  ││Description: checkout feat-dashboard          │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: checkout feat-dashboard          │
 │      ── Checkouts ──                                                 ││Branch: feat-dashboard                        │
-│▸  ○  feat-dashbo checkout fe feat-dashbo ✓                           ││Path: /test/my-project/feat-dashboard         │
+│▸  ○  feat-dashb checkout fe feat-dashb ✓                             ││Path: /test/my-project/feat-dashboard         │
 │      ── Pull Requests ──                                             ││                                              │
-│   ⊙              Build analy feat-dashbo         #99                 ││                                              │
+│   ⊙             Build analy feat-dashb         #99                   ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

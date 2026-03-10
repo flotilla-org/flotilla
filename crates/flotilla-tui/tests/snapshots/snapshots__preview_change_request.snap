@@ -1,13 +1,12 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 144
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path        Description Branch      WT  WS  PR   SS   Issu Git  ││Description: Refactor auth module             │
+│      Path       Description Branch     WT  WS  PR   SS   Issues Git  ││Description: Refactor auth module             │
 │      ── Pull Requests ──                                             ││Branch: feat-auth                             │
-│▸  ⊙              Refactor au feat-auth           #77                 ││PR #77: Refactor auth module                  │
+│▸  ⊙             Refactor au feat-auth          #77                   ││PR #77: Refactor auth module                  │
 │                                                                      ││State: Open                                   │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

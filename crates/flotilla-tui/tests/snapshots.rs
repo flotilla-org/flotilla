@@ -100,10 +100,10 @@ fn config_screen() {
                 ("issue_tracker", "GitHub"),
                 ("vcs", "Git"),
                 ("checkout_manager", "Git Worktrees"),
-                ("coding_agent", "Claude"),
+                ("cloud_agent", "Claude"),
             ],
         )
-        .with_provider_status("my-project", "coding_agent", "Claude", ProviderStatus::Ok);
+        .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -271,10 +271,10 @@ fn providers_overlay() {
                 ("vcs", "Git"),
                 ("checkout_manager", "Git Worktrees"),
                 ("code_review", "GitHub"),
-                ("coding_agent", "Claude"),
+                ("cloud_agent", "Claude"),
             ],
         )
-        .with_provider_status("my-project", "coding_agent", "Claude", ProviderStatus::Ok)
+        .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok)
         .with_provider_status("my-project", "code_review", "GitHub", ProviderStatus::Error);
     let repo = harness.model.repo_order[0].clone();
     harness.ui.repo_ui.get_mut(&repo).unwrap().show_providers = true;
