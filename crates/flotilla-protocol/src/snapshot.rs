@@ -47,7 +47,7 @@ pub struct RepoInfo {
     pub name: String,
     pub labels: RepoLabels,
     pub provider_names: HashMap<String, Vec<String>>,
-    pub provider_health: HashMap<String, bool>,
+    pub provider_health: HashMap<String, HashMap<String, bool>>,
     pub loading: bool,
 }
 
@@ -58,7 +58,7 @@ pub struct Snapshot {
     pub repo: PathBuf,
     pub work_items: Vec<WorkItem>,
     pub providers: ProviderData,
-    pub provider_health: HashMap<String, bool>,
+    pub provider_health: HashMap<String, HashMap<String, bool>>,
     pub errors: Vec<ProviderError>,
     #[serde(default)]
     pub issue_total: Option<u32>,
@@ -71,6 +71,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderError {
     pub category: String,
+    pub provider: String,
     pub message: String,
 }
 
@@ -185,7 +186,9 @@ mod tests {
                 ("vcs".to_string(), vec!["git".to_string()]),
                 ("code_review".to_string(), vec!["github".to_string()]),
             ]),
-            provider_health: HashMap::from([("git".to_string(), true)]),
+            provider_health: HashMap::from([
+                ("vcs".to_string(), HashMap::from([("Git".to_string(), true)])),
+            ]),
             loading: true,
         };
         let json = serde_json::to_string(&info).expect("serialize");
@@ -200,7 +203,7 @@ mod tests {
             vec!["github".to_string()]
         );
         assert_eq!(decoded.provider_health.len(), 1);
-        assert!(decoded.provider_health["git"]);
+        assert!(decoded.provider_health["vcs"]["Git"]);
         assert_eq!(decoded.labels.checkouts.section, "Worktrees");
         assert_eq!(decoded.labels.code_review.noun, "PR");
         assert_eq!(decoded.labels.issues.abbr, "I");
@@ -260,9 +263,12 @@ mod tests {
                 },
             ],
             providers: ProviderData::default(),
-            provider_health: HashMap::from([("git".to_string(), true)]),
+            provider_health: HashMap::from([
+                ("vcs".to_string(), HashMap::from([("Git".to_string(), true)])),
+            ]),
             errors: vec![ProviderError {
                 category: "github".into(),
+                provider: String::new(),
                 message: "not found".into(),
             }],
             issue_total: None,

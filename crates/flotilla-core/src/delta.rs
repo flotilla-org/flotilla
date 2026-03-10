@@ -579,6 +579,7 @@ mod tests {
     fn provider_error(category: &str, message: &str) -> ProviderError {
         ProviderError {
             category: category.into(),
+            provider: String::new(),
             message: message.into(),
         }
     }

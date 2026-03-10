@@ -64,6 +64,7 @@ pub enum Change {
         op: EntryOp<WorkItem>,
     },
     ProviderHealth {
+        category: String,
         provider: String,
         op: EntryOp<bool>,
     },
