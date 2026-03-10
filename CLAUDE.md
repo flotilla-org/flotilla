@@ -14,6 +14,8 @@ cargo run                            # run, auto-detect repo from cwd
 
 Before pushing, always run `cargo fmt`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`.
 
+In the Codex sandbox, prefer `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped.
+
 ## Architecture
 
 Provider-based plugin system with data correlation:
