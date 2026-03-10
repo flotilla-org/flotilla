@@ -89,15 +89,10 @@ fn config_screen() {
                 ("issue_tracker", "GitHub"),
                 ("vcs", "Git"),
                 ("checkout_manager", "Git Worktrees"),
+                ("coding_agent", "Claude"),
             ],
         )
-        .with_provider_status("my-project", "code_review", "GitHub", ProviderStatus::Ok)
-        .with_provider_status(
-            "my-project",
-            "issue_tracker",
-            "GitHub",
-            ProviderStatus::Error,
-        );
+        .with_provider_status("my-project", "coding_agent", "Claude", ProviderStatus::Ok);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -116,6 +111,55 @@ fn selected_item_preview() {
         make_work_item_cr("99", "Build analytics dashboard", Some("feat-dashboard")),
     ];
 
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn preview_change_request() {
+    let mut providers = ProviderData::default();
+    let (id, cr) = make_change_request("77", "Refactor auth module", "feat-auth");
+    providers.change_requests.insert(id, cr);
+
+    let mut item = support::pr_item("77");
+    item.description = "Refactor auth module".to_string();
+    item.branch = Some("feat-auth".to_string());
+    item.change_request_key = Some("77".to_string());
+
+    let items = vec![item];
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn preview_issue() {
+    let mut providers = ProviderData::default();
+    let (id, issue) = make_issue("25", "Fix login timeout bug");
+    providers.issues.insert(id, issue);
+
+    let mut item = support::issue_item("25");
+    item.description = "Fix login timeout bug".to_string();
+    item.issue_keys = vec!["25".to_string()];
+
+    let items = vec![item];
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn preview_session() {
+    let mut providers = ProviderData::default();
+    let (id, session) = make_session("s5", "Debug API endpoints", SessionStatus::Running);
+    providers.sessions.insert(id, session);
+
+    let mut item = support::session_item("s5");
+    item.description = "Debug API endpoints".to_string();
+    item.session_key = Some("s5".to_string());
+
+    let items = vec![item];
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);

@@ -3,18 +3,18 @@ source: crates/flotilla-tui/tests/snapshots.rs
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌──────────────────────────────────────────────────────────────────────┐┌ Event Log ───────────────────────────── INFO ┐
-│── Provider Factories ──                                              ││                                              │
-│VCS             Git                                                   ││                                              │
-│Checkout mgr    Git Worktrees                                         ││                                              │
-│Code review     GitHub                                                ││                                              │
-│Issue tracker   GitHub                                                ││                                              │
-│Coding agent    Claude                                                ││                                              │
-│AI utility      —                                                     ││                                              │
-│Workspace mgr   —                                                     ││                                              │
+┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
+│      Description     Branch          WT  WS  PR   SS   Issues   Git  ││Description: Debug API endpoints              │
+│      ── Sessions ──                                                  ││Branch: feat/session-branch                   │
+│▸  ▶  Debug API endp… feat/session-b…              ▶                  ││Session: Debug API endpoints                  │
+│                                                                      ││Status: Running                               │
 │                                                                      ││                                              │
-│── Coding Agent Status ──                                             ││                                              │
-│Claude          ✓ authenticated                                       ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
@@ -31,4 +31,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
- j/k:scroll log  [/]:switch tab  ?:help  q:quit
+ enter:open  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit
