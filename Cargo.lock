@@ -1053,11 +1053,13 @@ name = "flotilla-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "color-eyre",
  "dirs",
  "flotilla-protocol",
  "futures",
+ "http",
  "indexmap",
  "minijinja",
  "reqwest",

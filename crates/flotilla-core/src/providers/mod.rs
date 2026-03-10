@@ -134,7 +134,11 @@ impl HttpClient for ReqwestHttpClient {
         &self,
         request: reqwest::Request,
     ) -> Result<http::Response<bytes::Bytes>, String> {
-        let resp = self.client.execute(request).await.map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|e| e.to_string())?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let body = resp.bytes().await.map_err(|e| e.to_string())?;
