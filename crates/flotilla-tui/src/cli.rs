@@ -22,7 +22,11 @@ pub async fn run_status(socket_path: &Path) -> Result<(), String> {
         let health: Vec<String> = repo
             .provider_health
             .iter()
-            .map(|(k, v)| format!("{k}: {}", if *v { "ok" } else { "error" }))
+            .flat_map(|(category, providers)| {
+                providers.iter().map(move |(name, v)| {
+                    format!("{category}/{name}: {}", if *v { "ok" } else { "error" })
+                })
+            })
             .collect();
         let loading = if repo.loading { " (loading)" } else { "" };
         println!("{name}{loading}  {path}");

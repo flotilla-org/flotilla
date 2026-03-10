@@ -54,7 +54,7 @@ pub struct TuiRepoModel {
     pub providers: Arc<ProviderData>,
     pub labels: RepoLabels,
     pub provider_names: HashMap<String, Vec<String>>,
-    pub provider_health: HashMap<String, bool>,
+    pub provider_health: HashMap<String, HashMap<String, bool>>,
     pub loading: bool,
     pub issue_has_more: bool,
     pub issue_total: Option<u32>,
@@ -235,18 +235,16 @@ impl App {
         };
         let table_view = data::group_work_items(&snap.work_items, &rm.providers, &section_labels);
 
-        // Provider health -> model-level statuses
-        for (kind, healthy) in &rm.provider_health {
-            if let Some(pnames) = rm.provider_names.get(kind.as_str()) {
-                let status = if *healthy {
+        // Provider health -> model-level statuses (now 1:1)
+        for (category, providers) in &rm.provider_health {
+            for (provider_name, &healthy) in providers {
+                let status = if healthy {
                     ProviderStatus::Ok
                 } else {
                     ProviderStatus::Error
                 };
-                for pname in pnames {
-                    let key = (path.clone(), kind.clone(), pname.clone());
-                    self.model.provider_statuses.insert(key, status);
-                }
+                let key = (path.clone(), category.clone(), provider_name.clone());
+                self.model.provider_statuses.insert(key, status);
             }
         }
 
@@ -302,17 +300,27 @@ impl App {
         for change in &delta.changes {
             match change {
                 flotilla_protocol::Change::ProviderHealth {
+                    category,
                     provider,
                     op:
                         flotilla_protocol::EntryOp::Added(v) | flotilla_protocol::EntryOp::Updated(v),
                 } => {
-                    rm.provider_health.insert(provider.clone(), *v);
+                    rm.provider_health
+                        .entry(category.clone())
+                        .or_default()
+                        .insert(provider.clone(), *v);
                 }
                 flotilla_protocol::Change::ProviderHealth {
+                    category,
                     provider,
                     op: flotilla_protocol::EntryOp::Removed,
                 } => {
-                    rm.provider_health.remove(provider);
+                    if let Some(providers) = rm.provider_health.get_mut(category) {
+                        providers.remove(provider);
+                        if providers.is_empty() {
+                            rm.provider_health.remove(category);
+                        }
+                    }
                 }
                 flotilla_protocol::Change::ErrorsChanged(errors) => {
                     self.model.status_message = format_error_status(errors, &path);
@@ -330,18 +338,16 @@ impl App {
         };
         let table_view = data::group_work_items(&delta.work_items, &rm.providers, &section_labels);
 
-        // Provider health -> model-level statuses
-        for (kind, healthy) in &rm.provider_health {
-            if let Some(pnames) = rm.provider_names.get(kind.as_str()) {
-                let status = if *healthy {
+        // Provider health -> model-level statuses (now 1:1)
+        for (category, providers) in &rm.provider_health {
+            for (provider_name, &healthy) in providers {
+                let status = if healthy {
                     ProviderStatus::Ok
                 } else {
                     ProviderStatus::Error
                 };
-                for pname in pnames {
-                    let key = (path.clone(), kind.clone(), pname.clone());
-                    self.model.provider_statuses.insert(key, status);
-                }
+                let key = (path.clone(), category.clone(), provider_name.clone());
+                self.model.provider_statuses.insert(key, status);
             }
         }
 
