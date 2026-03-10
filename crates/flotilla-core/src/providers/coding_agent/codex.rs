@@ -150,15 +150,13 @@ fn is_trunk_branch(name: &str) -> bool {
 }
 
 #[allow(dead_code)]
-fn epoch_to_rfc3339(epoch: f64) -> String {
-    use chrono::{DateTime, TimeZone, Utc};
+fn epoch_to_rfc3339(epoch: f64) -> Option<String> {
+    use chrono::{TimeZone, Utc};
     let secs = epoch as i64;
-    let nanos = ((epoch - secs as f64) * 1_000_000_000.0) as u32;
-    let dt: DateTime<Utc> = Utc
-        .timestamp_opt(secs, nanos)
+    let nanos = ((epoch - secs as f64) * 1_000_000_000.0).clamp(0.0, 999_999_999.0) as u32;
+    Utc.timestamp_opt(secs, nanos)
         .single()
-        .expect("valid epoch timestamp");
-    dt.to_rfc3339()
+        .map(|dt| dt.to_rfc3339())
 }
 
 #[allow(dead_code)]
@@ -180,14 +178,8 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
         task.id.clone(),
     )];
 
-    // Check for pull requests first
-    let has_pr = task
-        .pull_requests
-        .as_ref()
-        .is_some_and(|prs| !prs.is_empty());
-
-    if has_pr {
-        if let Some(prs) = &task.pull_requests {
+    if let Some(prs) = &task.pull_requests {
+        if !prs.is_empty() {
             for pr in prs {
                 if let Some(ref head) = pr.head {
                     if !head.is_empty() {
@@ -199,6 +191,15 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
                         "github".to_string(),
                         number.to_string(),
                     ));
+                }
+            }
+        } else {
+            // Empty PR list — use source branch if it's not trunk
+            if let Some(ref display) = task.task_status_display {
+                if let Some(ref branch) = display.branch_name {
+                    if !branch.is_empty() && !is_trunk_branch(branch) {
+                        correlation_keys.push(CorrelationKey::Branch(branch.clone()));
+                    }
                 }
             }
         }
@@ -219,7 +220,7 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
         task.title.clone()
     };
 
-    let updated_at = task.updated_at.map(epoch_to_rfc3339);
+    let updated_at = task.updated_at.and_then(epoch_to_rfc3339);
 
     (
         task.id.clone(),
@@ -282,6 +283,12 @@ mod tests {
     #[test]
     fn parse_auth_chatgpt_missing_tokens_returns_none() {
         let json = r#"{"auth_mode": "chatgpt"}"#;
+        assert!(parse_auth_file(json).is_none());
+    }
+
+    #[test]
+    fn parse_auth_chatgpt_empty_token_returns_none() {
+        let json = r#"{"auth_mode": "chatgpt", "tokens": {"access_token": ""}}"#;
         assert!(parse_auth_file(json).is_none());
     }
 
