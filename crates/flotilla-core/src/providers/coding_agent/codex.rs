@@ -110,7 +110,7 @@ pub struct TaskItem {
     #[serde(default)]
     pub task_status_display: Option<TaskStatusDisplay>,
     #[serde(default)]
-    pub pull_requests: Option<Vec<TaskPullRequest>>,
+    pub pull_requests: Option<Vec<TaskPullRequestEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,8 +129,16 @@ pub struct LatestTurnStatus {
     pub turn_status: Option<String>,
 }
 
+/// Wrapper for the outer pull_requests array items, which contain a nested
+/// `pull_request` object with the actual PR fields.
 #[derive(Debug, Deserialize)]
-pub struct TaskPullRequest {
+pub struct TaskPullRequestEntry {
+    #[serde(default)]
+    pub pull_request: Option<PullRequestDetail>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PullRequestDetail {
     #[serde(default)]
     pub number: Option<u64>,
     #[serde(default)]
@@ -174,33 +182,31 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
         task.id.clone(),
     )];
 
-    if let Some(prs) = &task.pull_requests {
-        if !prs.is_empty() {
-            for pr in prs {
-                if let Some(ref head) = pr.head {
-                    if !head.is_empty() {
-                        correlation_keys.push(CorrelationKey::Branch(head.clone()));
-                    }
-                }
-                if let Some(number) = pr.number {
-                    correlation_keys.push(CorrelationKey::ChangeRequestRef(
-                        "github".to_string(),
-                        number.to_string(),
-                    ));
+    // Extract actual PR details from the nested structure
+    let pr_details: Vec<&PullRequestDetail> = task
+        .pull_requests
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry.pull_request.as_ref())
+        .collect();
+
+    if !pr_details.is_empty() {
+        for pr in &pr_details {
+            if let Some(ref head) = pr.head {
+                if !head.is_empty() {
+                    correlation_keys.push(CorrelationKey::Branch(head.clone()));
                 }
             }
-        } else {
-            // Empty PR list — use source branch if it's not trunk
-            if let Some(ref display) = task.task_status_display {
-                if let Some(ref branch) = display.branch_name {
-                    if !branch.is_empty() && !is_trunk_branch(branch) {
-                        correlation_keys.push(CorrelationKey::Branch(branch.clone()));
-                    }
-                }
+            if let Some(number) = pr.number {
+                correlation_keys.push(CorrelationKey::ChangeRequestRef(
+                    "github".to_string(),
+                    number.to_string(),
+                ));
             }
         }
     } else {
-        // No PR — use source branch if it's not trunk
+        // No usable PR — use source branch if it's not trunk
         if let Some(ref display) = task.task_status_display {
             if let Some(ref branch) = display.branch_name {
                 if !branch.is_empty() && !is_trunk_branch(branch) {
@@ -681,9 +687,12 @@ mod tests {
                     },
                     "pull_requests": [
                         {
-                            "number": 42,
-                            "head": "fix/bug",
-                            "url": "https://github.com/owner/repo/pull/42"
+                            "id": "github-123-42",
+                            "pull_request": {
+                                "number": 42,
+                                "head": "fix/bug",
+                                "url": "https://github.com/owner/repo/pull/42"
+                            }
                         }
                     ]
                 }
@@ -705,8 +714,9 @@ mod tests {
             .expect("has turn");
         assert_eq!(turn.turn_status.as_deref(), Some("in_progress"));
         let prs = task.pull_requests.as_ref().expect("has PRs");
-        assert_eq!(prs[0].number, Some(42));
-        assert_eq!(prs[0].head.as_deref(), Some("fix/bug"));
+        let pr = prs[0].pull_request.as_ref().expect("has PR detail");
+        assert_eq!(pr.number, Some(42));
+        assert_eq!(pr.head.as_deref(), Some("fix/bug"));
     }
 
     #[test]
@@ -853,10 +863,12 @@ mod tests {
                     turn_status: Some("completed".to_string()),
                 }),
             }),
-            pull_requests: Some(vec![TaskPullRequest {
-                number: Some(99),
-                head: Some("feat/pr-branch".to_string()),
-                url: Some("https://github.com/owner/repo/pull/99".to_string()),
+            pull_requests: Some(vec![TaskPullRequestEntry {
+                pull_request: Some(PullRequestDetail {
+                    number: Some(99),
+                    head: Some("feat/pr-branch".to_string()),
+                    url: Some("https://github.com/owner/repo/pull/99".to_string()),
+                }),
             }]),
         };
         let (_, session) = map_task_to_session(&task, "codex");

@@ -23,5 +23,5 @@ interactions:
       {"id":"task_2","title":"Review code","updated_at":1710100000.0,
        "task_status_display":{"branch_name":"main",
          "latest_turn_status_display":{"turn_status":"in_progress"}},
-       "pull_requests":[{"number":208,"head":"codex/review-code","url":"https://github.com/rjwittams/flotilla/pull/208"}]}
+       "pull_requests":[{"id":"github-123-208","pull_request":{"number":208,"head":"codex/review-code","url":"https://github.com/rjwittams/flotilla/pull/208"}}]}
     ]}
