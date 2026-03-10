@@ -94,9 +94,9 @@ async fn run_tui(cli: Cli) -> Result<()> {
             std::process::exit(1);
         }
         info!(
-            "config loaded: {} repo(s) in {:.0?}",
-            roots.len(),
-            startup.elapsed()
+            repo_count = roots.len(),
+            elapsed = ?startup.elapsed(),
+            "config loaded"
         );
         roots
     } else {
@@ -130,7 +130,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     flotilla_tui::splash::show_splash(&mut terminal).await?;
     let daemon = match daemon_task.await {
         Ok(Ok(daemon)) => {
-            info!("daemon ready in {:.0?}", startup.elapsed());
+            info!(elapsed = ?startup.elapsed(), "daemon ready");
             daemon
         }
         Ok(Err(e)) => {
@@ -152,7 +152,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         for root in &cli_repo_roots {
             let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
             if let Err(e) = daemon.add_repo(&canonical).await {
-                info!("failed to add repo {}: {e}", canonical.display());
+                info!(repo = %canonical.display(), err = %e, "failed to add repo");
             }
         }
     }

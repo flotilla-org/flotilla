@@ -97,7 +97,7 @@ impl TerminalPool for ShpoolTerminalPool {
         match result {
             Ok(json) => Self::parse_list_json(&json),
             Err(e) => {
-                tracing::debug!("shpool list failed (daemon may not be running): {e}");
+                tracing::debug!(err = %e, "shpool list failed (daemon may not be running)");
                 Ok(vec![])
             }
         }

@@ -76,7 +76,7 @@ impl SocketDaemon {
                         let msg: Message = match serde_json::from_str(&line) {
                             Ok(m) => m,
                             Err(e) => {
-                                warn!("failed to parse message from daemon: {e}");
+                                warn!(err = %e, "failed to parse message from daemon");
                                 continue;
                             }
                         };
@@ -93,7 +93,7 @@ impl SocketDaemon {
                                 if let Some(tx) = map.remove(&id) {
                                     let _ = tx.send(raw);
                                 } else {
-                                    warn!("received response for unknown request id {id}");
+                                    warn!(%id, "received response for unknown request id");
                                 }
                             }
                             Message::Event { event } => {
@@ -127,7 +127,7 @@ impl SocketDaemon {
                         break;
                     }
                     Err(e) => {
-                        error!("error reading from daemon socket: {e}");
+                        error!(err = %e, "error reading from daemon socket");
                         let mut map = reader_pending.lock().await;
                         for (_, tx) in map.drain() {
                             let _ = tx.send(RawResponse {
@@ -275,14 +275,17 @@ pub async fn connect_or_spawn(
                 // falling through to spawn without mutual exclusion.
                 if attempt + 1 < MAX_LOCK_RETRIES {
                     warn!(
-                        "connect after lock wait failed (attempt {}), retrying lock",
-                        attempt + 1
+                        attempt = attempt + 1,
+                        "connect after lock wait failed, retrying lock"
                     );
                     continue;
                 }
                 // Exhausted retries — acquire lock ourselves before spawning
                 // so we never spawn without mutual exclusion.
-                warn!("connect after lock wait failed after {MAX_LOCK_RETRIES} attempts, acquiring lock to spawn");
+                warn!(
+                    attempts = MAX_LOCK_RETRIES,
+                    "connect after lock wait failed, acquiring lock to spawn"
+                );
                 let lock_path_clone = lock_path.clone();
                 let final_lock =
                     tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
@@ -414,9 +417,9 @@ fn handle_event(
     match &event {
         DaemonEvent::SnapshotFull(snap) => {
             debug!(
-                "received full snapshot for {} (seq {})",
-                snap.repo.display(),
-                snap.seq
+                repo = %snap.repo.display(),
+                seq = snap.seq,
+                "received full snapshot"
             );
             // Sync lock: update seq before dispatching event so a
             // quickly-following delta sees the correct local seq.
@@ -439,10 +442,10 @@ fn handle_event(
                     // Happy path: apply delta (sync lock, no spawn needed)
                     local_seqs.write().unwrap().insert(repo.clone(), seq);
                     debug!(
-                        "applied delta for {} (seq {} → {})",
-                        repo.display(),
-                        prev_seq,
-                        seq
+                        repo = %repo.display(),
+                        %prev_seq,
+                        %seq,
+                        "applied delta"
                     );
                     let _ = event_tx.send(event);
                 }
@@ -454,9 +457,9 @@ fn handle_event(
                     let mut guard = recovering.lock().unwrap();
                     if let Some(buf) = guard.get_mut(&repo) {
                         debug!(
-                            "recovery in progress for {}, buffering delta (seq {})",
-                            repo.display(),
-                            seq
+                            repo = %repo.display(),
+                            %seq,
+                            "recovery in progress, buffering delta"
                         );
                         buf.push(event);
                         return;
@@ -466,15 +469,15 @@ fn handle_event(
 
                     if let Some(ls) = local_seq {
                         warn!(
-                            "seq gap for {} (local={}, delta prev_seq={}), requesting replay",
-                            repo.display(),
-                            ls,
-                            prev_seq
+                            repo = %repo.display(),
+                            local_seq = ls,
+                            %prev_seq,
+                            "seq gap, requesting replay"
                         );
                     } else {
                         warn!(
-                            "received delta for unknown repo {}, requesting replay",
-                            repo.display()
+                            repo = %repo.display(),
+                            "received delta for unknown repo, requesting replay"
                         );
                     }
 
@@ -558,7 +561,10 @@ async fn recover_from_gap(
     match resp {
         Ok(raw) => match raw.parse::<Vec<DaemonEvent>>() {
             Ok(events) => {
-                debug!("gap recovery: got {} replay events", events.len());
+                debug!(
+                    event_count = events.len(),
+                    "gap recovery: got replay events"
+                );
                 // Update seqs monotonically — a live event may have advanced
                 // a repo's seq while this replay was in flight.
                 {
@@ -586,11 +592,11 @@ async fn recover_from_gap(
                 }
             }
             Err(e) => {
-                error!("gap recovery: failed to parse replay events: {e}");
+                error!(err = %e, "gap recovery: failed to parse replay events");
             }
         },
         Err(e) => {
-            error!("gap recovery: replay_since request failed: {e}");
+            error!(err = %e, "gap recovery: replay_since request failed");
         }
     }
 }

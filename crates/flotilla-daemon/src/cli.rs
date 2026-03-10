@@ -31,7 +31,7 @@ pub async fn run(socket_path: &Path, timeout_secs: u64) -> Result<(), String> {
 
     let config = Arc::new(ConfigStore::new());
     let repo_roots = config.load_repos();
-    info!("starting daemon with {} repo(s)", repo_roots.len());
+    info!(repo_count = repo_roots.len(), "starting daemon");
 
     let server =
         crate::server::DaemonServer::new(repo_roots, config, socket_path.to_path_buf(), timeout)

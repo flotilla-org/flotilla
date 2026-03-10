@@ -93,6 +93,7 @@ Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `ChangeReques
 - **Adding dependencies is fine** when they solve a real problem — don't reinvent the wheel.
 - **`expect` over `unwrap`**: Prefer `.expect("reason")` over `.unwrap()` — it avoids having to reason about whether each `unwrap` is safe.
 - **Correctness first**: Always favour correct solutions over "pragmatic" shortcuts. Get the architecture right rather than patching around structural problems.
+- **Tracing**: Use structured fields, not format-string interpolation. Fields go before the message: `debug!(repo = %path.display(), %since, "issue incremental")`. Use `%` for Display, `?` for Debug, and shorthand `%var` when the field name matches the variable name.
 
 ## UI Modes
 

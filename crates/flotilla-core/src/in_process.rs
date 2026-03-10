@@ -132,7 +132,11 @@ fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
 
     match (delta_size, full_size) {
         (Ok(d), Ok(f)) if d < f => {
-            debug!("delta ({d} bytes) smaller than full ({f} bytes), sending delta");
+            debug!(
+                delta_bytes = d,
+                full_bytes = f,
+                "delta smaller than full, sending delta"
+            );
             DaemonEvent::SnapshotDelta(Box::new(snapshot_delta))
         }
         _ => {
@@ -477,7 +481,7 @@ impl InProcessDaemon {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("failed to fetch issue page {}: {}", page_num, e);
+                    tracing::warn!(%page_num, err = %e, "failed to fetch issue page");
                     let mut repos = self.repos.write().await;
                     if let Some(state) = repos.get_mut(repo) {
                         state.issue_cache.has_more = false;
@@ -507,14 +511,14 @@ impl InProcessDaemon {
 
         match result {
             Ok(issues) => {
-                info!("search returned {} issues for query", issues.len());
+                info!(count = issues.len(), "search returned issues for query");
                 let mut repos = self.repos.write().await;
                 if let Some(state) = repos.get_mut(repo) {
                     state.search_results = Some(issues);
                 }
             }
             Err(e) => {
-                tracing::warn!("issue search failed: {}", e);
+                tracing::warn!(err = %e, "issue search failed");
             }
         }
     }
@@ -1008,7 +1012,7 @@ impl DaemonHandle for InProcessDaemon {
         let order = self.repo_order.read().await;
         self.config.save_tab_order(&order);
 
-        info!("added repo {}", path.display());
+        info!(repo = %path.display(), "added repo");
         let _ = self
             .event_tx
             .send(DaemonEvent::RepoAdded(Box::new(repo_info)));
@@ -1106,7 +1110,7 @@ impl DaemonHandle for InProcessDaemon {
         let order = self.repo_order.read().await;
         self.config.save_tab_order(&order);
 
-        info!("removed repo {}", path.display());
+        info!(repo = %path.display(), "removed repo");
         let _ = self.event_tx.send(DaemonEvent::RepoRemoved { path });
 
         Ok(())

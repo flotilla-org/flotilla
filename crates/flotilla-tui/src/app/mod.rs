@@ -144,7 +144,7 @@ fn format_error_status(errors: &[ProviderError], repo_path: &Path) -> Option<Str
         if e.category == "issues" && e.message.contains("has disabled issues") {
             continue;
         }
-        tracing::error!("{name}: {}: {}", e.category, e.message);
+        tracing::error!(%name, category = %e.category, message = %e.message, "provider error");
         all_errors.push(format!("{name}: {}: {}", e.category, e.message));
     }
     if all_errors.is_empty() {
@@ -196,7 +196,7 @@ impl App {
                 repo,
                 description,
             } => {
-                tracing::info!("command {command_id} started: {description}");
+                tracing::info!(%command_id, %description, "command started");
                 self.in_flight
                     .insert(command_id, InFlightCommand { repo, description });
             }
@@ -204,7 +204,7 @@ impl App {
                 command_id, result, ..
             } => {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
-                    tracing::info!("command {command_id} finished");
+                    tracing::info!(%command_id, "command finished");
                     executor::handle_result(result, self);
                 }
             }

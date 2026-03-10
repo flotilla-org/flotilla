@@ -227,7 +227,9 @@ impl ConfigStore {
                 .ok()
                 .and_then(|content| {
                     toml::from_str(&content)
-                        .map_err(|e| tracing::warn!("failed to parse {}: {e}", path.display()))
+                        .map_err(
+                            |e| tracing::warn!(path = %path.display(), err = %e, "failed to parse"),
+                        )
                         .ok()
                 })
                 .unwrap_or_default()
@@ -255,7 +257,7 @@ impl ConfigStore {
                     };
                 }
                 Err(e) => {
-                    tracing::warn!("failed to parse {}: {e}", repo_file.display());
+                    tracing::warn!(path = %repo_file.display(), err = %e, "failed to parse");
                 }
             }
         }

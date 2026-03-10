@@ -32,7 +32,7 @@ pub async fn execute(
     match cmd {
         Command::CreateWorkspaceForCheckout { checkout_path } => {
             if let Some(co) = providers_data.checkouts.get(&checkout_path).cloned() {
-                info!("entering workspace for {}", co.branch);
+                info!(branch = %co.branch, "entering workspace");
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
                     let mut config = workspace_config(
                         repo_root,
@@ -57,7 +57,7 @@ pub async fn execute(
         }
 
         Command::SelectWorkspace { ws_ref } => {
-            info!("switching to workspace {ws_ref}");
+            info!(%ws_ref, "switching to workspace");
             if let Some((_, ws_mgr)) = &registry.workspace_manager {
                 if let Err(e) = ws_mgr.select_workspace(&ws_ref).await {
                     return CommandResult::Error { message: e };
@@ -71,7 +71,7 @@ pub async fn execute(
             create_branch,
             issue_ids,
         } => {
-            info!("creating checkout {branch}");
+            info!(%branch, "creating checkout");
             let checkout_result = if let Some(cm) = registry.checkout_managers.values().next() {
                 Some(cm.create_checkout(repo_root, &branch, create_branch).await)
             } else {
@@ -83,7 +83,7 @@ pub async fn execute(
                     if !issue_ids.is_empty() {
                         write_branch_issue_links(repo_root, &branch, &issue_ids, runner).await;
                     }
-                    info!("created checkout at {}", checkout_path.display());
+                    info!(checkout_path = %checkout_path.display(), "created checkout");
                     // Create workspace if manager available
                     if let Some((_, ws_mgr)) = &registry.workspace_manager {
                         let mut config = workspace_config(
@@ -99,7 +99,7 @@ pub async fn execute(
                         if let Err(e) = ws_mgr.create_workspace(&config).await {
                             // Checkout was created but workspace failed — report as error
                             // but the checkout still exists
-                            error!("workspace creation failed after checkout: {e}");
+                            error!(err = %e, "workspace creation failed after checkout");
                         }
                     }
                     CommandResult::CheckoutCreated {
@@ -107,7 +107,7 @@ pub async fn execute(
                     }
                 }
                 Some(Err(e)) => {
-                    error!("create checkout failed: {e}");
+                    error!(err = %e, "create checkout failed");
                     CommandResult::Error { message: e }
                 }
                 None => CommandResult::Error {
@@ -117,7 +117,7 @@ pub async fn execute(
         }
 
         Command::RemoveCheckout { branch } => {
-            info!("removing checkout {branch}");
+            info!(%branch, "removing checkout");
             let result = if let Some(cm) = registry.checkout_managers.values().next() {
                 Some(cm.remove_checkout(repo_root, &branch).await)
             } else {
@@ -149,7 +149,7 @@ pub async fn execute(
         }
 
         Command::OpenChangeRequest { id } => {
-            debug!("opening change request {id} in browser");
+            debug!(%id, "opening change request in browser");
             if let Some(cr) = registry.code_review.values().next() {
                 let _ = cr.open_in_browser(repo_root, &id).await;
             }
@@ -157,7 +157,7 @@ pub async fn execute(
         }
 
         Command::OpenIssue { id } => {
-            debug!("opening issue {id} in browser");
+            debug!(%id, "opening issue in browser");
             if let Some(it) = registry.issue_trackers.values().next() {
                 let _ = it.open_in_browser(repo_root, &id).await;
             }
@@ -168,10 +168,7 @@ pub async fn execute(
             change_request_id,
             issue_ids,
         } => {
-            info!(
-                "linking issues {:?} to change request #{change_request_id}",
-                issue_ids
-            );
+            info!(issue_ids = ?issue_ids, %change_request_id, "linking issues to change request");
             let body_result = runner
                 .run(
                     "gh",
@@ -205,17 +202,17 @@ pub async fn execute(
                         .await;
                     match result {
                         Ok(_) => {
-                            info!("linked issues to change request #{change_request_id}");
+                            info!(%change_request_id, "linked issues to change request");
                             CommandResult::Ok
                         }
                         Err(e) => {
-                            error!("failed to edit change request: {e}");
+                            error!(err = %e, "failed to edit change request");
                             CommandResult::Error { message: e }
                         }
                     }
                 }
                 Err(e) => {
-                    error!("failed to read change request body: {e}");
+                    error!(err = %e, "failed to read change request body");
                     CommandResult::Error { message: e }
                 }
             }
@@ -223,7 +220,7 @@ pub async fn execute(
 
         Command::ArchiveSession { session_id } => {
             if let Some(session) = providers_data.sessions.get(session_id.as_str()) {
-                info!("archiving session {session_id}");
+                info!(%session_id, "archiving session");
                 if let Some(key) = session_provider_key(session, &session_id) {
                     if let Some(ca) = registry.cloud_agents.get(key) {
                         match ca.archive_session(&session_id).await {
@@ -289,7 +286,7 @@ pub async fn execute(
             };
             match branch_result {
                 Some(Ok(name)) => {
-                    info!("AI suggested: {name}");
+                    info!(%name, "AI suggested");
                     CommandResult::BranchNameGenerated {
                         name,
                         issue_ids: issue_id_pairs,
@@ -314,7 +311,7 @@ pub async fn execute(
             branch,
             checkout_key,
         } => {
-            info!("teleporting to session {session_id}");
+            info!(%session_id, "teleporting to session");
             let teleport_cmd =
                 match resolve_attach_command(&session_id, registry, providers_data).await {
                     Ok(cmd) => cmd,
@@ -373,7 +370,7 @@ pub async fn execute(
 async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn TerminalPool) {
     let tmpl = if let Some(ref yaml) = config.template_yaml {
         serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
-            warn!("failed to parse workspace template, using default: {e}");
+            warn!(err = %e, "failed to parse workspace template, using default");
             template::default_template()
         })
     } else {
@@ -381,16 +378,17 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
     };
     let rendered = tmpl.render(&config.template_vars);
     info!(
-        "terminal pool ({}): resolving {} content entries",
-        terminal_pool.display_name(),
-        rendered.content.len(),
+        pool = %terminal_pool.display_name(),
+        count = rendered.content.len(),
+        "terminal pool: resolving content entries",
     );
     let mut resolved = Vec::new();
     for entry in &rendered.content {
         if entry.content_type != "terminal" {
             debug!(
-                "skipping non-terminal content: role={} type={}",
-                entry.role, entry.content_type
+                role = %entry.role,
+                content_type = %entry.content_type,
+                "skipping non-terminal content",
             );
             continue;
         }
@@ -405,7 +403,7 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
                 .ensure_running(&id, &entry.command, &config.working_directory)
                 .await
             {
-                warn!("failed to ensure terminal {id}: {e}");
+                warn!(%id, err = %e, "failed to ensure terminal");
                 continue;
             }
             match terminal_pool
@@ -413,14 +411,14 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
                 .await
             {
                 Ok(cmd) => {
-                    debug!("terminal {id}: cmd={:?} → {cmd:?}", entry.command);
+                    debug!(%id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
                     resolved.push((entry.role.clone(), cmd));
                 }
-                Err(e) => warn!("failed to get attach command for {id}: {e}"),
+                Err(e) => warn!(%id, err = %e, "failed to get attach command"),
             }
         }
     }
-    info!("terminal pool: resolved {} commands", resolved.len());
+    info!(count = resolved.len(), "terminal pool: resolved commands");
     if !resolved.is_empty() {
         config.resolved_commands = Some(resolved);
     }
@@ -497,7 +495,7 @@ async fn write_branch_issue_links(
             .run("git", &["config", &key, &value], repo_root)
             .await
         {
-            tracing::warn!("failed to write issue link: {e}");
+            tracing::warn!(err = %e, "failed to write issue link");
         }
     }
 }
