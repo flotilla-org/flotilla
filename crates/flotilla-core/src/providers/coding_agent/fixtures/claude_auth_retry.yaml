@@ -1,0 +1,24 @@
+interactions:
+- channel: http
+  method: GET
+  url: "https://api.test/v1/sessions"
+  request_headers:
+    authorization: "Bearer expired"
+    anthropic-beta: "ccr-byoc-2025-07-29"
+    anthropic-version: "2023-06-01"
+  status: 401
+  response_body: "{}"
+- channel: http
+  method: GET
+  url: "https://api.test/v1/sessions"
+  request_headers:
+    authorization: "Bearer fresh"
+    anthropic-beta: "ccr-byoc-2025-07-29"
+    anthropic-version: "2023-06-01"
+  status: 200
+  response_body: >-
+    {"data":[
+      {"id":"s1","title":"Recovered","session_status":"running",
+       "updated_at":"2026-03-02T00:00:00Z",
+       "session_context":{"model":"","outcomes":[]}}
+    ]}

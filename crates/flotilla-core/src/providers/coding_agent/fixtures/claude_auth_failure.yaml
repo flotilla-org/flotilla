@@ -1,0 +1,19 @@
+interactions:
+- channel: http
+  method: GET
+  url: "https://api.test/v1/sessions"
+  request_headers:
+    authorization: "Bearer bad-1"
+    anthropic-beta: "ccr-byoc-2025-07-29"
+    anthropic-version: "2023-06-01"
+  status: 403
+  response_body: "{}"
+- channel: http
+  method: GET
+  url: "https://api.test/v1/sessions"
+  request_headers:
+    authorization: "Bearer bad-2"
+    anthropic-beta: "ccr-byoc-2025-07-29"
+    anthropic-version: "2023-06-01"
+  status: 401
+  response_body: "{}"

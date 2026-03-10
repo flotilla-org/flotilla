@@ -1,0 +1,21 @@
+interactions:
+- channel: http
+  method: GET
+  url: "https://api.test/v1/sessions"
+  request_headers:
+    authorization: "Bearer abc123"
+    anthropic-beta: "ccr-byoc-2025-07-29"
+    anthropic-version: "2023-06-01"
+  status: 200
+  response_body: >-
+    {"data":[
+      {"id":"old","title":"Older","session_status":"running",
+       "updated_at":"2026-03-01T00:00:00Z",
+       "session_context":{"model":"opus","outcomes":[]}},
+      {"id":"skip","title":"Archived","session_status":"archived",
+       "updated_at":"2026-03-03T00:00:00Z",
+       "session_context":{"model":"opus","outcomes":[]}},
+      {"id":"new","title":"Newer","session_status":"idle",
+       "updated_at":"2026-03-02T00:00:00Z",
+       "session_context":{"model":"sonnet","outcomes":[]}}
+    ]}

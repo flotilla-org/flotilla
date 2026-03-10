@@ -1,0 +1,11 @@
+interactions:
+- channel: http
+  method: PATCH
+  url: "https://api.test/v1/sessions/s-fail"
+  request_headers:
+    authorization: "Bearer archive-token"
+    anthropic-beta: "ccr-byoc-2025-07-29"
+    anthropic-version: "2023-06-01"
+  request_body: '{"session_status":"archived"}'
+  status: 500
+  response_body: "boom"
