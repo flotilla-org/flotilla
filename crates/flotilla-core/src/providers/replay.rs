@@ -912,7 +912,11 @@ impl GhApi for RecordingGhApi {
 /// In replay mode: returns a `ReplayGhApi`.
 pub fn test_gh_api(session: &Session, runner: &Arc<dyn CommandRunner>) -> Arc<dyn GhApi> {
     if session.is_recording() {
-        let real_api = Arc::new(super::github_api::GhApiClient::new(Arc::clone(runner)));
+        // Use a raw ProcessCommandRunner — NOT the passed-in runner, which is a
+        // RecordingRunner.  GhApiClient shells out via its runner, so using a
+        // RecordingRunner here would double-record (once as Command, once as GhApi).
+        let raw_runner = Arc::new(super::ProcessCommandRunner);
+        let real_api = Arc::new(super::github_api::GhApiClient::new(raw_runner));
         Arc::new(RecordingGhApi::new(session.clone(), real_api))
     } else {
         Arc::new(ReplayGhApi::new(session.clone()))
