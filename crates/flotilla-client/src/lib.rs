@@ -280,7 +280,29 @@ pub async fn connect_or_spawn(
                     );
                     continue;
                 }
-                warn!("connect after lock wait failed after {MAX_LOCK_RETRIES} attempts, spawning");
+                // Exhausted retries — acquire lock ourselves before spawning
+                // so we never spawn without mutual exclusion.
+                warn!("connect after lock wait failed after {MAX_LOCK_RETRIES} attempts, acquiring lock to spawn");
+                let lock_path_clone = lock_path.clone();
+                let final_lock =
+                    tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
+                        .await
+                        .map_err(|e| format!("spawn_blocking: {e}"))?;
+                match final_lock {
+                    Ok(Some(file)) => {
+                        lock_file = Some(file);
+                    }
+                    Ok(None) => {
+                        // Someone else spawned while we waited — one last connect attempt.
+                        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+                            return Ok(daemon);
+                        }
+                        return Err("daemon spawn failed: all lock attempts exhausted and connect still failing".into());
+                    }
+                    Err(e) => {
+                        return Err(format!("spawn lock failed: {e}"));
+                    }
+                }
             }
             Err(e) => {
                 return Err(format!("spawn lock failed: {e}"));
@@ -464,10 +486,22 @@ fn handle_event(
 
                     tokio::spawn(async move {
                         recover_from_gap(&local_seqs, &event_tx, &writer, &pending, &next_id).await;
-                        // Drain buffered deltas and re-process. Any that still
-                        // show a gap will trigger a fresh recovery cycle.
+                        // Drain buffered deltas, discarding any that recovery
+                        // already covered (their seq <= recovered local_seq).
+                        // Only re-process deltas that are genuinely ahead.
                         let buffered = recovering.lock().unwrap().remove(&repo).unwrap_or_default();
+                        let recovered_seq = local_seqs.read().unwrap().get(&repo).copied();
                         for buffered_event in buffered {
+                            let dominated = match &buffered_event {
+                                DaemonEvent::SnapshotDelta(d) => {
+                                    recovered_seq.is_some_and(|rs| d.seq <= rs)
+                                }
+                                _ => false,
+                            };
+                            if dominated {
+                                debug!("discarding buffered delta already covered by recovery");
+                                continue;
+                            }
                             handle_event(
                                 buffered_event,
                                 &local_seqs,
