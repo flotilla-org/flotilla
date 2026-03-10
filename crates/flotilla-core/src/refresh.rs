@@ -129,10 +129,10 @@ async fn refresh_providers(
     };
 
     let sessions_fut = async {
-        if registry.coding_agents.is_empty() {
+        if registry.cloud_agents.is_empty() {
             return (vec![], vec![]);
         }
-        let results = futures::future::join_all(registry.coding_agents.iter().map(|(name, ca)| {
+        let results = futures::future::join_all(registry.cloud_agents.iter().map(|(name, ca)| {
             let provider = name.clone();
             async move { (provider, ca.list_sessions(criteria).await) }
         }))
@@ -282,7 +282,7 @@ fn compute_provider_health(
     errors: &[RefreshError],
 ) -> HashMap<&'static str, bool> {
     let mut health = HashMap::new();
-    if registry.coding_agents.values().next().is_some() {
+    if registry.cloud_agents.values().next().is_some() {
         health.insert(
             "coding_agent",
             !errors.iter().any(|e| e.category == "sessions"),
@@ -315,7 +315,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::providers::code_review::CodeReview;
-    use crate::providers::coding_agent::CodingAgent;
+    use crate::providers::coding_agent::CloudAgentService;
     use crate::providers::types::*;
     use crate::providers::vcs::{CheckoutManager, Vcs};
     use crate::providers::workspace::WorkspaceManager;
@@ -421,11 +421,11 @@ mod tests {
         }
     }
 
-    struct MockCodingAgent {
+    struct MockCloudAgent {
         result: Result<Vec<(String, CloudAgentSession)>, String>,
     }
 
-    impl MockCodingAgent {
+    impl MockCloudAgent {
         fn ok(sessions: Vec<(String, CloudAgentSession)>) -> Self {
             Self {
                 result: Ok(sessions),
@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CodingAgent for MockCodingAgent {
+    impl CloudAgentService for MockCloudAgent {
         fn display_name(&self) -> &str {
             "mock-agent"
         }
@@ -661,8 +661,8 @@ mod tests {
     fn compute_provider_health_maps_error_categories() {
         let mut registry = ProviderRegistry::new();
         registry
-            .coding_agents
-            .insert("claude".to_string(), Arc::new(MockCodingAgent::ok(vec![])));
+            .cloud_agents
+            .insert("claude".to_string(), Arc::new(MockCloudAgent::ok(vec![])));
         registry.code_review.insert(
             "github".to_string(),
             Arc::new(MockCodeReview::ok(vec![], vec![])),
@@ -724,9 +724,9 @@ mod tests {
                 vec!["shared".to_string()],
             )),
         );
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCodingAgent::ok(vec![(
+            Arc::new(MockCloudAgent::ok(vec![(
                 "sess-1".to_string(),
                 make_session("Debug", "sess-1"),
             )])),
@@ -794,9 +794,9 @@ mod tests {
             "github".to_string(),
             Arc::new(MockCodeReview::failing("pr fail", "merged fail")),
         );
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCodingAgent::failing("sessions fail")),
+            Arc::new(MockCloudAgent::failing("sessions fail")),
         );
         registry.vcs.insert(
             "git".to_string(),
@@ -844,9 +844,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_failing_provider_sets_error_and_unhealthy_health() {
         let mut registry = ProviderRegistry::new();
-        registry.coding_agents.insert(
+        registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCodingAgent::failing("agent offline")),
+            Arc::new(MockCloudAgent::failing("agent offline")),
         );
 
         let handle = RepoRefreshHandle::spawn(

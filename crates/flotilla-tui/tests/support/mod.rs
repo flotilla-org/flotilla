@@ -82,7 +82,9 @@ impl TestHarness {
         let rm = self.model.repos.get_mut(&path).unwrap();
         for (category, name) in names {
             rm.provider_names
-                .insert(category.to_string(), name.to_string());
+                .entry(category.to_string())
+                .or_default()
+                .push(name.to_string());
         }
         self
     }

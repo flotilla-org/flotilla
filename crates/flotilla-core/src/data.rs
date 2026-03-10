@@ -514,8 +514,12 @@ pub fn group_work_items(
     let mut entries: Vec<GroupEntry> = Vec::new();
     let mut selectable: Vec<usize> = Vec::new();
 
-    // Checkouts -- sorted by branch name ascending
-    checkout_items.sort_by(|a, b| a.branch.cmp(&b.branch));
+    // Checkouts -- main first, then sorted by path ascending
+    checkout_items.sort_by(|a, b| match (a.is_main_checkout, b.is_main_checkout) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.checkout_key().cmp(&b.checkout_key()),
+    });
     if !checkout_items.is_empty() {
         entries.push(GroupEntry::Header(SectionHeader(labels.checkouts.clone())));
         for item in checkout_items {
@@ -1750,12 +1754,13 @@ mod tests {
     }
 
     #[test]
-    fn group_work_items_checkouts_sorted_by_branch() {
+    fn group_work_items_checkouts_sorted_by_path_main_first() {
         let providers = new_providers();
         let labels = default_labels();
         let items = vec![
             to_proto(&checkout_item("/tmp/z", Some("z-branch"), false)),
             to_proto(&checkout_item("/tmp/a", Some("a-branch"), false)),
+            to_proto(&checkout_item("/tmp/main", Some("main"), true)),
             to_proto(&checkout_item("/tmp/m", Some("m-branch"), false)),
         ];
         let result = group_work_items(&items, &providers, &labels);
@@ -1764,7 +1769,8 @@ mod tests {
         assert_eq!(
             branches,
             vec![
-                Some("a-branch".to_string()),
+                Some("main".to_string()),     // main always first
+                Some("a-branch".to_string()), // then by path ascending
                 Some("m-branch".to_string()),
                 Some("z-branch".to_string()),
             ]

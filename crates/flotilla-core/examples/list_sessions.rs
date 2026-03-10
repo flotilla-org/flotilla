@@ -6,7 +6,7 @@
 
 use flotilla_core::providers::coding_agent::claude::ClaudeCodingAgent;
 use flotilla_core::providers::coding_agent::cursor::CursorCodingAgent;
-use flotilla_core::providers::coding_agent::CodingAgent;
+use flotilla_core::providers::coding_agent::CloudAgentService;
 use flotilla_core::providers::types::RepoCriteria;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ async fn main() {
 
     println!("Listing sessions for {slug}\n");
 
-    let providers: Vec<(&str, Arc<dyn CodingAgent>)> = vec![
+    let providers: Vec<(&str, Arc<dyn CloudAgentService>)> = vec![
         (
             "claude",
             Arc::new(ClaudeCodingAgent::new(
@@ -33,7 +33,10 @@ async fn main() {
         ),
         (
             "cursor",
-            Arc::new(CursorCodingAgent::new("cursor".to_string())),
+            Arc::new(CursorCodingAgent::new(
+                "cursor".to_string(),
+                Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
+            )),
         ),
     ];
 

@@ -46,7 +46,7 @@ pub struct RepoInfo {
     pub path: PathBuf,
     pub name: String,
     pub labels: RepoLabels,
-    pub provider_names: HashMap<String, String>,
+    pub provider_names: HashMap<String, Vec<String>>,
     pub provider_health: HashMap<String, bool>,
     pub loading: bool,
 }
@@ -182,8 +182,8 @@ mod tests {
             name: "test".into(),
             labels,
             provider_names: HashMap::from([
-                ("vcs".to_string(), "git".to_string()),
-                ("code_review".to_string(), "github".to_string()),
+                ("vcs".to_string(), vec!["git".to_string()]),
+                ("code_review".to_string(), vec!["github".to_string()]),
             ]),
             provider_health: HashMap::from([("git".to_string(), true)]),
             loading: true,
@@ -194,8 +194,11 @@ mod tests {
         assert_eq!(decoded.name, "test");
         assert!(decoded.loading);
         assert_eq!(decoded.provider_names.len(), 2);
-        assert_eq!(decoded.provider_names["vcs"], "git");
-        assert_eq!(decoded.provider_names["code_review"], "github");
+        assert_eq!(decoded.provider_names["vcs"], vec!["git".to_string()]);
+        assert_eq!(
+            decoded.provider_names["code_review"],
+            vec!["github".to_string()]
+        );
         assert_eq!(decoded.provider_health.len(), 1);
         assert!(decoded.provider_health["git"]);
         assert_eq!(decoded.labels.checkouts.section, "Worktrees");

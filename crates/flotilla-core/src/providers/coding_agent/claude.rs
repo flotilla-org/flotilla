@@ -10,17 +10,12 @@ use crate::providers::types::*;
 use crate::providers::{CommandRunner, HttpClient};
 use tracing::{debug, info, warn};
 
-/// Shared reqwest client used only as a request factory (building
-/// `reqwest::Request` objects). Actual execution goes through the
-/// injected `HttpClient` trait, which has its own client. This avoids
-/// creating a redundant connection pool per `ClaudeCodingAgent` instance.
-static REQUEST_FACTORY: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
-
 pub struct ClaudeCodingAgent {
     provider_name: String,
     runner: Arc<dyn CommandRunner>,
     http: Arc<dyn HttpClient>,
     sessions_cache: Mutex<SessionsCache>,
+    auth_warned: AtomicBool,
 }
 
 impl ClaudeCodingAgent {
@@ -38,6 +33,7 @@ impl ClaudeCodingAgent {
                 fetched_at: None,
                 known_ids: std::collections::HashSet::new(),
             }),
+            auth_warned: AtomicBool::new(false),
         }
     }
 }
@@ -64,9 +60,6 @@ struct AuthCache {
 
 static AUTH_CACHE: LazyLock<Mutex<AuthCache>> =
     LazyLock::new(|| Mutex::new(AuthCache { token: None }));
-
-/// Guard so the "sessions unavailable" warning is emitted only once per process.
-static AUTH_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ---------- API deserialization types ----------
 
@@ -208,7 +201,7 @@ impl ClaudeCodingAgent {
     ) -> Result<reqwest::Request, String> {
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| format!("invalid HTTP method: {e}"))?;
-        let mut builder = REQUEST_FACTORY
+        let mut builder = super::REQUEST_FACTORY
             .request(method, url)
             .header("authorization", format!("Bearer {access_token}"))
             .header("anthropic-beta", "ccr-byoc-2025-07-29")
@@ -228,7 +221,7 @@ impl ClaudeCodingAgent {
                 match self.fetch_sessions_inner(base_url).await {
                     Ok(sessions) => Ok(sessions),
                     Err(e) if e.contains("authentication") => {
-                        if !AUTH_WARNED.swap(true, Ordering::Relaxed) {
+                        if !self.auth_warned.swap(true, Ordering::Relaxed) {
                             warn!("Claude sessions unavailable: insufficient OAuth scopes");
                         }
                         debug!("Claude auth error detail: {e}");
@@ -298,9 +291,9 @@ impl ClaudeCodingAgent {
 // ---------- trait implementation ----------
 
 #[async_trait]
-impl super::CodingAgent for ClaudeCodingAgent {
+impl super::CloudAgentService for ClaudeCodingAgent {
     fn display_name(&self) -> &str {
-        "Claude Sessions"
+        "Claude Code Web"
     }
 
     async fn list_sessions(
@@ -419,7 +412,7 @@ impl super::CodingAgent for ClaudeCodingAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::coding_agent::CodingAgent;
+    use crate::providers::coding_agent::CloudAgentService;
     use crate::providers::replay;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
@@ -453,7 +446,6 @@ mod tests {
 
     fn reset_auth_state() {
         invalidate_auth_cache();
-        AUTH_WARNED.store(false, Ordering::Relaxed);
     }
 
     fn mock_runner(responses: Vec<Result<String, String>>) -> Arc<dyn CommandRunner> {

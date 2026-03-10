@@ -4,7 +4,7 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Description     Branch          WT  WS  PR   SS   Issues   Git  ││                                              │
+│      Path        Description Branch      WT  WS  PR   SS   Issu Git  ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

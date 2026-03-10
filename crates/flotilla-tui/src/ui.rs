@@ -219,53 +219,73 @@ fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, are
     let path = &model.repo_order[model.active_repo];
     let rm = &model.repos[path];
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    let categories: Vec<(&str, &str)> = vec![
+    let categories = [
         ("VCS", "vcs"),
         ("Checkout mgr", "checkout_manager"),
         ("Code review", "code_review"),
         ("Issue tracker", "issue_tracker"),
-        ("Coding agent", "coding_agent"),
+        ("Cloud agents", "coding_agent"),
         ("AI utility", "ai_utility"),
         ("Workspace mgr", "workspace_manager"),
         ("Terminal pool", "terminal_pool"),
     ];
 
-    for (category, key) in categories {
-        let provider_name = rm.provider_names.get(key);
-        let status = provider_name.and_then(|pname| {
-            model
-                .provider_statuses
-                .get(&(path.clone(), key.to_string(), pname.clone()))
-                .copied()
-        });
+    let mut rows: Vec<Row> = Vec::new();
 
-        let value = match (&provider_name, status) {
-            (Some(name), Some(ProviderStatus::Ok)) => format!("{} ✓", name),
-            (Some(name), Some(ProviderStatus::Error)) => format!("{} ✗", name),
-            (Some(name), None) => (*name).clone(),
-            (None, _) => "—".to_string(),
-        };
-        let value_style = match status {
-            Some(ProviderStatus::Ok) => Style::default().fg(Color::Green),
-            Some(ProviderStatus::Error) => Style::default().fg(Color::Red),
-            _ if provider_name.is_some() => Style::default().fg(Color::White),
-            _ => Style::default().fg(Color::DarkGray),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<16}", category),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(value, value_style),
-        ]));
+    for &(category, key) in &categories {
+        if let Some(pnames) = rm.provider_names.get(key) {
+            for (i, pname) in pnames.iter().enumerate() {
+                let label = if i == 0 { category } else { "" };
+                let status = model
+                    .provider_statuses
+                    .get(&(path.clone(), key.to_string(), pname.clone()))
+                    .copied();
+                let (status_text, status_color) = match status {
+                    Some(ProviderStatus::Ok) => ("✓", Color::Green),
+                    Some(ProviderStatus::Error) => ("✗", Color::Red),
+                    None => ("", Color::White),
+                };
+                rows.push(Row::new(vec![
+                    Cell::from(Span::styled(label, Style::default().fg(Color::DarkGray))),
+                    Cell::from(Span::styled(pname, Style::default().fg(Color::White))),
+                    Cell::from(Span::styled(status_text, Style::default().fg(status_color))),
+                ]));
+            }
+        } else {
+            rows.push(Row::new(vec![
+                Cell::from(Span::styled(category, Style::default().fg(Color::DarkGray))),
+                Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
+                Cell::from(""),
+            ]));
+        }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::bordered().title_top(Line::from(" ✕ ").right_aligned()))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+    let header = Row::new(vec![
+        Cell::from(Span::styled(
+            "Role",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+        Cell::from(Span::styled(
+            "Provider",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+        Cell::from(Span::styled(
+            "Status",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+    ])
+    .height(1);
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(24),
+        Constraint::Length(6),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered().title_top(Line::from(" ✕ ").right_aligned()));
+    frame.render_widget(table, area);
 }
 
 fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: Rect) {
@@ -303,16 +323,16 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
     .height(1);
 
     let widths = [
-        Constraint::Length(3),
-        Constraint::Length(14),
-        Constraint::Min(15),
-        Constraint::Length(25),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(10),
-        Constraint::Length(4),
-        Constraint::Length(10),
-        Constraint::Length(5),
+        Constraint::Length(3), // icon
+        Constraint::Min(6),    // Path (shrinks first when tight)
+        Constraint::Fill(1),   // Description (absorbs remaining space)
+        Constraint::Min(8),    // Branch (shrinks before fixed columns)
+        Constraint::Length(3), // WT
+        Constraint::Length(3), // WS
+        Constraint::Length(4), // PR
+        Constraint::Length(4), // SS
+        Constraint::Length(4), // Issues
+        Constraint::Length(5), // Git
     ];
 
     let inner_width = area.width.saturating_sub(4);
@@ -362,10 +382,29 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
         .expect("active repo must have UI state");
     frame.render_stateful_widget(table, area, &mut rui.table_state);
 
+    // Overlay section headers so they span the full row width, independent of
+    // column layout.  The Table rendered empty cells for header rows; we draw
+    // the title text on top, starting from after the icon column.
+    let offset = rui.table_state.offset();
+    let visible_rows = area.height.saturating_sub(3) as usize; // borders + column header
+                                                               // left border (1) + highlight symbol (2) + icon column + column spacing (1)
+    let header_x = area.x + 1 + 2 + col_widths[0] + 1;
+    let header_w = (area.x + area.width).saturating_sub(header_x + 1); // up to right border
+    let header_style = Style::default().fg(Color::Yellow).bold();
+
+    for i in 0..visible_rows {
+        if let Some(GroupEntry::Header(h)) = rui.table_view.table_entries.get(offset + i) {
+            let y = area.y + 2 + i as u16;
+            frame.render_widget(
+                Span::styled(format!("── {h} ──"), header_style),
+                Rect::new(header_x, y, header_w, 1),
+            );
+        }
+    }
+
     // Ratatui scrolls just enough to show the selected row, but section headers
     // sit one row above the first item in each section.  If the offset lands
     // right after a header, back it up so the header stays visible.
-    let offset = rui.table_state.offset();
     if offset > 0
         && matches!(
             rui.table_view.table_entries.get(offset - 1),
@@ -376,12 +415,13 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
     }
 }
 
-fn build_header_row(header: &SectionHeader) -> Row<'static> {
-    let style = Style::default().fg(Color::Yellow).bold();
+fn build_header_row(_header: &SectionHeader) -> Row<'static> {
+    // Empty cells — the actual section title is rendered as an overlay after the
+    // table so it can span across all columns regardless of column layout.
     Row::new(vec![
         Cell::from(""),
         Cell::from(""),
-        Cell::from(Span::styled(format!("── {} ──", header), style)),
+        Cell::from(""),
         Cell::from(""),
         Cell::from(""),
         Cell::from(""),
@@ -413,7 +453,7 @@ fn build_item_row<'a>(
 
     let path_display = item
         .checkout_key()
-        .map(|p| ui_helpers::shorten_path(p, repo_root))
+        .map(|p| ui_helpers::shorten_path(p, repo_root, path_width))
         .unwrap_or_default();
     let path_display = ui_helpers::truncate(&path_display, path_width);
 
@@ -472,7 +512,7 @@ fn build_item_row<'a>(
         )),
         Cell::from(Span::styled(
             path_display,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Indexed(245)),
         )),
         Cell::from(description),
         Cell::from(Span::styled(
@@ -918,123 +958,103 @@ fn render_config_screen(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 }
 
 fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+    // Collect providers across all repos: (category_key, provider_name) → status.
+    let categories = [
+        ("VCS", "vcs"),
+        ("Checkout mgr", "checkout_manager"),
+        ("Code review", "code_review"),
+        ("Issue tracker", "issue_tracker"),
+        ("Cloud agents", "coding_agent"),
+        ("AI utility", "ai_utility"),
+        ("Workspace mgr", "workspace_manager"),
+        ("Terminal pool", "terminal_pool"),
+    ];
 
-    // Collect provider names across all repos
-    let mut vcs_name: Option<String> = None;
-    let mut checkout_name: Option<String> = None;
-    let mut code_review_name: Option<String> = None;
-    let mut issue_tracker_name: Option<String> = None;
-    let mut coding_agent_name: Option<String> = None;
-    let mut ai_utility_name: Option<String> = None;
-    let mut workspace_name: Option<String> = None;
-    let mut terminal_pool_name: Option<String> = None;
-
-    let mut coding_agent_status: Option<ProviderStatus> = None;
+    // Collect unique (category, provider_name) pairs with their best-known status.
+    struct ProviderEntry {
+        name: String,
+        status: Option<ProviderStatus>,
+    }
+    let mut by_category: HashMap<&str, Vec<ProviderEntry>> = HashMap::new();
 
     for path in &model.repo_order {
         let rm = &model.repos[path];
-
-        if vcs_name.is_none() {
-            vcs_name = rm.provider_names.get("vcs").cloned();
-        }
-        if checkout_name.is_none() {
-            checkout_name = rm.provider_names.get("checkout_manager").cloned();
-        }
-        if code_review_name.is_none() {
-            code_review_name = rm.provider_names.get("code_review").cloned();
-        }
-        if issue_tracker_name.is_none() {
-            issue_tracker_name = rm.provider_names.get("issue_tracker").cloned();
-        }
-        if coding_agent_name.is_none() {
-            coding_agent_name = rm.provider_names.get("coding_agent").cloned();
-        }
-        if ai_utility_name.is_none() {
-            ai_utility_name = rm.provider_names.get("ai_utility").cloned();
-        }
-        if workspace_name.is_none() {
-            workspace_name = rm.provider_names.get("workspace_manager").cloned();
-        }
-        if terminal_pool_name.is_none() {
-            terminal_pool_name = rm.provider_names.get("terminal_pool").cloned();
-        }
-
-        if coding_agent_status.is_none() {
-            if let Some(pname) = rm.provider_names.get("coding_agent") {
-                if let Some(&status) = model.provider_statuses.get(&(
-                    path.clone(),
-                    "coding_agent".into(),
-                    pname.clone(),
-                )) {
-                    coding_agent_status = Some(status);
+        for &(_, key) in &categories {
+            if let Some(pnames) = rm.provider_names.get(key) {
+                let entries = by_category.entry(key).or_default();
+                for pname in pnames {
+                    if entries.iter().any(|e| e.name == *pname) {
+                        continue;
+                    }
+                    let status = model
+                        .provider_statuses
+                        .get(&(path.clone(), key.to_string(), pname.clone()))
+                        .copied();
+                    entries.push(ProviderEntry {
+                        name: pname.clone(),
+                        status,
+                    });
                 }
             }
         }
     }
 
-    lines.push(Line::from(Span::styled(
-        "── Provider Factories ──",
-        Style::default().fg(Color::Yellow).bold(),
-    )));
+    let mut rows: Vec<Row> = Vec::new();
 
-    let factories: Vec<(&str, &Option<String>)> = vec![
-        ("VCS", &vcs_name),
-        ("Checkout mgr", &checkout_name),
-        ("Code review", &code_review_name),
-        ("Issue tracker", &issue_tracker_name),
-        ("Coding agent", &coding_agent_name),
-        ("AI utility", &ai_utility_name),
-        ("Workspace mgr", &workspace_name),
-        ("Terminal pool", &terminal_pool_name),
+    for &(category, key) in &categories {
+        let entries = by_category.get(key);
+        if let Some(providers) = entries {
+            for (i, provider) in providers.iter().enumerate() {
+                let label = if i == 0 { category } else { "" };
+                let (status_text, status_color) = match provider.status {
+                    Some(ProviderStatus::Ok) => ("✓", Color::Green),
+                    Some(ProviderStatus::Error) => ("✗", Color::Red),
+                    None => ("", Color::White),
+                };
+                rows.push(Row::new(vec![
+                    Cell::from(Span::styled(label, Style::default().fg(Color::DarkGray))),
+                    Cell::from(Span::styled(
+                        &provider.name,
+                        Style::default().fg(Color::White),
+                    )),
+                    Cell::from(Span::styled(status_text, Style::default().fg(status_color))),
+                ]));
+            }
+        } else {
+            rows.push(Row::new(vec![
+                Cell::from(Span::styled(category, Style::default().fg(Color::DarkGray))),
+                Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
+                Cell::from(""),
+            ]));
+        }
+    }
+
+    let header = Row::new(vec![
+        Cell::from(Span::styled(
+            "Role",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+        Cell::from(Span::styled(
+            "Provider",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+        Cell::from(Span::styled(
+            "Status",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+    ])
+    .height(1);
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(24),
+        Constraint::Length(6),
     ];
 
-    for (category, name) in factories {
-        let value = name.as_deref().unwrap_or("—");
-        let style = if name.is_some() {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<16}", category),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(value, style),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "── Coding Agent Status ──",
-        Style::default().fg(Color::Yellow).bold(),
-    )));
-
-    if let Some(agent_name) = &coding_agent_name {
-        let (status_text, color) = match coding_agent_status {
-            Some(ProviderStatus::Ok) => ("✓ authenticated", Color::Green),
-            Some(ProviderStatus::Error) => ("✗ auth error", Color::Red),
-            None => ("? unknown", Color::DarkGray),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<16}", agent_name),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(status_text, Style::default().fg(color)),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "  No coding agent configured",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    let paragraph = Paragraph::new(lines)
-        .block(Block::bordered())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered().title(" Providers "));
+    frame.render_widget(table, area);
 }
 
 fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {

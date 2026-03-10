@@ -43,7 +43,7 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
             })
             .unwrap_or_default(),
         sessions: registry
-            .coding_agents
+            .cloud_agents
             .values()
             .next()
             .map(|ca| CategoryLabels {
@@ -55,31 +55,61 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     }
 }
 
-pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    if let Some(v) = registry.vcs.values().next() {
-        names.insert("vcs".into(), v.display_name().into());
+pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<String, Vec<String>> {
+    let mut names: HashMap<String, Vec<String>> = HashMap::new();
+    let vcs: Vec<String> = registry
+        .vcs
+        .values()
+        .map(|v| v.display_name().into())
+        .collect();
+    if !vcs.is_empty() {
+        names.insert("vcs".into(), vcs);
     }
-    if let Some(cm) = registry.checkout_managers.values().next() {
-        names.insert("checkout_manager".into(), cm.display_name().into());
+    let cms: Vec<String> = registry
+        .checkout_managers
+        .values()
+        .map(|v| v.display_name().into())
+        .collect();
+    if !cms.is_empty() {
+        names.insert("checkout_manager".into(), cms);
     }
-    if let Some(cr) = registry.code_review.values().next() {
-        names.insert("code_review".into(), cr.display_name().into());
+    let crs: Vec<String> = registry
+        .code_review
+        .values()
+        .map(|v| v.display_name().into())
+        .collect();
+    if !crs.is_empty() {
+        names.insert("code_review".into(), crs);
     }
-    if let Some(it) = registry.issue_trackers.values().next() {
-        names.insert("issue_tracker".into(), it.display_name().into());
+    let its: Vec<String> = registry
+        .issue_trackers
+        .values()
+        .map(|v| v.display_name().into())
+        .collect();
+    if !its.is_empty() {
+        names.insert("issue_tracker".into(), its);
     }
-    if let Some(ca) = registry.coding_agents.values().next() {
-        names.insert("coding_agent".into(), ca.display_name().into());
+    let cas: Vec<String> = registry
+        .cloud_agents
+        .values()
+        .map(|v| v.display_name().into())
+        .collect();
+    if !cas.is_empty() {
+        names.insert("coding_agent".into(), cas);
     }
-    if let Some(ai) = registry.ai_utilities.values().next() {
-        names.insert("ai_utility".into(), ai.display_name().into());
+    let ais: Vec<String> = registry
+        .ai_utilities
+        .values()
+        .map(|v| v.display_name().into())
+        .collect();
+    if !ais.is_empty() {
+        names.insert("ai_utility".into(), ais);
     }
     if let Some((_, wm)) = &registry.workspace_manager {
-        names.insert("workspace_manager".into(), wm.display_name().into());
+        names.insert("workspace_manager".into(), vec![wm.display_name().into()]);
     }
     if let Some((_, tp)) = &registry.terminal_pool {
-        names.insert("terminal_pool".into(), tp.display_name().into());
+        names.insert("terminal_pool".into(), vec![tp.display_name().into()]);
     }
     names
 }
@@ -124,7 +154,7 @@ mod tests {
     use super::*;
     use crate::providers::ai_utility::AiUtility;
     use crate::providers::code_review::CodeReview;
-    use crate::providers::coding_agent::CodingAgent;
+    use crate::providers::coding_agent::CloudAgentService;
     use crate::providers::issue_tracker::IssueTracker;
     use crate::providers::vcs::{CheckoutManager, Vcs};
     use crate::providers::workspace::WorkspaceManager;
@@ -282,14 +312,14 @@ mod tests {
         }
     }
 
-    struct StubCodingAgent;
+    struct StubCloudAgent;
     #[async_trait]
-    impl CodingAgent for StubCodingAgent {
+    impl CloudAgentService for StubCloudAgent {
         fn display_name(&self) -> &str {
             "StubCA"
         }
         fn section_label(&self) -> &str {
-            "Claude Sessions"
+            "Cloud Agents"
         }
         fn item_noun(&self) -> &str {
             "session"
@@ -354,8 +384,8 @@ mod tests {
             .insert("cr".into(), Arc::new(StubCodeReview));
         reg.issue_trackers
             .insert("it".into(), Arc::new(StubIssueTracker));
-        reg.coding_agents
-            .insert("ca".into(), Arc::new(StubCodingAgent));
+        reg.cloud_agents
+            .insert("ca".into(), Arc::new(StubCloudAgent));
         reg.ai_utilities
             .insert("ai".into(), Arc::new(StubAiUtility));
         reg.workspace_manager = Some(("wm".into(), Arc::new(StubWorkspaceManager)));
@@ -396,7 +426,7 @@ mod tests {
         assert_eq!(labels.issues.noun, "issue");
         assert_eq!(labels.issues.abbr, "#");
 
-        assert_eq!(labels.sessions.section, "Claude Sessions");
+        assert_eq!(labels.sessions.section, "Cloud Agents");
         assert_eq!(labels.sessions.noun, "session");
         assert_eq!(labels.sessions.abbr, "CS");
     }
@@ -407,14 +437,14 @@ mod tests {
         let mut reg = ProviderRegistry::new();
         reg.checkout_managers
             .insert("cm".into(), Arc::new(StubCheckoutManager));
-        reg.coding_agents
-            .insert("ca".into(), Arc::new(StubCodingAgent));
+        reg.cloud_agents
+            .insert("ca".into(), Arc::new(StubCloudAgent));
 
         let labels = labels_from_registry(&reg);
 
         // Populated providers have real labels.
         assert_eq!(labels.checkouts.section, "Checkouts");
-        assert_eq!(labels.sessions.section, "Claude Sessions");
+        assert_eq!(labels.sessions.section, "Cloud Agents");
 
         // Missing providers fall back to defaults.
         assert_eq!(labels.code_review.section, "\u{2014}");
@@ -437,13 +467,31 @@ mod tests {
         let reg = full_registry();
         let names = provider_names_from_registry(&reg);
 
-        assert_eq!(names.get("vcs").unwrap(), "StubVcs");
-        assert_eq!(names.get("checkout_manager").unwrap(), "StubCM");
-        assert_eq!(names.get("code_review").unwrap(), "StubCR");
-        assert_eq!(names.get("issue_tracker").unwrap(), "StubIT");
-        assert_eq!(names.get("coding_agent").unwrap(), "StubCA");
-        assert_eq!(names.get("ai_utility").unwrap(), "StubAI");
-        assert_eq!(names.get("workspace_manager").unwrap(), "StubWM");
+        assert_eq!(names.get("vcs").unwrap(), &vec!["StubVcs".to_string()]);
+        assert_eq!(
+            names.get("checkout_manager").unwrap(),
+            &vec!["StubCM".to_string()]
+        );
+        assert_eq!(
+            names.get("code_review").unwrap(),
+            &vec!["StubCR".to_string()]
+        );
+        assert_eq!(
+            names.get("issue_tracker").unwrap(),
+            &vec!["StubIT".to_string()]
+        );
+        assert_eq!(
+            names.get("coding_agent").unwrap(),
+            &vec!["StubCA".to_string()]
+        );
+        assert_eq!(
+            names.get("ai_utility").unwrap(),
+            &vec!["StubAI".to_string()]
+        );
+        assert_eq!(
+            names.get("workspace_manager").unwrap(),
+            &vec!["StubWM".to_string()]
+        );
         assert_eq!(names.len(), 7);
     }
 
@@ -455,7 +503,10 @@ mod tests {
 
         let names = provider_names_from_registry(&reg);
         assert_eq!(names.len(), 1);
-        assert_eq!(names.get("code_review").unwrap(), "StubCR");
+        assert_eq!(
+            names.get("code_review").unwrap(),
+            &vec!["StubCR".to_string()]
+        );
         assert!(!names.contains_key("vcs"));
     }
 
@@ -505,14 +556,14 @@ mod tests {
         assert_eq!(model.labels.checkouts.section, "Checkouts");
         assert_eq!(model.labels.code_review.section, "Pull Requests");
         assert_eq!(model.labels.issues.section, "GitHub Issues");
-        assert_eq!(model.labels.sessions.section, "Claude Sessions");
+        assert_eq!(model.labels.sessions.section, "Cloud Agents");
 
         assert!(!model.data.loading);
         assert!(model.data.provider_health.is_empty());
         assert!(model.data.correlation_groups.is_empty());
 
         assert!(model.registry.checkout_managers.contains_key("cm"));
-        assert!(model.registry.coding_agents.contains_key("ca"));
+        assert!(model.registry.cloud_agents.contains_key("ca"));
         assert!(model.registry.workspace_manager.is_some());
         model.refresh_handle.trigger_refresh();
     }

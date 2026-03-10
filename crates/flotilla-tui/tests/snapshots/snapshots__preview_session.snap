@@ -1,12 +1,13 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 176
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path     Description     Branch          WT  WS  PR  SS  Iss Git││Description: Debug API endpoints              │
-│               ── Sessions ──                                         ││Branch: feat/session-branch                   │
-│▸  ▶           Debug API endp… feat/session-b…             ▶          ││Session: Debug API endpoints                  │
+│      Path        Description Branch      WT  WS  PR   SS   Issu Git  ││Description: Debug API endpoints              │
+│      ── Sessions ──                                                  ││Branch: feat/session-branch                   │
+│▸  ▶              Debug API e feat/sessio              ▶              ││Session: Debug API endpoints                  │
 │                                                                      ││Status: Running                               │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

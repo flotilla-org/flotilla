@@ -115,23 +115,75 @@ pub fn checkout_indicator(is_main: bool, has_checkout: bool) -> &'static str {
     }
 }
 
-/// Shorten a checkout path relative to the repo root for display in the table.
+/// Shorten a checkout path for display in the table.
 ///
-/// - Main checkout (path == repo_root) → "."
-/// - Under `.worktrees/` → path relative to `.worktrees/` (e.g. "feat-auth" or "group/feat-auth")
-/// - Otherwise → relative path from repo root
-pub fn shorten_path(path: &Path, repo_root: &Path) -> String {
+/// Main checkout shows home-relative (e.g. `~/dev/flotilla`).
+/// Other checkouts are indented to show hierarchy: sibling worktrees show the
+/// suffix (e.g. `.low-hang-12`), nested worktrees show the relative path
+/// (e.g. `.worktrees/feat-auth`).  Padding matches the parent-directory portion
+/// of the main display, but shrinks when `col_width` is tight so the actual
+/// name is preserved.
+pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
+    let main_display = shorten_against_home(repo_root);
+
+    // Main checkout — show the full shortened path.
     if path == repo_root {
-        return ".".to_string();
+        return main_display;
     }
-    let rel = path
-        .strip_prefix(repo_root)
-        .unwrap_or(path)
-        .to_string_lossy();
-    match rel.strip_prefix(".worktrees/") {
-        Some(name) => name.to_string(),
-        None => rel.into_owned(),
+
+    // Ideal padding = width of the parent-directory portion of main_display.
+    let repo_name_len = repo_root
+        .file_name()
+        .map(|n| n.to_string_lossy().len())
+        .unwrap_or(0);
+    let ideal_padding = main_display.len().saturating_sub(repo_name_len);
+
+    // Under repo root (e.g. .worktrees/feat-auth, sub/dir)
+    if let Ok(rel) = path.strip_prefix(repo_root) {
+        let s = rel.to_string_lossy();
+        if !s.is_empty() {
+            let name = s.into_owned();
+            let padding = ideal_padding.min(col_width.saturating_sub(name.len()));
+            return format!("{:padding$}{name}", "");
+        }
     }
+
+    // Sibling directory (same parent as repo root)
+    if let (Some(path_parent), Some(root_parent)) = (path.parent(), repo_root.parent()) {
+        if path_parent == root_parent {
+            let root_name = repo_root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let path_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Strip repo name prefix to show just the suffix (e.g. ".low-hang-12")
+            let name = path_name
+                .strip_prefix(&root_name)
+                .unwrap_or(&path_name)
+                .to_string();
+            let padding = ideal_padding.min(col_width.saturating_sub(name.len()));
+            return format!("{:padding$}{name}", "");
+        }
+    }
+
+    // Elsewhere — shorten against home directory.
+    shorten_against_home(path)
+}
+
+fn shorten_against_home(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            let s = rel.to_string_lossy();
+            if s.is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{s}");
+        }
+    }
+    path.display().to_string()
 }
 
 /// Return the workspace indicator: "" for 0, "●" for 1, count as string for >1.
@@ -346,35 +398,87 @@ mod tests {
 
     #[test]
     fn shorten_path_main_checkout() {
-        let root = Path::new("/home/user/project");
-        assert_eq!(shorten_path(root, root), ".");
+        let root = Path::new("/dev/project");
+        assert_eq!(shorten_path(root, root, 40), "/dev/project");
     }
 
     #[test]
-    fn shorten_path_worktree() {
-        let root = Path::new("/home/user/project");
-        let wt = Path::new("/home/user/project/.worktrees/feat-auth");
-        assert_eq!(shorten_path(wt, root), "feat-auth");
+    fn shorten_path_main_checkout_under_home() {
+        let home = dirs::home_dir().expect("home dir");
+        let root = home.join("dev/flotilla");
+        assert_eq!(shorten_path(&root, &root, 40), "~/dev/flotilla");
+    }
+
+    #[test]
+    fn shorten_path_worktree_wide_column() {
+        // Wide column — full padding (5 = len("/dev/")).
+        let root = Path::new("/dev/project");
+        let wt = Path::new("/dev/project/.worktrees/feat-auth");
+        assert_eq!(shorten_path(wt, root, 40), "     .worktrees/feat-auth");
+    }
+
+    #[test]
+    fn shorten_path_worktree_narrow_column() {
+        // Narrow column — padding shrinks so name still fits.
+        let root = Path::new("/dev/project");
+        let wt = Path::new("/dev/project/.worktrees/feat-auth");
+        // name = ".worktrees/feat-auth" (20 chars), col = 22, padding = 2
+        assert_eq!(shorten_path(wt, root, 22), "  .worktrees/feat-auth");
+    }
+
+    #[test]
+    fn shorten_path_worktree_very_narrow() {
+        // Very narrow — no padding, name alone.
+        let root = Path::new("/dev/project");
+        let wt = Path::new("/dev/project/.worktrees/feat-auth");
+        assert_eq!(shorten_path(wt, root, 10), ".worktrees/feat-auth");
     }
 
     #[test]
     fn shorten_path_relative() {
-        let root = Path::new("/home/user/project");
-        let sub = Path::new("/home/user/project/sub/dir");
-        assert_eq!(shorten_path(sub, root), "sub/dir");
+        let root = Path::new("/dev/project");
+        let sub = Path::new("/dev/project/sub/dir");
+        assert_eq!(shorten_path(sub, root, 40), "     sub/dir");
     }
 
     #[test]
     fn shorten_path_nested_worktree() {
-        let root = Path::new("/home/user/project");
-        let wt = Path::new("/home/user/project/.worktrees/group/feat-auth");
-        assert_eq!(shorten_path(wt, root), "group/feat-auth");
+        let root = Path::new("/dev/project");
+        let wt = Path::new("/dev/project/.worktrees/group/feat-auth");
+        assert_eq!(
+            shorten_path(wt, root, 40),
+            "     .worktrees/group/feat-auth"
+        );
+    }
+
+    #[test]
+    fn shorten_path_sibling_worktree() {
+        // padding = len("/dev/") = 5
+        let root = Path::new("/dev/flotilla");
+        let wt = Path::new("/dev/flotilla.feat-xyz");
+        assert_eq!(shorten_path(wt, root, 40), "     .feat-xyz");
+    }
+
+    #[test]
+    fn shorten_path_sibling_different_name() {
+        let root = Path::new("/dev/flotilla");
+        let wt = Path::new("/dev/other-project");
+        assert_eq!(shorten_path(wt, root, 40), "     other-project");
+    }
+
+    #[test]
+    fn shorten_path_sibling_under_home() {
+        // padding = len("~/dev/") = 6
+        let home = dirs::home_dir().expect("home dir");
+        let root = home.join("dev/flotilla");
+        let wt = home.join("dev/flotilla.low-hang-12");
+        assert_eq!(shorten_path(&wt, &root, 40), "      .low-hang-12");
     }
 
     #[test]
     fn shorten_path_outside_root() {
-        let root = Path::new("/home/user/project");
+        let root = Path::new("/tmp/project");
         let other = Path::new("/elsewhere/wt");
-        assert_eq!(shorten_path(other, root), "/elsewhere/wt");
+        assert_eq!(shorten_path(other, root, 40), "/elsewhere/wt");
     }
 }
