@@ -7,7 +7,7 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::providers::types::*;
-use crate::providers::HttpClient;
+use crate::providers::{ChannelRequest, DefaultLabeler, HttpClient, IntoChannelLabel};
 
 // --- Auth ---
 
@@ -319,7 +319,11 @@ impl CodexCodingAgent {
             .ok_or_else(|| format!("invalid repo slug: {repo_slug}"))?;
         let url = format!("{BASE_URL}/wham/environments/by-repo/github/{owner}/{repo}");
         let request = self.build_request("GET", &url, auth)?;
-        let resp = self.http.execute(request).await?;
+        let label = DefaultLabeler.into_channel_label(&ChannelRequest::Http {
+            method: request.method().as_str(),
+            url: request.url().as_str(),
+        });
+        let resp = self.http.execute(request, &label).await?;
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
             return Err(format!("authentication error (HTTP {status})"));
@@ -349,7 +353,11 @@ impl CodexCodingAgent {
             url.push_str(&urlencoding::encode(c));
         }
         let request = self.build_request("GET", &url, auth)?;
-        let resp = self.http.execute(request).await?;
+        let label = DefaultLabeler.into_channel_label(&ChannelRequest::Http {
+            method: request.method().as_str(),
+            url: request.url().as_str(),
+        });
+        let resp = self.http.execute(request, &label).await?;
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
             return Err(format!("authentication error (HTTP {status})"));
