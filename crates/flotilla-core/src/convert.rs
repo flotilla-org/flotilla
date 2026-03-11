@@ -43,6 +43,7 @@ pub fn correlation_result_to_work_item(
         is_main_checkout: item.is_main_checkout(),
         debug_group,
         source: item.source().map(|s| s.to_string()),
+        terminal_keys: vec![],
     }
 }
 

@@ -442,6 +442,7 @@ impl App {
                     {
                         self.proto_commands.push(Command::RemoveCheckout {
                             branch: info.branch.clone(),
+                            terminal_keys: vec![], // TODO(#237): wire real keys in Task 7
                         });
                     }
                     self.ui.mode = UiMode::Normal;
@@ -972,7 +973,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::RemoveCheckout { branch } => {
+            Command::RemoveCheckout { branch, .. } => {
                 assert_eq!(branch, "feat/x");
             }
             other => panic!("expected RemoveCheckout, got {:?}", other),
@@ -987,7 +988,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::RemoveCheckout { branch } => {
+            Command::RemoveCheckout { branch, .. } => {
                 assert_eq!(branch, "feat/y");
             }
             other => panic!("expected RemoveCheckout, got {:?}", other),

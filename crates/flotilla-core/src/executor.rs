@@ -116,7 +116,7 @@ pub async fn execute(
             }
         }
 
-        Command::RemoveCheckout { branch } => {
+        Command::RemoveCheckout { branch, .. } => {
             info!(%branch, "removing checkout");
             let result = if let Some(cm) = registry.checkout_managers.values().next() {
                 Some(cm.remove_checkout(repo_root, &branch).await)
@@ -1235,6 +1235,7 @@ mod tests {
         let result = run_execute(
             Command::RemoveCheckout {
                 branch: "old".to_string(),
+                terminal_keys: vec![],
             },
             &registry,
             &empty_data(),
@@ -1257,6 +1258,7 @@ mod tests {
         let result = run_execute(
             Command::RemoveCheckout {
                 branch: "old".to_string(),
+                terminal_keys: vec![],
             },
             &registry,
             &empty_data(),
@@ -1279,6 +1281,7 @@ mod tests {
         let result = run_execute(
             Command::RemoveCheckout {
                 branch: "main".to_string(),
+                terminal_keys: vec![],
             },
             &registry,
             &empty_data(),
