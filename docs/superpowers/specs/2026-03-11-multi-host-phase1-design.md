@@ -64,15 +64,29 @@ Cross-host correlation works naturally: a checkout on the desktop and a PR fetch
 
 ### Repo Matching
 
-Two repos on different hosts are the same logical repo if they share the same root remote URL (e.g. `git@github.com:rjwittams/flotilla.git`). The daemon maintains:
+Two repos on different hosts are the same logical repo if they share the same **repo slug** (e.g. `rjwittams/flotilla`), extracted from the root remote URL. Slug-based matching avoids false negatives when hosts use different URL formats for the same repo (SSH `git@github.com:...` vs HTTPS `https://github.com/...`). The existing `extract_repo_slug` in `discovery.rs` already does this extraction.
+
+The daemon maintains:
 
 ```rust
-root_remote_url → LogicalRepo {
+repo_slug → LogicalRepo {
     host_repos: HashMap<HostName, RepoInfo>,
 }
 ```
 
 Each logical repo gets one tab. Repos that exist only on remote hosts still get a tab.
+
+For TUI snapshot keying (which uses `PathBuf` as repo identity): if the local host has the repo, use the local path. If the repo exists only on remote hosts, use a synthetic path like `<remote>/<host>/<remote-path>` — the TUI treats this as an opaque key, so the exact format matters only for display.
+
+### Host-Namespaced Correlation Keys
+
+`CorrelationKey::CheckoutPath(PathBuf)` would collide when two hosts share the same filesystem path (e.g. both have `/Users/robert/dev/flotilla`). To prevent false correlations, checkout paths and workspace paths from remote hosts are prefixed with the host name before entering the correlation engine — e.g. `desktop:/Users/robert/dev/flotilla`.
+
+Branch-based correlation (`CorrelationKey::Branch`) is intentionally *not* namespaced — a branch name on host A should correlate with the same branch name and its associated PR from host B. This is the primary mechanism for cross-host correlation.
+
+### HostName
+
+`HostName` is the user-chosen alias from `hosts.toml` (e.g. `desktop`, `cloud`). The local host's name defaults to the machine hostname but can be overridden in `daemon.toml`. This alias appears in the Source column and config view.
 
 ## Configuration
 
@@ -119,7 +133,11 @@ The `PeerManager` in `flotilla-daemon` manages connections to all configured rem
 3. Connects to the forwarded socket using `flotilla-client::SocketDaemon`
 4. Receives snapshot, then subscribes to deltas
 
-On failure: reconnects with exponential backoff. Connection status (connected / disconnected / reconnecting) is tracked per host.
+On startup, stale forwarding sockets in `~/.config/flotilla/peers/` are removed (same pattern as the daemon's own socket cleanup). The SSH child process is spawned with `kill_on_drop` so it is cleaned up if the daemon exits.
+
+On failure: reconnects with exponential backoff (capped at 60 seconds). Connection status (connected / disconnected / reconnecting) is tracked per host.
+
+The remote daemon must already be running. If the socket is not available, the connection enters the reconnect loop. Spawning remote daemons via SSH is out of scope for Phase 1.
 
 ### PeerTransport Trait
 
@@ -190,6 +208,10 @@ The Flotilla tab's config screen gains a "Hosts" section showing:
 - Last successful sync time
 
 This sits alongside the existing provider health display.
+
+### Actions on Remote Items
+
+Phase 1 is read-only for remote items. When a user selects a remote checkout or workspace and opens the action menu, actions that require local access (open terminal, delete worktree) are filtered out. The action menu shows only actions that remain valid (e.g. open PR in browser, copy branch name).
 
 ### No Other Changes
 
