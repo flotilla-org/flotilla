@@ -152,23 +152,27 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
         }
     }
 
-    // Sibling directory (same parent as repo root)
-    if let (Some(path_parent), Some(root_parent)) = (path.parent(), repo_root.parent()) {
-        if path_parent == root_parent {
+    // Sibling or descendant of sibling (same parent directory as repo root)
+    if let Some(root_parent) = repo_root.parent() {
+        if let Ok(rel) = path.strip_prefix(root_parent) {
+            let rel_str = rel.to_string_lossy();
             let root_name = repo_root
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
+                .map(|n| n.to_string_lossy())
                 .unwrap_or_default();
-            let path_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            // Strip repo name prefix to show just the suffix (e.g. ".low-hang-12")
-            let name = path_name
-                .strip_prefix(&root_name)
-                .unwrap_or(&path_name)
-                .to_string();
-            return format!("{:padding$}{name}", "");
+            // Strip repo name prefix to get the suffix
+            // e.g. "flotilla.quick-wins" -> ".quick-wins"
+            // e.g. "flotilla.quick-wins/.claude/worktrees/agent-x" -> ".quick-wins/.claude/worktrees/agent-x"
+            let suffix = rel_str.strip_prefix(root_name.as_ref()).unwrap_or(&rel_str);
+            // If nested under a sibling (contains '/'), strip the sibling dir
+            // and show only the sub-path with extra indentation.
+            // e.g. ".quick-wins/.claude/worktrees/agent-x" -> ".claude/worktrees/agent-x"
+            let (name, extra_indent) = match suffix.find('/') {
+                Some(pos) => (&suffix[pos + 1..], padding + 2),
+                None => (suffix, padding),
+            };
+            let p = extra_indent.min(col_width / 2);
+            return format!("{:p$}{name}", "");
         }
     }
 
@@ -476,6 +480,19 @@ mod tests {
         let root = home.join("dev/flotilla");
         let wt = home.join("dev/flotilla.low-hang-12");
         assert_eq!(shorten_path(&wt, &root, 40), "      .low-hang-12");
+    }
+
+    #[test]
+    fn shorten_path_nested_under_sibling() {
+        // Worktree created by Claude agent under a sibling worktree.
+        // Strips the sibling dir (.quick-wins) and adds extra indent.
+        // padding = len("/dev/") = 5, +2 extra = 7
+        let root = Path::new("/dev/flotilla");
+        let wt = Path::new("/dev/flotilla.quick-wins/.claude/worktrees/agent-abc");
+        assert_eq!(
+            shorten_path(wt, root, 60),
+            "       .claude/worktrees/agent-abc"
+        );
     }
 
     #[test]
