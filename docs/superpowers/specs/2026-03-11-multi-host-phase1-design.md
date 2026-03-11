@@ -85,13 +85,26 @@ Matching fallbacks:
 - **Multiple remotes**: Use the first remote (existing `first_remote_url()` behavior).
 - **Unrecognized URL format**: Fall back to exact URL comparison instead of slug extraction.
 
-For TUI snapshot keying (which uses `PathBuf` as repo identity): if the local host has the repo, use the local path. If the repo exists only on remote hosts, use a synthetic path like `<remote>/<host>/<remote-path>` — the TUI treats this as an opaque key, so the exact format matters only for display.
+For TUI snapshot keying (which uses `PathBuf` as repo identity): if the local host has the repo, use the local path. If the repo exists only on remote hosts, use a synthetic path like `<remote>/<host>/<remote-path>`.
 
-### Host-Namespaced Correlation Keys
+The synthetic path is not just cosmetic — the TUI uses `PathBuf` repo keys for tab labels, tab ordering persistence (`tab-order.json`), and `RepoUiState` identity. The format must be stable across restarts so saved tab order is preserved. The daemon also needs to handle these virtual repos in `InProcessDaemon`/`RepoState` without assuming they correspond to local filesystem paths.
 
-`CorrelationKey::CheckoutPath(PathBuf)` would collide when two hosts share the same filesystem path (e.g. both have `/Users/robert/dev/flotilla`). To prevent false correlations, checkout paths and workspace paths from remote hosts are prefixed with the host name before entering the correlation engine — e.g. `desktop:/Users/robert/dev/flotilla`.
+### Host-Namespaced Identity
+
+The collision problem goes deeper than correlation keys. `ProviderData` uses `PathBuf` as the key for `checkouts` and `managed_terminals`. `WorkItemIdentity::Checkout(PathBuf)` is how the TUI identifies rows for selection and scrolling. If two hosts report the same path, these structures break.
+
+**Solution**: When the daemon merges remote `ProviderData` into its local state, all path-based keys from remote hosts are prefixed with the host name: `desktop:/Users/robert/dev/flotilla`. This namespacing applies to:
+
+- `ProviderData.checkouts` keys (PathBuf)
+- `ProviderData.managed_terminals` keys (PathBuf)
+- `CorrelationKey::CheckoutPath` values
+- `WorkItemIdentity::Checkout` values
+
+This ensures no collisions in any data structure. The prefixed paths are opaque identifiers — the TUI does not parse them.
 
 Branch-based correlation (`CorrelationKey::Branch`) is intentionally *not* namespaced — a branch name on host A should correlate with the same branch name and its associated PR from host B. This is the primary mechanism for cross-host correlation.
+
+Note: the `is_singleton_kind` rule in the correlation engine prevents two `Checkout` items from merging into the same group. This means the same branch checked out on two hosts produces two separate rows — which is correct, as they represent separate work environments.
 
 ### HostName
 
@@ -127,9 +140,9 @@ File: `~/.config/flotilla/daemon.toml` on the remote host
 follower = true
 ```
 
-When `follower = true`, the daemon disables all external polling (GitHub PRs/issues, cloud agent services). It reports only local state: git worktrees, branches, and terminal sessions.
+When `follower = true`, the daemon skips registration of external-polling providers (GitHub PRs/issues, cloud agent services) during provider discovery. Only local providers are initialized: VCS (git), CheckoutManager (worktrees), WorkspaceManager (shpool). The `follower` flag is threaded through provider discovery and registry initialization.
 
-The follower still receives the full dataset from the leader via relay, so it can serve a local TUI with the complete picture.
+The follower still receives the full dataset from the leader via relay, so it can serve a local TUI with the complete picture. Service-level data (PRs, issues) arrives via `PeerData` messages, not local polling.
 
 ## SSH Transport
 
@@ -175,9 +188,11 @@ The SSH implementation is the first implementor. The trait exists so future tran
 The existing protocol is asymmetric: clients send `Message::Request`, servers push `Message::Event`. For peer communication, we add a new variant:
 
 ```rust
+// Schematic — actual field names follow the existing Message enum shape.
+// The key change is adding one new variant to the existing enum.
 enum Message {
-    Request { id: u64, command: ProtoCommand },
-    Response { id: u64, result: CommandResult },
+    Request { .. },
+    Response { .. },
     Event(DaemonEvent),
     PeerData(PeerDataMessage),  // NEW
 }
@@ -203,12 +218,17 @@ struct PeerDataMessage {
     repo_path: PathBuf,            // filesystem path on origin host
     kind: PeerDataKind,
 }
+```
 
+```rust
 enum PeerDataKind {
     Snapshot { data: ProviderData, seq: u64 },
     Delta { changes: ProviderDataDelta, seq: u64, prev_seq: u64 },
-    GapRecovery { since_seq: u64 },
+    RequestResync { since_seq: u64 },
 }
+```
+
+When a peer detects a sequence gap, it sends `RequestResync` with the last known sequence. The responder replies with a full `Snapshot` for that (origin_host, repo_slug) pair — the same strategy the TUI-daemon gap recovery uses. Delta streams resume from the new snapshot's sequence.
 ```
 
 Each message carries an `origin_host` tag so the receiver knows the data source and the relay logic can avoid reflecting data back to its origin. Sequence numbers are per-(origin_host, repo_slug).
@@ -233,12 +253,26 @@ Leader receives ProviderData from "cloud"
 
 The leader also sends its own local data to all followers.
 
-Each daemon maintains:
+Each daemon maintains peer state keyed by both host and repo:
+
 ```rust
-peer_data: HashMap<HostName, ProviderData>
+peer_data: HashMap<HostName, HashMap<RepoSlug, PerRepoPeerState>>
+
+struct PerRepoPeerState {
+    provider_data: ProviderData,
+    repo_path: PathBuf,  // filesystem path on the origin host
+    seq: u64,
+}
 ```
 
-When any entry changes, the daemon re-merges and re-correlates.
+A single host may report multiple repos — keying only by `HostName` would collapse them. When any entry changes, the daemon re-merges and re-correlates.
+
+### Merging Strategy
+
+For a given logical repo, the daemon merges `ProviderData` from all hosts:
+
+- **Host-scoped data** (checkouts, managed terminals): combined from all hosts with path namespacing. No conflicts possible since keys are host-prefixed.
+- **Service-level data** (PRs, issues, cloud agents): the leader is the single source of truth. Followers do not poll these, so there are no duplicates to reconcile. The leader's local `ProviderData` contains the canonical service-level data; peer data from followers contains only host-scoped items.
 
 ## TUI Changes
 
@@ -266,7 +300,7 @@ Each `WorkItem` (and `ProtoWorkItem`) carries an explicit `host: Option<HostName
 The action menu and executor use `host` to filter actions:
 - **Local items** (`host: None`): all actions available as today.
 - **Remote items** (`host: Some(_)`): actions requiring local filesystem access (open terminal, delete worktree, create checkout) are hidden. Actions that work without a local clone (open PR in browser, copy branch name) remain available.
-- **Remote-only repos**: For repos that exist only on remote hosts, `gh`-based browser actions may not work since there is no local clone. This is a known Phase 1 limitation; future work may proxy commands to a remote checkout or call the GitHub API directly.
+- **Remote-only repos**: For repos that exist only on remote hosts, `gh`-based browser actions are hidden since there is no local clone to provide context. Future work will either proxy commands to a remote checkout or call the GitHub API directly.
 
 ### No Other Changes
 
