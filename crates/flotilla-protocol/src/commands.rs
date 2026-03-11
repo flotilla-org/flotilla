@@ -120,6 +120,8 @@ pub struct CheckoutStatus {
     pub merge_commit_sha: Option<String>,
     pub unpushed_commits: Vec<String>,
     pub has_uncommitted: bool,
+    #[serde(default)]
+    pub uncommitted_files: Vec<String>,
     pub base_detection_warning: Option<String>,
 }
 
@@ -223,6 +225,7 @@ mod tests {
                 merge_commit_sha: Some("abc123".into()),
                 unpushed_commits: vec!["def456".into()],
                 has_uncommitted: true,
+                uncommitted_files: vec!["M  src/main.rs".into(), "?? TODO.txt".into()],
                 base_detection_warning: Some("warning text".into()),
             }),
             CommandResult::Error {
@@ -253,6 +256,7 @@ mod tests {
         assert!(info.merge_commit_sha.is_none());
         assert!(info.unpushed_commits.is_empty());
         assert!(!info.has_uncommitted);
+        assert!(info.uncommitted_files.is_empty());
         assert!(info.base_detection_warning.is_none());
     }
 
@@ -264,6 +268,7 @@ mod tests {
             merge_commit_sha: Some("deadbeef".into()),
             unpushed_commits: vec!["aaa".into(), "bbb".into()],
             has_uncommitted: true,
+            uncommitted_files: vec!["M  src/lib.rs".into()],
             base_detection_warning: Some("ambiguous base".into()),
         };
         assert_json_roundtrip(&info);

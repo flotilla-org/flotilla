@@ -1,0 +1,55 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 312
+expression: output
+---
+ ⚓  flotilla  | my-project | [+]
+┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
+│      Path     Description     Branch   WT  WS  PR   SS   Issues Git  ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                       ┌ Remove Worktree ─────────────────────────────────────────────────────┐                       │
+│                       │Branch: feat-big-wip                                                  │                       │
+│                       │                                                                      │                       │
+│                       │No PR found                                                           │                       │
+│                       │                                                                      │                       │
+│                       │⚠ 15 uncommitted file(s):                                             │                       │
+│                       │M src/file_0.rs                                                       │                       │
+│                       │M src/file_1.rs                                                       │                       │
+│                       │M src/file_2.rs                                                       │                       │
+│                       │M src/file_3.rs                                                       │                       │
+│                       │M src/file_4.rs                                                       │                       │
+│                       │M src/file_5.rs                                                       │                       │
+│                       │M src/file_6.rs                                                       │                       │
+│                       │M src/file_7.rs                                                       │                       │
+│                       │M src/file_8.rs                                                       │                       │
+│                       │M src/file_9.rs                                                       │                       │
+│                       │...and 5 more                                                         │                       │
+│                       │                                                                      │                       │
+│                       │y/Enter: confirm    n/Esc: cancel                                     │                       │
+│                       │                                                                      │                       │
+│                       │                                                                      │                       │
+│                       │                                                                      │                       │
+│                       │                                                                      │                       │
+│                       │                                                                      │                       │
+│                       └──────────────────────────────────────────────────────────────────────┘                       │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+ y/enter:confirm  n/esc:cancel

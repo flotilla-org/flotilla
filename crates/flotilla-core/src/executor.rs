@@ -1319,6 +1319,40 @@ mod tests {
         assert_checkout_status_branch(result, "feat");
     }
 
+    #[tokio::test]
+    async fn fetch_checkout_status_populates_uncommitted_files() {
+        let registry = empty_registry();
+        let runner = MockRunner::new(vec![
+            Err("err".to_string()),
+            Err("err".to_string()),
+            Ok(" M src/main.rs\n?? TODO.txt\n".to_string()),
+            Err("err".to_string()),
+        ]);
+
+        let result = run_execute(
+            Command::FetchCheckoutStatus {
+                branch: "feat".to_string(),
+                checkout_path: Some(PathBuf::from("/repo/wt")),
+                change_request_id: None,
+            },
+            &registry,
+            &empty_data(),
+            &runner,
+        )
+        .await;
+
+        match result {
+            CommandResult::CheckoutStatus(info) => {
+                assert!(info.has_uncommitted);
+                assert_eq!(
+                    info.uncommitted_files,
+                    vec![" M src/main.rs".to_string(), "?? TODO.txt".to_string(),]
+                );
+            }
+            other => panic!("expected CheckoutStatus, got {other:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Tests: OpenChangeRequest
     // -----------------------------------------------------------------------

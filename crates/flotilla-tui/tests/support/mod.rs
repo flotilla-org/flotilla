@@ -25,6 +25,8 @@ pub struct TestHarness {
     pub model: TuiModel,
     pub ui: UiState,
     pub in_flight: HashMap<u64, InFlightCommand>,
+    width: u16,
+    height: u16,
 }
 
 impl TestHarness {
@@ -37,6 +39,8 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
+            width: WIDTH,
+            height: HEIGHT,
         }
     }
 
@@ -49,6 +53,8 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
+            width: WIDTH,
+            height: HEIGHT,
         }
     }
 
@@ -61,7 +67,15 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
+            width: WIDTH,
+            height: HEIGHT,
         }
+    }
+
+    /// Override the terminal height for this test.
+    pub fn with_height(mut self, height: u16) -> Self {
+        self.height = height;
+        self
     }
 
     /// Set the UI mode.
@@ -125,7 +139,7 @@ impl TestHarness {
 
     /// Render the UI into a string via TestBackend.
     pub fn render_to_string(&mut self) -> String {
-        let backend = TestBackend::new(WIDTH, HEIGHT);
+        let backend = TestBackend::new(self.width, self.height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {

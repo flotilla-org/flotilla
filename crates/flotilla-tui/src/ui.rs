@@ -764,14 +764,18 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
 
     let mut lines: Vec<Line> = Vec::new();
 
+    // Wrap { trim: true } strips leading whitespace, so don't add prefix spaces.
+    const MAX_FILES: usize = 10;
+    const MAX_COMMITS: usize = 5;
+
     if loading {
         lines.push(Line::from(Span::styled(
-            "  Loading safety info...",
+            "Loading safety info...",
             Style::default().fg(Color::Yellow),
         )));
     } else if let Some(info) = info {
         lines.push(Line::from(vec![
-            Span::raw("  Branch: "),
+            Span::raw("Branch: "),
             Span::styled(&info.branch, Style::default().bold()),
         ]));
         lines.push(Line::from(""));
@@ -784,15 +788,15 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
                 _ => (pr_status.as_str(), Color::White),
             };
             lines.push(Line::from(vec![
-                Span::raw(format!("  {}: ", model.active_labels().code_review.abbr)),
+                Span::raw(format!("{}: ", model.active_labels().code_review.abbr)),
                 Span::styled(status_text, Style::default().fg(color).bold()),
             ]));
             if let Some(sha) = &info.merge_commit_sha {
-                lines.push(Line::from(format!("  Merge commit: {}", sha)));
+                lines.push(Line::from(format!("Merge commit: {}", sha)));
             }
         } else {
             lines.push(Line::from(Span::styled(
-                format!("  No {} found", model.active_labels().code_review.abbr),
+                format!("No {} found", model.active_labels().code_review.abbr),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -800,24 +804,43 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         lines.push(Line::from(""));
 
         if info.has_uncommitted {
-            lines.push(Line::from(Span::styled(
-                "  ⚠ Has uncommitted changes",
-                Style::default().fg(Color::Red).bold(),
-            )));
+            if info.uncommitted_files.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "⚠ Has uncommitted changes",
+                    Style::default().fg(Color::Red).bold(),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("⚠ {} uncommitted file(s):", info.uncommitted_files.len()),
+                    Style::default().fg(Color::Red).bold(),
+                )));
+                for file_line in info.uncommitted_files.iter().take(MAX_FILES) {
+                    lines.push(Line::from(Span::styled(
+                        file_line.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                if info.uncommitted_files.len() > MAX_FILES {
+                    lines.push(Line::from(Span::styled(
+                        format!("...and {} more", info.uncommitted_files.len() - MAX_FILES),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
         }
 
         if let Some(warning) = &info.base_detection_warning {
             lines.push(Line::from(Span::styled(
-                format!("  ⚠ {}", warning),
+                format!("⚠ {}", warning),
                 Style::default().fg(Color::Yellow),
             )));
         } else if !info.unpushed_commits.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!("  ⚠ {} unpushed commit(s):", info.unpushed_commits.len()),
+                format!("⚠ {} unpushed commit(s):", info.unpushed_commits.len()),
                 Style::default().fg(Color::Red).bold(),
             )));
-            for commit in info.unpushed_commits.iter().take(5) {
-                lines.push(Line::from(format!("    {}", commit)));
+            for commit in info.unpushed_commits.iter().take(MAX_COMMITS) {
+                lines.push(Line::from(commit.to_string()));
             }
         }
 
@@ -828,14 +851,14 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  ✓ Safe to delete",
+                "✓ Safe to delete",
                 Style::default().fg(Color::Green).bold(),
             )));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  y/Enter: confirm    n/Esc: cancel",
+            "y/Enter: confirm    n/Esc: cancel",
             Style::default().fg(Color::DarkGray),
         )));
     }

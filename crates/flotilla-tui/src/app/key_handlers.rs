@@ -494,6 +494,7 @@ mod tests {
                 merge_commit_sha: None,
                 unpushed_commits: vec![],
                 has_uncommitted: false,
+                uncommitted_files: vec![],
                 base_detection_warning: None,
             }),
             loading: false,

@@ -717,7 +717,12 @@ pub async fn fetch_checkout_status(
         }
     }
 
-    info.has_uncommitted = !uncommitted.trim().is_empty();
+    info.uncommitted_files = uncommitted
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    info.has_uncommitted = !info.uncommitted_files.is_empty();
 
     if let Some(pr_json) = pr_info {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pr_json) {

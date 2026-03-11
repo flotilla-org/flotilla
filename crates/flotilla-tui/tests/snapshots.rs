@@ -262,10 +262,54 @@ fn delete_confirm_safe_to_delete() {
             merge_commit_sha: Some("abc1234".into()),
             unpushed_commits: vec![],
             has_uncommitted: false,
+            uncommitted_files: vec![],
             base_detection_warning: None,
         }),
         loading: false,
     });
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn delete_confirm_with_uncommitted_files() {
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::DeleteConfirm {
+        info: Some(flotilla_protocol::CheckoutStatus {
+            branch: "feat-wip".into(),
+            change_request_status: Some("OPEN".into()),
+            merge_commit_sha: None,
+            unpushed_commits: vec!["abc1234 work in progress".into()],
+            has_uncommitted: true,
+            uncommitted_files: vec![
+                " M src/main.rs".into(),
+                " M src/lib.rs".into(),
+                "?? TODO.txt".into(),
+            ],
+            base_detection_warning: None,
+        }),
+        loading: false,
+    });
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn delete_confirm_with_many_uncommitted_files() {
+    let files: Vec<String> = (0..15).map(|i| format!(" M src/file_{}.rs", i)).collect();
+    let mut harness = TestHarness::single_repo("my-project")
+        .with_height(50)
+        .with_mode(UiMode::DeleteConfirm {
+            info: Some(flotilla_protocol::CheckoutStatus {
+                branch: "feat-big-wip".into(),
+                change_request_status: None,
+                merge_commit_sha: None,
+                unpushed_commits: vec![],
+                has_uncommitted: true,
+                uncommitted_files: files,
+                base_detection_warning: None,
+            }),
+            loading: false,
+        });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
