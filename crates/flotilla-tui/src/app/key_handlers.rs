@@ -7,7 +7,7 @@ use tui_input::Input;
 use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, WorkItem};
 
-use super::{App, Intent, UiMode};
+use super::{App, BranchInputKind, ClearDispatch, Intent, UiMode};
 
 impl App {
     // ── Key handling ──
@@ -85,9 +85,7 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
                 if self.active_ui().active_search_query.is_some() {
-                    let repo = self.model.active_repo_root().clone();
-                    self.proto_commands.push(Command::ClearIssueSearch { repo });
-                    self.active_ui_mut().active_search_query = None;
+                    self.clear_active_issue_search(ClearDispatch::OnlyIfActive);
                 } else if self.active_ui().show_providers {
                     self.active_ui_mut().show_providers = false;
                 } else if !self.active_ui().multi_selected.is_empty() {
@@ -102,13 +100,7 @@ impl App {
             KeyCode::Char(' ') => self.toggle_multi_select(),
             KeyCode::Char('.') => self.open_action_menu(),
             KeyCode::Enter => self.action_enter(),
-            KeyCode::Char('n') => {
-                self.ui.mode = UiMode::BranchInput {
-                    input: Input::default(),
-                    generating: false,
-                    pending_issue_ids: Vec::new(),
-                };
-            }
+            KeyCode::Char('n') => self.enter_branch_input(BranchInputKind::Manual),
             KeyCode::Char('d') => self.dispatch_if_available(Intent::RemoveCheckout),
             KeyCode::Char('D') => self.ui.show_debug = !self.ui.show_debug,
             KeyCode::Char('p') => self.dispatch_if_available(Intent::OpenChangeRequest),
@@ -133,19 +125,7 @@ impl App {
                 let sp = self.active_ui().show_providers;
                 self.active_ui_mut().show_providers = !sp;
             }
-            KeyCode::Char('a') => {
-                let mut input = Input::default();
-                if let Some(parent) = self.model.active_repo_root().parent() {
-                    let parent_str = format!("{}/", parent.display());
-                    input = Input::from(parent_str.as_str());
-                }
-                self.ui.mode = UiMode::FilePicker {
-                    input,
-                    dir_entries: Vec::new(),
-                    selected: 0,
-                };
-                self.refresh_dir_listing();
-            }
+            KeyCode::Char('a') => self.open_file_picker_from_active_repo_parent(),
             _ => {}
         }
     }
@@ -290,11 +270,7 @@ impl App {
         all_issue_keys.sort();
         all_issue_keys.dedup();
         if !all_issue_keys.is_empty() {
-            self.ui.mode = UiMode::BranchInput {
-                input: Input::default(),
-                generating: true,
-                pending_issue_ids: Vec::new(),
-            };
+            self.enter_branch_input(BranchInputKind::Generating);
             self.proto_commands.push(Command::GenerateBranchName {
                 issue_keys: all_issue_keys,
             });
@@ -321,11 +297,7 @@ impl App {
                     };
                 }
                 Intent::GenerateBranchName => {
-                    self.ui.mode = UiMode::BranchInput {
-                        input: Input::default(),
-                        generating: true,
-                        pending_issue_ids: Vec::new(),
-                    };
+                    self.enter_branch_input(BranchInputKind::Generating);
                 }
                 _ => {}
             }
@@ -390,7 +362,7 @@ impl App {
         if matches!(
             self.ui.mode,
             UiMode::BranchInput {
-                generating: true,
+                kind: BranchInputKind::Generating,
                 ..
             }
         ) {
@@ -430,9 +402,7 @@ impl App {
     fn handle_issue_search_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                let repo = self.model.active_repo_root().clone();
-                self.proto_commands.push(Command::ClearIssueSearch { repo });
-                self.active_ui_mut().active_search_query = None;
+                self.clear_active_issue_search(ClearDispatch::Always);
                 self.ui.mode = UiMode::Normal;
             }
             KeyCode::Enter => {
@@ -704,7 +674,7 @@ mod tests {
         assert!(matches!(
             app.ui.mode,
             UiMode::BranchInput {
-                generating: false,
+                kind: BranchInputKind::Manual,
                 ..
             }
         ));
@@ -850,7 +820,7 @@ mod tests {
         let mut app = stub_app();
         app.ui.mode = UiMode::BranchInput {
             input: Input::from("my-branch"),
-            generating: false,
+            kind: BranchInputKind::Manual,
             pending_issue_ids: vec![],
         };
         app.handle_key(key(KeyCode::Esc));
@@ -862,7 +832,7 @@ mod tests {
         let mut app = stub_app();
         app.ui.mode = UiMode::BranchInput {
             input: Input::from("my-branch"),
-            generating: false,
+            kind: BranchInputKind::Manual,
             pending_issue_ids: vec![],
         };
         app.handle_key(key(KeyCode::Enter));
@@ -887,7 +857,7 @@ mod tests {
         let mut app = stub_app();
         app.ui.mode = UiMode::BranchInput {
             input: Input::from("feat/issue-42"),
-            generating: false,
+            kind: BranchInputKind::Manual,
             pending_issue_ids: vec![("github".into(), "42".into())],
         };
         app.handle_key(key(KeyCode::Enter));
@@ -905,7 +875,7 @@ mod tests {
         let mut app = stub_app();
         app.ui.mode = UiMode::BranchInput {
             input: Input::default(),
-            generating: false,
+            kind: BranchInputKind::Manual,
             pending_issue_ids: vec![],
         };
         app.handle_key(key(KeyCode::Enter));
@@ -918,7 +888,7 @@ mod tests {
         let mut app = stub_app();
         app.ui.mode = UiMode::BranchInput {
             input: Input::from("partial"),
-            generating: true,
+            kind: BranchInputKind::Generating,
             pending_issue_ids: vec![],
         };
         // Enter should be ignored
@@ -926,7 +896,7 @@ mod tests {
         assert!(matches!(
             app.ui.mode,
             UiMode::BranchInput {
-                generating: true,
+                kind: BranchInputKind::Generating,
                 ..
             }
         ));
@@ -937,7 +907,7 @@ mod tests {
         assert!(matches!(
             app.ui.mode,
             UiMode::BranchInput {
-                generating: true,
+                kind: BranchInputKind::Generating,
                 ..
             }
         ));
@@ -1191,7 +1161,7 @@ mod tests {
         assert!(matches!(
             app.ui.mode,
             UiMode::BranchInput {
-                generating: true,
+                kind: BranchInputKind::Generating,
                 ..
             }
         ));
@@ -1307,7 +1277,7 @@ mod tests {
         assert!(matches!(
             app.ui.mode,
             UiMode::BranchInput {
-                generating: true,
+                kind: BranchInputKind::Generating,
                 ..
             }
         ));

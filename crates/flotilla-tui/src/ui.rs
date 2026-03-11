@@ -14,7 +14,9 @@ use unicode_width::UnicodeWidthStr;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::app::{InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState};
+use crate::app::{
+    BranchInputKind, InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState,
+};
 use crate::event_log::{self, LevelExt};
 use crate::ui_helpers;
 use flotilla_core::data::{GroupEntry, SectionHeader};
@@ -22,6 +24,16 @@ use flotilla_protocol::{ProviderData, WorkItem};
 
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
+const PROVIDER_CATEGORIES: [(&str, &str); 8] = [
+    ("VCS", "vcs"),
+    ("Checkout mgr", "checkout_manager"),
+    ("Code review", "code_review"),
+    ("Issue tracker", "issue_tracker"),
+    ("Cloud agents", "cloud_agent"),
+    ("AI utility", "ai_utility"),
+    ("Workspace mgr", "workspace_manager"),
+    ("Terminal pool", "terminal_pool"),
+];
 
 pub fn render(
     model: &TuiModel,
@@ -114,6 +126,66 @@ fn active_rui<'a>(model: &TuiModel, ui: &'a UiState) -> &'a crate::app::RepoUiSt
     ui.active_repo_ui(&model.repo_order, model.active_repo)
 }
 
+fn provider_status_badge(status: Option<ProviderStatus>) -> (&'static str, Color) {
+    match status {
+        Some(ProviderStatus::Ok) => ("✓", Color::Green),
+        Some(ProviderStatus::Error) => ("✗", Color::Red),
+        None => ("", Color::White),
+    }
+}
+
+fn provider_row(label: &str, provider: &str, status: Option<ProviderStatus>) -> Row<'static> {
+    let (status_text, status_color) = provider_status_badge(status);
+    Row::new(vec![
+        Cell::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Cell::from(Span::styled(
+            provider.to_string(),
+            Style::default().fg(Color::White),
+        )),
+        Cell::from(Span::styled(status_text, Style::default().fg(status_color))),
+    ])
+}
+
+fn provider_empty_row(category: &str) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(Span::styled(
+            category.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
+        Cell::from(""),
+    ])
+}
+
+fn provider_table_header() -> Row<'static> {
+    Row::new(vec![
+        Cell::from(Span::styled(
+            "Role",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+        Cell::from(Span::styled(
+            "Provider",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+        Cell::from(Span::styled(
+            "Status",
+            Style::default().fg(Color::DarkGray).bold(),
+        )),
+    ])
+    .height(1)
+}
+
+fn provider_table_widths() -> [Constraint; 3] {
+    [
+        Constraint::Length(16),
+        Constraint::Length(24),
+        Constraint::Length(6),
+    ]
+}
+
 fn selected_work_item<'a>(model: &TuiModel, ui: &'a UiState) -> Option<&'a WorkItem> {
     let rui = active_rui(model, ui);
     let table_idx = rui.table_state.selected()?;
@@ -161,10 +233,12 @@ fn render_status_bar(
     let text: String = match &ui.mode {
         UiMode::Config => " j/k:scroll log  [/]:switch tab  ?:help  q:quit".into(),
         UiMode::BranchInput {
-            generating: true, ..
+            kind: BranchInputKind::Generating,
+            ..
         } => " Generating branch name...".into(),
         UiMode::BranchInput {
-            generating: false, ..
+            kind: BranchInputKind::Manual,
+            ..
         } => " type branch name  enter:create  esc:cancel".into(),
         UiMode::ActionMenu { .. } => " j/k:navigate  enter:select  esc:close".into(),
         UiMode::IssueSearch { ref input } => {
@@ -222,20 +296,9 @@ fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, are
     let path = &model.repo_order[model.active_repo];
     let rm = &model.repos[path];
 
-    let categories = [
-        ("VCS", "vcs"),
-        ("Checkout mgr", "checkout_manager"),
-        ("Code review", "code_review"),
-        ("Issue tracker", "issue_tracker"),
-        ("Cloud agents", "cloud_agent"),
-        ("AI utility", "ai_utility"),
-        ("Workspace mgr", "workspace_manager"),
-        ("Terminal pool", "terminal_pool"),
-    ];
-
     let mut rows: Vec<Row> = Vec::new();
 
-    for &(category, key) in &categories {
+    for &(category, key) in &PROVIDER_CATEGORIES {
         if let Some(pnames) = rm.provider_names.get(key) {
             for (i, pname) in pnames.iter().enumerate() {
                 let label = if i == 0 { category } else { "" };
@@ -243,50 +306,15 @@ fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, are
                     .provider_statuses
                     .get(&(path.clone(), key.to_string(), pname.clone()))
                     .copied();
-                let (status_text, status_color) = match status {
-                    Some(ProviderStatus::Ok) => ("✓", Color::Green),
-                    Some(ProviderStatus::Error) => ("✗", Color::Red),
-                    None => ("", Color::White),
-                };
-                rows.push(Row::new(vec![
-                    Cell::from(Span::styled(label, Style::default().fg(Color::DarkGray))),
-                    Cell::from(Span::styled(pname, Style::default().fg(Color::White))),
-                    Cell::from(Span::styled(status_text, Style::default().fg(status_color))),
-                ]));
+                rows.push(provider_row(label, pname, status));
             }
         } else {
-            rows.push(Row::new(vec![
-                Cell::from(Span::styled(category, Style::default().fg(Color::DarkGray))),
-                Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
-                Cell::from(""),
-            ]));
+            rows.push(provider_empty_row(category));
         }
     }
 
-    let header = Row::new(vec![
-        Cell::from(Span::styled(
-            "Role",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-        Cell::from(Span::styled(
-            "Provider",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-        Cell::from(Span::styled(
-            "Status",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-    ])
-    .height(1);
-
-    let widths = [
-        Constraint::Length(16),
-        Constraint::Length(24),
-        Constraint::Length(6),
-    ];
-
-    let table = Table::new(rows, widths)
-        .header(header)
+    let table = Table::new(rows, provider_table_widths())
+        .header(provider_table_header())
         .block(Block::bordered().title_top(Line::from(" ✕ ").right_aligned()));
     frame.render_widget(table, area);
 }
@@ -695,7 +723,7 @@ fn render_action_menu(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
 fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     let UiMode::BranchInput {
         ref input,
-        generating,
+        ref kind,
         ..
     } = ui.mode
     else {
@@ -709,7 +737,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     let inner_area = inner.inner(area);
     frame.render_widget(inner, area);
 
-    if generating {
+    if *kind == BranchInputKind::Generating {
         let paragraph =
             Paragraph::new("  Generating branch name...").style(Style::default().fg(Color::Yellow));
         frame.render_widget(paragraph, inner_area);
@@ -1000,17 +1028,6 @@ fn worse_status(a: Option<ProviderStatus>, b: Option<ProviderStatus>) -> Option<
 
 fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
     // Collect providers across all repos: (category_key, provider_name) → status.
-    let categories = [
-        ("VCS", "vcs"),
-        ("Checkout mgr", "checkout_manager"),
-        ("Code review", "code_review"),
-        ("Issue tracker", "issue_tracker"),
-        ("Cloud agents", "cloud_agent"),
-        ("AI utility", "ai_utility"),
-        ("Workspace mgr", "workspace_manager"),
-        ("Terminal pool", "terminal_pool"),
-    ];
-
     // Collect unique (category, provider_name) pairs with worst-wins status.
     // If a provider is healthy in repo A but failing in repo B, the global
     // view should surface the failure (Error > Ok > None).
@@ -1022,7 +1039,7 @@ fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
 
     for path in &model.repo_order {
         let rm = &model.repos[path];
-        for &(_, key) in &categories {
+        for &(_, key) in &PROVIDER_CATEGORIES {
             if let Some(pnames) = rm.provider_names.get(key) {
                 let entries = by_category.entry(key).or_default();
                 for pname in pnames {
@@ -1046,58 +1063,20 @@ fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
 
     let mut rows: Vec<Row> = Vec::new();
 
-    for &(category, key) in &categories {
+    for &(category, key) in &PROVIDER_CATEGORIES {
         let entries = by_category.get(key);
         if let Some(providers) = entries {
             for (i, provider) in providers.iter().enumerate() {
                 let label = if i == 0 { category } else { "" };
-                let (status_text, status_color) = match provider.status {
-                    Some(ProviderStatus::Ok) => ("✓", Color::Green),
-                    Some(ProviderStatus::Error) => ("✗", Color::Red),
-                    None => ("", Color::White),
-                };
-                rows.push(Row::new(vec![
-                    Cell::from(Span::styled(label, Style::default().fg(Color::DarkGray))),
-                    Cell::from(Span::styled(
-                        &provider.name,
-                        Style::default().fg(Color::White),
-                    )),
-                    Cell::from(Span::styled(status_text, Style::default().fg(status_color))),
-                ]));
+                rows.push(provider_row(label, &provider.name, provider.status));
             }
         } else {
-            rows.push(Row::new(vec![
-                Cell::from(Span::styled(category, Style::default().fg(Color::DarkGray))),
-                Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
-                Cell::from(""),
-            ]));
+            rows.push(provider_empty_row(category));
         }
     }
 
-    let header = Row::new(vec![
-        Cell::from(Span::styled(
-            "Role",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-        Cell::from(Span::styled(
-            "Provider",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-        Cell::from(Span::styled(
-            "Status",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-    ])
-    .height(1);
-
-    let widths = [
-        Constraint::Length(16),
-        Constraint::Length(24),
-        Constraint::Length(6),
-    ];
-
-    let table = Table::new(rows, widths)
-        .header(header)
+    let table = Table::new(rows, provider_table_widths())
+        .header(provider_table_header())
         .block(Block::bordered().title(" Providers "));
     frame.render_widget(table, area);
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,6 +104,52 @@ impl Drop for RepoRefreshHandle {
     }
 }
 
+/// Collect results from parallel provider requests, separating successes from errors.
+async fn collect_named_results<T, Fut>(
+    requests: Vec<(String, Fut)>,
+) -> (Vec<T>, Vec<(String, String)>)
+where
+    Fut: Future<Output = Result<Vec<T>, String>>,
+{
+    let results = futures::future::join_all(
+        requests
+            .into_iter()
+            .map(|(name, fut)| async move { (name, fut.await) }),
+    )
+    .await;
+
+    let mut entries = Vec::new();
+    let mut errs = Vec::new();
+    for (name, result) in results {
+        match result {
+            Ok(mut items) => entries.append(&mut items),
+            Err(e) => errs.push((name, e)),
+        }
+    }
+    (entries, errs)
+}
+
+fn provider_has_error(errors: &[RefreshError], provider: &str, categories: &[&str]) -> bool {
+    errors
+        .iter()
+        .any(|e| categories.contains(&e.category) && e.provider == provider)
+}
+
+fn insert_category_health<I>(
+    health: &mut HashMap<(&'static str, String), bool>,
+    errors: &[RefreshError],
+    health_category: &'static str,
+    provider_names: I,
+    error_categories: &[&str],
+) where
+    I: IntoIterator<Item = String>,
+{
+    for name in provider_names {
+        let has_error = provider_has_error(errors, &name, error_categories);
+        health.insert((health_category, name), !has_error);
+    }
+}
+
 /// Fetch all provider data into the given ProviderData struct.
 async fn refresh_providers(
     pd: &mut ProviderData,
@@ -112,90 +159,60 @@ async fn refresh_providers(
 ) -> Vec<RefreshError> {
     let mut errors = Vec::new();
 
-    let checkouts_fut = async {
-        let results = futures::future::join_all(registry.checkout_managers.values().map(|cm| {
-            let name = cm.display_name().to_string();
-            async move { (name, cm.list_checkouts(repo_root).await) }
-        }))
-        .await;
-        let mut checkouts = Vec::new();
-        let mut errs = Vec::new();
-        for (name, result) in results {
-            match result {
-                Ok(mut entries) => checkouts.append(&mut entries),
-                Err(e) => errs.push((name, e)),
-            }
-        }
-        (checkouts, errs)
-    };
+    let checkouts_fut = collect_named_results(
+        registry
+            .checkout_managers
+            .values()
+            .map(|cm| (cm.display_name().to_string(), cm.list_checkouts(repo_root)))
+            .collect(),
+    );
 
-    let cr_fut = async {
-        let results = futures::future::join_all(registry.code_review.values().map(|cr| {
-            let name = cr.display_name().to_string();
-            async move { (name, cr.list_change_requests(repo_root, 20).await) }
-        }))
-        .await;
-        let mut crs = Vec::new();
-        let mut errs = Vec::new();
-        for (name, result) in results {
-            match result {
-                Ok(mut entries) => crs.append(&mut entries),
-                Err(e) => errs.push((name, e)),
-            }
-        }
-        (crs, errs)
-    };
+    let cr_fut = collect_named_results(
+        registry
+            .code_review
+            .values()
+            .map(|cr| {
+                (
+                    cr.display_name().to_string(),
+                    cr.list_change_requests(repo_root, 20),
+                )
+            })
+            .collect(),
+    );
 
-    let sessions_fut = async {
-        let results = futures::future::join_all(registry.cloud_agents.values().map(|ca| {
-            let name = ca.display_name().to_string();
-            async move { (name, ca.list_sessions(criteria).await) }
-        }))
-        .await;
-        let mut sessions = Vec::new();
-        let mut errs = Vec::new();
-        for (name, result) in results {
-            match result {
-                Ok(mut entries) => sessions.append(&mut entries),
-                Err(e) => errs.push((name, e)),
-            }
-        }
-        (sessions, errs)
-    };
+    let sessions_fut = collect_named_results(
+        registry
+            .cloud_agents
+            .values()
+            .map(|ca| (ca.display_name().to_string(), ca.list_sessions(criteria)))
+            .collect(),
+    );
 
-    let branches_fut = async {
-        let results = futures::future::join_all(registry.vcs.values().map(|vcs| {
-            let name = vcs.display_name().to_string();
-            async move { (name, vcs.list_remote_branches(repo_root).await) }
-        }))
-        .await;
-        let mut branches = Vec::new();
-        let mut errs = Vec::new();
-        for (name, result) in results {
-            match result {
-                Ok(mut entries) => branches.append(&mut entries),
-                Err(e) => errs.push((name, e)),
-            }
-        }
-        (branches, errs)
-    };
+    let branches_fut = collect_named_results(
+        registry
+            .vcs
+            .values()
+            .map(|vcs| {
+                (
+                    vcs.display_name().to_string(),
+                    vcs.list_remote_branches(repo_root),
+                )
+            })
+            .collect(),
+    );
 
-    let merged_fut = async {
-        let results = futures::future::join_all(registry.code_review.values().map(|cr| {
-            let name = cr.display_name().to_string();
-            async move { (name, cr.list_merged_branch_names(repo_root, 50).await) }
-        }))
-        .await;
-        let mut merged = Vec::new();
-        let mut errs = Vec::new();
-        for (name, result) in results {
-            match result {
-                Ok(mut entries) => merged.append(&mut entries),
-                Err(e) => errs.push((name, e)),
-            }
-        }
-        (merged, errs)
-    };
+    let merged_fut = collect_named_results(
+        registry
+            .code_review
+            .values()
+            .map(|cr| {
+                (
+                    cr.display_name().to_string(),
+                    cr.list_merged_branch_names(repo_root, 50),
+                )
+            })
+            .collect(),
+    );
 
     let ws_fut = async {
         if let Some((_, ws_mgr)) = &registry.workspace_manager {
@@ -303,52 +320,65 @@ fn compute_provider_health(
 ) -> HashMap<(&'static str, String), bool> {
     let mut health = HashMap::new();
 
-    for ca in registry.cloud_agents.values() {
-        let name = ca.display_name().to_string();
-        let has_error = errors
-            .iter()
-            .any(|e| e.category == "sessions" && e.provider == name);
-        health.insert(("cloud_agent", name), !has_error);
-    }
-
-    for cr in registry.code_review.values() {
-        let name = cr.display_name().to_string();
-        let has_error = errors
-            .iter()
-            .any(|e| (e.category == "PRs" || e.category == "merged") && e.provider == name);
-        health.insert(("code_review", name), !has_error);
-    }
-
-    for cm in registry.checkout_managers.values() {
-        let name = cm.display_name().to_string();
-        let has_error = errors
-            .iter()
-            .any(|e| e.category == "checkouts" && e.provider == name);
-        health.insert(("checkout_manager", name), !has_error);
-    }
-
-    for vcs in registry.vcs.values() {
-        let name = vcs.display_name().to_string();
-        let has_error = errors
-            .iter()
-            .any(|e| e.category == "branches" && e.provider == name);
-        health.insert(("vcs", name), !has_error);
-    }
+    insert_category_health(
+        &mut health,
+        errors,
+        "cloud_agent",
+        registry
+            .cloud_agents
+            .values()
+            .map(|ca| ca.display_name().to_string()),
+        &["sessions"],
+    );
+    insert_category_health(
+        &mut health,
+        errors,
+        "code_review",
+        registry
+            .code_review
+            .values()
+            .map(|cr| cr.display_name().to_string()),
+        &["PRs", "merged"],
+    );
+    insert_category_health(
+        &mut health,
+        errors,
+        "checkout_manager",
+        registry
+            .checkout_managers
+            .values()
+            .map(|cm| cm.display_name().to_string()),
+        &["checkouts"],
+    );
+    insert_category_health(
+        &mut health,
+        errors,
+        "vcs",
+        registry
+            .vcs
+            .values()
+            .map(|vcs| vcs.display_name().to_string()),
+        &["branches"],
+    );
 
     if let Some((_, ws)) = &registry.workspace_manager {
-        let name = ws.display_name().to_string();
-        let has_error = errors
-            .iter()
-            .any(|e| e.category == "workspaces" && e.provider == name);
-        health.insert(("workspace_manager", name), !has_error);
+        insert_category_health(
+            &mut health,
+            errors,
+            "workspace_manager",
+            [ws.display_name().to_string()],
+            &["workspaces"],
+        );
     }
 
     if let Some((_, tp)) = &registry.terminal_pool {
-        let name = tp.display_name().to_string();
-        let has_error = errors
-            .iter()
-            .any(|e| e.category == "terminals" && e.provider == name);
-        health.insert(("terminal_pool", name), !has_error);
+        insert_category_health(
+            &mut health,
+            errors,
+            "terminal_pool",
+            [tp.display_name().to_string()],
+            &["terminals"],
+        );
     }
 
     health

@@ -144,18 +144,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                                         tab_clicked = true;
                                     }
                                     Some(TabId::Add) => {
-                                        let mut input = tui_input::Input::default();
-                                        if let Some(parent) = app.model.active_repo_root().parent()
-                                        {
-                                            let parent_str = format!("{}/", parent.display());
-                                            input = tui_input::Input::from(parent_str.as_str());
-                                        }
-                                        app.ui.mode = UiMode::FilePicker {
-                                            input,
-                                            dir_entries: Vec::new(),
-                                            selected: 0,
-                                        };
-                                        app.refresh_dir_listing();
+                                        app.open_file_picker_from_active_repo_parent();
                                         tab_clicked = true;
                                     }
                                     _ => {}

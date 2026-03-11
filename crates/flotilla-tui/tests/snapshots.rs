@@ -1,7 +1,7 @@
 mod support;
 
 use flotilla_protocol::{ProviderData, SessionStatus};
-use flotilla_tui::app::{InFlightCommand, Intent, ProviderStatus, UiMode};
+use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, UiMode};
 use std::path::PathBuf;
 use support::*;
 use tui_input::Input;
@@ -217,7 +217,7 @@ fn status_bar_with_multiple_in_flight_commands() {
 fn branch_input_generating_popup() {
     let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::BranchInput {
         input: Input::from("feature/new-branch"),
-        generating: true,
+        kind: BranchInputKind::Generating,
         pending_issue_ids: vec![],
     });
     let output = harness.render_to_string();

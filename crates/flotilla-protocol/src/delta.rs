@@ -85,29 +85,24 @@ pub struct DeltaEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{assert_json_roundtrip, assert_roundtrip};
 
     #[test]
     fn entry_op_added_roundtrip() {
         let op: EntryOp<bool> = EntryOp::Added(true);
-        let json = serde_json::to_string(&op).unwrap();
-        let decoded: EntryOp<bool> = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, op);
+        assert_roundtrip(&op);
     }
 
     #[test]
     fn entry_op_removed_roundtrip() {
         let op: EntryOp<String> = EntryOp::Removed;
-        let json = serde_json::to_string(&op).unwrap();
-        let decoded: EntryOp<String> = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, op);
+        assert_roundtrip(&op);
     }
 
     #[test]
     fn branch_status_roundtrip() {
         for status in [BranchStatus::Remote, BranchStatus::Merged] {
-            let json = serde_json::to_string(&status).unwrap();
-            let decoded: BranchStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(decoded, status);
+            assert_roundtrip(&status);
         }
     }
 
@@ -126,11 +121,7 @@ mod tests {
                 association_keys: vec![],
             }),
         };
-        let json = serde_json::to_string(&change).unwrap();
-        let decoded: Change = serde_json::from_str(&json).unwrap();
-        // Verify it round-trips (Change doesn't derive PartialEq, so check JSON)
-        let json2 = serde_json::to_string(&decoded).unwrap();
-        assert_eq!(json, json2);
+        assert_json_roundtrip(&change);
     }
 
     #[test]
@@ -139,9 +130,6 @@ mod tests {
             key: "feature/old".into(),
             op: EntryOp::Removed,
         };
-        let json = serde_json::to_string(&change).unwrap();
-        let decoded: Change = serde_json::from_str(&json).unwrap();
-        let json2 = serde_json::to_string(&decoded).unwrap();
-        assert_eq!(json, json2);
+        assert_json_roundtrip(&change);
     }
 }
