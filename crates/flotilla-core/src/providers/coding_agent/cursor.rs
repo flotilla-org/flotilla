@@ -288,4 +288,131 @@ mod tests {
         assert_eq!(agent.branch(), Some("feature/one"));
         assert_eq!(agent.repo_slug(), Some("owner/repo".to_string()));
     }
+
+    #[test]
+    fn cursor_agent_empty_branch_returns_none() {
+        let agent = CursorAgent {
+            id: "a-1".to_string(),
+            name: String::new(),
+            status: "RUNNING".to_string(),
+            created_at: String::new(),
+            source: CursorSource {
+                repository: String::new(),
+            },
+            target: CursorTarget {
+                branch_name: String::new(),
+            },
+        };
+        assert!(agent.branch().is_none());
+    }
+
+    #[test]
+    fn cursor_agent_repo_slug_delegates() {
+        let agent = CursorAgent {
+            id: "a-2".to_string(),
+            name: String::new(),
+            status: "FINISHED".to_string(),
+            created_at: String::new(),
+            source: CursorSource {
+                repository: "https://github.com/owner/repo.git".to_string(),
+            },
+            target: CursorTarget {
+                branch_name: String::new(),
+            },
+        };
+        assert_eq!(agent.repo_slug(), Some("owner/repo".to_string()));
+    }
+
+    #[test]
+    fn cursor_agent_empty_repo_returns_none() {
+        let agent = CursorAgent {
+            id: "a-3".to_string(),
+            name: String::new(),
+            status: "RUNNING".to_string(),
+            created_at: String::new(),
+            source: CursorSource {
+                repository: String::new(),
+            },
+            target: CursorTarget {
+                branch_name: String::new(),
+            },
+        };
+        assert!(agent.repo_slug().is_none());
+    }
+
+    #[test]
+    fn cursor_agent_unknown_status_defaults_to_idle() {
+        let agent = CursorAgent {
+            id: "a-4".to_string(),
+            name: String::new(),
+            status: "UNKNOWN_STATUS".to_string(),
+            created_at: String::new(),
+            source: CursorSource::default(),
+            target: CursorTarget::default(),
+        };
+        assert_eq!(agent.session_status(), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn repo_slug_http_without_tls() {
+        assert_eq!(
+            repo_slug_from_cursor_repository("http://github.com/owner/repo"),
+            Some("owner/repo".to_string()),
+        );
+    }
+
+    #[test]
+    fn repo_slug_trailing_slashes() {
+        assert_eq!(
+            repo_slug_from_cursor_repository("https://github.com/owner/repo/"),
+            Some("owner/repo".to_string()),
+        );
+    }
+
+    #[test]
+    fn repo_slug_whitespace_trimmed() {
+        assert_eq!(
+            repo_slug_from_cursor_repository("  owner/repo  "),
+            Some("owner/repo".to_string()),
+        );
+    }
+
+    struct MockHttpClient;
+
+    #[async_trait::async_trait]
+    impl crate::providers::HttpClient for MockHttpClient {
+        async fn execute(
+            &self,
+            _request: reqwest::Request,
+        ) -> Result<http::Response<bytes::Bytes>, String> {
+            Err("mock: not called".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_session_returns_error() {
+        use crate::providers::coding_agent::CloudAgentService;
+        let http: Arc<dyn crate::providers::HttpClient> = Arc::new(MockHttpClient);
+        let agent = CursorCodingAgent::new("cursor".into(), http);
+        let result = agent.archive_session("any-id").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn attach_command_formats_resume() {
+        use crate::providers::coding_agent::CloudAgentService;
+        let http: Arc<dyn crate::providers::HttpClient> = Arc::new(MockHttpClient);
+        let agent = CursorCodingAgent::new("cursor".into(), http);
+        let cmd = agent.attach_command("sess-42").await.unwrap();
+        assert_eq!(cmd, "agent --resume sess-42");
+    }
+
+    #[tokio::test]
+    async fn display_name_returns_expected() {
+        use crate::providers::coding_agent::CloudAgentService;
+        let http: Arc<dyn crate::providers::HttpClient> = Arc::new(MockHttpClient);
+        let agent = CursorCodingAgent::new("cursor".into(), http);
+        assert_eq!(agent.display_name(), "Cursor Cloud Agents");
+    }
 }

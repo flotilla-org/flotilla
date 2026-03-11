@@ -355,4 +355,228 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(json).unwrap();
         assert!(v["merged_at"].as_str().is_some());
     }
+
+    // --- parse_state tests ---
+
+    #[test]
+    fn parse_state_all_variants() {
+        assert_eq!(
+            GitHubCodeReview::parse_state("OPEN"),
+            ChangeRequestStatus::Open
+        );
+        assert_eq!(
+            GitHubCodeReview::parse_state("DRAFT"),
+            ChangeRequestStatus::Draft
+        );
+        assert_eq!(
+            GitHubCodeReview::parse_state("MERGED"),
+            ChangeRequestStatus::Merged
+        );
+        assert_eq!(
+            GitHubCodeReview::parse_state("CLOSED"),
+            ChangeRequestStatus::Closed
+        );
+    }
+
+    #[test]
+    fn parse_state_case_insensitive() {
+        assert_eq!(
+            GitHubCodeReview::parse_state("open"),
+            ChangeRequestStatus::Open
+        );
+        assert_eq!(
+            GitHubCodeReview::parse_state("Merged"),
+            ChangeRequestStatus::Merged
+        );
+    }
+
+    #[test]
+    fn parse_state_unknown_defaults_to_open() {
+        assert_eq!(
+            GitHubCodeReview::parse_state("unknown"),
+            ChangeRequestStatus::Open
+        );
+        assert_eq!(GitHubCodeReview::parse_state(""), ChangeRequestStatus::Open);
+    }
+
+    // --- parse_linked_issues tests ---
+
+    #[test]
+    fn parse_linked_issues_fixes_keyword() {
+        assert_eq!(GitHubCodeReview::parse_linked_issues("Fixes #7"), vec!["7"]);
+    }
+
+    #[test]
+    fn parse_linked_issues_closes_keyword() {
+        assert_eq!(
+            GitHubCodeReview::parse_linked_issues("Closes #42"),
+            vec!["42"]
+        );
+    }
+
+    #[test]
+    fn parse_linked_issues_resolves_keyword() {
+        assert_eq!(
+            GitHubCodeReview::parse_linked_issues("Resolves #100"),
+            vec!["100"]
+        );
+    }
+
+    #[test]
+    fn parse_linked_issues_multiple_keywords() {
+        let result = GitHubCodeReview::parse_linked_issues("Fixes #1, Closes #2, Resolves #3");
+        assert_eq!(result, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn parse_linked_issues_case_insensitive() {
+        assert_eq!(GitHubCodeReview::parse_linked_issues("FIXES #5"), vec!["5"]);
+        assert_eq!(
+            GitHubCodeReview::parse_linked_issues("closes #6"),
+            vec!["6"]
+        );
+    }
+
+    #[test]
+    fn parse_linked_issues_deduplicates() {
+        let result = GitHubCodeReview::parse_linked_issues("Fixes #7\nCloses #7");
+        assert_eq!(result, vec!["7"]);
+    }
+
+    #[test]
+    fn parse_linked_issues_no_matches() {
+        assert!(GitHubCodeReview::parse_linked_issues("Just a description").is_empty());
+        assert!(GitHubCodeReview::parse_linked_issues("").is_empty());
+    }
+
+    #[test]
+    fn parse_linked_issues_missing_hash() {
+        assert!(GitHubCodeReview::parse_linked_issues("Fixes 7").is_empty());
+    }
+
+    #[test]
+    fn parse_linked_issues_embedded_in_text() {
+        let result = GitHubCodeReview::parse_linked_issues(
+            "This PR fixes #12 by updating the parser.\nAlso closes #34.",
+        );
+        assert_eq!(result, vec!["12", "34"]);
+    }
+
+    // --- gh_pr_to_change_request tests ---
+
+    /// Create a `GitHubCodeReview` with empty replay deps (the API/runner
+    /// are never called by `gh_pr_to_change_request`).
+    fn provider_with_empty_replay() -> GitHubCodeReview {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("empty.yaml");
+        std::fs::write(&path, "interactions: []\n").expect("write fixture");
+        let session = replay::ReplaySession::from_file(&path, Masks::new());
+        let (api, runner) = build_api_and_runner(&session, false);
+        GitHubCodeReview::new("github".into(), "owner/repo".into(), api, runner)
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_basic() {
+        let provider = provider_with_empty_replay();
+        let pr = GhPr {
+            number: 42,
+            title: "Add feature".into(),
+            head_ref_name: "feat/add-feature".into(),
+            state: "OPEN".into(),
+            body: Some("Fixes #7".into()),
+            is_draft: false,
+        };
+        let (id, cr) = provider.gh_pr_to_change_request(&pr);
+        assert_eq!(id, "42");
+        assert_eq!(cr.title, "Add feature");
+        assert_eq!(cr.branch, "feat/add-feature");
+        assert_eq!(cr.status, ChangeRequestStatus::Open);
+        assert!(cr
+            .correlation_keys
+            .contains(&CorrelationKey::Branch("feat/add-feature".into())));
+        assert!(cr
+            .correlation_keys
+            .contains(&CorrelationKey::ChangeRequestRef(
+                "github".into(),
+                "42".into()
+            )));
+        assert!(cr
+            .association_keys
+            .contains(&AssociationKey::IssueRef("github".into(), "7".into())));
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_draft_overrides_open() {
+        let provider = provider_with_empty_replay();
+        let pr = GhPr {
+            number: 10,
+            title: "WIP".into(),
+            head_ref_name: "wip-branch".into(),
+            state: "OPEN".into(),
+            body: None,
+            is_draft: true,
+        };
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        assert_eq!(cr.status, ChangeRequestStatus::Draft);
+        assert!(cr.association_keys.is_empty());
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_merged_not_affected_by_draft() {
+        let provider = provider_with_empty_replay();
+        let pr = GhPr {
+            number: 20,
+            title: "Done".into(),
+            head_ref_name: "done-branch".into(),
+            state: "MERGED".into(),
+            body: None,
+            is_draft: true,
+        };
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        assert_eq!(cr.status, ChangeRequestStatus::Merged);
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_issues_from_title_and_body() {
+        let provider = provider_with_empty_replay();
+        let pr = GhPr {
+            number: 30,
+            title: "Fixes #1".into(),
+            head_ref_name: "fix".into(),
+            state: "OPEN".into(),
+            body: Some("Also closes #2".into()),
+            is_draft: false,
+        };
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        assert!(cr
+            .association_keys
+            .contains(&AssociationKey::IssueRef("github".into(), "1".into())));
+        assert!(cr
+            .association_keys
+            .contains(&AssociationKey::IssueRef("github".into(), "2".into())));
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_deduplicates_issues_across_title_and_body() {
+        let provider = provider_with_empty_replay();
+        let pr = GhPr {
+            number: 31,
+            title: "Fixes #5".into(),
+            head_ref_name: "fix".into(),
+            state: "OPEN".into(),
+            body: Some("Closes #5".into()),
+            is_draft: false,
+        };
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        let issue_refs: Vec<_> = cr
+            .association_keys
+            .iter()
+            .filter(|k| matches!(k, AssociationKey::IssueRef(_, _)))
+            .collect();
+        assert_eq!(
+            issue_refs.len(),
+            1,
+            "same issue from title and body should deduplicate"
+        );
+    }
 }
