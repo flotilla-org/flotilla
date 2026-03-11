@@ -191,6 +191,7 @@ pub struct UiState {
     pub double_click: DoubleClickState,
     pub event_log: EventLogUiState,
     pub show_debug: bool,
+    pub help_scroll: u16,
 }
 
 impl UiState {
@@ -207,6 +208,7 @@ impl UiState {
             double_click: DoubleClickState::default(),
             event_log: EventLogUiState::default(),
             show_debug: false,
+            help_scroll: 0,
         }
     }
 

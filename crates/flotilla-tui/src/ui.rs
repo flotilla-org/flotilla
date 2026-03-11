@@ -827,11 +827,23 @@ fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         return;
     }
 
-    let area = ui_helpers::popup_area(frame.area(), 60, 70);
+    let area = ui_helpers::popup_area(frame.area(), 60, 85);
     frame.render_widget(Clear, area);
 
     let labels = model.active_labels();
     let help_text = vec![
+        Line::from(Span::styled("Item Icons", Style::default().bold())),
+        Line::from("  ●  Checkout with workspace    ○  Checkout (no workspace)"),
+        Line::from("  ▶  Running session            ◆  Idle session"),
+        Line::from("  ⊙  Pull request               ◇  Issue"),
+        Line::from("  ⊶  Remote branch"),
+        Line::from(""),
+        Line::from(Span::styled("Column Indicators", Style::default().bold())),
+        Line::from("  WT: ◆ main  ✓ checked out"),
+        Line::from("  WS: ● has workspace  2/3/… multiple"),
+        Line::from("  PR: ✓ merged  ✗ closed"),
+        Line::from("  Git: ? untracked  M modified  ↑ ahead  ↓ behind"),
+        Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().bold())),
         Line::from("  j/k or ↑/↓      Navigate list"),
         Line::from("  Click            Select item"),
@@ -876,8 +888,23 @@ fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         Line::from("  q / Esc          Quit"),
     ];
 
+    let total_lines = help_text.len() as u16;
+    let inner_height = area.height.saturating_sub(2); // borders
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let scroll = ui.help_scroll.min(max_scroll);
+
+    let has_more_below = scroll < max_scroll;
+    let has_more_above = scroll > 0;
+    let title = match (has_more_above, has_more_below) {
+        (true, true) => " Help ↑↓ ",
+        (false, true) => " Help ↓ ",
+        (true, false) => " Help ↑ ",
+        (false, false) => " Help ",
+    };
+
     let paragraph = Paragraph::new(help_text)
-        .block(Block::bordered().title(" Help "))
+        .block(Block::bordered().title(title))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }

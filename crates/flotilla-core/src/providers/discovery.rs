@@ -17,18 +17,80 @@ use crate::providers::vcs::wt::WtCheckoutManager;
 use crate::providers::workspace::cmux::CmuxWorkspaceManager;
 use crate::providers::workspace::tmux::TmuxWorkspaceManager;
 use crate::providers::workspace::zellij::ZellijWorkspaceManager;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-/// Extract the first git remote URL for this repo.
+/// Get the URL of the remote for the current tracking branch.
+///
+/// Runs `git rev-parse --abbrev-ref @{upstream}` to find the tracking ref
+/// (e.g. `origin/main`), then splits on `/` to extract the remote name.
+async fn tracking_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Option<String> {
+    let upstream = run!(
+        runner,
+        "git",
+        &["rev-parse", "--abbrev-ref", "@{upstream}"],
+        repo_root,
+    )
+    .ok()?;
+    let upstream = upstream.trim();
+    // upstream looks like "origin/main" — the remote name is the first segment
+    let remote_name = upstream.split('/').next()?;
+    if remote_name.is_empty() {
+        return None;
+    }
+    let url = run!(
+        runner,
+        "git",
+        &["remote", "get-url", remote_name],
+        repo_root
+    )
+    .ok()?;
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    debug!(%remote_name, %url, "using tracking remote");
+    Some(url)
+}
+
+/// Extract the preferred git remote URL for this repo.
+///
+/// Preference order:
+/// 1. The remote tracked by the current branch
+/// 2. `origin` if it exists
+/// 3. First remote with a valid URL as fallback
 pub async fn first_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Option<String> {
+    // 1. Try the tracking remote for the current branch
+    if let Some(url) = tracking_remote_url(repo_root, runner).await {
+        return Some(url);
+    }
+
+    // Get the list of remotes for steps 2 and 3
     let remotes_output = run!(runner, "git", &["remote"], repo_root).ok()?;
-    for remote in remotes_output.lines() {
-        let remote = remote.trim();
-        if remote.is_empty() {
-            continue;
+    let remotes: Vec<&str> = remotes_output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // 2. Prefer "origin" if it exists
+    if remotes.contains(&"origin") {
+        if let Ok(url) = run!(runner, "git", &["remote", "get-url", "origin"], repo_root) {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                debug!(%url, "using origin remote");
+                return Some(url);
+            }
         }
+    }
+
+    // 3. Fall back to first remote with a valid URL
+    for remote in &remotes {
         if let Ok(url) = run!(runner, "git", &["remote", "get-url", remote], repo_root) {
-            return Some(url.trim().to_string());
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                debug!(%remote, "using first available remote as fallback");
+                return Some(url);
+            }
         }
     }
     None
@@ -493,10 +555,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_remote_uses_first_success_and_trims_url() {
+    async fn first_remote_prefers_tracking_remote() {
         let repo_root = Path::new("/tmp/repo-root");
         let runner = DiscoveryMockRunner::builder()
-            .on_run("git", &["remote"], Ok(" upstream \norigin\n".to_string()))
+            .on_run(
+                "git",
+                &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                Ok("upstream/main\n".to_string()),
+            )
             .on_run(
                 "git",
                 &["remote", "get-url", "upstream"],
@@ -512,8 +578,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_remote_falls_back_to_origin_when_no_tracking_branch() {
+        let repo_root = Path::new("/tmp/repo-root");
+        let runner = DiscoveryMockRunner::builder()
+            .on_run(
+                "git",
+                &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                Err("fatal: no upstream configured".to_string()),
+            )
+            .on_run(
+                "git",
+                &["remote"],
+                Ok("fork\norigin\nupstream\n".to_string()),
+            )
+            .on_run(
+                "git",
+                &["remote", "get-url", "origin"],
+                Ok("  https://github.com/owner/repo.git  \n".to_string()),
+            )
+            .build();
+        let url = first_remote_url(repo_root, &runner).await;
+        assert_eq!(url, Some("https://github.com/owner/repo.git".to_string()));
+    }
+
+    #[tokio::test]
+    async fn first_remote_falls_back_to_first_when_no_origin() {
+        let repo_root = Path::new("/tmp/repo-root");
+        let runner = DiscoveryMockRunner::builder()
+            .on_run(
+                "git",
+                &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                Err("fatal: no upstream configured".to_string()),
+            )
+            .on_run("git", &["remote"], Ok("fork\nupstream\n".to_string()))
+            .on_run(
+                "git",
+                &["remote", "get-url", "fork"],
+                Ok("https://github.com/fork/repo.git\n".to_string()),
+            )
+            .build();
+        let url = first_remote_url(repo_root, &runner).await;
+        assert_eq!(url, Some("https://github.com/fork/repo.git".to_string()));
+    }
+
+    #[tokio::test]
     async fn first_remote_skips_failed_remote_and_uses_next() {
         let runner = DiscoveryMockRunner::builder()
+            .on_run(
+                "git",
+                &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                Err("fatal: no upstream".to_string()),
+            )
             .on_run(
                 "git",
                 &["remote"],
@@ -540,14 +655,29 @@ mod tests {
             DiscoveryMockRunner::builder()
                 .on_run(
                     "git",
+                    &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                    Err("fatal: no upstream".to_string()),
+                )
+                .on_run(
+                    "git",
                     &["remote"],
                     Err("fatal: not a git repository".to_string()),
                 )
                 .build(),
             DiscoveryMockRunner::builder()
+                .on_run(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                    Err("fatal: no upstream".to_string()),
+                )
                 .on_run("git", &["remote"], Ok(String::new()))
                 .build(),
             DiscoveryMockRunner::builder()
+                .on_run(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                    Err("fatal: no upstream".to_string()),
+                )
                 .on_run("git", &["remote"], Ok("\n\n".to_string()))
                 .build(),
         ];
@@ -879,12 +1009,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_providers_uses_first_remote_for_slug_and_host() {
+    async fn detect_providers_prefers_origin_over_alphabetical_first() {
+        let (dir, repo) = make_repo_with_git_dir();
+        let config = temp_config(&dir);
+        // "fork" sorts before "origin" alphabetically, but origin should win
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            discovery_runner()
+                .on_run("git", &["remote"], Ok("fork\norigin\n".to_string()))
+                .on_run(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    Ok("https://github.com/owner/repo.git\n".to_string()),
+                )
+                .tool_exists("wt", false)
+                .tool_exists("gh", true)
+                .tool_exists("claude", false)
+                .build(),
+        );
+
+        let (registry, slug) = detect_providers(&repo, &config, runner).await;
+        assert!(registry.code_review.contains_key("github"));
+        assert!(registry.issue_trackers.contains_key("github"));
+        assert_eq!(slug, Some("owner/repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn detect_providers_prefers_tracking_remote() {
         let (dir, repo) = make_repo_with_git_dir();
         let config = temp_config(&dir);
         let runner: Arc<dyn CommandRunner> = Arc::new(
             discovery_runner()
-                .on_run("git", &["remote"], Ok("upstream\norigin\n".to_string()))
+                .on_run(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                    Ok("upstream/main\n".to_string()),
+                )
                 .on_run(
                     "git",
                     &["remote", "get-url", "upstream"],

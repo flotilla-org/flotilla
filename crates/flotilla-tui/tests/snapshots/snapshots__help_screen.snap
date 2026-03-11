@@ -4,10 +4,19 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path     Description     Branch   WT  WS  PR   SS   Issues Git  ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                       ┌ Help ────────────────────────────────────────────────────────────────┐                       │
+│      Path     Descript┌ Help ↓ ──────────────────────────────────────────────────────────────┐                       │
+│                       │Item Icons                                                            │                       │
+│                       │●  Checkout with workspace    ○  Checkout (no workspace)              │                       │
+│                       │▶  Running session            ◆  Idle session                         │                       │
+│                       │⊙  Pull request               ◇  Issue                                │                       │
+│                       │⊶  Remote branch                                                      │                       │
+│                       │                                                                      │                       │
+│                       │Column Indicators                                                     │                       │
+│                       │WT: ◆ main  ✓ checked out                                             │                       │
+│                       │WS: ● has workspace  2/3/… multiple                                   │                       │
+│                       │PR: ✓ merged  ✗ closed                                                │                       │
+│                       │Git: ? untracked  M modified  ↑ ahead  ↓ behind                       │                       │
+│                       │                                                                      │                       │
 │                       │Navigation                                                            │                       │
 │                       │j/k or ↑/↓      Navigate list                                         │                       │
 │                       │Click            Select item                                          │                       │
@@ -20,15 +29,6 @@ expression: output
 │                       │Right-click      Action menu                                          │                       │
 │                       │n                New branch (enter name, creates worktree)            │                       │
 │                       │d                Remove worktree (with safety check)                  │                       │
-│                       │p                Show PR in browser                                   │                       │
-│                       │r                Refresh data                                         │                       │
-│                       │                                                                      │                       │
-│                       │Multi-select (issues)                                                 │                       │
-│                       │Space            Toggle selection on current item                     │                       │
-│                       │Enter            Generate branch name for all selected                │                       │
-│                       │Esc              Clear selection                                      │                       │
 │                       └──────────────────────────────────────────────────────────────────────┘                       │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
  ?:close help  esc:close help

@@ -256,6 +256,15 @@ impl App {
             }
         }
 
+        // Remove stale provider_statuses entries for providers no longer in health map
+        self.model.provider_statuses.retain(|k, _| {
+            k.0 != path
+                || rm
+                    .provider_health
+                    .get(&k.1)
+                    .is_some_and(|ps| ps.contains_key(&k.2))
+        });
+
         // Change detection badge for inactive tabs
         let active_idx = self.model.active_repo;
         let i = self.model.repo_order.iter().position(|p| p == &path);
@@ -358,6 +367,15 @@ impl App {
                 self.model.provider_statuses.insert(key, status);
             }
         }
+
+        // Remove stale provider_statuses entries for providers no longer in health map
+        self.model.provider_statuses.retain(|k, _| {
+            k.0 != path
+                || rm
+                    .provider_health
+                    .get(&k.1)
+                    .is_some_and(|ps| ps.contains_key(&k.2))
+        });
 
         // Change detection badge — any non-empty delta on inactive tab
         let has_data_changes = delta.changes.iter().any(|c| {
