@@ -68,12 +68,22 @@ Cross-host correlation works naturally: a checkout on the desktop and a PR fetch
 
 ### Repo Matching
 
-Two repos on different hosts are the same logical repo if they share the same **repo slug** (e.g. `rjwittams/flotilla`), extracted from the root remote URL. Slug-based matching avoids false negatives when hosts use different URL formats for the same repo (SSH `git@github.com:...` vs HTTPS `https://github.com/...`). The existing `extract_repo_slug` in `discovery.rs` already does this extraction.
+Two repos on different hosts are the same logical repo if they share the same `RepoIdentity`. Rather than matching on bare slugs (which assumes GitHub's `owner/repo` format), we introduce a type that pairs the hosting authority with the repo path:
+
+```rust
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
+struct RepoIdentity {
+    authority: String,  // e.g. "github.com", "gitlab.company.com"
+    path: String,       // e.g. "rjwittams/flotilla", "team/project"
+}
+```
+
+This generalizes beyond GitHub — a GitLab repo at `gitlab.company.com:team/project` and a GitHub repo at `github.com:team/project` are correctly treated as different repos despite sharing the same path component. The existing `extract_repo_slug` in `discovery.rs` is extended to produce `RepoIdentity` by also extracting the authority from the remote URL.
 
 The daemon maintains:
 
 ```rust
-repo_slug → LogicalRepo {
+repo_identity → LogicalRepo {
     host_repos: HashMap<HostName, RepoInfo>,
 }
 ```
@@ -81,26 +91,36 @@ repo_slug → LogicalRepo {
 Each logical repo gets one tab. Repos that exist only on remote hosts still get a tab.
 
 Matching fallbacks:
-- **No usable remote**: The repo is local-only and cannot match across hosts.
+- **No usable remote**: The repo is local-only (no `RepoIdentity`) and cannot match across hosts.
 - **Multiple remotes**: Use the first remote (existing `first_remote_url()` behavior).
-- **Unrecognized URL format**: Fall back to exact URL comparison instead of slug extraction.
+- **Unrecognized URL format**: Fall back to a `RepoIdentity` with authority `"unknown"` and the full URL as the path. Two hosts with the same unrecognized URL will still match.
 
 For TUI snapshot keying (which uses `PathBuf` as repo identity): if the local host has the repo, use the local path. If the repo exists only on remote hosts, use a synthetic path like `<remote>/<host>/<remote-path>`.
 
 The synthetic path is not just cosmetic — the TUI uses `PathBuf` repo keys for tab labels, tab ordering persistence (`tab-order.json`), and `RepoUiState` identity. The format must be stable across restarts so saved tab order is preserved. The daemon also needs to handle these virtual repos in `InProcessDaemon`/`RepoState` without assuming they correspond to local filesystem paths.
 
-### Host-Namespaced Identity
+### HostPath Type
 
-The collision problem goes deeper than correlation keys. `ProviderData` uses `PathBuf` as the key for `checkouts` and `managed_terminals`. `WorkItemIdentity::Checkout(PathBuf)` is how the TUI identifies rows for selection and scrolling. If two hosts report the same path, these structures break.
+The collision problem goes deeper than correlation keys. `ProviderData` uses `PathBuf` as the key for `checkouts` and `managed_terminals`. `WorkItemIdentity::Checkout(PathBuf)` is how the TUI identifies rows for selection and scrolling. If two hosts report the same filesystem path, these structures break.
 
-**Solution**: When the daemon merges remote `ProviderData` into its local state, all path-based keys from remote hosts are prefixed with the host name: `desktop:/Users/robert/dev/flotilla`. This namespacing applies to:
+**Solution**: Introduce a `HostPath` type that carries host and path as separate fields:
 
-- `ProviderData.checkouts` keys (PathBuf)
-- `ProviderData.managed_terminals` keys (PathBuf)
+```rust
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+struct HostPath {
+    host: Option<HostName>,  // None = local
+    path: PathBuf,
+}
+```
+
+`HostPath` replaces bare `PathBuf` in all identity-bearing positions:
+
+- `ProviderData.checkouts` keys
+- `ProviderData.managed_terminals` keys
 - `CorrelationKey::CheckoutPath` values
 - `WorkItemIdentity::Checkout` values
 
-This ensures no collisions in any data structure. The prefixed paths are opaque identifiers — the TUI does not parse them.
+This avoids fragile string concatenation — the host and path remain separate, queryable fields. `Display` renders as `desktop:/path/to/repo` for remote or just `/path/to/repo` for local. The TUI treats `HostPath` as an opaque identifier.
 
 Branch-based correlation (`CorrelationKey::Branch`) is intentionally *not* namespaced — a branch name on host A should correlate with the same branch name and its associated PR from host B. This is the primary mechanism for cross-host correlation.
 
@@ -214,7 +234,7 @@ This distinction matters because correlation must run on the merged dataset from
 ```rust
 struct PeerDataMessage {
     origin_host: HostName,         // who generated this data
-    repo_slug: String,             // logical repo identity
+    repo_identity: RepoIdentity,   // logical repo identity (authority + path)
     repo_path: PathBuf,            // filesystem path on origin host
     kind: PeerDataKind,
 }
@@ -228,10 +248,9 @@ enum PeerDataKind {
 }
 ```
 
-When a peer detects a sequence gap, it sends `RequestResync` with the last known sequence. The responder replies with a full `Snapshot` for that (origin_host, repo_slug) pair — the same strategy the TUI-daemon gap recovery uses. Delta streams resume from the new snapshot's sequence.
-```
+When a peer detects a sequence gap, it sends `RequestResync` with the last known sequence. The responder replies with a full `Snapshot` for that (origin_host, repo_identity) pair — the same strategy the TUI-daemon gap recovery uses. Delta streams resume from the new snapshot's sequence.
 
-Each message carries an `origin_host` tag so the receiver knows the data source and the relay logic can avoid reflecting data back to its origin. Sequence numbers are per-(origin_host, repo_slug).
+Each message carries an `origin_host` tag so the receiver knows the data source and the relay logic can avoid reflecting data back to its origin. Sequence numbers are per-(origin_host, repo_identity).
 
 ### Authentication
 
@@ -256,7 +275,7 @@ The leader also sends its own local data to all followers.
 Each daemon maintains peer state keyed by both host and repo:
 
 ```rust
-peer_data: HashMap<HostName, HashMap<RepoSlug, PerRepoPeerState>>
+peer_data: HashMap<HostName, HashMap<RepoIdentity, PerRepoPeerState>>
 
 struct PerRepoPeerState {
     provider_data: ProviderData,
@@ -311,8 +330,8 @@ No new tab types. No new modes. No new key bindings. The tab system, navigation,
 | Crate | Changes |
 |-------|---------|
 | `flotilla-daemon` | `PeerManager`, `PeerTransport` trait, SSH implementation, relay logic, follower mode flag, snapshot merging |
-| `flotilla-protocol` | `Message::PeerData` variant, `PeerDataMessage`, `PeerDataKind`, `HostName` type |
-| `flotilla-core` | Config parsing for `hosts.toml`, host-namespaced correlation keys, `host` field on work items |
+| `flotilla-protocol` | `Message::PeerData` variant, `PeerDataMessage`, `PeerDataKind`, `HostName`, `HostPath`, `RepoIdentity` types |
+| `flotilla-core` | Config parsing for `hosts.toml`, `HostPath` in correlation keys and provider data, `host` field on work items, `RepoIdentity` extraction from remote URLs |
 | `flotilla-client` | None (reused as-is for peer connections) |
 | `flotilla-tui` | Host in Source column, Hosts section in config view, action filtering by host provenance |
 | `flotilla` (root) | None |
@@ -320,6 +339,8 @@ No new tab types. No new modes. No new key bindings. The tab system, navigation,
 ## Future Work
 
 - **Phase 2**: Remote terminal opening, remote checkout creation (file follow-up issue)
+- **Local ↔ remote branch correlation**: Model local tracking branches and their remote counterparts as separate correlated items, enabling richer branch-level status display
+- **Direct GitHub API**: Replace `gh` CLI dependency with direct API calls for actions on repos without a local clone
 - **Per-provider leader election**: Split-brain resilience, capability-restricted election
 - **Auto-discovery**: mDNS or similar for LAN hosts
 - **Alternate transports**: Direct TCP, WireGuard tunnels
