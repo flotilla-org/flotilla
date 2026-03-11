@@ -114,6 +114,8 @@ pub struct CloudAgentSession {
     #[serde(default)]
     pub provider_display_name: String,
     /// Capitalized item noun for this provider (e.g. "Agent", "Task").
+    /// Lives in the protocol (not derived in the TUI) because the TUI may
+    /// receive snapshots from a remote daemon and needs display context.
     #[serde(default)]
     pub item_noun: String,
 }

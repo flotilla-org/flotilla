@@ -1,7 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+fn local_hostname() -> &'static str {
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME.get_or_init(|| gethostname::gethostname().to_string_lossy().into_owned())
+}
 
 // Re-export protocol types that are used throughout the crate and by consumers.
 pub use flotilla_protocol::{CheckoutRef, CheckoutStatus, WorkItemIdentity, WorkItemKind};
@@ -184,7 +189,11 @@ impl CorrelationResult {
         match self {
             CorrelationResult::Correlated(c) => c.source.as_deref(),
             CorrelationResult::Standalone(StandaloneResult::Issue { source, .. }) => {
-                Some(source.as_str())
+                if source.is_empty() {
+                    None
+                } else {
+                    Some(source.as_str())
+                }
             }
             CorrelationResult::Standalone(StandaloneResult::RemoteBranch { .. }) => Some("git"),
         }
@@ -335,18 +344,16 @@ fn group_to_work_item(
         .unwrap_or_default();
 
     let source = match &anchor {
-        CorrelatedAnchor::Checkout(_) => {
-            Some(gethostname::gethostname().to_string_lossy().into_owned())
-        }
+        CorrelatedAnchor::Checkout(_) => Some(local_hostname().to_string()),
         CorrelatedAnchor::ChangeRequest(key) => providers
             .change_requests
             .get(key.as_str())
-            .map(|cr| cr.provider_name.clone())
+            .map(|cr| cr.provider_display_name.clone())
             .filter(|s| !s.is_empty()),
         CorrelatedAnchor::Session(key) => providers
             .sessions
             .get(key.as_str())
-            .map(|s| s.provider_name.clone())
+            .map(|s| s.provider_display_name.clone())
             .filter(|s| !s.is_empty()),
     };
 
@@ -501,7 +508,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
             work_items.push(CorrelationResult::Standalone(StandaloneResult::Issue {
                 key: id.clone(),
                 description: issue.title.clone(),
-                source: issue.provider_name.clone(),
+                source: issue.provider_display_name.clone(),
             }));
         }
     }

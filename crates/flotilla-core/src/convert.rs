@@ -206,10 +206,10 @@ mod tests {
             linked_issues: vec![],
             workspace_refs: vec![],
             correlation_group_idx: 0,
-            source: Some("claude".to_string()),
+            source: Some("Claude".to_string()),
         });
         let proto = correlation_result_to_work_item(&item, &[]);
-        assert_eq!(proto.source, Some("claude".to_string()));
+        assert_eq!(proto.source, Some("Claude".to_string()));
     }
 
     #[test]
@@ -217,10 +217,10 @@ mod tests {
         let item = CorrelationResult::Standalone(StandaloneResult::Issue {
             key: "42".to_string(),
             description: "Fix the bug".to_string(),
-            source: "github".to_string(),
+            source: "GitHub".to_string(),
         });
         let proto = correlation_result_to_work_item(&item, &[]);
-        assert_eq!(proto.source, Some("github".to_string()));
+        assert_eq!(proto.source, Some("GitHub".to_string()));
     }
 
     #[test]
