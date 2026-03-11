@@ -290,31 +290,70 @@ impl super::CheckoutManager for GitCheckoutManager {
                 repo_root
             )?;
         } else {
-            // Fetch latest default branch from origin so we branch from current remote state.
-            // Fall back to local default branch if fetch fails (offline, no remote, etc).
-            let fetch_ok = run!(
+            // Check if a remote-tracking branch exists on origin.
+            let remote_exists = run!(
                 self.runner,
                 "git",
-                &["fetch", "origin", &default_branch],
-                repo_root
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/origin/{branch}"),
+                ],
+                repo_root,
             )
             .is_ok();
 
-            let start_point = if fetch_ok {
-                format!("origin/{default_branch}")
+            if remote_exists {
+                // Fetch latest and create worktree tracking the remote branch.
+                // If fetch fails (offline, etc), the local remote-tracking ref
+                // is still usable — just potentially stale.
+                if run!(self.runner, "git", &["fetch", "origin", branch], repo_root).is_err() {
+                    tracing::warn!(
+                        %branch, "fetch from origin failed, using existing remote-tracking ref"
+                    );
+                }
+                run!(
+                    self.runner,
+                    "git",
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        branch,
+                        wt_str,
+                        &format!("origin/{branch}")
+                    ],
+                    repo_root,
+                )?;
             } else {
-                tracing::warn!(
-                    %default_branch, "fetch from origin failed, branching from local"
-                );
-                default_branch.clone()
-            };
+                // Brand new branch: fetch latest default branch from origin so we
+                // branch from current remote state. Fall back to local default
+                // branch if fetch fails (offline, no remote, etc).
+                let fetch_ok = run!(
+                    self.runner,
+                    "git",
+                    &["fetch", "origin", &default_branch],
+                    repo_root
+                )
+                .is_ok();
 
-            run!(
-                self.runner,
-                "git",
-                &["worktree", "add", "-b", branch, wt_str, &start_point],
-                repo_root,
-            )?;
+                let start_point = if fetch_ok {
+                    format!("origin/{default_branch}")
+                } else {
+                    tracing::warn!(
+                        %default_branch, "fetch from origin failed, branching from local"
+                    );
+                    default_branch.clone()
+                };
+
+                run!(
+                    self.runner,
+                    "git",
+                    &["worktree", "add", "-b", branch, wt_str, &start_point],
+                    repo_root,
+                )?;
+            }
         }
         let is_trunk = branch == default_branch;
         Ok(self
@@ -492,5 +531,48 @@ branch refs/heads/feature
 
         let path = mgr.render_worktree_path(repo, "dev/thing").unwrap();
         assert_eq!(path, PathBuf::from("/home/user/myrepo/worktrees/dev-thing"));
+    }
+
+    // ── Record/replay tests ──
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/src/providers/vcs/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
+    }
+
+    #[tokio::test]
+    async fn record_replay_create_checkout_tracks_remote_branch() {
+        use crate::providers::replay;
+        use crate::providers::vcs::checkout_test_support;
+
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(checkout_test_support::setup_remote_only_branch())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(
+            repo_path.to_str().expect("repo path is valid UTF-8"),
+            "{repo}",
+        );
+        let session = replay::test_session(&fixture("git_create_remote_branch.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
+        let config = CheckoutsConfig::default();
+        let mgr = GitCheckoutManager::new(config, runner.clone());
+
+        checkout_test_support::assert_checkout_tracks_remote_branch(&mgr, &runner, &repo_path)
+            .await;
+
+        session.finish();
     }
 }

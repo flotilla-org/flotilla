@@ -1,4 +1,17 @@
 interactions:
+# Check if remote tracking branch exists (it doesn't)
+- channel: command
+  cmd: git
+  args:
+  - show-ref
+  - '--verify'
+  - '--quiet'
+  - refs/remotes/origin/new-feature
+  cwd: '{repo}'
+  stdout: null
+  stderr: ''
+  exit_code: 1
+# No remote branch, so create a new one
 - channel: command
   cmd: wt
   args:

@@ -1,0 +1,120 @@
+# Fixture for wt creating a worktree that tracks a remote-only branch.
+# The branch feature/remote-only exists on origin but not locally.
+# wt switch (without --create) should detect and track the remote branch.
+interactions:
+# 1. Check if remote tracking branch exists (it does)
+- channel: command
+  cmd: git
+  args:
+  - show-ref
+  - '--verify'
+  - '--quiet'
+  - refs/remotes/origin/feature/remote-only
+  cwd: '{repo}'
+  stdout: null
+  stderr: ''
+  exit_code: 0
+# 2. Switch to the remote branch (wt handles remote tracking)
+- channel: command
+  cmd: wt
+  args:
+  - switch
+  - feature/remote-only
+  - '--no-cd'
+  - '--yes'
+  cwd: '{repo}'
+  stdout: ''
+  stderr: null
+  exit_code: 0
+# 3. List worktrees to find the new one
+- channel: command
+  cmd: wt
+  args:
+  - list
+  - '--format=json'
+  cwd: '{repo}'
+  stdout: |
+    [
+      {
+        "branch": "main",
+        "path": "{repo}",
+        "kind": "worktree",
+        "commit": {
+          "sha": "aaa1111111111111111111111111111111111111",
+          "short_sha": "aaa1111",
+          "message": "Initial commit",
+          "timestamp": 1773058918
+        },
+        "working_tree": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "diff": { "added": 0, "deleted": 0 }
+        },
+        "main_state": "is_main",
+        "remote": {
+          "name": "origin",
+          "branch": "main",
+          "ahead": 0,
+          "behind": 0
+        },
+        "worktree": { "detached": false },
+        "is_main": true,
+        "is_current": true,
+        "is_previous": true,
+        "statusline": "main",
+        "symbols": "^|"
+      },
+      {
+        "branch": "feature/remote-only",
+        "path": "{repo}.feature-remote-only",
+        "kind": "worktree",
+        "commit": {
+          "sha": "bbb2222222222222222222222222222222222222",
+          "short_sha": "bbb2222",
+          "message": "remote-only work",
+          "timestamp": 1773059000
+        },
+        "working_tree": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "diff": { "added": 0, "deleted": 0 }
+        },
+        "main_state": "ahead",
+        "main": {
+          "ahead": 1,
+          "behind": 0
+        },
+        "remote": {
+          "name": "origin",
+          "branch": "feature/remote-only",
+          "ahead": 0,
+          "behind": 0
+        },
+        "worktree": { "detached": false },
+        "is_main": false,
+        "is_current": false,
+        "is_previous": false,
+        "statusline": "feature/remote-only",
+        "symbols": ""
+      }
+    ]
+  stderr: null
+  exit_code: 0
+# 4. Verification — confirm HEAD commit message
+- channel: command
+  label: verify-commit
+  cmd: git
+  args:
+  - log
+  - '-1'
+  - '--format=%s'
+  cwd: '{repo}.feature-remote-only'
+  stdout: "remote-only work\n"
+  stderr: null
+  exit_code: 0

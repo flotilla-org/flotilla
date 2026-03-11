@@ -1,0 +1,134 @@
+# Fixture for creating a worktree that tracks a remote-only branch.
+# The branch feature/remote-only exists on origin but not locally.
+# The worktree should end up on the remote branch's commit, not main.
+interactions:
+# 1. Check if local branch exists — it doesn't
+- channel: command
+  cmd: git
+  args:
+  - show-ref
+  - '--verify'
+  - '--quiet'
+  - refs/heads/feature/remote-only
+  cwd: '{repo}'
+  stdout: null
+  stderr: ''
+  exit_code: 1
+# 2. Detect default branch (always runs)
+- channel: command
+  cmd: git
+  args:
+  - symbolic-ref
+  - refs/remotes/origin/HEAD
+  - '--short'
+  cwd: '{repo}'
+  stdout: "origin/main\n"
+  stderr: null
+  exit_code: 0
+# 3. Check if remote tracking branch exists — it does
+- channel: command
+  cmd: git
+  args:
+  - show-ref
+  - '--verify'
+  - '--quiet'
+  - refs/remotes/origin/feature/remote-only
+  cwd: '{repo}'
+  stdout: null
+  stderr: ''
+  exit_code: 0
+# 4. Fetch the remote branch to get latest
+- channel: command
+  cmd: git
+  args:
+  - fetch
+  - origin
+  - feature/remote-only
+  cwd: '{repo}'
+  stdout: ''
+  stderr: null
+  exit_code: 0
+# 5. Create worktree tracking the remote branch
+- channel: command
+  cmd: git
+  args:
+  - worktree
+  - add
+  - -b
+  - feature/remote-only
+  - '{repo}/../repo.feature-remote-only'
+  - origin/feature/remote-only
+  cwd: '{repo}'
+  stdout: ''
+  stderr: null
+  exit_code: 0
+# 6. Enrichment — trunk ahead/behind (1 commit ahead of main)
+- channel: command
+  label: trunk-ab
+  cmd: git
+  args:
+  - rev-list
+  - '--left-right'
+  - '--count'
+  - HEAD...main
+  cwd: '{repo}/../repo.feature-remote-only'
+  stdout: "1\t0\n"
+  stderr: null
+  exit_code: 0
+# 7. Enrichment — remote ahead/behind (in sync with origin)
+- channel: command
+  label: remote-ab
+  cmd: git
+  args:
+  - rev-list
+  - '--left-right'
+  - '--count'
+  - HEAD...origin/feature/remote-only
+  cwd: '{repo}/../repo.feature-remote-only'
+  stdout: "0\t0\n"
+  stderr: null
+  exit_code: 0
+# 8. Enrichment — working tree status (clean)
+- channel: command
+  cmd: git
+  args:
+  - status
+  - '--porcelain'
+  cwd: '{repo}/../repo.feature-remote-only'
+  stdout: ''
+  stderr: null
+  exit_code: 0
+# 9. Enrichment — last commit
+- channel: command
+  cmd: git
+  args:
+  - log
+  - '-1'
+  - "--format=%h\t%s"
+  cwd: '{repo}/../repo.feature-remote-only'
+  stdout: "abc1234\tremote-only work\n"
+  stderr: null
+  exit_code: 0
+# 10. Enrichment — issue links (none)
+- channel: command
+  cmd: git
+  args:
+  - config
+  - '--get-regexp'
+  - branch\.feature/remote-only\.flotilla\.issues\.
+  cwd: '{repo}/../repo.feature-remote-only'
+  stdout: null
+  stderr: ''
+  exit_code: 1
+# 11. Verification — confirm HEAD commit message
+- channel: command
+  label: verify-commit
+  cmd: git
+  args:
+  - log
+  - '-1'
+  - '--format=%s'
+  cwd: '{repo}/../repo.feature-remote-only'
+  stdout: "remote-only work\n"
+  stderr: null
+  exit_code: 0

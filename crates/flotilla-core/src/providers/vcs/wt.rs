@@ -151,7 +151,28 @@ impl super::CheckoutManager for WtCheckoutManager {
         create_branch: bool,
     ) -> Result<(PathBuf, Checkout), String> {
         info!(%branch, %create_branch, "wt: creating worktree");
-        if create_branch {
+
+        // Check if a remote-tracking branch exists. If so, use `wt switch`
+        // (without --create) so wt tracks the remote branch instead of
+        // creating a brand new one from the default branch.
+        let remote_exists = if create_branch {
+            run!(
+                self.runner,
+                "git",
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/origin/{branch}"),
+                ],
+                repo_root,
+            )
+            .is_ok()
+        } else {
+            false
+        };
+
+        if create_branch && !remote_exists {
             run!(
                 self.runner,
                 "wt",
@@ -467,6 +488,37 @@ mod tests {
         mgr.remove_checkout(&repo_path, "feat-remove")
             .await
             .unwrap();
+
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn record_replay_create_checkout_tracks_remote_branch() {
+        use crate::providers::vcs::checkout_test_support;
+
+        let recording = replay::is_recording();
+        let temp = if recording {
+            Some(checkout_test_support::setup_remote_only_branch())
+        } else {
+            None
+        };
+        let repo_path = temp
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+
+        let mut masks = replay::Masks::new();
+        masks.add(
+            repo_path.to_str().expect("repo path is valid UTF-8"),
+            "{repo}",
+        );
+        let session = replay::test_session(&fixture("wt_create_remote_branch.yaml"), masks);
+        let runner = replay::test_runner(&session);
+
+        let mgr = WtCheckoutManager::new(runner.clone());
+
+        checkout_test_support::assert_checkout_tracks_remote_branch(&mgr, &runner, &repo_path)
+            .await;
 
         session.finish();
     }

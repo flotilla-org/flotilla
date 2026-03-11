@@ -211,3 +211,114 @@ mod tests {
         assert_eq!(regex_escape_branch("simple"), "simple");
     }
 }
+
+/// Shared test utilities for checkout manager implementations.
+#[cfg(test)]
+pub(crate) mod checkout_test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crate::providers::vcs::CheckoutManager;
+    use crate::providers::{ChannelLabel, CommandRunner};
+
+    /// Run a git command, panicking on failure.
+    pub fn git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Create a repo where `feature/remote-only` exists on the remote but not locally.
+    /// The remote branch has a commit "remote-only work" ahead of main.
+    pub fn setup_remote_only_branch() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let base = dir
+            .path()
+            .canonicalize()
+            .expect("failed to canonicalize tempdir");
+        let remote = base.join("remote.git");
+        let repo = base.join("repo");
+
+        git(
+            &base,
+            &["init", "--bare", remote.to_str().expect("non-UTF-8 path")],
+        );
+        git(
+            &base,
+            &[
+                "clone",
+                remote.to_str().expect("non-UTF-8 path"),
+                repo.to_str().expect("non-UTF-8 path"),
+            ],
+        );
+        git(&repo, &["config", "user.email", "test@test.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+
+        // Initial commit on main
+        std::fs::write(repo.join("README.md"), "# Test\n").expect("failed to write README");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "Initial commit"]);
+        git(&repo, &["push", "origin", "main"]);
+
+        // Create feature branch, commit, push, then delete local
+        git(&repo, &["checkout", "-b", "feature/remote-only"]);
+        std::fs::write(repo.join("remote-work.txt"), "work\n").expect("failed to write test file");
+        git(&repo, &["add", "remote-work.txt"]);
+        git(&repo, &["commit", "-m", "remote-only work"]);
+        git(&repo, &["push", "origin", "feature/remote-only"]);
+
+        // Back to main, delete local branch
+        git(&repo, &["checkout", "main"]);
+        git(&repo, &["branch", "-D", "feature/remote-only"]);
+
+        (dir, repo)
+    }
+
+    /// Assert that create_checkout correctly tracks a remote-only branch.
+    ///
+    /// The worktree should end up on the remote branch's commit ("remote-only work"),
+    /// not on main's HEAD ("Initial commit").
+    pub async fn assert_checkout_tracks_remote_branch(
+        mgr: &dyn CheckoutManager,
+        runner: &Arc<dyn CommandRunner>,
+        repo_path: &Path,
+    ) {
+        let (wt_path, checkout) = mgr
+            .create_checkout(repo_path, "feature/remote-only", true)
+            .await
+            .expect("create_checkout should succeed");
+
+        assert_eq!(checkout.branch, "feature/remote-only");
+        assert!(!checkout.is_trunk);
+
+        let commit = checkout
+            .last_commit
+            .as_ref()
+            .expect("should have commit info");
+        assert_eq!(
+            commit.message, "remote-only work",
+            "checkout should be on the remote branch's commit, not main"
+        );
+
+        // Verify via direct git command through the runner
+        let label = ChannelLabel::Command("verify-commit".into());
+        let log_output = runner
+            .run("git", &["log", "-1", "--format=%s"], &wt_path, &label)
+            .await
+            .expect("git log should succeed");
+        assert_eq!(
+            log_output.trim(),
+            "remote-only work",
+            "worktree HEAD should be the remote branch's tip"
+        );
+    }
+}
