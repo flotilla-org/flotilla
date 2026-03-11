@@ -152,7 +152,7 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
         }
     }
 
-    // Sibling or descendant of sibling (same parent directory as repo root)
+    // Sibling or descendant of sibling (shares repo name prefix in first component)
     if let Some(root_parent) = repo_root.parent() {
         if let Ok(rel) = path.strip_prefix(root_parent) {
             let rel_str = rel.to_string_lossy();
@@ -160,19 +160,23 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
                 .file_name()
                 .map(|n| n.to_string_lossy())
                 .unwrap_or_default();
-            // Strip repo name prefix to get the suffix
-            // e.g. "flotilla.quick-wins" -> ".quick-wins"
-            // e.g. "flotilla.quick-wins/.claude/worktrees/agent-x" -> ".quick-wins/.claude/worktrees/agent-x"
-            let suffix = rel_str.strip_prefix(root_name.as_ref()).unwrap_or(&rel_str);
-            // If nested under a sibling (contains '/'), strip the sibling dir
-            // and show only the sub-path with extra indentation.
-            // e.g. ".quick-wins/.claude/worktrees/agent-x" -> ".claude/worktrees/agent-x"
-            let (name, extra_indent) = match suffix.find('/') {
-                Some(pos) => (&suffix[pos + 1..], padding + 2),
-                None => (suffix, padding),
-            };
-            let p = extra_indent.min(col_width / 2);
-            return format!("{:p$}{name}", "");
+            // Only handle paths whose first component starts with the repo name
+            // (e.g. "flotilla.quick-wins/..." but not "unrelated/...")
+            if rel_str.starts_with(root_name.as_ref()) {
+                // Strip repo name prefix to get the suffix
+                // e.g. "flotilla.quick-wins" -> ".quick-wins"
+                // e.g. "flotilla.quick-wins/.claude/worktrees/agent-x" -> ".quick-wins/.claude/worktrees/agent-x"
+                let suffix = rel_str.strip_prefix(root_name.as_ref()).unwrap_or(&rel_str);
+                // If nested under a sibling (contains '/'), strip the sibling dir
+                // and show only the sub-path with extra indentation.
+                // e.g. ".quick-wins/.claude/worktrees/agent-x" -> ".claude/worktrees/agent-x"
+                let (name, extra_indent) = match suffix.find('/') {
+                    Some(pos) => (&suffix[pos + 1..], padding + 2),
+                    None => (suffix, padding),
+                };
+                let p = extra_indent.min(col_width / 2);
+                return format!("{:p$}{name}", "");
+            }
         }
     }
 
@@ -468,9 +472,10 @@ mod tests {
 
     #[test]
     fn shorten_path_sibling_different_name() {
+        // Sibling with a different name prefix is not a related worktree
         let root = Path::new("/dev/flotilla");
         let wt = Path::new("/dev/other-project");
-        assert_eq!(shorten_path(wt, root, 40), "     other-project");
+        assert_eq!(shorten_path(wt, root, 40), "/dev/other-project");
     }
 
     #[test]
@@ -493,6 +498,14 @@ mod tests {
             shorten_path(wt, root, 60),
             "       .claude/worktrees/agent-abc"
         );
+    }
+
+    #[test]
+    fn shorten_path_unrelated_under_same_parent() {
+        // Unrelated directory under the same parent should NOT be treated as sibling
+        let root = Path::new("/dev/flotilla");
+        let other = Path::new("/dev/unrelated/sub");
+        assert_eq!(shorten_path(other, root, 40), "/dev/unrelated/sub");
     }
 
     #[test]
