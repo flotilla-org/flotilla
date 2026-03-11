@@ -773,9 +773,25 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
 
         if info.has_uncommitted {
             lines.push(Line::from(Span::styled(
-                "  ⚠ Has uncommitted changes",
+                format!("  ⚠ {} uncommitted file(s):", info.uncommitted_files.len()),
                 Style::default().fg(Color::Red).bold(),
             )));
+            let max_display = 10;
+            for file_line in info.uncommitted_files.iter().take(max_display) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", file_line),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            if info.uncommitted_files.len() > max_display {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    ...and {} more",
+                        info.uncommitted_files.len() - max_display
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
 
         if let Some(warning) = &info.base_detection_warning {
