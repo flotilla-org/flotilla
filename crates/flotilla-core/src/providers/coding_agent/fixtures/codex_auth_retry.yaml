@@ -1,0 +1,30 @@
+interactions:
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/environments/by-repo/github/owner/repo"
+  request_headers:
+    authorization: "Bearer expired-token"
+  status: 401
+  response_body: '{"error":"unauthorized"}'
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/environments/by-repo/github/owner/repo"
+  request_headers:
+    authorization: "Bearer fresh-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: '[{"id":"env-1"}]'
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/tasks/list?task_filter=current&limit=20&environment_id=env-1"
+  request_headers:
+    authorization: "Bearer fresh-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: >-
+    {"items":[
+      {"id":"task_1","title":"Test","updated_at":1710000000.0,
+       "task_status_display":{"branch_name":"feat-test",
+         "latest_turn_status_display":{"turn_status":"completed"}},
+       "pull_requests":null}
+    ]}
