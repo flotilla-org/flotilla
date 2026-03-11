@@ -331,6 +331,7 @@ mod tests {
         async fn execute(
             &self,
             _request: reqwest::Request,
+            _label: &crate::providers::ChannelLabel,
         ) -> Result<http::Response<bytes::Bytes>, String> {
             Err("mock: not called".into())
         }

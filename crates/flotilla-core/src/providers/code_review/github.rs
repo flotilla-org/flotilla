@@ -394,8 +394,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("empty.yaml");
         std::fs::write(&path, "interactions: []\n").expect("write fixture");
-        let session = replay::ReplaySession::from_file(&path, Masks::new());
-        let (api, runner) = build_api_and_runner(&session, false);
+        let session = replay::Session::replaying(&path, Masks::new());
+        let (api, runner) = build_api_and_runner(&session);
         GitHubCodeReview::new("github".into(), "owner/repo".into(), api, runner)
     }
 
