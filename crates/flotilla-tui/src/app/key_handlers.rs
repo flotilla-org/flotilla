@@ -24,6 +24,7 @@ impl App {
                 }
                 UiMode::Help => {
                     self.ui.mode = UiMode::Normal;
+                    self.ui.help_scroll = 0;
                     return;
                 }
                 _ => {}
@@ -31,11 +32,19 @@ impl App {
         }
 
         match self.ui.mode {
-            UiMode::Help => {
-                if key.code == KeyCode::Esc {
+            UiMode::Help => match key.code {
+                KeyCode::Esc => {
                     self.ui.mode = UiMode::Normal;
+                    self.ui.help_scroll = 0;
                 }
-            }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.ui.help_scroll = self.ui.help_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1);
+                }
+                _ => {}
+            },
             UiMode::DeleteConfirm { .. } => self.handle_delete_confirm_key(key),
             UiMode::ActionMenu { .. } => self.handle_menu_key(key),
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),

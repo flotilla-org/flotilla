@@ -888,8 +888,23 @@ fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         Line::from("  q / Esc          Quit"),
     ];
 
+    let total_lines = help_text.len() as u16;
+    let inner_height = area.height.saturating_sub(2); // borders
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let scroll = ui.help_scroll.min(max_scroll);
+
+    let has_more_below = scroll < max_scroll;
+    let has_more_above = scroll > 0;
+    let title = match (has_more_above, has_more_below) {
+        (true, true) => " Help ↑↓ ",
+        (false, true) => " Help ↓ ",
+        (true, false) => " Help ↑ ",
+        (false, false) => " Help ",
+    };
+
     let paragraph = Paragraph::new(help_text)
-        .block(Block::bordered().title(" Help "))
+        .block(Block::bordered().title(title))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
