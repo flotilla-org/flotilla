@@ -1952,4 +1952,95 @@ rounds:
             session.assert_complete();
         }
     }
+
+    #[tokio::test]
+    async fn concurrent_same_subcommand_with_task_id() {
+        use super::super::TaskId;
+
+        let yaml = r#"
+rounds:
+- interactions:
+  - channel: command
+    label: trunk-ab
+    cmd: git
+    args: ["rev-list", "--left-right", "--count", "HEAD...main"]
+    cwd: /test
+    stdout: "2\t3"
+    exit_code: 0
+  - channel: command
+    label: remote-ab
+    cmd: git
+    args: ["rev-list", "--left-right", "--count", "HEAD...origin/feature"]
+    cwd: /test
+    stdout: "0\t5"
+    exit_code: 0
+"#;
+        let session = Session::replaying_from_str(yaml, Masks::new());
+        let runner = Arc::new(ReplayRunner::new(session.clone()));
+        let cwd = Path::new("/test");
+
+        // Consume in REVERSE order — works because TaskId puts them on different channels
+        let (remote, trunk) = tokio::join!(
+            async {
+                run!(
+                    runner,
+                    "git",
+                    &[
+                        "rev-list",
+                        "--left-right",
+                        "--count",
+                        "HEAD...origin/feature"
+                    ],
+                    cwd,
+                    TaskId("remote-ab")
+                )
+            },
+            async {
+                run!(
+                    runner,
+                    "git",
+                    &["rev-list", "--left-right", "--count", "HEAD...main"],
+                    cwd,
+                    TaskId("trunk-ab")
+                )
+            },
+        );
+
+        assert_eq!(remote.unwrap().trim(), "0\t5");
+        assert_eq!(trunk.unwrap().trim(), "2\t3");
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_subcommands_default_labeler() {
+        let yaml = r#"
+rounds:
+- interactions:
+  - channel: command
+    cmd: git
+    args: ["status", "--porcelain"]
+    cwd: /test
+    stdout: "M file.txt"
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args: ["log", "-1", "--format=%h\t%s"]
+    cwd: /test
+    stdout: "abc1234\tcommit msg"
+    exit_code: 0
+"#;
+        let session = Session::replaying_from_str(yaml, Masks::new());
+        let runner = Arc::new(ReplayRunner::new(session.clone()));
+        let cwd = Path::new("/test");
+
+        // Consume in reverse order — works because "git status" and "git log" are different channels
+        let (log, status) = tokio::join!(
+            async { run!(runner, "git", &["log", "-1", "--format=%h\t%s"], cwd) },
+            async { run!(runner, "git", &["status", "--porcelain"], cwd) },
+        );
+
+        assert_eq!(log.unwrap().trim(), "abc1234\tcommit msg");
+        assert_eq!(status.unwrap().trim(), "M file.txt");
+        session.finish();
+    }
 }
