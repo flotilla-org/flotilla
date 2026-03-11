@@ -1,6 +1,6 @@
 use crate::providers::github_api::{clamp_per_page, GhApi};
 use crate::providers::types::*;
-use crate::providers::CommandRunner;
+use crate::providers::{gh_api_get, run, CommandRunner};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
@@ -135,7 +135,7 @@ impl super::CodeReview for GitHubCodeReview {
             "repos/{}/pulls?state=open&per_page={}",
             self.repo_slug, per_page
         );
-        let body = self.api.get(&endpoint, repo_root).await?;
+        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
@@ -168,7 +168,7 @@ impl super::CodeReview for GitHubCodeReview {
         id: &str,
     ) -> Result<(String, ChangeRequest), String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
-        let body = self.api.get(&endpoint, repo_root).await?;
+        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         let number = v["number"].as_i64().ok_or("missing number")?;
@@ -193,9 +193,7 @@ impl super::CodeReview for GitHubCodeReview {
     }
 
     async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        self.runner
-            .run("gh", &["pr", "view", id, "--web"], repo_root)
-            .await?;
+        run!(self.runner, "gh", &["pr", "view", id, "--web"], repo_root)?;
         Ok(())
     }
 
@@ -209,7 +207,7 @@ impl super::CodeReview for GitHubCodeReview {
             "repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}",
             self.repo_slug, per_page
         );
-        let body = self.api.get(&endpoint, repo_root).await?;
+        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
@@ -247,43 +245,27 @@ mod tests {
     }
 
     fn build_api_and_runner(
-        session: &replay::ReplaySession,
-        recording: bool,
+        session: &replay::Session,
     ) -> (
         Arc<dyn crate::providers::github_api::GhApi>,
         Arc<dyn crate::providers::CommandRunner>,
     ) {
-        if recording {
-            let real_runner = Arc::new(crate::providers::ProcessCommandRunner)
-                as Arc<dyn crate::providers::CommandRunner>;
-            let real_api = Arc::new(crate::providers::github_api::GhApiClient::new(
-                real_runner.clone(),
-            ));
-            (
-                Arc::new(replay::RecordingGhApi::new(session.clone(), real_api))
-                    as Arc<dyn crate::providers::github_api::GhApi>,
-                real_runner,
-            )
-        } else {
-            (
-                Arc::new(session.gh_api()) as Arc<dyn crate::providers::github_api::GhApi>,
-                Arc::new(session.command_runner()) as Arc<dyn crate::providers::CommandRunner>,
-            )
-        }
+        let runner = replay::test_runner(session);
+        let api = replay::test_gh_api(session);
+        (api, runner)
     }
 
     #[tokio::test]
     async fn record_replay_list_change_requests() {
-        let recording = replay::is_recording();
         let repo_slug = "rjwittams/flotilla".to_string();
-        let repo_root = if recording {
+
+        let session = replay::test_session(&fixture("github_prs.yaml"), Masks::new());
+        let repo_root = if session.is_recording() {
             repo_root_for_recording()
         } else {
             PathBuf::from("/test/repo")
         };
-
-        let session = replay::test_session(&fixture("github_prs.yaml"), Masks::new());
-        let (api, runner) = build_api_and_runner(&session, recording);
+        let (api, runner) = build_api_and_runner(&session);
 
         let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
         let prs = provider
@@ -303,16 +285,15 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_list_merged_branch_names() {
-        let recording = replay::is_recording();
         let repo_slug = "rjwittams/flotilla".to_string();
-        let repo_root = if recording {
+
+        let session = replay::test_session(&fixture("github_merged.yaml"), Masks::new());
+        let repo_root = if session.is_recording() {
             repo_root_for_recording()
         } else {
             PathBuf::from("/test/repo")
         };
-
-        let session = replay::test_session(&fixture("github_merged.yaml"), Masks::new());
-        let (api, runner) = build_api_and_runner(&session, recording);
+        let (api, runner) = build_api_and_runner(&session);
 
         let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
         let branches = provider
@@ -354,5 +335,162 @@ mod tests {
         }"#;
         let v: serde_json::Value = serde_json::from_str(json).unwrap();
         assert!(v["merged_at"].as_str().is_some());
+    }
+
+    // --- parse_state tests ---
+
+    #[test]
+    fn parse_state_cases() {
+        let cases = [
+            ("OPEN", ChangeRequestStatus::Open),
+            ("DRAFT", ChangeRequestStatus::Draft),
+            ("MERGED", ChangeRequestStatus::Merged),
+            ("CLOSED", ChangeRequestStatus::Closed),
+            ("open", ChangeRequestStatus::Open),
+            ("Merged", ChangeRequestStatus::Merged),
+            ("unknown", ChangeRequestStatus::Open),
+            ("", ChangeRequestStatus::Open),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(GitHubCodeReview::parse_state(input), expected, "{input}");
+        }
+    }
+
+    // --- parse_linked_issues tests ---
+
+    #[test]
+    fn parse_linked_issues_cases() {
+        let cases = [
+            ("Fixes #7", vec!["7"]),
+            ("Closes #42", vec!["42"]),
+            ("Resolves #100", vec!["100"]),
+            ("Fixes #1, Closes #2, Resolves #3", vec!["1", "2", "3"]),
+            ("FIXES #5", vec!["5"]),
+            ("closes #6", vec!["6"]),
+            ("Fixes #7\nCloses #7", vec!["7"]),
+            ("Just a description", vec![]),
+            ("", vec![]),
+            ("Fixes 7", vec![]),
+            (
+                "This PR fixes #12 by updating the parser.\nAlso closes #34.",
+                vec!["12", "34"],
+            ),
+        ];
+        for (input, expected) in cases {
+            let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                GitHubCodeReview::parse_linked_issues(input),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    // --- gh_pr_to_change_request tests ---
+
+    /// Create a `GitHubCodeReview` with empty replay deps (the API/runner
+    /// are never called by `gh_pr_to_change_request`).
+    fn provider_with_empty_replay() -> GitHubCodeReview {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("empty.yaml");
+        std::fs::write(&path, "interactions: []\n").expect("write fixture");
+        let session = replay::Session::replaying(&path, Masks::new());
+        let (api, runner) = build_api_and_runner(&session);
+        GitHubCodeReview::new("github".into(), "owner/repo".into(), api, runner)
+    }
+
+    fn gh_pr(number: i64) -> GhPr {
+        GhPr {
+            number,
+            title: "Add feature".into(),
+            head_ref_name: "feat/add-feature".into(),
+            state: "OPEN".into(),
+            body: None,
+            is_draft: false,
+        }
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_basic() {
+        let provider = provider_with_empty_replay();
+        let mut pr = gh_pr(42);
+        pr.body = Some("Fixes #7".into());
+        let (id, cr) = provider.gh_pr_to_change_request(&pr);
+        assert_eq!(id, "42");
+        assert_eq!(cr.title, "Add feature");
+        assert_eq!(cr.branch, "feat/add-feature");
+        assert_eq!(cr.status, ChangeRequestStatus::Open);
+        assert!(cr
+            .correlation_keys
+            .contains(&CorrelationKey::Branch("feat/add-feature".into())));
+        assert!(cr
+            .correlation_keys
+            .contains(&CorrelationKey::ChangeRequestRef(
+                "github".into(),
+                "42".into()
+            )));
+        assert!(cr
+            .association_keys
+            .contains(&AssociationKey::IssueRef("github".into(), "7".into())));
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_draft_overrides_open() {
+        let provider = provider_with_empty_replay();
+        let mut pr = gh_pr(10);
+        pr.title = "WIP".into();
+        pr.head_ref_name = "wip-branch".into();
+        pr.is_draft = true;
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        assert_eq!(cr.status, ChangeRequestStatus::Draft);
+        assert!(cr.association_keys.is_empty());
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_merged_not_affected_by_draft() {
+        let provider = provider_with_empty_replay();
+        let mut pr = gh_pr(20);
+        pr.title = "Done".into();
+        pr.head_ref_name = "done-branch".into();
+        pr.state = "MERGED".into();
+        pr.is_draft = true;
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        assert_eq!(cr.status, ChangeRequestStatus::Merged);
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_issues_from_title_and_body() {
+        let provider = provider_with_empty_replay();
+        let mut pr = gh_pr(30);
+        pr.title = "Fixes #1".into();
+        pr.head_ref_name = "fix".into();
+        pr.body = Some("Also closes #2".into());
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        assert!(cr
+            .association_keys
+            .contains(&AssociationKey::IssueRef("github".into(), "1".into())));
+        assert!(cr
+            .association_keys
+            .contains(&AssociationKey::IssueRef("github".into(), "2".into())));
+    }
+
+    #[test]
+    fn gh_pr_to_change_request_deduplicates_issues_across_title_and_body() {
+        let provider = provider_with_empty_replay();
+        let mut pr = gh_pr(31);
+        pr.title = "Fixes #5".into();
+        pr.head_ref_name = "fix".into();
+        pr.body = Some("Closes #5".into());
+        let (_, cr) = provider.gh_pr_to_change_request(&pr);
+        let issue_refs: Vec<_> = cr
+            .association_keys
+            .iter()
+            .filter(|k| matches!(k, AssociationKey::IssueRef(_, _)))
+            .collect();
+        assert_eq!(
+            issue_refs.len(),
+            1,
+            "same issue from title and body should deduplicate"
+        );
     }
 }

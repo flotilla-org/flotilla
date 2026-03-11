@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::providers::types::*;
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 pub struct GitVcs {
     runner: Arc<dyn CommandRunner>,
@@ -65,14 +65,12 @@ impl super::Vcs for GitVcs {
     }
 
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
-        let output = self
-            .runner
-            .run(
-                "git",
-                &["branch", "--list", "--format=%(refname:short)"],
-                repo_root,
-            )
-            .await?;
+        let output = run!(
+            self.runner,
+            "git",
+            &["branch", "--list", "--format=%(refname:short)"],
+            repo_root
+        )?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -86,19 +84,17 @@ impl super::Vcs for GitVcs {
 
     async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String> {
         // Check if any remote exists; return empty if not (local-only repo).
-        let remotes = self
-            .runner
-            .run("git", &["remote"], repo_root)
-            .await
-            .unwrap_or_default();
+        let remotes = run!(self.runner, "git", &["remote"], repo_root).unwrap_or_default();
         if remotes.trim().is_empty() {
             return Ok(vec![]);
         }
         let remote = remotes.lines().next().unwrap_or("origin");
-        let output = self
-            .runner
-            .run("git", &["ls-remote", "--heads", remote], repo_root)
-            .await?;
+        let output = run!(
+            self.runner,
+            "git",
+            &["ls-remote", "--heads", remote],
+            repo_root
+        )?;
         // Output format: "<sha>\trefs/heads/<branch>"
         Ok(output
             .lines()
@@ -118,10 +114,12 @@ impl super::Vcs for GitVcs {
         limit: usize,
     ) -> Result<Vec<CommitInfo>, String> {
         let limit_arg = format!("-{}", limit);
-        let output = self
-            .runner
-            .run("git", &["log", branch, "--oneline", &limit_arg], repo_root)
-            .await?;
+        let output = run!(
+            self.runner,
+            "git",
+            &["log", branch, "--oneline", &limit_arg],
+            repo_root
+        )?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -141,14 +139,12 @@ impl super::Vcs for GitVcs {
         reference: &str,
     ) -> Result<AheadBehind, String> {
         let range = format!("{}...{}", branch, reference);
-        let output = self
-            .runner
-            .run(
-                "git",
-                &["rev-list", "--count", "--left-right", &range],
-                repo_root,
-            )
-            .await?;
+        let output = run!(
+            self.runner,
+            "git",
+            &["rev-list", "--count", "--left-right", &range],
+            repo_root
+        )?;
         let trimmed = output.trim();
         let mut parts = trimmed.split('\t');
         let ahead: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -161,10 +157,12 @@ impl super::Vcs for GitVcs {
         _repo_root: &Path,
         checkout_path: &Path,
     ) -> Result<WorkingTreeStatus, String> {
-        let output = self
-            .runner
-            .run("git", &["status", "--porcelain"], checkout_path)
-            .await?;
+        let output = run!(
+            self.runner,
+            "git",
+            &["status", "--porcelain"],
+            checkout_path
+        )?;
         Ok(super::parse_porcelain_status(&output))
     }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::providers::types::*;
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 const CMUX_BIN: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";
 
@@ -19,10 +19,7 @@ impl CmuxWorkspaceManager {
     }
 
     async fn cmux_cmd(&self, args: &[&str]) -> Result<String, String> {
-        self.runner
-            .run(CMUX_BIN, args, Path::new("."))
-            .await
-            .map(|s| s.trim().to_string())
+        run!(self.runner, CMUX_BIN, args, Path::new(".")).map(|s| s.trim().to_string())
     }
 
     /// Shell-quote a string with single quotes, escaping embedded single quotes.

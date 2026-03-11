@@ -6,7 +6,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-use flotilla_protocol::{Command, DaemonEvent, RepoInfo, RepoLabels, Snapshot, WorkItem};
+use flotilla_protocol::{
+    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot,
+    SnapshotDelta, WorkItem,
+};
 use tokio::sync::broadcast;
 use tui_input::Input;
 
@@ -79,6 +82,45 @@ pub(crate) fn stub_app_with_repos(count: usize) -> App {
         })
         .collect();
     stub_app_with_repo_infos(repos_info)
+}
+
+pub(crate) fn active_repo_path(app: &App) -> PathBuf {
+    app.model.repo_order[app.model.active_repo].clone()
+}
+
+pub(crate) fn provider_error(category: &str, provider: &str, message: &str) -> ProviderError {
+    ProviderError {
+        category: category.into(),
+        provider: provider.into(),
+        message: message.into(),
+    }
+}
+
+pub(crate) fn snapshot(repo: &Path) -> Snapshot {
+    Snapshot {
+        seq: 1,
+        repo: repo.to_path_buf(),
+        work_items: vec![],
+        providers: ProviderData::default(),
+        provider_health: HashMap::new(),
+        errors: vec![],
+        issue_total: None,
+        issue_has_more: false,
+        issue_search_results: None,
+    }
+}
+
+pub(crate) fn delta(repo: &Path, changes: Vec<Change>) -> SnapshotDelta {
+    SnapshotDelta {
+        seq: 2,
+        prev_seq: 1,
+        repo: repo.to_path_buf(),
+        changes,
+        work_items: vec![],
+        issue_total: None,
+        issue_has_more: false,
+        issue_search_results: None,
+    }
 }
 
 pub(crate) fn default_repo_model(labels: RepoLabels) -> TuiRepoModel {

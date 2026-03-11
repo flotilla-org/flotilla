@@ -15,6 +15,72 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+/// Identifies the logical channel an interaction belongs to.
+/// Within a replay round, interactions on the same channel are FIFO-ordered,
+/// while different channels can be consumed in any order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ChannelLabel {
+    Command(String),
+    GhApi(String),
+    Http(String),
+}
+
+impl ChannelLabel {
+    /// Extract host from a URL via simple string parsing.
+    /// "https://api.example.com/v1/foo" → "api.example.com"
+    pub fn http_from_url(url: &str) -> Self {
+        let host = url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split('/')
+            .next()
+            .unwrap_or(url)
+            .split(':')
+            .next()
+            .unwrap_or(url)
+            .to_string();
+        ChannelLabel::Http(host)
+    }
+}
+
+/// Request-side data passed to channel labeling strategies.
+pub enum ChannelRequest<'a> {
+    Command { cmd: &'a str, args: &'a [&'a str] },
+    GhApi { method: &'a str, endpoint: &'a str },
+    Http { method: &'a str, url: &'a str },
+}
+
+#[allow(clippy::wrong_self_convention)]
+pub trait IntoChannelLabel {
+    fn into_channel_label(&self, request: &ChannelRequest) -> ChannelLabel;
+}
+
+pub struct DefaultLabeler;
+impl IntoChannelLabel for DefaultLabeler {
+    fn into_channel_label(&self, request: &ChannelRequest) -> ChannelLabel {
+        match request {
+            ChannelRequest::Command { cmd, args } => match args.first() {
+                Some(sub) if !sub.is_empty() => ChannelLabel::Command(format!("{} {}", cmd, sub)),
+                _ => ChannelLabel::Command(cmd.to_string()),
+            },
+            ChannelRequest::GhApi { endpoint, .. } => ChannelLabel::GhApi(endpoint.to_string()),
+            ChannelRequest::Http { url, .. } => ChannelLabel::http_from_url(url),
+        }
+    }
+}
+
+pub struct TaskId(pub &'static str);
+impl IntoChannelLabel for TaskId {
+    fn into_channel_label(&self, request: &ChannelRequest) -> ChannelLabel {
+        match request {
+            ChannelRequest::Command { .. } => ChannelLabel::Command(self.0.into()),
+            ChannelRequest::GhApi { .. } => ChannelLabel::GhApi(self.0.into()),
+            ChannelRequest::Http { .. } => ChannelLabel::Http(self.0.into()),
+        }
+    }
+}
+
 /// Raw output from a command, preserving stdout/stderr regardless of exit status.
 pub struct CommandOutput {
     pub stdout: String,
@@ -27,7 +93,13 @@ pub struct CommandOutput {
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run a command and return stdout on success, stderr on failure.
-    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String>;
+    async fn run(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<String, String>;
 
     /// Run a command and return full output regardless of exit status.
     /// `Err` only if the process could not be spawned at all.
@@ -36,6 +108,7 @@ pub trait CommandRunner: Send + Sync {
         cmd: &str,
         args: &[&str],
         cwd: &Path,
+        label: &ChannelLabel,
     ) -> Result<CommandOutput, String>;
 
     /// Check if a command is available by running it.
@@ -47,7 +120,13 @@ pub struct ProcessCommandRunner;
 
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
-    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+    async fn run(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<String, String> {
         let output = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
@@ -67,6 +146,7 @@ impl CommandRunner for ProcessCommandRunner {
         cmd: &str,
         args: &[&str],
         cwd: &Path,
+        _label: &ChannelLabel,
     ) -> Result<CommandOutput, String> {
         let output = tokio::process::Command::new(cmd)
             .args(args)
@@ -95,6 +175,135 @@ impl CommandRunner for ProcessCommandRunner {
     }
 }
 
+macro_rules! run {
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __request = $crate::providers::ChannelRequest::Command {
+            cmd: __cmd,
+            args: __args,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__request);
+        $runner.run(__cmd, __args, $cwd, &__label).await
+    }};
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __request = $crate::providers::ChannelRequest::Command {
+            cmd: __cmd,
+            args: __args,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        $runner.run(__cmd, __args, $cwd, &__label).await
+    }};
+}
+pub(crate) use run;
+
+macro_rules! run_output {
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __request = $crate::providers::ChannelRequest::Command {
+            cmd: __cmd,
+            args: __args,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__request);
+        $runner.run_output(__cmd, __args, $cwd, &__label).await
+    }};
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __request = $crate::providers::ChannelRequest::Command {
+            cmd: __cmd,
+            args: __args,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        $runner.run_output(__cmd, __args, $cwd, &__label).await
+    }};
+}
+pub(crate) use run_output;
+
+/// Macro that calls `GhApi::get`, auto-deriving the channel label from the endpoint.
+macro_rules! gh_api_get {
+    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__request);
+        $api.get(__endpoint, $repo_root, &__label).await
+    }};
+    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        $api.get(__endpoint, $repo_root, &__label).await
+    }};
+}
+pub(crate) use gh_api_get;
+
+/// Macro that calls `GhApi::get_with_headers`, auto-deriving the channel label from the endpoint.
+macro_rules! gh_api_get_with_headers {
+    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__request);
+        $api.get_with_headers(__endpoint, $repo_root, &__label)
+            .await
+    }};
+    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        $api.get_with_headers(__endpoint, $repo_root, &__label)
+            .await
+    }};
+}
+pub(crate) use gh_api_get_with_headers;
+
+/// Macro that calls `HttpClient::execute`, auto-deriving the channel label from the request.
+macro_rules! http_execute {
+    ($http:expr, $request:expr, $labeler:expr $(,)?) => {{
+        let __request = $request;
+        let __chan_request = $crate::providers::ChannelRequest::Http {
+            method: __request.method().as_str(),
+            url: __request.url().as_str(),
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__chan_request);
+        $http.execute(__request, &__label).await
+    }};
+    ($http:expr, $request:expr $(,)?) => {{
+        let __request = $request;
+        let __chan_request = $crate::providers::ChannelRequest::Http {
+            method: __request.method().as_str(),
+            url: __request.url().as_str(),
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__chan_request);
+        $http.execute(__request, &__label).await
+    }};
+}
+pub(crate) use http_execute;
+
 /// Trait abstracting HTTP request execution so providers can be tested
 /// without making real network calls.
 ///
@@ -106,6 +315,7 @@ pub trait HttpClient: Send + Sync {
     async fn execute(
         &self,
         request: reqwest::Request,
+        label: &ChannelLabel,
     ) -> Result<http::Response<bytes::Bytes>, String>;
 }
 
@@ -133,6 +343,7 @@ impl HttpClient for ReqwestHttpClient {
     async fn execute(
         &self,
         request: reqwest::Request,
+        _label: &ChannelLabel,
     ) -> Result<http::Response<bytes::Bytes>, String> {
         let resp = self
             .client
@@ -194,7 +405,13 @@ pub mod testing {
 
     #[async_trait]
     impl CommandRunner for MockRunner {
-        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path) -> Result<String, String> {
+        async fn run(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+        ) -> Result<String, String> {
             self.responses
                 .lock()
                 .unwrap()
@@ -207,8 +424,9 @@ pub mod testing {
             cmd: &str,
             args: &[&str],
             cwd: &Path,
+            label: &ChannelLabel,
         ) -> Result<CommandOutput, String> {
-            match self.run(cmd, args, cwd).await {
+            match self.run(cmd, args, cwd, label).await {
                 Ok(stdout) => Ok(CommandOutput {
                     stdout,
                     stderr: String::new(),
@@ -236,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn process_runner_echo() {
         let runner = ProcessCommandRunner;
-        let result = runner.run("echo", &["hello"], &PathBuf::from("/")).await;
+        let result = run!(runner, "echo", &["hello"], &PathBuf::from("/"));
         assert_eq!(result.unwrap().trim(), "hello");
     }
 

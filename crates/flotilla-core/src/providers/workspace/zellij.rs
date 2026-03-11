@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::providers::types::*;
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ZellijState {
@@ -51,18 +51,13 @@ impl ZellijWorkspaceManager {
         let mut cmd_args = vec!["action"];
         cmd_args.extend_from_slice(args);
 
-        self.runner
-            .run("zellij", &cmd_args, Path::new("."))
-            .await
-            .map(|s| s.trim().to_string())
+        run!(self.runner, "zellij", &cmd_args, Path::new(".")).map(|s| s.trim().to_string())
     }
 
     /// Check that `zellij --version` reports >= 0.40.
     /// Parses output like "zellij 0.42.2".
     pub async fn check_version(runner: &dyn CommandRunner) -> Result<(), String> {
-        let version_str = runner
-            .run("zellij", &["--version"], Path::new("."))
-            .await
+        let version_str = run!(runner, "zellij", &["--version"], Path::new("."))
             .map_err(|e| format!("failed to run zellij --version: {e}"))?
             .trim()
             .to_string();
@@ -603,10 +598,13 @@ mod tests {
         assert_eq!(ws2.name, "fix-456");
 
         // Verify with external command: query tab names through the runner
-        let list_output = runner
-            .run("zellij", &["action", "query-tab-names"], Path::new("."))
-            .await
-            .unwrap();
+        let list_output = run!(
+            runner,
+            "zellij",
+            &["action", "query-tab-names"],
+            Path::new(".")
+        )
+        .unwrap();
         assert!(
             list_output.contains("feat-123"),
             "expected 'feat-123' in tab list: {list_output}"

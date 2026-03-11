@@ -14,7 +14,7 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::terminal::TerminalPool;
 use crate::providers::types::WorkspaceConfig;
 use crate::providers::types::{CloudAgentSession, CorrelationKey};
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 use crate::template::{self, WorkspaceTemplate};
 
 /// Execute a `Command` against the given repo context.
@@ -169,21 +169,20 @@ pub async fn execute(
             issue_ids,
         } => {
             info!(issue_ids = ?issue_ids, %change_request_id, "linking issues to change request");
-            let body_result = runner
-                .run(
-                    "gh",
-                    &[
-                        "pr",
-                        "view",
-                        &change_request_id,
-                        "--json",
-                        "body",
-                        "--jq",
-                        ".body",
-                    ],
-                    repo_root,
-                )
-                .await;
+            let body_result = run!(
+                runner,
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    &change_request_id,
+                    "--json",
+                    "body",
+                    "--jq",
+                    ".body",
+                ],
+                repo_root,
+            );
             match body_result {
                 Ok(current_body) => {
                     let fixes_lines: Vec<String> =
@@ -193,13 +192,12 @@ pub async fn execute(
                     } else {
                         format!("{}\n\n{}", current_body.trim(), fixes_lines.join("\n"))
                     };
-                    let result = runner
-                        .run(
-                            "gh",
-                            &["pr", "edit", &change_request_id, "--body", &new_body],
-                            repo_root,
-                        )
-                        .await;
+                    let result = run!(
+                        runner,
+                        "gh",
+                        &["pr", "edit", &change_request_id, "--body", &new_body],
+                        repo_root,
+                    );
                     match result {
                         Ok(_) => {
                             info!(%change_request_id, "linked issues to change request");
@@ -491,10 +489,7 @@ async fn write_branch_issue_links(
     for (provider, ids) in by_provider {
         let key = format!("branch.{branch}.flotilla.issues.{provider}");
         let value = ids.join(",");
-        if let Err(e) = runner
-            .run("git", &["config", &key, &value], repo_root)
-            .await
-        {
+        if let Err(e) = run!(runner, "git", &["config", &key, &value], repo_root) {
             tracing::warn!(err = %e, "failed to write issue link");
         }
     }

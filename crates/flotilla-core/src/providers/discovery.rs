@@ -1,11 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::{resolve_claude_path, CommandRunner};
+use super::{resolve_claude_path, run, CommandRunner};
 use crate::config::ConfigStore;
 use crate::providers::ai_utility::claude::ClaudeAiUtility;
 use crate::providers::code_review::github::GitHubCodeReview;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
+use crate::providers::coding_agent::codex::CodexCodingAgent;
 use crate::providers::coding_agent::cursor::CursorCodingAgent;
 use crate::providers::github_api::GhApiClient;
 use crate::providers::issue_tracker::github::GitHubIssueTracker;
@@ -23,24 +24,26 @@ use tracing::{debug, info, warn};
 /// Runs `git rev-parse --abbrev-ref @{upstream}` to find the tracking ref
 /// (e.g. `origin/main`), then splits on `/` to extract the remote name.
 async fn tracking_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Option<String> {
-    let upstream = runner
-        .run(
-            "git",
-            &["rev-parse", "--abbrev-ref", "@{upstream}"],
-            repo_root,
-        )
-        .await
-        .ok()?;
+    let upstream = run!(
+        runner,
+        "git",
+        &["rev-parse", "--abbrev-ref", "@{upstream}"],
+        repo_root,
+    )
+    .ok()?;
     let upstream = upstream.trim();
     // upstream looks like "origin/main" — the remote name is the first segment
     let remote_name = upstream.split('/').next()?;
     if remote_name.is_empty() {
         return None;
     }
-    let url = runner
-        .run("git", &["remote", "get-url", remote_name], repo_root)
-        .await
-        .ok()?;
+    let url = run!(
+        runner,
+        "git",
+        &["remote", "get-url", remote_name],
+        repo_root
+    )
+    .ok()?;
     let url = url.trim().to_string();
     if url.is_empty() {
         return None;
@@ -62,7 +65,7 @@ pub async fn first_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> O
     }
 
     // Get the list of remotes for steps 2 and 3
-    let remotes_output = runner.run("git", &["remote"], repo_root).await.ok()?;
+    let remotes_output = run!(runner, "git", &["remote"], repo_root).ok()?;
     let remotes: Vec<&str> = remotes_output
         .lines()
         .map(|l| l.trim())
@@ -71,10 +74,7 @@ pub async fn first_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> O
 
     // 2. Prefer "origin" if it exists
     if remotes.contains(&"origin") {
-        if let Ok(url) = runner
-            .run("git", &["remote", "get-url", "origin"], repo_root)
-            .await
-        {
+        if let Ok(url) = run!(runner, "git", &["remote", "get-url", "origin"], repo_root) {
             let url = url.trim().to_string();
             if !url.is_empty() {
                 debug!(%url, "using origin remote");
@@ -85,10 +85,7 @@ pub async fn first_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> O
 
     // 3. Fall back to first remote with a valid URL
     for remote in &remotes {
-        if let Ok(url) = runner
-            .run("git", &["remote", "get-url", remote], repo_root)
-            .await
-        {
+        if let Ok(url) = run!(runner, "git", &["remote", "get-url", remote], repo_root) {
             let url = url.trim().to_string();
             if !url.is_empty() {
                 debug!(%remote, "using first available remote as fallback");
@@ -258,6 +255,18 @@ pub async fn detect_providers(
         info!(%repo_name, "Cloud agent → Cursor Cloud Agents");
     }
 
+    // 4b. Cloud agent: Codex (gated on auth file, not binary — provider uses API directly)
+    if super::coding_agent::codex::codex_auth_file_exists() {
+        registry.cloud_agents.insert(
+            "codex".to_string(),
+            Arc::new(CodexCodingAgent::new(
+                "codex".to_string(),
+                Arc::new(crate::providers::ReqwestHttpClient::new()),
+            )),
+        );
+        info!(%repo_name, "Cloud agent → Codex");
+    }
+
     // 5. Cloud agent: Claude Code Web & AI utility
     if let Some(claude_bin) = resolve_claude_path(&*runner).await {
         registry.cloud_agents.insert(
@@ -408,7 +417,13 @@ mod tests {
 
     #[async_trait]
     impl CommandRunner for DiscoveryMockRunner {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+        async fn run(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            _label: &super::super::ChannelLabel,
+        ) -> Result<String, String> {
             self.seen_cwds.lock().unwrap().push(cwd.to_path_buf());
             let key = (cmd.to_string(), args.join(" "));
             let mut map = self.responses.lock().unwrap();
@@ -428,8 +443,9 @@ mod tests {
             cmd: &str,
             args: &[&str],
             cwd: &Path,
+            label: &super::super::ChannelLabel,
         ) -> Result<super::super::CommandOutput, String> {
-            match self.run(cmd, args, cwd).await {
+            match self.run(cmd, args, cwd, label).await {
                 Ok(stdout) => Ok(super::super::CommandOutput {
                     stdout,
                     stderr: String::new(),
@@ -941,6 +957,55 @@ mod tests {
         let (registry, _) = detect_providers(&repo, &config, runner_dyn).await;
         assert!(!registry.checkout_managers.is_empty());
         assert_eq!(runner.exists_call_count("wt"), 1);
+    }
+
+    #[tokio::test]
+    async fn detect_providers_codex_registration_depends_on_auth_file() {
+        let _lock = crate::providers::coding_agent::codex::CODEX_TEST_LOCK
+            .lock()
+            .await;
+
+        // With auth.json present → registered
+        let codex_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            codex_dir.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t","account_id":"a"}}"#,
+        )
+        .unwrap();
+        std::env::set_var("CODEX_HOME", codex_dir.path());
+        {
+            let (dir, repo) = make_repo_with_git_dir();
+            let config = temp_config(&dir);
+            let runner: Arc<dyn CommandRunner> = Arc::new(
+                discovery_runner()
+                    .on_run("git", &["remote"], Err("no remotes".to_string()))
+                    .tool_exists("wt", false)
+                    .tool_exists("gh", false)
+                    .tool_exists("claude", false)
+                    .build(),
+            );
+            let (registry, _) = detect_providers(&repo, &config, runner).await;
+            assert!(registry.cloud_agents.contains_key("codex"));
+        }
+
+        // Without auth.json → not registered
+        std::fs::remove_file(codex_dir.path().join("auth.json")).unwrap();
+        {
+            let (dir, repo) = make_repo_with_git_dir();
+            let config = temp_config(&dir);
+            let runner: Arc<dyn CommandRunner> = Arc::new(
+                discovery_runner()
+                    .on_run("git", &["remote"], Err("no remotes".to_string()))
+                    .tool_exists("wt", false)
+                    .tool_exists("gh", false)
+                    .tool_exists("claude", false)
+                    .build(),
+            );
+            let (registry, _) = detect_providers(&repo, &config, runner).await;
+            assert!(!registry.cloud_agents.contains_key("codex"));
+        }
+
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[tokio::test]

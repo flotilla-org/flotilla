@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 pub struct ClaudeAiUtility {
     claude_bin: String,
@@ -29,11 +29,12 @@ impl super::AiUtility for ClaudeAiUtility {
              Output ONLY the branch name, nothing else. Use kebab-case: {context}"
         );
 
-        match self
-            .runner
-            .run(&self.claude_bin, &["-p", &prompt], Path::new("."))
-            .await
-        {
+        match run!(
+            self.runner,
+            &self.claude_bin,
+            &["-p", &prompt],
+            Path::new(".")
+        ) {
             Ok(output) => {
                 let branch = output
                     .trim()

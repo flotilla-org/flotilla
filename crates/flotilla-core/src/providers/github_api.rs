@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::providers::CommandRunner;
+use crate::providers::{run_output, ChannelLabel, CommandRunner};
 
 use async_trait::async_trait;
 
@@ -66,11 +66,17 @@ pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
 
 #[async_trait]
 pub trait GhApi: Send + Sync {
-    async fn get(&self, endpoint: &str, repo_root: &Path) -> Result<String, String>;
+    async fn get(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<String, String>;
     async fn get_with_headers(
         &self,
         endpoint: &str,
         repo_root: &Path,
+        label: &ChannelLabel,
     ) -> Result<GhApiResponse, String>;
 }
 
@@ -100,8 +106,13 @@ impl GhApiClient {
 impl GhApi for GhApiClient {
     /// Fetch a GitHub API endpoint, using cached ETag for conditional requests.
     /// Returns the JSON body (from cache on 304, fresh on 200).
-    async fn get(&self, endpoint: &str, repo_root: &Path) -> Result<String, String> {
-        self.get_with_headers(endpoint, repo_root)
+    async fn get(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<String, String> {
+        self.get_with_headers(endpoint, repo_root, label)
             .await
             .map(|r| r.body)
     }
@@ -110,6 +121,7 @@ impl GhApi for GhApiClient {
         &self,
         endpoint: &str,
         repo_root: &Path,
+        _label: &ChannelLabel,
     ) -> Result<GhApiResponse, String> {
         // Build args
         let cached_etag = {
@@ -129,7 +141,7 @@ impl GhApi for GhApiClient {
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-        let output = self.runner.run_output("gh", &args_refs, repo_root).await?;
+        let output = run_output!(self.runner, "gh", &args_refs, repo_root)?;
 
         // Always parse stdout — gh api --include writes headers even on 304
         let parsed = parse_gh_api_response(&output.stdout);

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use crate::providers::types::*;
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
@@ -142,9 +142,12 @@ pub async fn read_branch_issue_links(
         "branch\\.{}\\.flotilla\\.issues\\.",
         regex_escape_branch(branch)
     );
-    let result = runner
-        .run("git", &["config", "--get-regexp", &pattern], repo_root)
-        .await;
+    let result = run!(
+        runner,
+        "git",
+        &["config", "--get-regexp", &pattern],
+        repo_root
+    );
     match result {
         Ok(output) => parse_issue_config_output(&output),
         Err(_) => Vec::new(),

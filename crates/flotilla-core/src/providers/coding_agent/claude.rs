@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use crate::providers::types::*;
-use crate::providers::{CommandRunner, HttpClient};
+use crate::providers::{http_execute, run, CommandRunner, HttpClient};
 use tracing::{debug, info, warn};
 
 pub struct ClaudeCodingAgent {
@@ -149,19 +149,18 @@ fn session_url_for(base_url: &str, session_id: &str) -> String {
 // ---------- auth helpers ----------
 
 async fn read_oauth_token_from_keychain(runner: &dyn CommandRunner) -> Result<OAuthToken, String> {
-    let output = runner
-        .run(
-            "security",
-            &[
-                "find-generic-password",
-                "-s",
-                "Claude Code-credentials",
-                "-w",
-            ],
-            Path::new("."),
-        )
-        .await
-        .map_err(|_| "No Claude Code credentials in keychain".to_string())?;
+    let output = run!(
+        runner,
+        "security",
+        &[
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ],
+        Path::new("."),
+    )
+    .map_err(|_| "No Claude Code credentials in keychain".to_string())?;
     let json = output.trim();
     let creds: OAuthCredentials = serde_json::from_str(json).map_err(|e| e.to_string())?;
     Ok(creds.claude_ai_oauth)
@@ -236,13 +235,9 @@ impl ClaudeCodingAgent {
 
     async fn fetch_sessions_inner(&self, base_url: &str) -> Result<Vec<WebSession>, String> {
         let token = get_oauth_token(&*self.runner).await?;
-        let request = Self::build_request(
-            "GET",
-            &sessions_url_for(base_url),
-            &token.access_token,
-            None,
-        )?;
-        let resp = self.http.execute(request).await?;
+        let url = sessions_url_for(base_url);
+        let request = Self::build_request("GET", &url, &token.access_token, None)?;
+        let resp = http_execute!(self.http, request)?;
         let status = resp.status().as_u16();
         let body = std::str::from_utf8(resp.body()).map_err(|e| e.to_string())?;
 
@@ -271,13 +266,14 @@ impl ClaudeCodingAgent {
     async fn archive_session_inner(&self, session_id: &str, base_url: &str) -> Result<(), String> {
         info!(%session_id, "archiving session");
         let token = get_oauth_token(&*self.runner).await?;
+        let url = session_url_for(base_url, session_id);
         let request = Self::build_request(
             "PATCH",
-            &session_url_for(base_url, session_id),
+            &url,
             &token.access_token,
             Some(serde_json::json!({"session_status": "archived"})),
         )?;
-        let resp = self.http.execute(request).await?;
+        let resp = http_execute!(self.http, request)?;
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
             Ok(())
@@ -501,7 +497,7 @@ mod tests {
             .fetch_sessions_inner("https://api.test")
             .await
             .expect("fetch sessions");
-        session.assert_complete();
+        session.finish();
 
         assert_eq!(sessions.len(), 2, "archived sessions should be filtered");
         assert_eq!(sessions[0].id, "new", "sessions should be sorted desc");
@@ -526,7 +522,7 @@ mod tests {
             .fetch_sessions("https://api.test")
             .await
             .expect("retry should succeed");
-        session.assert_complete();
+        session.finish();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s1");
@@ -550,7 +546,7 @@ mod tests {
             .fetch_sessions("https://api.test")
             .await
             .expect("auth failures should degrade gracefully");
-        session.assert_complete();
+        session.finish();
 
         assert!(sessions.is_empty());
     }
@@ -664,7 +660,7 @@ mod tests {
             .archive_session_inner("s-ok", "https://api.test")
             .await
             .expect("archive should succeed");
-        session.assert_complete();
+        session.finish();
     }
 
     #[tokio::test]
@@ -685,7 +681,7 @@ mod tests {
             .archive_session_inner("s-fail", "https://api.test")
             .await
             .expect_err("archive should fail");
-        session.assert_complete();
+        session.finish();
 
         assert!(err.contains("HTTP 500"));
         assert!(err.contains("boom"));

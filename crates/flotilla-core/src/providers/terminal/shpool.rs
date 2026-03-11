@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{ManagedTerminal, ManagedTerminalId, TerminalStatus};
 
 use super::TerminalPool;
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
@@ -85,14 +85,12 @@ impl TerminalPool for ShpoolTerminalPool {
 
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
         let socket_path_str = self.socket_path.display().to_string();
-        let result = self
-            .runner
-            .run(
-                "shpool",
-                &["--socket", &socket_path_str, "list", "--json"],
-                Path::new("/"),
-            )
-            .await;
+        let result = run!(
+            self.runner,
+            "shpool",
+            &["--socket", &socket_path_str, "list", "--json"],
+            Path::new("/")
+        );
 
         match result {
             Ok(json) => Self::parse_list_json(&json),
@@ -154,14 +152,13 @@ impl TerminalPool for ShpoolTerminalPool {
     async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
         let session_name = format!("flotilla/{id}");
         let socket_path_str = self.socket_path.display().to_string();
-        self.runner
-            .run(
-                "shpool",
-                &["--socket", &socket_path_str, "kill", &session_name],
-                Path::new("/"),
-            )
-            .await
-            .map(|_| ())
+        run!(
+            self.runner,
+            "shpool",
+            &["--socket", &socket_path_str, "kill", &session_name],
+            Path::new("/")
+        )
+        .map(|_| ())
     }
 }
 

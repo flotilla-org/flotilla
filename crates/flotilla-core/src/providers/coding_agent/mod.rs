@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod codex;
 pub mod cursor;
 
 use crate::providers::types::{CloudAgentSession, RepoCriteria};

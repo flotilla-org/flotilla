@@ -10,6 +10,7 @@ use crate::provider_data::ProviderData;
 use crate::providers::correlation::{
     self, CorrelatedGroup, CorrelatedItem, ItemKind as CorItemKind, ProviderItemKey,
 };
+use crate::providers::run;
 use crate::providers::types::AssociationKey;
 
 #[derive(Debug, Clone)]
@@ -626,30 +627,28 @@ pub async fn fetch_checkout_status(
     let (unpushed_result, uncommitted, pr_info) = tokio::join!(
         async {
             let base = async {
-                let upstream = runner
-                    .run(
-                        "git",
-                        &[
-                            "rev-parse",
-                            "--abbrev-ref",
-                            &format!("{branch_for_base}@{{upstream}}"),
-                        ],
-                        &repo_for_base,
-                    )
-                    .await;
+                let upstream = run!(
+                    runner,
+                    "git",
+                    &[
+                        "rev-parse",
+                        "--abbrev-ref",
+                        &format!("{branch_for_base}@{{upstream}}"),
+                    ],
+                    &repo_for_base,
+                );
                 if let Ok(ref u) = upstream {
                     let u = u.trim();
                     if !u.is_empty() {
                         return Ok(u.to_string());
                     }
                 }
-                let remote_head = runner
-                    .run(
-                        "git",
-                        &["rev-parse", "--abbrev-ref", "origin/HEAD"],
-                        &repo_for_base,
-                    )
-                    .await;
+                let remote_head = run!(
+                    runner,
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    &repo_for_base,
+                );
                 if let Ok(ref rh) = remote_head {
                     let rh = rh.trim();
                     if !rh.is_empty() {
@@ -662,18 +661,17 @@ pub async fn fetch_checkout_status(
 
             match base {
                 Ok(base_ref) => {
-                    let log = runner
-                        .run(
-                            "git",
-                            &[
-                                "log",
-                                &format!("{base_ref}..{branch_for_base}"),
-                                "--oneline",
-                            ],
-                            &repo_for_base,
-                        )
-                        .await
-                        .unwrap_or_default();
+                    let log = run!(
+                        runner,
+                        "git",
+                        &[
+                            "log",
+                            &format!("{base_ref}..{branch_for_base}"),
+                            "--oneline",
+                        ],
+                        &repo_for_base,
+                    )
+                    .unwrap_or_default();
                     Ok(log)
                 }
                 Err(warning) => Err(warning),
@@ -681,24 +679,20 @@ pub async fn fetch_checkout_status(
         },
         async {
             if let Some(path) = &checkout_path {
-                runner
-                    .run("git", &["status", "--porcelain"], path)
-                    .await
-                    .unwrap_or_default()
+                run!(runner, "git", &["status", "--porcelain"], path).unwrap_or_default()
             } else {
                 String::new()
             }
         },
         async {
             if let Some(ref num) = cr_id {
-                runner
-                    .run(
-                        "gh",
-                        &["pr", "view", num, "--json", "state,mergeCommit"],
-                        &repo2,
-                    )
-                    .await
-                    .ok()
+                run!(
+                    runner,
+                    "gh",
+                    &["pr", "view", num, "--json", "state,mergeCommit"],
+                    &repo2,
+                )
+                .ok()
             } else {
                 None
             }

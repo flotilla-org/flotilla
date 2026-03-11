@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::providers::types::*;
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TmuxState {
@@ -33,10 +33,7 @@ impl TmuxWorkspaceManager {
 
     /// Run a tmux command and return stdout, or an error on failure.
     async fn tmux_cmd(&self, args: &[&str]) -> Result<String, String> {
-        self.runner
-            .run("tmux", args, Path::new("."))
-            .await
-            .map(|s| s.trim().to_string())
+        run!(self.runner, "tmux", args, Path::new(".")).map(|s| s.trim().to_string())
     }
 
     /// Return the current tmux session name.
@@ -577,14 +574,13 @@ mod tests {
         assert_eq!(ws2.name, "fix-456");
 
         // Verify with external command: list windows through the runner
-        let list_output = runner
-            .run(
-                "tmux",
-                &["list-windows", "-F", "#{window_name}"],
-                Path::new("."),
-            )
-            .await
-            .unwrap();
+        let list_output = run!(
+            runner,
+            "tmux",
+            &["list-windows", "-F", "#{window_name}"],
+            Path::new(".")
+        )
+        .unwrap();
         assert!(
             list_output.contains("feat-123"),
             "expected 'feat-123' in list output: {list_output}"
@@ -598,14 +594,13 @@ mod tests {
         mgr.select_workspace("feat-123").await.unwrap();
 
         // Verify current window through the runner
-        let current = runner
-            .run(
-                "tmux",
-                &["display-message", "-p", "#{window_name}"],
-                Path::new("."),
-            )
-            .await
-            .unwrap();
+        let current = run!(
+            runner,
+            "tmux",
+            &["display-message", "-p", "#{window_name}"],
+            Path::new(".")
+        )
+        .unwrap();
         assert!(
             current.contains("feat-123"),
             "expected current window 'feat-123', got: {current}"

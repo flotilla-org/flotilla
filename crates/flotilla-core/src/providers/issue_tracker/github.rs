@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::providers::github_api::{clamp_per_page, GhApi};
 use crate::providers::types::*;
-use crate::providers::CommandRunner;
+use crate::providers::{gh_api_get, gh_api_get_with_headers, run, CommandRunner};
 
 pub struct GitHubIssueTracker {
     provider_name: String,
@@ -82,7 +82,7 @@ impl super::IssueTracker for GitHubIssueTracker {
             "repos/{}/issues?state=open&per_page={}&page={}",
             self.repo_slug, per_page, page
         );
-        let response = self.api.get_with_headers(&endpoint, repo_root).await?;
+        let response = gh_api_get_with_headers!(self.api, &endpoint, repo_root)?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
 
@@ -118,7 +118,7 @@ impl super::IssueTracker for GitHubIssueTracker {
                 let provider_name = self.provider_name.clone();
                 let id = id.clone();
                 async move {
-                    let body = api.get(&endpoint, &repo_root).await?;
+                    let body = gh_api_get!(api, &endpoint, &repo_root)?;
                     let v: serde_json::Value =
                         serde_json::from_str(&body).map_err(|e| e.to_string())?;
                     parse_issue(&provider_name, &v)
@@ -148,7 +148,7 @@ impl super::IssueTracker for GitHubIssueTracker {
         let raw_query = format!("repo:{} is:issue is:open {}", self.repo_slug, query);
         let encoded_query = urlencoding::encode(&raw_query);
         let endpoint = format!("search/issues?q={}&per_page={}", encoded_query, per_page);
-        let body = self.api.get(&endpoint, repo_root).await?;
+        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let response: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         let items = response["items"]
@@ -172,7 +172,7 @@ impl super::IssueTracker for GitHubIssueTracker {
             "repos/{}/issues?state=all&since={}&sort=updated&direction=desc&per_page={}",
             self.repo_slug, encoded_since, per_page
         );
-        let response = self.api.get_with_headers(&endpoint, repo_root).await?;
+        let response = gh_api_get_with_headers!(self.api, &endpoint, repo_root)?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
 
@@ -209,9 +209,12 @@ impl super::IssueTracker for GitHubIssueTracker {
     }
 
     async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        self.runner
-            .run("gh", &["issue", "view", id, "--web"], repo_root)
-            .await?;
+        run!(
+            self.runner,
+            "gh",
+            &["issue", "view", id, "--web"],
+            repo_root
+        )?;
         Ok(())
     }
 }
@@ -221,6 +224,7 @@ mod tests {
     use super::*;
     use crate::providers::github_api::GhApiResponse;
     use crate::providers::issue_tracker::IssueTracker;
+    use crate::providers::ChannelLabel;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -238,8 +242,13 @@ mod tests {
 
     #[async_trait]
     impl GhApi for MockGhApi {
-        async fn get(&self, endpoint: &str, repo_root: &Path) -> Result<String, String> {
-            self.get_with_headers(endpoint, repo_root)
+        async fn get(
+            &self,
+            endpoint: &str,
+            repo_root: &Path,
+            label: &ChannelLabel,
+        ) -> Result<String, String> {
+            self.get_with_headers(endpoint, repo_root, label)
                 .await
                 .map(|r| r.body)
         }
@@ -247,6 +256,7 @@ mod tests {
             &self,
             _endpoint: &str,
             _repo_root: &Path,
+            _label: &ChannelLabel,
         ) -> Result<GhApiResponse, String> {
             self.responses
                 .lock()
@@ -283,43 +293,27 @@ mod tests {
     }
 
     fn build_api_and_runner(
-        session: &replay::ReplaySession,
-        recording: bool,
+        session: &replay::Session,
     ) -> (
         Arc<dyn crate::providers::github_api::GhApi>,
         Arc<dyn crate::providers::CommandRunner>,
     ) {
-        if recording {
-            let real_runner = Arc::new(crate::providers::ProcessCommandRunner)
-                as Arc<dyn crate::providers::CommandRunner>;
-            let real_api = Arc::new(crate::providers::github_api::GhApiClient::new(
-                real_runner.clone(),
-            ));
-            (
-                Arc::new(replay::RecordingGhApi::new(session.clone(), real_api))
-                    as Arc<dyn crate::providers::github_api::GhApi>,
-                real_runner,
-            )
-        } else {
-            (
-                Arc::new(session.gh_api()) as Arc<dyn crate::providers::github_api::GhApi>,
-                Arc::new(session.command_runner()) as Arc<dyn crate::providers::CommandRunner>,
-            )
-        }
+        let runner = replay::test_runner(session);
+        let api = replay::test_gh_api(session);
+        (api, runner)
     }
 
     #[tokio::test]
     async fn record_replay_list_issues() {
-        let recording = replay::is_recording();
         let repo_slug = "rjwittams/flotilla".to_string();
-        let repo_root = if recording {
+
+        let session = replay::test_session(&fixture("github_issues.yaml"), Masks::new());
+        let repo_root = if session.is_recording() {
             repo_root_for_recording()
         } else {
             PathBuf::from("/test/repo")
         };
-
-        let session = replay::test_session(&fixture("github_issues.yaml"), Masks::new());
-        let (api, runner) = build_api_and_runner(&session, recording);
+        let (api, runner) = build_api_and_runner(&session);
 
         let tracker = GitHubIssueTracker::new("github".into(), repo_slug, api, runner);
         let issues = tracker.list_issues(&repo_root, 30).await.unwrap();

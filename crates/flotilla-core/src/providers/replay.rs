@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
 use super::github_api::{GhApi, GhApiResponse};
-use super::{CommandOutput, CommandRunner};
+use super::{
+    ChannelLabel, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler, IntoChannelLabel,
+};
 
 /// A single recorded interaction with an external system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +16,8 @@ use super::{CommandOutput, CommandRunner};
 pub enum Interaction {
     #[serde(rename = "command")]
     Command {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         cmd: String,
         args: Vec<String>,
         cwd: String,
@@ -26,6 +30,8 @@ pub enum Interaction {
     },
     #[serde(rename = "gh_api")]
     GhApi {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         method: String,
         endpoint: String,
         status: u16,
@@ -35,6 +41,8 @@ pub enum Interaction {
     },
     #[serde(rename = "http")]
     Http {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         method: String,
         url: String,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -48,10 +56,85 @@ pub enum Interaction {
     },
 }
 
+impl Interaction {
+    /// Derive the channel label from interaction data.
+    /// When an explicit `label` field is present, use it directly;
+    /// otherwise fall back to `DefaultLabeler` derivation.
+    pub fn channel_label(&self) -> ChannelLabel {
+        match self {
+            Interaction::Command { label: Some(l), .. } => ChannelLabel::Command(l.clone()),
+            Interaction::Command { cmd, args, .. } => {
+                let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let request = ChannelRequest::Command {
+                    cmd,
+                    args: &args_refs,
+                };
+                DefaultLabeler.into_channel_label(&request)
+            }
+            Interaction::GhApi { label: Some(l), .. } => ChannelLabel::GhApi(l.clone()),
+            Interaction::GhApi {
+                method, endpoint, ..
+            } => {
+                let request = ChannelRequest::GhApi { method, endpoint };
+                DefaultLabeler.into_channel_label(&request)
+            }
+            Interaction::Http { label: Some(l), .. } => ChannelLabel::Http(l.clone()),
+            Interaction::Http { method, url, .. } => {
+                let request = ChannelRequest::Http { method, url };
+                DefaultLabeler.into_channel_label(&request)
+            }
+        }
+    }
+}
+
 /// Top-level YAML document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InteractionLog {
     pub interactions: Vec<Interaction>,
+}
+
+/// A round of interactions grouped by channel.
+#[derive(Debug)]
+pub(crate) struct Round {
+    pub(crate) queues: HashMap<ChannelLabel, VecDeque<Interaction>>,
+}
+
+impl Round {
+    fn from_interactions(interactions: Vec<Interaction>) -> Self {
+        let mut queues: HashMap<ChannelLabel, VecDeque<Interaction>> = HashMap::new();
+        for interaction in interactions {
+            let label = interaction.channel_label();
+            queues.entry(label).or_default().push_back(interaction);
+        }
+        Round { queues }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queues.values().all(|q| q.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RoundLog {
+    rounds: Vec<InteractionLog>,
+}
+
+fn load_rounds_from_str(yaml: &str) -> Vec<Round> {
+    // Detect which format by checking for the `rounds:` key.
+    // If present, parse as RoundLog and propagate errors directly
+    // (don't fall through to flat format, which gives misleading errors).
+    if yaml.trim_start().starts_with("rounds:") {
+        let round_log: RoundLog = serde_yml::from_str(yaml)
+            .unwrap_or_else(|e| panic!("Failed to parse multi-round fixture YAML: {e}"));
+        return round_log
+            .rounds
+            .into_iter()
+            .map(|log| Round::from_interactions(log.interactions))
+            .collect();
+    }
+    let log: InteractionLog =
+        serde_yml::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse fixture YAML: {e}"));
+    vec![Round::from_interactions(log.interactions)]
 }
 
 /// Placeholder substitutions for non-deterministic values.
@@ -92,157 +175,236 @@ impl Masks {
     }
 }
 
-/// Shared session state, holding the interaction log and current read position.
-struct SessionInner {
-    log: InteractionLog,
-    cursor: usize,
-    masks: Masks,
-    /// In record mode, newly captured interactions accumulate here.
-    recorded: Vec<Interaction>,
-    recording: bool,
-    file_path: Option<PathBuf>,
-}
-
-/// A replay session backed by a YAML file. Multiple adapters share one session
-/// via `Arc`. Each adapter reads entries matching its channel.
+/// A replayer that serves canned interactions from round-based per-channel FIFO queues.
 #[derive(Clone)]
-pub struct ReplaySession {
-    inner: Arc<Mutex<SessionInner>>,
+pub struct Replayer {
+    inner: Arc<Mutex<ReplayerInner>>,
 }
 
-impl ReplaySession {
-    /// Load a session from a YAML fixture file.
+struct ReplayerInner {
+    rounds: VecDeque<Round>,
+    masks: Masks,
+}
+
+impl Replayer {
+    /// Load a replayer from a YAML fixture file.
     pub fn from_file(path: impl AsRef<Path>, masks: Masks) -> Self {
         let content = std::fs::read_to_string(path.as_ref())
             .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", path.as_ref().display()));
-        let log: InteractionLog = serde_yml::from_str(&content)
-            .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {e}", path.as_ref().display()));
+        Self::from_str(&content, masks)
+    }
+
+    /// Load a replayer from an inline YAML string.
+    pub fn from_str(yaml: &str, masks: Masks) -> Self {
+        let rounds = load_rounds_from_str(yaml);
         Self {
-            inner: Arc::new(Mutex::new(SessionInner {
-                log,
-                cursor: 0,
+            inner: Arc::new(Mutex::new(ReplayerInner {
+                rounds: rounds.into(),
                 masks,
-                recorded: Vec::new(),
-                recording: false,
-                file_path: Some(path.as_ref().to_path_buf()),
             })),
         }
     }
 
-    /// Create an empty session for recording.
-    pub fn recording(path: impl AsRef<Path>, masks: Masks) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(SessionInner {
-                log: InteractionLog {
-                    interactions: Vec::new(),
-                },
-                cursor: 0,
-                masks,
-                recorded: Vec::new(),
-                recording: true,
-                file_path: Some(path.as_ref().to_path_buf()),
-            })),
-        }
-    }
-
-    /// Consume the next interaction, asserting it matches the expected channel.
+    /// Consume the next interaction matching the given channel label from the current round.
     /// Returns the interaction with masks unmasked (placeholders -> concrete values).
-    pub(crate) fn next(&self, expected_channel: &str) -> Interaction {
-        let mut inner = self.inner.lock().unwrap();
-        assert!(
-            !inner.recording,
-            "next() called in recording mode — use record() instead"
-        );
-        let idx = inner.cursor;
-        let interaction = inner
-            .log
-            .interactions
-            .get(idx)
-            .unwrap_or_else(|| {
-                panic!(
-                    "ReplaySession: no more interactions (cursor={idx}, total={})",
-                    inner.log.interactions.len()
-                )
-            })
-            .clone();
-
-        // Verify channel matches
-        let actual_channel = match &interaction {
-            Interaction::Command { .. } => "command",
-            Interaction::GhApi { .. } => "gh_api",
-            Interaction::Http { .. } => "http",
-        };
-        assert_eq!(
-            actual_channel, expected_channel,
-            "ReplaySession: expected channel '{expected_channel}' at position {idx}, got '{actual_channel}'"
-        );
-
-        inner.cursor += 1;
+    /// Panics if no matching interaction is found in the current round.
+    pub(crate) fn next(&self, label: &ChannelLabel) -> Interaction {
+        let mut inner = self.inner.lock().expect("replayer lock poisoned");
+        let round = inner
+            .rounds
+            .front_mut()
+            .expect("Replayer: no more rounds — all interactions consumed");
+        if !round.queues.contains_key(label) {
+            panic!(
+                "Replayer: no queue for channel {:?} in current round (available: {:?})",
+                label,
+                round.queues.keys().collect::<Vec<_>>()
+            );
+        }
+        let queue = round
+            .queues
+            .get_mut(label)
+            .expect("Replayer: channel verified present");
+        let interaction = queue.pop_front().unwrap_or_else(|| {
+            panic!(
+                "Replayer: channel {:?} queue is empty in current round",
+                label
+            )
+        });
+        // Remove queue if drained
+        if queue.is_empty() {
+            round.queues.remove(label);
+        }
+        // Auto-advance if round is fully drained
+        if round.is_empty() {
+            inner.rounds.pop_front();
+        }
         unmask_interaction(&interaction, &inner.masks)
     }
 
-    /// Record a new interaction (in recording mode).
-    pub(crate) fn record(&self, interaction: Interaction) {
-        let mut inner = self.inner.lock().unwrap();
-        assert!(inner.recording, "record() called in replay mode");
-        let masked = mask_interaction(&interaction, &inner.masks);
-        inner.recorded.push(masked);
+    /// Check that all rounds and their queues have been fully consumed.
+    /// Because `next()` removes empty queues and auto-pops empty rounds,
+    /// any remaining round necessarily has non-empty queues.
+    pub fn assert_complete(&self) {
+        let inner = self.inner.lock().expect("replayer lock poisoned");
+        if let Some(round) = inner.rounds.front() {
+            let remaining: Vec<_> = round
+                .queues
+                .iter()
+                .map(|(label, q)| format!("{label:?} ({} remaining)", q.len()))
+                .collect();
+            panic!(
+                "Replayer: {} round(s) with unconsumed interactions: {}",
+                inner.rounds.len(),
+                remaining.join(", ")
+            );
+        }
     }
+}
 
-    /// Write recorded interactions to the YAML file.
-    pub fn save(&self) {
-        let inner = self.inner.lock().unwrap();
-        if let Some(ref path) = inner.file_path {
-            let log = InteractionLog {
-                interactions: inner.recorded.clone(),
-            };
-            let yaml = serde_yml::to_string(&log).expect("Failed to serialize interactions");
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            std::fs::write(path, yaml)
-                .unwrap_or_else(|e| panic!("Failed to write fixture {}: {e}", path.display()));
+/// A recorder that captures interactions with round barriers and masking.
+#[derive(Clone)]
+pub struct Recorder {
+    inner: Arc<Mutex<RecorderInner>>,
+}
+
+struct RecorderInner {
+    rounds: Vec<Vec<Interaction>>,
+    current: Vec<Interaction>,
+    masks: Masks,
+    file_path: PathBuf,
+}
+
+impl Recorder {
+    /// Create a new recorder that will write to the given path.
+    pub fn new(path: impl AsRef<Path>, masks: Masks) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RecorderInner {
+                rounds: Vec::new(),
+                current: Vec::new(),
+                masks,
+                file_path: path.as_ref().to_path_buf(),
+            })),
         }
     }
 
-    /// Create a `ReplayRunner` that replays command interactions from this session.
-    pub fn command_runner(&self) -> ReplayRunner {
-        ReplayRunner::new(self.clone())
+    /// Record a new interaction, applying masks before storing.
+    pub(crate) fn record(&self, interaction: Interaction) {
+        let mut inner = self.inner.lock().expect("recorder lock poisoned");
+        let masked = mask_interaction(&interaction, &inner.masks);
+        inner.current.push(masked);
     }
 
-    /// Create a `ReplayGhApi` that replays gh_api interactions from this session.
-    pub fn gh_api(&self) -> ReplayGhApi {
-        ReplayGhApi::new(self.clone())
+    /// Close the current round and start a new one.
+    pub fn barrier(&self) {
+        let mut inner = self.inner.lock().expect("recorder lock poisoned");
+        if !inner.current.is_empty() {
+            let round = std::mem::take(&mut inner.current);
+            inner.rounds.push(round);
+        }
     }
 
-    /// Create a `ReplayHttpClient` that replays HTTP interactions from this session.
-    pub fn http_client(&self) -> ReplayHttpClient {
-        ReplayHttpClient::new(self.clone())
+    /// Finalize and write recorded interactions to the YAML file.
+    /// Sorts interactions within each round by channel label for deterministic output.
+    pub fn save(&self) {
+        let mut inner = self.inner.lock().expect("recorder lock poisoned");
+        // Flush any remaining current interactions as a final round
+        if !inner.current.is_empty() {
+            let round = std::mem::take(&mut inner.current);
+            inner.rounds.push(round);
+        }
+
+        // Sort each round's interactions by channel label for deterministic output
+        for round in &mut inner.rounds {
+            round.sort_by_key(|a| a.channel_label());
+        }
+
+        let round_log = RoundLog {
+            rounds: inner
+                .rounds
+                .iter()
+                .map(|interactions| InteractionLog {
+                    interactions: interactions.clone(),
+                })
+                .collect(),
+        };
+
+        let yaml =
+            serde_yml::to_string(&round_log).expect("Failed to serialize recorded interactions");
+        if let Some(parent) = inner.file_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&inner.file_path, yaml).unwrap_or_else(|e| {
+            panic!("Failed to write fixture {}: {e}", inner.file_path.display())
+        });
+    }
+}
+
+/// A test session that is either recording or replaying interactions.
+#[derive(Clone)]
+pub enum Session {
+    Recording(Recorder),
+    Replaying(Replayer),
+}
+
+impl Session {
+    /// Create a replaying session from a YAML fixture file.
+    pub fn replaying(path: impl AsRef<Path>, masks: Masks) -> Self {
+        Session::Replaying(Replayer::from_file(path, masks))
     }
 
-    /// Check that all interactions were consumed.
-    pub fn assert_complete(&self) {
-        let inner = self.inner.lock().unwrap();
-        if !inner.recording {
-            let remaining = inner.log.interactions.len() - inner.cursor;
-            assert_eq!(
-                remaining, 0,
-                "ReplaySession: {remaining} unconsumed interactions remaining"
-            );
+    /// Create a replaying session from an inline YAML string.
+    pub fn replaying_from_str(yaml: &str, masks: Masks) -> Self {
+        Session::Replaying(Replayer::from_str(yaml, masks))
+    }
+
+    /// Create a recording session that writes to the given path.
+    pub fn recording(path: impl AsRef<Path>, masks: Masks) -> Self {
+        Session::Recording(Recorder::new(path, masks))
+    }
+
+    /// Consume the next interaction matching the given channel label (replay mode).
+    pub(crate) fn next(&self, label: &ChannelLabel) -> Interaction {
+        match self {
+            Session::Replaying(r) => r.next(label),
+            Session::Recording(_) => panic!("next() called in recording mode — use record()"),
+        }
+    }
+
+    /// Record a new interaction (recording mode).
+    pub(crate) fn record(&self, interaction: Interaction) {
+        match self {
+            Session::Recording(r) => r.record(interaction),
+            Session::Replaying(_) => panic!("record() called in replay mode"),
+        }
+    }
+
+    /// Insert a round barrier (recording mode).
+    pub fn barrier(&self) {
+        match self {
+            Session::Recording(r) => r.barrier(),
+            Session::Replaying(_) => {} // no-op in replay mode
         }
     }
 
     /// Returns true if this session is in recording mode.
     pub fn is_recording(&self) -> bool {
-        self.inner.lock().unwrap().recording
+        matches!(self, Session::Recording(_))
+    }
+
+    /// Check that all interactions were consumed (replay mode).
+    pub fn assert_complete(&self) {
+        match self {
+            Session::Replaying(r) => r.assert_complete(),
+            Session::Recording(_) => {} // nothing to assert
+        }
     }
 
     /// Save if recording, assert_complete if replaying.
     pub fn finish(&self) {
-        if self.is_recording() {
-            self.save();
-        } else {
-            self.assert_complete();
+        match self {
+            Session::Recording(r) => r.save(),
+            Session::Replaying(r) => r.assert_complete(),
         }
     }
 }
@@ -253,46 +415,52 @@ pub fn is_recording() -> bool {
     std::env::var("RECORD").ok().as_deref() == Some("1")
 }
 
-/// Create a `ReplaySession` that either records or replays.
+/// Create a `Session` that either records or replays.
 /// In record mode: creates a recording session (fixture will be written on `finish()`).
 /// In replay mode: loads canned interactions from the fixture file.
-pub fn test_session(fixture_path: &str, masks: Masks) -> ReplaySession {
+pub fn test_session(fixture_path: &str, masks: Masks) -> Session {
     if is_recording() {
-        ReplaySession::recording(fixture_path, masks)
+        Session::recording(fixture_path, masks)
     } else {
-        ReplaySession::from_file(fixture_path, masks)
+        Session::replaying(fixture_path, masks)
     }
 }
 
 /// Create a `CommandRunner` for a test session.
 /// In record mode: wraps `ProcessCommandRunner` with recording.
 /// In replay mode: returns a `ReplayRunner`.
-pub fn test_runner(session: &ReplaySession) -> Arc<dyn CommandRunner> {
+pub fn test_runner(session: &Session) -> Arc<dyn CommandRunner> {
     if session.is_recording() {
         Arc::new(RecordingRunner::new(
             session.clone(),
             Arc::new(super::ProcessCommandRunner),
         ))
     } else {
-        Arc::new(session.command_runner())
+        Arc::new(ReplayRunner::new(session.clone()))
     }
 }
 
-/// A `CommandRunner` that replays canned responses from a `ReplaySession`.
+/// A `CommandRunner` that replays canned responses from a `Session`.
 pub struct ReplayRunner {
-    session: ReplaySession,
+    session: Session,
 }
 
 impl ReplayRunner {
-    pub fn new(session: ReplaySession) -> Self {
+    pub fn new(session: Session) -> Self {
         Self { session }
     }
 }
 
 #[async_trait]
 impl CommandRunner for ReplayRunner {
-    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
-        let interaction = self.session.next("command");
+    async fn run(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<String, String> {
+        let interaction = self.session.next(label);
         let Interaction::Command {
             cmd: expected_cmd,
             args: expected_args,
@@ -300,6 +468,7 @@ impl CommandRunner for ReplayRunner {
             stdout,
             stderr,
             exit_code,
+            ..
         } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
@@ -329,8 +498,9 @@ impl CommandRunner for ReplayRunner {
         cmd: &str,
         args: &[&str],
         cwd: &Path,
+        label: &ChannelLabel,
     ) -> Result<CommandOutput, String> {
-        let interaction = self.session.next("command");
+        let interaction = self.session.next(label);
         let Interaction::Command {
             cmd: expected_cmd,
             args: expected_args,
@@ -338,6 +508,7 @@ impl CommandRunner for ReplayRunner {
             stdout,
             stderr,
             exit_code,
+            ..
         } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
@@ -367,25 +538,25 @@ impl CommandRunner for ReplayRunner {
     }
 }
 
-/// A `GhApi` implementation that replays canned responses from a `ReplaySession`.
+/// A `GhApi` implementation that replays canned responses from a `Session`.
 pub struct ReplayGhApi {
-    session: ReplaySession,
+    session: Session,
 }
 
 impl ReplayGhApi {
-    pub fn new(session: ReplaySession) -> Self {
+    pub fn new(session: Session) -> Self {
         Self { session }
     }
 }
 
 /// An `HttpClient` implementation that replays canned HTTP interactions
-/// from a `ReplaySession`.
+/// from a `Session`.
 pub struct ReplayHttpClient {
-    session: ReplaySession,
+    session: Session,
 }
 
 impl ReplayHttpClient {
-    pub fn new(session: ReplaySession) -> Self {
+    pub fn new(session: Session) -> Self {
         Self { session }
     }
 }
@@ -395,8 +566,9 @@ impl super::HttpClient for ReplayHttpClient {
     async fn execute(
         &self,
         request: reqwest::Request,
+        label: &ChannelLabel,
     ) -> Result<http::Response<bytes::Bytes>, String> {
-        let interaction = self.session.next("http");
+        let interaction = self.session.next(label);
         let Interaction::Http {
             method: expected_method,
             url: expected_url,
@@ -405,6 +577,7 @@ impl super::HttpClient for ReplayHttpClient {
             status,
             response_body,
             response_headers,
+            ..
         } = interaction
         else {
             panic!("ReplayHttpClient: expected http interaction");
@@ -462,8 +635,13 @@ impl super::HttpClient for ReplayHttpClient {
 
 #[async_trait]
 impl GhApi for ReplayGhApi {
-    async fn get(&self, endpoint: &str, _repo_root: &Path) -> Result<String, String> {
-        let interaction = self.session.next("gh_api");
+    async fn get(
+        &self,
+        endpoint: &str,
+        _repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<String, String> {
+        let interaction = self.session.next(label);
         let Interaction::GhApi {
             endpoint: expected_endpoint,
             status,
@@ -490,8 +668,9 @@ impl GhApi for ReplayGhApi {
         &self,
         endpoint: &str,
         _repo_root: &Path,
+        label: &ChannelLabel,
     ) -> Result<GhApiResponse, String> {
-        let interaction = self.session.next("gh_api");
+        let interaction = self.session.next(label);
         let Interaction::GhApi {
             endpoint: expected_endpoint,
             status,
@@ -531,9 +710,25 @@ impl GhApi for ReplayGhApi {
     }
 }
 
+/// Returns `Some(label_string)` when the caller's label differs from what
+/// `DefaultLabeler` would produce, so the YAML only contains an explicit
+/// `label` field when it's truly non-default.
+fn explicit_label(label: &ChannelLabel, default: &ChannelLabel) -> Option<String> {
+    if label == default {
+        None
+    } else {
+        Some(match label {
+            ChannelLabel::Command(s) => s.clone(),
+            ChannelLabel::GhApi(s) => s.clone(),
+            ChannelLabel::Http(s) => s.clone(),
+        })
+    }
+}
+
 fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
         Interaction::Command {
+            label,
             cmd,
             args,
             cwd,
@@ -541,6 +736,7 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stderr,
             exit_code,
         } => Interaction::Command {
+            label: label.clone(),
             cmd: masks.unmask(cmd),
             args: args.iter().map(|a| masks.unmask(a)).collect(),
             cwd: masks.unmask(cwd),
@@ -549,12 +745,14 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             exit_code: *exit_code,
         },
         Interaction::GhApi {
+            label,
             method,
             endpoint,
             status,
             body,
             headers,
         } => Interaction::GhApi {
+            label: label.clone(),
             method: method.clone(),
             endpoint: masks.unmask(endpoint),
             status: *status,
@@ -565,6 +763,7 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
                 .collect(),
         },
         Interaction::Http {
+            label,
             method,
             url,
             request_headers,
@@ -573,6 +772,7 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             response_body,
             response_headers,
         } => Interaction::Http {
+            label: label.clone(),
             method: method.clone(),
             url: masks.unmask(url),
             request_headers: request_headers
@@ -592,20 +792,30 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
 
 /// A `CommandRunner` that delegates to a real runner and records all interactions.
 pub struct RecordingRunner {
-    session: ReplaySession,
+    session: Session,
     inner: Arc<dyn CommandRunner>,
 }
 
 impl RecordingRunner {
-    pub fn new(session: ReplaySession, inner: Arc<dyn CommandRunner>) -> Self {
+    pub fn new(session: Session, inner: Arc<dyn CommandRunner>) -> Self {
         Self { session, inner }
     }
 }
 
 #[async_trait]
 impl CommandRunner for RecordingRunner {
-    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
-        let result = self.inner.run(cmd, args, cwd).await;
+    async fn run(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<String, String> {
+        let result = self.inner.run(cmd, args, cwd, label).await;
+
+        let request = ChannelRequest::Command { cmd, args };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
 
         let (stdout, stderr, exit_code) = match &result {
             Ok(out) => (Some(out.clone()), None, 0),
@@ -613,6 +823,7 @@ impl CommandRunner for RecordingRunner {
         };
 
         self.session.record(Interaction::Command {
+            label: explicit,
             cmd: cmd.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string_lossy().to_string(),
@@ -629,12 +840,18 @@ impl CommandRunner for RecordingRunner {
         cmd: &str,
         args: &[&str],
         cwd: &Path,
+        label: &ChannelLabel,
     ) -> Result<CommandOutput, String> {
-        let result = self.inner.run_output(cmd, args, cwd).await;
+        let result = self.inner.run_output(cmd, args, cwd, label).await;
+
+        let request = ChannelRequest::Command { cmd, args };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
 
         match &result {
             Ok(output) => {
                 self.session.record(Interaction::Command {
+                    label: explicit,
                     cmd: cmd.to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     cwd: cwd.to_string_lossy().to_string(),
@@ -645,6 +862,7 @@ impl CommandRunner for RecordingRunner {
             }
             Err(err) => {
                 self.session.record(Interaction::Command {
+                    label: explicit,
                     cmd: cmd.to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     cwd: cwd.to_string_lossy().to_string(),
@@ -668,24 +886,37 @@ impl CommandRunner for RecordingRunner {
 
 /// A `GhApi` that delegates to a real GhApi and records all interactions.
 pub struct RecordingGhApi {
-    session: ReplaySession,
+    session: Session,
     inner: Arc<dyn GhApi>,
 }
 
 impl RecordingGhApi {
-    pub fn new(session: ReplaySession, inner: Arc<dyn GhApi>) -> Self {
+    pub fn new(session: Session, inner: Arc<dyn GhApi>) -> Self {
         Self { session, inner }
     }
 }
 
 #[async_trait]
 impl GhApi for RecordingGhApi {
-    async fn get(&self, endpoint: &str, repo_root: &Path) -> Result<String, String> {
-        let result = self.inner.get(endpoint, repo_root).await;
+    async fn get(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<String, String> {
+        let result = self.inner.get(endpoint, repo_root, label).await;
+
+        let request = ChannelRequest::GhApi {
+            method: "GET",
+            endpoint,
+        };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
 
         match &result {
             Ok(body) => {
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: 200,
@@ -695,6 +926,7 @@ impl GhApi for RecordingGhApi {
             }
             Err(err) => {
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: 500,
@@ -711,8 +943,19 @@ impl GhApi for RecordingGhApi {
         &self,
         endpoint: &str,
         repo_root: &Path,
+        label: &ChannelLabel,
     ) -> Result<GhApiResponse, String> {
-        let result = self.inner.get_with_headers(endpoint, repo_root).await;
+        let result = self
+            .inner
+            .get_with_headers(endpoint, repo_root, label)
+            .await;
+
+        let request = ChannelRequest::GhApi {
+            method: "GET",
+            endpoint,
+        };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
 
         match &result {
             Ok(resp) => {
@@ -727,6 +970,7 @@ impl GhApi for RecordingGhApi {
                     headers.insert("total_count".to_string(), count.to_string());
                 }
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: resp.status,
@@ -736,6 +980,7 @@ impl GhApi for RecordingGhApi {
             }
             Err(err) => {
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: 500,
@@ -752,23 +997,27 @@ impl GhApi for RecordingGhApi {
 /// Create a `GhApi` for a test session.
 /// In record mode: wraps a real `GhApiClient` with recording.
 /// In replay mode: returns a `ReplayGhApi`.
-pub fn test_gh_api(session: &ReplaySession, runner: &Arc<dyn CommandRunner>) -> Arc<dyn GhApi> {
+pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
     if session.is_recording() {
-        let real_api = Arc::new(super::github_api::GhApiClient::new(Arc::clone(runner)));
+        // Use a raw ProcessCommandRunner — NOT the passed-in runner, which is a
+        // RecordingRunner.  GhApiClient shells out via its runner, so using a
+        // RecordingRunner here would double-record (once as Command, once as GhApi).
+        let raw_runner = Arc::new(super::ProcessCommandRunner);
+        let real_api = Arc::new(super::github_api::GhApiClient::new(raw_runner));
         Arc::new(RecordingGhApi::new(session.clone(), real_api))
     } else {
-        Arc::new(session.gh_api())
+        Arc::new(ReplayGhApi::new(session.clone()))
     }
 }
 
 /// An `HttpClient` that delegates to a real `HttpClient` and records all interactions.
 pub struct RecordingHttpClient {
-    session: ReplaySession,
+    session: Session,
     inner: Arc<dyn super::HttpClient>,
 }
 
 impl RecordingHttpClient {
-    pub fn new(session: ReplaySession, inner: Arc<dyn super::HttpClient>) -> Self {
+    pub fn new(session: Session, inner: Arc<dyn super::HttpClient>) -> Self {
         Self { session, inner }
     }
 }
@@ -778,6 +1027,7 @@ impl super::HttpClient for RecordingHttpClient {
     async fn execute(
         &self,
         request: reqwest::Request,
+        label: &ChannelLabel,
     ) -> Result<http::Response<bytes::Bytes>, String> {
         let method = request.method().to_string();
         let url = request.url().to_string();
@@ -791,7 +1041,14 @@ impl super::HttpClient for RecordingHttpClient {
             .and_then(|b| b.as_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string());
 
-        let result = self.inner.execute(request).await;
+        let chan_request = ChannelRequest::Http {
+            method: &method,
+            url: &url,
+        };
+        let default = DefaultLabeler.into_channel_label(&chan_request);
+        let explicit = explicit_label(label, &default);
+
+        let result = self.inner.execute(request, label).await;
 
         match &result {
             Ok(resp) => {
@@ -801,6 +1058,7 @@ impl super::HttpClient for RecordingHttpClient {
                     .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
                 self.session.record(Interaction::Http {
+                    label: explicit,
                     method,
                     url,
                     request_headers,
@@ -812,6 +1070,7 @@ impl super::HttpClient for RecordingHttpClient {
             }
             Err(err) => {
                 self.session.record(Interaction::Http {
+                    label: explicit,
                     method,
                     url,
                     request_headers,
@@ -830,18 +1089,19 @@ impl super::HttpClient for RecordingHttpClient {
 /// Create an `HttpClient` for a test session.
 /// In record mode: wraps a real `ReqwestHttpClient` with recording.
 /// In replay mode: returns a `ReplayHttpClient`.
-pub fn test_http_client(session: &ReplaySession) -> Arc<dyn super::HttpClient> {
+pub fn test_http_client(session: &Session) -> Arc<dyn super::HttpClient> {
     if session.is_recording() {
         let real_client = Arc::new(super::ReqwestHttpClient::new());
         Arc::new(RecordingHttpClient::new(session.clone(), real_client))
     } else {
-        Arc::new(session.http_client())
+        Arc::new(ReplayHttpClient::new(session.clone()))
     }
 }
 
 fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
         Interaction::Command {
+            label,
             cmd,
             args,
             cwd,
@@ -849,6 +1109,7 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stderr,
             exit_code,
         } => Interaction::Command {
+            label: label.clone(),
             cmd: masks.mask(cmd),
             args: args.iter().map(|a| masks.mask(a)).collect(),
             cwd: masks.mask(cwd),
@@ -857,12 +1118,14 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             exit_code: *exit_code,
         },
         Interaction::GhApi {
+            label,
             method,
             endpoint,
             status,
             body,
             headers,
         } => Interaction::GhApi {
+            label: label.clone(),
             method: method.clone(),
             endpoint: masks.mask(endpoint),
             status: *status,
@@ -873,6 +1136,7 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
                 .collect(),
         },
         Interaction::Http {
+            label,
             method,
             url,
             request_headers,
@@ -881,6 +1145,7 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             response_body,
             response_headers,
         } => Interaction::Http {
+            label: label.clone(),
             method: method.clone(),
             url: masks.mask(url),
             request_headers: request_headers
@@ -919,6 +1184,7 @@ mod tests {
         let log = InteractionLog {
             interactions: vec![
                 Interaction::Command {
+                    label: None,
                     cmd: "git".into(),
                     args: vec!["status".into()],
                     cwd: "{repo}".into(),
@@ -927,6 +1193,7 @@ mod tests {
                     exit_code: 0,
                 },
                 Interaction::GhApi {
+                    label: None,
                     method: "GET".into(),
                     endpoint: "/repos/owner/repo/pulls".into(),
                     status: 200,
@@ -958,8 +1225,8 @@ interactions:
 
         let mut masks = Masks::new();
         masks.add("/test/repo", "{repo}");
-        let session = ReplaySession::from_file(&path, masks);
-        let runner = Arc::new(session.command_runner());
+        let session = Session::replaying(&path, masks);
+        let runner = Arc::new(ReplayRunner::new(session.clone()));
 
         use crate::providers::vcs::git::GitVcs;
         use crate::providers::vcs::Vcs;
@@ -980,6 +1247,7 @@ interactions:
     fn replay_session_serves_in_order() {
         let log = InteractionLog {
             interactions: vec![Interaction::Command {
+                label: None,
                 cmd: "git".into(),
                 args: vec!["status".into()],
                 cwd: "{repo}".into(),
@@ -996,9 +1264,9 @@ interactions:
 
         let mut masks = Masks::new();
         masks.add("/real/repo", "{repo}");
-        let session = ReplaySession::from_file(&path, masks);
+        let session = Session::replaying(&path, masks);
 
-        let interaction = session.next("command");
+        let interaction = session.next(&ChannelLabel::Command("git status".into()));
         match interaction {
             Interaction::Command { cmd, cwd, .. } => {
                 assert_eq!(cmd, "git");
@@ -1023,15 +1291,12 @@ interactions:
         let path = dir.path().join("test.yaml");
         std::fs::write(&path, yaml).unwrap();
 
-        let session = ReplaySession::from_file(&path, Masks::new());
-        let api = session.gh_api();
+        let session = Session::replaying(&path, Masks::new());
+        let api = ReplayGhApi::new(session.clone());
 
-        let result = api
-            .get(
-                "/repos/owner/repo/pulls?state=all&per_page=100",
-                Path::new("/repo"),
-            )
-            .await;
+        let endpoint = "/repos/owner/repo/pulls?state=all&per_page=100";
+        let label = ChannelLabel::GhApi(endpoint.to_string());
+        let result = api.get(endpoint, Path::new("/repo"), &label).await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("Fix bug"));
         session.assert_complete();
@@ -1051,10 +1316,12 @@ interactions:
         let path = dir.path().join("test.yaml");
         std::fs::write(&path, yaml).unwrap();
 
-        let session = ReplaySession::from_file(&path, Masks::new());
-        let api = session.gh_api();
+        let session = Session::replaying(&path, Masks::new());
+        let api = ReplayGhApi::new(session.clone());
 
-        let result = api.get("/repos/owner/repo/pulls", Path::new("/repo")).await;
+        let endpoint = "/repos/owner/repo/pulls";
+        let label = ChannelLabel::GhApi(endpoint.to_string());
+        let result = api.get(endpoint, Path::new("/repo"), &label).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("404"));
         session.assert_complete();
@@ -1078,11 +1345,13 @@ interactions:
         let path = dir.path().join("test.yaml");
         std::fs::write(&path, yaml).unwrap();
 
-        let session = ReplaySession::from_file(&path, Masks::new());
-        let api = session.gh_api();
+        let session = Session::replaying(&path, Masks::new());
+        let api = ReplayGhApi::new(session.clone());
 
+        let endpoint = "/repos/owner/repo/issues?per_page=100";
+        let label = ChannelLabel::GhApi(endpoint.to_string());
         let result = api
-            .get_with_headers("/repos/owner/repo/issues?per_page=100", Path::new("/repo"))
+            .get_with_headers(endpoint, Path::new("/repo"), &label)
             .await;
         assert!(result.is_ok());
         let resp = result.unwrap();
@@ -1108,11 +1377,13 @@ interactions:
         let path = dir.path().join("test.yaml");
         std::fs::write(&path, yaml).unwrap();
 
-        let session = ReplaySession::from_file(&path, Masks::new());
-        let api = session.gh_api();
+        let session = Session::replaying(&path, Masks::new());
+        let api = ReplayGhApi::new(session.clone());
 
+        let endpoint = "/repos/owner/repo/issues";
+        let label = ChannelLabel::GhApi(endpoint.to_string());
         let result = api
-            .get_with_headers("/repos/owner/repo/issues", Path::new("/repo"))
+            .get_with_headers(endpoint, Path::new("/repo"), &label)
             .await;
         assert!(result.is_ok());
         let resp = result.unwrap();
@@ -1136,27 +1407,27 @@ interactions:
                 Ok("hello\n".into()),
                 Err("not found".into()),
             ]));
-            let session = ReplaySession::recording(&fixture_path, Masks::new());
+            let session = Session::recording(&fixture_path, Masks::new());
             let recorder = RecordingRunner::new(session.clone(), mock);
 
-            let r1 = recorder.run("echo", &["hello"], Path::new("/tmp")).await;
+            let r1 = run!(recorder, "echo", &["hello"], Path::new("/tmp"));
             assert!(r1.is_ok());
 
-            let r2 = recorder.run("missing", &[], Path::new("/tmp")).await;
+            let r2 = run!(recorder, "missing", &[], Path::new("/tmp"));
             assert!(r2.is_err());
 
-            session.save();
+            session.finish();
         }
 
         // Replay phase: verify the recorded fixture works
         {
-            let session = ReplaySession::from_file(&fixture_path, Masks::new());
-            let runner = session.command_runner();
+            let session = Session::replaying(&fixture_path, Masks::new());
+            let runner = ReplayRunner::new(session.clone());
 
-            let r1 = runner.run("echo", &["hello"], Path::new("/tmp")).await;
+            let r1 = run!(runner, "echo", &["hello"], Path::new("/tmp"));
             assert_eq!(r1.unwrap(), "hello\n");
 
-            let r2 = runner.run("missing", &[], Path::new("/tmp")).await;
+            let r2 = run!(runner, "missing", &[], Path::new("/tmp"));
             assert!(r2.is_err());
 
             session.assert_complete();
@@ -1182,8 +1453,8 @@ interactions:
         let path = dir.path().join("http.yaml");
         std::fs::write(&path, yaml).unwrap();
 
-        let session = ReplaySession::from_file(&path, Masks::new());
-        let client = session.http_client();
+        let session = Session::replaying(&path, Masks::new());
+        let client = ReplayHttpClient::new(session.clone());
 
         let request = reqwest::Client::new()
             .get("https://example.test/v1/sessions")
@@ -1192,9 +1463,584 @@ interactions:
             .build()
             .unwrap();
 
-        let response = client.execute(request).await.expect("replay should work");
+        let label = ChannelLabel::http_from_url("https://example.test/v1/sessions");
+        let response = client
+            .execute(request, &label)
+            .await
+            .expect("replay should work");
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(response.body().as_ref(), br#"{"data":[]}"#);
         session.assert_complete();
+    }
+
+    #[test]
+    fn multi_channel_round_allows_any_consumption_order() {
+        // Fixture has command and http in same round
+        let yaml = r#"
+interactions:
+  - channel: command
+    cmd: git
+    args: ["status"]
+    cwd: "/repo"
+    stdout: "ok\n"
+    exit_code: 0
+  - channel: http
+    method: GET
+    url: "https://api.test/v1/sessions"
+    status: 200
+    response_body: '{"data":[]}'
+  - channel: command
+    cmd: git
+    args: ["log"]
+    cwd: "/repo"
+    stdout: "abc\n"
+    exit_code: 0
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.yaml");
+        std::fs::write(&path, yaml).unwrap();
+
+        let session = Session::replaying(&path, Masks::new());
+
+        // Consume http FIRST (before any commands) — this is the key test.
+        // With the old linear cursor this would have panicked.
+        let http = session.next(&ChannelLabel::Http("api.test".into()));
+        assert!(matches!(http, Interaction::Http { .. }));
+
+        // Now consume commands in order
+        let cmd1 = session.next(&ChannelLabel::Command("git status".into()));
+        match cmd1 {
+            Interaction::Command { args, .. } => assert_eq!(args[0], "status"),
+            _ => panic!("expected command"),
+        }
+
+        let cmd2 = session.next(&ChannelLabel::Command("git log".into()));
+        match cmd2 {
+            Interaction::Command { args, .. } => assert_eq!(args[0], "log"),
+            _ => panic!("expected command"),
+        }
+
+        session.finish();
+    }
+
+    #[test]
+    fn channel_label_from_interaction() {
+        let cmd = Interaction::Command {
+            label: None,
+            cmd: "git".into(),
+            args: vec!["status".into()],
+            cwd: "/repo".into(),
+            stdout: Some("ok\n".into()),
+            stderr: None,
+            exit_code: 0,
+        };
+        // DefaultLabeler uses subcommand: "git status"
+        assert_eq!(
+            cmd.channel_label(),
+            ChannelLabel::Command("git status".into())
+        );
+
+        let cmd_no_args = Interaction::Command {
+            label: None,
+            cmd: "git".into(),
+            args: vec![],
+            cwd: "/repo".into(),
+            stdout: Some("ok\n".into()),
+            stderr: None,
+            exit_code: 0,
+        };
+        assert_eq!(
+            cmd_no_args.channel_label(),
+            ChannelLabel::Command("git".into())
+        );
+
+        let api = Interaction::GhApi {
+            label: None,
+            method: "GET".into(),
+            endpoint: "repos/owner/repo/pulls".into(),
+            status: 200,
+            body: "[]".into(),
+            headers: HashMap::new(),
+        };
+        assert_eq!(
+            api.channel_label(),
+            ChannelLabel::GhApi("repos/owner/repo/pulls".into())
+        );
+
+        let http = Interaction::Http {
+            label: None,
+            method: "GET".into(),
+            url: "https://api.claude.ai/v1/sessions".into(),
+            request_headers: HashMap::new(),
+            request_body: None,
+            status: 200,
+            response_body: "{}".into(),
+            response_headers: HashMap::new(),
+        };
+        assert_eq!(
+            http.channel_label(),
+            ChannelLabel::Http("api.claude.ai".into())
+        );
+    }
+
+    #[test]
+    fn default_labeler_uses_subcommand() {
+        let request = ChannelRequest::Command {
+            cmd: "git",
+            args: &["branch", "--list"],
+        };
+        assert_eq!(
+            DefaultLabeler.into_channel_label(&request),
+            ChannelLabel::Command("git branch".into())
+        );
+    }
+
+    #[test]
+    fn default_labeler_no_args_uses_cmd() {
+        let request = ChannelRequest::Command {
+            cmd: "git",
+            args: &[],
+        };
+        assert_eq!(
+            DefaultLabeler.into_channel_label(&request),
+            ChannelLabel::Command("git".into())
+        );
+    }
+
+    #[test]
+    fn task_id_overrides_label() {
+        use super::super::TaskId;
+        let request = ChannelRequest::Command {
+            cmd: "git",
+            args: &["rev-list", "--left-right", "--count", "HEAD...main"],
+        };
+        assert_eq!(
+            TaskId("trunk-ab").into_channel_label(&request),
+            ChannelLabel::Command("trunk-ab".into())
+        );
+    }
+
+    #[test]
+    fn load_rounds_flat_format() {
+        let yaml = r#"
+interactions:
+  - channel: command
+    cmd: git
+    args: ["status"]
+    cwd: "/repo"
+    stdout: "ok\n"
+    exit_code: 0
+  - channel: gh_api
+    method: GET
+    endpoint: "/repos/owner/repo/pulls"
+    status: 200
+    body: "[]"
+"#;
+        let rounds = load_rounds_from_str(yaml);
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].queues.len(), 2);
+        assert!(rounds[0]
+            .queues
+            .contains_key(&ChannelLabel::Command("git status".into())));
+        assert!(rounds[0]
+            .queues
+            .contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
+    }
+
+    #[test]
+    fn load_rounds_multi_round_format() {
+        let yaml = r#"
+rounds:
+  - interactions:
+      - channel: command
+        cmd: git
+        args: ["status"]
+        cwd: "/repo"
+        stdout: "ok\n"
+        exit_code: 0
+  - interactions:
+      - channel: gh_api
+        method: GET
+        endpoint: "/repos/owner/repo/pulls"
+        status: 200
+        body: "[]"
+"#;
+        let rounds = load_rounds_from_str(yaml);
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(rounds[0].queues.len(), 1);
+        assert!(rounds[0]
+            .queues
+            .contains_key(&ChannelLabel::Command("git status".into())));
+        assert_eq!(rounds[1].queues.len(), 1);
+        assert!(rounds[1]
+            .queues
+            .contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
+    }
+
+    #[test]
+    fn round_is_empty() {
+        let round = Round::from_interactions(vec![]);
+        assert!(round.is_empty());
+
+        let round = Round::from_interactions(vec![Interaction::Command {
+            label: None,
+            cmd: "git".into(),
+            args: vec![],
+            cwd: "/repo".into(),
+            stdout: None,
+            stderr: None,
+            exit_code: 0,
+        }]);
+        assert!(!round.is_empty());
+    }
+
+    #[test]
+    fn replayer_serves_by_channel_label() {
+        let yaml = r#"
+interactions:
+  - channel: command
+    cmd: git
+    args: ["status"]
+    cwd: "/repo"
+    stdout: "ok\n"
+    exit_code: 0
+  - channel: gh_api
+    method: GET
+    endpoint: "/repos/owner/repo/pulls"
+    status: 200
+    body: "[]"
+  - channel: command
+    cmd: git
+    args: ["log"]
+    cwd: "/repo"
+    stdout: "commits\n"
+    exit_code: 0
+"#;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("test.yaml");
+        std::fs::write(&path, yaml).expect("write fixture");
+
+        let replayer = Replayer::from_file(&path, Masks::new());
+
+        // Can consume in any channel order within the same round
+        let api = replayer.next(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into()));
+        match api {
+            Interaction::GhApi { endpoint, .. } => {
+                assert_eq!(endpoint, "/repos/owner/repo/pulls");
+            }
+            _ => panic!("expected gh_api"),
+        }
+
+        // First git command
+        let cmd1 = replayer.next(&ChannelLabel::Command("git status".into()));
+        match cmd1 {
+            Interaction::Command { stdout, .. } => {
+                assert_eq!(stdout, Some("ok\n".into()));
+            }
+            _ => panic!("expected command"),
+        }
+
+        // Second git command (different subcommand channel)
+        let cmd2 = replayer.next(&ChannelLabel::Command("git log".into()));
+        match cmd2 {
+            Interaction::Command { stdout, .. } => {
+                assert_eq!(stdout, Some("commits\n".into()));
+            }
+            _ => panic!("expected command"),
+        }
+
+        replayer.assert_complete();
+    }
+
+    #[test]
+    #[should_panic(expected = "no queue for channel")]
+    fn replayer_enforces_round_boundaries() {
+        let yaml = r#"
+rounds:
+  - interactions:
+      - channel: command
+        cmd: git
+        args: ["status"]
+        cwd: "/repo"
+        stdout: "ok\n"
+        exit_code: 0
+  - interactions:
+      - channel: gh_api
+        method: GET
+        endpoint: "/repos/owner/repo/pulls"
+        status: 200
+        body: "[]"
+"#;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("test.yaml");
+        std::fs::write(&path, yaml).expect("write fixture");
+
+        let replayer = Replayer::from_file(&path, Masks::new());
+
+        // Round 1 only has a command — requesting gh_api should panic
+        replayer.next(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into()));
+    }
+
+    #[test]
+    fn replayer_auto_advances_rounds() {
+        let yaml = r#"
+rounds:
+  - interactions:
+      - channel: command
+        cmd: git
+        args: ["status"]
+        cwd: "/repo"
+        stdout: "ok\n"
+        exit_code: 0
+  - interactions:
+      - channel: gh_api
+        method: GET
+        endpoint: "/repos/owner/repo/pulls"
+        status: 200
+        body: "[]"
+"#;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("test.yaml");
+        std::fs::write(&path, yaml).expect("write fixture");
+
+        let replayer = Replayer::from_file(&path, Masks::new());
+
+        // Consume round 1
+        let cmd = replayer.next(&ChannelLabel::Command("git status".into()));
+        match cmd {
+            Interaction::Command { cmd, .. } => assert_eq!(cmd, "git"),
+            _ => panic!("expected command"),
+        }
+
+        // Round auto-advances — now we can get gh_api from round 2
+        let api = replayer.next(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into()));
+        match api {
+            Interaction::GhApi { endpoint, .. } => {
+                assert_eq!(endpoint, "/repos/owner/repo/pulls");
+            }
+            _ => panic!("expected gh_api"),
+        }
+
+        replayer.assert_complete();
+    }
+
+    #[test]
+    fn recorder_saves_single_round() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("recorded.yaml");
+
+        let recorder = Recorder::new(&path, Masks::new());
+        recorder.record(Interaction::Command {
+            label: None,
+            cmd: "git".into(),
+            args: vec!["status".into()],
+            cwd: "/repo".into(),
+            stdout: Some("ok\n".into()),
+            stderr: None,
+            exit_code: 0,
+        });
+        recorder.save();
+
+        let content = std::fs::read_to_string(&path).expect("read fixture");
+        let round_log: RoundLog = serde_yml::from_str(&content).expect("parse fixture");
+        assert_eq!(round_log.rounds.len(), 1);
+        assert_eq!(round_log.rounds[0].interactions.len(), 1);
+    }
+
+    #[test]
+    fn recorder_saves_multi_round_with_barriers() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("recorded.yaml");
+
+        let recorder = Recorder::new(&path, Masks::new());
+        recorder.record(Interaction::Command {
+            label: None,
+            cmd: "git".into(),
+            args: vec!["status".into()],
+            cwd: "/repo".into(),
+            stdout: Some("ok\n".into()),
+            stderr: None,
+            exit_code: 0,
+        });
+        recorder.barrier();
+        recorder.record(Interaction::GhApi {
+            label: None,
+            method: "GET".into(),
+            endpoint: "/repos/owner/repo/pulls".into(),
+            status: 200,
+            body: "[]".into(),
+            headers: HashMap::new(),
+        });
+        recorder.save();
+
+        let content = std::fs::read_to_string(&path).expect("read fixture");
+        let round_log: RoundLog = serde_yml::from_str(&content).expect("parse fixture");
+        assert_eq!(round_log.rounds.len(), 2);
+        assert_eq!(round_log.rounds[0].interactions.len(), 1);
+        assert_eq!(round_log.rounds[1].interactions.len(), 1);
+    }
+
+    #[test]
+    fn recorder_applies_masks() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("recorded.yaml");
+
+        let mut masks = Masks::new();
+        masks.add("/Users/bob/dev/repo", "{repo}");
+
+        let recorder = Recorder::new(&path, masks);
+        recorder.record(Interaction::Command {
+            label: None,
+            cmd: "git".into(),
+            args: vec!["status".into()],
+            cwd: "/Users/bob/dev/repo".into(),
+            stdout: Some("ok\n".into()),
+            stderr: None,
+            exit_code: 0,
+        });
+        recorder.save();
+
+        let content = std::fs::read_to_string(&path).expect("read fixture");
+        assert!(
+            content.contains("{repo}"),
+            "expected masked value in output"
+        );
+        assert!(
+            !content.contains("/Users/bob/dev/repo"),
+            "expected concrete value to be masked"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_record_then_replay_round_trip() {
+        use crate::providers::testing::MockRunner;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fixture_path = dir.path().join("round_trip.yaml");
+
+        // Record phase with barriers
+        {
+            let mock = Arc::new(MockRunner::new(vec![
+                Ok("branch-list\n".into()),
+                Ok("status-ok\n".into()),
+            ]));
+            let session = Session::recording(&fixture_path, Masks::new());
+            let runner = RecordingRunner::new(session.clone(), mock);
+
+            let r1 = run!(runner, "git", &["branch"], Path::new("/repo"));
+            assert!(r1.is_ok());
+
+            session.barrier();
+
+            let r2 = run!(runner, "git", &["status"], Path::new("/repo"));
+            assert!(r2.is_ok());
+
+            session.finish();
+        }
+
+        // Replay phase — verify round structure is preserved
+        {
+            let session = Session::replaying(&fixture_path, Masks::new());
+            let runner = ReplayRunner::new(session.clone());
+
+            let r1 = run!(runner, "git", &["branch"], Path::new("/repo"));
+            assert_eq!(r1.expect("round 1 replay"), "branch-list\n");
+
+            let r2 = run!(runner, "git", &["status"], Path::new("/repo"));
+            assert_eq!(r2.expect("round 2 replay"), "status-ok\n");
+
+            session.assert_complete();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_subcommand_with_task_id() {
+        use super::super::TaskId;
+
+        let yaml = r#"
+rounds:
+- interactions:
+  - channel: command
+    label: trunk-ab
+    cmd: git
+    args: ["rev-list", "--left-right", "--count", "HEAD...main"]
+    cwd: /test
+    stdout: "2\t3"
+    exit_code: 0
+  - channel: command
+    label: remote-ab
+    cmd: git
+    args: ["rev-list", "--left-right", "--count", "HEAD...origin/feature"]
+    cwd: /test
+    stdout: "0\t5"
+    exit_code: 0
+"#;
+        let session = Session::replaying_from_str(yaml, Masks::new());
+        let runner = Arc::new(ReplayRunner::new(session.clone()));
+        let cwd = Path::new("/test");
+
+        // Consume in REVERSE order — works because TaskId puts them on different channels
+        let (remote, trunk) = tokio::join!(
+            async {
+                run!(
+                    runner,
+                    "git",
+                    &[
+                        "rev-list",
+                        "--left-right",
+                        "--count",
+                        "HEAD...origin/feature"
+                    ],
+                    cwd,
+                    TaskId("remote-ab")
+                )
+            },
+            async {
+                run!(
+                    runner,
+                    "git",
+                    &["rev-list", "--left-right", "--count", "HEAD...main"],
+                    cwd,
+                    TaskId("trunk-ab")
+                )
+            },
+        );
+
+        assert_eq!(remote.unwrap().trim(), "0\t5");
+        assert_eq!(trunk.unwrap().trim(), "2\t3");
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_subcommands_default_labeler() {
+        let yaml = r#"
+rounds:
+- interactions:
+  - channel: command
+    cmd: git
+    args: ["status", "--porcelain"]
+    cwd: /test
+    stdout: "M file.txt"
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args: ["log", "-1", "--format=%h\t%s"]
+    cwd: /test
+    stdout: "abc1234\tcommit msg"
+    exit_code: 0
+"#;
+        let session = Session::replaying_from_str(yaml, Masks::new());
+        let runner = Arc::new(ReplayRunner::new(session.clone()));
+        let cwd = Path::new("/test");
+
+        // Consume in reverse order — works because "git status" and "git log" are different channels
+        let (log, status) = tokio::join!(
+            async { run!(runner, "git", &["log", "-1", "--format=%h\t%s"], cwd) },
+            async { run!(runner, "git", &["status", "--porcelain"], cwd) },
+        );
+
+        assert_eq!(log.unwrap().trim(), "abc1234\tcommit msg");
+        assert_eq!(status.unwrap().trim(), "M file.txt");
+        session.finish();
     }
 }
