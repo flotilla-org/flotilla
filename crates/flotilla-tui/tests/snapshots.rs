@@ -283,6 +283,18 @@ fn providers_overlay() {
 }
 
 #[test]
+fn config_screen_cross_repo_worst_wins() {
+    let mut harness = TestHarness::multi_repo(&["alpha", "beta"])
+        .with_mode(UiMode::Config)
+        .with_provider_names("alpha", vec![("code_review", "GitHub")])
+        .with_provider_names("beta", vec![("code_review", "GitHub")])
+        .with_provider_status("alpha", "code_review", "GitHub", ProviderStatus::Ok)
+        .with_provider_status("beta", "code_review", "GitHub", ProviderStatus::Error);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn debug_panel_with_correlation_details() {
     let mut item = support::checkout_item("feat-xyz", "/test/my-project/feat-xyz", false);
     item.description = "Feature branch checkout".into();

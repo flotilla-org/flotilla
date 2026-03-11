@@ -1,0 +1,35 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 294
+expression: output
+---
+ ⚓  flotilla  | alpha | beta | [+]
+┌ Providers ───────────────────────────────────────────────────────────┐┌ Event Log ───────────────────────────── INFO ┐
+│Role             Provider                 Status                      ││                                              │
+│VCS              —                                                    ││                                              │
+│Checkout mgr     —                                                    ││                                              │
+│Code review      GitHub                   ✗                           ││                                              │
+│Issue tracker    —                                                    ││                                              │
+│Cloud agents     —                                                    ││                                              │
+│AI utility       —                                                    ││                                              │
+│Workspace mgr    —                                                    ││                                              │
+│Terminal pool    —                                                    ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+ j/k:scroll log  [/]:switch tab  ?:help  q:quit
