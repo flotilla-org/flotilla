@@ -76,6 +76,14 @@ fn help_screen() {
 }
 
 #[test]
+fn help_screen_clamps_scroll_state_after_render() {
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::Help);
+    harness.ui.help_scroll = u16::MAX;
+    let _ = harness.render_to_string();
+    assert!(harness.ui.help_scroll < u16::MAX);
+}
+
+#[test]
 fn action_menu() {
     let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::ActionMenu {
         items: vec![

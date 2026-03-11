@@ -32,8 +32,24 @@ async fn tracking_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Op
     )
     .ok()?;
     let upstream = upstream.trim();
-    // upstream looks like "origin/main" — the remote name is the first segment
-    let remote_name = upstream.split('/').next()?;
+    let remotes_output = run!(runner, "git", &["remote"], repo_root).ok()?;
+    let remotes: Vec<&str> = remotes_output
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    // upstream looks like "origin/main" or "team/origin/main". Match it against
+    // configured remotes and prefer the longest prefix to handle remotes containing '/'.
+    let remote_name = remotes
+        .into_iter()
+        .filter(|remote| {
+            upstream == *remote
+                || upstream
+                    .strip_prefix(remote)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .max_by_key(|remote| remote.len())
+        .or_else(|| upstream.split('/').next())?;
     if remote_name.is_empty() {
         return None;
     }
@@ -563,6 +579,7 @@ mod tests {
                 &["rev-parse", "--abbrev-ref", "@{upstream}"],
                 Ok("upstream/main\n".to_string()),
             )
+            .on_run("git", &["remote"], Ok("origin\nupstream\n".to_string()))
             .on_run(
                 "git",
                 &["remote", "get-url", "upstream"],
@@ -575,6 +592,31 @@ mod tests {
             Some("https://github.com/upstream/repo.git".to_string())
         );
         assert!(runner.saw_cwd(repo_root));
+    }
+
+    #[tokio::test]
+    async fn first_remote_prefers_tracking_remote_with_slash_in_name_over_origin() {
+        let repo_root = Path::new("/tmp/repo-root");
+        let runner = DiscoveryMockRunner::builder()
+            .on_run(
+                "git",
+                &["rev-parse", "--abbrev-ref", "@{upstream}"],
+                Ok("team/origin/main\n".to_string()),
+            )
+            .on_run("git", &["remote"], Ok("origin\nteam/origin\n".to_string()))
+            .on_run(
+                "git",
+                &["remote", "get-url", "origin"],
+                Ok("https://github.com/wrong/repo.git\n".to_string()),
+            )
+            .on_run(
+                "git",
+                &["remote", "get-url", "team/origin"],
+                Ok("https://github.com/team/repo.git\n".to_string()),
+            )
+            .build();
+        let url = first_remote_url(repo_root, &runner).await;
+        assert_eq!(url, Some("https://github.com/team/repo.git".to_string()));
     }
 
     #[tokio::test]
@@ -1044,6 +1086,7 @@ mod tests {
                     &["rev-parse", "--abbrev-ref", "@{upstream}"],
                     Ok("upstream/main\n".to_string()),
                 )
+                .on_run("git", &["remote"], Ok("origin\nupstream\n".to_string()))
                 .on_run(
                     "git",
                     &["remote", "get-url", "upstream"],

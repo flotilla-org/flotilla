@@ -822,7 +822,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
+fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
     if !matches!(ui.mode, UiMode::Help) {
         return;
     }
@@ -891,7 +891,8 @@ fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
     let total_lines = help_text.len() as u16;
     let inner_height = area.height.saturating_sub(2); // borders
     let max_scroll = total_lines.saturating_sub(inner_height);
-    let scroll = ui.help_scroll.min(max_scroll);
+    ui.help_scroll = ui.help_scroll.min(max_scroll);
+    let scroll = ui.help_scroll;
 
     let has_more_below = scroll < max_scroll;
     let has_more_above = scroll > 0;
