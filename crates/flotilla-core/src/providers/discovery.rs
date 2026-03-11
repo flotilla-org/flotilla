@@ -77,7 +77,7 @@ pub async fn first_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> O
         {
             let url = url.trim().to_string();
             if !url.is_empty() {
-                debug!("using origin remote");
+                debug!(%url, "using origin remote");
                 return Some(url);
             }
         }

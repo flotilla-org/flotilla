@@ -832,6 +832,18 @@ fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
 
     let labels = model.active_labels();
     let help_text = vec![
+        Line::from(Span::styled("Item Icons", Style::default().bold())),
+        Line::from("  ●  Checkout with workspace    ○  Checkout (no workspace)"),
+        Line::from("  ▶  Running session            ◆  Idle session"),
+        Line::from("  ⊙  Pull request               ◇  Issue"),
+        Line::from("  ⊶  Remote branch"),
+        Line::from(""),
+        Line::from(Span::styled("Column Indicators", Style::default().bold())),
+        Line::from("  WT: ◆ main  ✓ checked out"),
+        Line::from("  WS: ● has workspace  2/3/… multiple"),
+        Line::from("  PR: ✓ merged  ✗ closed"),
+        Line::from("  Git: ? untracked  M modified  ↑ ahead  ↓ behind"),
+        Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().bold())),
         Line::from("  j/k or ↑/↓      Navigate list"),
         Line::from("  Click            Select item"),
@@ -874,18 +886,6 @@ fn render_help(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         Line::from("  D                Toggle correlation debug panel"),
         Line::from("  ?                Toggle this help"),
         Line::from("  q / Esc          Quit"),
-        Line::from(""),
-        Line::from(Span::styled("Item Icons", Style::default().bold())),
-        Line::from("  ●  Checkout with workspace    ○  Checkout (no workspace)"),
-        Line::from("  ▶  Running session            ◆  Idle session"),
-        Line::from("  ⊙  Pull request               ◇  Issue"),
-        Line::from("  ⊶  Remote branch"),
-        Line::from(""),
-        Line::from(Span::styled("Column Indicators", Style::default().bold())),
-        Line::from("  WT: ◆ main  ✓ checked out"),
-        Line::from("  WS: ● has workspace  2/3/… multiple"),
-        Line::from("  PR: ✓ merged  ✗ closed"),
-        Line::from("  Git: ? untracked  M modified  ↑ ahead  ↓ behind"),
     ];
 
     let paragraph = Paragraph::new(help_text)
