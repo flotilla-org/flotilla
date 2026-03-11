@@ -271,3 +271,69 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::providers::testing::MockRunner;
+    use crate::providers::workspace::WorkspaceManager;
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(
+            CmuxWorkspaceManager::shell_quote("a'b c"),
+            "'a'\\''b c'".to_string()
+        );
+    }
+
+    #[test]
+    fn parse_ok_ref_extracts_first_token() {
+        assert_eq!(
+            CmuxWorkspaceManager::parse_ok_ref("OK workspace:42"),
+            "workspace:42"
+        );
+        // Defensive fallback for unexpected output without the "OK " prefix.
+        assert_eq!(CmuxWorkspaceManager::parse_ok_ref("surface:7"), "surface:7");
+        assert_eq!(CmuxWorkspaceManager::parse_ok_ref(""), "");
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_parses_json_response() {
+        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Ok(
+            r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo","/tmp/repo2"]}]}"#.to_string(),
+        )])));
+
+        let workspaces = manager.list_workspaces().await.expect("list workspaces");
+        assert_eq!(workspaces.len(), 1);
+        let (ws_ref, ws) = &workspaces[0];
+        assert_eq!(ws_ref, "workspace:10");
+        assert_eq!(ws.name, "Main");
+        assert_eq!(
+            ws.directories,
+            vec![PathBuf::from("/tmp/repo"), PathBuf::from("/tmp/repo2")]
+        );
+        assert_eq!(ws.correlation_keys.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_returns_error_when_ref_missing() {
+        let manager =
+            CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
+        let config = WorkspaceConfig {
+            name: "demo".into(),
+            working_directory: PathBuf::from("/tmp/repo"),
+            template_vars: std::collections::HashMap::new(),
+            template_yaml: None,
+            resolved_commands: None,
+        };
+
+        let err = manager
+            .create_workspace(&config)
+            .await
+            .expect_err("should fail when ref is missing");
+        assert!(err.contains("returned no workspace ref"));
+    }
+}

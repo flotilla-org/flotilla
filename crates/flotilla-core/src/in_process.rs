@@ -1108,3 +1108,184 @@ impl DaemonHandle for InProcessDaemon {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout};
+
+    fn checkout_with_issue(issue_id: &str) -> Checkout {
+        Checkout {
+            branch: "main".into(),
+            is_trunk: true,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![AssociationKey::IssueRef("gh".into(), issue_id.into())],
+        }
+    }
+
+    fn cr_with_issue(issue_id: &str) -> ChangeRequest {
+        ChangeRequest {
+            title: "Fix bug".into(),
+            branch: "feature/fix".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![AssociationKey::IssueRef("gh".into(), issue_id.into())],
+        }
+    }
+
+    #[test]
+    fn collect_linked_issue_ids_deduplicates_across_sources() {
+        let mut providers = ProviderData::default();
+        providers
+            .checkouts
+            .insert(PathBuf::from("/tmp/repo"), checkout_with_issue("123"));
+        providers
+            .change_requests
+            .insert("1".into(), cr_with_issue("123"));
+        providers
+            .change_requests
+            .insert("2".into(), cr_with_issue("456"));
+
+        let mut ids = collect_linked_issue_ids(&providers);
+        ids.sort();
+        assert_eq!(ids, vec!["123".to_string(), "456".to_string()]);
+    }
+
+    #[test]
+    fn inject_issues_prefers_search_results_then_cache_then_empty() {
+        let base = ProviderData::default();
+
+        let mut cache = IssueCache::new();
+        cache.add_pinned(vec![(
+            "1".into(),
+            Issue {
+                title: "cached".into(),
+                labels: vec![],
+                association_keys: vec![],
+            },
+        )]);
+
+        let search_results = Some(vec![(
+            "2".into(),
+            Issue {
+                title: "search".into(),
+                labels: vec![],
+                association_keys: vec![],
+            },
+        )]);
+
+        let from_search = inject_issues(&base, &cache, &search_results);
+        assert_eq!(from_search.issues.len(), 1);
+        assert!(from_search.issues.contains_key("2"));
+
+        let from_cache = inject_issues(&base, &cache, &None);
+        assert!(from_cache.issues.contains_key("1"));
+
+        let empty_cache = IssueCache::new();
+        let empty = inject_issues(&base, &empty_cache, &None);
+        assert!(empty.issues.is_empty());
+    }
+
+    #[test]
+    fn choose_event_uses_delta_for_non_initial_changes() {
+        let repo = PathBuf::from("/tmp/repo");
+        let snapshot = Snapshot {
+            seq: 2,
+            repo: repo.clone(),
+            work_items: vec![],
+            providers: ProviderData::default(),
+            provider_health: HashMap::new(),
+            errors: vec![],
+            issue_total: None,
+            issue_has_more: false,
+            issue_search_results: None,
+        };
+
+        let initial = DeltaEntry {
+            seq: 1,
+            prev_seq: 0,
+            changes: vec![],
+            work_items: vec![],
+        };
+        assert!(matches!(
+            choose_event(snapshot.clone(), initial),
+            DaemonEvent::SnapshotFull(_)
+        ));
+
+        let non_empty = DeltaEntry {
+            seq: 2,
+            prev_seq: 1,
+            changes: vec![flotilla_protocol::Change::Branch {
+                key: "feature/x".into(),
+                op: flotilla_protocol::EntryOp::Removed,
+            }],
+            work_items: vec![],
+        };
+        assert!(matches!(
+            choose_event(snapshot, non_empty),
+            DaemonEvent::SnapshotDelta(_)
+        ));
+    }
+
+    #[test]
+    fn choose_event_falls_back_to_full_when_delta_is_larger() {
+        let snapshot = Snapshot {
+            seq: 3,
+            repo: PathBuf::from("/tmp/repo"),
+            work_items: vec![],
+            providers: ProviderData::default(),
+            provider_health: HashMap::new(),
+            errors: vec![],
+            issue_total: None,
+            issue_has_more: false,
+            issue_search_results: None,
+        };
+
+        let delta = DeltaEntry {
+            seq: 3,
+            prev_seq: 2,
+            changes: vec![flotilla_protocol::Change::Branch {
+                key: "feature/".repeat(128),
+                op: flotilla_protocol::EntryOp::Removed,
+            }],
+            work_items: vec![],
+        };
+
+        assert!(matches!(
+            choose_event(snapshot, delta),
+            DaemonEvent::SnapshotFull(_)
+        ));
+    }
+
+    #[test]
+    fn build_repo_snapshot_sets_issue_metadata() {
+        let mut cache = IssueCache::new();
+        cache.total_count = Some(5);
+        cache.has_more = true;
+        cache.add_pinned(vec![(
+            "9".into(),
+            Issue {
+                title: "cached issue".into(),
+                labels: vec![],
+                association_keys: vec![],
+            },
+        )]);
+
+        let snap = build_repo_snapshot(
+            Path::new("/tmp/repo"),
+            7,
+            &RefreshSnapshot::default(),
+            &cache,
+            &None,
+        );
+        assert_eq!(snap.seq, 7);
+        assert_eq!(snap.issue_total, Some(5));
+        assert!(snap.issue_has_more);
+        assert!(snap.providers.issues.contains_key("9"));
+    }
+}
