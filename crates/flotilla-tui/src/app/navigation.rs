@@ -3,31 +3,40 @@ use flotilla_protocol::Command;
 
 use super::{App, UiMode};
 
+enum TabDirection {
+    Forward,
+    Backward,
+}
+
 impl App {
-    fn step_tab(&mut self, forward: bool) {
+    fn step_tab(&mut self, direction: TabDirection) {
         if self.model.repo_order.is_empty() {
             return;
         }
         if self.ui.mode.is_config() {
             self.ui.mode = UiMode::Normal;
-            self.model.active_repo = if forward {
-                0
-            } else {
-                self.model.repo_order.len() - 1
+            self.model.active_repo = match direction {
+                TabDirection::Forward => 0,
+                TabDirection::Backward => self.model.repo_order.len() - 1,
             };
             return;
         }
 
-        if forward {
-            if self.model.active_repo + 1 < self.model.repo_order.len() {
-                self.switch_tab(self.model.active_repo + 1);
-            } else {
-                self.ui.mode = UiMode::Config;
+        match direction {
+            TabDirection::Forward => {
+                if self.model.active_repo + 1 < self.model.repo_order.len() {
+                    self.switch_tab(self.model.active_repo + 1);
+                } else {
+                    self.ui.mode = UiMode::Config;
+                }
             }
-        } else if self.model.active_repo > 0 {
-            self.switch_tab(self.model.active_repo - 1);
-        } else {
-            self.ui.mode = UiMode::Config;
+            TabDirection::Backward => {
+                if self.model.active_repo > 0 {
+                    self.switch_tab(self.model.active_repo - 1);
+                } else {
+                    self.ui.mode = UiMode::Config;
+                }
+            }
         }
     }
 
@@ -45,11 +54,11 @@ impl App {
     }
 
     pub fn next_tab(&mut self) {
-        self.step_tab(true);
+        self.step_tab(TabDirection::Forward);
     }
 
     pub fn prev_tab(&mut self) {
-        self.step_tab(false);
+        self.step_tab(TabDirection::Backward);
     }
 
     pub fn move_tab(&mut self, delta: isize) -> bool {

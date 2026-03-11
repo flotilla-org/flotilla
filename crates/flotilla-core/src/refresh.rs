@@ -104,7 +104,7 @@ impl Drop for RepoRefreshHandle {
     }
 }
 
-/// Fetch all provider data into the given ProviderData struct.
+/// Collect results from parallel provider requests, separating successes from errors.
 async fn collect_named_results<T, Fut>(
     requests: Vec<(String, Fut)>,
 ) -> (Vec<T>, Vec<(String, String)>)
@@ -150,6 +150,7 @@ fn insert_category_health<I>(
     }
 }
 
+/// Fetch all provider data into the given ProviderData struct.
 async fn refresh_providers(
     pd: &mut ProviderData,
     repo_root: &Path,

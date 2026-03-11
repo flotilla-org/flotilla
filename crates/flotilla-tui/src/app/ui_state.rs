@@ -19,6 +19,15 @@ pub struct DirEntry {
     pub is_added: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BranchInputKind {
+    /// User is manually typing a branch name.
+    #[default]
+    Manual,
+    /// AI is generating a branch name from issue context.
+    Generating,
+}
+
 #[derive(Default)]
 pub enum UiMode {
     #[default]
@@ -31,7 +40,7 @@ pub enum UiMode {
     },
     BranchInput {
         input: Input,
-        generating: bool,
+        kind: BranchInputKind,
         /// Issue IDs to link to the branch when created (provider_name, issue_id).
         pending_issue_ids: Vec<(String, String)>,
     },
@@ -237,7 +246,7 @@ mod tests {
             (
                 UiMode::BranchInput {
                     input: Input::default(),
-                    generating: false,
+                    kind: BranchInputKind::Manual,
                     pending_issue_ids: vec![],
                 },
                 false,

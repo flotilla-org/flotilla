@@ -25,7 +25,7 @@ use flotilla_protocol::{
 use std::collections::VecDeque;
 
 pub use intent::Intent;
-pub use ui_state::{DirEntry, RepoUiState, TabId, UiMode, UiState};
+pub use ui_state::{BranchInputKind, DirEntry, RepoUiState, TabId, UiMode, UiState};
 
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,15 +453,15 @@ impl App {
     ) {
         self.ui.mode = UiMode::BranchInput {
             input: Input::from(branch_name),
-            generating: false,
+            kind: BranchInputKind::Manual,
             pending_issue_ids,
         };
     }
 
-    pub(super) fn enter_branch_input(&mut self, generating: bool) {
+    pub(super) fn enter_branch_input(&mut self, kind: BranchInputKind) {
         self.ui.mode = UiMode::BranchInput {
             input: Input::default(),
-            generating,
+            kind,
             pending_issue_ids: Vec::new(),
         };
     }
@@ -480,13 +480,21 @@ impl App {
         self.refresh_dir_listing();
     }
 
-    pub(super) fn clear_active_issue_search(&mut self, always_dispatch: bool) {
-        if always_dispatch || self.active_ui().active_search_query.is_some() {
+    pub(super) fn clear_active_issue_search(&mut self, dispatch: ClearDispatch) {
+        if dispatch == ClearDispatch::Always || self.active_ui().active_search_query.is_some() {
             let repo = self.model.active_repo_root().clone();
             self.proto_commands.push(Command::ClearIssueSearch { repo });
         }
         self.active_ui_mut().active_search_query = None;
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClearDispatch {
+    /// Always dispatch the clear command, even if no search is active.
+    Always,
+    /// Only dispatch if there is an active search query.
+    OnlyIfActive,
 }
 
 #[cfg(test)]
@@ -994,11 +1002,11 @@ mod tests {
         match &app.ui.mode {
             UiMode::BranchInput {
                 input,
-                generating,
+                kind,
                 pending_issue_ids,
             } => {
                 assert_eq!(input.value(), "my-branch");
-                assert!(!generating);
+                assert_eq!(*kind, BranchInputKind::Manual);
                 assert_eq!(pending_issue_ids.len(), 1);
             }
             _ => panic!("expected BranchInput mode"),

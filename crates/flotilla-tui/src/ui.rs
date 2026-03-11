@@ -14,7 +14,9 @@ use unicode_width::UnicodeWidthStr;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::app::{InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState};
+use crate::app::{
+    BranchInputKind, InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState,
+};
 use crate::event_log::{self, LevelExt};
 use crate::ui_helpers;
 use flotilla_core::data::{GroupEntry, SectionHeader};
@@ -231,10 +233,12 @@ fn render_status_bar(
     let text: String = match &ui.mode {
         UiMode::Config => " j/k:scroll log  [/]:switch tab  ?:help  q:quit".into(),
         UiMode::BranchInput {
-            generating: true, ..
+            kind: BranchInputKind::Generating,
+            ..
         } => " Generating branch name...".into(),
         UiMode::BranchInput {
-            generating: false, ..
+            kind: BranchInputKind::Manual,
+            ..
         } => " type branch name  enter:create  esc:cancel".into(),
         UiMode::ActionMenu { .. } => " j/k:navigate  enter:select  esc:close".into(),
         UiMode::IssueSearch { ref input } => {
@@ -719,7 +723,7 @@ fn render_action_menu(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
 fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     let UiMode::BranchInput {
         ref input,
-        generating,
+        ref kind,
         ..
     } = ui.mode
     else {
@@ -733,7 +737,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     let inner_area = inner.inner(area);
     frame.render_widget(inner, area);
 
-    if generating {
+    if *kind == BranchInputKind::Generating {
         let paragraph =
             Paragraph::new("  Generating branch name...").style(Style::default().fg(Color::Yellow));
         frame.render_widget(paragraph, inner_area);
