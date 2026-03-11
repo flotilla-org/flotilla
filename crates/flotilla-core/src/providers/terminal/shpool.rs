@@ -10,13 +10,46 @@ use crate::providers::{run, CommandRunner};
 pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
     socket_path: PathBuf,
+    config_path: PathBuf,
 }
+
+/// Shpool config content managed by flotilla.
+/// Disables prompt prefix (flotilla manages its own UI) and forwards
+/// terminal environment variables that would otherwise be lost when
+/// the shpool daemon spawns shells outside the terminal emulator.
+/// Note: `forward_env` only takes effect when creating new sessions,
+/// not when reattaching to existing ones (shpool limitation).
+const FLOTILLA_SHPOOL_CONFIG: &str = include_str!("shpool_config.toml");
 
 impl ShpoolTerminalPool {
     pub fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
+        let config_path = socket_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("config.toml");
+        Self::ensure_config(&config_path);
         Self {
             runner,
             socket_path,
+            config_path,
+        }
+    }
+
+    /// Write the flotilla-managed shpool config if it doesn't exist or is stale.
+    fn ensure_config(path: &Path) {
+        let needs_write = match std::fs::read_to_string(path) {
+            Ok(existing) => existing != FLOTILLA_SHPOOL_CONFIG,
+            Err(_) => true,
+        };
+        if needs_write {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(path = %parent.display(), err = %e, "failed to create shpool config dir");
+                }
+            }
+            if let Err(e) = std::fs::write(path, FLOTILLA_SHPOOL_CONFIG) {
+                tracing::warn!(path = %path.display(), err = %e, "failed to write shpool config");
+            }
         }
     }
 
@@ -85,10 +118,18 @@ impl TerminalPool for ShpoolTerminalPool {
 
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
         let socket_path_str = self.socket_path.display().to_string();
+        let config_path_str = self.config_path.display().to_string();
         let result = run!(
             self.runner,
             "shpool",
-            &["--socket", &socket_path_str, "list", "--json"],
+            &[
+                "--socket",
+                &socket_path_str,
+                "-c",
+                &config_path_str,
+                "list",
+                "--json"
+            ],
             Path::new("/")
         );
 
@@ -120,6 +161,7 @@ impl TerminalPool for ShpoolTerminalPool {
     ) -> Result<String, String> {
         let session_name = format!("flotilla/{id}");
         let socket_path_str = self.socket_path.display().to_string();
+        let config_path_str = self.config_path.display().to_string();
         let cwd_str = cwd.display().to_string();
         fn sq(s: &str) -> String {
             format!("'{}'", s.replace('\'', "'\\''"))
@@ -141,8 +183,9 @@ impl TerminalPool for ShpoolTerminalPool {
             format!(" --cmd {}", sq(&format!("{shell} -lic '{escaped_cmd}'")))
         };
         Ok(format!(
-            "shpool --socket {} attach{} --dir {} {}",
+            "shpool --socket {} -c {} attach{} --dir {} {}",
             sq(&socket_path_str),
+            sq(&config_path_str),
             cmd_part,
             sq(&cwd_str),
             sq(&session_name),
@@ -152,10 +195,18 @@ impl TerminalPool for ShpoolTerminalPool {
     async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
         let session_name = format!("flotilla/{id}");
         let socket_path_str = self.socket_path.display().to_string();
+        let config_path_str = self.config_path.display().to_string();
         run!(
             self.runner,
             "shpool",
-            &["--socket", &socket_path_str, "kill", &session_name],
+            &[
+                "--socket",
+                &socket_path_str,
+                "-c",
+                &config_path_str,
+                "kill",
+                &session_name
+            ],
             Path::new("/")
         )
         .map(|_| ())
@@ -166,6 +217,26 @@ impl TerminalPool for ShpoolTerminalPool {
 mod tests {
     use super::*;
     use crate::providers::testing::MockRunner;
+
+    /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
+    fn test_pool(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create tempdir for shpool test");
+        let socket_path = dir.path().join("shpool.socket");
+        let pool = ShpoolTerminalPool::new(runner, socket_path);
+        (pool, dir)
+    }
+
+    #[test]
+    fn ensure_config_writes_expected_content() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_path = dir.path().join("config.toml");
+        ShpoolTerminalPool::ensure_config(&config_path);
+        let content =
+            std::fs::read_to_string(&config_path).expect("config should have been written");
+        assert!(content.contains("prompt_prefix = \"\""));
+        assert!(content.contains("TERMINFO"));
+        assert!(content.contains("COLORTERM"));
+    }
 
     #[test]
     fn parse_list_json_with_flotilla_sessions() {
@@ -245,8 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_running_is_noop() {
-        let runner = Arc::new(MockRunner::new(vec![]));
-        let pool = ShpoolTerminalPool::new(runner, PathBuf::from("/tmp/test.sock"));
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId {
             checkout: "feat".into(),
             role: "shell".into(),
@@ -259,9 +329,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_command_includes_cmd_and_dir() {
-        let runner = Arc::new(MockRunner::new(vec![]));
-        let pool = ShpoolTerminalPool::new(runner, PathBuf::from("/tmp/test.sock"));
+    async fn attach_command_includes_cmd_dir_and_config() {
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId {
             checkout: "feat".into(),
             role: "shell".into(),
@@ -279,12 +348,16 @@ mod tests {
         assert!(cmd.contains("--dir"));
         assert!(cmd.contains("/home/dev"));
         assert!(cmd.contains("flotilla/feat/shell/0"));
+        assert!(cmd.contains("-c"), "should pass config file: {cmd}");
+        assert!(
+            cmd.contains("config.toml"),
+            "should reference config.toml: {cmd}"
+        );
     }
 
     #[tokio::test]
     async fn attach_command_empty_cmd_omits_cmd_flag() {
-        let runner = Arc::new(MockRunner::new(vec![]));
-        let pool = ShpoolTerminalPool::new(runner, PathBuf::from("/tmp/test.sock"));
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId {
             checkout: "feat".into(),
             role: "shell".into(),
@@ -298,12 +371,14 @@ mod tests {
         assert!(cmd.contains("attach"));
         assert!(!cmd.contains("--cmd"));
         assert!(cmd.contains("--dir"));
+        assert!(cmd.contains("-c"));
     }
 
     #[tokio::test]
     async fn list_terminals_returns_empty_when_daemon_not_running() {
-        let runner = Arc::new(MockRunner::new(vec![Err("connection refused".into())]));
-        let pool = ShpoolTerminalPool::new(runner, PathBuf::from("/tmp/test.sock"));
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![Err(
+            "connection refused".into()
+        )])));
         let terminals = pool.list_terminals().await.unwrap();
         assert!(terminals.is_empty());
     }
