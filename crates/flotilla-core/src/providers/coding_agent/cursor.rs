@@ -110,7 +110,8 @@ impl CursorAgent {
     fn session_status(&self) -> SessionStatus {
         match self.status.as_str() {
             "CREATING" | "RUNNING" => SessionStatus::Running,
-            "FINISHED" | "STOPPED" | "FAILED" | "EXPIRED" => SessionStatus::Idle,
+            "EXPIRED" => SessionStatus::Expired,
+            "FINISHED" | "STOPPED" | "FAILED" => SessionStatus::Idle,
             _ => SessionStatus::Idle,
         }
     }
@@ -199,6 +200,7 @@ impl super::CloudAgentService for CursorCodingAgent {
         let provider_name = &self.provider_name;
         Ok(agents
             .into_iter()
+            .filter(|a| a.session_status() != SessionStatus::Expired)
             .filter(|a| a.repo_slug().is_some_and(|r| r == *slug))
             .map(|a| {
                 let mut correlation_keys = vec![CorrelationKey::SessionRef(
@@ -296,7 +298,7 @@ mod tests {
             ("FINISHED", SessionStatus::Idle),
             ("STOPPED", SessionStatus::Idle),
             ("FAILED", SessionStatus::Idle),
-            ("EXPIRED", SessionStatus::Idle),
+            ("EXPIRED", SessionStatus::Expired),
             ("UNKNOWN_STATUS", SessionStatus::Idle),
         ];
         for (status, expected) in status_cases {

@@ -61,7 +61,7 @@ pub fn session_status_display(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Running => "▶",
         SessionStatus::Idle => "◆",
-        SessionStatus::Archived => "○",
+        SessionStatus::Archived | SessionStatus::Expired => "○",
     }
 }
 
@@ -311,6 +311,7 @@ mod tests {
         assert_eq!(session_status_display(&SessionStatus::Running), "▶");
         assert_eq!(session_status_display(&SessionStatus::Idle), "◆");
         assert_eq!(session_status_display(&SessionStatus::Archived), "○");
+        assert_eq!(session_status_display(&SessionStatus::Expired), "○");
     }
 
     #[test]
