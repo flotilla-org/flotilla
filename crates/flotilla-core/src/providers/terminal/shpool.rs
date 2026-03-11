@@ -17,6 +17,8 @@ pub struct ShpoolTerminalPool {
 /// Disables prompt prefix (flotilla manages its own UI) and forwards
 /// terminal environment variables that would otherwise be lost when
 /// the shpool daemon spawns shells outside the terminal emulator.
+/// Note: `forward_env` only takes effect when creating new sessions,
+/// not when reattaching to existing ones (shpool limitation).
 const FLOTILLA_SHPOOL_CONFIG: &str = include_str!("shpool_config.toml");
 
 impl ShpoolTerminalPool {
@@ -41,7 +43,9 @@ impl ShpoolTerminalPool {
         };
         if needs_write {
             if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(path = %parent.display(), err = %e, "failed to create shpool config dir");
+                }
             }
             if let Err(e) = std::fs::write(path, FLOTILLA_SHPOOL_CONFIG) {
                 tracing::warn!(path = %path.display(), err = %e, "failed to write shpool config");
@@ -216,7 +220,7 @@ mod tests {
 
     /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
     fn test_pool(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir().expect("create tempdir for shpool test");
         let socket_path = dir.path().join("shpool.socket");
         let pool = ShpoolTerminalPool::new(runner, socket_path);
         (pool, dir)
@@ -224,10 +228,11 @@ mod tests {
 
     #[test]
     fn ensure_config_writes_expected_content() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create tempdir");
         let config_path = dir.path().join("config.toml");
         ShpoolTerminalPool::ensure_config(&config_path);
-        let content = std::fs::read_to_string(&config_path).unwrap();
+        let content =
+            std::fs::read_to_string(&config_path).expect("config should have been written");
         assert!(content.contains("prompt_prefix = \"\""));
         assert!(content.contains("TERMINFO"));
         assert!(content.contains("COLORTERM"));
