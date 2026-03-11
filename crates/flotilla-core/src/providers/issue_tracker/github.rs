@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::providers::github_api::{clamp_per_page, GhApi};
 use crate::providers::types::*;
-use crate::providers::{run, ChannelRequest, CommandRunner, DefaultLabeler, IntoChannelLabel};
+use crate::providers::{gh_api_get, gh_api_get_with_headers, run, CommandRunner};
 
 pub struct GitHubIssueTracker {
     provider_name: String,
@@ -82,14 +82,7 @@ impl super::IssueTracker for GitHubIssueTracker {
             "repos/{}/issues?state=open&per_page={}&page={}",
             self.repo_slug, per_page, page
         );
-        let label = DefaultLabeler.into_channel_label(&ChannelRequest::GhApi {
-            method: "GET",
-            endpoint: &endpoint,
-        });
-        let response = self
-            .api
-            .get_with_headers(&endpoint, repo_root, &label)
-            .await?;
+        let response = gh_api_get_with_headers!(self.api, &endpoint, repo_root)?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
 
@@ -120,16 +113,12 @@ impl super::IssueTracker for GitHubIssueTracker {
             .iter()
             .map(|id| {
                 let endpoint = format!("repos/{}/issues/{}", self.repo_slug, id);
-                let label = DefaultLabeler.into_channel_label(&ChannelRequest::GhApi {
-                    method: "GET",
-                    endpoint: &endpoint,
-                });
                 let api = Arc::clone(&self.api);
                 let repo_root = repo_root.to_path_buf();
                 let provider_name = self.provider_name.clone();
                 let id = id.clone();
                 async move {
-                    let body = api.get(&endpoint, &repo_root, &label).await?;
+                    let body = gh_api_get!(api, &endpoint, &repo_root)?;
                     let v: serde_json::Value =
                         serde_json::from_str(&body).map_err(|e| e.to_string())?;
                     parse_issue(&provider_name, &v)
@@ -159,11 +148,7 @@ impl super::IssueTracker for GitHubIssueTracker {
         let raw_query = format!("repo:{} is:issue is:open {}", self.repo_slug, query);
         let encoded_query = urlencoding::encode(&raw_query);
         let endpoint = format!("search/issues?q={}&per_page={}", encoded_query, per_page);
-        let label = DefaultLabeler.into_channel_label(&ChannelRequest::GhApi {
-            method: "GET",
-            endpoint: &endpoint,
-        });
-        let body = self.api.get(&endpoint, repo_root, &label).await?;
+        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let response: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         let items = response["items"]
@@ -187,14 +172,7 @@ impl super::IssueTracker for GitHubIssueTracker {
             "repos/{}/issues?state=all&since={}&sort=updated&direction=desc&per_page={}",
             self.repo_slug, encoded_since, per_page
         );
-        let label = DefaultLabeler.into_channel_label(&ChannelRequest::GhApi {
-            method: "GET",
-            endpoint: &endpoint,
-        });
-        let response = self
-            .api
-            .get_with_headers(&endpoint, repo_root, &label)
-            .await?;
+        let response = gh_api_get_with_headers!(self.api, &endpoint, repo_root)?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
 

@@ -227,6 +227,83 @@ macro_rules! run_output {
 }
 pub(crate) use run_output;
 
+/// Macro that calls `GhApi::get`, auto-deriving the channel label from the endpoint.
+macro_rules! gh_api_get {
+    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__request);
+        $api.get(__endpoint, $repo_root, &__label).await
+    }};
+    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        $api.get(__endpoint, $repo_root, &__label).await
+    }};
+}
+pub(crate) use gh_api_get;
+
+/// Macro that calls `GhApi::get_with_headers`, auto-deriving the channel label from the endpoint.
+macro_rules! gh_api_get_with_headers {
+    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__request);
+        $api.get_with_headers(__endpoint, $repo_root, &__label)
+            .await
+    }};
+    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __request = $crate::providers::ChannelRequest::GhApi {
+            method: "GET",
+            endpoint: __endpoint,
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        $api.get_with_headers(__endpoint, $repo_root, &__label)
+            .await
+    }};
+}
+pub(crate) use gh_api_get_with_headers;
+
+/// Macro that calls `HttpClient::execute`, auto-deriving the channel label from the request.
+macro_rules! http_execute {
+    ($http:expr, $request:expr, $labeler:expr $(,)?) => {{
+        let __request = $request;
+        let __chan_request = $crate::providers::ChannelRequest::Http {
+            method: __request.method().as_str(),
+            url: __request.url().as_str(),
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $labeler.into_channel_label(&__chan_request);
+        $http.execute(__request, &__label).await
+    }};
+    ($http:expr, $request:expr $(,)?) => {{
+        let __request = $request;
+        let __chan_request = $crate::providers::ChannelRequest::Http {
+            method: __request.method().as_str(),
+            url: __request.url().as_str(),
+        };
+        use $crate::providers::IntoChannelLabel as _;
+        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__chan_request);
+        $http.execute(__request, &__label).await
+    }};
+}
+pub(crate) use http_execute;
+
 /// Trait abstracting HTTP request execution so providers can be tested
 /// without making real network calls.
 ///
