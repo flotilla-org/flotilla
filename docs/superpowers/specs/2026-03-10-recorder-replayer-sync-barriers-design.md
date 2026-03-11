@@ -162,6 +162,6 @@ The loader detects which format by checking for `rounds:` vs `interactions:` at 
 
 ## Out of Scope
 
-- Explicit channel label overrides / `IntoChannelLabel` trait (future).
+- Explicit channel label overrides / `ChannelLabeler` trait (future).
 - Automatic barrier detection from async boundaries.
 - Migration tool to convert flat fixtures to round-based format.

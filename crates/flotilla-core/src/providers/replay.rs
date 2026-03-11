@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use super::github_api::{GhApi, GhApiResponse};
 use super::{
-    ChannelLabel, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler, IntoChannelLabel,
+    ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler,
 };
 
 /// A single recorded interaction with an external system.
@@ -69,19 +69,19 @@ impl Interaction {
                     cmd,
                     args: &args_refs,
                 };
-                DefaultLabeler.into_channel_label(&request)
+                DefaultLabeler.label_for(&request)
             }
             Interaction::GhApi { label: Some(l), .. } => ChannelLabel::GhApi(l.clone()),
             Interaction::GhApi {
                 method, endpoint, ..
             } => {
                 let request = ChannelRequest::GhApi { method, endpoint };
-                DefaultLabeler.into_channel_label(&request)
+                DefaultLabeler.label_for(&request)
             }
             Interaction::Http { label: Some(l), .. } => ChannelLabel::Http(l.clone()),
             Interaction::Http { method, url, .. } => {
                 let request = ChannelRequest::Http { method, url };
-                DefaultLabeler.into_channel_label(&request)
+                DefaultLabeler.label_for(&request)
             }
         }
     }
@@ -814,7 +814,7 @@ impl CommandRunner for RecordingRunner {
         let result = self.inner.run(cmd, args, cwd, label).await;
 
         let request = ChannelRequest::Command { cmd, args };
-        let default = DefaultLabeler.into_channel_label(&request);
+        let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
         let (stdout, stderr, exit_code) = match &result {
@@ -845,7 +845,7 @@ impl CommandRunner for RecordingRunner {
         let result = self.inner.run_output(cmd, args, cwd, label).await;
 
         let request = ChannelRequest::Command { cmd, args };
-        let default = DefaultLabeler.into_channel_label(&request);
+        let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
         match &result {
@@ -910,7 +910,7 @@ impl GhApi for RecordingGhApi {
             method: "GET",
             endpoint,
         };
-        let default = DefaultLabeler.into_channel_label(&request);
+        let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
         match &result {
@@ -954,7 +954,7 @@ impl GhApi for RecordingGhApi {
             method: "GET",
             endpoint,
         };
-        let default = DefaultLabeler.into_channel_label(&request);
+        let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
         match &result {
@@ -1045,7 +1045,7 @@ impl super::HttpClient for RecordingHttpClient {
             method: &method,
             url: &url,
         };
-        let default = DefaultLabeler.into_channel_label(&chan_request);
+        let default = DefaultLabeler.label_for(&chan_request);
         let explicit = explicit_label(label, &default);
 
         let result = self.inner.execute(request, label).await;
@@ -1590,7 +1590,7 @@ interactions:
             args: &["branch", "--list"],
         };
         assert_eq!(
-            DefaultLabeler.into_channel_label(&request),
+            DefaultLabeler.label_for(&request),
             ChannelLabel::Command("git branch".into())
         );
     }
@@ -1602,7 +1602,7 @@ interactions:
             args: &[],
         };
         assert_eq!(
-            DefaultLabeler.into_channel_label(&request),
+            DefaultLabeler.label_for(&request),
             ChannelLabel::Command("git".into())
         );
     }
@@ -1615,7 +1615,7 @@ interactions:
             args: &["rev-list", "--left-right", "--count", "HEAD...main"],
         };
         assert_eq!(
-            TaskId("trunk-ab").into_channel_label(&request),
+            TaskId("trunk-ab").label_for(&request),
             ChannelLabel::Command("trunk-ab".into())
         );
     }

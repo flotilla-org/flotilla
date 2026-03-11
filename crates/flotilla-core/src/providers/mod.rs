@@ -51,14 +51,13 @@ pub enum ChannelRequest<'a> {
     Http { method: &'a str, url: &'a str },
 }
 
-#[allow(clippy::wrong_self_convention)]
-pub trait IntoChannelLabel {
-    fn into_channel_label(&self, request: &ChannelRequest) -> ChannelLabel;
+pub trait ChannelLabeler {
+    fn label_for(&self, request: &ChannelRequest) -> ChannelLabel;
 }
 
 pub struct DefaultLabeler;
-impl IntoChannelLabel for DefaultLabeler {
-    fn into_channel_label(&self, request: &ChannelRequest) -> ChannelLabel {
+impl ChannelLabeler for DefaultLabeler {
+    fn label_for(&self, request: &ChannelRequest) -> ChannelLabel {
         match request {
             ChannelRequest::Command { cmd, args } => match args.first() {
                 Some(sub) if !sub.is_empty() => ChannelLabel::Command(format!("{} {}", cmd, sub)),
@@ -71,8 +70,8 @@ impl IntoChannelLabel for DefaultLabeler {
 }
 
 pub struct TaskId(pub &'static str);
-impl IntoChannelLabel for TaskId {
-    fn into_channel_label(&self, request: &ChannelRequest) -> ChannelLabel {
+impl ChannelLabeler for TaskId {
+    fn label_for(&self, request: &ChannelRequest) -> ChannelLabel {
         match request {
             ChannelRequest::Command { .. } => ChannelLabel::Command(self.0.into()),
             ChannelRequest::GhApi { .. } => ChannelLabel::GhApi(self.0.into()),
@@ -183,8 +182,8 @@ macro_rules! run {
             cmd: __cmd,
             args: __args,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $labeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $labeler.label_for(&__request);
         $runner.run(__cmd, __args, $cwd, &__label).await
     }};
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
@@ -194,8 +193,8 @@ macro_rules! run {
             cmd: __cmd,
             args: __args,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
         $runner.run(__cmd, __args, $cwd, &__label).await
     }};
 }
@@ -209,8 +208,8 @@ macro_rules! run_output {
             cmd: __cmd,
             args: __args,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $labeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $labeler.label_for(&__request);
         $runner.run_output(__cmd, __args, $cwd, &__label).await
     }};
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
@@ -220,8 +219,8 @@ macro_rules! run_output {
             cmd: __cmd,
             args: __args,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
         $runner.run_output(__cmd, __args, $cwd, &__label).await
     }};
 }
@@ -235,8 +234,8 @@ macro_rules! gh_api_get {
             method: "GET",
             endpoint: __endpoint,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $labeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $labeler.label_for(&__request);
         $api.get(__endpoint, $repo_root, &__label).await
     }};
     ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
@@ -245,8 +244,8 @@ macro_rules! gh_api_get {
             method: "GET",
             endpoint: __endpoint,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
         $api.get(__endpoint, $repo_root, &__label).await
     }};
 }
@@ -260,8 +259,8 @@ macro_rules! gh_api_get_with_headers {
             method: "GET",
             endpoint: __endpoint,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $labeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $labeler.label_for(&__request);
         $api.get_with_headers(__endpoint, $repo_root, &__label)
             .await
     }};
@@ -271,8 +270,8 @@ macro_rules! gh_api_get_with_headers {
             method: "GET",
             endpoint: __endpoint,
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
         $api.get_with_headers(__endpoint, $repo_root, &__label)
             .await
     }};
@@ -287,8 +286,8 @@ macro_rules! http_execute {
             method: __request.method().as_str(),
             url: __request.url().as_str(),
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $labeler.into_channel_label(&__chan_request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $labeler.label_for(&__chan_request);
         $http.execute(__request, &__label).await
     }};
     ($http:expr, $request:expr $(,)?) => {{
@@ -297,8 +296,8 @@ macro_rules! http_execute {
             method: __request.method().as_str(),
             url: __request.url().as_str(),
         };
-        use $crate::providers::IntoChannelLabel as _;
-        let __label = $crate::providers::DefaultLabeler.into_channel_label(&__chan_request);
+        use $crate::providers::ChannelLabeler as _;
+        let __label = $crate::providers::DefaultLabeler.label_for(&__chan_request);
         $http.execute(__request, &__label).await
     }};
 }
