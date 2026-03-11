@@ -6,7 +6,7 @@ expression: output
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
 │      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││Description: Debug API endpoints              │
 │      ── Sessions ──                                                  ││Branch: feat/session-branch                   │
-│▸  ▶                   Debug API  feat/              ▶                ││Agent: Debug API endpoints                    │
+│▸  ▶             s5    Debug API  feat/              ▶                ││Session: Debug API endpoints                  │
 │                                                                      ││Id: s5                                        │
 │                                                                      ││Status: Running                               │
 │                                                                      ││                                              │

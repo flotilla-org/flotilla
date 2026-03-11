@@ -61,6 +61,8 @@ pub struct ChangeRequest {
     pub association_keys: Vec<AssociationKey>,
     #[serde(default)]
     pub provider_name: String,
+    #[serde(default)]
+    pub provider_display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +80,8 @@ pub struct Issue {
     pub association_keys: Vec<AssociationKey>,
     #[serde(default)]
     pub provider_name: String,
+    #[serde(default)]
+    pub provider_display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +111,11 @@ pub struct CloudAgentSession {
     pub correlation_keys: Vec<CorrelationKey>,
     #[serde(default)]
     pub provider_name: String,
+    #[serde(default)]
+    pub provider_display_name: String,
+    /// Capitalized item noun for this provider (e.g. "Agent", "Task").
+    #[serde(default)]
+    pub item_noun: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +273,7 @@ mod tests {
                 correlation_keys: vec![CorrelationKey::Branch("feat-x".into())],
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
             ChangeRequest {
                 title: "T".into(),
@@ -273,6 +283,7 @@ mod tests {
                 correlation_keys: vec![],
                 association_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
         ];
         for case in &cases {
@@ -297,12 +308,14 @@ mod tests {
                 labels: vec!["bug".into(), "P1".into()],
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "42".into())],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
             Issue {
                 title: "T".into(),
                 labels: vec![],
                 association_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
         ];
         for case in &issue_cases {
@@ -320,6 +333,8 @@ mod tests {
                     "sess-abc".into(),
                 )],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
             },
             CloudAgentSession {
                 title: "T".into(),
@@ -328,6 +343,8 @@ mod tests {
                 updated_at: None,
                 correlation_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
             },
         ];
         for case in &session_cases {
@@ -413,6 +430,7 @@ mod tests {
                     labels: vec!["bug".into()],
                     association_keys: vec![],
                     provider_name: String::new(),
+                    provider_display_name: String::new(),
                 },
             )],
             closed_ids: vec!["7".into(), "13".into()],
@@ -442,6 +460,7 @@ mod tests {
                 correlation_keys: vec![],
                 association_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
         );
         pd.change_requests.insert(
@@ -454,6 +473,7 @@ mod tests {
                 correlation_keys: vec![],
                 association_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
         );
         pd.checkouts.insert(

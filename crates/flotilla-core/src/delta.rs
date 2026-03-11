@@ -162,6 +162,7 @@ mod tests {
             correlation_keys: vec![],
             association_keys: vec![],
             provider_name: String::new(),
+            provider_display_name: String::new(),
         }
     }
 
@@ -171,6 +172,7 @@ mod tests {
             labels: vec![],
             association_keys: vec![],
             provider_name: String::new(),
+            provider_display_name: String::new(),
         }
     }
 
@@ -182,6 +184,8 @@ mod tests {
             updated_at: None,
             correlation_keys: vec![],
             provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
         }
     }
 

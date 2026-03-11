@@ -666,6 +666,7 @@ mod tests {
             correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
             association_keys: vec![],
             provider_name: String::new(),
+            provider_display_name: String::new(),
         }
     }
 
@@ -680,6 +681,8 @@ mod tests {
                 session_id.to_string(),
             )],
             provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
         }
     }
 

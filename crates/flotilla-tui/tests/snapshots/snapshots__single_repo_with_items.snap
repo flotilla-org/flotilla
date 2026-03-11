@@ -8,7 +8,7 @@ expression: output
 │      ── Checkouts ──                                                 ││Branch: feat-login                            │
 │▸  ○                 f checkout f feat- ✓                             ││Path: /test/my-project/feat-login             │
 │      ── Sessions ──                                                  ││                                              │
-│   ◆                   session s1 feat/              ◆                ││                                              │
+│   ◆             s1    session s1 feat/              ◆                ││                                              │
 │      ── Pull Requests ──                                             ││                                              │
 │   ⊙                   Add login  feat-         #42                   ││                                              │
 │      ── Issues ──                                                    ││                                              │

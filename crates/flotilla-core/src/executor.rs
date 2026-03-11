@@ -811,6 +811,8 @@ mod tests {
                 id.to_string(),
             )],
             provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
         }
     }
 
@@ -820,6 +822,7 @@ mod tests {
             labels: vec![],
             association_keys: vec![],
             provider_name: String::new(),
+            provider_display_name: String::new(),
         }
     }
 

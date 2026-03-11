@@ -23,14 +23,6 @@ use flotilla_protocol::{ProviderData, WorkItem};
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
 
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().to_string() + c.as_str(),
-    }
-}
-
 pub fn render(
     model: &TuiModel,
     ui: &mut UiState,
@@ -481,10 +473,13 @@ fn build_item_row<'a>(
     let desc_width = col_widths.get(3).copied().unwrap_or(15) as usize;
     let branch_width = col_widths.get(4).copied().unwrap_or(25) as usize;
 
-    let path_display = item
-        .checkout_key()
-        .map(|p| ui_helpers::shorten_path(p, repo_root, path_width))
-        .unwrap_or_default();
+    let path_display = if let Some(p) = item.checkout_key() {
+        ui_helpers::shorten_path(p, repo_root, path_width)
+    } else if let Some(ref ses_key) = item.session_key {
+        ses_key.clone()
+    } else {
+        String::new()
+    };
     let path_display = ui_helpers::truncate(&path_display, path_width);
 
     let description = ui_helpers::truncate(&item.description, desc_width);
@@ -542,7 +537,7 @@ fn build_item_row<'a>(
         )),
         Cell::from(Span::styled(
             source_display,
-            Style::default().fg(Color::Indexed(245)),
+            Style::default().fg(Color::Indexed(67)),
         )),
         Cell::from(Span::styled(
             path_display,
@@ -625,10 +620,10 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
 
         if let Some(ref pr_key) = item.change_request_key {
             if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
-                let provider_prefix = if cr.provider_name.is_empty() {
+                let provider_prefix = if cr.provider_display_name.is_empty() {
                     String::new()
                 } else {
-                    format!("{} ", capitalize(&cr.provider_name))
+                    format!("{} ", cr.provider_display_name)
                 };
                 lines.push(format!(
                     "{}{} #{}: {}",
@@ -643,10 +638,15 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
 
         if let Some(ref ses_key) = item.session_key {
             if let Some(ses) = providers.sessions.get(ses_key.as_str()) {
-                let provider_prefix = if ses.provider_name.is_empty() {
-                    "Agent".to_string()
+                let noun = if ses.item_noun.is_empty() {
+                    model.active_labels().sessions.noun_capitalized()
                 } else {
-                    format!("{} Agent", capitalize(&ses.provider_name))
+                    ses.item_noun.clone()
+                };
+                let provider_prefix = if ses.provider_display_name.is_empty() {
+                    noun
+                } else {
+                    format!("{} {}", ses.provider_display_name, noun)
                 };
                 lines.push(format!("{}: {}", provider_prefix, ses.title));
                 lines.push(format!("Id: {}", ses_key));
@@ -675,10 +675,10 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
         for issue_key in &item.issue_keys {
             if let Some(issue) = providers.issues.get(issue_key.as_str()) {
                 let labels = issue.labels.join(", ");
-                let provider_prefix = if issue.provider_name.is_empty() {
+                let provider_prefix = if issue.provider_display_name.is_empty() {
                     String::new()
                 } else {
-                    format!("{} ", capitalize(&issue.provider_name))
+                    format!("{} ", issue.provider_display_name)
                 };
                 lines.push(format!(
                     "{}Issue #{}: {} [{}]",

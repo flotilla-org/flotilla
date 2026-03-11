@@ -53,6 +53,7 @@ fn parse_issue(provider_name: &str, v: &serde_json::Value) -> Option<(String, Is
             labels,
             association_keys,
             provider_name: provider_name.to_string(),
+            provider_display_name: "GitHub".into(),
         },
     ))
 }

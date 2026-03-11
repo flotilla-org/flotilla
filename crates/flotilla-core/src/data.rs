@@ -861,6 +861,7 @@ mod tests {
             correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
             association_keys: vec![],
             provider_name: String::new(),
+            provider_display_name: String::new(),
         }
     }
 
@@ -880,6 +881,8 @@ mod tests {
             updated_at: None,
             correlation_keys: keys,
             provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
         }
     }
 
@@ -889,6 +892,7 @@ mod tests {
             labels: vec![],
             association_keys: vec![],
             provider_name: String::new(),
+            provider_display_name: String::new(),
         }
     }
 
@@ -1936,6 +1940,8 @@ mod tests {
                 updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 correlation_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
             },
         );
         providers.sessions.insert(
@@ -1947,6 +1953,8 @@ mod tests {
                 updated_at: Some("2026-03-01T00:00:00Z".to_string()),
                 correlation_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
             },
         );
         providers.sessions.insert(
@@ -1958,6 +1966,8 @@ mod tests {
                 updated_at: Some("2026-02-01T00:00:00Z".to_string()),
                 correlation_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
             },
         );
 

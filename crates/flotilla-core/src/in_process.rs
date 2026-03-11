@@ -1136,6 +1136,7 @@ mod tests {
             correlation_keys: vec![],
             association_keys: vec![AssociationKey::IssueRef("gh".into(), issue_id.into())],
             provider_name: String::new(),
+            provider_display_name: String::new(),
         }
     }
 
@@ -1169,6 +1170,7 @@ mod tests {
                 labels: vec![],
                 association_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
         )]);
 
@@ -1179,6 +1181,7 @@ mod tests {
                 labels: vec![],
                 association_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
         )]);
 
@@ -1277,6 +1280,7 @@ mod tests {
                 labels: vec![],
                 association_keys: vec![],
                 provider_name: String::new(),
+                provider_display_name: String::new(),
             },
         )]);
 
