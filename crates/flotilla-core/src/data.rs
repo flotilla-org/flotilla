@@ -823,6 +823,7 @@ mod tests {
             body: None,
             correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
             association_keys: vec![],
+            provider_name: String::new(),
         }
     }
 
@@ -841,6 +842,7 @@ mod tests {
             model: None,
             updated_at: None,
             correlation_keys: keys,
+            provider_name: String::new(),
         }
     }
 
@@ -849,6 +851,7 @@ mod tests {
             title: title.to_string(),
             labels: vec![],
             association_keys: vec![],
+            provider_name: String::new(),
         }
     }
 
@@ -1895,6 +1898,7 @@ mod tests {
                 model: None,
                 updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 correlation_keys: vec![],
+                provider_name: String::new(),
             },
         );
         providers.sessions.insert(
@@ -1905,6 +1909,7 @@ mod tests {
                 model: None,
                 updated_at: Some("2026-03-01T00:00:00Z".to_string()),
                 correlation_keys: vec![],
+                provider_name: String::new(),
             },
         );
         providers.sessions.insert(
@@ -1915,6 +1920,7 @@ mod tests {
                 model: None,
                 updated_at: Some("2026-02-01T00:00:00Z".to_string()),
                 correlation_keys: vec![],
+                provider_name: String::new(),
             },
         );
 

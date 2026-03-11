@@ -226,6 +226,7 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
             model: None,
             updated_at,
             correlation_keys,
+            provider_name: provider_name.to_string(),
         },
     )
 }

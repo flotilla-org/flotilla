@@ -104,6 +104,7 @@ impl GitHubCodeReview {
                 body: pr.body.clone(),
                 correlation_keys,
                 association_keys,
+                provider_name: self.provider_name.clone(),
             },
         )
     }

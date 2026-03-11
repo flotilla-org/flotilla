@@ -912,6 +912,7 @@ mod tests {
                 correlation_keys: vec![],
                 // PR already has issue "10" linked
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
+                provider_name: String::new(),
             },
         );
         let co_path = PathBuf::from("/tmp/feat-x");

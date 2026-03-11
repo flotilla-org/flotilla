@@ -92,6 +92,8 @@ pub struct WorkItem {
     /// Empty for standalone items.
     #[serde(default)]
     pub debug_group: Vec<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl WorkItem {
@@ -248,6 +250,7 @@ mod tests {
                     workspace_refs: vec![],
                     is_main_checkout: false,
                     debug_group: vec![],
+                    source: None,
                 },
                 WorkItem {
                     kind: WorkItemKind::Session,
@@ -261,6 +264,7 @@ mod tests {
                     workspace_refs: vec![],
                     is_main_checkout: false,
                     debug_group: vec![],
+                    source: None,
                 },
             ],
             providers: ProviderData::default(),
@@ -301,6 +305,7 @@ mod tests {
                 workspace_refs: vec![],
                 is_main_checkout: false,
                 debug_group: vec![],
+                source: None,
             },
             WorkItem {
                 kind: WorkItemKind::Checkout,
@@ -317,6 +322,7 @@ mod tests {
                 workspace_refs: vec!["ws-1".into()],
                 is_main_checkout: true,
                 debug_group: vec!["group info".into()],
+                source: None,
             },
         ];
 

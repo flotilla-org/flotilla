@@ -810,6 +810,7 @@ mod tests {
                 provider.to_string(),
                 id.to_string(),
             )],
+            provider_name: String::new(),
         }
     }
 
@@ -818,6 +819,7 @@ mod tests {
             title: title.to_string(),
             labels: vec![],
             association_keys: vec![],
+            provider_name: String::new(),
         }
     }
 

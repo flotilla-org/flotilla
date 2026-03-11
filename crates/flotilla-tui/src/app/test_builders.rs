@@ -23,6 +23,7 @@ pub fn bare_item() -> WorkItem {
         workspace_refs: Vec::new(),
         is_main_checkout: false,
         debug_group: Vec::new(),
+        source: None,
     }
 }
 
@@ -40,6 +41,7 @@ pub fn issue_item(id: impl Into<String>) -> WorkItem {
         workspace_refs: Vec::new(),
         is_main_checkout: false,
         debug_group: Vec::new(),
+        source: None,
     }
 }
 
@@ -59,6 +61,7 @@ pub fn checkout_item(branch: &str, path: &str, is_main: bool) -> WorkItem {
         workspace_refs: Vec::new(),
         is_main_checkout: is_main,
         debug_group: Vec::new(),
+        source: None,
     }
 }
 
@@ -75,6 +78,7 @@ pub fn pr_item(pr_id: &str) -> WorkItem {
         workspace_refs: Vec::new(),
         is_main_checkout: false,
         debug_group: Vec::new(),
+        source: None,
     }
 }
 
@@ -91,6 +95,7 @@ pub fn session_item(session_id: &str) -> WorkItem {
         workspace_refs: Vec::new(),
         is_main_checkout: false,
         debug_group: Vec::new(),
+        source: None,
     }
 }
 
@@ -107,6 +112,7 @@ pub fn remote_branch_item(branch: &str) -> WorkItem {
         workspace_refs: Vec::new(),
         is_main_checkout: false,
         debug_group: Vec::new(),
+        source: None,
     }
 }
 

@@ -389,6 +389,7 @@ impl super::CloudAgentService for ClaudeCodingAgent {
                         model,
                         updated_at: Some(s.updated_at.clone()),
                         correlation_keys,
+                        provider_name: provider_name.clone(),
                     },
                 )
             })

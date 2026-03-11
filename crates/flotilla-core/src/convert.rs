@@ -42,6 +42,7 @@ pub fn correlation_result_to_work_item(
         workspace_refs: item.workspace_refs().to_vec(),
         is_main_checkout: item.is_main_checkout(),
         debug_group,
+        source: None,
     }
 }
 

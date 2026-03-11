@@ -267,6 +267,7 @@ mod tests {
                 workspace_refs: vec![],
                 is_main_checkout: false,
                 debug_group: vec![],
+                source: None,
             }],
             providers: ProviderData::default(),
             provider_health: HashMap::from([

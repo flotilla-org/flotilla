@@ -52,6 +52,7 @@ fn parse_issue(provider_name: &str, v: &serde_json::Value) -> Option<(String, Is
             title,
             labels,
             association_keys,
+            provider_name: provider_name.to_string(),
         },
     ))
 }

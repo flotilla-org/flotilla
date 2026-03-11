@@ -850,6 +850,7 @@ mod tests {
                     model: None,
                     updated_at: None,
                     correlation_keys: vec![],
+                    provider_name: String::new(),
                 }),
             }],
         );

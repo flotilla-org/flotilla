@@ -224,6 +224,7 @@ impl super::CloudAgentService for CursorCodingAgent {
                             Some(a.created_at)
                         },
                         correlation_keys,
+                        provider_name: provider_name.clone(),
                     },
                 )
             })
