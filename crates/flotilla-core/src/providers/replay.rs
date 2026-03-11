@@ -16,6 +16,8 @@ use super::{
 pub enum Interaction {
     #[serde(rename = "command")]
     Command {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         cmd: String,
         args: Vec<String>,
         cwd: String,
@@ -28,6 +30,8 @@ pub enum Interaction {
     },
     #[serde(rename = "gh_api")]
     GhApi {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         method: String,
         endpoint: String,
         status: u16,
@@ -37,6 +41,8 @@ pub enum Interaction {
     },
     #[serde(rename = "http")]
     Http {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         method: String,
         url: String,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -52,8 +58,11 @@ pub enum Interaction {
 
 impl Interaction {
     /// Derive the channel label from interaction data.
+    /// When an explicit `label` field is present, use it directly;
+    /// otherwise fall back to `DefaultLabeler` derivation.
     pub fn channel_label(&self) -> ChannelLabel {
         match self {
+            Interaction::Command { label: Some(l), .. } => ChannelLabel::Command(l.clone()),
             Interaction::Command { cmd, args, .. } => {
                 let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                 let request = ChannelRequest::Command {
@@ -62,12 +71,14 @@ impl Interaction {
                 };
                 DefaultLabeler.into_channel_label(&request)
             }
+            Interaction::GhApi { label: Some(l), .. } => ChannelLabel::GhApi(l.clone()),
             Interaction::GhApi {
                 method, endpoint, ..
             } => {
                 let request = ChannelRequest::GhApi { method, endpoint };
                 DefaultLabeler.into_channel_label(&request)
             }
+            Interaction::Http { label: Some(l), .. } => ChannelLabel::Http(l.clone()),
             Interaction::Http { method, url, .. } => {
                 let request = ChannelRequest::Http { method, url };
                 DefaultLabeler.into_channel_label(&request)
@@ -180,7 +191,12 @@ impl Replayer {
     pub fn from_file(path: impl AsRef<Path>, masks: Masks) -> Self {
         let content = std::fs::read_to_string(path.as_ref())
             .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", path.as_ref().display()));
-        let rounds = load_rounds_from_str(&content);
+        Self::from_str(&content, masks)
+    }
+
+    /// Load a replayer from an inline YAML string.
+    pub fn from_str(yaml: &str, masks: Masks) -> Self {
+        let rounds = load_rounds_from_str(yaml);
         Self {
             inner: Arc::new(Mutex::new(ReplayerInner {
                 rounds: rounds.into(),
@@ -337,6 +353,11 @@ impl Session {
         Session::Replaying(Replayer::from_file(path, masks))
     }
 
+    /// Create a replaying session from an inline YAML string.
+    pub fn replaying_from_str(yaml: &str, masks: Masks) -> Self {
+        Session::Replaying(Replayer::from_str(yaml, masks))
+    }
+
     /// Create a recording session that writes to the given path.
     pub fn recording(path: impl AsRef<Path>, masks: Masks) -> Self {
         Session::Recording(Recorder::new(path, masks))
@@ -447,6 +468,7 @@ impl CommandRunner for ReplayRunner {
             stdout,
             stderr,
             exit_code,
+            ..
         } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
@@ -486,6 +508,7 @@ impl CommandRunner for ReplayRunner {
             stdout,
             stderr,
             exit_code,
+            ..
         } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
@@ -554,6 +577,7 @@ impl super::HttpClient for ReplayHttpClient {
             status,
             response_body,
             response_headers,
+            ..
         } = interaction
         else {
             panic!("ReplayHttpClient: expected http interaction");
@@ -686,9 +710,25 @@ impl GhApi for ReplayGhApi {
     }
 }
 
+/// Returns `Some(label_string)` when the caller's label differs from what
+/// `DefaultLabeler` would produce, so the YAML only contains an explicit
+/// `label` field when it's truly non-default.
+fn explicit_label(label: &ChannelLabel, default: &ChannelLabel) -> Option<String> {
+    if label == default {
+        None
+    } else {
+        Some(match label {
+            ChannelLabel::Command(s) => s.clone(),
+            ChannelLabel::GhApi(s) => s.clone(),
+            ChannelLabel::Http(s) => s.clone(),
+        })
+    }
+}
+
 fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
         Interaction::Command {
+            label,
             cmd,
             args,
             cwd,
@@ -696,6 +736,7 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stderr,
             exit_code,
         } => Interaction::Command {
+            label: label.clone(),
             cmd: masks.unmask(cmd),
             args: args.iter().map(|a| masks.unmask(a)).collect(),
             cwd: masks.unmask(cwd),
@@ -704,12 +745,14 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             exit_code: *exit_code,
         },
         Interaction::GhApi {
+            label,
             method,
             endpoint,
             status,
             body,
             headers,
         } => Interaction::GhApi {
+            label: label.clone(),
             method: method.clone(),
             endpoint: masks.unmask(endpoint),
             status: *status,
@@ -720,6 +763,7 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
                 .collect(),
         },
         Interaction::Http {
+            label,
             method,
             url,
             request_headers,
@@ -728,6 +772,7 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             response_body,
             response_headers,
         } => Interaction::Http {
+            label: label.clone(),
             method: method.clone(),
             url: masks.unmask(url),
             request_headers: request_headers
@@ -768,12 +813,17 @@ impl CommandRunner for RecordingRunner {
     ) -> Result<String, String> {
         let result = self.inner.run(cmd, args, cwd, label).await;
 
+        let request = ChannelRequest::Command { cmd, args };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
+
         let (stdout, stderr, exit_code) = match &result {
             Ok(out) => (Some(out.clone()), None, 0),
             Err(err) => (None, Some(err.clone()), 1),
         };
 
         self.session.record(Interaction::Command {
+            label: explicit,
             cmd: cmd.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string_lossy().to_string(),
@@ -794,9 +844,14 @@ impl CommandRunner for RecordingRunner {
     ) -> Result<CommandOutput, String> {
         let result = self.inner.run_output(cmd, args, cwd, label).await;
 
+        let request = ChannelRequest::Command { cmd, args };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
+
         match &result {
             Ok(output) => {
                 self.session.record(Interaction::Command {
+                    label: explicit,
                     cmd: cmd.to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     cwd: cwd.to_string_lossy().to_string(),
@@ -807,6 +862,7 @@ impl CommandRunner for RecordingRunner {
             }
             Err(err) => {
                 self.session.record(Interaction::Command {
+                    label: explicit,
                     cmd: cmd.to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     cwd: cwd.to_string_lossy().to_string(),
@@ -850,9 +906,17 @@ impl GhApi for RecordingGhApi {
     ) -> Result<String, String> {
         let result = self.inner.get(endpoint, repo_root, label).await;
 
+        let request = ChannelRequest::GhApi {
+            method: "GET",
+            endpoint,
+        };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
+
         match &result {
             Ok(body) => {
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: 200,
@@ -862,6 +926,7 @@ impl GhApi for RecordingGhApi {
             }
             Err(err) => {
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: 500,
@@ -885,6 +950,13 @@ impl GhApi for RecordingGhApi {
             .get_with_headers(endpoint, repo_root, label)
             .await;
 
+        let request = ChannelRequest::GhApi {
+            method: "GET",
+            endpoint,
+        };
+        let default = DefaultLabeler.into_channel_label(&request);
+        let explicit = explicit_label(label, &default);
+
         match &result {
             Ok(resp) => {
                 let mut headers = HashMap::new();
@@ -898,6 +970,7 @@ impl GhApi for RecordingGhApi {
                     headers.insert("total_count".to_string(), count.to_string());
                 }
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: resp.status,
@@ -907,6 +980,7 @@ impl GhApi for RecordingGhApi {
             }
             Err(err) => {
                 self.session.record(Interaction::GhApi {
+                    label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
                     status: 500,
@@ -967,6 +1041,13 @@ impl super::HttpClient for RecordingHttpClient {
             .and_then(|b| b.as_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string());
 
+        let chan_request = ChannelRequest::Http {
+            method: &method,
+            url: &url,
+        };
+        let default = DefaultLabeler.into_channel_label(&chan_request);
+        let explicit = explicit_label(label, &default);
+
         let result = self.inner.execute(request, label).await;
 
         match &result {
@@ -977,6 +1058,7 @@ impl super::HttpClient for RecordingHttpClient {
                     .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
                 self.session.record(Interaction::Http {
+                    label: explicit,
                     method,
                     url,
                     request_headers,
@@ -988,6 +1070,7 @@ impl super::HttpClient for RecordingHttpClient {
             }
             Err(err) => {
                 self.session.record(Interaction::Http {
+                    label: explicit,
                     method,
                     url,
                     request_headers,
@@ -1018,6 +1101,7 @@ pub fn test_http_client(session: &Session) -> Arc<dyn super::HttpClient> {
 fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
         Interaction::Command {
+            label,
             cmd,
             args,
             cwd,
@@ -1025,6 +1109,7 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stderr,
             exit_code,
         } => Interaction::Command {
+            label: label.clone(),
             cmd: masks.mask(cmd),
             args: args.iter().map(|a| masks.mask(a)).collect(),
             cwd: masks.mask(cwd),
@@ -1033,12 +1118,14 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             exit_code: *exit_code,
         },
         Interaction::GhApi {
+            label,
             method,
             endpoint,
             status,
             body,
             headers,
         } => Interaction::GhApi {
+            label: label.clone(),
             method: method.clone(),
             endpoint: masks.mask(endpoint),
             status: *status,
@@ -1049,6 +1136,7 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
                 .collect(),
         },
         Interaction::Http {
+            label,
             method,
             url,
             request_headers,
@@ -1057,6 +1145,7 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             response_body,
             response_headers,
         } => Interaction::Http {
+            label: label.clone(),
             method: method.clone(),
             url: masks.mask(url),
             request_headers: request_headers
@@ -1095,6 +1184,7 @@ mod tests {
         let log = InteractionLog {
             interactions: vec![
                 Interaction::Command {
+                    label: None,
                     cmd: "git".into(),
                     args: vec!["status".into()],
                     cwd: "{repo}".into(),
@@ -1103,6 +1193,7 @@ mod tests {
                     exit_code: 0,
                 },
                 Interaction::GhApi {
+                    label: None,
                     method: "GET".into(),
                     endpoint: "/repos/owner/repo/pulls".into(),
                     status: 200,
@@ -1156,6 +1247,7 @@ interactions:
     fn replay_session_serves_in_order() {
         let log = InteractionLog {
             interactions: vec![Interaction::Command {
+                label: None,
                 cmd: "git".into(),
                 args: vec!["status".into()],
                 cwd: "{repo}".into(),
@@ -1434,6 +1526,7 @@ interactions:
     #[test]
     fn channel_label_from_interaction() {
         let cmd = Interaction::Command {
+            label: None,
             cmd: "git".into(),
             args: vec!["status".into()],
             cwd: "/repo".into(),
@@ -1448,6 +1541,7 @@ interactions:
         );
 
         let cmd_no_args = Interaction::Command {
+            label: None,
             cmd: "git".into(),
             args: vec![],
             cwd: "/repo".into(),
@@ -1461,6 +1555,7 @@ interactions:
         );
 
         let api = Interaction::GhApi {
+            label: None,
             method: "GET".into(),
             endpoint: "repos/owner/repo/pulls".into(),
             status: 200,
@@ -1473,6 +1568,7 @@ interactions:
         );
 
         let http = Interaction::Http {
+            label: None,
             method: "GET".into(),
             url: "https://api.claude.ai/v1/sessions".into(),
             request_headers: HashMap::new(),
@@ -1587,6 +1683,7 @@ rounds:
         assert!(round.is_empty());
 
         let round = Round::from_interactions(vec![Interaction::Command {
+            label: None,
             cmd: "git".into(),
             args: vec![],
             cwd: "/repo".into(),
@@ -1734,6 +1831,7 @@ rounds:
 
         let recorder = Recorder::new(&path, Masks::new());
         recorder.record(Interaction::Command {
+            label: None,
             cmd: "git".into(),
             args: vec!["status".into()],
             cwd: "/repo".into(),
@@ -1756,6 +1854,7 @@ rounds:
 
         let recorder = Recorder::new(&path, Masks::new());
         recorder.record(Interaction::Command {
+            label: None,
             cmd: "git".into(),
             args: vec!["status".into()],
             cwd: "/repo".into(),
@@ -1765,6 +1864,7 @@ rounds:
         });
         recorder.barrier();
         recorder.record(Interaction::GhApi {
+            label: None,
             method: "GET".into(),
             endpoint: "/repos/owner/repo/pulls".into(),
             status: 200,
@@ -1790,6 +1890,7 @@ rounds:
 
         let recorder = Recorder::new(&path, masks);
         recorder.record(Interaction::Command {
+            label: None,
             cmd: "git".into(),
             args: vec!["status".into()],
             cwd: "/Users/bob/dev/repo".into(),
