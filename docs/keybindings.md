@@ -20,6 +20,8 @@
 | `n` | New branch — enter name, creates worktree + workspace |
 | `d` | Remove worktree (with safety confirmation) |
 | `p` | Open PR in browser |
+| `v` | Cycle preview mode (`auto` → `right` → `below`) |
+| `P` | Hide/show preview panel |
 | `r` | Refresh data |
 | `a` | Add repo tab |
 | `c` | Toggle providers panel |

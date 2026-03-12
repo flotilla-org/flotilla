@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::app::{
-    BranchInputKind, InFlightCommand, Intent, PreviewPositionMode, ProviderStatus, TabId,
-    TuiModel, UiMode, UiState,
+    BranchInputKind, InFlightCommand, Intent, PreviewPositionMode, ProviderStatus, TabId, TuiModel,
+    UiMode, UiState,
 };
 use crate::event_log::{self, LevelExt};
 use crate::ui_helpers;
@@ -1324,7 +1324,8 @@ mod tests {
 
     #[test]
     fn auto_preview_prefers_right_when_wide_layout_meets_minimums() {
-        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), PreviewPositionMode::Auto);
+        let position =
+            resolve_preview_position(Rect::new(0, 0, 160, 40), PreviewPositionMode::Auto);
         assert_eq!(position, ResolvedPreviewPosition::Right);
     }
 
@@ -1336,13 +1337,15 @@ mod tests {
 
     #[test]
     fn explicit_right_mode_ignores_terminal_shape() {
-        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), PreviewPositionMode::Right);
+        let position =
+            resolve_preview_position(Rect::new(0, 0, 90, 50), PreviewPositionMode::Right);
         assert_eq!(position, ResolvedPreviewPosition::Right);
     }
 
     #[test]
     fn explicit_below_mode_ignores_terminal_shape() {
-        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), PreviewPositionMode::Below);
+        let position =
+            resolve_preview_position(Rect::new(0, 0, 160, 40), PreviewPositionMode::Below);
         assert_eq!(position, ResolvedPreviewPosition::Below);
     }
 }

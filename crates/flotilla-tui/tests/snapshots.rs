@@ -180,8 +180,8 @@ fn hidden_preview_uses_full_content_area() {
 
 #[test]
 fn status_bar_preview_state() {
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_preview_mode(PreviewPositionMode::Below);
+    let mut harness =
+        TestHarness::single_repo("my-project").with_preview_mode(PreviewPositionMode::Below);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }

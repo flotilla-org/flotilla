@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tui_input::Input;
 
-use flotilla_core::config::ConfigStore;
+use flotilla_core::config::{ConfigStore, PreviewPositionModeConfig};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{self, GroupEntry, SectionLabels};
 use flotilla_protocol::{
@@ -182,7 +182,14 @@ impl App {
         config: Arc<ConfigStore>,
     ) -> Self {
         let model = TuiModel::from_repo_info(repos_info);
-        let ui = UiState::new(&model.repo_order);
+        let mut ui = UiState::new(&model.repo_order);
+        let preview = &config.load_config().ui.preview;
+        ui.preview.position_mode = match preview.position_mode {
+            PreviewPositionModeConfig::Auto => PreviewPositionMode::Auto,
+            PreviewPositionModeConfig::Right => PreviewPositionMode::Right,
+            PreviewPositionModeConfig::Below => PreviewPositionMode::Below,
+        };
+        ui.preview.visible = preview.visible;
         Self {
             daemon,
             config,
@@ -192,6 +199,16 @@ impl App {
             in_flight: HashMap::new(),
             should_quit: false,
         }
+    }
+
+    pub fn persist_preview_preferences(&self) {
+        let position_mode = match self.ui.preview.position_mode {
+            PreviewPositionMode::Auto => PreviewPositionModeConfig::Auto,
+            PreviewPositionMode::Right => PreviewPositionModeConfig::Right,
+            PreviewPositionMode::Below => PreviewPositionModeConfig::Below,
+        };
+        self.config
+            .save_preview_preferences(position_mode, self.ui.preview.visible);
     }
 
     // ── Daemon event handling ──
@@ -523,7 +540,58 @@ pub enum ClearDispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use test_support::*;
+    use tokio::sync::broadcast;
+
+    struct TestDaemon {
+        tx: broadcast::Sender<DaemonEvent>,
+    }
+
+    impl TestDaemon {
+        fn new() -> Self {
+            let (tx, _) = broadcast::channel(1);
+            Self { tx }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DaemonHandle for TestDaemon {
+        fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+            self.tx.subscribe()
+        }
+
+        async fn get_state(&self, _repo: &Path) -> Result<Snapshot, String> {
+            Err("stub".into())
+        }
+
+        async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
+            Ok(vec![])
+        }
+
+        async fn execute(&self, _repo: &Path, _command: Command) -> Result<u64, String> {
+            Ok(1)
+        }
+
+        async fn refresh(&self, _repo: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn add_repo(&self, _path: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn remove_repo(&self, _path: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn replay_since(
+            &self,
+            _last_seen: &HashMap<PathBuf, u64>,
+        ) -> Result<Vec<DaemonEvent>, String> {
+            Ok(vec![])
+        }
+    }
 
     // -- CommandQueue --
 
@@ -594,6 +662,51 @@ mod tests {
         let model = TuiModel::from_repo_info(vec![]);
         assert!(model.repos.is_empty());
         assert!(model.repo_order.is_empty());
+    }
+
+    #[test]
+    fn app_new_loads_preview_preferences_from_config() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[ui.preview]\nposition_mode = \"below\"\nvisible = false\n",
+        )
+        .unwrap();
+
+        let daemon: Arc<dyn DaemonHandle> = Arc::new(TestDaemon::new());
+        let config = Arc::new(ConfigStore::with_base(dir.path()));
+        let app = App::new(
+            daemon,
+            vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())],
+            config,
+        );
+
+        assert_eq!(app.ui.preview.position_mode, PreviewPositionMode::Below);
+        assert!(!app.ui.preview.visible);
+    }
+
+    #[test]
+    fn persist_preview_preferences_writes_current_ui_state() {
+        let dir = tempdir().unwrap();
+        let daemon: Arc<dyn DaemonHandle> = Arc::new(TestDaemon::new());
+        let config = Arc::new(ConfigStore::with_base(dir.path()));
+        let mut app = App::new(
+            daemon,
+            vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())],
+            config,
+        );
+
+        app.ui.preview.position_mode = PreviewPositionMode::Right;
+        app.ui.preview.visible = false;
+        app.persist_preview_preferences();
+
+        let reloaded = ConfigStore::with_base(dir.path());
+        let cfg = reloaded.load_config();
+        assert_eq!(
+            cfg.ui.preview.position_mode,
+            PreviewPositionModeConfig::Right
+        );
+        assert!(!cfg.ui.preview.visible);
     }
 
     // -- format_error_status --

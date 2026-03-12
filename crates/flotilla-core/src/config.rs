@@ -4,25 +4,27 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 /// Global flotilla config from ~/.config/flotilla/config.toml
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FlotillaConfig {
     #[serde(default)]
     pub vcs: VcsConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct VcsConfig {
     #[serde(default)]
     pub git: GitConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct GitConfig {
     #[serde(default)]
     pub checkouts: CheckoutsConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CheckoutsConfig {
     #[serde(default = "CheckoutsConfig::default_path")]
     pub path: String,
@@ -46,6 +48,42 @@ impl CheckoutsConfig {
     fn default_provider() -> String {
         "auto".to_string()
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub preview: PreviewConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PreviewConfig {
+    #[serde(default)]
+    pub position_mode: PreviewPositionModeConfig,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+}
+
+impl Default for PreviewConfig {
+    fn default() -> Self {
+        Self {
+            position_mode: PreviewPositionModeConfig::default(),
+            visible: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewPositionModeConfig {
+    #[default]
+    Auto,
+    Right,
+    Below,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Full repo config file including optional overrides.
@@ -234,6 +272,25 @@ impl ConfigStore {
                 })
                 .unwrap_or_default()
         })
+    }
+
+    pub fn save_preview_preferences(
+        &self,
+        position_mode: PreviewPositionModeConfig,
+        visible: bool,
+    ) {
+        let path = self.base.join("config.toml");
+        let mut config = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| toml::from_str::<FlotillaConfig>(&content).ok())
+            .unwrap_or_default();
+        config.ui.preview.position_mode = position_mode;
+        config.ui.preview.visible = visible;
+
+        let _ = std::fs::create_dir_all(&self.base);
+        if let Ok(content) = toml::to_string_pretty(&config) {
+            let _ = std::fs::write(path, content);
+        }
     }
 
     /// Resolve checkouts config for a repo: per-repo override > global > defaults.
@@ -490,6 +547,46 @@ mod tests {
         let cfg = store.load_config();
         assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
         assert_eq!(cfg.vcs.git.checkouts.path, CheckoutsConfig::default_path());
+    }
+
+    #[test]
+    fn load_config_parses_preview_preferences() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[ui.preview]\nposition_mode = \"below\"\nvisible = false\n",
+        )
+        .unwrap();
+
+        let store = ConfigStore::with_base(dir.path());
+        let cfg = store.load_config();
+        assert_eq!(
+            cfg.ui.preview.position_mode,
+            PreviewPositionModeConfig::Below
+        );
+        assert!(!cfg.ui.preview.visible);
+    }
+
+    #[test]
+    fn save_preview_preferences_writes_global_config() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[vcs.git.checkouts]\nprovider = \"worktree\"\n",
+        )
+        .unwrap();
+
+        let store = ConfigStore::with_base(dir.path());
+        store.save_preview_preferences(PreviewPositionModeConfig::Right, false);
+
+        let reloaded = ConfigStore::with_base(dir.path());
+        let cfg = reloaded.load_config();
+        assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
+        assert_eq!(
+            cfg.ui.preview.position_mode,
+            PreviewPositionModeConfig::Right
+        );
+        assert!(!cfg.ui.preview.visible);
     }
 
     #[test]
