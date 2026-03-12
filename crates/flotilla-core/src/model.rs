@@ -313,6 +313,9 @@ mod tests {
         async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
             Ok(())
         }
+        async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+            Ok(())
+        }
         async fn list_merged_branch_names(
             &self,
             _: &Path,

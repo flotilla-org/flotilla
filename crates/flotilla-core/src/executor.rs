@@ -176,6 +176,14 @@ pub async fn execute(
             CommandResult::Ok
         }
 
+        Command::CloseChangeRequest { id } => {
+            debug!(%id, "closing change request");
+            if let Some(cr) = registry.code_review.values().next() {
+                let _ = cr.close_change_request(repo_root, &id).await;
+            }
+            CommandResult::Ok
+        }
+
         Command::OpenIssue { id } => {
             debug!(%id, "opening issue in browser");
             if let Some(it) = registry.issue_trackers.values().next() {
@@ -683,6 +691,9 @@ mod tests {
             Err("not implemented".to_string())
         }
         async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn close_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
             Ok(())
         }
         async fn list_merged_branch_names(
@@ -1496,6 +1507,49 @@ mod tests {
 
         let result = run_execute(
             Command::OpenChangeRequest {
+                id: "42".to_string(),
+            },
+            &registry,
+            &empty_data(),
+            &runner,
+        )
+        .await;
+
+        assert_ok(result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: CloseChangeRequest
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn close_change_request_no_provider() {
+        let registry = empty_registry();
+        let runner = runner_ok();
+
+        let result = run_execute(
+            Command::CloseChangeRequest {
+                id: "42".to_string(),
+            },
+            &registry,
+            &empty_data(),
+            &runner,
+        )
+        .await;
+
+        assert_ok(result);
+    }
+
+    #[tokio::test]
+    async fn close_change_request_with_provider() {
+        let mut registry = empty_registry();
+        registry
+            .code_review
+            .insert("github".to_string(), Arc::new(MockCodeReview));
+        let runner = runner_ok();
+
+        let result = run_execute(
+            Command::CloseChangeRequest {
                 id: "42".to_string(),
             },
             &registry,

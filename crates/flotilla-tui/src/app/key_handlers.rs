@@ -46,6 +46,7 @@ impl App {
                 _ => {}
             },
             UiMode::DeleteConfirm { .. } => self.handle_delete_confirm_key(key),
+            UiMode::CloseConfirm { .. } => self.handle_close_confirm_key(key),
             UiMode::ActionMenu { .. } => self.handle_menu_key(key),
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
             UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
@@ -152,6 +153,7 @@ impl App {
             }
             UiMode::Help
             | UiMode::DeleteConfirm { .. }
+            | UiMode::CloseConfirm { .. }
             | UiMode::BranchInput { .. }
             | UiMode::IssueSearch { .. } => {
                 return;
@@ -314,6 +316,16 @@ impl App {
                 Intent::GenerateBranchName => {
                     self.enter_branch_input(BranchInputKind::Generating);
                 }
+                Intent::CloseChangeRequest => {
+                    self.ui.mode = UiMode::CloseConfirm {
+                        id: match &cmd {
+                            Command::CloseChangeRequest { id } => id.clone(),
+                            _ => return,
+                        },
+                        title: item.description.clone(),
+                    };
+                    return; // Don't push command — confirm handler will
+                }
                 _ => {}
             }
             self.proto_commands.push(cmd);
@@ -468,6 +480,22 @@ impl App {
                     }
                     self.ui.mode = UiMode::Normal;
                 }
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.ui.mode = UiMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_close_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let UiMode::CloseConfirm { ref id, .. } = self.ui.mode {
+                    self.proto_commands
+                        .push(Command::CloseChangeRequest { id: id.clone() });
+                }
+                self.ui.mode = UiMode::Normal;
             }
             KeyCode::Esc | KeyCode::Char('n') => {
                 self.ui.mode = UiMode::Normal;

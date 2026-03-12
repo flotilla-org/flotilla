@@ -13,6 +13,7 @@ pub enum Intent {
     LinkIssuesToChangeRequest,
     TeleportSession,
     ArchiveSession,
+    CloseChangeRequest,
 }
 
 impl Intent {
@@ -32,6 +33,7 @@ impl Intent {
             }
             Intent::TeleportSession => "Teleport session".into(),
             Intent::ArchiveSession => "Archive session".into(),
+            Intent::CloseChangeRequest => format!("Close {}", labels.code_review.noun),
         }
     }
 
@@ -55,6 +57,7 @@ impl Intent {
             }
             Intent::TeleportSession => item.session_key.is_some(),
             Intent::ArchiveSession => item.session_key.is_some(),
+            Intent::CloseChangeRequest => item.change_request_key.is_some(),
         }
     }
 
@@ -205,6 +208,15 @@ impl Intent {
             Intent::ArchiveSession => item.session_key.as_ref().map(|k| Command::ArchiveSession {
                 session_id: k.clone(),
             }),
+            Intent::CloseChangeRequest => {
+                let cr_key = item.change_request_key.as_ref()?;
+                let providers = &app.model.active().providers;
+                let cr = providers.change_requests.get(cr_key.as_str())?;
+                if cr.status != flotilla_protocol::ChangeRequestStatus::Open {
+                    return None;
+                }
+                Some(Command::CloseChangeRequest { id: cr_key.clone() })
+            }
         }
     }
 
@@ -220,6 +232,7 @@ impl Intent {
             Intent::LinkIssuesToChangeRequest,
             Intent::TeleportSession,
             Intent::ArchiveSession,
+            Intent::CloseChangeRequest,
         ]
     }
 
@@ -407,6 +420,15 @@ mod tests {
         assert!(!Intent::ArchiveSession.is_available(&no_sess));
     }
 
+    #[test]
+    fn close_pr_needs_change_request_key() {
+        let pr = pr_item("123");
+        assert!(Intent::CloseChangeRequest.is_available(&pr));
+
+        let no_pr = bare_item();
+        assert!(!Intent::CloseChangeRequest.is_available(&no_pr));
+    }
+
     // ── is_available: edge cases ──
 
     #[test]
@@ -446,6 +468,7 @@ mod tests {
         );
         assert_eq!(Intent::TeleportSession.label(&labels), "Teleport session");
         assert_eq!(Intent::ArchiveSession.label(&labels), "Archive session");
+        assert_eq!(Intent::CloseChangeRequest.label(&labels), "Close item");
     }
 
     #[test]
@@ -464,6 +487,7 @@ mod tests {
             Intent::LinkIssuesToChangeRequest.label(&labels),
             "Link issues to PR"
         );
+        assert_eq!(Intent::CloseChangeRequest.label(&labels), "Close PR");
     }
 
     #[test]
@@ -531,6 +555,7 @@ mod tests {
             .is_none());
         assert!(Intent::TeleportSession.shortcut_hint(&labels).is_none());
         assert!(Intent::ArchiveSession.shortcut_hint(&labels).is_none());
+        assert!(Intent::CloseChangeRequest.shortcut_hint(&labels).is_none());
     }
 
     // ── all_in_menu_order tests ──
@@ -551,6 +576,7 @@ mod tests {
             Intent::LinkIssuesToChangeRequest,
             Intent::TeleportSession,
             Intent::ArchiveSession,
+            Intent::CloseChangeRequest,
         ]
         .into_iter()
         .map(|v| match v {
@@ -564,6 +590,7 @@ mod tests {
             Intent::LinkIssuesToChangeRequest => v,
             Intent::TeleportSession => v,
             Intent::ArchiveSession => v,
+            Intent::CloseChangeRequest => v,
         })
         .collect()
     }
@@ -1085,6 +1112,7 @@ mod tests {
         assert!(!Intent::OpenIssue.requires_local_host());
         assert!(!Intent::LinkIssuesToChangeRequest.requires_local_host());
         assert!(!Intent::ArchiveSession.requires_local_host());
+        assert!(!Intent::CloseChangeRequest.requires_local_host());
     }
 
     // ── is_allowed_for_host tests ──
@@ -1121,6 +1149,7 @@ mod tests {
         assert!(Intent::GenerateBranchName.is_allowed_for_host(&item, &my_host));
         assert!(Intent::LinkIssuesToChangeRequest.is_allowed_for_host(&item, &my_host));
         assert!(Intent::ArchiveSession.is_allowed_for_host(&item, &my_host));
+        assert!(Intent::CloseChangeRequest.is_allowed_for_host(&item, &my_host));
     }
 
     #[test]
@@ -1167,5 +1196,63 @@ mod tests {
         assert!(available.contains(&&Intent::OpenIssue));
         assert!(available.contains(&&Intent::LinkIssuesToChangeRequest));
         assert!(available.contains(&&Intent::ArchiveSession));
+        assert!(available.contains(&&Intent::CloseChangeRequest));
+    }
+
+    // ── resolve: CloseChangeRequest ──
+
+    #[test]
+    fn resolve_close_change_request_open_pr() {
+        let mut app = stub_app();
+        let repo = app.model.repo_order[0].clone();
+        let rm = app.model.repos.get_mut(&repo).unwrap();
+        let mut providers = ProviderData::default();
+        providers.change_requests.insert(
+            "55".to_string(),
+            flotilla_protocol::ChangeRequest {
+                title: "My PR".into(),
+                branch: "feat/x".into(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                correlation_keys: vec![],
+                association_keys: vec![],
+                provider_name: "github".into(),
+                provider_display_name: "GitHub".into(),
+            },
+        );
+        rm.providers = Arc::new(providers);
+
+        let item = pr_item("55");
+        let cmd = Intent::CloseChangeRequest.resolve(&item, &app);
+        assert!(cmd.is_some());
+        match cmd.unwrap() {
+            Command::CloseChangeRequest { id } => assert_eq!(id, "55"),
+            other => panic!("expected CloseChangeRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_close_change_request_none_for_merged() {
+        let mut app = stub_app();
+        let repo = app.model.repo_order[0].clone();
+        let rm = app.model.repos.get_mut(&repo).unwrap();
+        let mut providers = ProviderData::default();
+        providers.change_requests.insert(
+            "56".to_string(),
+            flotilla_protocol::ChangeRequest {
+                title: "Done PR".into(),
+                branch: "feat/done".into(),
+                status: flotilla_protocol::ChangeRequestStatus::Merged,
+                body: None,
+                correlation_keys: vec![],
+                association_keys: vec![],
+                provider_name: "github".into(),
+                provider_display_name: "GitHub".into(),
+            },
+        );
+        rm.providers = Arc::new(providers);
+
+        let item = pr_item("56");
+        assert!(Intent::CloseChangeRequest.resolve(&item, &app).is_none());
     }
 }

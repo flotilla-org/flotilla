@@ -105,6 +105,7 @@ pub fn render(
     render_action_menu(model, ui, frame);
     render_input_popup(ui, frame);
     render_delete_confirm(model, ui, frame);
+    render_close_confirm(model, ui, frame);
     render_help(model, ui, frame);
     render_file_picker(ui, frame);
 }
@@ -320,7 +321,9 @@ fn render_status_bar(
             format!(" / search: {}▏  enter:search  esc:cancel", input.value())
         }
         UiMode::FilePicker { .. } => " j/k:navigate  tab:complete  enter:select  esc:cancel".into(),
-        UiMode::DeleteConfirm { .. } => " y/enter:confirm  n/esc:cancel".into(),
+        UiMode::DeleteConfirm { .. } | UiMode::CloseConfirm { .. } => {
+            " y/enter:confirm  n/esc:cancel".into()
+        }
         UiMode::Help => " ?:close help  esc:close help".into(),
         UiMode::Normal => {
             if rui.show_providers {
@@ -1019,6 +1022,38 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
     );
     let paragraph = Paragraph::new(lines)
         .block(Block::bordered().title(title))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_close_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
+    let UiMode::CloseConfirm { ref id, ref title } = ui.mode else {
+        return;
+    };
+
+    let area = ui_helpers::popup_area(frame.area(), 50, 30);
+    frame.render_widget(Clear, area);
+
+    let noun = &model.active_labels().code_review.noun;
+    let lines = vec![
+        Line::from(vec![
+            Span::raw(format!("{} #", noun)),
+            Span::styled(id, Style::default().bold()),
+        ]),
+        Line::from(Span::styled(
+            title.as_str(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y/Enter: confirm    n/Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block_title = format!(" Close {} ", noun);
+    let paragraph = Paragraph::new(lines)
+        .block(Block::bordered().title(block_title))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }

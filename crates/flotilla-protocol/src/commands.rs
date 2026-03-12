@@ -30,6 +30,9 @@ pub enum Command {
     OpenChangeRequest {
         id: String,
     },
+    CloseChangeRequest {
+        id: String,
+    },
     OpenIssue {
         id: String,
     },
@@ -81,6 +84,7 @@ impl Command {
             Command::RemoveCheckout { .. } => "Removing checkout...",
             Command::FetchCheckoutStatus { .. } => "Fetching checkout status...",
             Command::OpenChangeRequest { .. } => "Opening in browser...",
+            Command::CloseChangeRequest { .. } => "Closing PR...",
             Command::OpenIssue { .. } => "Opening in browser...",
             Command::LinkIssuesToChangeRequest { .. } => "Linking issues...",
             Command::ArchiveSession { .. } => "Archiving session...",
@@ -166,6 +170,7 @@ mod tests {
                 change_request_id: None,
             },
             Command::OpenChangeRequest { id: "55".into() },
+            Command::CloseChangeRequest { id: "77".into() },
             Command::OpenIssue { id: "GH-10".into() },
             Command::LinkIssuesToChangeRequest {
                 change_request_id: "PR-7".into(),
@@ -299,6 +304,7 @@ mod tests {
                 change_request_id: None,
             },
             Command::OpenChangeRequest { id: "1".into() },
+            Command::CloseChangeRequest { id: "1".into() },
             Command::OpenIssue { id: "1".into() },
             Command::LinkIssuesToChangeRequest {
                 change_request_id: "1".into(),
