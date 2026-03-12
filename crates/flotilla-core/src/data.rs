@@ -607,7 +607,9 @@ pub fn group_work_items(
     checkout_items.sort_by_cached_key(|item| {
         let main_tier = u8::from(!item.is_main_checkout);
         let key = item.checkout_key();
-        let proximity_tier = key.map(|p| checkout_sort_tier(&p.path, repo_root)).unwrap_or(1);
+        let proximity_tier = key
+            .map(|p| checkout_sort_tier(&p.path, repo_root))
+            .unwrap_or(1);
         let path_key = key.map(|p| p.path.to_path_buf());
         (main_tier, proximity_tier, path_key)
     });
