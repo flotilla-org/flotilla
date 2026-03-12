@@ -1,0 +1,44 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+expression: output
+---
+ ⚓  flotilla  | my-project | [+]
+┌───────────────────────────────────────────────────────────────────────────────────── ⚙ ┐
+│      Source     Path       Description         Branch    WT  WS  PR   SS   Issues Git  │
+│      ── Checkouts ──                                                                   │
+│▸  ○                   feat checkout feat-dashb feat-dash ✓                             │
+│      ── Pull Requests ──                                                               │
+│   ⊙                        Build analytics das feat-dash         #99                   │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Preview ───────────────────────────────────────────────────────────────────────────────┐
+│Description: checkout feat-dashboard                                                    │
+│Branch: feat-dashboard                                                                  │
+│Path: /test/my-project/feat-dashboard                                                   │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+ enter:open  d:remove worktree  Layout(l): below  .:menu  /:search  n:new  r:refresh  spac

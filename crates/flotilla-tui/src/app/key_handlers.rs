@@ -98,6 +98,10 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
             KeyCode::Char('r') => {} // refresh handled in main loop
             KeyCode::Char(' ') => self.toggle_multi_select(),
+            KeyCode::Char('l') => {
+                self.ui.cycle_layout();
+                self.persist_layout();
+            }
             KeyCode::Char('.') => self.open_action_menu(),
             KeyCode::Enter => self.action_enter(),
             KeyCode::Char('n') => self.enter_branch_input(BranchInputKind::Manual),
@@ -1364,6 +1368,28 @@ mod tests {
         assert!(!app.active_ui().multi_selected.is_empty());
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.active_ui().multi_selected.is_empty());
+    }
+
+    #[test]
+    fn l_cycles_layout_in_normal_mode() {
+        let mut app = stub_app();
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Auto);
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Zoom);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Right);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Below);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Auto);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
     }
 
     // ── normal p dispatches open change request ──────────────────────

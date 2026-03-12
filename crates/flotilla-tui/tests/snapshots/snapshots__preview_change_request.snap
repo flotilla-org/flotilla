@@ -31,4 +31,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
- enter:open  p:show PR  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit
+ enter:open  p:show PR  Layout(l): auto  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit

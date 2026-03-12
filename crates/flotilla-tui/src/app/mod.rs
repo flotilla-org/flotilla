@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tui_input::Input;
 
-use flotilla_core::config::ConfigStore;
+use flotilla_core::config::{ConfigStore, RepoViewLayoutConfig};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{self, GroupEntry, SectionLabels};
 use flotilla_protocol::{
@@ -25,7 +25,9 @@ use flotilla_protocol::{
 use std::collections::VecDeque;
 
 pub use intent::Intent;
-pub use ui_state::{BranchInputKind, DirEntry, RepoUiState, TabId, UiMode, UiState};
+pub use ui_state::{
+    BranchInputKind, DirEntry, RepoUiState, RepoViewLayout, TabId, UiMode, UiState,
+};
 
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +181,14 @@ impl App {
         config: Arc<ConfigStore>,
     ) -> Self {
         let model = TuiModel::from_repo_info(repos_info);
-        let ui = UiState::new(&model.repo_order);
+        let mut ui = UiState::new(&model.repo_order);
+        let loaded_config = config.load_config();
+        ui.view_layout = match loaded_config.ui.preview.layout {
+            RepoViewLayoutConfig::Auto => RepoViewLayout::Auto,
+            RepoViewLayoutConfig::Zoom => RepoViewLayout::Zoom,
+            RepoViewLayoutConfig::Right => RepoViewLayout::Right,
+            RepoViewLayoutConfig::Below => RepoViewLayout::Below,
+        };
         Self {
             daemon,
             config,
@@ -189,6 +198,16 @@ impl App {
             in_flight: HashMap::new(),
             should_quit: false,
         }
+    }
+
+    pub fn persist_layout(&self) {
+        let layout = match self.ui.view_layout {
+            RepoViewLayout::Auto => RepoViewLayoutConfig::Auto,
+            RepoViewLayout::Zoom => RepoViewLayoutConfig::Zoom,
+            RepoViewLayout::Right => RepoViewLayoutConfig::Right,
+            RepoViewLayout::Below => RepoViewLayoutConfig::Below,
+        };
+        self.config.save_layout(layout);
     }
 
     // ── Daemon event handling ──
@@ -520,7 +539,58 @@ pub enum ClearDispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use test_support::*;
+    use tokio::sync::broadcast;
+
+    struct TestDaemon {
+        tx: broadcast::Sender<DaemonEvent>,
+    }
+
+    impl TestDaemon {
+        fn new() -> Self {
+            let (tx, _) = broadcast::channel(1);
+            Self { tx }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DaemonHandle for TestDaemon {
+        fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+            self.tx.subscribe()
+        }
+
+        async fn get_state(&self, _repo: &Path) -> Result<Snapshot, String> {
+            Err("stub".into())
+        }
+
+        async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
+            Ok(vec![])
+        }
+
+        async fn execute(&self, _repo: &Path, _command: Command) -> Result<u64, String> {
+            Ok(1)
+        }
+
+        async fn refresh(&self, _repo: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn add_repo(&self, _path: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn remove_repo(&self, _path: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn replay_since(
+            &self,
+            _last_seen: &HashMap<PathBuf, u64>,
+        ) -> Result<Vec<DaemonEvent>, String> {
+            Ok(vec![])
+        }
+    }
 
     // -- CommandQueue --
 
@@ -591,6 +661,45 @@ mod tests {
         let model = TuiModel::from_repo_info(vec![]);
         assert!(model.repos.is_empty());
         assert!(model.repo_order.is_empty());
+    }
+
+    #[test]
+    fn app_new_loads_layout_from_config() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[ui.preview]\nlayout = \"below\"\n",
+        )
+        .unwrap();
+
+        let daemon: Arc<dyn DaemonHandle> = Arc::new(TestDaemon::new());
+        let config = Arc::new(ConfigStore::with_base(dir.path()));
+        let app = App::new(
+            daemon,
+            vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())],
+            config,
+        );
+
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Below);
+    }
+
+    #[test]
+    fn persist_layout_writes_current_ui_state() {
+        let dir = tempdir().unwrap();
+        let daemon: Arc<dyn DaemonHandle> = Arc::new(TestDaemon::new());
+        let config = Arc::new(ConfigStore::with_base(dir.path()));
+        let mut app = App::new(
+            daemon,
+            vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())],
+            config,
+        );
+
+        app.ui.view_layout = RepoViewLayout::Right;
+        app.persist_layout();
+
+        let reloaded = ConfigStore::with_base(dir.path());
+        let cfg = reloaded.load_config();
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Right);
     }
 
     // -- format_error_status --

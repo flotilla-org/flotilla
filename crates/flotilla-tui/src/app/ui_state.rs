@@ -65,6 +65,15 @@ impl UiMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepoViewLayout {
+    #[default]
+    Auto,
+    Zoom,
+    Right,
+    Below,
+}
+
 /// Per-repo UI state (selection, table widget state, visual flags).
 #[derive(Default)]
 pub struct RepoUiState {
@@ -196,6 +205,7 @@ impl Default for EventLogUiState {
 pub struct UiState {
     pub mode: UiMode,
     pub repo_ui: HashMap<PathBuf, RepoUiState>,
+    pub view_layout: RepoViewLayout,
     pub layout: LayoutAreas,
     pub drag: DragState,
     pub double_click: DoubleClickState,
@@ -213,6 +223,7 @@ impl UiState {
         Self {
             mode: UiMode::default(),
             repo_ui,
+            view_layout: RepoViewLayout::default(),
             layout: LayoutAreas::default(),
             drag: DragState::default(),
             double_click: DoubleClickState::default(),
@@ -224,6 +235,15 @@ impl UiState {
 
     pub fn active_repo_ui(&self, repo_order: &[PathBuf], active_repo: usize) -> &RepoUiState {
         &self.repo_ui[&repo_order[active_repo]]
+    }
+
+    pub fn cycle_layout(&mut self) {
+        self.view_layout = match self.view_layout {
+            RepoViewLayout::Auto => RepoViewLayout::Zoom,
+            RepoViewLayout::Zoom => RepoViewLayout::Right,
+            RepoViewLayout::Right => RepoViewLayout::Below,
+            RepoViewLayout::Below => RepoViewLayout::Auto,
+        };
     }
 }
 
@@ -295,6 +315,7 @@ mod tests {
         assert!(state.repo_ui.is_empty());
         assert!(matches!(state.mode, UiMode::Normal));
         assert!(!state.show_debug);
+        assert_eq!(state.view_layout, RepoViewLayout::Auto);
     }
 
     #[test]
@@ -317,6 +338,29 @@ mod tests {
         for p in &paths {
             assert!(state.repo_ui.contains_key(p));
         }
+    }
+
+    #[test]
+    fn ui_state_defaults_to_auto_layout() {
+        let state = UiState::new(&[]);
+        assert_eq!(state.view_layout, RepoViewLayout::Auto);
+    }
+
+    #[test]
+    fn layout_cycles_auto_zoom_right_below_auto() {
+        let mut state = UiState::new(&[]);
+
+        state.cycle_layout();
+        assert_eq!(state.view_layout, RepoViewLayout::Zoom);
+
+        state.cycle_layout();
+        assert_eq!(state.view_layout, RepoViewLayout::Right);
+
+        state.cycle_layout();
+        assert_eq!(state.view_layout, RepoViewLayout::Below);
+
+        state.cycle_layout();
+        assert_eq!(state.view_layout, RepoViewLayout::Auto);
     }
 
     // ── active_repo_ui tests ──────────────────────────────────────────

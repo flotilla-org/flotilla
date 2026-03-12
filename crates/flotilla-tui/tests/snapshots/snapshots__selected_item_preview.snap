@@ -31,4 +31,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
- enter:open  d:remove worktree  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit
+ enter:open  d:remove worktree  Layout(l): auto  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit

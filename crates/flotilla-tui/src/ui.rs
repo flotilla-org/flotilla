@@ -15,7 +15,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::app::{
-    BranchInputKind, InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState,
+    BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, TabId, TuiModel,
+    UiMode, UiState,
 };
 use crate::event_log::{self, LevelExt};
 use crate::ui_helpers;
@@ -24,6 +25,13 @@ use flotilla_protocol::{ProviderData, WorkItem};
 
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
+const PREVIEW_SPLIT_RIGHT_PERCENT: u16 = 40;
+const PREVIEW_SPLIT_BELOW_PERCENT: u16 = 40;
+const MIN_TABLE_WIDTH: u16 = 50;
+const MIN_PREVIEW_WIDTH: u16 = 32;
+const MIN_TABLE_HEIGHT: u16 = 8;
+const MIN_PREVIEW_HEIGHT: u16 = 6;
+const PREVIEW_BELOW_ASPECT_RATIO_THRESHOLD: f32 = 2.0;
 const PROVIDER_CATEGORIES: [(&str, &str); 8] = [
     ("VCS", "vcs"),
     ("Checkout mgr", "checkout_manager"),
@@ -34,6 +42,47 @@ const PROVIDER_CATEGORIES: [(&str, &str); 8] = [
     ("Workspace mgr", "workspace_manager"),
     ("Terminal pool", "terminal_pool"),
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedPreviewPosition {
+    Right,
+    Below,
+}
+
+fn resolve_preview_position(area: Rect, layout: RepoViewLayout) -> Option<ResolvedPreviewPosition> {
+    match layout {
+        RepoViewLayout::Right => Some(ResolvedPreviewPosition::Right),
+        RepoViewLayout::Below => Some(ResolvedPreviewPosition::Below),
+        RepoViewLayout::Auto => Some(resolve_auto_preview_position(area)),
+        RepoViewLayout::Zoom => None,
+    }
+}
+
+fn resolve_auto_preview_position(area: Rect) -> ResolvedPreviewPosition {
+    let right_preview_width = area.width.saturating_mul(PREVIEW_SPLIT_RIGHT_PERCENT) / 100;
+    let right_table_width = area.width.saturating_sub(right_preview_width);
+    let below_preview_height = area.height.saturating_mul(PREVIEW_SPLIT_BELOW_PERCENT) / 100;
+    let below_table_height = area.height.saturating_sub(below_preview_height);
+
+    let right_viable =
+        right_table_width >= MIN_TABLE_WIDTH && right_preview_width >= MIN_PREVIEW_WIDTH;
+    let below_viable =
+        below_table_height >= MIN_TABLE_HEIGHT && below_preview_height >= MIN_PREVIEW_HEIGHT;
+
+    match (right_viable, below_viable) {
+        (true, false) => ResolvedPreviewPosition::Right,
+        (false, true) => ResolvedPreviewPosition::Below,
+        (false, false) => ResolvedPreviewPosition::Right,
+        (true, true) => {
+            let aspect_ratio = area.width as f32 / area.height as f32;
+            if aspect_ratio < PREVIEW_BELOW_ASPECT_RATIO_THRESHOLD {
+                ResolvedPreviewPosition::Below
+            } else {
+                ResolvedPreviewPosition::Right
+            }
+        }
+    }
+}
 
 pub fn render(
     model: &TuiModel,
@@ -229,6 +278,7 @@ fn render_status_bar(
     }
 
     let rui = active_rui(model, ui);
+    let layout_status = layout_status_text(ui);
 
     let text: String = match &ui.mode {
         UiMode::Config => " j/k:scroll log  [/]:switch tab  ?:help  q:quit".into(),
@@ -249,11 +299,15 @@ fn render_status_bar(
         UiMode::Help => " ?:close help  esc:close help".into(),
         UiMode::Normal => {
             if rui.show_providers {
-                " c:close providers  [/]:switch tab  ?:help  q:quit".into()
+                format!(" c:close providers  {layout_status}  [/]:switch tab  ?:help  q:quit")
             } else if let Some(q) = rui.active_search_query.as_deref() {
-                format!(" search: \"{q}\"  /:new search  esc:clear  ?:help  q:quit")
+                format!(
+                    " search: \"{q}\"  {layout_status}  /:new search  esc:clear  ?:help  q:quit"
+                )
             } else if !rui.multi_selected.is_empty() {
-                " enter:create branch  space:toggle  esc:clear  ?:help  q:quit".into()
+                format!(
+                    " enter:create branch  space:toggle  {layout_status}  esc:clear  ?:help  q:quit"
+                )
             } else {
                 let mut s = " enter:open".to_string();
                 if let Some(item) = selected_work_item(model, ui) {
@@ -267,6 +321,8 @@ fn render_status_bar(
                         }
                     }
                 }
+                s.push_str("  ");
+                s.push_str(layout_status);
                 s.push_str("  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit");
                 s
             }
@@ -283,10 +339,27 @@ fn render_content(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
+    let Some(position) = resolve_preview_position(area, ui.view_layout) else {
+        render_unified_table(model, ui, frame, area);
+        return;
+    };
+
+    let chunks = match position {
+        ResolvedPreviewPosition::Right => Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(100 - PREVIEW_SPLIT_RIGHT_PERCENT),
+                Constraint::Percentage(PREVIEW_SPLIT_RIGHT_PERCENT),
+            ])
+            .split(area),
+        ResolvedPreviewPosition::Below => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(100 - PREVIEW_SPLIT_BELOW_PERCENT),
+                Constraint::Percentage(PREVIEW_SPLIT_BELOW_PERCENT),
+            ])
+            .split(area),
+    };
 
     render_unified_table(model, ui, frame, chunks[0]);
     render_preview(model, ui, frame, chunks[1]);
@@ -969,6 +1042,7 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
             "  p                Show {} in browser",
             labels.code_review.abbr
         )),
+        Line::from("  l                Cycle layout (auto/zoom/right/below)"),
         Line::from("  r                Refresh data"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1011,6 +1085,15 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
         .scroll((scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn layout_status_text(ui: &UiState) -> &'static str {
+    match ui.view_layout {
+        RepoViewLayout::Auto => "Layout(l): auto",
+        RepoViewLayout::Zoom => "Layout(l): zoom",
+        RepoViewLayout::Right => "Layout(l): right",
+        RepoViewLayout::Below => "Layout(l): below",
+    }
 }
 
 fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
@@ -1224,4 +1307,40 @@ fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {
     let mut state = ListState::default();
     state.select(ui.event_log.selected);
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::RepoViewLayout;
+
+    #[test]
+    fn auto_layout_prefers_right_when_wide() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Auto);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Right));
+    }
+
+    #[test]
+    fn auto_layout_prefers_below_when_tall() {
+        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), RepoViewLayout::Auto);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Below));
+    }
+
+    #[test]
+    fn explicit_right_layout() {
+        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), RepoViewLayout::Right);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Right));
+    }
+
+    #[test]
+    fn explicit_below_layout() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Below);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Below));
+    }
+
+    #[test]
+    fn zoom_layout_returns_none() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Zoom);
+        assert_eq!(position, None);
+    }
 }

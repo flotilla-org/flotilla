@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,6 +22,8 @@ pub(crate) use super::test_builders::*;
 struct StubDaemon {
     tx: broadcast::Sender<DaemonEvent>,
 }
+
+static STUB_APP_CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl StubDaemon {
     fn new() -> Self {
@@ -201,6 +204,9 @@ fn stub_app_with_repo_info(repo_info: RepoInfo) -> App {
 
 fn stub_app_with_repo_infos(repos_info: Vec<RepoInfo>) -> App {
     let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
-    let config = Arc::new(ConfigStore::with_base("/tmp/flotilla-test"));
+    let config_id = STUB_APP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let config_base = std::env::temp_dir().join(format!("flotilla-test-{config_id}"));
+    let _ = std::fs::remove_dir_all(&config_base);
+    let config = Arc::new(ConfigStore::with_base(config_base));
     App::new(daemon, repos_info, config)
 }

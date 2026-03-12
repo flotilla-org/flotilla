@@ -1,7 +1,9 @@
 mod support;
 
 use flotilla_protocol::{ProviderData, SessionStatus};
-use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, UiMode};
+use flotilla_tui::app::{
+    BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, UiMode,
+};
 use std::path::PathBuf;
 use support::*;
 use tui_input::Input;
@@ -131,6 +133,55 @@ fn selected_item_preview() {
     ];
 
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn selected_item_preview_below() {
+    let mut providers = ProviderData::default();
+    let (path, checkout) =
+        make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
+    providers.checkouts.insert(path, checkout);
+    let (id, cr) = make_change_request("99", "Build analytics dashboard", "feat-dashboard");
+    providers.change_requests.insert(id, cr);
+
+    let items = vec![
+        make_work_item_checkout("feat-dashboard", "/test/my-project/feat-dashboard"),
+        make_work_item_cr("99", "Build analytics dashboard", Some("feat-dashboard")),
+    ];
+
+    let mut harness = TestHarness::single_repo("my-project")
+        .with_provider_data(providers, items)
+        .with_layout(RepoViewLayout::Below)
+        .with_width(90)
+        .with_height(40);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn zoom_layout_uses_full_content_area() {
+    let mut providers = ProviderData::default();
+    let (path, checkout) =
+        make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
+    providers.checkouts.insert(path, checkout);
+
+    let items = vec![make_work_item_checkout(
+        "feat-dashboard",
+        "/test/my-project/feat-dashboard",
+    )];
+
+    let mut harness = TestHarness::single_repo("my-project")
+        .with_provider_data(providers, items)
+        .with_layout(RepoViewLayout::Zoom);
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn status_bar_layout_state() {
+    let mut harness = TestHarness::single_repo("my-project").with_layout(RepoViewLayout::Below);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }

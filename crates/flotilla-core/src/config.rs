@@ -1,28 +1,29 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Global flotilla config from ~/.config/flotilla/config.toml
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FlotillaConfig {
     #[serde(default)]
     pub vcs: VcsConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct VcsConfig {
     #[serde(default)]
     pub git: GitConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct GitConfig {
     #[serde(default)]
     pub checkouts: CheckoutsConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CheckoutsConfig {
     #[serde(default = "CheckoutsConfig::default_path")]
     pub path: String,
@@ -46,6 +47,28 @@ impl CheckoutsConfig {
     fn default_provider() -> String {
         "auto".to_string()
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub preview: PreviewConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PreviewConfig {
+    #[serde(default)]
+    pub layout: RepoViewLayoutConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoViewLayoutConfig {
+    #[default]
+    Auto,
+    Zoom,
+    Right,
+    Below,
 }
 
 /// Full repo config file including optional overrides.
@@ -113,7 +136,7 @@ pub fn path_to_slug(path: &Path) -> String {
 /// Owns the config base path and caches the global `FlotillaConfig`.
 pub struct ConfigStore {
     base: PathBuf,
-    global_config: OnceLock<FlotillaConfig>,
+    global_config: OnceLock<Mutex<FlotillaConfig>>,
 }
 
 impl Default for ConfigStore {
@@ -220,20 +243,54 @@ impl ConfigStore {
     }
 
     /// Load global flotilla config (cached for the lifetime of the store).
-    pub fn load_config(&self) -> &FlotillaConfig {
-        self.global_config.get_or_init(|| {
-            let path = self.base.join("config.toml");
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|content| {
-                    toml::from_str(&content)
-                        .map_err(
-                            |e| tracing::warn!(path = %path.display(), err = %e, "failed to parse"),
-                        )
+    pub fn load_config(&self) -> FlotillaConfig {
+        self.global_config
+            .get_or_init(|| {
+                Mutex::new({
+                    let path = self.base.join("config.toml");
+                    std::fs::read_to_string(&path)
                         .ok()
+                        .and_then(|content| {
+                            toml::from_str(&content)
+                                .map_err(
+                                    |e| tracing::warn!(path = %path.display(), err = %e, "failed to parse"),
+                                )
+                                .ok()
+                        })
+                        .unwrap_or_default()
                 })
-                .unwrap_or_default()
-        })
+            })
+            .lock()
+            .expect("config cache mutex poisoned")
+            .clone()
+    }
+
+    pub fn save_layout(&self, layout: RepoViewLayoutConfig) {
+        let path = self.base.join("config.toml");
+        let mut config = self.load_config();
+        config.ui.preview.layout = layout;
+
+        if let Err(err) = std::fs::create_dir_all(&self.base) {
+            tracing::warn!(path = %self.base.display(), err = %err, "failed to create config dir");
+            return;
+        }
+
+        let content = match toml::to_string_pretty(&config) {
+            Ok(content) => content,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), err = %err, "failed to serialize config");
+                return;
+            }
+        };
+
+        if let Err(err) = std::fs::write(&path, content) {
+            tracing::warn!(path = %path.display(), err = %err, "failed to write config");
+            return;
+        }
+
+        if let Some(cached) = self.global_config.get() {
+            *cached.lock().expect("config cache mutex poisoned") = config;
+        }
     }
 
     /// Resolve checkouts config for a repo: per-repo override > global > defaults.
@@ -490,6 +547,54 @@ mod tests {
         let cfg = store.load_config();
         assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
         assert_eq!(cfg.vcs.git.checkouts.path, CheckoutsConfig::default_path());
+    }
+
+    #[test]
+    fn load_config_parses_layout() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[ui.preview]\nlayout = \"zoom\"\n",
+        )
+        .unwrap();
+
+        let store = ConfigStore::with_base(dir.path());
+        let cfg = store.load_config();
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Zoom);
+    }
+
+    #[test]
+    fn save_layout_writes_global_config() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[vcs.git.checkouts]\nprovider = \"worktree\"\n",
+        )
+        .unwrap();
+
+        let store = ConfigStore::with_base(dir.path());
+        store.save_layout(RepoViewLayoutConfig::Right);
+
+        let reloaded = ConfigStore::with_base(dir.path());
+        let cfg = reloaded.load_config();
+        assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Right);
+    }
+
+    #[test]
+    fn save_layout_updates_same_store_cache() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::with_base(dir.path());
+
+        assert_eq!(
+            store.load_config().ui.preview.layout,
+            RepoViewLayoutConfig::Auto
+        );
+
+        store.save_layout(RepoViewLayoutConfig::Below);
+
+        let cfg = store.load_config();
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Below);
     }
 
     #[test]
