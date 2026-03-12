@@ -5,7 +5,7 @@
 use flotilla_core::config::ConfigStore;
 use flotilla_core::convert::correlation_result_to_work_item;
 use flotilla_core::data;
-use flotilla_core::providers::discovery::detect_providers;
+use flotilla_core::providers::discovery_legacy::detect_providers;
 use flotilla_core::providers::types::RepoCriteria;
 use flotilla_core::providers::{CommandRunner, ProcessCommandRunner};
 use flotilla_core::refresh::RepoRefreshHandle;

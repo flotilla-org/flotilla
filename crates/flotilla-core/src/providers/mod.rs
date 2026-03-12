@@ -3,6 +3,7 @@ pub mod code_review;
 pub mod coding_agent;
 pub mod correlation;
 pub mod discovery;
+pub mod discovery_legacy;
 pub mod github_api;
 pub mod issue_tracker;
 pub mod registry;

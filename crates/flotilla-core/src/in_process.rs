@@ -326,7 +326,7 @@ impl InProcessDaemon {
             if repos.contains_key(&path) {
                 continue;
             }
-            let (registry, repo_slug) = crate::providers::discovery::detect_providers(
+            let (registry, repo_slug) = crate::providers::discovery_legacy::detect_providers(
                 &path,
                 &config,
                 Arc::clone(&runner),
@@ -335,9 +335,12 @@ impl InProcessDaemon {
             .await;
 
             // Extract RepoIdentity from git remote URL for peer data routing
-            if let Some(url) = crate::providers::discovery::first_remote_url(&path, &*runner).await
+            if let Some(url) =
+                crate::providers::discovery_legacy::first_remote_url(&path, &*runner).await
             {
-                if let Some(identity) = crate::providers::discovery::extract_repo_identity(&url) {
+                if let Some(identity) =
+                    crate::providers::discovery_legacy::extract_repo_identity(&url)
+                {
                     identities.insert(identity, path.clone());
                 }
             }
@@ -1218,7 +1221,7 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let (registry, repo_slug) = crate::providers::discovery::detect_providers(
+        let (registry, repo_slug) = crate::providers::discovery_legacy::detect_providers(
             &path,
             &self.config,
             Arc::clone(&self.runner),
@@ -1263,9 +1266,11 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Register RepoIdentity for peer routing
-        if let Some(url) = crate::providers::discovery::first_remote_url(&path, &*self.runner).await
+        if let Some(url) =
+            crate::providers::discovery_legacy::first_remote_url(&path, &*self.runner).await
         {
-            if let Some(identity) = crate::providers::discovery::extract_repo_identity(&url) {
+            if let Some(identity) = crate::providers::discovery_legacy::extract_repo_identity(&url)
+            {
                 self.repo_identities
                     .write()
                     .await
