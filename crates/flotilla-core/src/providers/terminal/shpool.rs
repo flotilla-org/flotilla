@@ -655,7 +655,9 @@ mod tests {
         let socket_path = dir.path().join("shpool.socket");
         let pid_path = dir.path().join("daemonized-shpool.pid");
 
-        // Create fake socket and pid file pointing to a dead process
+        // PID 99999999 is above both Linux pid_max (4194304) and macOS
+        // kern.pid_max (99998), so kill() returns ESRCH (no such process).
+        // This exercises the SIGTERM-failure → dead-process cleanup path.
         std::fs::write(&socket_path, b"").expect("create fake socket");
         std::fs::write(&pid_path, "99999999").expect("create fake pid");
 
