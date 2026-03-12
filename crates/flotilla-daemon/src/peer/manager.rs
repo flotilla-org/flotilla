@@ -387,7 +387,10 @@ impl PeerManager {
                 }
                 self.store_snapshot_from(&env.connection_peer, env.connection_generation, msg)
             }
-            PeerWireMessage::Routed(msg) => self.handle_routed(env.connection_peer, env.connection_generation, msg).await,
+            PeerWireMessage::Routed(msg) => {
+                self.handle_routed(env.connection_peer, env.connection_generation, msg)
+                    .await
+            }
         }
     }
 
@@ -488,10 +491,9 @@ impl PeerManager {
                 let Some(reverse_hop) = self.reverse_paths.get(&key).cloned() else {
                     return HandleResult::Ignored;
                 };
-                if !self.generation_is_current(
-                    &reverse_hop.next_hop,
-                    reverse_hop.next_hop_generation,
-                ) {
+                if !self
+                    .generation_is_current(&reverse_hop.next_hop, reverse_hop.next_hop_generation)
+                {
                     self.reverse_paths.remove(&key);
                     return HandleResult::Ignored;
                 }
@@ -554,7 +556,10 @@ impl PeerManager {
                 continue;
             }
 
-            match sender.send(PeerWireMessage::Data(relayed_msg.clone())).await {
+            match sender
+                .send(PeerWireMessage::Data(relayed_msg.clone()))
+                .await
+            {
                 Ok(()) => {
                     debug!(
                         from = %origin,
@@ -795,7 +800,8 @@ impl PeerManager {
                 .peer_data
                 .get(&origin)
                 .map(|repos| {
-                    repos.iter()
+                    repos
+                        .iter()
                         .filter(|(_, state)| {
                             state.via_peer == *name && state.via_generation == generation
                         })
@@ -1246,8 +1252,8 @@ mod tests {
             &HostName::new("peer"),
             PeerWireMessage::Data(snapshot_msg("local", 1)),
         )
-            .await
-            .expect("send succeeds");
+        .await
+        .expect("send succeeds");
 
         assert_eq!(sent.lock().expect("lock").len(), 1);
     }

@@ -472,9 +472,9 @@ impl PeerTransport for SshTransport {
     }
 
     fn sender(&self) -> Option<Arc<dyn PeerSender>> {
-        self.outbound_tx.as_ref().map(|tx| {
-            Arc::new(ChannelPeerSender { tx: tx.clone() }) as Arc<dyn PeerSender>
-        })
+        self.outbound_tx
+            .as_ref()
+            .map(|tx| Arc::new(ChannelPeerSender { tx: tx.clone() }) as Arc<dyn PeerSender>)
     }
 }
 
@@ -624,7 +624,10 @@ mod tests {
             config,
         )
         .expect("valid host name");
-        assert!(transport.sender().is_none(), "disconnected transport should not expose a sender");
+        assert!(
+            transport.sender().is_none(),
+            "disconnected transport should not expose a sender"
+        );
     }
 
     #[tokio::test]

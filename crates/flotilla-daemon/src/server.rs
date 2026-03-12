@@ -352,7 +352,9 @@ impl DaemonServer {
 
                 while let Some(env) = rx.recv().await {
                     let (origin, repo_path) = match &env.msg {
-                        PeerWireMessage::Data(msg) => (msg.origin_host.clone(), msg.repo_path.clone()),
+                        PeerWireMessage::Data(msg) => {
+                            (msg.origin_host.clone(), msg.repo_path.clone())
+                        }
                         PeerWireMessage::Routed(_) => (env.connection_peer.clone(), PathBuf::new()),
                     };
 
@@ -771,7 +773,6 @@ async fn send_local_to_peers(
         }
         drop(pm);
     }
-
 }
 
 /// Forward messages from an inbound receiver to the shared peer_data channel.
@@ -1416,7 +1417,10 @@ mod tests {
             host_name: HostName::new("remote-host"),
         };
         let hello_json = serde_json::to_string(&hello).expect("serialize hello");
-        writer.write_all(hello_json.as_bytes()).await.expect("write");
+        writer
+            .write_all(hello_json.as_bytes())
+            .await
+            .expect("write");
         writer.write_all(b"\n").await.expect("newline");
         writer.flush().await.expect("flush");
 
@@ -1472,7 +1476,8 @@ mod tests {
 
         let pm = peer_manager.lock().await;
         assert!(
-            pm.current_generation(&HostName::new("remote-host")).is_none(),
+            pm.current_generation(&HostName::new("remote-host"))
+                .is_none(),
             "peer should be disconnected after socket close"
         );
     }
@@ -1549,7 +1554,10 @@ mod tests {
             host_name: HostName::new("relay-target"),
         };
         let hello_json = serde_json::to_string(&hello).expect("serialize");
-        writer.write_all(hello_json.as_bytes()).await.expect("write");
+        writer
+            .write_all(hello_json.as_bytes())
+            .await
+            .expect("write");
         writer.write_all(b"\n").await.expect("newline");
         writer.flush().await.expect("flush");
         let _ = reader.next_line().await.expect("read hello").expect("line");

@@ -5,7 +5,7 @@ pub mod transport;
 
 pub use manager::{
     synthetic_repo_path, ConnectionDirection, ConnectionMeta, DisconnectPlan, HandleResult,
-    InboundPeerEnvelope, PendingResyncRequest, PeerManager, PerRepoPeerState, ReversePathHop,
+    InboundPeerEnvelope, PeerManager, PendingResyncRequest, PerRepoPeerState, ReversePathHop,
     ReversePathKey, RouteHop, RouteState,
 };
 pub use merge::merge_provider_data;
