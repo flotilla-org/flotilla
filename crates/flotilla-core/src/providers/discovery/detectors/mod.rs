@@ -1,4 +1,9 @@
 pub mod claude;
+pub mod cmux;
+pub mod codex;
 pub mod cursor;
+pub mod env;
 pub mod git;
 pub mod github;
+pub mod shpool;
+pub mod tmux;
