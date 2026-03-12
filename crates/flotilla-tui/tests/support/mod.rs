@@ -130,7 +130,7 @@ impl TestHarness {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.sessions.section.clone(),
         };
-        let table_view = group_work_items(&items, &rm.providers, &section_labels);
+        let table_view = group_work_items(&items, &rm.providers, &section_labels, &path);
 
         let rui = self.ui.repo_ui.get_mut(&path).unwrap();
         rui.update_table_view(table_view);

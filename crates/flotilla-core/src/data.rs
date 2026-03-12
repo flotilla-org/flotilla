@@ -538,10 +538,34 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
 ///
 /// Accepts protocol `WorkItem` (flat, serializable) so this function can be
 /// used both in-process (core side) and in the TUI after receiving a Snapshot.
+/// Sort tier for a checkout path relative to the repo root.
+/// Tier 0 = child of repo root or sibling (same parent, name starts with repo name).
+/// Tier 1 = everything else (external worktrees).
+fn checkout_sort_tier(path: &Path, repo_root: &Path) -> u8 {
+    // Child of repo root (e.g. repo_root/.worktrees/feat)
+    if path.starts_with(repo_root) {
+        return 0;
+    }
+    // Sibling (e.g. repo_root.branch-name)
+    if let Some(parent) = repo_root.parent() {
+        if let Ok(rel) = path.strip_prefix(parent) {
+            let root_name = repo_root
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            if rel.to_string_lossy().starts_with(root_name.as_ref()) {
+                return 0;
+            }
+        }
+    }
+    1
+}
+
 pub fn group_work_items(
     work_items: &[flotilla_protocol::WorkItem],
     providers: &ProviderData,
     labels: &SectionLabels,
+    repo_root: &Path,
 ) -> GroupedWorkItems {
     let mut checkout_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
     let mut session_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
@@ -562,11 +586,21 @@ pub fn group_work_items(
     let mut entries: Vec<GroupEntry> = Vec::new();
     let mut selectable: Vec<usize> = Vec::new();
 
-    // Checkouts -- main first, then sorted by path ascending
+    // Checkouts -- main first, then local (children/siblings) before external, then by path
     checkout_items.sort_by(|a, b| match (a.is_main_checkout, b.is_main_checkout) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
-        _ => a.checkout_key().cmp(&b.checkout_key()),
+        _ => {
+            let tier_a = a
+                .checkout_key()
+                .map(|p| checkout_sort_tier(p, repo_root))
+                .unwrap_or(1);
+            let tier_b = b
+                .checkout_key()
+                .map(|p| checkout_sort_tier(p, repo_root))
+                .unwrap_or(1);
+            tier_a.cmp(&tier_b).then_with(|| a.checkout_key().cmp(&b.checkout_key()))
+        }
     });
     if !checkout_items.is_empty() {
         entries.push(GroupEntry::Header(SectionHeader(labels.checkouts.clone())));
@@ -1764,7 +1798,7 @@ mod tests {
     fn group_work_items_empty_input() {
         let providers = new_providers();
         let labels = default_labels();
-        let result = group_work_items(&[], &providers, &labels);
+        let result = group_work_items(&[], &providers, &labels, Path::new("/tmp"));
         assert!(result.table_entries.is_empty());
         assert!(result.selectable_indices.is_empty());
     }
@@ -1774,7 +1808,7 @@ mod tests {
         let providers = new_providers();
         let labels = default_labels();
         let items = vec![to_proto(&checkout_item("/tmp/wt", Some("feat"), false))];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         // Should have 1 header + 1 item
         assert_eq!(result.table_entries.len(), 2);
@@ -1795,7 +1829,7 @@ mod tests {
             to_proto(&remote_branch_item("origin/dev")),
             to_proto(&issue_item("1", "Bug")),
         ];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         // Expect 5 headers + 5 items = 10 entries
         assert_eq!(result.table_entries.len(), 10);
@@ -1823,7 +1857,7 @@ mod tests {
             to_proto(&checkout_item("/tmp/main", Some("main"), true)),
             to_proto(&checkout_item("/tmp/m", Some("m-branch"), false)),
         ];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let branches = item_branches(&result.table_entries);
         assert_eq!(
@@ -1838,6 +1872,51 @@ mod tests {
     }
 
     #[test]
+    fn group_work_items_codex_worktree_sorts_after_siblings() {
+        // Real scenario: main at ~/dev/flotilla, sibling worktrees at
+        // ~/dev/flotilla.checkout-order etc., and a Codex auto-worktree at
+        // ~/.codex/worktrees/0cf6/flotilla.  The Codex path currently sorts
+        // between main and siblings because raw "/Users/x/.codex" < "/Users/x/dev".
+        let providers = new_providers();
+        let labels = default_labels();
+        let items = vec![
+            to_proto(&checkout_item(
+                "/Users/robert/dev/flotilla",
+                Some("main"),
+                true,
+            )),
+            to_proto(&checkout_item(
+                "/Users/robert/.codex/worktrees/0cf6/flotilla",
+                Some("codex-detached"),
+                false,
+            )),
+            to_proto(&checkout_item(
+                "/Users/robert/dev/flotilla.checkout-order",
+                Some("checkout-order"),
+                false,
+            )),
+            to_proto(&checkout_item(
+                "/Users/robert/dev/flotilla.low-hang-13",
+                Some("low-hang-13"),
+                false,
+            )),
+        ];
+        let repo_root = Path::new("/Users/robert/dev/flotilla");
+        let result = group_work_items(&items, &providers, &labels, repo_root);
+
+        let branches = item_branches(&result.table_entries);
+        assert_eq!(
+            branches,
+            vec![
+                Some("main".to_string()),           // main always first
+                Some("checkout-order".to_string()),  // siblings next
+                Some("low-hang-13".to_string()),
+                Some("codex-detached".to_string()),  // external worktrees last
+            ]
+        );
+    }
+
+    #[test]
     fn group_work_items_prs_sorted_by_id_descending() {
         let providers = new_providers();
         let labels = default_labels();
@@ -1846,7 +1925,7 @@ mod tests {
         let pr3 = to_proto(&cr_item("3", "PR three"));
 
         let items = vec![pr1, pr5, pr3];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let cr_keys = item_change_request_keys(&result.table_entries);
         assert_eq!(cr_keys, vec!["5", "3", "1"]);
@@ -1861,7 +1940,7 @@ mod tests {
             to_proto(&issue_item("10", "Issue ten")),
             to_proto(&issue_item("1", "Issue one")),
         ];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let issue_keys = issue_key_groups(&result.table_entries);
         assert_eq!(
@@ -1882,7 +1961,7 @@ mod tests {
             to_proto(&remote_branch_item("z-remote")),
             to_proto(&remote_branch_item("a-remote")),
         ];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let branches = item_branches(&result.table_entries);
         assert_eq!(
@@ -1900,7 +1979,7 @@ mod tests {
             to_proto(&checkout_item("/tmp/b", Some("b"), false)),
             to_proto(&issue_item("1", "Bug")),
         ];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         // Layout: Header(0), Item(1), Item(2), Header(3), Item(4)
         assert_eq!(result.selectable_indices, vec![1, 2, 4]);
@@ -1912,7 +1991,7 @@ mod tests {
         let labels = default_labels();
         // Only issues, no checkouts/sessions/PRs/remote
         let items = vec![to_proto(&issue_item("1", "Bug"))];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         assert_eq!(result.table_entries.len(), 2); // 1 header + 1 item
         let headers = header_titles(&result.table_entries);
@@ -1934,7 +2013,7 @@ mod tests {
             to_proto(&cr_item("1", "PR")),
             to_proto(&issue_item("1", "Ticket")),
         ];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let headers = header_titles(&result.table_entries);
         assert_eq!(
@@ -1993,7 +2072,7 @@ mod tests {
         let si3 = to_proto(&session_item("s-mid", "Mid"));
 
         let items = vec![si1, si2, si3];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let session_descs = session_descriptions(&result.table_entries);
         assert_eq!(session_descs, vec!["New", "Mid", "Old"]);
@@ -2048,7 +2127,7 @@ mod tests {
             to_proto(&session_item("s-codex-new", "Codex New")),
             to_proto(&session_item("s-claude-new", "Claude New")),
         ];
-        let result = group_work_items(&items, &providers, &labels);
+        let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let session_descs = session_descriptions(&result.table_entries);
         // claude sessions grouped first (alphabetically), newest first within group
@@ -2159,7 +2238,7 @@ mod tests {
         // Now group them
         let labels = default_labels();
         let proto_items: Vec<_> = work_items.iter().map(to_proto).collect();
-        let grouped = group_work_items(&proto_items, &providers, &labels);
+        let grouped = group_work_items(&proto_items, &providers, &labels, Path::new("/tmp"));
 
         // Should have sections for checkouts, sessions, remote, issues
         let header_count = grouped
