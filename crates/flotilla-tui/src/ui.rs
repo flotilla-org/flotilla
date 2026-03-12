@@ -281,6 +281,7 @@ fn render_status_bar(
     }
 
     let rui = active_rui(model, ui);
+    let preview_status = preview_status_text(ui);
 
     let text: String = match &ui.mode {
         UiMode::Config => " j/k:scroll log  [/]:switch tab  ?:help  q:quit".into(),
@@ -301,11 +302,15 @@ fn render_status_bar(
         UiMode::Help => " ?:close help  esc:close help".into(),
         UiMode::Normal => {
             if rui.show_providers {
-                " c:close providers  [/]:switch tab  ?:help  q:quit".into()
+                format!(" c:close providers  {preview_status}  [/]:switch tab  ?:help  q:quit")
             } else if let Some(q) = rui.active_search_query.as_deref() {
-                format!(" search: \"{q}\"  /:new search  esc:clear  ?:help  q:quit")
+                format!(
+                    " search: \"{q}\"  {preview_status}  /:new search  esc:clear  ?:help  q:quit"
+                )
             } else if !rui.multi_selected.is_empty() {
-                " enter:create branch  space:toggle  esc:clear  ?:help  q:quit".into()
+                format!(
+                    " enter:create branch  space:toggle  {preview_status}  esc:clear  ?:help  q:quit"
+                )
             } else {
                 let mut s = " enter:open".to_string();
                 if let Some(item) = selected_work_item(model, ui) {
@@ -319,6 +324,9 @@ fn render_status_bar(
                         }
                     }
                 }
+                s.push_str("  v:preview  P:hide");
+                s.push_str("  ");
+                s.push_str(preview_status);
                 s.push_str("  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit");
                 s
             }
@@ -335,10 +343,27 @@ fn render_content(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
+    if !ui.preview.visible {
+        render_unified_table(model, ui, frame, area);
+        return;
+    }
+
+    let chunks = match resolve_preview_position(area, ui.preview.position_mode) {
+        ResolvedPreviewPosition::Right => Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(100 - PREVIEW_SPLIT_RIGHT_PERCENT),
+                Constraint::Percentage(PREVIEW_SPLIT_RIGHT_PERCENT),
+            ])
+            .split(area),
+        ResolvedPreviewPosition::Below => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(100 - PREVIEW_SPLIT_BELOW_PERCENT),
+                Constraint::Percentage(PREVIEW_SPLIT_BELOW_PERCENT),
+            ])
+            .split(area),
+    };
 
     render_unified_table(model, ui, frame, chunks[0]);
     render_preview(model, ui, frame, chunks[1]);
@@ -1021,6 +1046,8 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
             "  p                Show {} in browser",
             labels.code_review.abbr
         )),
+        Line::from("  v                Cycle preview mode (auto/right/below)"),
+        Line::from("  P                Hide/show preview"),
         Line::from("  r                Refresh data"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1063,6 +1090,18 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
         .scroll((scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn preview_status_text(ui: &UiState) -> &'static str {
+    if !ui.preview.visible {
+        return "preview:hidden";
+    }
+
+    match ui.preview.position_mode {
+        PreviewPositionMode::Auto => "preview:auto",
+        PreviewPositionMode::Right => "preview:right",
+        PreviewPositionMode::Below => "preview:below",
+    }
 }
 
 fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {

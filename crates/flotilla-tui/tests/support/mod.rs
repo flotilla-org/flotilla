@@ -10,7 +10,9 @@ use flotilla_protocol::{
     CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
     CorrelationKey, Issue, ProviderData, RepoLabels, SessionStatus, WorkItem,
 };
-use flotilla_tui::app::{InFlightCommand, ProviderStatus, TuiModel, UiMode, UiState};
+use flotilla_tui::app::{
+    InFlightCommand, PreviewPositionMode, ProviderStatus, TuiModel, UiMode, UiState,
+};
 use flotilla_tui::ui;
 
 // Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
@@ -78,9 +80,25 @@ impl TestHarness {
         self
     }
 
+    /// Override the terminal width for this test.
+    pub fn with_width(mut self, width: u16) -> Self {
+        self.width = width;
+        self
+    }
+
     /// Set the UI mode.
     pub fn with_mode(mut self, mode: UiMode) -> Self {
         self.ui.mode = mode;
+        self
+    }
+
+    pub fn with_preview_mode(mut self, mode: PreviewPositionMode) -> Self {
+        self.ui.preview.position_mode = mode;
+        self
+    }
+
+    pub fn with_preview_visible(mut self, visible: bool) -> Self {
+        self.ui.preview.visible = visible;
         self
     }
 

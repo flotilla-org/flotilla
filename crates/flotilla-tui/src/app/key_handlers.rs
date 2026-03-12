@@ -98,6 +98,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
             KeyCode::Char('r') => {} // refresh handled in main loop
             KeyCode::Char(' ') => self.toggle_multi_select(),
+            KeyCode::Char('v') => self.ui.cycle_preview_position_mode(),
+            KeyCode::Char('P') => self.ui.toggle_preview_visibility(),
             KeyCode::Char('.') => self.open_action_menu(),
             KeyCode::Enter => self.action_enter(),
             KeyCode::Char('n') => self.enter_branch_input(BranchInputKind::Manual),
@@ -1364,6 +1366,40 @@ mod tests {
         assert!(!app.active_ui().multi_selected.is_empty());
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.active_ui().multi_selected.is_empty());
+    }
+
+    #[test]
+    fn v_cycles_preview_position_mode_in_normal_mode() {
+        let mut app = stub_app();
+        assert_eq!(app.ui.preview.position_mode, super::super::PreviewPositionMode::Auto);
+
+        app.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(
+            app.ui.preview.position_mode,
+            super::super::PreviewPositionMode::Right
+        );
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+
+        app.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(
+            app.ui.preview.position_mode,
+            super::super::PreviewPositionMode::Below
+        );
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn uppercase_p_toggles_preview_visibility_in_normal_mode() {
+        let mut app = stub_app();
+        assert!(app.ui.preview.visible);
+
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(!app.ui.preview.visible);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app.ui.preview.visible);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
     }
 
     // ── normal p dispatches open change request ──────────────────────

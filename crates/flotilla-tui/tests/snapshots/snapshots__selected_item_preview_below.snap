@@ -1,0 +1,45 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 159
+expression: output
+---
+ ⚓  flotilla  | my-project | [+]
+┌───────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────┐
+│      Source     P D  WT  WS  PR   SS   Issues Git  ││Description: checkout             │
+│      ── Checkouts ──                               ││feat-dashboard                    │
+│▸  ○               c  ✓                             ││Branch: feat-dashboard            │
+│      ── Pull Requests ──                           ││Path:                             │
+│   ⊙               B          #99                   ││/test/my-project/feat-dashboard   │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+│                                                    ││                                  │
+└────────────────────────────────────────────────────┘└──────────────────────────────────┘
+ enter:open  d:remove worktree  v:preview  P:hide  preview:auto  .:menu  /:search  n:new
