@@ -52,6 +52,7 @@ pub enum UiMode {
     DeleteConfirm {
         info: Option<CheckoutStatus>,
         loading: bool,
+        terminal_keys: Vec<flotilla_protocol::ManagedTerminalId>,
     },
     IssueSearch {
         input: Input,
@@ -265,6 +266,7 @@ mod tests {
                 UiMode::DeleteConfirm {
                     info: None,
                     loading: false,
+                    terminal_keys: vec![],
                 },
                 false,
             ),

@@ -304,6 +304,7 @@ impl App {
                     self.ui.mode = UiMode::DeleteConfirm {
                         info: None,
                         loading: true,
+                        terminal_keys: item.terminal_keys.clone(),
                     };
                 }
                 Intent::GenerateBranchName => {
@@ -452,11 +453,13 @@ impl App {
                     // Extract branch from CheckoutStatus and send RemoveCheckout
                     if let UiMode::DeleteConfirm {
                         info: Some(ref info),
+                        ref terminal_keys,
                         ..
                     } = self.ui.mode
                     {
                         self.proto_commands.push(Command::RemoveCheckout {
                             branch: info.branch.clone(),
+                            terminal_keys: terminal_keys.clone(),
                         });
                     }
                     self.ui.mode = UiMode::Normal;
@@ -517,6 +520,7 @@ mod tests {
                 base_detection_warning: None,
             }),
             loading: false,
+            terminal_keys: vec![],
         }
     }
 
@@ -991,7 +995,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::RemoveCheckout { branch } => {
+            Command::RemoveCheckout { branch, .. } => {
                 assert_eq!(branch, "feat/x");
             }
             other => panic!("expected RemoveCheckout, got {:?}", other),
@@ -1006,7 +1010,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::RemoveCheckout { branch } => {
+            Command::RemoveCheckout { branch, .. } => {
                 assert_eq!(branch, "feat/y");
             }
             other => panic!("expected RemoveCheckout, got {:?}", other),
@@ -1019,6 +1023,7 @@ mod tests {
         app.ui.mode = UiMode::DeleteConfirm {
             info: None,
             loading: true,
+            terminal_keys: vec![],
         };
         app.handle_key(key(KeyCode::Char('y')));
         // Should still be in DeleteConfirm mode
@@ -1339,6 +1344,7 @@ mod tests {
         app.ui.mode = UiMode::DeleteConfirm {
             info: None,
             loading: false,
+            terminal_keys: vec![],
         };
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));

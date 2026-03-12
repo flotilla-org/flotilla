@@ -718,6 +718,7 @@ fn explicit_label(label: &ChannelLabel, default: &ChannelLabel) -> Option<String
         None
     } else {
         Some(match label {
+            ChannelLabel::Noop => return None,
             ChannelLabel::Command(s) => s.clone(),
             ChannelLabel::GhApi(s) => s.clone(),
             ChannelLabel::Http(s) => s.clone(),

@@ -99,6 +99,8 @@ pub struct WorkItem {
     pub debug_group: Vec<String>,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub terminal_keys: Vec<crate::ManagedTerminalId>,
 }
 
 impl WorkItem {
@@ -264,6 +266,7 @@ mod tests {
                     is_main_checkout: false,
                     debug_group: vec![],
                     source: None,
+                    terminal_keys: vec![],
                 },
                 WorkItem {
                     kind: WorkItemKind::Session,
@@ -279,6 +282,7 @@ mod tests {
                     is_main_checkout: false,
                     debug_group: vec![],
                     source: None,
+                    terminal_keys: vec![],
                 },
             ],
             providers: ProviderData::default(),
@@ -321,6 +325,7 @@ mod tests {
                 is_main_checkout: false,
                 debug_group: vec![],
                 source: None,
+                terminal_keys: vec![],
             },
             WorkItem {
                 kind: WorkItemKind::Checkout,
@@ -339,6 +344,7 @@ mod tests {
                 is_main_checkout: true,
                 debug_group: vec!["group info".into()],
                 source: None,
+                terminal_keys: vec![],
             },
         ];
 
@@ -373,6 +379,24 @@ mod tests {
         }"#;
         let decoded: WorkItem = serde_json::from_str(json).expect("deserialize");
         assert!(decoded.debug_group.is_empty());
+    }
+
+    #[test]
+    fn work_item_terminal_keys_defaults_when_missing() {
+        let json = r#"{
+            "kind": "Issue",
+            "identity": {"Issue": "X"},
+            "branch": null,
+            "description": "test",
+            "checkout": null,
+            "change_request_key": null,
+            "session_key": null,
+            "issue_keys": [],
+            "workspace_refs": [],
+            "is_main_checkout": false
+        }"#;
+        let decoded: WorkItem = serde_json::from_str(json).expect("deserialize");
+        assert!(decoded.terminal_keys.is_empty());
     }
 
     #[test]

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 /// while different channels can be consumed in any order.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ChannelLabel {
+    Noop,
     Command(String),
     GhApi(String),
     Http(String),
@@ -77,6 +78,70 @@ impl ChannelLabeler for TaskId {
             ChannelRequest::GhApi { .. } => ChannelLabel::GhApi(self.0.into()),
             ChannelRequest::Http { .. } => ChannelLabel::Http(self.0.into()),
         }
+    }
+}
+
+pub(crate) const REPLAY_LABELS_ENABLED: bool = cfg!(any(test, feature = "replay"));
+
+#[inline]
+pub(crate) fn noop_channel_label() -> ChannelLabel {
+    ChannelLabel::Noop
+}
+
+#[inline]
+pub(crate) fn command_channel_label(cmd: &str, args: &[&str]) -> ChannelLabel {
+    command_channel_label_with::<REPLAY_LABELS_ENABLED, _>(cmd, args, &DefaultLabeler)
+}
+
+#[inline]
+pub(crate) fn command_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(
+    cmd: &str,
+    args: &[&str],
+    labeler: &L,
+) -> ChannelLabel {
+    if ENABLED {
+        let request = ChannelRequest::Command { cmd, args };
+        labeler.label_for(&request)
+    } else {
+        noop_channel_label()
+    }
+}
+
+#[inline]
+pub(crate) fn gh_api_channel_label(method: &'static str, endpoint: &str) -> ChannelLabel {
+    gh_api_channel_label_with::<REPLAY_LABELS_ENABLED, _>(method, endpoint, &DefaultLabeler)
+}
+
+#[inline]
+pub(crate) fn gh_api_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(
+    method: &'static str,
+    endpoint: &str,
+    labeler: &L,
+) -> ChannelLabel {
+    if ENABLED {
+        let request = ChannelRequest::GhApi { method, endpoint };
+        labeler.label_for(&request)
+    } else {
+        noop_channel_label()
+    }
+}
+
+#[inline]
+pub(crate) fn http_channel_label(method: &str, url: &str) -> ChannelLabel {
+    http_channel_label_with::<REPLAY_LABELS_ENABLED, _>(method, url, &DefaultLabeler)
+}
+
+#[inline]
+pub(crate) fn http_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(
+    method: &str,
+    url: &str,
+    labeler: &L,
+) -> ChannelLabel {
+    if ENABLED {
+        let request = ChannelRequest::Http { method, url };
+        labeler.label_for(&request)
+    } else {
+        noop_channel_label()
     }
 }
 
@@ -178,23 +243,16 @@ macro_rules! run {
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
         let __args = $args;
         let __cmd = $cmd;
-        let __request = $crate::providers::ChannelRequest::Command {
-            cmd: __cmd,
-            args: __args,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $labeler.label_for(&__request);
+        let __label = $crate::providers::command_channel_label_with::<
+            { $crate::providers::REPLAY_LABELS_ENABLED },
+            _,
+        >(__cmd, __args, &$labeler);
         $runner.run(__cmd, __args, $cwd, &__label).await
     }};
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
         let __args = $args;
         let __cmd = $cmd;
-        let __request = $crate::providers::ChannelRequest::Command {
-            cmd: __cmd,
-            args: __args,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
+        let __label = $crate::providers::command_channel_label(__cmd, __args);
         $runner.run(__cmd, __args, $cwd, &__label).await
     }};
 }
@@ -204,23 +262,16 @@ macro_rules! run_output {
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
         let __args = $args;
         let __cmd = $cmd;
-        let __request = $crate::providers::ChannelRequest::Command {
-            cmd: __cmd,
-            args: __args,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $labeler.label_for(&__request);
+        let __label = $crate::providers::command_channel_label_with::<
+            { $crate::providers::REPLAY_LABELS_ENABLED },
+            _,
+        >(__cmd, __args, &$labeler);
         $runner.run_output(__cmd, __args, $cwd, &__label).await
     }};
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
         let __args = $args;
         let __cmd = $cmd;
-        let __request = $crate::providers::ChannelRequest::Command {
-            cmd: __cmd,
-            args: __args,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
+        let __label = $crate::providers::command_channel_label(__cmd, __args);
         $runner.run_output(__cmd, __args, $cwd, &__label).await
     }};
 }
@@ -230,22 +281,15 @@ pub(crate) use run_output;
 macro_rules! gh_api_get {
     ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
         let __endpoint = $endpoint;
-        let __request = $crate::providers::ChannelRequest::GhApi {
-            method: "GET",
-            endpoint: __endpoint,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $labeler.label_for(&__request);
+        let __label = $crate::providers::gh_api_channel_label_with::<
+            { $crate::providers::REPLAY_LABELS_ENABLED },
+            _,
+        >("GET", __endpoint, &$labeler);
         $api.get(__endpoint, $repo_root, &__label).await
     }};
     ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
         let __endpoint = $endpoint;
-        let __request = $crate::providers::ChannelRequest::GhApi {
-            method: "GET",
-            endpoint: __endpoint,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
+        let __label = $crate::providers::gh_api_channel_label("GET", __endpoint);
         $api.get(__endpoint, $repo_root, &__label).await
     }};
 }
@@ -255,23 +299,16 @@ pub(crate) use gh_api_get;
 macro_rules! gh_api_get_with_headers {
     ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
         let __endpoint = $endpoint;
-        let __request = $crate::providers::ChannelRequest::GhApi {
-            method: "GET",
-            endpoint: __endpoint,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $labeler.label_for(&__request);
+        let __label = $crate::providers::gh_api_channel_label_with::<
+            { $crate::providers::REPLAY_LABELS_ENABLED },
+            _,
+        >("GET", __endpoint, &$labeler);
         $api.get_with_headers(__endpoint, $repo_root, &__label)
             .await
     }};
     ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
         let __endpoint = $endpoint;
-        let __request = $crate::providers::ChannelRequest::GhApi {
-            method: "GET",
-            endpoint: __endpoint,
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $crate::providers::DefaultLabeler.label_for(&__request);
+        let __label = $crate::providers::gh_api_channel_label("GET", __endpoint);
         $api.get_with_headers(__endpoint, $repo_root, &__label)
             .await
     }};
@@ -282,22 +319,22 @@ pub(crate) use gh_api_get_with_headers;
 macro_rules! http_execute {
     ($http:expr, $request:expr, $labeler:expr $(,)?) => {{
         let __request = $request;
-        let __chan_request = $crate::providers::ChannelRequest::Http {
-            method: __request.method().as_str(),
-            url: __request.url().as_str(),
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $labeler.label_for(&__chan_request);
+        let __label = $crate::providers::http_channel_label_with::<
+            { $crate::providers::REPLAY_LABELS_ENABLED },
+            _,
+        >(
+            __request.method().as_str(),
+            __request.url().as_str(),
+            &$labeler,
+        );
         $http.execute(__request, &__label).await
     }};
     ($http:expr, $request:expr $(,)?) => {{
         let __request = $request;
-        let __chan_request = $crate::providers::ChannelRequest::Http {
-            method: __request.method().as_str(),
-            url: __request.url().as_str(),
-        };
-        use $crate::providers::ChannelLabeler as _;
-        let __label = $crate::providers::DefaultLabeler.label_for(&__chan_request);
+        let __label = $crate::providers::http_channel_label(
+            __request.method().as_str(),
+            __request.url().as_str(),
+        );
         $http.execute(__request, &__label).await
     }};
 }
@@ -450,6 +487,14 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    struct PanicLabeler;
+
+    impl ChannelLabeler for PanicLabeler {
+        fn label_for(&self, _request: &ChannelRequest) -> ChannelLabel {
+            panic!("labeler should not be called");
+        }
+    }
+
     #[tokio::test]
     async fn process_runner_echo() {
         let runner = ProcessCommandRunner;
@@ -467,5 +512,49 @@ mod tests {
     async fn process_runner_exists_false() {
         let runner = ProcessCommandRunner;
         assert!(!runner.exists("nonexistent-binary-xyz", &[]).await);
+    }
+
+    #[test]
+    fn command_label_enabled_uses_labeler() {
+        let label = command_channel_label_with::<true, _>("git", &["status"], &TaskId("task"));
+        assert_eq!(label, ChannelLabel::Command("task".to_string()));
+    }
+
+    #[test]
+    fn command_label_disabled_skips_labeler() {
+        let label = command_channel_label_with::<false, _>("git", &["status"], &PanicLabeler);
+        assert_eq!(label, ChannelLabel::Noop);
+    }
+
+    #[test]
+    fn gh_api_label_enabled_uses_labeler() {
+        let label = gh_api_channel_label_with::<true, _>("GET", "repos/a/b/issues", &TaskId("gh"));
+        assert_eq!(label, ChannelLabel::GhApi("gh".to_string()));
+    }
+
+    #[test]
+    fn gh_api_label_disabled_skips_labeler() {
+        let label = gh_api_channel_label_with::<false, _>("GET", "repos/a/b/issues", &PanicLabeler);
+        assert_eq!(label, ChannelLabel::Noop);
+    }
+
+    #[test]
+    fn http_label_enabled_uses_labeler() {
+        let label = http_channel_label_with::<true, _>(
+            "POST",
+            "https://api.example.com/v1",
+            &TaskId("http"),
+        );
+        assert_eq!(label, ChannelLabel::Http("http".to_string()));
+    }
+
+    #[test]
+    fn http_label_disabled_skips_labeler() {
+        let label = http_channel_label_with::<false, _>(
+            "POST",
+            "https://api.example.com/v1",
+            &PanicLabeler,
+        );
+        assert_eq!(label, ChannelLabel::Noop);
     }
 }

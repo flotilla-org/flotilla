@@ -22,7 +22,26 @@ pub struct ShpoolTerminalPool {
 const FLOTILLA_SHPOOL_CONFIG: &str = include_str!("shpool_config.toml");
 
 impl ShpoolTerminalPool {
-    pub fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
+    /// Create a new ShpoolTerminalPool, cleaning up stale sockets and
+    /// spawning the daemon with flotilla's managed config.
+    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
+        let config_path = socket_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("config.toml");
+        Self::ensure_config(&config_path);
+        Self::clean_stale_socket(&socket_path);
+        Self::start_daemon(&socket_path, &config_path).await;
+        Self {
+            runner,
+            socket_path,
+            config_path,
+        }
+    }
+
+    /// Sync constructor for tests — skips daemon lifecycle.
+    #[cfg(test)]
+    pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
         let config_path = socket_path
             .parent()
             .unwrap_or(Path::new("."))
@@ -33,6 +52,121 @@ impl ShpoolTerminalPool {
             socket_path,
             config_path,
         }
+    }
+
+    /// Check if a process is alive. Returns true for both "alive and ours"
+    /// (kill returns 0) and "alive but not ours" (EPERM).
+    #[cfg(unix)]
+    fn is_process_alive(pid: i32) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // EPERM means the process exists but we can't signal it
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// Remove stale shpool socket and pid files when the daemon is dead.
+    ///
+    /// On macOS, `connect()` to a stale Unix socket succeeds (unlike Linux
+    /// where it returns ConnectionRefused), causing shpool's auto-daemonize
+    /// to think a daemon is running when it isn't.
+    #[cfg(unix)]
+    fn clean_stale_socket(socket_path: &Path) {
+        let pid_path = socket_path.with_file_name("daemonized-shpool.pid");
+
+        if !socket_path.exists() {
+            return;
+        }
+
+        match std::fs::read_to_string(&pid_path) {
+            Ok(contents) => {
+                if let Some(pid) = contents.trim().parse::<i32>().ok().filter(|&p| p > 0) {
+                    if Self::is_process_alive(pid) {
+                        tracing::debug!(%pid, "shpool daemon is alive, keeping socket");
+                        return;
+                    }
+                    tracing::info!(%pid, "shpool daemon is dead, removing stale socket");
+                }
+                // PID file exists but daemon is dead (or unparseable) — remove both
+                let _ = std::fs::remove_file(socket_path);
+                let _ = std::fs::remove_file(&pid_path);
+            }
+            Err(_) => {
+                // No pid file but socket exists — can't verify liveness, remove it
+                tracing::info!("no pid file found, removing orphaned shpool socket");
+                let _ = std::fs::remove_file(socket_path);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn clean_stale_socket(_socket_path: &Path) {
+        // Unix sockets don't exist on non-Unix platforms
+    }
+
+    /// Spawn the shpool daemon if one isn't already running.
+    ///
+    /// `clean_stale_socket` must be called first — it removes sockets for dead
+    /// daemons, so if the socket still exists here the daemon is alive and we
+    /// can reuse it. If the spawn fails, logs a warning — shpool's built-in
+    /// auto-daemonize from `attach` will still work as a fallback.
+    #[cfg(unix)]
+    async fn start_daemon(socket_path: &Path, config_path: &Path) {
+        // If socket exists after clean_stale_socket, a live daemon is already
+        // running — reuse it rather than tearing down persistent sessions.
+        if socket_path.exists() {
+            tracing::debug!("shpool daemon already running, reusing existing");
+            return;
+        }
+
+        let socket_str = socket_path.display().to_string();
+        let config_str = config_path.display().to_string();
+        let log_path = socket_path.with_file_name("daemonized-shpool.log");
+
+        match std::fs::File::create(&log_path) {
+            Ok(log_file) => {
+                // Clone for stderr before consuming for stdout
+                let log_stderr = match log_file.try_clone() {
+                    Ok(f) => f.into(),
+                    Err(_) => std::process::Stdio::null(),
+                };
+                let result = tokio::process::Command::new("shpool")
+                    .args(["--socket", &socket_str, "-c", &config_str, "daemon"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(log_file)
+                    .stderr(log_stderr)
+                    .spawn();
+
+                match result {
+                    Ok(_child) => {
+                        // Child handle is intentionally dropped — tokio does not
+                        // kill on drop, so the daemon outlives this handle.
+                        tracing::info!("spawned shpool daemon");
+                        // Wait for socket to appear (up to 2s)
+                        for _ in 0..20 {
+                            if socket_path.exists() {
+                                tracing::debug!("shpool socket is ready");
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        tracing::warn!("shpool socket did not appear within 2s");
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "failed to spawn shpool daemon");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to create shpool log file");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn start_daemon(_socket_path: &Path, _config_path: &Path) {
+        // shpool is Unix-only
     }
 
     /// Write the flotilla-managed shpool config if it doesn't exist or is stale.
@@ -381,5 +515,63 @@ mod tests {
         )])));
         let terminals = pool.list_terminals().await.unwrap();
         assert!(terminals.is_empty());
+    }
+
+    #[test]
+    fn clean_stale_socket_removes_dead_pid_artifacts() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let socket_path = dir.path().join("shpool.socket");
+        let pid_path = dir.path().join("daemonized-shpool.pid");
+
+        // Create a socket file and a pid file pointing to a dead process
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+        // PID 99999999 is almost certainly not running
+        std::fs::write(&pid_path, "99999999").expect("create fake pid");
+
+        ShpoolTerminalPool::clean_stale_socket(&socket_path);
+
+        assert!(!socket_path.exists(), "stale socket should be removed");
+        assert!(!pid_path.exists(), "stale pid file should be removed");
+    }
+
+    #[test]
+    fn clean_stale_socket_removes_orphan_socket_without_pid_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let socket_path = dir.path().join("shpool.socket");
+
+        // Socket exists but no pid file
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+
+        ShpoolTerminalPool::clean_stale_socket(&socket_path);
+
+        assert!(!socket_path.exists(), "orphan socket should be removed");
+    }
+
+    #[test]
+    fn clean_stale_socket_noop_when_nothing_exists() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let socket_path = dir.path().join("shpool.socket");
+
+        // Nothing exists — should not panic
+        ShpoolTerminalPool::clean_stale_socket(&socket_path);
+    }
+
+    /// Create a ShpoolTerminalPool via the async factory method.
+    async fn test_pool_async(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create tempdir for shpool test");
+        let socket_path = dir.path().join("shpool.socket");
+        let pool = ShpoolTerminalPool::create(runner, socket_path).await;
+        (pool, dir)
+    }
+
+    #[tokio::test]
+    async fn create_writes_config_and_returns_pool() {
+        // No mock responses needed — start_daemon spawns shpool directly
+        // (not through MockRunner), and will fail gracefully in test.
+        let runner = Arc::new(MockRunner::new(vec![]));
+        let (pool, dir) = test_pool_async(runner).await;
+        let config_path = dir.path().join("config.toml");
+        assert!(config_path.exists(), "config should be written");
+        assert_eq!(pool.display_name(), "shpool");
     }
 }

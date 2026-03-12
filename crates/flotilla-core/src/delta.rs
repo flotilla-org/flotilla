@@ -399,6 +399,7 @@ mod tests {
             is_main_checkout: false,
             debug_group: vec![],
             source: None,
+            terminal_keys: vec![],
         }
     }
 

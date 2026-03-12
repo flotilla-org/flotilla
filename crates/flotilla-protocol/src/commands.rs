@@ -19,6 +19,8 @@ pub enum Command {
     },
     RemoveCheckout {
         branch: String,
+        #[serde(default)]
+        terminal_keys: Vec<crate::ManagedTerminalId>,
     },
     FetchCheckoutStatus {
         branch: String,
@@ -151,6 +153,7 @@ mod tests {
             },
             Command::RemoveCheckout {
                 branch: "old-branch".into(),
+                terminal_keys: vec![],
             },
             Command::FetchCheckoutStatus {
                 branch: "feat-done".into(),
@@ -286,7 +289,10 @@ mod tests {
                 create_branch: true,
                 issue_ids: vec![],
             },
-            Command::RemoveCheckout { branch: "b".into() },
+            Command::RemoveCheckout {
+                branch: "b".into(),
+                terminal_keys: vec![],
+            },
             Command::FetchCheckoutStatus {
                 branch: "b".into(),
                 checkout_path: None,

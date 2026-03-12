@@ -78,9 +78,15 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
             app.prefill_branch_input(&name, issue_ids);
         }
         CommandResult::CheckoutStatus(info) => {
+            // Preserve terminal_keys from the loading state
+            let terminal_keys = match &app.ui.mode {
+                UiMode::DeleteConfirm { terminal_keys, .. } => terminal_keys.clone(),
+                _ => vec![],
+            };
             app.ui.mode = UiMode::DeleteConfirm {
                 info: Some(info),
                 loading: false,
+                terminal_keys,
             };
         }
         CommandResult::Error { message } => {
