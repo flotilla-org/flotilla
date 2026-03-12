@@ -320,7 +320,9 @@ fn render_status_bar(
             format!(" / search: {}▏  enter:search  esc:cancel", input.value())
         }
         UiMode::FilePicker { .. } => " j/k:navigate  tab:complete  enter:select  esc:cancel".into(),
-        UiMode::DeleteConfirm { .. } => " y/enter:confirm  n/esc:cancel".into(),
+        UiMode::DeleteConfirm { .. } | UiMode::CloseConfirm { .. } => {
+            " y/enter:confirm  n/esc:cancel".into()
+        }
         UiMode::Help => " ?:close help  esc:close help".into(),
         UiMode::Normal => {
             if rui.show_providers {

@@ -54,6 +54,10 @@ pub enum UiMode {
         loading: bool,
         terminal_keys: Vec<flotilla_protocol::ManagedTerminalId>,
     },
+    CloseConfirm {
+        id: String,
+        title: String,
+    },
     IssueSearch {
         input: Input,
     },
@@ -287,6 +291,13 @@ mod tests {
                     info: None,
                     loading: false,
                     terminal_keys: vec![],
+                },
+                false,
+            ),
+            (
+                UiMode::CloseConfirm {
+                    id: "42".into(),
+                    title: "test".into(),
                 },
                 false,
             ),
