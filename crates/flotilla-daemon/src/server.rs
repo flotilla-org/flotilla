@@ -434,6 +434,7 @@ impl DaemonServer {
                             }
                         }
                         HandleResult::ResyncRequested {
+                            request_id,
                             from,
                             repo,
                             since_seq: _, // Phase 1: always send full snapshot
@@ -447,7 +448,6 @@ impl DaemonServer {
                                     peer_daemon.get_local_providers(&local_path).await
                                 {
                                     reply_clock.tick(&local_host);
-                                    let request_id = pm.next_request_id();
                                     let response_clock = reply_clock.clone();
                                     let response_repo = repo.clone();
                                     let response_repo_path = repo_path.clone();
@@ -480,7 +480,6 @@ impl DaemonServer {
                                     }
                                 }
                             }
-                            drop(pm);
                         }
                         HandleResult::NeedsResync { from, repo } => {
                             let local_host = pm.local_host().clone();
@@ -508,7 +507,6 @@ impl DaemonServer {
                                     "failed to send resync request"
                                 );
                             }
-                            drop(pm);
                         }
                         HandleResult::Ignored => {}
                     }
@@ -706,7 +704,6 @@ async fn dispatch_resync_requests(
         if let Err(e) = pm.send_to(&target, PeerWireMessage::Routed(request)).await {
             warn!(peer = %target, err = %e, "failed to dispatch routed resync request");
         }
-        drop(pm);
     }
 }
 
@@ -771,7 +768,6 @@ async fn send_local_to_peers(
         {
             debug!(peer = %peer_name, err = %e, "failed to send snapshot to peer");
         }
-        drop(pm);
     }
 }
 

@@ -43,12 +43,12 @@ impl PeerSender for ChannelPeerSender {
 }
 
 /// SSH-based transport that forwards a remote daemon's Unix socket locally
-/// and exchanges `PeerData` messages over it.
+/// and exchanges peer wire messages over it.
 ///
 /// The transport spawns `ssh -N -L <local>:<remote> [user@]host` as a child
 /// process, then connects to the locally-forwarded socket to read/write
-/// JSON-line `Message` values. Only `Message::PeerData` messages are
-/// forwarded; other message types on the wire are silently discarded.
+/// JSON-line `Message` values. Only `Message::Peer` payloads are forwarded;
+/// other message types on the wire are silently discarded.
 pub struct SshTransport {
     local_host: HostName,
     config: RemoteHostConfig,
@@ -367,6 +367,7 @@ impl SshTransport {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn should_initiate(local_host: &HostName, expected_host_name: &HostName) -> bool {
+        // Pairwise initiator helper for the planned deterministic connect policy.
         local_host.as_str() < expected_host_name.as_str()
     }
 

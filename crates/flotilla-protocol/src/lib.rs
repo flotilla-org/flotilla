@@ -77,8 +77,6 @@ pub enum Message {
         protocol_version: u32,
         host_name: HostName,
     },
-    #[serde(rename = "peer_data")]
-    PeerData(Box<PeerDataMessage>),
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),
 }

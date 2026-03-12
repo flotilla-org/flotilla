@@ -32,6 +32,7 @@ pub enum HandleResult {
     Updated(RepoIdentity),
     /// The sender is requesting a resync — caller should send a snapshot back.
     ResyncRequested {
+        request_id: u64,
         from: HostName,
         repo: RepoIdentity,
         since_seq: u64,
@@ -362,6 +363,7 @@ impl PeerManager {
                 HandleResult::NeedsResync { from: origin, repo }
             }
             PeerDataKind::RequestResync { since_seq } => HandleResult::ResyncRequested {
+                request_id: 0,
                 from: origin,
                 repo,
                 since_seq,
@@ -414,6 +416,7 @@ impl PeerManager {
                 }
                 if target_host == self.local_host {
                     return HandleResult::ResyncRequested {
+                        request_id,
                         from: requester_host,
                         repo: repo_identity,
                         since_seq,
@@ -789,7 +792,8 @@ impl PeerManager {
         self.senders.remove(name);
         self.generations.remove(name);
         self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
-        self.pending_resync_requests.clear();
+        self.pending_resync_requests
+            .retain(|key, _| key.target_host != *name);
 
         let mut affected_repos = Vec::new();
         let mut resync_requests = Vec::new();
@@ -1028,6 +1032,7 @@ mod tests {
         assert_eq!(
             result,
             HandleResult::ResyncRequested {
+                request_id: 0,
                 from: HostName::new("remote"),
                 repo: test_repo(),
                 since_seq: 3,
@@ -1469,6 +1474,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routed_request_resync_to_local_preserves_request_id() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let generation = mgr.activate_connection(
+            HostName::new("relay"),
+            sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Routed(RoutedPeerMessage::RequestResync {
+                    request_id: 41,
+                    requester_host: HostName::new("requester"),
+                    target_host: HostName::new("local"),
+                    remaining_hops: 3,
+                    repo_identity: test_repo(),
+                    since_seq: 7,
+                }),
+                connection_generation: generation,
+                connection_peer: HostName::new("relay"),
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            HandleResult::ResyncRequested {
+                request_id: 41,
+                from: HostName::new("requester"),
+                repo: test_repo(),
+                since_seq: 7,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_peer_keeps_snapshot_stale_when_fallback_exists() {
         let mut mgr = PeerManager::new(HostName::new("local"));
         let direct_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
@@ -1523,6 +1570,58 @@ mod tests {
             mgr.routes[&HostName::new("target")].primary.next_hop,
             HostName::new("relay")
         );
+    }
+
+    #[tokio::test]
+    async fn disconnect_peer_keeps_unrelated_pending_resync_requests() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let target_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let other_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        mgr.activate_connection(
+            HostName::new("target"),
+            target_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+        let other_generation = mgr.activate_connection(
+            HostName::new("other"),
+            other_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        let kept_request_id = mgr.note_pending_resync_request(HostName::new("target"), test_repo());
+        let dropped_request_id =
+            mgr.note_pending_resync_request(HostName::new("other"), test_repo());
+
+        let _ = mgr.disconnect_peer(&HostName::new("other"), other_generation);
+
+        let kept_key = ReversePathKey {
+            request_id: kept_request_id,
+            requester_host: HostName::new("local"),
+            target_host: HostName::new("target"),
+            repo_identity: test_repo(),
+        };
+        let dropped_key = ReversePathKey {
+            request_id: dropped_request_id,
+            requester_host: HostName::new("local"),
+            target_host: HostName::new("other"),
+            repo_identity: test_repo(),
+        };
+
+        assert!(mgr.pending_resync_requests.contains_key(&kept_key));
+        assert!(!mgr.pending_resync_requests.contains_key(&dropped_key));
     }
 
     #[tokio::test]
