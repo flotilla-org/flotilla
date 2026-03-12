@@ -1,10 +1,12 @@
 pub mod commands;
 pub mod delta;
 mod host;
+pub mod peer;
 pub mod provider_data;
 pub mod snapshot;
 
 pub use host::{HostName, HostPath, RepoIdentity};
+pub use peer::{PeerDataKind, PeerDataMessage};
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
@@ -65,6 +67,8 @@ pub enum Message {
     },
     #[serde(rename = "event")]
     Event { event: Box<DaemonEvent> },
+    #[serde(rename = "peer_data")]
+    PeerData(Box<PeerDataMessage>),
 }
 
 /// Parsed response from the wire — before type-specific deserialization.
