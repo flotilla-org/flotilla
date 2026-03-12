@@ -1,5 +1,5 @@
 use super::App;
-use flotilla_protocol::{Command, RepoLabels, WorkItem, WorkItemKind};
+use flotilla_protocol::{Command, HostName, RepoLabels, WorkItem, WorkItemKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
@@ -55,6 +55,37 @@ impl Intent {
             }
             Intent::TeleportSession => item.session_key.is_some(),
             Intent::ArchiveSession => item.session_key.is_some(),
+        }
+    }
+
+    /// Whether this intent requires local filesystem access.
+    ///
+    /// Returns `true` for actions that operate on the local filesystem
+    /// (switch workspace, create workspace, remove checkout, create checkout,
+    /// teleport session). These should be hidden for work items from remote hosts.
+    pub fn requires_local_host(&self) -> bool {
+        matches!(
+            self,
+            Intent::SwitchToWorkspace
+                | Intent::CreateWorkspace
+                | Intent::RemoveCheckout
+                | Intent::CreateCheckoutAndWorkspace
+                | Intent::TeleportSession
+        )
+    }
+
+    /// Whether this intent is allowed given the item's host provenance.
+    ///
+    /// Remote items (where `item.host != my_host`) cannot use intents that
+    /// require local filesystem access. If `my_host` is `None`, all items
+    /// are treated as local (pre-multi-host compatibility).
+    pub fn is_allowed_for_host(&self, item: &WorkItem, my_host: &Option<HostName>) -> bool {
+        if !self.requires_local_host() {
+            return true;
+        }
+        match my_host {
+            Some(host) => item.host == *host,
+            None => true,
         }
     }
 
@@ -1034,5 +1065,107 @@ mod tests {
             available.is_empty(),
             "bare item should have no intents, got {available:?}"
         );
+    }
+
+    // ── requires_local_host tests ──
+
+    #[test]
+    fn requires_local_host_true_for_filesystem_intents() {
+        assert!(Intent::SwitchToWorkspace.requires_local_host());
+        assert!(Intent::CreateWorkspace.requires_local_host());
+        assert!(Intent::RemoveCheckout.requires_local_host());
+        assert!(Intent::CreateCheckoutAndWorkspace.requires_local_host());
+        assert!(Intent::TeleportSession.requires_local_host());
+    }
+
+    #[test]
+    fn requires_local_host_false_for_non_filesystem_intents() {
+        assert!(!Intent::GenerateBranchName.requires_local_host());
+        assert!(!Intent::OpenChangeRequest.requires_local_host());
+        assert!(!Intent::OpenIssue.requires_local_host());
+        assert!(!Intent::LinkIssuesToChangeRequest.requires_local_host());
+        assert!(!Intent::ArchiveSession.requires_local_host());
+    }
+
+    // ── is_allowed_for_host tests ──
+
+    #[test]
+    fn allowed_for_host_local_item_with_known_host() {
+        let item = checkout_item("feat/x", "/tmp/feat-x", false);
+        let my_host = Some(HostName::local());
+        // Local item, local host -> all intents allowed
+        for intent in Intent::all_in_menu_order() {
+            assert!(
+                intent.is_allowed_for_host(&item, &my_host),
+                "{intent:?} should be allowed for local item"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_for_host_remote_item_blocks_filesystem_intents() {
+        let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
+        item.host = HostName::new("remote-host");
+        let my_host = Some(HostName::local());
+
+        // Filesystem intents should be blocked
+        assert!(!Intent::SwitchToWorkspace.is_allowed_for_host(&item, &my_host));
+        assert!(!Intent::CreateWorkspace.is_allowed_for_host(&item, &my_host));
+        assert!(!Intent::RemoveCheckout.is_allowed_for_host(&item, &my_host));
+        assert!(!Intent::CreateCheckoutAndWorkspace.is_allowed_for_host(&item, &my_host));
+        assert!(!Intent::TeleportSession.is_allowed_for_host(&item, &my_host));
+
+        // Non-filesystem intents should be allowed
+        assert!(Intent::OpenChangeRequest.is_allowed_for_host(&item, &my_host));
+        assert!(Intent::OpenIssue.is_allowed_for_host(&item, &my_host));
+        assert!(Intent::GenerateBranchName.is_allowed_for_host(&item, &my_host));
+        assert!(Intent::LinkIssuesToChangeRequest.is_allowed_for_host(&item, &my_host));
+        assert!(Intent::ArchiveSession.is_allowed_for_host(&item, &my_host));
+    }
+
+    #[test]
+    fn allowed_for_host_unknown_host_treats_all_as_local() {
+        let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
+        item.host = HostName::new("remote-host");
+        let my_host: Option<HostName> = None;
+
+        // When my_host is unknown, treat everything as local
+        for intent in Intent::all_in_menu_order() {
+            assert!(
+                intent.is_allowed_for_host(&item, &my_host),
+                "{intent:?} should be allowed when my_host is unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_item_action_menu_excludes_filesystem_intents() {
+        // A rich remote item that would normally have many intents
+        let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
+        item.host = HostName::new("remote-host");
+        item.change_request_key = Some("42".into());
+        item.session_key = Some("sess-1".into());
+        item.issue_keys = vec!["7".into()];
+        item.workspace_refs = vec!["ws-1".into()];
+
+        let my_host = Some(HostName::local());
+
+        let available: Vec<_> = Intent::all_in_menu_order()
+            .iter()
+            .filter(|i| i.is_available(&item) && i.is_allowed_for_host(&item, &my_host))
+            .collect();
+
+        // Filesystem intents should be excluded
+        assert!(!available.contains(&&Intent::SwitchToWorkspace));
+        assert!(!available.contains(&&Intent::RemoveCheckout));
+        assert!(!available.contains(&&Intent::CreateWorkspace));
+        assert!(!available.contains(&&Intent::CreateCheckoutAndWorkspace));
+        assert!(!available.contains(&&Intent::TeleportSession));
+
+        // Non-filesystem intents should remain
+        assert!(available.contains(&&Intent::OpenChangeRequest));
+        assert!(available.contains(&&Intent::OpenIssue));
+        assert!(available.contains(&&Intent::LinkIssuesToChangeRequest));
+        assert!(available.contains(&&Intent::ArchiveSession));
     }
 }

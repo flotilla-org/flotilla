@@ -239,8 +239,9 @@ impl App {
             return;
         };
 
+        let my_host = &self.model.my_host;
         for &intent in Intent::enter_priority() {
-            if intent.is_available(&item) {
+            if intent.is_available(&item) && intent.is_allowed_for_host(&item, my_host) {
                 self.resolve_and_push(intent, &item);
                 return;
             }
@@ -282,12 +283,21 @@ impl App {
         let Some(item) = self.selected_work_item().cloned() else {
             return;
         };
-        if intent.is_available(&item) {
+        if intent.is_available(&item) && intent.is_allowed_for_host(&item, &self.model.my_host) {
             self.resolve_and_push(intent, &item);
         }
     }
 
     fn resolve_and_push(&mut self, intent: Intent, item: &WorkItem) {
+        // Safety net: block filesystem operations on remote items even if
+        // the caller somehow bypassed the menu/availability filter.
+        if !intent.is_allowed_for_host(item, &self.model.my_host) {
+            tracing::warn!(?intent, host = %item.host, "blocked intent on remote item");
+            self.model.status_message =
+                Some("Cannot perform this action on a remote item".to_string());
+            return;
+        }
+
         if let Some(cmd) = intent.resolve(item, self) {
             match intent {
                 Intent::RemoveCheckout => {
@@ -310,10 +320,15 @@ impl App {
             return;
         };
 
+        let my_host = &self.model.my_host;
         let items: Vec<Intent> = Intent::all_in_menu_order()
             .iter()
             .copied()
-            .filter(|a| a.is_available(&item) && a.resolve(&item, self).is_some())
+            .filter(|a| {
+                a.is_available(&item)
+                    && a.is_allowed_for_host(&item, my_host)
+                    && a.resolve(&item, self).is_some()
+            })
             .collect();
 
         if items.is_empty() {
