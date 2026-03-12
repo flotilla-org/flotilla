@@ -199,6 +199,11 @@ impl super::CodeReview for GitHubCodeReview {
         Ok(())
     }
 
+    async fn close_change_request(&self, repo_root: &Path, id: &str) -> Result<(), String> {
+        run!(self.runner, "gh", &["pr", "close", id], repo_root)?;
+        Ok(())
+    }
+
     async fn list_merged_branch_names(
         &self,
         repo_root: &Path,
