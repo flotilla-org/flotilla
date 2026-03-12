@@ -576,4 +576,77 @@ mod tests {
         assert_eq!(model.labels.code_review.section, "\u{2014}");
         model.refresh_handle.trigger_refresh();
     }
+
+    // -------------------------------------------------------
+    // strip_external_providers
+    // -------------------------------------------------------
+
+    #[test]
+    fn strip_external_providers_keeps_local_removes_external() {
+        let mut reg = full_registry();
+
+        // Before stripping: everything populated
+        assert!(!reg.vcs.is_empty());
+        assert!(!reg.checkout_managers.is_empty());
+        assert!(!reg.code_review.is_empty());
+        assert!(!reg.issue_trackers.is_empty());
+        assert!(!reg.cloud_agents.is_empty());
+        assert!(!reg.ai_utilities.is_empty());
+        assert!(reg.workspace_manager.is_some());
+
+        reg.strip_external_providers();
+
+        // Local providers are kept
+        assert!(!reg.vcs.is_empty(), "VCS should be kept");
+        assert!(
+            !reg.checkout_managers.is_empty(),
+            "checkout managers should be kept"
+        );
+        assert!(
+            reg.workspace_manager.is_some(),
+            "workspace manager should be kept"
+        );
+
+        // External providers are removed
+        assert!(reg.code_review.is_empty(), "code review should be removed");
+        assert!(
+            reg.issue_trackers.is_empty(),
+            "issue trackers should be removed"
+        );
+        assert!(
+            reg.cloud_agents.is_empty(),
+            "cloud agents should be removed"
+        );
+        assert!(
+            reg.ai_utilities.is_empty(),
+            "AI utilities should be removed"
+        );
+    }
+
+    #[test]
+    fn strip_external_providers_on_empty_registry_is_noop() {
+        let mut reg = ProviderRegistry::new();
+        reg.strip_external_providers();
+        assert!(reg.vcs.is_empty());
+        assert!(reg.checkout_managers.is_empty());
+        assert!(reg.code_review.is_empty());
+    }
+
+    #[test]
+    fn provider_names_after_strip_omits_external() {
+        let mut reg = full_registry();
+        reg.strip_external_providers();
+        let names = provider_names_from_registry(&reg);
+
+        // Local providers remain
+        assert!(names.contains_key("vcs"));
+        assert!(names.contains_key("checkout_manager"));
+        assert!(names.contains_key("workspace_manager"));
+
+        // External providers gone
+        assert!(!names.contains_key("code_review"));
+        assert!(!names.contains_key("issue_tracker"));
+        assert!(!names.contains_key("cloud_agent"));
+        assert!(!names.contains_key("ai_utility"));
+    }
 }

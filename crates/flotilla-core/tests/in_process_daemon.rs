@@ -303,3 +303,69 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
         "should not emit CommandStarted for invalid repo"
     );
 }
+
+#[tokio::test]
+async fn follower_mode_flag_is_stored() {
+    let config = Arc::new(ConfigStore::new());
+    let leader = InProcessDaemon::new(vec![], config.clone()).await;
+    assert!(
+        !leader.is_follower(),
+        "default daemon should not be follower"
+    );
+
+    let follower = InProcessDaemon::new_with_options(vec![], config, true).await;
+    assert!(
+        follower.is_follower(),
+        "follower daemon should report follower=true"
+    );
+}
+
+#[tokio::test]
+async fn follower_mode_skips_external_providers() {
+    // Use a temp dir with a .git directory to guarantee VCS detection
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().to_path_buf();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new_with_options(vec![repo.clone()], config, true).await;
+
+    assert!(daemon.is_follower());
+
+    // list_repos gives us RepoInfo with provider_names populated from the registry
+    let repos = daemon.list_repos().await.expect("list_repos");
+    assert_eq!(repos.len(), 1);
+    let provider_names = &repos[0].provider_names;
+
+    // VCS should be present (local provider, .git dir exists)
+    assert!(
+        provider_names.contains_key("vcs"),
+        "follower should have VCS provider"
+    );
+    // checkout_manager should also be present (git-based fallback)
+    assert!(
+        provider_names.contains_key("checkout_manager"),
+        "follower should have checkout_manager provider"
+    );
+
+    // External providers should be absent
+    assert!(
+        !provider_names.contains_key("code_review"),
+        "follower should not have code_review provider"
+    );
+    assert!(
+        !provider_names.contains_key("issue_tracker"),
+        "follower should not have issue_tracker provider"
+    );
+    // cloud_agent and ai_utility depend on Claude/Codex/Cursor being
+    // installed, so they may or may not be present in non-follower mode.
+    // In follower mode they should always be absent.
+    assert!(
+        !provider_names.contains_key("cloud_agent"),
+        "follower should not have cloud_agent provider"
+    );
+    assert!(
+        !provider_names.contains_key("ai_utility"),
+        "follower should not have ai_utility provider"
+    );
+}

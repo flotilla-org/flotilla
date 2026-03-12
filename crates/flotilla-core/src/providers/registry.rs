@@ -39,3 +39,20 @@ impl Default for ProviderRegistry {
         Self::new()
     }
 }
+
+impl ProviderRegistry {
+    /// Remove external (network-polling) providers, keeping only local ones.
+    ///
+    /// Local providers (kept): VCS, CheckoutManagers, WorkspaceManager, TerminalPool
+    /// External providers (removed): CodeReview, IssueTracker, CloudAgents, AiUtilities
+    ///
+    /// Used by follower-mode daemons that receive service-level data
+    /// (PRs, issues, sessions) from the leader via PeerData messages
+    /// instead of polling external APIs directly.
+    pub fn strip_external_providers(&mut self) {
+        self.code_review.clear();
+        self.issue_trackers.clear();
+        self.cloud_agents.clear();
+        self.ai_utilities.clear();
+    }
+}

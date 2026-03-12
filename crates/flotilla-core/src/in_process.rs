@@ -249,6 +249,11 @@ pub struct InProcessDaemon {
     runner: Arc<dyn CommandRunner>,
     next_command_id: AtomicU64,
     host_name: HostName,
+    /// When true, only local providers (VCS, checkout manager, workspace
+    /// manager, terminal pool) are registered. External providers (code
+    /// review, issue tracker, cloud agents, AI utilities) are skipped
+    /// because the follower receives that data from the leader via PeerData.
+    follower: bool,
 }
 
 impl InProcessDaemon {
@@ -258,6 +263,21 @@ impl InProcessDaemon {
     /// holds a reference. The poll loop checks every 100ms for new refresh
     /// snapshots and broadcasts delta or full events for each change.
     pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<Self> {
+        Self::new_with_options(repo_paths, config, false).await
+    }
+
+    /// Create a new in-process daemon with explicit follower mode.
+    ///
+    /// When `follower` is true, external providers (code review, issue
+    /// tracker, cloud agents, AI utilities) are skipped during provider
+    /// discovery. The follower daemon only reports local state (VCS,
+    /// checkouts, workspace manager, terminal pool). Service-level data
+    /// arrives from the leader via PeerData messages.
+    pub async fn new_with_options(
+        repo_paths: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        follower: bool,
+    ) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let mut repos = HashMap::new();
@@ -267,9 +287,13 @@ impl InProcessDaemon {
             if repos.contains_key(&path) {
                 continue;
             }
-            let (registry, repo_slug) =
-                crate::providers::discovery::detect_providers(&path, &config, Arc::clone(&runner))
-                    .await;
+            let (registry, repo_slug) = crate::providers::discovery::detect_providers_with_mode(
+                &path,
+                &config,
+                Arc::clone(&runner),
+                follower,
+            )
+            .await;
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
             repos.insert(
@@ -298,6 +322,7 @@ impl InProcessDaemon {
             runner,
             next_command_id: AtomicU64::new(1),
             host_name: HostName::local(),
+            follower,
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -316,6 +341,11 @@ impl InProcessDaemon {
         });
 
         daemon
+    }
+
+    /// Returns whether this daemon is running in follower mode.
+    pub fn is_follower(&self) -> bool {
+        self.follower
     }
 
     /// Poll all repos for new refresh snapshots.
@@ -964,10 +994,11 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let (registry, repo_slug) = crate::providers::discovery::detect_providers(
+        let (registry, repo_slug) = crate::providers::discovery::detect_providers_with_mode(
             &path,
             &self.config,
             Arc::clone(&self.runner),
+            self.follower,
         )
         .await;
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
