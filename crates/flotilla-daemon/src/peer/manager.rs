@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -139,6 +139,9 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
+    const RESYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    const DEFAULT_ROUTED_HOPS: u8 = 8;
+
     /// Create a new PeerManager with no peers.
     pub fn new(local_host: HostName) -> Self {
         Self {
@@ -201,6 +204,43 @@ impl PeerManager {
                 candidates: Vec::new(),
             },
         );
+    }
+
+    fn route_hop_is_live(&self, hop: &RouteHop) -> bool {
+        self.generation_is_current(&hop.next_hop, hop.next_hop_generation)
+            && self.senders.contains_key(&hop.next_hop)
+    }
+
+    fn promote_route_after_disconnect(&mut self, origin: &HostName) -> Option<RouteHop> {
+        let mut route = self.routes.remove(origin)?;
+
+        route
+            .fallbacks
+            .retain(|hop| self.route_hop_is_live(hop) && hop.next_hop != *origin);
+        route
+            .candidates
+            .retain(|hop| self.route_hop_is_live(hop) && hop.next_hop != *origin);
+
+        if self.route_hop_is_live(&route.primary) && route.primary.next_hop != *origin {
+            let primary = route.primary.clone();
+            self.routes.insert(origin.clone(), route);
+            return Some(primary);
+        }
+
+        if let Some((idx, _)) = route
+            .fallbacks
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, hop)| hop.learned_epoch)
+        {
+            let next = route.fallbacks.remove(idx);
+            route.primary = next.clone();
+            self.routes.insert(origin.clone(), route);
+            return Some(next);
+        }
+
+        self.routes.remove(origin);
+        None
     }
 
     pub fn activate_connection(
@@ -716,13 +756,91 @@ impl PeerManager {
 
         self.senders.remove(name);
         self.generations.remove(name);
-        self.routes.remove(name);
         self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
-        self.pending_resync_requests.retain(|_, _| true);
+        self.pending_resync_requests.clear();
+
+        let mut affected_repos = Vec::new();
+        let mut resync_requests = Vec::new();
+        let origins: Vec<HostName> = self.peer_data.keys().cloned().collect();
+
+        for origin in origins {
+            let affected_for_origin: Vec<RepoIdentity> = self
+                .peer_data
+                .get(&origin)
+                .map(|repos| {
+                    repos.iter()
+                        .filter(|(_, state)| {
+                            state.via_peer == *name && state.via_generation == generation
+                        })
+                        .map(|(repo_id, _)| repo_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if affected_for_origin.is_empty() {
+                continue;
+            }
+
+            let replacement = self.promote_route_after_disconnect(&origin);
+            if let Some(next_hop) = replacement {
+                if let Some(repos) = self.peer_data.get_mut(&origin) {
+                    for repo_id in &affected_for_origin {
+                        if let Some(state) = repos.get_mut(repo_id) {
+                            state.stale = true;
+                        }
+                    }
+                }
+
+                for repo_id in &affected_for_origin {
+                    let request_id = self.next_request_id();
+                    let key = ReversePathKey {
+                        request_id,
+                        requester_host: self.local_host.clone(),
+                        target_host: origin.clone(),
+                        repo_identity: repo_id.clone(),
+                    };
+                    self.pending_resync_requests.insert(
+                        key,
+                        PendingResyncRequest {
+                            deadline_at: Instant::now() + Self::RESYNC_REQUEST_TIMEOUT,
+                        },
+                    );
+                    resync_requests.push(RoutedPeerMessage::RequestResync {
+                        request_id,
+                        requester_host: self.local_host.clone(),
+                        target_host: origin.clone(),
+                        remaining_hops: Self::DEFAULT_ROUTED_HOPS,
+                        repo_identity: repo_id.clone(),
+                        since_seq: 0,
+                    });
+                }
+
+                debug!(
+                    origin = %origin,
+                    via = %next_hop.next_hop,
+                    repos = affected_for_origin.len(),
+                    "retaining stale peer data while failover resync is pending"
+                );
+            } else {
+                if let Some(repos) = self.peer_data.get_mut(&origin) {
+                    for repo_id in &affected_for_origin {
+                        repos.remove(repo_id);
+                    }
+                    if repos.is_empty() {
+                        self.peer_data.remove(&origin);
+                    }
+                }
+                self.routes.remove(&origin);
+            }
+
+            affected_repos.extend(affected_for_origin);
+        }
+
+        self.last_seen_clocks.retain(|(host, _), _| host != name);
 
         DisconnectPlan {
-            affected_repos: self.remove_peer_data(name),
-            resync_requests: Vec::new(),
+            affected_repos,
+            resync_requests,
         }
     }
 }
@@ -1315,5 +1433,139 @@ mod tests {
 
         assert_eq!(result, HandleResult::Ignored);
         assert!(sent.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_peer_keeps_snapshot_stale_when_fallback_exists() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let direct_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let relay_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let direct_generation = mgr.activate_connection(
+            HostName::new("target"),
+            direct_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Outbound,
+                config_label: None,
+                expected_peer: Some(HostName::new("target")),
+            },
+        );
+        let relay_generation = mgr.activate_connection(
+            HostName::new("relay"),
+            relay_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Outbound,
+                config_label: None,
+                expected_peer: Some(HostName::new("relay")),
+            },
+        );
+        let _ = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Data(snapshot_msg("target", 1)),
+                connection_generation: direct_generation,
+                connection_peer: HostName::new("target"),
+            })
+            .await;
+
+        mgr.routes
+            .get_mut(&HostName::new("target"))
+            .expect("route exists")
+            .fallbacks
+            .push(RouteHop {
+                next_hop: HostName::new("relay"),
+                next_hop_generation: relay_generation,
+                learned_epoch: 10,
+            });
+
+        let plan = mgr.disconnect_peer(&HostName::new("target"), direct_generation);
+
+        assert_eq!(plan.affected_repos, vec![test_repo()]);
+        assert_eq!(plan.resync_requests.len(), 1);
+        let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+        assert!(state.stale, "snapshot should be retained as stale");
+        assert_eq!(
+            mgr.routes[&HostName::new("target")].primary.next_hop,
+            HostName::new("relay")
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_resync_clears_stale_and_rebinds_provenance() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let direct_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let relay_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let direct_generation = mgr.activate_connection(
+            HostName::new("target"),
+            direct_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Outbound,
+                config_label: None,
+                expected_peer: Some(HostName::new("target")),
+            },
+        );
+        let relay_generation = mgr.activate_connection(
+            HostName::new("relay"),
+            relay_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Outbound,
+                config_label: None,
+                expected_peer: Some(HostName::new("relay")),
+            },
+        );
+        let baseline = snapshot_msg("target", 1);
+        let _ = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Data(baseline.clone()),
+                connection_generation: direct_generation,
+                connection_peer: HostName::new("target"),
+            })
+            .await;
+
+        mgr.routes
+            .get_mut(&HostName::new("target"))
+            .expect("route exists")
+            .fallbacks
+            .push(RouteHop {
+                next_hop: HostName::new("relay"),
+                next_hop_generation: relay_generation,
+                learned_epoch: 10,
+            });
+
+        let plan = mgr.disconnect_peer(&HostName::new("target"), direct_generation);
+        let request = match &plan.resync_requests[0] {
+            RoutedPeerMessage::RequestResync { request_id, .. } => *request_id,
+            other => panic!("expected request_resync, got {:?}", other),
+        };
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
+                    request_id: request,
+                    requester_host: HostName::new("local"),
+                    responder_host: HostName::new("target"),
+                    remaining_hops: 4,
+                    repo_identity: baseline.repo_identity.clone(),
+                    repo_path: baseline.repo_path.clone(),
+                    clock: baseline.clock.clone(),
+                    seq: 1,
+                    data: Box::new(ProviderData::default()),
+                }),
+                connection_generation: relay_generation,
+                connection_peer: HostName::new("relay"),
+            })
+            .await;
+
+        assert_eq!(result, HandleResult::Updated(test_repo()));
+        let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+        assert!(!state.stale, "failover resync should clear stale");
+        assert_eq!(state.via_peer, HostName::new("relay"));
+        assert_eq!(state.via_generation, relay_generation);
     }
 }
