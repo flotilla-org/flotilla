@@ -23,6 +23,8 @@ futures = "0.3"
 urlencoding = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gethostname = "1.1.0"
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

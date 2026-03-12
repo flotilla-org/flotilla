@@ -100,16 +100,18 @@ impl ShpoolTerminalPool {
     /// If a daemon is already running, kills it first so the new one picks up
     /// the latest config. If the spawn fails, logs a warning — shpool's
     /// built-in auto-daemonize from `attach` will still work as a fallback.
+    #[cfg(unix)]
     async fn start_daemon(socket_path: &Path, config_path: &Path) {
         let pid_path = socket_path.with_file_name("daemonized-shpool.pid");
 
         // Kill existing daemon if running (to apply fresh config)
         if let Ok(contents) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = contents.trim().parse::<i32>() {
-                #[cfg(unix)]
                 if unsafe { libc::kill(pid, 0) } == 0 {
                     tracing::info!(%pid, "killing existing shpool daemon to apply fresh config");
-                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                        tracing::debug!(%pid, "SIGTERM failed (process may have already exited)");
+                    }
                     // Give it a moment to shut down
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     // Clean up after killed daemon
@@ -159,6 +161,11 @@ impl ShpoolTerminalPool {
                 tracing::warn!(err = %e, "failed to create shpool log file");
             }
         }
+    }
+
+    #[cfg(not(unix))]
+    async fn start_daemon(_socket_path: &Path, _config_path: &Path) {
+        // shpool is Unix-only
     }
 
     /// Write the flotilla-managed shpool config if it doesn't exist or is stale.
