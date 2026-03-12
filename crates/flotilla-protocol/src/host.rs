@@ -20,7 +20,13 @@ impl HostName {
     pub fn local() -> Self {
         let name = gethostname::gethostname()
             .into_string()
-            .unwrap_or_else(|_| "localhost".to_string());
+            .unwrap_or_else(|os| {
+                eprintln!(
+                    "warning: hostname is not valid UTF-8 ({:?}), falling back to \"localhost\"",
+                    os
+                );
+                "localhost".to_string()
+            });
         Self(name)
     }
 }

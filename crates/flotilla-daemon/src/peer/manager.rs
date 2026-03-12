@@ -14,9 +14,12 @@ use super::transport::PeerTransport;
 ///
 /// Remote-only repos have no local filesystem path. This function produces
 /// a deterministic `PathBuf` that serves as a stable key for tab identity
-/// and repo tracking, e.g. `<remote>/desktop//home/dev/repo`.
+/// and repo tracking, e.g. `<remote>/desktop/home/dev/repo`.
 pub fn synthetic_repo_path(host: &HostName, repo_path: &Path) -> PathBuf {
-    PathBuf::from(format!("<remote>/{}/{}", host, repo_path.display()))
+    // Strip leading `/` from absolute paths to avoid double-slash in the
+    // resulting string (e.g. `<remote>/desktop//home/...`).
+    let stripped = repo_path.strip_prefix("/").unwrap_or(repo_path);
+    PathBuf::from(format!("<remote>/{}/{}", host, stripped.display()))
 }
 
 /// Result of handling an inbound PeerDataMessage.
@@ -311,6 +314,23 @@ impl PeerManager {
         self.last_seen_clocks.retain(|(host, _), _| host != name);
         info!(peer = %name, repos = affected.len(), "cleared peer data");
         affected
+    }
+
+    /// Check whether a remote-only repo still has any peer data backing it.
+    ///
+    /// Returns `true` if at least one remaining peer holds data for this identity.
+    pub fn has_peer_data_for(&self, identity: &RepoIdentity) -> bool {
+        self.peer_data
+            .values()
+            .any(|repos| repos.contains_key(identity))
+    }
+
+    /// Unregister a remote-only repo identity.
+    ///
+    /// Returns the synthetic path if it was tracked, so the caller can
+    /// call `remove_repo` on the daemon.
+    pub fn unregister_remote_repo(&mut self, identity: &RepoIdentity) -> Option<PathBuf> {
+        self.known_remote_repos.remove(identity)
     }
 
     /// Send a message to a specific peer by name.
@@ -645,7 +665,7 @@ mod tests {
         let host = HostName::new("desktop");
         let repo_path = std::path::Path::new("/home/dev/repo");
         let path = super::synthetic_repo_path(&host, repo_path);
-        assert_eq!(path, PathBuf::from("<remote>/desktop//home/dev/repo"));
+        assert_eq!(path, PathBuf::from("<remote>/desktop/home/dev/repo"));
     }
 
     #[test]
@@ -660,7 +680,7 @@ mod tests {
     fn register_and_query_remote_repos() {
         let mut mgr = PeerManager::new(HostName::new("local"));
         let repo = test_repo();
-        let synthetic = PathBuf::from("<remote>/desktop//home/dev/repo");
+        let synthetic = PathBuf::from("<remote>/desktop/home/dev/repo");
 
         assert!(!mgr.is_remote_repo(&repo));
         assert!(mgr.known_remote_repos().is_empty());

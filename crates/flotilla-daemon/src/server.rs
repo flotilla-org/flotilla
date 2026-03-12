@@ -529,7 +529,8 @@ impl DaemonServer {
 ///
 /// Called when an SSH connection drops. Removes the peer's stored snapshots
 /// and updates the daemon's peer overlay so the UI no longer shows stale
-/// checkouts and terminals from the unreachable host.
+/// checkouts and terminals from the unreachable host. Remote-only virtual
+/// repos that no longer have any backing peer data are removed entirely.
 async fn clear_peer_data(
     peer_manager: &Arc<Mutex<PeerManager>>,
     daemon: &Arc<InProcessDaemon>,
@@ -543,6 +544,7 @@ async fn clear_peer_data(
     // Rebuild peer overlays for each affected repo
     for repo_id in affected_repos {
         if let Some(local_path) = daemon.find_repo_by_identity(&repo_id).await {
+            // Local repo — rebuild its peer overlay from remaining peers
             let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = {
                 let pm = peer_manager.lock().await;
                 pm.get_peer_data()
@@ -555,6 +557,26 @@ async fn clear_peer_data(
                     .collect()
             };
             daemon.set_peer_providers(&local_path, peers).await;
+        } else {
+            // Remote-only repo — remove the virtual tab if no peers remain
+            let mut pm = peer_manager.lock().await;
+            if !pm.has_peer_data_for(&repo_id) {
+                if let Some(synthetic_path) = pm.unregister_remote_repo(&repo_id) {
+                    drop(pm);
+                    info!(
+                        repo = %repo_id,
+                        path = %synthetic_path.display(),
+                        "removing virtual repo — no peers remaining"
+                    );
+                    if let Err(e) = daemon.remove_repo(&synthetic_path).await {
+                        warn!(
+                            repo = %repo_id,
+                            err = %e,
+                            "failed to remove virtual repo"
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -707,10 +729,14 @@ async fn handle_client(
                                 if peer_host_name.is_none() {
                                     debug!(host = %origin, "registering peer client");
                                     peer_host_name = Some(origin.clone());
-                                    peer_clients
-                                        .lock()
-                                        .await
-                                        .insert(origin, outbound_tx.clone());
+                                    let mut clients = peer_clients.lock().await;
+                                    if clients.contains_key(&origin) {
+                                        warn!(
+                                            host = %origin,
+                                            "duplicate peer hostname — overwriting previous connection"
+                                        );
+                                    }
+                                    clients.insert(origin, outbound_tx.clone());
                                 }
 
                                 if let Err(e) = peer_data_tx.send(*peer_msg).await {
