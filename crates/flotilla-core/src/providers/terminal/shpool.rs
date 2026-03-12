@@ -29,7 +29,7 @@ impl ShpoolTerminalPool {
             .parent()
             .unwrap_or(Path::new("."))
             .join("config.toml");
-        Self::ensure_config(&config_path);
+        let _config_changed = Self::ensure_config(&config_path);
         Self::clean_stale_socket(&socket_path);
         Self::start_daemon(&socket_path, &config_path).await;
         Self {
@@ -46,7 +46,7 @@ impl ShpoolTerminalPool {
             .parent()
             .unwrap_or(Path::new("."))
             .join("config.toml");
-        Self::ensure_config(&config_path);
+        let _ = Self::ensure_config(&config_path);
         Self {
             runner,
             socket_path,
@@ -170,7 +170,8 @@ impl ShpoolTerminalPool {
     }
 
     /// Write the flotilla-managed shpool config if it doesn't exist or is stale.
-    fn ensure_config(path: &Path) {
+    /// Returns true if the config was written (changed), false if it already matched or write failed.
+    fn ensure_config(path: &Path) -> bool {
         let needs_write = match std::fs::read_to_string(path) {
             Ok(existing) => existing != FLOTILLA_SHPOOL_CONFIG,
             Err(_) => true,
@@ -179,12 +180,16 @@ impl ShpoolTerminalPool {
             if let Some(parent) = path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     tracing::warn!(path = %parent.display(), err = %e, "failed to create shpool config dir");
+                    return false;
                 }
             }
             if let Err(e) = std::fs::write(path, FLOTILLA_SHPOOL_CONFIG) {
                 tracing::warn!(path = %path.display(), err = %e, "failed to write shpool config");
+                return false;
             }
+            return true;
         }
+        false
     }
 
     /// Parse the JSON output of `shpool list --json`.
@@ -370,6 +375,22 @@ mod tests {
         assert!(content.contains("prompt_prefix = \"\""));
         assert!(content.contains("TERMINFO"));
         assert!(content.contains("COLORTERM"));
+    }
+
+    #[test]
+    fn ensure_config_returns_true_on_first_write_false_on_second() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        // First call: file doesn't exist → should write and return true
+        assert!(ShpoolTerminalPool::ensure_config(&config_path));
+
+        // Second call: file matches → should return false
+        assert!(!ShpoolTerminalPool::ensure_config(&config_path));
+
+        // Modify the file externally → should return true again
+        std::fs::write(&config_path, "stale config").expect("write stale");
+        assert!(ShpoolTerminalPool::ensure_config(&config_path));
     }
 
     #[test]
