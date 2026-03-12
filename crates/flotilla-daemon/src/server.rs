@@ -24,6 +24,7 @@ pub struct DaemonServer {
     daemon: Arc<InProcessDaemon>,
     socket_path: PathBuf,
     idle_timeout: Duration,
+    follower: bool,
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
@@ -91,6 +92,7 @@ impl DaemonServer {
             daemon,
             socket_path,
             idle_timeout,
+            follower: daemon_config.follower,
             client_count: Arc::new(AtomicUsize::new(0)),
             client_notify: Arc::new(Notify::new()),
             shutdown_tx,
@@ -150,41 +152,46 @@ impl DaemonServer {
         let peer_data_tx = self.peer_data_tx;
         let peer_clients = self.peer_clients;
 
-        // Spawn idle timeout watcher
-        let idle_client_count = Arc::clone(&client_count);
-        let idle_shutdown_tx = shutdown_tx.clone();
-        let idle_notify = Arc::clone(&client_notify);
-        tokio::spawn(async move {
-            loop {
-                // Wait until zero clients
+        // Spawn idle timeout watcher (disabled for follower-mode daemons
+        // which serve peer connections and should stay up indefinitely)
+        if !self.follower {
+            let idle_client_count = Arc::clone(&client_count);
+            let idle_shutdown_tx = shutdown_tx.clone();
+            let idle_notify = Arc::clone(&client_notify);
+            tokio::spawn(async move {
                 loop {
-                    if idle_client_count.load(Ordering::SeqCst) == 0 {
-                        break;
-                    }
-                    idle_notify.notified().await;
-                }
-
-                info!(
-                    timeout_secs = idle_timeout.as_secs(),
-                    "no clients connected, waiting before shutdown"
-                );
-
-                // Race: timeout vs client count change
-                tokio::select! {
-                    () = tokio::time::sleep(idle_timeout) => {
+                    // Wait until zero clients
+                    loop {
                         if idle_client_count.load(Ordering::SeqCst) == 0 {
-                            info!("idle timeout reached, shutting down");
-                            let _ = idle_shutdown_tx.send(true);
-                            return;
+                            break;
                         }
-                        // Client connected during the sleep — loop back
+                        idle_notify.notified().await;
                     }
-                    () = idle_notify.notified() => {
-                        // Client count changed — loop back to re-check
+
+                    info!(
+                        timeout_secs = idle_timeout.as_secs(),
+                        "no clients connected, waiting before shutdown"
+                    );
+
+                    // Race: timeout vs client count change
+                    tokio::select! {
+                        () = tokio::time::sleep(idle_timeout) => {
+                            if idle_client_count.load(Ordering::SeqCst) == 0 {
+                                info!("idle timeout reached, shutting down");
+                                let _ = idle_shutdown_tx.send(true);
+                                return;
+                            }
+                            // Client connected during the sleep — loop back
+                        }
+                        () = idle_notify.notified() => {
+                            // Client count changed — loop back to re-check
+                        }
                     }
                 }
-            }
-        });
+            });
+        } else {
+            info!("follower mode: idle timeout disabled");
+        }
 
         // Spawn peer manager background task
         let peer_manager = self.peer_manager;
