@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -5,13 +6,13 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixListener;
-use tokio::sync::{watch, Notify};
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
+use tracing::{debug, error, info, warn};
 
 use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_protocol::{Command, Message};
+use flotilla_protocol::{Command, HostName, Message, PeerDataMessage};
 
 /// The daemon server that listens on a Unix socket and dispatches requests
 /// to an `InProcessDaemon`.
@@ -23,6 +24,12 @@ pub struct DaemonServer {
     client_notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Channel for inbound peer data messages forwarded from connected peer clients.
+    peer_data_tx: mpsc::Sender<PeerDataMessage>,
+    peer_data_rx: Option<mpsc::Receiver<PeerDataMessage>>,
+    /// Map of connected peer clients, keyed by their host name.
+    /// Each entry holds a sender that can push messages back to that peer's socket.
+    peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>>,
 }
 
 impl DaemonServer {
@@ -39,6 +46,7 @@ impl DaemonServer {
     ) -> Self {
         let daemon = InProcessDaemon::new(repo_paths, config).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
 
         Self {
             daemon,
@@ -48,7 +56,26 @@ impl DaemonServer {
             client_notify: Arc::new(Notify::new()),
             shutdown_tx,
             shutdown_rx,
+            peer_data_tx,
+            peer_data_rx: Some(peer_data_rx),
+            peer_clients: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Take the receiver for inbound peer data messages.
+    ///
+    /// Returns `Some` on the first call, `None` thereafter. The PeerManager
+    /// consumes this to process data arriving from peer daemons.
+    pub fn take_peer_data_rx(&mut self) -> Option<mpsc::Receiver<PeerDataMessage>> {
+        self.peer_data_rx.take()
+    }
+
+    /// Get a handle to the peer clients map.
+    ///
+    /// The PeerManager uses this to send `Message::PeerData` back to specific
+    /// connected peer daemons.
+    pub fn peer_clients(&self) -> Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>> {
+        Arc::clone(&self.peer_clients)
     }
 
     /// Run the server, accepting connections until idle timeout or shutdown signal.
@@ -77,6 +104,8 @@ impl DaemonServer {
         let idle_timeout = self.idle_timeout;
         let socket_path = self.socket_path.clone();
         let client_notify = self.client_notify;
+        let peer_data_tx = self.peer_data_tx;
+        let peer_clients = self.peer_clients;
 
         // Spawn idle timeout watcher
         let idle_client_count = Arc::clone(&client_count);
@@ -132,9 +161,18 @@ impl DaemonServer {
                             let client_count = Arc::clone(&client_count);
                             let client_notify = Arc::clone(&client_notify);
                             let shutdown_rx = shutdown_rx.clone();
+                            let peer_data_tx = peer_data_tx.clone();
+                            let peer_clients = Arc::clone(&peer_clients);
 
                             tokio::spawn(async move {
-                                handle_client(stream, daemon, shutdown_rx).await;
+                                handle_client(
+                                    stream,
+                                    daemon,
+                                    shutdown_rx,
+                                    peer_data_tx,
+                                    peer_clients,
+                                )
+                                .await;
                                 let count = client_count.fetch_sub(1, Ordering::SeqCst) - 1;
                                 info!(%count, "client disconnected");
                                 client_notify.notify_one();
@@ -190,10 +228,15 @@ async fn handle_client(
     stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
     mut shutdown_rx: watch::Receiver<bool>,
+    peer_data_tx: mpsc::Sender<PeerDataMessage>,
+    peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>>,
 ) {
     let (read_half, write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
     let writer = Arc::new(tokio::sync::Mutex::new(BufWriter::new(write_half)));
+
+    // Channel for outbound messages to this specific client (used for peer relay).
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(64);
 
     // Spawn event forwarder task
     let event_writer = Arc::clone(&writer);
@@ -219,6 +262,19 @@ async fn handle_client(
         }
     });
 
+    // Spawn outbound relay task — writes messages from outbound_rx to the socket.
+    let relay_writer = Arc::clone(&writer);
+    let relay_task = tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            if write_message(&relay_writer, &msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Track whether this client has registered as a peer, and under what name.
+    let mut peer_host_name: Option<HostName> = None;
+
     // Read request lines and dispatch
     let mut lines = reader.lines();
     loop {
@@ -239,6 +295,23 @@ async fn handle_client(
                                 let response = dispatch_request(&daemon, id, &method, params).await;
                                 if write_message(&writer, &response).await.is_err() {
                                     break;
+                                }
+                            }
+                            Message::PeerData(peer_msg) => {
+                                let origin = peer_msg.origin_host.clone();
+
+                                // Register this client as a peer on first PeerData message.
+                                if peer_host_name.is_none() {
+                                    debug!(host = %origin, "registering peer client");
+                                    peer_host_name = Some(origin.clone());
+                                    peer_clients
+                                        .lock()
+                                        .await
+                                        .insert(origin, outbound_tx.clone());
+                                }
+
+                                if let Err(e) = peer_data_tx.send(*peer_msg).await {
+                                    warn!(err = %e, "failed to forward peer data");
                                 }
                             }
                             other => {
@@ -264,8 +337,15 @@ async fn handle_client(
         }
     }
 
-    // Abort the event forwarder task
+    // Unregister peer client on disconnect.
+    if let Some(host) = peer_host_name {
+        debug!(%host, "unregistering peer client");
+        peer_clients.lock().await.remove(&host);
+    }
+
+    // Abort the event forwarder and relay tasks
     event_task.abort();
+    relay_task.abort();
 }
 
 /// Dispatch a request to the appropriate `DaemonHandle` method.
@@ -382,7 +462,7 @@ fn extract_path_param(params: &serde_json::Value, field: &str) -> Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_protocol::{DaemonEvent, RepoInfo};
+    use flotilla_protocol::{DaemonEvent, PeerDataKind, RepoIdentity, RepoInfo};
 
     fn assert_ok_empty_response(msg: Message, expected_id: u64) {
         match msg {
@@ -557,5 +637,188 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn take_peer_data_rx_returns_some_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+        let mut server = DaemonServer::new(
+            vec![],
+            config,
+            tmp.path().join("test.sock"),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(
+            server.take_peer_data_rx().is_some(),
+            "first call should return Some"
+        );
+        assert!(
+            server.take_peer_data_rx().is_none(),
+            "second call should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_clients_accessor_returns_shared_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+        let server = DaemonServer::new(
+            vec![],
+            config,
+            tmp.path().join("test.sock"),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let map = server.peer_clients();
+        assert!(map.lock().await.is_empty());
+
+        // Inserting via one handle is visible via another
+        let map2 = server.peer_clients();
+        let (tx, _rx) = mpsc::channel(1);
+        map.lock().await.insert(HostName::new("laptop"), tx);
+        assert_eq!(map2.lock().await.len(), 1);
+    }
+
+    fn test_peer_msg(host: &str) -> PeerDataMessage {
+        PeerDataMessage {
+            origin_host: HostName::new(host),
+            repo_identity: RepoIdentity {
+                authority: "github.com".into(),
+                path: "owner/repo".into(),
+            },
+            repo_path: PathBuf::from("/tmp/repo"),
+            kind: PeerDataKind::RequestResync { since_seq: 0 },
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_client_forwards_peer_data_and_registers_peer() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let (peer_data_tx, mut peer_data_rx) = mpsc::channel(16);
+        let peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
+
+        // Spawn handle_client on the server side
+        let pc = Arc::clone(&peer_clients);
+        let handle = tokio::spawn(async move {
+            handle_client(server_stream, daemon, shutdown_rx, peer_data_tx, pc).await;
+        });
+
+        // Send a PeerData message from the client side
+        let peer_msg = test_peer_msg("remote-host");
+        let wire_msg = Message::PeerData(Box::new(peer_msg.clone()));
+        let json = serde_json::to_string(&wire_msg).expect("serialize");
+
+        let (read_half, write_half) = client_stream.into_split();
+        let mut writer = BufWriter::new(write_half);
+        writer.write_all(json.as_bytes()).await.expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        // The server should forward the peer data
+        let received = tokio::time::timeout(Duration::from_secs(2), peer_data_rx.recv())
+            .await
+            .expect("timeout waiting for peer data")
+            .expect("channel closed");
+        assert_eq!(received.origin_host, HostName::new("remote-host"));
+
+        // The peer should now be registered in peer_clients
+        // Give a brief moment for the lock to be released
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let map = peer_clients.lock().await;
+        assert!(
+            map.contains_key(&HostName::new("remote-host")),
+            "peer should be registered after sending PeerData"
+        );
+        drop(map);
+
+        // Drop the writer to close the connection, triggering cleanup
+        drop(writer);
+        drop(read_half);
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        // After disconnect, the peer should be unregistered
+        let map = peer_clients.lock().await;
+        assert!(
+            !map.contains_key(&HostName::new("remote-host")),
+            "peer should be unregistered after disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_relays_outbound_peer_messages() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+        let peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
+
+        // Spawn handle_client on the server side
+        let pc = Arc::clone(&peer_clients);
+        let handle = tokio::spawn(async move {
+            handle_client(server_stream, daemon, shutdown_rx, peer_data_tx, pc).await;
+        });
+
+        let (read_half, write_half) = client_stream.into_split();
+        let mut writer = BufWriter::new(write_half);
+
+        // Send a PeerData message to register as a peer
+        let peer_msg = test_peer_msg("relay-target");
+        let wire_msg = Message::PeerData(Box::new(peer_msg));
+        let json = serde_json::to_string(&wire_msg).expect("serialize");
+        writer.write_all(json.as_bytes()).await.expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        // Wait for registration
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now push a message via peer_clients to relay back to this client
+        let relay_msg = Message::PeerData(Box::new(test_peer_msg("other-host")));
+        {
+            let map = peer_clients.lock().await;
+            let sender = map
+                .get(&HostName::new("relay-target"))
+                .expect("peer should be registered");
+            sender.send(relay_msg).await.expect("send relay");
+        }
+
+        // Read from the client side — should receive the relayed message
+        let reader = BufReader::new(read_half);
+        let mut lines = reader.lines();
+
+        // We may receive event messages (snapshots) before our peer data relay,
+        // so loop until we find the PeerData message.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut found_relay = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    let msg: Message = serde_json::from_str(&line).expect("parse");
+                    if let Message::PeerData(peer_msg) = msg {
+                        assert_eq!(peer_msg.origin_host, HostName::new("other-host"));
+                        found_relay = true;
+                        break;
+                    }
+                    // Skip non-PeerData messages (events, etc.)
+                }
+                _ => break,
+            }
+        }
+        assert!(found_relay, "should have received relayed PeerData message");
+
+        // Clean up
+        drop(writer);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 }
