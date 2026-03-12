@@ -6,4 +6,4 @@ pub mod transport;
 pub use manager::{synthetic_repo_path, HandleResult, PeerManager};
 pub use merge::merge_provider_data;
 pub use ssh_transport::SshTransport;
-pub use transport::{PeerConnectionStatus, PeerTransport};
+pub use transport::{PeerConnectionStatus, PeerSender, PeerTransport};

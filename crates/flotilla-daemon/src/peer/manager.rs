@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use flotilla_protocol::{
-    HostName, PeerDataKind, PeerDataMessage, ProviderData, RepoIdentity, VectorClock,
+    HostName, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity,
+    VectorClock,
 };
 
-use super::transport::PeerTransport;
+use super::transport::{PeerSender, PeerTransport};
 
 /// Generate a synthetic path for a remote-only repo.
 ///
@@ -55,6 +57,7 @@ pub struct PerRepoPeerState {
 pub struct PeerManager {
     local_host: HostName,
     peers: HashMap<HostName, Box<dyn PeerTransport>>,
+    senders: HashMap<HostName, Arc<dyn PeerSender>>,
     peer_data: HashMap<HostName, HashMap<RepoIdentity, PerRepoPeerState>>,
     /// RepoIdentity values that exist only on remote peers — no local repo
     /// matches. Each maps to the synthetic path used for tab identity.
@@ -70,6 +73,7 @@ impl PeerManager {
         Self {
             local_host,
             peers: HashMap::new(),
+            senders: HashMap::new(),
             peer_data: HashMap::new(),
             known_remote_repos: HashMap::new(),
             last_seen_clocks: HashMap::new(),
@@ -80,6 +84,11 @@ impl PeerManager {
     pub fn add_peer(&mut self, name: HostName, transport: Box<dyn PeerTransport>) {
         info!(peer = %name, "registered peer transport");
         self.peers.insert(name, transport);
+    }
+
+    /// Register or replace a sender for a connected peer.
+    pub fn register_sender(&mut self, name: HostName, sender: Arc<dyn PeerSender>) {
+        self.senders.insert(name, sender);
     }
 
     /// Process an inbound PeerDataMessage.
@@ -181,7 +190,7 @@ impl PeerManager {
         let mut relayed_msg = msg.clone();
         relayed_msg.clock.tick(&self.local_host);
 
-        for (name, transport) in &self.peers {
+        for (name, sender) in &self.senders {
             if name == origin || name == &self.local_host {
                 continue;
             }
@@ -196,7 +205,7 @@ impl PeerManager {
                 continue;
             }
 
-            match transport.send(relayed_msg.clone()).await {
+            match sender.send(PeerWireMessage::Data(relayed_msg.clone())).await {
                 Ok(()) => {
                     debug!(
                         from = %origin,
@@ -236,22 +245,34 @@ impl PeerManager {
         let names: Vec<HostName> = self.peers.keys().cloned().collect();
         let mut receivers = Vec::new();
         for name in names {
-            if let Some(transport) = self.peers.get_mut(&name) {
+            let connect_result = if let Some(transport) = self.peers.get_mut(&name) {
                 match transport.connect().await {
                     Ok(()) => {
-                        info!(peer = %name, "peer transport connected");
-                        match transport.subscribe().await {
-                            Ok(rx) => {
-                                receivers.push((name.clone(), rx));
-                            }
-                            Err(e) => {
-                                warn!(peer = %name, err = %e, "failed to subscribe to peer");
-                            }
+                        let sender = transport.sender();
+                        let subscribe_result = transport.subscribe().await;
+                        Ok((sender, subscribe_result))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                continue;
+            };
+
+            match connect_result {
+                Ok((sender, subscribe_result)) => {
+                    info!(peer = %name, "peer transport connected");
+                    if let Some(sender) = sender {
+                        self.register_sender(name.clone(), sender);
+                    }
+                    match subscribe_result {
+                        Ok(rx) => receivers.push((name.clone(), rx)),
+                        Err(e) => {
+                            warn!(peer = %name, err = %e, "failed to subscribe to peer");
                         }
                     }
-                    Err(e) => {
-                        warn!(peer = %name, err = %e, "failed to connect peer transport");
-                    }
+                }
+                Err(e) => {
+                    warn!(peer = %name, err = %e, "failed to connect peer transport");
                 }
             }
         }
@@ -265,6 +286,7 @@ impl PeerManager {
             if let Some(transport) = self.peers.get_mut(&name) {
                 match transport.disconnect().await {
                     Ok(()) => {
+                        self.senders.remove(&name);
                         info!(peer = %name, "peer transport disconnected");
                     }
                     Err(e) => {
@@ -335,11 +357,11 @@ impl PeerManager {
 
     /// Send a message to a specific peer by name.
     pub async fn send_to(&self, name: &HostName, msg: PeerDataMessage) -> Result<(), String> {
-        let transport = self
-            .peers
+        let sender = self
+            .senders
             .get(name)
             .ok_or_else(|| format!("unknown peer: {name}"))?;
-        transport.send(msg).await
+        sender.send(PeerWireMessage::Data(msg)).await
     }
 
     /// Reconnect a specific peer: disconnect, then connect + subscribe.
@@ -349,16 +371,26 @@ impl PeerManager {
         &mut self,
         name: &HostName,
     ) -> Result<mpsc::Receiver<PeerDataMessage>, String> {
-        let transport = self
-            .peers
-            .get_mut(name)
-            .ok_or_else(|| format!("unknown peer: {name}"))?;
+        let (sender, rx) = {
+            let transport = self
+                .peers
+                .get_mut(name)
+                .ok_or_else(|| format!("unknown peer: {name}"))?;
 
-        // Best-effort disconnect before reconnecting
-        let _ = transport.disconnect().await;
+            // Best-effort disconnect before reconnecting
+            let _ = transport.disconnect().await;
 
-        transport.connect().await?;
-        transport.subscribe().await
+            transport.connect().await?;
+            let sender = transport.sender();
+            let rx = transport.subscribe().await?;
+            (sender, rx)
+        };
+
+        if let Some(sender) = sender {
+            self.register_sender(name.clone(), sender);
+        }
+
+        Ok(rx)
     }
 }
 
@@ -373,18 +405,40 @@ mod tests {
 
     use super::super::transport::PeerConnectionStatus;
 
-    /// Mock transport that records sent messages and tracks connection status.
+    struct MockPeerSender {
+        sent: Arc<Mutex<Vec<PeerWireMessage>>>,
+    }
+
+    #[async_trait]
+    impl PeerSender for MockPeerSender {
+        async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
+            self.sent.lock().expect("lock poisoned").push(msg);
+            Ok(())
+        }
+    }
+
+    /// Mock transport that tracks connection status and optionally exposes a sender.
     struct MockTransport {
-        sent: Arc<Mutex<Vec<PeerDataMessage>>>,
         status: PeerConnectionStatus,
+        sender: Option<Arc<dyn PeerSender>>,
     }
 
     impl MockTransport {
-        fn new() -> (Self, Arc<Mutex<Vec<PeerDataMessage>>>) {
-            let sent = Arc::new(Mutex::new(Vec::new()));
-            let transport = Self {
-                sent: Arc::clone(&sent),
+        fn new() -> Self {
+            Self {
                 status: PeerConnectionStatus::Connected,
+                sender: None,
+            }
+        }
+
+        fn with_sender() -> (Self, Arc<Mutex<Vec<PeerWireMessage>>>) {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+                sent: Arc::clone(&sent),
+            });
+            let transport = Self {
+                status: PeerConnectionStatus::Connected,
+                sender: Some(sender),
             };
             (transport, sent)
         }
@@ -411,9 +465,8 @@ mod tests {
             Ok(rx)
         }
 
-        async fn send(&self, msg: PeerDataMessage) -> Result<(), String> {
-            self.sent.lock().expect("lock poisoned").push(msg);
-            Ok(())
+        fn sender(&self) -> Option<Arc<dyn PeerSender>> {
+            self.sender.clone()
         }
     }
 
@@ -546,13 +599,19 @@ mod tests {
     async fn relay_sends_to_all_except_origin() {
         let mut mgr = PeerManager::new(HostName::new("local"));
 
-        let (transport_a, sent_a) = MockTransport::new();
-        let (transport_b, sent_b) = MockTransport::new();
-        let (transport_c, sent_c) = MockTransport::new();
+        let (transport_a, sent_a) = MockTransport::with_sender();
+        let (transport_b, sent_b) = MockTransport::with_sender();
+        let (transport_c, sent_c) = MockTransport::with_sender();
+        let sender_a = transport_a.sender().expect("sender");
+        let sender_b = transport_b.sender().expect("sender");
+        let sender_c = transport_c.sender().expect("sender");
 
         mgr.add_peer(HostName::new("peer-a"), Box::new(transport_a));
         mgr.add_peer(HostName::new("peer-b"), Box::new(transport_b));
         mgr.add_peer(HostName::new("peer-c"), Box::new(transport_c));
+        mgr.register_sender(HostName::new("peer-a"), sender_a);
+        mgr.register_sender(HostName::new("peer-b"), sender_b);
+        mgr.register_sender(HostName::new("peer-c"), sender_c);
 
         let msg = snapshot_msg("peer-a", 1);
         mgr.relay(&HostName::new("peer-a"), &msg).await;
@@ -568,8 +627,10 @@ mod tests {
     async fn relay_does_not_send_to_self() {
         let mut mgr = PeerManager::new(HostName::new("local"));
 
-        let (transport, sent) = MockTransport::new();
+        let (transport, sent) = MockTransport::with_sender();
+        let sender = transport.sender().expect("sender");
         mgr.add_peer(HostName::new("local"), Box::new(transport));
+        mgr.register_sender(HostName::new("local"), sender);
 
         let msg = snapshot_msg("remote", 1);
         mgr.relay(&HostName::new("remote"), &msg).await;
@@ -586,8 +647,10 @@ mod tests {
         // because leader is already in the clock.
         let mut mgr = PeerManager::new(HostName::new("F2"));
 
-        let (transport_leader, sent_leader) = MockTransport::new();
+        let (transport_leader, sent_leader) = MockTransport::with_sender();
+        let sender_leader = transport_leader.sender().expect("sender");
         mgr.add_peer(HostName::new("leader"), Box::new(transport_leader));
+        mgr.register_sender(HostName::new("leader"), sender_leader);
 
         // Simulate a message that was relayed through leader:
         // origin=F1, clock={F1:1, leader:1}
@@ -635,7 +698,7 @@ mod tests {
     async fn connect_all_connects_peers() {
         let mut mgr = PeerManager::new(HostName::new("local"));
 
-        let (transport, _sent) = MockTransport::new();
+        let transport = MockTransport::new();
         // Start disconnected
         let mut transport = transport;
         transport.status = PeerConnectionStatus::Disconnected;
@@ -652,7 +715,7 @@ mod tests {
     async fn disconnect_all_disconnects_peers() {
         let mut mgr = PeerManager::new(HostName::new("local"));
 
-        let (transport, _sent) = MockTransport::new();
+        let transport = MockTransport::new();
         mgr.add_peer(HostName::new("peer"), Box::new(transport));
         mgr.disconnect_all().await;
 
@@ -690,5 +753,21 @@ mod tests {
         assert!(mgr.is_remote_repo(&repo));
         assert_eq!(mgr.known_remote_repos().len(), 1);
         assert_eq!(mgr.known_remote_repos()[&repo], synthetic);
+    }
+
+    #[tokio::test]
+    async fn send_to_reaches_registered_sender() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::clone(&sent),
+        });
+        mgr.register_sender(HostName::new("peer"), sender);
+
+        mgr.send_to(&HostName::new("peer"), snapshot_msg("local", 1))
+            .await
+            .expect("send succeeds");
+
+        assert_eq!(sent.lock().expect("lock").len(), 1);
     }
 }

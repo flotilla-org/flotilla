@@ -700,11 +700,17 @@ async fn send_local_to_peers(
     };
 
     // Send to outbound peers (SSH transports we connected to)
-    let pm = peer_manager.lock().await;
-    for transport in pm.peers().values() {
-        let _ = transport.send(msg.clone()).await;
+    let peer_names = {
+        let pm = peer_manager.lock().await;
+        pm.peers().keys().cloned().collect::<Vec<_>>()
+    };
+    for peer_name in peer_names {
+        let pm = peer_manager.lock().await;
+        if let Err(e) = pm.send_to(&peer_name, msg.clone()).await {
+            debug!(peer = %peer_name, err = %e, "failed to send snapshot to peer");
+        }
+        drop(pm);
     }
-    drop(pm);
 
     // Send to inbound peer clients (peers that connected to our socket)
     let clients = peer_clients.lock().await;

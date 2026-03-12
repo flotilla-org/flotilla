@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,9 +9,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use flotilla_core::config::{flotilla_config_dir, RemoteHostConfig};
-use flotilla_protocol::{HostName, Message, PeerDataMessage};
+use flotilla_protocol::{HostName, Message, PeerDataMessage, PeerWireMessage};
 
-use super::transport::{PeerConnectionStatus, PeerTransport};
+use super::transport::{PeerConnectionStatus, PeerSender, PeerTransport};
 
 /// Maximum backoff delay between reconnection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -26,6 +27,26 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Channel buffer size for inbound and outbound peer data messages.
 const CHANNEL_BUFFER: usize = 256;
+
+struct ChannelPeerSender {
+    tx: mpsc::Sender<PeerDataMessage>,
+}
+
+#[async_trait]
+impl PeerSender for ChannelPeerSender {
+    async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
+        match msg {
+            PeerWireMessage::Data(msg) => self
+                .tx
+                .send(msg)
+                .await
+                .map_err(|_| "outbound channel closed".to_string()),
+            PeerWireMessage::Routed(_) => {
+                Err("routed peer messages are not supported by ssh transport yet".into())
+            }
+        }
+    }
+}
 
 /// SSH-based transport that forwards a remote daemon's Unix socket locally
 /// and exchanges `PeerData` messages over it.
@@ -375,15 +396,10 @@ impl PeerTransport for SshTransport {
             .ok_or_else(|| "already subscribed (receiver already taken)".to_string())
     }
 
-    async fn send(&self, msg: PeerDataMessage) -> Result<(), String> {
-        let tx = self
-            .outbound_tx
-            .as_ref()
-            .ok_or_else(|| "not connected".to_string())?;
-
-        tx.send(msg)
-            .await
-            .map_err(|_| "outbound channel closed".to_string())
+    fn sender(&self) -> Option<Arc<dyn PeerSender>> {
+        self.outbound_tx.as_ref().map(|tx| {
+            Arc::new(ChannelPeerSender { tx: tx.clone() }) as Arc<dyn PeerSender>
+        })
     }
 }
 
@@ -470,21 +486,7 @@ mod tests {
         };
         let transport =
             SshTransport::new(HostName::new("remote"), config).expect("valid host name");
-
-        let msg = PeerDataMessage {
-            origin_host: HostName::new("local"),
-            repo_identity: flotilla_protocol::RepoIdentity {
-                authority: "github.com".into(),
-                path: "owner/repo".into(),
-            },
-            repo_path: PathBuf::from("/tmp/repo"),
-            clock: flotilla_protocol::VectorClock::default(),
-            kind: flotilla_protocol::PeerDataKind::RequestResync { since_seq: 0 },
-        };
-
-        let result = transport.send(msg).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not connected"));
+        assert!(transport.sender().is_none(), "disconnected transport should not expose a sender");
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use flotilla_protocol::PeerDataMessage;
+use std::sync::Arc;
+
+use flotilla_protocol::{PeerDataMessage, PeerWireMessage};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +13,11 @@ pub enum PeerConnectionStatus {
 }
 
 #[async_trait]
+pub trait PeerSender: Send + Sync {
+    async fn send(&self, msg: PeerWireMessage) -> Result<(), String>;
+}
+
+#[async_trait]
 pub trait PeerTransport: Send + Sync {
     async fn connect(&mut self) -> Result<(), String>;
     async fn disconnect(&mut self) -> Result<(), String>;
@@ -19,8 +26,6 @@ pub trait PeerTransport: Send + Sync {
     /// Subscribe to inbound peer data messages.
     async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerDataMessage>, String>;
 
-    /// Send a peer data message to the remote daemon.
-    /// Uses `&self` (not `&mut self`) — implementations use interior mutability
-    /// (e.g. `Mutex<mpsc::Sender>`) so the PeerManager can iterate peers and send.
-    async fn send(&self, msg: PeerDataMessage) -> Result<(), String>;
+    /// Return a sender for outbound peer messages when the transport is connected.
+    fn sender(&self) -> Option<Arc<dyn PeerSender>>;
 }

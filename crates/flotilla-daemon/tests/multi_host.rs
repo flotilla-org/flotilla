@@ -18,10 +18,12 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::peer::merge::merge_provider_data;
-use flotilla_daemon::peer::{HandleResult, PeerConnectionStatus, PeerManager, PeerTransport};
+use flotilla_daemon::peer::{
+    HandleResult, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
+};
 use flotilla_protocol::{
-    Checkout, HostName, HostPath, PeerDataKind, PeerDataMessage, ProviderData, RepoIdentity,
-    VectorClock,
+    Checkout, HostName, HostPath, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData,
+    RepoIdentity, VectorClock,
 };
 
 // ---------------------------------------------------------------------------
@@ -29,18 +31,33 @@ use flotilla_protocol::{
 // ---------------------------------------------------------------------------
 
 struct MockTransport {
-    sent: Arc<Mutex<Vec<PeerDataMessage>>>,
     status: PeerConnectionStatus,
+    sender: Option<Arc<dyn PeerSender>>,
 }
 
 impl MockTransport {
-    fn new() -> (Self, Arc<Mutex<Vec<PeerDataMessage>>>) {
+    fn with_sender() -> (Self, Arc<Mutex<Vec<PeerWireMessage>>>) {
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let transport = Self {
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
             sent: Arc::clone(&sent),
+        });
+        let transport = Self {
             status: PeerConnectionStatus::Connected,
+            sender: Some(sender),
         };
         (transport, sent)
+    }
+}
+
+struct MockPeerSender {
+    sent: Arc<Mutex<Vec<PeerWireMessage>>>,
+}
+
+#[async_trait]
+impl PeerSender for MockPeerSender {
+    async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
+        self.sent.lock().expect("lock poisoned").push(msg);
+        Ok(())
     }
 }
 
@@ -65,9 +82,8 @@ impl PeerTransport for MockTransport {
         Ok(rx)
     }
 
-    async fn send(&self, msg: PeerDataMessage) -> Result<(), String> {
-        self.sent.lock().expect("lock poisoned").push(msg);
-        Ok(())
+    fn sender(&self) -> Option<Arc<dyn PeerSender>> {
+        self.sender.clone()
     }
 }
 
@@ -316,13 +332,19 @@ async fn daemon_snapshot_has_correct_host_attribution() {
 async fn relay_excludes_origin_and_sends_to_other_peers() {
     let mut mgr = PeerManager::new(HostName::new("leader"));
 
-    let (transport_a, sent_a) = MockTransport::new();
-    let (transport_b, sent_b) = MockTransport::new();
-    let (transport_c, sent_c) = MockTransport::new();
+    let (transport_a, sent_a) = MockTransport::with_sender();
+    let (transport_b, sent_b) = MockTransport::with_sender();
+    let (transport_c, sent_c) = MockTransport::with_sender();
+    let sender_a = transport_a.sender().expect("sender");
+    let sender_b = transport_b.sender().expect("sender");
+    let sender_c = transport_c.sender().expect("sender");
 
     mgr.add_peer(HostName::new("follower-a"), Box::new(transport_a));
     mgr.add_peer(HostName::new("follower-b"), Box::new(transport_b));
     mgr.add_peer(HostName::new("follower-c"), Box::new(transport_c));
+    mgr.register_sender(HostName::new("follower-a"), sender_a);
+    mgr.register_sender(HostName::new("follower-b"), sender_b);
+    mgr.register_sender(HostName::new("follower-c"), sender_c);
 
     // Data arrives from follower-a
     let mut data = ProviderData::default();
@@ -360,11 +382,15 @@ async fn relay_excludes_self_even_if_registered_as_peer() {
     let mut mgr = PeerManager::new(HostName::new("leader"));
 
     // Register self as a peer (shouldn't happen in practice, but test the guard)
-    let (self_transport, sent_self) = MockTransport::new();
-    let (other_transport, sent_other) = MockTransport::new();
+    let (self_transport, sent_self) = MockTransport::with_sender();
+    let (other_transport, sent_other) = MockTransport::with_sender();
+    let self_sender = self_transport.sender().expect("sender");
+    let other_sender = other_transport.sender().expect("sender");
 
     mgr.add_peer(HostName::new("leader"), Box::new(self_transport));
     mgr.add_peer(HostName::new("follower"), Box::new(other_transport));
+    mgr.register_sender(HostName::new("leader"), self_sender);
+    mgr.register_sender(HostName::new("follower"), other_sender);
 
     let msg = snapshot_msg("remote", 1, ProviderData::default());
     mgr.relay(&HostName::new("remote"), &msg).await;
