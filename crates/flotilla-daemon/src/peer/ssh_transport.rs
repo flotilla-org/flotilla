@@ -421,6 +421,7 @@ mod tests {
     fn local_socket_path_uses_host_name() {
         let config = RemoteHostConfig {
             hostname: "10.0.0.5".to_string(),
+            expected_host_name: "my-server".to_string(),
             user: Some("dev".to_string()),
             daemon_socket: "/run/user/1000/flotilla.sock".to_string(),
         };
@@ -436,6 +437,7 @@ mod tests {
     fn rejects_host_name_with_path_separator() {
         let config = RemoteHostConfig {
             hostname: "10.0.0.5".to_string(),
+            expected_host_name: "remote".to_string(),
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
@@ -449,6 +451,7 @@ mod tests {
     fn initial_status_is_disconnected() {
         let config = RemoteHostConfig {
             hostname: "example.com".to_string(),
+            expected_host_name: "remote".to_string(),
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
@@ -461,6 +464,7 @@ mod tests {
     async fn send_fails_when_not_connected() {
         let config = RemoteHostConfig {
             hostname: "example.com".to_string(),
+            expected_host_name: "remote".to_string(),
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
@@ -487,6 +491,7 @@ mod tests {
     async fn subscribe_fails_when_not_connected() {
         let config = RemoteHostConfig {
             hostname: "example.com".to_string(),
+            expected_host_name: "remote".to_string(),
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
@@ -505,6 +510,7 @@ mod tests {
     async fn ssh_transport_connects() {
         let config = RemoteHostConfig {
             hostname: "localhost".to_string(),
+            expected_host_name: "localhost-test".to_string(),
             user: None,
             daemon_socket: "/tmp/flotilla-test-daemon.sock".to_string(),
         };

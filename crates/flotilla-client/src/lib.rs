@@ -114,6 +114,12 @@ impl SocketDaemon {
                             Message::PeerData(_) => {
                                 warn!("received unexpected peer_data from daemon");
                             }
+                            Message::Hello { .. } => {
+                                warn!("received unexpected hello from daemon");
+                            }
+                            Message::Peer(_) => {
+                                warn!("received unexpected peer envelope from daemon");
+                            }
                         }
                     }
                     Ok(None) => {

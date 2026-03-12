@@ -63,6 +63,39 @@ pub struct PeerDataMessage {
     pub kind: PeerDataKind,
 }
 
+/// Unified peer-to-peer wire payload used inside `Message::Peer`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "peer_type")]
+pub enum PeerWireMessage {
+    Data(PeerDataMessage),
+    Routed(RoutedPeerMessage),
+}
+
+/// Targeted peer control messages that are routed hop-by-hop rather than flooded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "routed_type")]
+pub enum RoutedPeerMessage {
+    RequestResync {
+        request_id: u64,
+        requester_host: HostName,
+        target_host: HostName,
+        remaining_hops: u8,
+        repo_identity: RepoIdentity,
+        since_seq: u64,
+    },
+    ResyncSnapshot {
+        request_id: u64,
+        requester_host: HostName,
+        responder_host: HostName,
+        remaining_hops: u8,
+        repo_identity: RepoIdentity,
+        repo_path: PathBuf,
+        clock: VectorClock,
+        seq: u64,
+        data: Box<ProviderData>,
+    },
+}
+
 /// The payload kind within a peer data exchange.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]

@@ -113,6 +113,7 @@ pub struct HostsConfig {
 #[derive(Debug, Deserialize)]
 pub struct RemoteHostConfig {
     pub hostname: String,
+    pub expected_host_name: String,
     pub user: Option<String>,
     pub daemon_socket: String,
 }
@@ -755,17 +756,21 @@ mod tests {
         let toml = r#"
 [hosts.desktop]
 hostname = "desktop.local"
+expected_host_name = "desktop"
 user = "robert"
 daemon_socket = "/run/user/1000/flotilla/daemon.sock"
 
 [hosts.cloud]
 hostname = "10.0.1.50"
+expected_host_name = "cloud"
 daemon_socket = "/home/robert/.config/flotilla/daemon.sock"
 "#;
         let config: HostsConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.hosts.len(), 2);
         assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
+        assert_eq!(config.hosts["desktop"].expected_host_name, "desktop");
         assert_eq!(config.hosts["desktop"].user, Some("robert".into()));
+        assert_eq!(config.hosts["cloud"].expected_host_name, "cloud");
         assert_eq!(config.hosts["cloud"].user, None);
     }
 
@@ -801,13 +806,14 @@ host_name = "my-desktop"
         let base = dir.path();
         std::fs::write(
             base.join("hosts.toml"),
-            "[hosts.desktop]\nhostname = \"desktop.local\"\ndaemon_socket = \"/tmp/d.sock\"\n",
+            "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/d.sock\"\n",
         )
         .unwrap();
         let store = ConfigStore::with_base(base);
         let config = store.load_hosts();
         assert_eq!(config.hosts.len(), 1);
         assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
+        assert_eq!(config.hosts["desktop"].expected_host_name, "desktop");
     }
 
     #[test]
