@@ -534,10 +534,6 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
     (work_items, groups)
 }
 
-/// Phase 4: Sort work items into sections and build table entries.
-///
-/// Accepts protocol `WorkItem` (flat, serializable) so this function can be
-/// used both in-process (core side) and in the TUI after receiving a Snapshot.
 /// Sort tier for a checkout path relative to the repo root.
 /// Tier 0 = child of repo root or sibling (same parent, name starts with repo name).
 /// Tier 1 = everything else (external worktrees).
@@ -561,6 +557,10 @@ fn checkout_sort_tier(path: &Path, repo_root: &Path) -> u8 {
     1
 }
 
+/// Sort work items into sections and build table entries.
+///
+/// Accepts protocol `WorkItem` (flat, serializable) so this function can be
+/// used both in-process (core side) and in the TUI after receiving a Snapshot.
 pub fn group_work_items(
     work_items: &[flotilla_protocol::WorkItem],
     providers: &ProviderData,
@@ -587,22 +587,12 @@ pub fn group_work_items(
     let mut selectable: Vec<usize> = Vec::new();
 
     // Checkouts -- main first, then local (children/siblings) before external, then by path
-    checkout_items.sort_by(|a, b| match (a.is_main_checkout, b.is_main_checkout) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => {
-            let tier_a = a
-                .checkout_key()
-                .map(|p| checkout_sort_tier(p, repo_root))
-                .unwrap_or(1);
-            let tier_b = b
-                .checkout_key()
-                .map(|p| checkout_sort_tier(p, repo_root))
-                .unwrap_or(1);
-            tier_a
-                .cmp(&tier_b)
-                .then_with(|| a.checkout_key().cmp(&b.checkout_key()))
-        }
+    checkout_items.sort_by_cached_key(|item| {
+        let main_tier = u8::from(!item.is_main_checkout);
+        let key = item.checkout_key();
+        let proximity_tier = key.map(|p| checkout_sort_tier(p, repo_root)).unwrap_or(1);
+        let path_key = key.map(|p| p.to_path_buf());
+        (main_tier, proximity_tier, path_key)
     });
     if !checkout_items.is_empty() {
         entries.push(GroupEntry::Header(SectionHeader(labels.checkouts.clone())));
