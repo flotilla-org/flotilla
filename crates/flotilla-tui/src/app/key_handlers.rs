@@ -316,6 +316,16 @@ impl App {
                 Intent::GenerateBranchName => {
                     self.enter_branch_input(BranchInputKind::Generating);
                 }
+                Intent::CloseChangeRequest => {
+                    self.ui.mode = UiMode::CloseConfirm {
+                        id: match &cmd {
+                            Command::CloseChangeRequest { id } => id.clone(),
+                            _ => return,
+                        },
+                        title: item.description.clone(),
+                    };
+                    return; // Don't push command — confirm handler will
+                }
                 _ => {}
             }
             self.proto_commands.push(cmd);
