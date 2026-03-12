@@ -14,6 +14,8 @@ use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{Command, HostName, Message, PeerDataMessage};
 
+use crate::peer::{HandleResult, PeerManager, SshTransport};
+
 /// The daemon server that listens on a Unix socket and dispatches requests
 /// to an `InProcessDaemon`.
 pub struct DaemonServer {
@@ -30,6 +32,8 @@ pub struct DaemonServer {
     /// Map of connected peer clients, keyed by their host name.
     /// Each entry holds a sender that can push messages back to that peer's socket.
     peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>>,
+    /// Manages connections to remote peer hosts and stores their provider data.
+    peer_manager: Arc<Mutex<PeerManager>>,
 }
 
 impl DaemonServer {
@@ -44,6 +48,26 @@ impl DaemonServer {
         socket_path: PathBuf,
         idle_timeout: Duration,
     ) -> Self {
+        let daemon_config = config.load_daemon_config();
+        let host_name = daemon_config
+            .host_name
+            .map(HostName::new)
+            .unwrap_or_else(HostName::local);
+        let hosts_config = config.load_hosts();
+
+        let peer_count = hosts_config.hosts.len();
+        let mut peer_manager = PeerManager::new(host_name.clone());
+        for (name, host_config) in hosts_config.hosts {
+            let transport = SshTransport::new(HostName::new(&name), host_config);
+            peer_manager.add_peer(HostName::new(&name), Box::new(transport));
+        }
+
+        info!(
+            host = %host_name,
+            %peer_count,
+            "initialized PeerManager"
+        );
+
         let daemon = InProcessDaemon::new(repo_paths, config).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
@@ -59,6 +83,7 @@ impl DaemonServer {
             peer_data_tx,
             peer_data_rx: Some(peer_data_rx),
             peer_clients: Arc::new(Mutex::new(HashMap::new())),
+            peer_manager: Arc::new(Mutex::new(peer_manager)),
         }
     }
 
@@ -79,7 +104,7 @@ impl DaemonServer {
     }
 
     /// Run the server, accepting connections until idle timeout or shutdown signal.
-    pub async fn run(self) -> Result<(), String> {
+    pub async fn run(mut self) -> Result<(), String> {
         // Clean up stale socket file before binding
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)
@@ -96,6 +121,9 @@ impl DaemonServer {
             .map_err(|e| format!("failed to bind socket: {e}"))?;
 
         info!(path = %self.socket_path.display(), "daemon listening");
+
+        // Take peer_data_rx before destructuring self
+        let peer_data_rx = self.take_peer_data_rx();
 
         let daemon = self.daemon;
         let client_count = self.client_count;
@@ -142,6 +170,52 @@ impl DaemonServer {
                 }
             }
         });
+
+        // Spawn peer manager background task
+        let peer_manager = self.peer_manager;
+        tokio::spawn(async move {
+            if let Some(mut rx) = peer_data_rx {
+                // Connect all peers
+                {
+                    let mut pm = peer_manager.lock().await;
+                    pm.connect_all().await;
+                }
+
+                // Process inbound peer data
+                while let Some(msg) = rx.recv().await {
+                    let mut pm = peer_manager.lock().await;
+
+                    // Relay to other peers before consuming the message
+                    pm.relay(&msg.origin_host, &msg).await;
+
+                    // Then handle locally
+                    let result = pm.handle_peer_data(msg);
+                    match result {
+                        HandleResult::Updated(repo_id) => {
+                            info!(repo = %repo_id, "peer data updated, re-merge needed");
+                            // TODO: trigger re-merge on daemon
+                        }
+                        HandleResult::ResyncRequested {
+                            from,
+                            repo,
+                            since_seq,
+                        } => {
+                            info!(%from, repo = %repo, %since_seq, "peer requested resync");
+                            // TODO: send snapshot back to requesting peer
+                        }
+                        HandleResult::NeedsResync { from, repo } => {
+                            info!(%from, repo = %repo, "need to request resync from peer");
+                            // TODO: send RequestResync message to origin peer
+                        }
+                        HandleResult::Ignored => {}
+                    }
+                }
+            }
+        });
+
+        // TODO: Subscribe to daemon broadcast events and forward local snapshots
+        // to peers as PeerDataMessages. Requires converting SnapshotFull events
+        // to PeerDataMessage with the correct RepoIdentity for each repo.
 
         // SIGTERM handler
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -751,6 +825,54 @@ mod tests {
             !map.contains_key(&HostName::new("remote-host")),
             "peer should be unregistered after disconnect"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_manager_initialized_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("config");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Write daemon config with a custom host name
+        std::fs::write(base.join("daemon.toml"), "host_name = \"test-host\"\n").unwrap();
+
+        // Write hosts config with one peer
+        std::fs::write(
+            base.join("hosts.toml"),
+            "[hosts.remote]\nhostname = \"10.0.0.5\"\ndaemon_socket = \"/tmp/daemon.sock\"\n",
+        )
+        .unwrap();
+
+        let config = Arc::new(ConfigStore::with_base(&base));
+        let server = DaemonServer::new(
+            vec![],
+            config,
+            tmp.path().join("test.sock"),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        // PeerManager should be initialized and accessible
+        let pm = server.peer_manager.lock().await;
+        // peer_data is empty since no data has been received yet
+        assert!(pm.get_peer_data().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_manager_default_when_no_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+        let server = DaemonServer::new(
+            vec![],
+            config,
+            tmp.path().join("test.sock"),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        // Should still have a PeerManager with no peers
+        let pm = server.peer_manager.lock().await;
+        assert!(pm.get_peer_data().is_empty());
     }
 
     #[tokio::test]
