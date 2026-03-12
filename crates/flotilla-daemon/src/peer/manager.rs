@@ -170,11 +170,9 @@ impl PeerManager {
         }
     }
 
-    /// Forward a message to all connected peers except the origin.
-    ///
-    /// Before forwarding, the local host's entry in the vector clock is
-    /// incremented so downstream receivers can detect duplicates if the
-    /// message arrives via multiple paths.
+    /// Forward a message to all connected peers except the origin, self,
+    /// and any host already present in the message's vector clock (which
+    /// indicates that host has already seen or relayed the message).
     pub async fn relay(&self, origin: &HostName, msg: &PeerDataMessage) {
         // Stamp our own host into the clock before relaying
         let mut relayed_msg = msg.clone();
@@ -182,6 +180,16 @@ impl PeerManager {
 
         for (name, transport) in &self.peers {
             if name == origin || name == &self.local_host {
+                continue;
+            }
+            // Skip peers that already appear in the clock — they've
+            // already seen or relayed this message.
+            if msg.clock.get(name) > 0 {
+                debug!(
+                    to = %name,
+                    repo = %msg.repo_identity,
+                    "skipping relay to peer already in clock"
+                );
                 continue;
             }
 
@@ -532,6 +540,42 @@ mod tests {
 
         // Should not send to self even if registered as a peer
         assert!(sent.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn relay_skips_peers_already_in_clock() {
+        // Star topology: leader has peers [F1, F2].
+        // F1 sends a message that leader relays to F2 (stamping leader into clock).
+        // If F2 then tried to relay, it should NOT send back to leader
+        // because leader is already in the clock.
+        let mut mgr = PeerManager::new(HostName::new("F2"));
+
+        let (transport_leader, sent_leader) = MockTransport::new();
+        mgr.add_peer(HostName::new("leader"), Box::new(transport_leader));
+
+        // Simulate a message that was relayed through leader:
+        // origin=F1, clock={F1:1, leader:1}
+        let mut clock = VectorClock::default();
+        clock.tick(&HostName::new("F1"));
+        clock.tick(&HostName::new("leader"));
+        let msg = PeerDataMessage {
+            origin_host: HostName::new("F1"),
+            repo_identity: test_repo(),
+            repo_path: PathBuf::from("/home/dev/repo"),
+            clock,
+            kind: PeerDataKind::Snapshot {
+                data: Box::new(ProviderData::default()),
+                seq: 1,
+            },
+        };
+
+        mgr.relay(&HostName::new("F1"), &msg).await;
+
+        // Leader is already in the clock, so relay should skip it
+        assert!(
+            sent_leader.lock().expect("lock").is_empty(),
+            "should not relay back to a peer already in the clock"
+        );
     }
 
     #[test]
