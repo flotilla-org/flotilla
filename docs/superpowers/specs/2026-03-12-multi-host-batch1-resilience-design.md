@@ -36,16 +36,17 @@ Both are thin wrappers around cloneable channel senders. The transport owns the 
 
 `PeerManager` gains a unified senders map and renames the existing map:
 
-| Map | Type | Purpose |
-|-----|------|---------|
-| `transports` | `HashMap<HostName, Box<dyn PeerTransport>>` | Lifecycle management (connect, disconnect, subscribe). SSH-specific today; future transports later. |
-| `senders` | `HashMap<HostName, Arc<dyn PeerSender>>` | Messaging. All peers, regardless of transport. Used by `prepare_relay()` and `send_to()`. |
+| Map | Key | Type | Purpose |
+|-----|-----|------|---------|
+| `transports` | Config label | `HashMap<String, Box<dyn PeerTransport>>` | Lifecycle management (connect, disconnect, subscribe). Keyed by hosts.toml label, not peer identity. SSH-specific today; future transports later. |
+| `senders` | Canonical name | `HashMap<HostName, Arc<dyn PeerSender>>` | Messaging. All peers, regardless of transport. Keyed by `Hello.host_name`. Used by `prepare_relay()` and `send_to()`. |
+| `transport_peers` | Config label → canonical name | `HashMap<String, HostName>` | Mapping established after Hello. Lets the reconnect loop find the canonical name to clean up when a transport-managed connection drops. |
 
 Lifecycle:
 
-- **SSH peer connects:** call `transport.sender()` to get the outbound channel sender, wrap in `Arc<ChannelPeerSender>`, register via `register_sender()`.
-- **Socket peer connects (after Hello handshake — see #259):** wrap its `mpsc::Sender<Message>` in `Arc<SocketPeerSender>`, register via `register_sender()`.
-- **Either disconnects:** call `disconnect_peer()` (#263).
+- **SSH peer connects:** transport does Hello handshake, returns canonical name. Caller wraps the outbound channel in `Arc<ChannelPeerSender>`, registers via `register_sender(canonical_name)`, and stores the config-label → canonical-name mapping.
+- **Socket peer connects (after Hello handshake — see #259):** wrap its `mpsc::Sender<Message>` in `Arc<SocketPeerSender>`, register via `register_sender(hello.host_name)`.
+- **Either disconnects:** call `disconnect_peer(canonical_name, generation)` (#263).
 
 `send_local_to_peers()` in `server.rs` simplifies: remove the `peer_clients` parameter and the separate `PeerClientMap` send loop. All sends go through `pm.senders()`. The `PeerClientMap` type is removed — connection tracking moves into PeerManager's generation counter (#263).
 
@@ -161,19 +162,24 @@ This means `handle_client` reads one message, branches on its type, and enters t
 
 ### Identity rule
 
-Each host owns its identity. A host's canonical name comes from its `daemon.toml` `host_name` setting (or OS hostname as fallback), advertised via `Hello.host_name`. This is the name used everywhere: senders, transports, generations, peer data, dedup clocks, UI display.
+Each host owns its identity. A host's canonical name comes from its `daemon.toml` `host_name` setting (or OS hostname as fallback), advertised via `Hello.host_name`. This is the name used for peer messaging state: senders, generations, peer data, dedup clocks, UI display.
 
 The `hosts.toml` key is a **connection config label** — it names the SSH connection config, not the peer's identity. Once connected, the remote's self-advertised `Hello.host_name` becomes the canonical key for that peer. If you want a host to appear as "build-box," configure `host_name = "build-box"` in that host's `daemon.toml`.
 
-**Duplicate rejection:** If an inbound `Hello.host_name` matches an already-registered peer (from a different connection), reject the connection. This prevents identity collisions without rewriting names.
+This creates two identity layers:
 
-**Enforcement on PeerData messages:** After identity is established via Hello, validate `PeerDataMessage.origin_host` on each message:
+| Layer | Key | Scope | Lifetime |
+|-------|-----|-------|----------|
+| **Connection config** | hosts.toml label | `transports` map, reconnect loop | Static — exists before Hello |
+| **Peer identity** | `Hello.host_name` | `senders`, `peer_data`, `generations`, `last_seen_clocks` | Established at Hello time |
 
-- **Direct messages** (origin_host matches the connection's Hello name): accept normally.
-- **Relayed messages** (origin_host differs from the connection's Hello name): accept as-is — the origin is a third party whose data is being relayed through this connection. The origin_host is that third party's self-advertised name.
-- **Spoofed messages** (origin_host is not the connection's Hello name AND not a known peer): drop with warning.
+For outbound SSH, `PeerManager` stores a mapping from config label → canonical name after Hello completes. The reconnect loop uses the config label to find the transport, performs the handshake, learns the canonical name, and registers the sender under it. If the canonical name changes on reconnect (remote reconfigured), the old-generation cleanup removes state under the old name, and the new connection registers under the new name.
 
-This avoids the config-coherency problem that arises with name rewriting: in a mesh, relayed messages preserve the originator's self-chosen name, so all nodes agree on identity without coordinating config.
+For inbound socket peers, there is no config label — only the canonical name from Hello.
+
+**Duplicate identity — supersede, not reject:** If a Hello arrives with a `host_name` that's already registered (from a different connection), the new connection **supersedes** the old one. This is consistent with #263's generation model — `register_sender()` bumps the generation, and the old connection's eventual cleanup no-ops because its generation is stale. This handles the rapid-reconnect case correctly: the replacement connection is accepted, not refused.
+
+**PeerData messages:** No origin_host validation or rewriting. `PeerDataMessage.origin_host` is accepted as-is on all messages. Direct messages carry the connection peer's name; relayed messages carry a third party's name. Both are legitimate. Vector clock dedup already prevents replays and loops. This keeps the system simple and works correctly in mesh topologies where the first time you hear about a peer may be through relay.
 
 ### Handshake mechanics
 
@@ -186,10 +192,9 @@ This requires restructuring `connect_socket()`: do the handshake on the raw stre
 
 **Inbound (socket peer):** In `handle_client`, after reading the first message and identifying it as `Hello`:
 1. Check version. On mismatch, log a warning and close the connection (no error message — the remote sees EOF and will reconnect with backoff).
-2. Check for duplicate identity — if `Hello.host_name` is already registered from a different connection, log a warning and close.
-3. Respond with the server's own `Hello`.
-4. Register the peer sender (#262) using the advertised `host_name`.
-5. Enter the peer data forwarding loop (suppressing all other output until this point). Validate `origin_host` on each `PeerData` message per the identity rule above.
+2. Respond with the server's own `Hello`.
+3. Register the peer sender (#262) using the advertised `host_name`. If the name is already registered, the new connection supersedes the old one (generation bump per #263).
+4. Enter the peer data forwarding loop.
 
 This replaces the current implicit peer identification (extracting `origin_host` from the first `PeerData` message).
 
