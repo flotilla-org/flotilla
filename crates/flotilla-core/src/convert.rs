@@ -274,6 +274,7 @@ mod tests {
             linked_session: None,
             linked_issues: vec![],
             workspace_refs: vec![],
+            terminal_ids: vec![],
             correlation_group_idx: 0,
             source: None,
         });

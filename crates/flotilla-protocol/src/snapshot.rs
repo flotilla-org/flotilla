@@ -386,6 +386,7 @@ mod tests {
         let json = r#"{
             "kind": "Issue",
             "identity": {"Issue": "X"},
+            "host": "test-host",
             "branch": null,
             "description": "test",
             "checkout": null,

@@ -417,7 +417,10 @@ impl DaemonServer {
         // Spawn outbound task: forward local snapshots to peers as PeerDataMessages.
         // Uses local-only providers (no peer overlay) to avoid echoing peer data back.
         // Maintains a persistent vector clock so each message has a strictly increasing clock.
+        // Sends to both configured SSH transports (PeerManager) and inbound peer clients
+        // (peers that connected to us via socket).
         let outbound_daemon = Arc::clone(&daemon);
+        let outbound_peer_clients = Arc::clone(&peer_clients);
         tokio::spawn(async move {
             let mut event_rx = outbound_daemon.subscribe();
             let mut outbound_clock = flotilla_protocol::VectorClock::default();
@@ -429,6 +432,7 @@ impl DaemonServer {
                         send_local_to_peers(
                             &outbound_daemon,
                             &outbound_peer_manager,
+                            &outbound_peer_clients,
                             &host_name,
                             &mut outbound_clock,
                             &snapshot.repo,
@@ -441,6 +445,7 @@ impl DaemonServer {
                         send_local_to_peers(
                             &outbound_daemon,
                             &outbound_peer_manager,
+                            &outbound_peer_clients,
                             &host_name,
                             &mut outbound_clock,
                             &delta.repo,
@@ -601,9 +606,13 @@ async fn clear_peer_data(
 /// Called by the outbound task whenever any snapshot event (full or delta)
 /// indicates local data changed. Always sends a full snapshot to peers —
 /// peer replication doesn't use deltas.
+///
+/// Sends to both configured SSH transports (outbound peers we connected to)
+/// and inbound peer clients (peers that connected to our socket).
 async fn send_local_to_peers(
     daemon: &Arc<InProcessDaemon>,
     peer_manager: &Arc<Mutex<PeerManager>>,
+    peer_clients: &Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>>,
     host_name: &HostName,
     clock: &mut flotilla_protocol::VectorClock,
     repo_path: &std::path::Path,
@@ -626,9 +635,22 @@ async fn send_local_to_peers(
             seq,
         },
     };
+
+    // Send to outbound peers (SSH transports we connected to)
     let pm = peer_manager.lock().await;
     for transport in pm.peers().values() {
         let _ = transport.send(msg.clone()).await;
+    }
+    drop(pm);
+
+    // Send to inbound peer clients (peers that connected to our socket)
+    let clients = peer_clients.lock().await;
+    if !clients.is_empty() {
+        let wire_msg = Message::PeerData(Box::new(msg));
+        for (name, tx) in clients.iter() {
+            debug!(peer = %name, "sending snapshot to inbound peer client");
+            let _ = tx.send(wire_msg.clone()).await;
+        }
     }
 }
 

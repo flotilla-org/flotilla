@@ -2283,7 +2283,10 @@ mod tests {
     fn correlate_terminal_ids_populated_when_managed_terminal_shares_branch() {
         let mut providers = new_providers();
 
-        let co_path = PathBuf::from("/tmp/feat-term");
+        let co_path = flotilla_protocol::HostPath::new(
+            flotilla_protocol::HostName::local(),
+            "/tmp/feat-term",
+        );
         providers.checkouts.insert(
             co_path.clone(),
             make_checkout("feat-term", "/tmp/feat-term", false),
