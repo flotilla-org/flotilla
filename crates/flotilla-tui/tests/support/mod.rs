@@ -11,7 +11,7 @@ use flotilla_protocol::{
     CorrelationKey, Issue, ProviderData, RepoLabels, SessionStatus, WorkItem,
 };
 use flotilla_tui::app::{
-    InFlightCommand, PreviewPositionMode, ProviderStatus, TuiModel, UiMode, UiState,
+    InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState,
 };
 use flotilla_tui::ui;
 
@@ -92,13 +92,8 @@ impl TestHarness {
         self
     }
 
-    pub fn with_preview_mode(mut self, mode: PreviewPositionMode) -> Self {
-        self.ui.preview.position_mode = mode;
-        self
-    }
-
-    pub fn with_preview_visible(mut self, visible: bool) -> Self {
-        self.ui.preview.visible = visible;
+    pub fn with_layout(mut self, layout: RepoViewLayout) -> Self {
+        self.ui.view_layout = layout;
         self
     }
 

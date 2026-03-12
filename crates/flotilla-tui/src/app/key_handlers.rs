@@ -98,13 +98,9 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
             KeyCode::Char('r') => {} // refresh handled in main loop
             KeyCode::Char(' ') => self.toggle_multi_select(),
-            KeyCode::Char('v') => {
-                self.ui.cycle_preview_position_mode();
-                self.persist_preview_preferences();
-            }
-            KeyCode::Char('P') => {
-                self.ui.toggle_preview_visibility();
-                self.persist_preview_preferences();
+            KeyCode::Char('l') => {
+                self.ui.cycle_layout();
+                self.persist_layout();
             }
             KeyCode::Char('.') => self.open_action_menu(),
             KeyCode::Enter => self.action_enter(),
@@ -1375,39 +1371,24 @@ mod tests {
     }
 
     #[test]
-    fn v_cycles_preview_position_mode_in_normal_mode() {
+    fn l_cycles_layout_in_normal_mode() {
         let mut app = stub_app();
-        assert_eq!(
-            app.ui.preview.position_mode,
-            super::super::PreviewPositionMode::Auto
-        );
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Auto);
 
-        app.handle_key(key(KeyCode::Char('v')));
-        assert_eq!(
-            app.ui.preview.position_mode,
-            super::super::PreviewPositionMode::Right
-        );
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Zoom);
         assert!(matches!(app.ui.mode, UiMode::Normal));
 
-        app.handle_key(key(KeyCode::Char('v')));
-        assert_eq!(
-            app.ui.preview.position_mode,
-            super::super::PreviewPositionMode::Below
-        );
-        assert!(matches!(app.ui.mode, UiMode::Normal));
-    }
-
-    #[test]
-    fn uppercase_p_toggles_preview_visibility_in_normal_mode() {
-        let mut app = stub_app();
-        assert!(app.ui.preview.visible);
-
-        app.handle_key(key(KeyCode::Char('P')));
-        assert!(!app.ui.preview.visible);
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Right);
         assert!(matches!(app.ui.mode, UiMode::Normal));
 
-        app.handle_key(key(KeyCode::Char('P')));
-        assert!(app.ui.preview.visible);
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Below);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Auto);
         assert!(matches!(app.ui.mode, UiMode::Normal));
     }
 

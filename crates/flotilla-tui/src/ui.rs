@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::app::{
-    BranchInputKind, InFlightCommand, Intent, PreviewPositionMode, ProviderStatus, TabId, TuiModel,
+    BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, TabId, TuiModel,
     UiMode, UiState,
 };
 use crate::event_log::{self, LevelExt};
@@ -49,11 +49,12 @@ enum ResolvedPreviewPosition {
     Below,
 }
 
-fn resolve_preview_position(area: Rect, mode: PreviewPositionMode) -> ResolvedPreviewPosition {
-    match mode {
-        PreviewPositionMode::Right => ResolvedPreviewPosition::Right,
-        PreviewPositionMode::Below => ResolvedPreviewPosition::Below,
-        PreviewPositionMode::Auto => resolve_auto_preview_position(area),
+fn resolve_preview_position(area: Rect, layout: RepoViewLayout) -> Option<ResolvedPreviewPosition> {
+    match layout {
+        RepoViewLayout::Right => Some(ResolvedPreviewPosition::Right),
+        RepoViewLayout::Below => Some(ResolvedPreviewPosition::Below),
+        RepoViewLayout::Auto => Some(resolve_auto_preview_position(area)),
+        RepoViewLayout::Zoom => None,
     }
 }
 
@@ -277,7 +278,7 @@ fn render_status_bar(
     }
 
     let rui = active_rui(model, ui);
-    let preview_status = preview_status_text(ui);
+    let layout_status = layout_status_text(ui);
 
     let text: String = match &ui.mode {
         UiMode::Config => " j/k:scroll log  [/]:switch tab  ?:help  q:quit".into(),
@@ -298,14 +299,14 @@ fn render_status_bar(
         UiMode::Help => " ?:close help  esc:close help".into(),
         UiMode::Normal => {
             if rui.show_providers {
-                format!(" c:close providers  {preview_status}  [/]:switch tab  ?:help  q:quit")
+                format!(" c:close providers  {layout_status}  [/]:switch tab  ?:help  q:quit")
             } else if let Some(q) = rui.active_search_query.as_deref() {
                 format!(
-                    " search: \"{q}\"  {preview_status}  /:new search  esc:clear  ?:help  q:quit"
+                    " search: \"{q}\"  {layout_status}  /:new search  esc:clear  ?:help  q:quit"
                 )
             } else if !rui.multi_selected.is_empty() {
                 format!(
-                    " enter:create branch  space:toggle  {preview_status}  esc:clear  ?:help  q:quit"
+                    " enter:create branch  space:toggle  {layout_status}  esc:clear  ?:help  q:quit"
                 )
             } else {
                 let mut s = " enter:open".to_string();
@@ -320,9 +321,8 @@ fn render_status_bar(
                         }
                     }
                 }
-                s.push_str("  v:preview  P:hide");
                 s.push_str("  ");
-                s.push_str(preview_status);
+                s.push_str(layout_status);
                 s.push_str("  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit");
                 s
             }
@@ -339,12 +339,12 @@ fn render_content(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
         return;
     }
 
-    if !ui.preview.visible {
+    let Some(position) = resolve_preview_position(area, ui.view_layout) else {
         render_unified_table(model, ui, frame, area);
         return;
-    }
+    };
 
-    let chunks = match resolve_preview_position(area, ui.preview.position_mode) {
+    let chunks = match position {
         ResolvedPreviewPosition::Right => Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1042,8 +1042,7 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
             "  p                Show {} in browser",
             labels.code_review.abbr
         )),
-        Line::from("  v                Cycle preview mode (auto/right/below)"),
-        Line::from("  P                Hide/show preview"),
+        Line::from("  l                Cycle layout (auto/zoom/right/below)"),
         Line::from("  r                Refresh data"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1088,15 +1087,12 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
     frame.render_widget(paragraph, area);
 }
 
-fn preview_status_text(ui: &UiState) -> &'static str {
-    if !ui.preview.visible {
-        return "preview:hidden";
-    }
-
-    match ui.preview.position_mode {
-        PreviewPositionMode::Auto => "preview:auto",
-        PreviewPositionMode::Right => "preview:right",
-        PreviewPositionMode::Below => "preview:below",
+fn layout_status_text(ui: &UiState) -> &'static str {
+    match ui.view_layout {
+        RepoViewLayout::Auto => "Layout(l): auto",
+        RepoViewLayout::Zoom => "Layout(l): zoom",
+        RepoViewLayout::Right => "Layout(l): right",
+        RepoViewLayout::Below => "Layout(l): below",
     }
 }
 
@@ -1316,32 +1312,35 @@ fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::PreviewPositionMode;
+    use crate::app::RepoViewLayout;
 
     #[test]
-    fn auto_preview_prefers_right_when_wide_layout_meets_minimums() {
-        let position =
-            resolve_preview_position(Rect::new(0, 0, 160, 40), PreviewPositionMode::Auto);
-        assert_eq!(position, ResolvedPreviewPosition::Right);
+    fn auto_layout_prefers_right_when_wide() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Auto);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Right));
     }
 
     #[test]
-    fn auto_preview_prefers_below_when_aspect_ratio_is_below_threshold() {
-        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), PreviewPositionMode::Auto);
-        assert_eq!(position, ResolvedPreviewPosition::Below);
+    fn auto_layout_prefers_below_when_tall() {
+        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), RepoViewLayout::Auto);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Below));
     }
 
     #[test]
-    fn explicit_right_mode_ignores_terminal_shape() {
-        let position =
-            resolve_preview_position(Rect::new(0, 0, 90, 50), PreviewPositionMode::Right);
-        assert_eq!(position, ResolvedPreviewPosition::Right);
+    fn explicit_right_layout() {
+        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), RepoViewLayout::Right);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Right));
     }
 
     #[test]
-    fn explicit_below_mode_ignores_terminal_shape() {
-        let position =
-            resolve_preview_position(Rect::new(0, 0, 160, 40), PreviewPositionMode::Below);
-        assert_eq!(position, ResolvedPreviewPosition::Below);
+    fn explicit_below_layout() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Below);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Below));
+    }
+
+    #[test]
+    fn zoom_layout_returns_none() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Zoom);
+        assert_eq!(position, None);
     }
 }

@@ -1,22 +1,10 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 178
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ⚙ ┐
 │      Source     Path              Description                        Branch            WT  WS  PR   SS   Issues Git  │
-│      ── Checkouts ──                                                                                                 │
-│▸  ○                   feat-dashbo checkout feat-dashboard            feat-dashboard    ✓                             │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -32,4 +20,15 @@ expression: output
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- enter:open  d:remove worktree  v:preview  P:hide  preview:hidden  .:menu  /:search  n:new  r:refresh  space:select  ?:h
+┌ Preview ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ enter:open  Layout(l): below  .:menu  /:search  n:new  r:refresh  space:select  ?:help  q:quit

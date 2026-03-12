@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tui_input::Input;
 
-use flotilla_core::config::{ConfigStore, PreviewPositionModeConfig};
+use flotilla_core::config::{ConfigStore, RepoViewLayoutConfig};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{self, GroupEntry, SectionLabels};
 use flotilla_protocol::{
@@ -26,8 +26,7 @@ use std::collections::VecDeque;
 
 pub use intent::Intent;
 pub use ui_state::{
-    BranchInputKind, DirEntry, PreviewPositionMode, PreviewState, RepoUiState, TabId, UiMode,
-    UiState,
+    BranchInputKind, DirEntry, RepoUiState, RepoViewLayout, TabId, UiMode, UiState,
 };
 
 /// Per-provider auth/health status from last refresh.
@@ -184,13 +183,12 @@ impl App {
         let model = TuiModel::from_repo_info(repos_info);
         let mut ui = UiState::new(&model.repo_order);
         let loaded_config = config.load_config();
-        let preview = &loaded_config.ui.preview;
-        ui.preview.position_mode = match preview.position_mode {
-            PreviewPositionModeConfig::Auto => PreviewPositionMode::Auto,
-            PreviewPositionModeConfig::Right => PreviewPositionMode::Right,
-            PreviewPositionModeConfig::Below => PreviewPositionMode::Below,
+        ui.view_layout = match loaded_config.ui.preview.layout {
+            RepoViewLayoutConfig::Auto => RepoViewLayout::Auto,
+            RepoViewLayoutConfig::Zoom => RepoViewLayout::Zoom,
+            RepoViewLayoutConfig::Right => RepoViewLayout::Right,
+            RepoViewLayoutConfig::Below => RepoViewLayout::Below,
         };
-        ui.preview.visible = preview.visible;
         Self {
             daemon,
             config,
@@ -202,14 +200,14 @@ impl App {
         }
     }
 
-    pub fn persist_preview_preferences(&self) {
-        let position_mode = match self.ui.preview.position_mode {
-            PreviewPositionMode::Auto => PreviewPositionModeConfig::Auto,
-            PreviewPositionMode::Right => PreviewPositionModeConfig::Right,
-            PreviewPositionMode::Below => PreviewPositionModeConfig::Below,
+    pub fn persist_layout(&self) {
+        let layout = match self.ui.view_layout {
+            RepoViewLayout::Auto => RepoViewLayoutConfig::Auto,
+            RepoViewLayout::Zoom => RepoViewLayoutConfig::Zoom,
+            RepoViewLayout::Right => RepoViewLayoutConfig::Right,
+            RepoViewLayout::Below => RepoViewLayoutConfig::Below,
         };
-        self.config
-            .save_preview_preferences(position_mode, self.ui.preview.visible);
+        self.config.save_layout(layout);
     }
 
     // ── Daemon event handling ──
@@ -666,11 +664,11 @@ mod tests {
     }
 
     #[test]
-    fn app_new_loads_preview_preferences_from_config() {
+    fn app_new_loads_layout_from_config() {
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[ui.preview]\nposition_mode = \"below\"\nvisible = false\n",
+            "[ui.preview]\nlayout = \"below\"\n",
         )
         .unwrap();
 
@@ -682,12 +680,11 @@ mod tests {
             config,
         );
 
-        assert_eq!(app.ui.preview.position_mode, PreviewPositionMode::Below);
-        assert!(!app.ui.preview.visible);
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Below);
     }
 
     #[test]
-    fn persist_preview_preferences_writes_current_ui_state() {
+    fn persist_layout_writes_current_ui_state() {
         let dir = tempdir().unwrap();
         let daemon: Arc<dyn DaemonHandle> = Arc::new(TestDaemon::new());
         let config = Arc::new(ConfigStore::with_base(dir.path()));
@@ -697,17 +694,12 @@ mod tests {
             config,
         );
 
-        app.ui.preview.position_mode = PreviewPositionMode::Right;
-        app.ui.preview.visible = false;
-        app.persist_preview_preferences();
+        app.ui.view_layout = RepoViewLayout::Right;
+        app.persist_layout();
 
         let reloaded = ConfigStore::with_base(dir.path());
         let cfg = reloaded.load_config();
-        assert_eq!(
-            cfg.ui.preview.position_mode,
-            PreviewPositionModeConfig::Right
-        );
-        assert!(!cfg.ui.preview.visible);
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Right);
     }
 
     // -- format_error_status --

@@ -55,34 +55,20 @@ pub struct UiConfig {
     pub preview: PreviewConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PreviewConfig {
     #[serde(default)]
-    pub position_mode: PreviewPositionModeConfig,
-    #[serde(default = "default_true")]
-    pub visible: bool,
-}
-
-impl Default for PreviewConfig {
-    fn default() -> Self {
-        Self {
-            position_mode: PreviewPositionModeConfig::default(),
-            visible: default_true(),
-        }
-    }
+    pub layout: RepoViewLayoutConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum PreviewPositionModeConfig {
+pub enum RepoViewLayoutConfig {
     #[default]
     Auto,
+    Zoom,
     Right,
     Below,
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 /// Full repo config file including optional overrides.
@@ -279,15 +265,10 @@ impl ConfigStore {
             .clone()
     }
 
-    pub fn save_preview_preferences(
-        &self,
-        position_mode: PreviewPositionModeConfig,
-        visible: bool,
-    ) {
+    pub fn save_layout(&self, layout: RepoViewLayoutConfig) {
         let path = self.base.join("config.toml");
         let mut config = self.load_config();
-        config.ui.preview.position_mode = position_mode;
-        config.ui.preview.visible = visible;
+        config.ui.preview.layout = layout;
 
         if let Err(err) = std::fs::create_dir_all(&self.base) {
             tracing::warn!(path = %self.base.display(), err = %err, "failed to create config dir");
@@ -569,25 +550,21 @@ mod tests {
     }
 
     #[test]
-    fn load_config_parses_preview_preferences() {
+    fn load_config_parses_layout() {
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[ui.preview]\nposition_mode = \"below\"\nvisible = false\n",
+            "[ui.preview]\nlayout = \"zoom\"\n",
         )
         .unwrap();
 
         let store = ConfigStore::with_base(dir.path());
         let cfg = store.load_config();
-        assert_eq!(
-            cfg.ui.preview.position_mode,
-            PreviewPositionModeConfig::Below
-        );
-        assert!(!cfg.ui.preview.visible);
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Zoom);
     }
 
     #[test]
-    fn save_preview_preferences_writes_global_config() {
+    fn save_layout_writes_global_config() {
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
@@ -596,37 +573,28 @@ mod tests {
         .unwrap();
 
         let store = ConfigStore::with_base(dir.path());
-        store.save_preview_preferences(PreviewPositionModeConfig::Right, false);
+        store.save_layout(RepoViewLayoutConfig::Right);
 
         let reloaded = ConfigStore::with_base(dir.path());
         let cfg = reloaded.load_config();
         assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
-        assert_eq!(
-            cfg.ui.preview.position_mode,
-            PreviewPositionModeConfig::Right
-        );
-        assert!(!cfg.ui.preview.visible);
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Right);
     }
 
     #[test]
-    fn save_preview_preferences_updates_same_store_cache() {
+    fn save_layout_updates_same_store_cache() {
         let dir = tempdir().unwrap();
         let store = ConfigStore::with_base(dir.path());
 
         assert_eq!(
-            store.load_config().ui.preview.position_mode,
-            PreviewPositionModeConfig::Auto
+            store.load_config().ui.preview.layout,
+            RepoViewLayoutConfig::Auto
         );
-        assert!(store.load_config().ui.preview.visible);
 
-        store.save_preview_preferences(PreviewPositionModeConfig::Below, false);
+        store.save_layout(RepoViewLayoutConfig::Below);
 
         let cfg = store.load_config();
-        assert_eq!(
-            cfg.ui.preview.position_mode,
-            PreviewPositionModeConfig::Below
-        );
-        assert!(!cfg.ui.preview.visible);
+        assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Below);
     }
 
     #[test]

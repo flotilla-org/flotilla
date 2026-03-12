@@ -2,7 +2,7 @@ mod support;
 
 use flotilla_protocol::{ProviderData, SessionStatus};
 use flotilla_tui::app::{
-    BranchInputKind, InFlightCommand, Intent, PreviewPositionMode, ProviderStatus, UiMode,
+    BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, UiMode,
 };
 use std::path::PathBuf;
 use support::*;
@@ -153,7 +153,7 @@ fn selected_item_preview_below() {
 
     let mut harness = TestHarness::single_repo("my-project")
         .with_provider_data(providers, items)
-        .with_preview_mode(PreviewPositionMode::Below)
+        .with_layout(RepoViewLayout::Below)
         .with_width(90)
         .with_height(40);
     let output = harness.render_to_string();
@@ -161,7 +161,7 @@ fn selected_item_preview_below() {
 }
 
 #[test]
-fn hidden_preview_uses_full_content_area() {
+fn zoom_layout_uses_full_content_area() {
     let mut providers = ProviderData::default();
     let (path, checkout) =
         make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
@@ -174,15 +174,14 @@ fn hidden_preview_uses_full_content_area() {
 
     let mut harness = TestHarness::single_repo("my-project")
         .with_provider_data(providers, items)
-        .with_preview_visible(false);
+        .with_layout(RepoViewLayout::Zoom);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
 
 #[test]
-fn status_bar_preview_state() {
-    let mut harness =
-        TestHarness::single_repo("my-project").with_preview_mode(PreviewPositionMode::Below);
+fn status_bar_layout_state() {
+    let mut harness = TestHarness::single_repo("my-project").with_layout(RepoViewLayout::Below);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
