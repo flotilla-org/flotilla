@@ -203,10 +203,13 @@ impl DaemonServer {
                     names
                 };
 
-                // Spawn resilient per-peer forwarding tasks with reconnect loop
+                // Spawn resilient per-peer forwarding tasks with reconnect loop.
+                // On disconnect, stale peer data is cleared from the daemon overlay
+                // so the UI doesn't show checkouts from unreachable hosts.
                 for peer_name in peer_names {
                     let tx = peer_data_tx_for_ssh.clone();
                     let pm = Arc::clone(&peer_manager);
+                    let daemon_for_cleanup = Arc::clone(&peer_daemon);
                     let initial_rx = initial_rx_map.remove(&peer_name);
 
                     tokio::spawn(async move {
@@ -216,6 +219,7 @@ impl DaemonServer {
                                 return; // Main channel closed, stop entirely
                             }
                             info!(peer = %peer_name, "SSH connection dropped, will reconnect");
+                            clear_peer_data(&pm, &daemon_for_cleanup, &peer_name).await;
                         }
 
                         // Reconnect loop with exponential backoff
@@ -247,6 +251,7 @@ impl DaemonServer {
                                         peer = %peer_name,
                                         "SSH connection dropped, will reconnect"
                                     );
+                                    clear_peer_data(&pm, &daemon_for_cleanup, &peer_name).await;
                                 }
                                 Err(e) => {
                                     warn!(
@@ -421,39 +426,28 @@ impl DaemonServer {
             loop {
                 match event_rx.recv().await {
                     Ok(DaemonEvent::SnapshotFull(snapshot)) => {
-                        let repo_path = snapshot.repo.clone();
-
-                        // Look up RepoIdentity for this repo
-                        let Some(identity) =
-                            outbound_daemon.find_identity_for_path(&repo_path).await
-                        else {
-                            continue;
-                        };
-
-                        // Get local-only providers to avoid sending merged peer data
-                        let Some((local_providers, seq)) =
-                            outbound_daemon.get_local_providers(&repo_path).await
-                        else {
-                            continue;
-                        };
-
-                        outbound_clock.tick(&host_name);
-                        let msg = PeerDataMessage {
-                            origin_host: host_name.clone(),
-                            repo_identity: identity,
-                            repo_path,
-                            clock: outbound_clock.clone(),
-                            kind: flotilla_protocol::PeerDataKind::Snapshot {
-                                data: Box::new(local_providers),
-                                seq,
-                            },
-                        };
-                        let pm = outbound_peer_manager.lock().await;
-                        for transport in pm.peers().values() {
-                            let _ = transport.send(msg.clone()).await;
-                        }
+                        send_local_to_peers(
+                            &outbound_daemon,
+                            &outbound_peer_manager,
+                            &host_name,
+                            &mut outbound_clock,
+                            &snapshot.repo,
+                        )
+                        .await;
                     }
-                    Ok(_) => {} // Ignore non-snapshot events
+                    Ok(DaemonEvent::SnapshotDelta(delta)) => {
+                        // Deltas also indicate local data changed — send full
+                        // local providers to peers (we don't replicate deltas).
+                        send_local_to_peers(
+                            &outbound_daemon,
+                            &outbound_peer_manager,
+                            &host_name,
+                            &mut outbound_clock,
+                            &delta.repo,
+                        )
+                        .await;
+                    }
+                    Ok(_) => {} // Ignore non-data events
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "outbound peer event subscriber lagged");
                     }
@@ -528,6 +522,76 @@ impl DaemonServer {
 
         info!("daemon server stopped");
         Ok(())
+    }
+}
+
+/// Clear a disconnected peer's data from PeerManager and daemon overlays.
+///
+/// Called when an SSH connection drops. Removes the peer's stored snapshots
+/// and updates the daemon's peer overlay so the UI no longer shows stale
+/// checkouts and terminals from the unreachable host.
+async fn clear_peer_data(
+    peer_manager: &Arc<Mutex<PeerManager>>,
+    daemon: &Arc<InProcessDaemon>,
+    peer_name: &HostName,
+) {
+    let affected_repos = {
+        let mut pm = peer_manager.lock().await;
+        pm.remove_peer_data(peer_name)
+    };
+
+    // Rebuild peer overlays for each affected repo
+    for repo_id in affected_repos {
+        if let Some(local_path) = daemon.find_repo_by_identity(&repo_id).await {
+            let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = {
+                let pm = peer_manager.lock().await;
+                pm.get_peer_data()
+                    .iter()
+                    .filter_map(|(host, repos)| {
+                        repos
+                            .get(&repo_id)
+                            .map(|state| (host.clone(), state.provider_data.clone()))
+                    })
+                    .collect()
+            };
+            daemon.set_peer_providers(&local_path, peers).await;
+        }
+    }
+}
+
+/// Send local-only provider data to all peers for a given repo.
+///
+/// Called by the outbound task whenever any snapshot event (full or delta)
+/// indicates local data changed. Always sends a full snapshot to peers —
+/// peer replication doesn't use deltas.
+async fn send_local_to_peers(
+    daemon: &Arc<InProcessDaemon>,
+    peer_manager: &Arc<Mutex<PeerManager>>,
+    host_name: &HostName,
+    clock: &mut flotilla_protocol::VectorClock,
+    repo_path: &std::path::Path,
+) {
+    let Some(identity) = daemon.find_identity_for_path(repo_path).await else {
+        return;
+    };
+    let Some((local_providers, seq)) = daemon.get_local_providers(repo_path).await else {
+        return;
+    };
+
+    clock.tick(host_name);
+    let msg = PeerDataMessage {
+        origin_host: host_name.clone(),
+        repo_identity: identity,
+        repo_path: repo_path.to_path_buf(),
+        clock: clock.clone(),
+        kind: flotilla_protocol::PeerDataKind::Snapshot {
+            data: Box::new(local_providers),
+            seq,
+        },
+    };
+    let pm = peer_manager.lock().await;
+    for transport in pm.peers().values() {
+        let _ = transport.send(msg.clone()).await;
     }
 }
 

@@ -1239,6 +1239,17 @@ impl DaemonHandle for InProcessDaemon {
             order.push(path.clone());
         }
 
+        // Register RepoIdentity for peer routing
+        if let Some(url) = crate::providers::discovery::first_remote_url(&path, &*self.runner).await
+        {
+            if let Some(identity) = crate::providers::discovery::extract_repo_identity(&url) {
+                self.repo_identities
+                    .write()
+                    .await
+                    .insert(identity, path.clone());
+            }
+        }
+
         // Persist to config
         self.config.save_repo(&path);
         let order = self.repo_order.read().await;
@@ -1335,6 +1346,16 @@ impl DaemonHandle for InProcessDaemon {
                 return Err(format!("repo not tracked: {}", path.display()));
             }
             order.retain(|p| p != &path);
+        }
+
+        // Remove from identity map and peer overlay
+        {
+            let mut ids = self.repo_identities.write().await;
+            ids.retain(|_, p| p != &path);
+        }
+        {
+            let mut pp = self.peer_providers.write().await;
+            pp.remove(&path);
         }
 
         // Persist to config

@@ -297,6 +297,22 @@ impl PeerManager {
         &self.peers
     }
 
+    /// Remove all stored data for a peer (e.g. on disconnect).
+    ///
+    /// Returns the list of RepoIdentity values that were affected, so the
+    /// caller can rebuild the daemon's peer overlay for those repos.
+    pub fn remove_peer_data(&mut self, name: &HostName) -> Vec<RepoIdentity> {
+        let affected: Vec<RepoIdentity> = self
+            .peer_data
+            .get(name)
+            .map(|repos| repos.keys().cloned().collect())
+            .unwrap_or_default();
+        self.peer_data.remove(name);
+        self.last_seen_clocks.retain(|(host, _), _| host != name);
+        info!(peer = %name, repos = affected.len(), "cleared peer data");
+        affected
+    }
+
     /// Send a message to a specific peer by name.
     pub async fn send_to(&self, name: &HostName, msg: PeerDataMessage) -> Result<(), String> {
         let transport = self
