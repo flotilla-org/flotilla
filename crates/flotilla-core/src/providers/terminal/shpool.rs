@@ -29,8 +29,12 @@ impl ShpoolTerminalPool {
             .parent()
             .unwrap_or(Path::new("."))
             .join("config.toml");
-        let _config_changed = Self::ensure_config(&config_path);
+        let config_changed = Self::ensure_config(&config_path);
         Self::clean_stale_socket(&socket_path);
+        if config_changed && socket_path.exists() {
+            tracing::info!("shpool config changed, restarting daemon");
+            Self::stop_daemon(&socket_path).await;
+        }
         Self::start_daemon(&socket_path, &config_path).await;
         Self {
             runner,
