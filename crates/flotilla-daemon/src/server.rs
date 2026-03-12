@@ -574,15 +574,6 @@ async fn clear_peer_data(
 
                 if let Some(synthetic_path) = pm.known_remote_repos().get(&repo_id).cloned() {
                     drop(pm);
-                    let merged = crate::peer::merge_provider_data(
-                        &flotilla_protocol::ProviderData::default(),
-                        daemon.host_name(),
-                        &peers
-                            .iter()
-                            .map(|(h, d)| (h.clone(), d))
-                            .collect::<Vec<_>>(),
-                    );
-                    daemon.update_virtual_repo(&synthetic_path, merged).await;
                     daemon.set_peer_providers(&synthetic_path, peers).await;
                 }
             } else if let Some(synthetic_path) = pm.unregister_remote_repo(&repo_id) {
@@ -915,7 +906,12 @@ fn extract_path_param(params: &serde_json::Value, field: &str) -> Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_protocol::{DaemonEvent, PeerDataKind, RepoIdentity, RepoInfo, VectorClock};
+    use flotilla_protocol::{
+        Checkout, DaemonEvent, HostName, HostPath, PeerDataKind, PeerDataMessage, ProviderData,
+        RepoIdentity, RepoInfo, VectorClock,
+    };
+    use indexmap::IndexMap;
+    use std::path::Path;
 
     fn assert_ok_empty_response(msg: Message, expected_id: u64) {
         match msg {
@@ -939,6 +935,44 @@ mod tests {
         let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
         let daemon = InProcessDaemon::new(vec![], config).await;
         (tmp, daemon)
+    }
+
+    fn checkout(branch: &str) -> Checkout {
+        Checkout {
+            branch: branch.to_string(),
+            is_trunk: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+        }
+    }
+
+    fn peer_snapshot(
+        host: &str,
+        repo_identity: &RepoIdentity,
+        repo_path: &Path,
+        checkout_path: &str,
+        branch: &str,
+    ) -> PeerDataMessage {
+        PeerDataMessage {
+            origin_host: HostName::new(host),
+            repo_identity: repo_identity.clone(),
+            repo_path: repo_path.to_path_buf(),
+            clock: VectorClock::default(),
+            kind: PeerDataKind::Snapshot {
+                data: Box::new(ProviderData {
+                    checkouts: IndexMap::from([(
+                        HostPath::new(HostName::new(host), checkout_path),
+                        checkout(branch),
+                    )]),
+                    ..Default::default()
+                }),
+                seq: 1,
+            },
+        }
     }
 
     #[tokio::test]
@@ -1322,5 +1356,135 @@ mod tests {
         // Clean up
         drop(writer);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+        let repo_identity = RepoIdentity {
+            authority: "github.com".into(),
+            path: "owner/remote-only".into(),
+        };
+        let repo_path = PathBuf::from("/srv/remote-only");
+
+        {
+            let mut pm = peer_manager.lock().await;
+            assert_eq!(
+                pm.handle_peer_data(peer_snapshot(
+                    "peer-a",
+                    &repo_identity,
+                    &repo_path,
+                    "/srv/peer-a/remote-only",
+                    "feature-a",
+                )),
+                crate::peer::HandleResult::Updated(repo_identity.clone())
+            );
+            assert_eq!(
+                pm.handle_peer_data(peer_snapshot(
+                    "peer-b",
+                    &repo_identity,
+                    &repo_path,
+                    "/srv/peer-b/remote-only",
+                    "feature-b",
+                )),
+                crate::peer::HandleResult::Updated(repo_identity.clone())
+            );
+        }
+
+        let synthetic = crate::peer::synthetic_repo_path(&HostName::new("peer-a"), &repo_path);
+        let merged = {
+            let pm = peer_manager.lock().await;
+            let peers: Vec<(HostName, ProviderData)> = pm
+                .get_peer_data()
+                .iter()
+                .filter_map(|(host, repos)| {
+                    repos
+                        .get(&repo_identity)
+                        .map(|state| (host.clone(), state.provider_data.clone()))
+                })
+                .collect();
+            crate::peer::merge_provider_data(
+                &ProviderData::default(),
+                daemon.host_name(),
+                &peers
+                    .iter()
+                    .map(|(h, d)| (h.clone(), d))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        daemon
+            .add_virtual_repo(synthetic.clone(), merged)
+            .await
+            .expect("add virtual repo");
+        daemon
+            .set_peer_providers(
+                &synthetic,
+                vec![
+                    (
+                        HostName::new("peer-a"),
+                        ProviderData {
+                            checkouts: IndexMap::from([(
+                                HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"),
+                                checkout("feature-a"),
+                            )]),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        HostName::new("peer-b"),
+                        ProviderData {
+                            checkouts: IndexMap::from([(
+                                HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"),
+                                checkout("feature-b"),
+                            )]),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+            )
+            .await;
+        {
+            let mut pm = peer_manager.lock().await;
+            pm.register_remote_repo(repo_identity.clone(), synthetic.clone());
+        }
+
+        let mut rx = daemon.subscribe();
+        clear_peer_data(&peer_manager, &daemon, &HostName::new("peer-a")).await;
+
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for first event")
+            .expect("broadcast channel should stay open");
+
+        let stale_key = HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only");
+        let remaining_key = HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only");
+        match event {
+            DaemonEvent::SnapshotFull(snapshot) => {
+                assert_eq!(snapshot.repo, synthetic);
+                assert!(
+                    !snapshot.providers.checkouts.contains_key(&stale_key),
+                    "first snapshot after disconnect should not include stale peer-a checkout"
+                );
+                assert_eq!(
+                    snapshot.providers.checkouts[&remaining_key].branch,
+                    "feature-b"
+                );
+            }
+            DaemonEvent::SnapshotDelta(delta) => {
+                assert_eq!(delta.repo, synthetic);
+                assert!(
+                    delta.changes.iter().any(|change| matches!(
+                        change,
+                        flotilla_protocol::Change::Checkout {
+                            key,
+                            op: flotilla_protocol::EntryOp::Removed
+                        } if key == &stale_key
+                    )),
+                    "first delta after disconnect should remove stale peer-a checkout"
+                );
+            }
+            other => panic!("expected snapshot event, got {other:?}"),
+        }
     }
 }

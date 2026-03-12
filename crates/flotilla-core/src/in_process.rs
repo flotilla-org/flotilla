@@ -971,19 +971,6 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    /// Update the provider data for an existing virtual repo and re-broadcast.
-    ///
-    /// Used when a peer disconnects but other peers still back the virtual repo,
-    /// so the merged data needs to be rebuilt from the remaining peers.
-    pub async fn update_virtual_repo(&self, synthetic_path: &Path, provider_data: ProviderData) {
-        let mut repos = self.repos.write().await;
-        if let Some(state) = repos.get_mut(synthetic_path) {
-            state.model.data.providers = Arc::new(provider_data);
-            drop(repos);
-            self.broadcast_snapshot(synthetic_path).await;
-        }
-    }
-
     /// Re-build and broadcast a snapshot for the given repo using current cache state.
     ///
     /// If peer provider data has been set for this repo via [`set_peer_providers`],
