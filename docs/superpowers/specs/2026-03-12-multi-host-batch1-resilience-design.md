@@ -25,38 +25,41 @@ pub trait PeerSender: Send + Sync {
 }
 ```
 
-Two concrete implementations:
+`PeerTransport` loses its `send()` method — it keeps only lifecycle methods (`connect`, `disconnect`, `subscribe`). Sending is now exclusively through `PeerSender`.
 
+Two concrete `PeerSender` implementations:
+
+- **`ChannelPeerSender`** — wraps an `mpsc::Sender<PeerDataMessage>`. Used for SSH transports: `SshTransport::connect()` creates the outbound channel internally, then exposes a method (e.g. `sender()`) that returns a cloneable `mpsc::Sender<PeerDataMessage>`. The caller wraps it in `ChannelPeerSender` and registers it. `SshTransport` itself does not implement `PeerSender`.
 - **`SocketPeerSender`** — wraps an `mpsc::Sender<Message>`, converting `PeerDataMessage` to `Message::PeerData` before sending. Used for inbound socket peers.
-- For SSH transports, `PeerTransport` gains a blanket or explicit `PeerSender` impl — no separate `SshPeerSender` wrapper. `PeerTransport::send()` already has the right signature. Remove `send()` from `PeerTransport` and make it a `PeerSender` impl instead, keeping `PeerTransport` focused on lifecycle (connect, disconnect, subscribe).
+
+Both are thin wrappers around cloneable channel senders. The transport owns the channel; the `PeerSender` holds a clone.
 
 `PeerManager` gains a unified senders map and renames the existing map:
 
 | Map | Type | Purpose |
 |-----|------|---------|
 | `transports` | `HashMap<HostName, Box<dyn PeerTransport>>` | Lifecycle management (connect, disconnect, subscribe). SSH-specific today; future transports later. |
-| `senders` | `HashMap<HostName, Arc<dyn PeerSender>>` | Messaging. All peers, regardless of transport. Used by `relay()` and `send_to()`. |
+| `senders` | `HashMap<HostName, Arc<dyn PeerSender>>` | Messaging. All peers, regardless of transport. Used by `prepare_relay()` and `send_to()`. |
 
 Lifecycle:
 
-- **SSH peer connects:** wrap its outbound `mpsc::Sender` in an `Arc<dyn PeerSender>`, register via `register_sender()`.
-- **Socket peer connects:** wrap its `mpsc::Sender<Message>` in `Arc<SocketPeerSender>`, register via `register_sender()`.
-- **Either disconnects:** call `unregister_sender()`.
+- **SSH peer connects:** call `transport.sender()` to get the outbound channel sender, wrap in `Arc<ChannelPeerSender>`, register via `register_sender()`.
+- **Socket peer connects (after Hello handshake — see #259):** wrap its `mpsc::Sender<Message>` in `Arc<SocketPeerSender>`, register via `register_sender()`.
+- **Either disconnects:** call `disconnect_peer()` (#263).
 
-`send_local_to_peers()` in `server.rs` simplifies: remove the `peer_clients` parameter and the separate `PeerClientMap` send loop. All sends go through `pm.senders()`. The `PeerClientMap` type is removed — connection ID tracking moves into PeerManager's generation counter (#263).
+`send_local_to_peers()` in `server.rs` simplifies: remove the `peer_clients` parameter and the separate `PeerClientMap` send loop. All sends go through `pm.senders()`. The `PeerClientMap` type is removed — connection tracking moves into PeerManager's generation counter (#263).
 
 ### Files changed
 
 - `crates/flotilla-daemon/src/peer/transport.rs` — add `PeerSender` trait; remove `send()` from `PeerTransport`
-- `crates/flotilla-daemon/src/peer/manager.rs` — rename `peers` to `transports`; add `senders` map, `register_sender()`, `unregister_sender()`, `senders()` accessor; `relay()` and `send_to()` use `senders`
-- `crates/flotilla-daemon/src/peer/ssh_transport.rs` — implement `PeerSender` for the outbound channel wrapper
+- `crates/flotilla-daemon/src/peer/manager.rs` — rename `peers` to `transports`; add `senders` map, `register_sender()`, `senders()` accessor; `send_to()` uses `senders`
+- `crates/flotilla-daemon/src/peer/ssh_transport.rs` — add `sender()` method; add `ChannelPeerSender` implementing `PeerSender`
 - `crates/flotilla-daemon/src/server.rs` — add `SocketPeerSender`; register/unregister senders on peer connect/disconnect; simplify `send_local_to_peers()` (remove `peer_clients` parameter and send loop); remove `PeerClientMap` type
 
 ### Tests
 
-- Existing relay tests in `manager.rs` must be updated: `MockTransport` implements `PeerSender`; tests call `register_sender()` alongside `add_peer()` so relay finds senders.
+- Existing relay tests in `manager.rs` must be updated: `MockTransport` no longer has `send()`; tests register a mock `PeerSender` via `register_sender()` so relay finds senders.
 - New test: register a mock sender via `register_sender()` (without a transport), verify relay reaches it.
-- New test: unregister a sender, verify relay skips it.
 - New test: `send_to()` reaches a socket-only peer registered via `register_sender()`.
 
 ---
@@ -147,21 +150,43 @@ Hello {
 }
 ```
 
+### Session model
+
+The daemon socket is shared between TUI clients and peer connections. `Hello` acts as a **mode switch**: the first message a client sends determines its role.
+
+- If the first message is `Message::Hello` → peer mode. Server responds with its own `Hello`, checks version compatibility, and enters the peer data exchange loop. No non-peer traffic is sent until the `Hello` exchange completes.
+- If the first message is `Message::Request` → normal TUI client. Handled as today, no `Hello` required.
+
+This means `handle_client` reads one message, branches on its type, and enters the appropriate handler loop.
+
+### Identity rule
+
+Peers are keyed by `HostName` throughout the system (senders, transports, generations). One authoritative rule:
+
+- **Outbound (SSH) peers:** the *configured* name (from `hosts.toml`) is authoritative. The `Hello.host_name` from the remote is logged but not used for keying. If it differs from the configured name, log a warning. This prevents a misconfigured remote from hijacking another peer's identity.
+- **Inbound (socket) peers:** the *self-advertised* `Hello.host_name` is authoritative, since there is no prior configuration for them.
+
+### Handshake mechanics
+
 **Outbound (SSH transport):** The Hello handshake happens *before* spawning reader/writer tasks. After `connect_socket()` opens the `UnixStream` but before splitting it into read/write halves and spawning tasks:
 1. Write `Message::Hello` as a JSON line to the stream.
 2. Read one JSON line from the stream. If it's a `Hello` with a matching version, proceed to spawn reader/writer tasks. Otherwise, close the stream and return an error.
 
 This requires restructuring `connect_socket()`: do the handshake on the raw stream first, then split and spawn tasks.
 
-**Inbound (socket peer):** In `handle_client`, the first message from a connecting client must be `Hello`. The server responds with its own `Hello`. On version mismatch, log a warning and close the connection. This replaces the current implicit peer identification (extracting `origin_host` from the first `PeerData` message in lines 830-846 of `server.rs`) — `Hello` carries the `host_name` explicitly upfront.
+**Inbound (socket peer):** In `handle_client`, after reading the first message and identifying it as `Hello`:
+1. Check version. On mismatch, send an error response and close.
+2. Respond with the server's own `Hello`.
+3. Register the peer sender (#262) using the advertised `host_name`.
+4. Enter the peer data forwarding loop (suppressing all other output until this point).
 
-Bump `PROTOCOL_VERSION` whenever the wire format changes incompatibly. No migration logic needed (per project conventions).
+This replaces the current implicit peer identification (extracting `origin_host` from the first `PeerData` message).
 
 ### Files changed
 
 - `crates/flotilla-protocol/src/lib.rs` — `PROTOCOL_VERSION` constant, `Message::Hello` variant
 - `crates/flotilla-daemon/src/peer/ssh_transport.rs` — restructure `connect_socket()` to handshake before spawning tasks
-- `crates/flotilla-daemon/src/server.rs` — handle `Hello` from inbound peers; replace implicit `origin_host` identification with explicit `Hello` exchange
+- `crates/flotilla-daemon/src/server.rs` — `handle_client` branches on first message type; `Hello` path does version check, responds, registers peer sender, enters peer loop
 
 ### Tests
 
@@ -175,7 +200,7 @@ Bump `PROTOCOL_VERSION` whenever the wire format changes incompatibly. No migrat
 
 ### Problem
 
-When a peer disconnects, `clear_peer_data()` removes its stored data and rebuilds overlays. If the peer reconnects quickly and sends new data before cleanup runs, the stale cleanup wipes fresh data.
+When a peer disconnects, `clear_peer_data()` removes its stored data and rebuilds overlays. If the peer reconnects quickly and sends new data before cleanup runs, the stale cleanup wipes fresh data. The same race applies to sender cleanup — `unregister_sender()` from an old connection would remove the live sender registered by the new connection.
 
 ### Design
 
@@ -187,30 +212,36 @@ generations: HashMap<HostName, u64>,
 
 `register_sender()` increments the generation for that host and returns the new value. The caller captures this generation at connect time.
 
-`remove_peer_data()` takes the generation it's cleaning up for:
+Combine sender and data cleanup into a single generation-guarded method:
 
 ```rust
-pub fn remove_peer_data(&mut self, name: &HostName, generation: u64) -> Vec<RepoIdentity> {
+pub fn disconnect_peer(&mut self, name: &HostName, generation: u64) -> Vec<RepoIdentity> {
     if self.generations.get(name).copied().unwrap_or(0) != generation {
-        debug!(peer = %name, "skipping stale cleanup (generation mismatch)");
+        debug!(peer = %name, "skipping stale disconnect (generation mismatch)");
         return vec![];
     }
-    // ... existing cleanup logic
+    // Remove sender
+    self.senders.remove(name);
+    // Remove peer data and last-seen clocks
+    // ... existing cleanup logic from remove_peer_data
 }
 ```
 
+Both sender removal and data removal happen atomically under the same generation check. A stale disconnect (from an earlier generation) is a complete no-op — it touches neither the sender nor the data.
+
 Both peer connection paths capture and use generations:
 
-- **SSH outbound peers:** The reconnect loop in `server.rs` captures the generation from `register_sender()` when the connection establishes. On disconnect, passes that generation to `clear_peer_data()`. A stale cleanup (from an earlier generation) becomes a no-op.
-- **Inbound socket peers:** When `handle_client` registers a socket peer sender via `register_sender()`, it captures the generation. On client disconnect, it calls `clear_peer_data()` with that generation. This replaces the current `PeerClientMap` connection ID scheme — the generation counter on `PeerManager` serves the same purpose.
+- **SSH outbound peers:** The reconnect loop in `server.rs` captures the generation from `register_sender()` when the connection establishes. On disconnect, passes that generation to `disconnect_peer()`. A stale cleanup becomes a no-op.
+- **Inbound socket peers:** When `handle_client` registers a socket peer sender via `register_sender()`, it captures the generation. On client disconnect, it calls `disconnect_peer()` with that generation. This replaces the current `PeerClientMap` connection ID scheme — the generation counter on `PeerManager` serves the same purpose.
 
 ### Files changed
 
-- `crates/flotilla-daemon/src/peer/manager.rs` — `generations` map, generation-aware `register_sender()` and `remove_peer_data()`
-- `crates/flotilla-daemon/src/server.rs` — capture generation on both SSH and socket peer connect; pass to cleanup on disconnect
+- `crates/flotilla-daemon/src/peer/manager.rs` — `generations` map, `disconnect_peer()` replacing `remove_peer_data()` and `unregister_sender()`
+- `crates/flotilla-daemon/src/server.rs` — capture generation on both SSH and socket peer connect; pass to `disconnect_peer()` on disconnect; update `clear_peer_data()` to use `disconnect_peer()`
 
 ### Tests
 
-- Register a sender (generation 1), register again (generation 2, simulating reconnect), call `remove_peer_data` with generation 1 — verify no data is removed.
-- Register, remove with matching generation — verify data is removed (existing behavior preserved).
+- Register a sender (generation 1), register again (generation 2, simulating reconnect), call `disconnect_peer` with generation 1 — verify neither sender nor data is removed.
+- Register, disconnect with matching generation — verify both sender and data are removed (existing behavior preserved).
+- Verify the sender registered at generation 2 is still functional after stale generation 1 disconnect.
 - Test both paths: SSH reconnect scenario and socket peer reconnect scenario.
