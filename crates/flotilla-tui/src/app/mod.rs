@@ -34,6 +34,21 @@ pub enum ProviderStatus {
     Error,
 }
 
+/// Connection status for a remote peer host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerStatus {
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
+/// Status of a configured remote peer host, for display in the config view.
+#[derive(Debug, Clone)]
+pub struct PeerHostStatus {
+    pub name: HostName,
+    pub status: PeerStatus,
+}
+
 #[derive(Default)]
 pub struct CommandQueue {
     queue: VecDeque<Command>,
@@ -77,6 +92,8 @@ pub struct TuiModel {
     pub status_message: Option<String>,
     /// The daemon's hostname, set from the first Snapshot received.
     pub my_host: Option<HostName>,
+    /// Status of configured remote peer hosts.
+    pub peer_hosts: Vec<PeerHostStatus>,
 }
 
 impl TuiModel {
@@ -108,6 +125,7 @@ impl TuiModel {
             provider_statuses: HashMap::new(),
             status_message: None,
             my_host: None,
+            peer_hosts: Vec::new(),
         }
     }
 

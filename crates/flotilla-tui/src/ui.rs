@@ -15,7 +15,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::app::{
-    BranchInputKind, InFlightCommand, Intent, ProviderStatus, TabId, TuiModel, UiMode, UiState,
+    BranchInputKind, InFlightCommand, Intent, PeerHostStatus, PeerStatus, ProviderStatus, TabId,
+    TuiModel, UiMode, UiState,
 };
 use crate::event_log::{self, LevelExt};
 use crate::ui_helpers;
@@ -1088,7 +1089,18 @@ fn render_config_screen(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    render_global_status(model, frame, chunks[0]);
+    if model.peer_hosts.is_empty() {
+        render_global_status(model, frame, chunks[0]);
+    } else {
+        // Split left panel: providers on top, hosts below.
+        let host_height = (model.peer_hosts.len() as u16 + 2).min(8);
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(host_height)])
+            .split(chunks[0]);
+        render_global_status(model, frame, left_chunks[0]);
+        render_hosts_status(frame, left_chunks[1], &model.peer_hosts);
+    }
     render_event_log(ui, frame, chunks[1]);
 }
 
@@ -1156,6 +1168,26 @@ fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
         .header(provider_table_header())
         .block(Block::bordered().title(" Providers "));
     frame.render_widget(table, area);
+}
+
+fn render_hosts_status(frame: &mut Frame, area: Rect, hosts: &[PeerHostStatus]) {
+    let items: Vec<ListItem> = hosts
+        .iter()
+        .map(|h| {
+            let (icon, style) = match h.status {
+                PeerStatus::Connected => ("\u{25cf}", Style::default().fg(Color::Green)),
+                PeerStatus::Disconnected => ("\u{25cb}", Style::default().fg(Color::Red)),
+                PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(Color::Yellow)),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{icon} "), style),
+                Span::raw(h.name.as_str()),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).block(Block::bordered().title(" Connected Hosts "));
+    frame.render_widget(list, area);
 }
 
 fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {
