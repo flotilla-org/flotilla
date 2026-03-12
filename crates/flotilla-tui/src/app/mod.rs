@@ -586,6 +586,7 @@ pub enum ClearDispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
     use tempfile::tempdir;
     use test_support::*;
 
@@ -1144,5 +1145,57 @@ mod tests {
             }
             _ => panic!("expected BranchInput mode"),
         }
+    }
+
+    // -- CloseConfirm flow --
+
+    #[test]
+    fn close_confirm_y_dispatches_command() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+        };
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        let cmd = app.proto_commands.take_next();
+        assert!(matches!(cmd, Some(Command::CloseChangeRequest { id }) if id == "42"));
+    }
+
+    #[test]
+    fn close_confirm_enter_dispatches_command() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+        };
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        let cmd = app.proto_commands.take_next();
+        assert!(matches!(cmd, Some(Command::CloseChangeRequest { id }) if id == "42"));
+    }
+
+    #[test]
+    fn close_confirm_esc_cancels() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+        };
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
+    }
+
+    #[test]
+    fn close_confirm_n_cancels() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+        };
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.proto_commands.take_next().is_none());
     }
 }
