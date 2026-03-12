@@ -69,7 +69,7 @@ impl ShpoolTerminalPool {
 
         match std::fs::read_to_string(&pid_path) {
             Ok(contents) => {
-                if let Ok(pid) = contents.trim().parse::<i32>() {
+                if let Some(pid) = contents.trim().parse::<i32>().ok().filter(|&p| p > 0) {
                     // Signal 0 checks process existence without sending a signal
                     let alive = unsafe { libc::kill(pid, 0) } == 0;
                     if alive {
@@ -106,7 +106,7 @@ impl ShpoolTerminalPool {
 
         // Kill existing daemon if running (to apply fresh config)
         if let Ok(contents) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = contents.trim().parse::<i32>() {
+            if let Some(pid) = contents.trim().parse::<i32>().ok().filter(|&p| p > 0) {
                 if unsafe { libc::kill(pid, 0) } == 0 {
                     tracing::info!(%pid, "killing existing shpool daemon to apply fresh config");
                     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
@@ -141,6 +141,8 @@ impl ShpoolTerminalPool {
 
                 match result {
                     Ok(_child) => {
+                        // Child handle is intentionally dropped — tokio does not
+                        // kill on drop, so the daemon outlives this handle.
                         tracing::info!("spawned shpool daemon");
                         // Wait for socket to appear (up to 2s)
                         for _ in 0..20 {
