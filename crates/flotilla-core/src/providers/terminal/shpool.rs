@@ -95,30 +95,19 @@ impl ShpoolTerminalPool {
         // Unix sockets don't exist on non-Unix platforms
     }
 
-    /// Spawn the shpool daemon as a background process with flotilla's config.
+    /// Spawn the shpool daemon if one isn't already running.
     ///
-    /// If a daemon is already running, kills it first so the new one picks up
-    /// the latest config. If the spawn fails, logs a warning — shpool's
-    /// built-in auto-daemonize from `attach` will still work as a fallback.
+    /// `clean_stale_socket` must be called first — it removes sockets for dead
+    /// daemons, so if the socket still exists here the daemon is alive and we
+    /// can reuse it. If the spawn fails, logs a warning — shpool's built-in
+    /// auto-daemonize from `attach` will still work as a fallback.
     #[cfg(unix)]
     async fn start_daemon(socket_path: &Path, config_path: &Path) {
-        let pid_path = socket_path.with_file_name("daemonized-shpool.pid");
-
-        // Kill existing daemon if running (to apply fresh config)
-        if let Ok(contents) = std::fs::read_to_string(&pid_path) {
-            if let Some(pid) = contents.trim().parse::<i32>().ok().filter(|&p| p > 0) {
-                if unsafe { libc::kill(pid, 0) } == 0 {
-                    tracing::info!(%pid, "killing existing shpool daemon to apply fresh config");
-                    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-                        tracing::debug!(%pid, "SIGTERM failed (process may have already exited)");
-                    }
-                    // Give it a moment to shut down
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    // Clean up after killed daemon
-                    let _ = std::fs::remove_file(socket_path);
-                    let _ = std::fs::remove_file(&pid_path);
-                }
-            }
+        // If socket exists after clean_stale_socket, a live daemon is already
+        // running — reuse it rather than tearing down persistent sessions.
+        if socket_path.exists() {
+            tracing::debug!("shpool daemon already running, reusing existing");
+            return;
         }
 
         let socket_str = socket_path.display().to_string();
