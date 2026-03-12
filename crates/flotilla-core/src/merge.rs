@@ -12,7 +12,7 @@ use flotilla_protocol::{HostName, ProviderData};
 /// leader relaying its own data), we include it.
 pub fn merge_provider_data(
     local: &ProviderData,
-    _local_host: &HostName,
+    _local_host: &HostName, // reserved: Phase 2 will use for conflict resolution
     peers: &[(HostName, &ProviderData)],
 ) -> ProviderData {
     let mut merged = local.clone();

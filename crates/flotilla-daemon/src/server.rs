@@ -413,7 +413,7 @@ impl DaemonServer {
                         HandleResult::ResyncRequested {
                             from,
                             repo,
-                            since_seq: _,
+                            since_seq: _, // Phase 1: always send full snapshot
                         } => {
                             let local_host = pm.local_host().clone();
 
