@@ -1,11 +1,10 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 312
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Path     Description     Branch   WT  WS  PR   SS   Issues Git  ││                                              │
+│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │

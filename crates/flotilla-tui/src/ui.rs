@@ -804,7 +804,10 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
 }
 
 fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
-    let UiMode::DeleteConfirm { ref info, loading } = ui.mode else {
+    let UiMode::DeleteConfirm {
+        ref info, loading, ..
+    } = ui.mode
+    else {
         return;
     };
 
