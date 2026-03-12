@@ -40,15 +40,16 @@ impl CmuxWorkspaceManager {
 
     fn parse_window_refs(output: &str) -> Result<Vec<String>, String> {
         let parsed: serde_json::Value = serde_json::from_str(output).map_err(|e| e.to_string())?;
-        let windows = parsed["windows"]
+        // cmux --json list-windows returns a bare array of window objects
+        let windows = parsed
             .as_array()
-            .ok_or("cmux list-windows: response missing 'windows' array")?;
+            .ok_or("cmux list-windows: expected JSON array")?;
         let mut refs = Vec::new();
         for window in windows {
-            if let Some(window_ref) = window["ref"].as_str() {
-                refs.push(window_ref.to_string());
+            if let Some(id) = window["id"].as_str() {
+                refs.push(id.to_string());
             } else {
-                warn!(window = %window, "cmux: skipping window without ref");
+                warn!(window = %window, "cmux: skipping window without id");
             }
         }
         Ok(refs)
@@ -369,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn list_workspaces_aggregates_all_windows() {
         let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
-            Ok(r#"{"windows":[{"ref":"window:1"},{"ref":"window:2"}]}"#.to_string()),
+            Ok(r#"[{"id":"W1","index":0},{"id":"W2","index":1}]"#.to_string()),
             Ok(
                 r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo-a"]}]}"#
                     .to_string(),
@@ -397,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn list_workspaces_skips_failed_window() {
         let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
-            Ok(r#"{"windows":[{"ref":"window:1"},{"ref":"window:2"}]}"#.to_string()),
+            Ok(r#"[{"id":"W1","index":0},{"id":"W2","index":1}]"#.to_string()),
             Ok(
                 r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo-a"]}]}"#
                     .to_string(),
@@ -426,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn list_workspaces_dedupes_duplicate_workspace_refs() {
         let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
-            Ok(r#"{"windows":[{"ref":"window:1"},{"ref":"window:2"}]}"#.to_string()),
+            Ok(r#"[{"id":"W1","index":0},{"id":"W2","index":1}]"#.to_string()),
             Ok(
                 r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo-a"]}]}"#
                     .to_string(),
