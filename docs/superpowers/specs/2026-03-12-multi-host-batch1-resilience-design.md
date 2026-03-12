@@ -8,7 +8,7 @@ Addresses four independent issues in the peer relay/connection infrastructure:
 
 ## New types
 
-Two newtypes enforce the distinction between connection config labels and peer identities at compile time:
+A newtype enforces the distinction between connection config labels and peer identities at compile time:
 
 ```rust
 /// Connection config label from hosts.toml. Used to key transports and
@@ -193,11 +193,11 @@ For inbound socket peers, there is no `ConfigLabel` — only the canonical `Host
 
 **Supersede on duplicate identity:** If a Hello arrives with a `host_name` that's already registered (from a different connection), the new connection **supersedes** the old one. `register_sender()` bumps the generation, and the old connection's eventual cleanup no-ops because its generation is stale. This handles the rapid-reconnect case correctly (see #263).
 
-**PeerData messages and the inbound generation gate:** No `origin_host` validation or rewriting. `PeerDataMessage.origin_host` is accepted as-is. Direct messages carry the connection peer's name; relayed messages carry a third party's name. Both are legitimate. Vector clock dedup prevents replays and loops.
+**PeerData messages and provenance:** No `origin_host` validation or rewriting. `PeerDataMessage.origin_host` is accepted as-is. Direct messages carry the connection peer's name; relayed messages carry a third party's name. Both are legitimate. Vector clock dedup prevents replays and loops.
 
-However, each inbound message from a connection is tagged with that connection's generation (see #263). If the connection has been superseded (generation is stale), the message is dropped before processing. This ensures that after supersede, only the new connection's data stream is authoritative — the old connection's reader task may still be running, but its messages are ignored.
+Every inbound message is tagged with the forwarding connection's `connection_peer` and `connection_generation` (see #263). If that generation has gone stale, the message is dropped before processing. This applies to both direct and relayed messages. After supersede, the old connection may still have a live reader task, but none of its messages remain authoritative.
 
-**Relayed data ownership:** Data received via relay (where `origin_host` differs from the connection peer's Hello name) is keyed by `origin_host`, not by the connection peer. This data is not owned by any single connection's generation. It persists until superseded by a newer snapshot from the same `origin_host` (via any relay path), or until the system restarts. This is intentional — the system trusts peers to relay data on behalf of third parties, and relay paths may change without invalidating the data.
+**Relayed data ownership:** `peer_data` remains keyed by `origin_host` (the host the snapshot is about), but each stored snapshot also carries provenance: which connection peer introduced it, and at which generation. Batch 1 keeps a single active snapshot per `(origin_host, repo)`; it does not retain multiple alternate relay paths. If the same `origin_host` snapshot later arrives through a different connection, the newer accepted snapshot replaces the old one and its provenance becomes authoritative. On disconnect, cleanup removes any active snapshots whose provenance matches the disconnecting connection/generation. If another path still exists, that peer will republish and become the new active provenance source.
 
 ### Handshake mechanics
 
@@ -236,7 +236,7 @@ This replaces the current implicit peer identification (extracting `origin_host`
 
 When a peer disconnects, `clear_peer_data()` removes its stored data and rebuilds overlays. If the peer reconnects quickly and sends new data before cleanup runs, the stale cleanup wipes fresh data. The same race applies to sender cleanup — `unregister_sender()` from an old connection would remove the live sender registered by the new connection.
 
-A related race: after supersede, the old connection's reader task may still be running and forwarding messages. These stale messages must not update peer state.
+A related race: after supersede, the old connection's reader task may still be running and forwarding messages. These stale messages must not update peer state, including relayed third-party state.
 
 ### Design
 
@@ -247,6 +247,20 @@ generations: HashMap<HostName, u64>,
 ```
 
 `register_sender()` increments the generation for that host and returns the new value. The caller captures this generation at connect time.
+
+Each stored peer snapshot gains provenance metadata:
+
+```rust
+pub struct PerRepoPeerState {
+    pub provider_data: ProviderData,
+    pub repo_path: PathBuf,
+    pub seq: u64,
+    /// Which connection peer introduced the currently active snapshot.
+    pub via_peer: HostName,
+    /// Generation of `via_peer` when this snapshot was accepted.
+    pub via_generation: u64,
+}
+```
 
 **Inbound message gating:** The forwarding path (in `server.rs`) tags each inbound `PeerDataMessage` with the connection's generation. A wrapper type carries the tag:
 
@@ -260,9 +274,9 @@ struct InboundPeerData {
 }
 ```
 
-The processing loop checks before accepting: is this generation still current for this peer? If not, drop the message. This ensures that after supersede, only the new connection's messages are processed — even if the old connection's reader task hasn't stopped yet.
+The processing loop checks before accepting: is this generation still current for this peer? If not, drop the message. This applies to all messages from that connection, including relays. This ensures that after supersede, only the new connection's messages are processed — even if the old connection's reader task hasn't stopped yet.
 
-Note: generation gating applies to messages where `origin_host` matches `connection_peer` (direct messages). Relayed messages (`origin_host` ≠ `connection_peer`) are not gated — they carry third-party data that isn't tied to any single connection's generation.
+When a message is accepted, the resulting stored state is tagged with `via_peer = connection_peer` and `via_generation = connection_generation`, regardless of whether the message is direct or relayed. The state is still keyed by `msg.origin_host`; provenance is metadata used for authority and cleanup, not the primary storage key.
 
 **Disconnect cleanup:** Combine sender and data cleanup into a single generation-guarded method:
 
@@ -274,14 +288,21 @@ pub fn disconnect_peer(&mut self, name: &HostName, generation: u64) -> Vec<RepoI
     }
     // Remove sender
     self.senders.remove(name);
-    // Remove peer data and last-seen clocks
-    // ... existing cleanup logic from remove_peer_data
+    // Remove direct peer data for `name`
+    // Remove relayed peer data whose provenance is (via_peer = name,
+    // via_generation = generation)
+    // Remove last-seen clocks owned by that removed state
 }
 ```
 
 Both sender removal and data removal happen atomically under the same generation check. A stale disconnect (from an earlier generation) is a complete no-op — it touches neither the sender nor the data.
 
-Note: `disconnect_peer` only removes data keyed by the direct peer's `HostName`. Relayed data (keyed by third-party `origin_host` values) is intentionally left in place — it may still be valid via other relay paths and will be superseded by future snapshots.
+`disconnect_peer` removes two classes of state:
+
+- Direct state keyed by the disconnecting peer's own `HostName`
+- Relayed state for any third-party `origin_host` whose active snapshot provenance is `(via_peer = disconnecting peer, via_generation = disconnecting generation)`
+
+This gives relayed data a deterministic cleanup path and prevents stale relay paths from leaving orphaned state behind indefinitely.
 
 Both peer connection paths capture and use generations:
 
@@ -298,6 +319,8 @@ Both peer connection paths capture and use generations:
 - Register a sender (generation 1), register again (generation 2, simulating reconnect), call `disconnect_peer` with generation 1 — verify neither sender nor data is removed.
 - Register, disconnect with matching generation — verify both sender and data are removed (existing behavior preserved).
 - Verify the sender registered at generation 2 is still functional after stale generation 1 disconnect.
-- Inbound message from stale generation is dropped.
-- Relayed message (origin ≠ connection peer) from stale generation is still accepted (relay data is connection-independent).
+- Inbound direct message from stale generation is dropped.
+- Inbound relayed message from stale generation is also dropped.
+- Relayed snapshot stores provenance (`via_peer`, `via_generation`) and is removed when that provenance disconnects.
+- Same `origin_host` snapshot received through a new relay path replaces the old active snapshot and updates provenance.
 - Test both paths: SSH reconnect scenario and socket peer reconnect scenario.
