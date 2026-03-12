@@ -54,17 +54,18 @@ impl SshTransport {
     ///
     /// The local forwarded socket will be placed at
     /// `~/.config/flotilla/peers/<host-name>.sock`.
-    pub fn new(host_name: HostName, config: RemoteHostConfig) -> Self {
+    pub fn new(host_name: HostName, config: RemoteHostConfig) -> Result<Self, String> {
         // Sanitise: reject host names containing path separators to prevent
         // path traversal (e.g. `../` in hosts.toml).
         let name_str = host_name.as_str();
-        assert!(
-            !name_str.contains('/') && !name_str.contains('\\') && !name_str.contains('\0'),
-            "peer host name must not contain path separators: {name_str:?}"
-        );
+        if name_str.contains('/') || name_str.contains('\\') || name_str.contains('\0') {
+            return Err(format!(
+                "peer host name must not contain path separators: {name_str:?}"
+            ));
+        }
         let local_socket_path = peers_dir().join(format!("{}.sock", host_name));
 
-        Self {
+        Ok(Self {
             config,
             host_name,
             local_socket_path,
@@ -73,7 +74,7 @@ impl SshTransport {
             inbound_rx: None,
             outbound_tx: None,
             task_handles: Vec::new(),
-        }
+        })
     }
 
     /// Spawn the SSH child process that forwards the remote socket locally.
@@ -412,11 +413,25 @@ mod tests {
             user: Some("dev".to_string()),
             daemon_socket: "/run/user/1000/flotilla.sock".to_string(),
         };
-        let transport = SshTransport::new(HostName::new("my-server"), config);
+        let transport =
+            SshTransport::new(HostName::new("my-server"), config).expect("valid host name");
         assert!(transport
             .local_socket_path
             .to_string_lossy()
             .ends_with("peers/my-server.sock"));
+    }
+
+    #[test]
+    fn rejects_host_name_with_path_separator() {
+        let config = RemoteHostConfig {
+            hostname: "10.0.0.5".to_string(),
+            user: None,
+            daemon_socket: "/tmp/daemon.sock".to_string(),
+        };
+        match SshTransport::new(HostName::new("../evil"), config) {
+            Err(e) => assert!(e.contains("path separators"), "unexpected error: {e}"),
+            Ok(_) => panic!("should reject host name with path separators"),
+        }
     }
 
     #[test]
@@ -426,7 +441,8 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        let transport = SshTransport::new(HostName::new("remote"), config);
+        let transport =
+            SshTransport::new(HostName::new("remote"), config).expect("valid host name");
         assert_eq!(transport.status(), PeerConnectionStatus::Disconnected);
     }
 
@@ -437,7 +453,8 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        let transport = SshTransport::new(HostName::new("remote"), config);
+        let transport =
+            SshTransport::new(HostName::new("remote"), config).expect("valid host name");
 
         let msg = PeerDataMessage {
             origin_host: HostName::new("local"),
@@ -462,7 +479,8 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        let mut transport = SshTransport::new(HostName::new("remote"), config);
+        let mut transport =
+            SshTransport::new(HostName::new("remote"), config).expect("valid host name");
 
         let result = transport.subscribe().await;
         assert!(result.is_err());
@@ -479,7 +497,8 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/flotilla-test-daemon.sock".to_string(),
         };
-        let mut transport = SshTransport::new(HostName::new("localhost-test"), config);
+        let mut transport =
+            SshTransport::new(HostName::new("localhost-test"), config).expect("valid host name");
 
         transport
             .connect()

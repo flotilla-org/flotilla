@@ -75,8 +75,14 @@ impl DaemonServer {
                     "peer config uses same name as local host — messages will be ignored"
                 );
             }
-            let transport = SshTransport::new(peer_host.clone(), host_config);
-            peer_manager.add_peer(peer_host, Box::new(transport));
+            match SshTransport::new(peer_host.clone(), host_config) {
+                Ok(transport) => {
+                    peer_manager.add_peer(peer_host, Box::new(transport));
+                }
+                Err(e) => {
+                    warn!(host = %name, err = %e, "skipping peer with invalid host name");
+                }
+            }
         }
 
         info!(
@@ -1281,8 +1287,7 @@ mod tests {
     async fn handle_client_forwards_peer_data_and_registers_peer() {
         let (_tmp, daemon) = empty_daemon().await;
         let (peer_data_tx, mut peer_data_rx) = mpsc::channel(16);
-        let peer_clients: Arc<Mutex<PeerClientMap>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let peer_clients: Arc<Mutex<PeerClientMap>> = Arc::new(Mutex::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
@@ -1395,8 +1400,7 @@ mod tests {
     async fn handle_client_relays_outbound_peer_messages() {
         let (_tmp, daemon) = empty_daemon().await;
         let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
-        let peer_clients: Arc<Mutex<PeerClientMap>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let peer_clients: Arc<Mutex<PeerClientMap>> = Arc::new(Mutex::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");

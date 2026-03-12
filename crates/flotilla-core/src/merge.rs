@@ -46,7 +46,26 @@ pub fn merge_provider_data(
         }
 
         // Service-level data (PRs, issues, sessions) comes only from leader.
-        // Followers don't have this data, so no merge conflict possible.
+        // Followers don't poll external APIs so their maps are empty — no
+        // conflict. We merge unconditionally so followers see leader's data.
+        for (key, cr) in &peer_data.change_requests {
+            merged
+                .change_requests
+                .entry(key.clone())
+                .or_insert_with(|| cr.clone());
+        }
+        for (key, issue) in &peer_data.issues {
+            merged
+                .issues
+                .entry(key.clone())
+                .or_insert_with(|| issue.clone());
+        }
+        for (key, session) in &peer_data.sessions {
+            merged
+                .sessions
+                .entry(key.clone())
+                .or_insert_with(|| session.clone());
+        }
     }
 
     merged
