@@ -43,6 +43,7 @@ pub fn correlation_result_to_work_item(
         is_main_checkout: item.is_main_checkout(),
         debug_group,
         source: item.source().map(|s| s.to_string()),
+        terminal_keys: item.terminal_ids().to_vec(),
     }
 }
 
@@ -129,6 +130,7 @@ mod tests {
             workspace_refs: vec!["cmux-1".to_string()],
             correlation_group_idx: 0,
             source: None,
+            terminal_ids: vec![],
         });
 
         let proto = correlation_result_to_work_item(&item, &[]);
@@ -190,6 +192,7 @@ mod tests {
             workspace_refs: vec![],
             correlation_group_idx: 0,
             source: Some(hostname.clone()),
+            terminal_ids: vec![],
         });
         let proto = correlation_result_to_work_item(&item, &[]);
         assert_eq!(proto.source, Some(hostname));
@@ -207,6 +210,7 @@ mod tests {
             workspace_refs: vec![],
             correlation_group_idx: 0,
             source: Some("Claude".to_string()),
+            terminal_ids: vec![],
         });
         let proto = correlation_result_to_work_item(&item, &[]);
         assert_eq!(proto.source, Some("Claude".to_string()));

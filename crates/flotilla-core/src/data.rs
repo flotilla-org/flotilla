@@ -68,6 +68,7 @@ pub struct CorrelatedWorkItem {
     pub workspace_refs: Vec<String>,
     pub correlation_group_idx: usize,
     pub source: Option<String>,
+    pub terminal_ids: Vec<flotilla_protocol::ManagedTerminalId>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +179,13 @@ impl CorrelationResult {
         }
     }
 
+    pub fn terminal_ids(&self) -> &[flotilla_protocol::ManagedTerminalId] {
+        match self {
+            CorrelationResult::Correlated(c) => &c.terminal_ids,
+            _ => &[],
+        }
+    }
+
     pub fn correlation_group_idx(&self) -> Option<usize> {
         match self {
             CorrelationResult::Correlated(c) => Some(c.correlation_group_idx),
@@ -269,6 +277,7 @@ fn group_to_work_item(
     let mut change_request_key: Option<String> = None;
     let mut session_key: Option<String> = None;
     let mut workspace_refs: Vec<String> = Vec::new();
+    let mut terminal_ids: Vec<flotilla_protocol::ManagedTerminalId> = Vec::new();
 
     for item in &group.items {
         match (&item.kind, &item.source_key) {
@@ -295,11 +304,12 @@ fn group_to_work_item(
                     workspace_refs.push(ws_ref.clone());
                 }
             }
-            (CorItemKind::ManagedTerminal, ProviderItemKey::ManagedTerminal(_key)) => {
-                // Managed terminals contribute to correlation but don't need
-                // explicit tracking on work items yet — their presence in the
-                // group is enough. The terminal pool provider shows them in
-                // ProviderData.managed_terminals.
+            (CorItemKind::ManagedTerminal, ProviderItemKey::ManagedTerminal(key)) => {
+                if let Some(terminal) = providers.managed_terminals.get(key.as_str()) {
+                    terminal_ids.push(terminal.id.clone());
+                } else {
+                    tracing::debug!(%key, "managed_terminals lookup miss in group_to_work_item");
+                }
             }
             _ => {}
         }
@@ -367,6 +377,7 @@ fn group_to_work_item(
         workspace_refs,
         correlation_group_idx: group_idx,
         source,
+        terminal_ids,
     }))
 }
 
@@ -835,6 +846,7 @@ mod tests {
             workspace_refs: Vec::new(),
             correlation_group_idx: 0,
             source: None,
+            terminal_ids: vec![],
         }
     }
 
@@ -2242,5 +2254,50 @@ mod tests {
 
         // All items should be selectable
         assert_eq!(grouped.selectable_indices.len(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // terminal_ids population tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn correlate_terminal_ids_populated_when_managed_terminal_shares_branch() {
+        let mut providers = new_providers();
+
+        let co_path = PathBuf::from("/tmp/feat-term");
+        providers.checkouts.insert(
+            co_path.clone(),
+            make_checkout("feat-term", "/tmp/feat-term", false),
+        );
+
+        let terminal_id = flotilla_protocol::ManagedTerminalId {
+            checkout: "feat-term".to_string(),
+            role: "dev".to_string(),
+            index: 0,
+        };
+        let terminal_key = terminal_id.to_string();
+        providers.managed_terminals.insert(
+            terminal_key.clone(),
+            flotilla_protocol::ManagedTerminal {
+                id: terminal_id.clone(),
+                role: "dev".to_string(),
+                command: "bash".to_string(),
+                working_directory: PathBuf::from("/tmp/feat-term"),
+                status: flotilla_protocol::TerminalStatus::Running,
+            },
+        );
+
+        let (items, _) = correlate(&providers);
+
+        // Should merge into a single checkout work item
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind(), WorkItemKind::Checkout);
+
+        let terminal_ids = items[0].terminal_ids();
+        assert!(
+            !terminal_ids.is_empty(),
+            "terminal_ids should be non-empty after correlation"
+        );
+        assert_eq!(terminal_ids[0], terminal_id);
     }
 }

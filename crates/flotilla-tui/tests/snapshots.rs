@@ -266,6 +266,7 @@ fn delete_confirm_safe_to_delete() {
             base_detection_warning: None,
         }),
         loading: false,
+        terminal_keys: vec![],
     });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
@@ -288,6 +289,7 @@ fn delete_confirm_with_uncommitted_files() {
             base_detection_warning: None,
         }),
         loading: false,
+        terminal_keys: vec![],
     });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
@@ -309,6 +311,7 @@ fn delete_confirm_with_many_uncommitted_files() {
                 base_detection_warning: None,
             }),
             loading: false,
+            terminal_keys: vec![],
         });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);

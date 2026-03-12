@@ -346,10 +346,13 @@ pub async fn detect_providers(
         let shpool_socket = crate::config::flotilla_config_dir().join("shpool/shpool.socket");
         registry.terminal_pool = Some((
             "shpool".into(),
-            Arc::new(crate::providers::terminal::shpool::ShpoolTerminalPool::new(
-                Arc::clone(&runner),
-                shpool_socket,
-            )),
+            Arc::new(
+                crate::providers::terminal::shpool::ShpoolTerminalPool::create(
+                    Arc::clone(&runner),
+                    shpool_socket,
+                )
+                .await,
+            ),
         ));
         info!(%repo_name, "Terminal pool → shpool");
     } else {

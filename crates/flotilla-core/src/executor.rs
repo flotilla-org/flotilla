@@ -116,7 +116,10 @@ pub async fn execute(
             }
         }
 
-        Command::RemoveCheckout { branch } => {
+        Command::RemoveCheckout {
+            branch,
+            terminal_keys,
+        } => {
             info!(%branch, "removing checkout");
             let result = if let Some(cm) = registry.checkout_managers.values().next() {
                 Some(cm.remove_checkout(repo_root, &branch).await)
@@ -124,7 +127,21 @@ pub async fn execute(
                 None
             };
             match result {
-                Some(Ok(())) => CommandResult::Ok,
+                Some(Ok(())) => {
+                    // Best-effort cleanup of correlated terminal sessions
+                    if let Some((_, tp)) = &registry.terminal_pool {
+                        for terminal_id in &terminal_keys {
+                            if let Err(e) = tp.kill_terminal(terminal_id).await {
+                                warn!(
+                                    terminal = %terminal_id,
+                                    err = %e,
+                                    "failed to kill terminal session (best-effort)"
+                                );
+                            }
+                        }
+                    }
+                    CommandResult::Ok
+                }
                 Some(Err(e)) => CommandResult::Error { message: e },
                 None => CommandResult::Error {
                     message: "No checkout manager available".to_string(),
@@ -1235,6 +1252,7 @@ mod tests {
         let result = run_execute(
             Command::RemoveCheckout {
                 branch: "old".to_string(),
+                terminal_keys: vec![],
             },
             &registry,
             &empty_data(),
@@ -1257,6 +1275,7 @@ mod tests {
         let result = run_execute(
             Command::RemoveCheckout {
                 branch: "old".to_string(),
+                terminal_keys: vec![],
             },
             &registry,
             &empty_data(),
@@ -1279,6 +1298,7 @@ mod tests {
         let result = run_execute(
             Command::RemoveCheckout {
                 branch: "main".to_string(),
+                terminal_keys: vec![],
             },
             &registry,
             &empty_data(),
@@ -1287,6 +1307,83 @@ mod tests {
         .await;
 
         assert_error_eq(result, "cannot remove trunk");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: RemoveCheckout — terminal cleanup
+    // -----------------------------------------------------------------------
+
+    struct MockTerminalPool {
+        killed: tokio::sync::Mutex<Vec<ManagedTerminalId>>,
+    }
+
+    #[async_trait]
+    impl TerminalPool for MockTerminalPool {
+        fn display_name(&self) -> &str {
+            "mock-pool"
+        }
+        async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
+            Ok(vec![])
+        }
+        async fn ensure_running(
+            &self,
+            _id: &ManagedTerminalId,
+            _cmd: &str,
+            _cwd: &Path,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn attach_command(
+            &self,
+            _id: &ManagedTerminalId,
+            _cmd: &str,
+            _cwd: &Path,
+        ) -> Result<String, String> {
+            Ok(String::new())
+        }
+        async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
+            self.killed.lock().await.push(id.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_checkout_kills_correlated_terminals() {
+        let terminal_id = ManagedTerminalId {
+            checkout: "feat-x".into(),
+            role: "shell".into(),
+            index: 0,
+        };
+        let mock_pool = Arc::new(MockTerminalPool {
+            killed: tokio::sync::Mutex::new(vec![]),
+        });
+
+        let mut registry = empty_registry();
+        registry.checkout_managers.insert(
+            "wt".to_string(),
+            Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")),
+        );
+        registry.terminal_pool = Some((
+            "shpool".into(),
+            Arc::clone(&mock_pool) as Arc<dyn TerminalPool>,
+        ));
+
+        let runner = runner_ok();
+        let result = run_execute(
+            Command::RemoveCheckout {
+                branch: "feat-x".into(),
+                terminal_keys: vec![terminal_id.clone()],
+            },
+            &registry,
+            &empty_data(),
+            &runner,
+        )
+        .await;
+
+        assert_ok(result);
+        let killed = mock_pool.killed.lock().await;
+        assert_eq!(killed.len(), 1);
+        assert_eq!(killed[0], terminal_id);
     }
 
     // -----------------------------------------------------------------------
