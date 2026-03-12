@@ -169,6 +169,62 @@ impl ShpoolTerminalPool {
         // shpool is Unix-only
     }
 
+    /// Gracefully stop a running shpool daemon by sending SIGTERM and
+    /// waiting for it to exit. Removes the socket and pid files afterward.
+    /// This is load-bearing: `start_daemon()` checks socket existence as
+    /// its first guard, so the socket must be gone for a replacement to spawn.
+    #[cfg(unix)]
+    async fn stop_daemon(socket_path: &Path) {
+        let pid_path = socket_path.with_file_name("daemonized-shpool.pid");
+
+        // Read and parse the pid — if we can't, just clean up files
+        let pid = match std::fs::read_to_string(&pid_path) {
+            Ok(contents) => match contents.trim().parse::<i32>().ok().filter(|&p| p > 0) {
+                Some(pid) => pid,
+                None => {
+                    tracing::warn!("shpool pid file unparseable, removing socket");
+                    let _ = std::fs::remove_file(socket_path);
+                    let _ = std::fs::remove_file(&pid_path);
+                    return;
+                }
+            },
+            Err(_) => {
+                tracing::warn!("no shpool pid file found, removing socket");
+                let _ = std::fs::remove_file(socket_path);
+                return;
+            }
+        };
+
+        // Send SIGTERM
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if rc != 0 {
+            tracing::warn!(%pid, "failed to send SIGTERM to shpool daemon");
+            let _ = std::fs::remove_file(socket_path);
+            let _ = std::fs::remove_file(&pid_path);
+            return;
+        }
+
+        // Wait for process to exit (up to 2s)
+        for _ in 0..20 {
+            if !Self::is_process_alive(pid) {
+                tracing::debug!(%pid, "shpool daemon exited after SIGTERM");
+                let _ = std::fs::remove_file(socket_path);
+                let _ = std::fs::remove_file(&pid_path);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        tracing::warn!(%pid, "shpool daemon did not exit within 2s after SIGTERM");
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[cfg(not(unix))]
+    async fn stop_daemon(_socket_path: &Path) {
+        // shpool is Unix-only
+    }
+
     /// Write the flotilla-managed shpool config if it doesn't exist or is stale.
     /// Returns true if the config was written (changed), false if it already matched or write failed.
     fn ensure_config(path: &Path) -> bool {
@@ -575,6 +631,36 @@ mod tests {
 
         // Nothing exists — should not panic
         ShpoolTerminalPool::clean_stale_socket(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_cleans_up_dead_pid() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let socket_path = dir.path().join("shpool.socket");
+        let pid_path = dir.path().join("daemonized-shpool.pid");
+
+        // Create fake socket and pid file pointing to a dead process
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+        std::fs::write(&pid_path, "99999999").expect("create fake pid");
+
+        ShpoolTerminalPool::stop_daemon(&socket_path).await;
+
+        assert!(!socket_path.exists(), "socket should be removed");
+        assert!(!pid_path.exists(), "pid file should be removed");
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_handles_missing_pid_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let socket_path = dir.path().join("shpool.socket");
+
+        // Socket exists but no pid file — should not panic
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+
+        ShpoolTerminalPool::stop_daemon(&socket_path).await;
+
+        // Socket should still be removed (best-effort cleanup)
+        assert!(!socket_path.exists(), "socket should be removed");
     }
 
     /// Create a ShpoolTerminalPool via the async factory method.
