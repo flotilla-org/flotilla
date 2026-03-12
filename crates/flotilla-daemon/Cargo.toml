@@ -18,6 +18,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+indexmap = { workspace = true }
 tempfile = "3"
 flotilla-client = { path = "../flotilla-client" }
 flotilla-protocol = { path = "../flotilla-protocol" }
