@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -75,6 +76,31 @@ pub struct RepoGitConfig {
 pub struct RepoCheckoutsOverride {
     pub path: Option<String>,
     pub provider: Option<String>,
+}
+
+/// Remote host configuration for multi-host mode.
+/// Loaded from `~/.config/flotilla/hosts.toml`.
+#[derive(Debug, Default, Deserialize)]
+pub struct HostsConfig {
+    #[serde(default)]
+    pub hosts: HashMap<String, RemoteHostConfig>,
+}
+
+/// Configuration for a single remote host.
+#[derive(Debug, Deserialize)]
+pub struct RemoteHostConfig {
+    pub hostname: String,
+    pub user: Option<String>,
+    pub daemon_socket: String,
+}
+
+/// Daemon-level configuration.
+/// Loaded from `~/.config/flotilla/daemon.toml`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default)]
+    pub follower: bool,
+    pub host_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +260,28 @@ impl ConfigStore {
                 })
                 .unwrap_or_default()
         })
+    }
+
+    /// Load remote hosts config from `~/.config/flotilla/hosts.toml`.
+    pub fn load_hosts(&self) -> HostsConfig {
+        let path = self.base_path().join("hosts.toml");
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            toml::from_str(&content).unwrap_or_default()
+        } else {
+            HostsConfig::default()
+        }
+    }
+
+    /// Load daemon config from `~/.config/flotilla/daemon.toml`.
+    pub fn load_daemon_config(&self) -> DaemonConfig {
+        let path = self.base_path().join("daemon.toml");
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            toml::from_str(&content).unwrap_or_default()
+        } else {
+            DaemonConfig::default()
+        }
     }
 
     /// Resolve checkouts config for a repo: per-repo override > global > defaults.
@@ -595,5 +643,89 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = ConfigStore::with_base(dir.path());
         assert_eq!(store.base_path(), dir.path());
+    }
+
+    #[test]
+    fn parse_hosts_config() {
+        let toml = r#"
+[hosts.desktop]
+hostname = "desktop.local"
+user = "robert"
+daemon_socket = "/run/user/1000/flotilla/daemon.sock"
+
+[hosts.cloud]
+hostname = "10.0.1.50"
+daemon_socket = "/home/robert/.config/flotilla/daemon.sock"
+"#;
+        let config: HostsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.hosts.len(), 2);
+        assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
+        assert_eq!(config.hosts["desktop"].user, Some("robert".into()));
+        assert_eq!(config.hosts["cloud"].user, None);
+    }
+
+    #[test]
+    fn parse_daemon_config_follower() {
+        let toml = r#"
+follower = true
+host_name = "my-desktop"
+"#;
+        let config: DaemonConfig = toml::from_str(toml).unwrap();
+        assert!(config.follower);
+        assert_eq!(config.host_name, Some("my-desktop".into()));
+    }
+
+    #[test]
+    fn parse_daemon_config_defaults() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert!(!config.follower);
+        assert_eq!(config.host_name, None);
+    }
+
+    #[test]
+    fn load_hosts_missing_file_returns_default() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::with_base(dir.path());
+        let config = store.load_hosts();
+        assert!(config.hosts.is_empty());
+    }
+
+    #[test]
+    fn load_hosts_from_file() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("hosts.toml"),
+            "[hosts.desktop]\nhostname = \"desktop.local\"\ndaemon_socket = \"/tmp/d.sock\"\n",
+        )
+        .unwrap();
+        let store = ConfigStore::with_base(base);
+        let config = store.load_hosts();
+        assert_eq!(config.hosts.len(), 1);
+        assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
+    }
+
+    #[test]
+    fn load_daemon_config_missing_file_returns_default() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::with_base(dir.path());
+        let config = store.load_daemon_config();
+        assert!(!config.follower);
+        assert_eq!(config.host_name, None);
+    }
+
+    #[test]
+    fn load_daemon_config_from_file() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("daemon.toml"),
+            "follower = true\nhost_name = \"my-host\"\n",
+        )
+        .unwrap();
+        let store = ConfigStore::with_base(base);
+        let config = store.load_daemon_config();
+        assert!(config.follower);
+        assert_eq!(config.host_name, Some("my-host".into()));
     }
 }

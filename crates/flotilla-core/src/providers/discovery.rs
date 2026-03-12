@@ -125,6 +125,12 @@ fn detect_host_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// Extract a RepoIdentity from a git remote URL.
+/// Delegates to `RepoIdentity::from_remote_url`.
+pub fn extract_repo_identity(url: &str) -> Option<flotilla_protocol::RepoIdentity> {
+    flotilla_protocol::RepoIdentity::from_remote_url(url)
+}
+
 /// Extract "owner/repo" from a git remote URL.
 /// Handles SSH (git@github.com:owner/repo.git) and HTTPS (https://github.com/owner/repo.git).
 pub fn extract_repo_slug(url: &str) -> Option<String> {
@@ -519,6 +525,18 @@ mod tests {
         );
         std::fs::write(repo_file, content).unwrap();
         ConfigStore::with_base(base)
+    }
+
+    #[test]
+    fn test_extract_repo_identity() {
+        let id = extract_repo_identity("git@github.com:rjwittams/flotilla.git");
+        assert_eq!(
+            id,
+            Some(flotilla_protocol::RepoIdentity {
+                authority: "github.com".into(),
+                path: "rjwittams/flotilla".into(),
+            })
+        );
     }
 
     #[test]
