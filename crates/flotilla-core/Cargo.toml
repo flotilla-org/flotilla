@@ -3,6 +3,10 @@ name = "flotilla-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+replay = []
+
 [dependencies]
 flotilla-protocol = { path = "../flotilla-protocol" }
 tokio = { workspace = true }
