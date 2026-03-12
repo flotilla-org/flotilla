@@ -54,6 +54,18 @@ impl ShpoolTerminalPool {
         }
     }
 
+    /// Check if a process is alive. Returns true for both "alive and ours"
+    /// (kill returns 0) and "alive but not ours" (EPERM).
+    #[cfg(unix)]
+    fn is_process_alive(pid: i32) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // EPERM means the process exists but we can't signal it
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
     /// Remove stale shpool socket and pid files when the daemon is dead.
     ///
     /// On macOS, `connect()` to a stale Unix socket succeeds (unlike Linux
@@ -70,9 +82,7 @@ impl ShpoolTerminalPool {
         match std::fs::read_to_string(&pid_path) {
             Ok(contents) => {
                 if let Some(pid) = contents.trim().parse::<i32>().ok().filter(|&p| p > 0) {
-                    // Signal 0 checks process existence without sending a signal
-                    let alive = unsafe { libc::kill(pid, 0) } == 0;
-                    if alive {
+                    if Self::is_process_alive(pid) {
                         tracing::debug!(%pid, "shpool daemon is alive, keeping socket");
                         return;
                     }
