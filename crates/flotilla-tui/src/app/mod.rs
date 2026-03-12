@@ -19,7 +19,7 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{self, GroupEntry, SectionLabels};
 use flotilla_protocol::{
-    Command, DaemonEvent, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot,
+    Command, DaemonEvent, HostName, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot,
     SnapshotDelta, WorkItem,
 };
 use std::collections::VecDeque;
@@ -75,6 +75,8 @@ pub struct TuiModel {
     /// Key: (repo_path, provider_category, provider_name)
     pub provider_statuses: HashMap<(PathBuf, String, String), ProviderStatus>,
     pub status_message: Option<String>,
+    /// The daemon's hostname, set from the first Snapshot received.
+    pub my_host: Option<HostName>,
 }
 
 impl TuiModel {
@@ -105,6 +107,7 @@ impl TuiModel {
             active_repo: 0,
             provider_statuses: HashMap::new(),
             status_message: None,
+            my_host: None,
         }
     }
 
@@ -220,6 +223,10 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snap: Snapshot) {
+        if self.model.my_host.is_none() {
+            self.model.my_host = Some(snap.host_name.clone());
+        }
+
         let path = snap.repo.clone();
         let rm = match self.model.repos.get_mut(&path) {
             Some(rm) => rm,

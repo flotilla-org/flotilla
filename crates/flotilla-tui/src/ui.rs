@@ -20,7 +20,7 @@ use crate::app::{
 use crate::event_log::{self, LevelExt};
 use crate::ui_helpers;
 use flotilla_core::data::{GroupEntry, SectionHeader};
-use flotilla_protocol::{ProviderData, WorkItem};
+use flotilla_protocol::{HostName, ProviderData, WorkItem};
 
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
@@ -399,6 +399,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
                         &col_widths,
                         model.active_repo_root(),
                         prev_source.as_deref(),
+                        model.my_host.as_ref(),
                     );
                     prev_source = item.source.clone();
                     if is_multi_selected {
@@ -482,6 +483,7 @@ fn build_item_row<'a>(
     col_widths: &[u16],
     repo_root: &Path,
     prev_source: Option<&str>,
+    my_host: Option<&HostName>,
 ) -> Row<'a> {
     let session_status = item
         .session_key
@@ -491,9 +493,12 @@ fn build_item_row<'a>(
     let (icon, icon_color) =
         ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
 
+    let is_remote = my_host.is_some_and(|h| h != &item.host);
     let source_display = match item.source.as_deref() {
         Some(s) if prev_source == Some(s) => String::new(),
+        Some(s) if is_remote => format!("{}:{}", item.host, s),
         Some(s) => s.to_string(),
+        None if is_remote => item.host.to_string(),
         None => String::new(),
     };
 
