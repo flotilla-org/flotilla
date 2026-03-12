@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::providers::types::*;
 use crate::providers::{run, CommandRunner};
@@ -37,17 +37,25 @@ impl CmuxWorkspaceManager {
             .unwrap_or("")
             .to_string()
     }
-}
 
-#[async_trait]
-impl super::WorkspaceManager for CmuxWorkspaceManager {
-    fn display_name(&self) -> &str {
-        "cmux Workspaces"
+    fn parse_window_refs(output: &str) -> Result<Vec<String>, String> {
+        let parsed: serde_json::Value = serde_json::from_str(output).map_err(|e| e.to_string())?;
+        let windows = parsed["windows"]
+            .as_array()
+            .ok_or("cmux list-windows: response missing 'windows' array")?;
+        let mut refs = Vec::new();
+        for window in windows {
+            if let Some(window_ref) = window["ref"].as_str() {
+                refs.push(window_ref.to_string());
+            } else {
+                warn!(window = %window, "cmux: skipping window without ref");
+            }
+        }
+        Ok(refs)
     }
 
-    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
-        let output = self.cmux_cmd(&["--json", "list-workspaces"]).await?;
-        let parsed: serde_json::Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
+    fn parse_workspaces(output: &str) -> Result<Vec<(String, Workspace)>, String> {
+        let parsed: serde_json::Value = serde_json::from_str(output).map_err(|e| e.to_string())?;
         let workspaces = parsed["workspaces"]
             .as_array()
             .ok_or("cmux list-workspaces: response missing 'workspaces' array")?;
@@ -85,6 +93,49 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
                 ))
             })
             .collect())
+    }
+}
+
+#[async_trait]
+impl super::WorkspaceManager for CmuxWorkspaceManager {
+    fn display_name(&self) -> &str {
+        "cmux Workspaces"
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+        let windows_output = self.cmux_cmd(&["--json", "list-windows"]).await?;
+        let window_refs = Self::parse_window_refs(&windows_output)?;
+        let mut seen = HashSet::new();
+        let mut workspaces = Vec::new();
+
+        for window_ref in window_refs {
+            let output = match self
+                .cmux_cmd(&["--json", "list-workspaces", "--window", &window_ref])
+                .await
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    warn!(%window_ref, %err, "cmux: failed to list workspaces for window");
+                    continue;
+                }
+            };
+
+            let parsed = match Self::parse_workspaces(&output) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    warn!(%window_ref, %err, "cmux: failed to parse workspaces for window");
+                    continue;
+                }
+            };
+
+            for (ws_ref, workspace) in parsed {
+                if seen.insert(ws_ref.clone()) {
+                    workspaces.push((ws_ref, workspace));
+                }
+            }
+        }
+
+        Ok(workspaces)
     }
 
     async fn create_workspace(
@@ -312,11 +363,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_workspaces_parses_json_response() {
-        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Ok(
-            r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo","/tmp/repo2"]}]}"#.to_string(),
-        )])));
-
-        let workspaces = manager.list_workspaces().await.expect("list workspaces");
+        let output = r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo","/tmp/repo2"]}]}"#;
+        let workspaces = CmuxWorkspaceManager::parse_workspaces(output).expect("parse workspaces");
         assert_eq!(workspaces.len(), 1);
         let (ws_ref, ws) = &workspaces[0];
         assert_eq!(ws_ref, "workspace:10");
@@ -326,6 +374,87 @@ mod tests {
             vec![PathBuf::from("/tmp/repo"), PathBuf::from("/tmp/repo2")]
         );
         assert_eq!(ws.correlation_keys.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_aggregates_all_windows() {
+        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
+            Ok(r#"{"windows":[{"ref":"window:1"},{"ref":"window:2"}]}"#.to_string()),
+            Ok(
+                r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo-a"]}]}"#
+                    .to_string(),
+            ),
+            Ok(
+                r#"{"workspaces":[{"ref":"workspace:11","title":"Feature","directories":["/tmp/repo-b"]}]}"#
+                    .to_string(),
+            ),
+        ])));
+
+        let workspaces = manager.list_workspaces().await.expect("list workspaces");
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].0, "workspace:10");
+        assert_eq!(workspaces[1].0, "workspace:11");
+        assert_eq!(
+            workspaces[0].1.correlation_keys,
+            vec![CorrelationKey::CheckoutPath(PathBuf::from("/tmp/repo-a"))]
+        );
+        assert_eq!(
+            workspaces[1].1.correlation_keys,
+            vec![CorrelationKey::CheckoutPath(PathBuf::from("/tmp/repo-b"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_skips_failed_window() {
+        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
+            Ok(r#"{"windows":[{"ref":"window:1"},{"ref":"window:2"}]}"#.to_string()),
+            Ok(
+                r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo-a"]}]}"#
+                    .to_string(),
+            ),
+            Err("window gone".to_string()),
+        ])));
+
+        let workspaces = manager.list_workspaces().await.expect("list workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].0, "workspace:10");
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_fails_when_window_listing_fails() {
+        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Err(
+            "cmux unavailable".to_string(),
+        )])));
+
+        let err = manager
+            .list_workspaces()
+            .await
+            .expect_err("window listing should fail");
+        assert!(err.contains("cmux unavailable"));
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_dedupes_duplicate_workspace_refs() {
+        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
+            Ok(r#"{"windows":[{"ref":"window:1"},{"ref":"window:2"}]}"#.to_string()),
+            Ok(
+                r#"{"workspaces":[{"ref":"workspace:10","title":"Main","directories":["/tmp/repo-a"]}]}"#
+                    .to_string(),
+            ),
+            Ok(
+                r#"{"workspaces":[{"ref":"workspace:10","title":"Main Copy","directories":["/tmp/repo-b"]}]}"#
+                    .to_string(),
+            ),
+        ])));
+
+        let workspaces = manager.list_workspaces().await.expect("list workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].0, "workspace:10");
+        assert_eq!(workspaces[0].1.name, "Main");
+        assert_eq!(
+            workspaces[0].1.directories,
+            vec![PathBuf::from("/tmp/repo-a")]
+        );
     }
 
     #[tokio::test]

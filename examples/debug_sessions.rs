@@ -112,7 +112,12 @@ async fn main() {
             )
         })
         .collect();
-    let table_view = data::group_work_items(&work_items, &snapshot.providers, &section_labels);
+    let table_view = data::group_work_items(
+        &work_items,
+        &snapshot.providers,
+        &section_labels,
+        &repo_root,
+    );
     for (i, entry) in table_view.table_entries.iter().enumerate() {
         match entry {
             data::GroupEntry::Header(h) => {

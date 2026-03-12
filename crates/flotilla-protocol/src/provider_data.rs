@@ -127,6 +127,7 @@ pub enum SessionStatus {
     Running,
     Idle,
     Archived,
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -365,6 +366,7 @@ mod tests {
             SessionStatus::Running,
             SessionStatus::Idle,
             SessionStatus::Archived,
+            SessionStatus::Expired,
         ] {
             assert_roundtrip(&status);
         }

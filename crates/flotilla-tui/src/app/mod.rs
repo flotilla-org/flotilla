@@ -266,7 +266,8 @@ impl App {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.sessions.section.clone(),
         };
-        let table_view = data::group_work_items(&snap.work_items, &rm.providers, &section_labels);
+        let table_view =
+            data::group_work_items(&snap.work_items, &rm.providers, &section_labels, &path);
 
         // Provider health -> model-level statuses (now 1:1)
         for (category, providers) in &rm.provider_health {
@@ -378,7 +379,8 @@ impl App {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.sessions.section.clone(),
         };
-        let table_view = data::group_work_items(&delta.work_items, &rm.providers, &section_labels);
+        let table_view =
+            data::group_work_items(&delta.work_items, &rm.providers, &section_labels, &path);
 
         // Provider health -> model-level statuses (now 1:1)
         for (category, providers) in &rm.provider_health {
