@@ -6,16 +6,6 @@ use std::path::Path;
 
 #[async_trait]
 pub trait IssueTracker: Send + Sync {
-    fn display_name(&self) -> &str;
-    fn section_label(&self) -> &str {
-        "Issues"
-    }
-    fn item_noun(&self) -> &str {
-        "issue"
-    }
-    fn abbreviation(&self) -> &str {
-        "#"
-    }
     async fn list_issues(
         &self,
         repo_root: &Path,

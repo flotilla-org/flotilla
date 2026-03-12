@@ -407,7 +407,6 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
     };
     let rendered = tmpl.render(&config.template_vars);
     info!(
-        pool = %terminal_pool.display_name(),
         count = rendered.content.len(),
         "terminal pool: resolving content entries",
     );
@@ -598,9 +597,6 @@ mod tests {
 
     #[async_trait]
     impl CheckoutManager for MockCheckoutManager {
-        fn display_name(&self) -> &str {
-            "mock-checkout"
-        }
         async fn list_checkouts(
             &self,
             _repo_root: &Path,
@@ -652,9 +648,6 @@ mod tests {
 
     #[async_trait]
     impl WorkspaceManager for MockWorkspaceManager {
-        fn display_name(&self) -> &str {
-            "mock-ws"
-        }
         async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
             Ok(vec![])
         }
@@ -686,9 +679,6 @@ mod tests {
 
     #[async_trait]
     impl CodeReview for MockCodeReview {
-        fn display_name(&self) -> &str {
-            "mock-cr"
-        }
         async fn list_change_requests(
             &self,
             _repo_root: &Path,
@@ -723,9 +713,6 @@ mod tests {
 
     #[async_trait]
     impl IssueTracker for MockIssueTracker {
-        fn display_name(&self) -> &str {
-            "mock-issues"
-        }
         async fn list_issues(
             &self,
             _repo_root: &Path,
@@ -769,9 +756,6 @@ mod tests {
 
     #[async_trait]
     impl CloudAgentService for MockCloudAgent {
-        fn display_name(&self) -> &str {
-            "mock-agent"
-        }
         async fn list_sessions(
             &self,
             _criteria: &RepoCriteria,
@@ -808,9 +792,6 @@ mod tests {
 
     #[async_trait]
     impl crate::providers::ai_utility::AiUtility for MockAiUtility {
-        fn display_name(&self) -> &str {
-            "mock-ai"
-        }
         async fn generate_branch_name(&self, _context: &str) -> Result<String, String> {
             let result = self.result.lock().await;
             result.clone()
@@ -1370,9 +1351,6 @@ mod tests {
 
     #[async_trait]
     impl TerminalPool for MockTerminalPool {
-        fn display_name(&self) -> &str {
-            "mock-pool"
-        }
         async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
             Ok(vec![])
         }

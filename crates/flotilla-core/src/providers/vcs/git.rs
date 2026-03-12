@@ -20,10 +20,6 @@ use super::TRUNK_NAMES;
 
 #[async_trait]
 impl super::Vcs for GitVcs {
-    fn display_name(&self) -> &str {
-        "Git"
-    }
-
     fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
         // git-common-dir points to the shared .git dir (same as .git for
         // non-worktree repos, the main repo's .git for worktrees).

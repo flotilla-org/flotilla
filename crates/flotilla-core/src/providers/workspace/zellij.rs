@@ -151,10 +151,6 @@ impl ZellijWorkspaceManager {
 
 #[async_trait]
 impl super::WorkspaceManager for ZellijWorkspaceManager {
-    fn display_name(&self) -> &str {
-        "zellij Workspaces"
-    }
-
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let output = self.zellij_action(&["query-tab-names"]).await?;
         let tab_names: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();

@@ -291,10 +291,6 @@ impl ClaudeCodingAgent {
 
 #[async_trait]
 impl super::CloudAgentService for ClaudeCodingAgent {
-    fn display_name(&self) -> &str {
-        "Claude Code Web"
-    }
-
     async fn list_sessions(
         &self,
         criteria: &RepoCriteria,

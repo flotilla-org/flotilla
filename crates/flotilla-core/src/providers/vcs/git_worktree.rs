@@ -223,17 +223,6 @@ fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
 
 #[async_trait]
 impl super::CheckoutManager for GitCheckoutManager {
-    fn display_name(&self) -> &str {
-        "git"
-    }
-
-    fn item_noun(&self) -> &str {
-        "worktree"
-    }
-    fn abbreviation(&self) -> &str {
-        "WT"
-    }
-
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
         let output = run!(
             self.runner,

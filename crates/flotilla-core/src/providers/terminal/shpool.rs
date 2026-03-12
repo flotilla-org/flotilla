@@ -246,10 +246,6 @@ impl ShpoolTerminalPool {
 
 #[async_trait]
 impl TerminalPool for ShpoolTerminalPool {
-    fn display_name(&self) -> &str {
-        "shpool"
-    }
-
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
@@ -569,9 +565,9 @@ mod tests {
         // No mock responses needed — start_daemon spawns shpool directly
         // (not through MockRunner), and will fail gracefully in test.
         let runner = Arc::new(MockRunner::new(vec![]));
-        let (pool, dir) = test_pool_async(runner).await;
+        let (_pool, dir) = test_pool_async(runner).await;
         let config_path = dir.path().join("config.toml");
         assert!(config_path.exists(), "config should be written");
-        assert_eq!(pool.display_name(), "shpool");
+        // display_name removed — verified via ProviderDescriptor now
     }
 }

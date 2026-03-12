@@ -457,10 +457,6 @@ mod tests {
 
     #[async_trait]
     impl CheckoutManager for MockCheckoutManager {
-        fn display_name(&self) -> &str {
-            "mock-checkout"
-        }
-
         async fn list_checkouts(
             &self,
             _repo_root: &Path,
@@ -485,7 +481,6 @@ mod tests {
     struct MockCodeReview {
         change_requests_result: Result<Vec<(String, ChangeRequest)>, String>,
         merged_result: Result<Vec<String>, String>,
-        display_name: String,
     }
 
     impl MockCodeReview {
@@ -493,7 +488,6 @@ mod tests {
             Self {
                 change_requests_result: Ok(change_requests),
                 merged_result: Ok(merged_branches),
-                display_name: "MockCR".into(),
             }
         }
 
@@ -501,17 +495,12 @@ mod tests {
             Self {
                 change_requests_result: Err(change_requests_msg.to_string()),
                 merged_result: Err(merged_msg.to_string()),
-                display_name: "MockCR".into(),
             }
         }
     }
 
     #[async_trait]
     impl CodeReview for MockCodeReview {
-        fn display_name(&self) -> &str {
-            &self.display_name
-        }
-
         async fn list_change_requests(
             &self,
             _repo_root: &Path,
@@ -547,45 +536,36 @@ mod tests {
 
     struct MockCloudAgent {
         result: Result<Vec<(String, CloudAgentSession)>, String>,
-        display_name: String,
     }
 
     impl MockCloudAgent {
         fn ok(sessions: Vec<(String, CloudAgentSession)>) -> Self {
             Self {
                 result: Ok(sessions),
-                display_name: "MockCA".into(),
             }
         }
 
-        fn ok_named(name: &str, sessions: Vec<(String, CloudAgentSession)>) -> Self {
+        fn ok_named(_name: &str, sessions: Vec<(String, CloudAgentSession)>) -> Self {
             Self {
                 result: Ok(sessions),
-                display_name: name.into(),
             }
         }
 
         fn failing(msg: &str) -> Self {
             Self {
                 result: Err(msg.to_string()),
-                display_name: "MockCA".into(),
             }
         }
 
-        fn failing_named(name: &str, msg: &str) -> Self {
+        fn failing_named(_name: &str, msg: &str) -> Self {
             Self {
                 result: Err(msg.to_string()),
-                display_name: name.into(),
             }
         }
     }
 
     #[async_trait]
     impl CloudAgentService for MockCloudAgent {
-        fn display_name(&self) -> &str {
-            &self.display_name
-        }
-
         async fn list_sessions(
             &self,
             _criteria: &RepoCriteria,
@@ -622,10 +602,6 @@ mod tests {
 
     #[async_trait]
     impl Vcs for MockVcs {
-        fn display_name(&self) -> &str {
-            "mock-vcs"
-        }
-
         fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
             None
         }
@@ -688,10 +664,6 @@ mod tests {
 
     #[async_trait]
     impl WorkspaceManager for MockWorkspaceManager {
-        fn display_name(&self) -> &str {
-            "mock-ws"
-        }
-
         async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
             self.result.clone()
         }

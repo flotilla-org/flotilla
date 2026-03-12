@@ -14,7 +14,6 @@ pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 #[allow(dead_code)]
 #[async_trait]
 pub trait Vcs: Send + Sync {
-    fn display_name(&self) -> &str;
     /// Given any path (possibly inside a worktree/checkout), resolve to the
     /// main repository root. Returns None if the path is not inside a repo.
     fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf>;
@@ -41,16 +40,6 @@ pub trait Vcs: Send + Sync {
 
 #[async_trait]
 pub trait CheckoutManager: Send + Sync {
-    fn display_name(&self) -> &str;
-    fn section_label(&self) -> &str {
-        "Checkouts"
-    }
-    fn item_noun(&self) -> &str {
-        "checkout"
-    }
-    fn abbreviation(&self) -> &str {
-        "CO"
-    }
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String>;
     async fn create_checkout(
         &self,

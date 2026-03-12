@@ -14,16 +14,6 @@ static REQUEST_FACTORY: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Clien
 
 #[async_trait]
 pub trait CloudAgentService: Send + Sync {
-    fn display_name(&self) -> &str;
-    fn section_label(&self) -> &str {
-        "Cloud Agents"
-    }
-    fn item_noun(&self) -> &str {
-        "agent"
-    }
-    fn abbreviation(&self) -> &str {
-        "Agt"
-    }
     async fn list_sessions(
         &self,
         criteria: &RepoCriteria,

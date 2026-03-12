@@ -204,9 +204,6 @@ mod tests {
     struct StubVcs;
     #[async_trait]
     impl Vcs for StubVcs {
-        fn display_name(&self) -> &str {
-            "StubVcs"
-        }
         fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
             None
         }
@@ -254,15 +251,6 @@ mod tests {
     struct StubCheckoutManager;
     #[async_trait]
     impl CheckoutManager for StubCheckoutManager {
-        fn display_name(&self) -> &str {
-            "StubCM"
-        }
-        fn item_noun(&self) -> &str {
-            "worktree"
-        }
-        fn abbreviation(&self) -> &str {
-            "WT"
-        }
         async fn list_checkouts(
             &self,
             _: &Path,
@@ -285,18 +273,6 @@ mod tests {
     struct StubCodeReview;
     #[async_trait]
     impl CodeReview for StubCodeReview {
-        fn display_name(&self) -> &str {
-            "StubCR"
-        }
-        fn section_label(&self) -> &str {
-            "Pull Requests"
-        }
-        fn item_noun(&self) -> &str {
-            "pull request"
-        }
-        fn abbreviation(&self) -> &str {
-            "PR"
-        }
         async fn list_change_requests(
             &self,
             _: &Path,
@@ -329,18 +305,6 @@ mod tests {
     struct StubIssueTracker;
     #[async_trait]
     impl IssueTracker for StubIssueTracker {
-        fn display_name(&self) -> &str {
-            "StubIT"
-        }
-        fn section_label(&self) -> &str {
-            "GitHub Issues"
-        }
-        fn item_noun(&self) -> &str {
-            "issue"
-        }
-        fn abbreviation(&self) -> &str {
-            "#"
-        }
         async fn list_issues(
             &self,
             _: &Path,
@@ -356,18 +320,6 @@ mod tests {
     struct StubCloudAgent;
     #[async_trait]
     impl CloudAgentService for StubCloudAgent {
-        fn display_name(&self) -> &str {
-            "StubCA"
-        }
-        fn section_label(&self) -> &str {
-            "Cloud Agents"
-        }
-        fn item_noun(&self) -> &str {
-            "session"
-        }
-        fn abbreviation(&self) -> &str {
-            "CS"
-        }
         async fn list_sessions(
             &self,
             _: &RepoCriteria,
@@ -385,9 +337,6 @@ mod tests {
     struct StubAiUtility;
     #[async_trait]
     impl AiUtility for StubAiUtility {
-        fn display_name(&self) -> &str {
-            "StubAI"
-        }
         async fn generate_branch_name(&self, _: &str) -> Result<String, String> {
             Ok("stub".into())
         }
@@ -396,9 +345,6 @@ mod tests {
     struct StubWorkspaceManager;
     #[async_trait]
     impl WorkspaceManager for StubWorkspaceManager {
-        fn display_name(&self) -> &str {
-            "StubWM"
-        }
         async fn list_workspaces(
             &self,
         ) -> Result<Vec<(String, crate::providers::types::Workspace)>, String> {

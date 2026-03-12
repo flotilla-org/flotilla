@@ -99,10 +99,6 @@ impl CmuxWorkspaceManager {
 
 #[async_trait]
 impl super::WorkspaceManager for CmuxWorkspaceManager {
-    fn display_name(&self) -> &str {
-        "cmux Workspaces"
-    }
-
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let windows_output = self.cmux_cmd(&["--json", "list-windows"]).await?;
         let window_refs = Self::parse_window_refs(&windows_output)?;

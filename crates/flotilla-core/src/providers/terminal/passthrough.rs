@@ -7,10 +7,6 @@ pub struct PassthroughTerminalPool;
 
 #[async_trait]
 impl TerminalPool for PassthroughTerminalPool {
-    fn display_name(&self) -> &str {
-        "passthrough"
-    }
-
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
         Ok(vec![])
     }

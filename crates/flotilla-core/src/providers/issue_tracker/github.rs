@@ -60,10 +60,6 @@ fn parse_issue(provider_name: &str, v: &serde_json::Value) -> Option<(String, Is
 
 #[async_trait]
 impl super::IssueTracker for GitHubIssueTracker {
-    fn display_name(&self) -> &str {
-        "GitHub Issues"
-    }
-
     async fn list_issues(
         &self,
         repo_root: &Path,

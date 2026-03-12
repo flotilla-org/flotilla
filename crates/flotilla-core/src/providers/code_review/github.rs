@@ -113,20 +113,6 @@ impl GitHubCodeReview {
 
 #[async_trait]
 impl super::CodeReview for GitHubCodeReview {
-    fn display_name(&self) -> &str {
-        "GitHub Pull Requests"
-    }
-
-    fn section_label(&self) -> &str {
-        "Pull Requests"
-    }
-    fn item_noun(&self) -> &str {
-        "pull request"
-    }
-    fn abbreviation(&self) -> &str {
-        "PR"
-    }
-
     async fn list_change_requests(
         &self,
         repo_root: &Path,

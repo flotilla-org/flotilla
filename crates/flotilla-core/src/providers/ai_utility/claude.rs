@@ -18,10 +18,6 @@ impl ClaudeAiUtility {
 
 #[async_trait]
 impl super::AiUtility for ClaudeAiUtility {
-    fn display_name(&self) -> &str {
-        "Claude AI"
-    }
-
     async fn generate_branch_name(&self, context: &str) -> Result<String, String> {
         info!("ai: generating branch name");
         let prompt = format!(

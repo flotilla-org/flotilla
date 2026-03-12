@@ -41,7 +41,7 @@ async fn main() {
     ];
 
     for (name, provider) in &providers {
-        print!("{name} ({}): ", provider.display_name());
+        print!("{name}: ");
         match provider.list_sessions(&criteria).await {
             Ok(sessions) => {
                 println!("{} sessions", sessions.len());

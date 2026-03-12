@@ -8,7 +8,6 @@ use flotilla_protocol::{ManagedTerminal, ManagedTerminalId};
 
 #[async_trait]
 pub trait TerminalPool: Send + Sync {
-    fn display_name(&self) -> &str;
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String>;
     async fn ensure_running(
         &self,

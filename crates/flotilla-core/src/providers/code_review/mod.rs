@@ -6,16 +6,6 @@ use std::path::Path;
 
 #[async_trait]
 pub trait CodeReview: Send + Sync {
-    fn display_name(&self) -> &str;
-    fn section_label(&self) -> &str {
-        "Change Requests"
-    }
-    fn item_noun(&self) -> &str {
-        "change request"
-    }
-    fn abbreviation(&self) -> &str {
-        "CR"
-    }
     async fn list_change_requests(
         &self,
         repo_root: &Path,

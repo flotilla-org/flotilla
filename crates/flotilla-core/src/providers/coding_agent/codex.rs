@@ -436,18 +436,6 @@ fn is_auth_error(e: &str) -> bool {
 
 #[async_trait]
 impl super::CloudAgentService for CodexCodingAgent {
-    fn display_name(&self) -> &str {
-        "Codex"
-    }
-
-    fn item_noun(&self) -> &str {
-        "task"
-    }
-
-    fn abbreviation(&self) -> &str {
-        "Cdx"
-    }
-
     async fn list_sessions(
         &self,
         criteria: &RepoCriteria,

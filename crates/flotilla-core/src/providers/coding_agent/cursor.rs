@@ -171,10 +171,6 @@ fn repo_slug_from_cursor_repository(repository: &str) -> Option<String> {
 
 #[async_trait]
 impl super::CloudAgentService for CursorCodingAgent {
-    fn display_name(&self) -> &str {
-        "Cursor Cloud Agents"
-    }
-
     async fn list_sessions(
         &self,
         criteria: &RepoCriteria,
@@ -363,11 +359,5 @@ mod tests {
         let agent = cursor_service();
         let cmd = agent.attach_command("sess-42").await.unwrap();
         assert_eq!(cmd, "agent --resume sess-42");
-    }
-
-    #[tokio::test]
-    async fn display_name_returns_expected() {
-        let agent = cursor_service();
-        assert_eq!(agent.display_name(), "Cursor Cloud Agents");
     }
 }

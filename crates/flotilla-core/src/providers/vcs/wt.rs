@@ -115,17 +115,6 @@ impl WtCheckoutManager {
 
 #[async_trait]
 impl super::CheckoutManager for WtCheckoutManager {
-    fn display_name(&self) -> &str {
-        "wt"
-    }
-
-    fn item_noun(&self) -> &str {
-        "worktree"
-    }
-    fn abbreviation(&self) -> &str {
-        "WT"
-    }
-
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
         let output = run!(self.runner, "wt", &["list", "--format=json"], repo_root)?;
         let json = Self::strip_to_json(&output);

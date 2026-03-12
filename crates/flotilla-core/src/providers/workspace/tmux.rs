@@ -102,10 +102,6 @@ impl TmuxWorkspaceManager {
 
 #[async_trait]
 impl super::WorkspaceManager for TmuxWorkspaceManager {
-    fn display_name(&self) -> &str {
-        "tmux Workspaces"
-    }
-
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let output = self
             .tmux_cmd(&["list-windows", "-F", "#{window_name}"])
