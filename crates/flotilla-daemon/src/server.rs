@@ -218,7 +218,7 @@ impl DaemonServer {
                     HashMap::new();
                 let peer_names = {
                     let mut pm = peer_manager_task.lock().await;
-                    let names: Vec<HostName> = pm.peers().keys().cloned().collect();
+                    let names = pm.outbound_peer_names();
                     for (name, generation, rx) in pm.connect_all().await {
                         initial_rx_map.insert(name, (generation, rx));
                     }

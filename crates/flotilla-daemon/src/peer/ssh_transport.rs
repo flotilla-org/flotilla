@@ -365,12 +365,6 @@ impl SshTransport {
         std::cmp::min(delay, MAX_BACKOFF)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn should_initiate(local_host: &HostName, expected_host_name: &HostName) -> bool {
-        // Pairwise initiator helper for the planned deterministic connect policy.
-        local_host.as_str() < expected_host_name.as_str()
-    }
-
     fn validate_remote_hello(expected_host_name: &HostName, hello: Message) -> Result<(), String> {
         match hello {
             Message::Hello {
@@ -597,18 +591,6 @@ mod tests {
         let err = SshTransport::validate_remote_hello(&HostName::new("remote"), hello)
             .expect_err("unexpected host name should be rejected");
         assert!(err.contains("host"));
-    }
-
-    #[test]
-    fn pairwise_initiator_prefers_lexicographically_smaller_host() {
-        assert!(SshTransport::should_initiate(
-            &HostName::new("alpha"),
-            &HostName::new("zeta")
-        ));
-        assert!(!SshTransport::should_initiate(
-            &HostName::new("zeta"),
-            &HostName::new("alpha")
-        ));
     }
 
     #[tokio::test]

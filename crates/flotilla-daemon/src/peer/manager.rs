@@ -232,6 +232,67 @@ impl PeerManager {
             && self.senders.contains_key(&hop.next_hop)
     }
 
+    fn should_initiate_peer(&self, peer: &HostName) -> bool {
+        self.local_host.as_str() < peer.as_str()
+    }
+
+    fn retain_unique_hops(hops: &mut Vec<RouteHop>, next_hop: &HostName) {
+        hops.retain(|hop| hop.next_hop != *next_hop);
+    }
+
+    fn observe_route(&mut self, origin: &HostName, via_peer: &HostName, via_generation: u64) {
+        let learned_epoch = self.next_route_epoch();
+        let new_hop = RouteHop {
+            next_hop: via_peer.clone(),
+            next_hop_generation: via_generation,
+            learned_epoch,
+        };
+
+        let Some(mut route) = self.routes.remove(origin) else {
+            self.routes.insert(
+                origin.clone(),
+                RouteState {
+                    primary: new_hop,
+                    fallbacks: Vec::new(),
+                    candidates: Vec::new(),
+                },
+            );
+            return;
+        };
+
+        if route.primary.next_hop == *via_peer {
+            route.primary = new_hop;
+            self.routes.insert(origin.clone(), route);
+            return;
+        }
+
+        Self::retain_unique_hops(&mut route.fallbacks, via_peer);
+        Self::retain_unique_hops(&mut route.candidates, via_peer);
+
+        if origin == via_peer {
+            if self.route_hop_is_live(&route.primary) && route.primary.next_hop != *origin {
+                Self::retain_unique_hops(&mut route.fallbacks, &route.primary.next_hop);
+                route.fallbacks.push(route.primary.clone());
+            }
+            route.primary = new_hop;
+            self.routes.insert(origin.clone(), route);
+            return;
+        }
+
+        if route.primary.next_hop == *origin && self.route_hop_is_live(&route.primary) {
+            route.fallbacks.push(new_hop);
+            self.routes.insert(origin.clone(), route);
+            return;
+        }
+
+        if self.route_hop_is_live(&route.primary) {
+            Self::retain_unique_hops(&mut route.fallbacks, &route.primary.next_hop);
+            route.fallbacks.push(route.primary.clone());
+        }
+        route.primary = new_hop;
+        self.routes.insert(origin.clone(), route);
+    }
+
     fn promote_route_after_disconnect(&mut self, origin: &HostName) -> Option<RouteHop> {
         let mut route = self.routes.remove(origin)?;
 
@@ -329,21 +390,7 @@ impl PeerManager {
                     },
                 );
 
-                if !self.routes.contains_key(&origin) {
-                    let learned_epoch = self.next_route_epoch();
-                    self.routes.insert(
-                        origin.clone(),
-                        RouteState {
-                            primary: RouteHop {
-                                next_hop: via_peer.clone(),
-                                next_hop_generation: via_generation,
-                                learned_epoch,
-                            },
-                            fallbacks: Vec::new(),
-                            candidates: Vec::new(),
-                        },
-                    );
-                }
+                self.observe_route(&origin, via_peer, via_generation);
 
                 HandleResult::Updated(repo)
             }
@@ -474,6 +521,8 @@ impl PeerManager {
                     if self.pending_resync_requests.remove(&key).is_none() {
                         return HandleResult::Ignored;
                     }
+                    self.last_seen_clocks
+                        .remove(&(responder_host.clone(), repo_identity.clone()));
                     return self.store_snapshot_from(
                         &connection_peer,
                         connection_generation,
@@ -599,7 +648,12 @@ impl PeerManager {
     /// inbound message receiver. The caller should spawn forwarding tasks that
     /// feed these receivers into the shared `peer_data_tx` channel.
     pub async fn connect_all(&mut self) -> Vec<(HostName, u64, mpsc::Receiver<PeerWireMessage>)> {
-        let names: Vec<HostName> = self.peers.keys().cloned().collect();
+        let names: Vec<HostName> = self
+            .peers
+            .keys()
+            .filter(|name| self.should_initiate_peer(name))
+            .cloned()
+            .collect();
         let mut receivers = Vec::new();
         for name in names {
             let connect_result = if let Some(transport) = self.peers.get_mut(&name) {
@@ -688,6 +742,14 @@ impl PeerManager {
         &self.peers
     }
 
+    pub fn outbound_peer_names(&self) -> Vec<HostName> {
+        self.peers
+            .keys()
+            .filter(|name| self.should_initiate_peer(name))
+            .cloned()
+            .collect()
+    }
+
     /// Return the currently addressable peers that have active senders.
     pub fn active_peers(&self) -> Vec<HostName> {
         self.senders.keys().cloned().collect()
@@ -750,6 +812,12 @@ impl PeerManager {
         &mut self,
         name: &HostName,
     ) -> Result<(u64, mpsc::Receiver<PeerWireMessage>), String> {
+        if !self.should_initiate_peer(name) {
+            return Err(format!(
+                "outbound connect disabled by pairwise initiator rule for {name}"
+            ));
+        }
+
         let (sender, rx) = {
             let transport = self
                 .peers
@@ -1400,6 +1468,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_all_only_initiates_when_local_host_is_smaller() {
+        let mut mgr = PeerManager::new(HostName::new("m"));
+        mgr.add_peer(HostName::new("z"), Box::new(MockTransport::new()));
+        mgr.add_peer(HostName::new("a"), Box::new(MockTransport::new()));
+
+        let connected = mgr.connect_all().await;
+        let connected_hosts: Vec<HostName> =
+            connected.into_iter().map(|(name, _, _)| name).collect();
+
+        assert_eq!(connected_hosts, vec![HostName::new("z")]);
+        assert_eq!(mgr.outbound_peer_names(), vec![HostName::new("z")]);
+    }
+
+    #[tokio::test]
     async fn late_resync_snapshot_is_dropped_without_pending_request() {
         let mut mgr = PeerManager::new(HostName::new("local"));
         let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
@@ -1573,6 +1655,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_snapshot_refreshes_route_primary_to_live_hop() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let relay_a_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let relay_b_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let relay_a_generation = mgr.activate_connection(
+            HostName::new("relay-a"),
+            relay_a_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+        let relay_b_generation = mgr.activate_connection(
+            HostName::new("relay-b"),
+            relay_b_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        let _ = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Data(snapshot_msg("target", 1)),
+                connection_generation: relay_a_generation,
+                connection_peer: HostName::new("relay-a"),
+            })
+            .await;
+        let _ = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Data(snapshot_msg("target", 2)),
+                connection_generation: relay_b_generation,
+                connection_peer: HostName::new("relay-b"),
+            })
+            .await;
+
+        assert_eq!(
+            mgr.routes[&HostName::new("target")].primary.next_hop,
+            HostName::new("relay-b")
+        );
+        assert_eq!(
+            mgr.routes[&HostName::new("target")].fallbacks[0].next_hop,
+            HostName::new("relay-a")
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_peer_keeps_unrelated_pending_resync_requests() {
         let mut mgr = PeerManager::new(HostName::new("local"));
         let target_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
@@ -1622,6 +1757,82 @@ mod tests {
 
         assert!(mgr.pending_resync_requests.contains_key(&kept_key));
         assert!(!mgr.pending_resync_requests.contains_key(&dropped_key));
+    }
+
+    #[tokio::test]
+    async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let relay_a_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let relay_b_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let relay_a_generation = mgr.activate_connection(
+            HostName::new("relay-a"),
+            relay_a_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+        let relay_b_generation = mgr.activate_connection(
+            HostName::new("relay-b"),
+            relay_b_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        let baseline = snapshot_msg("target", 1);
+        let _ = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Data(baseline.clone()),
+                connection_generation: relay_a_generation,
+                connection_peer: HostName::new("relay-a"),
+            })
+            .await;
+        mgr.routes
+            .get_mut(&HostName::new("target"))
+            .expect("route exists")
+            .fallbacks
+            .push(RouteHop {
+                next_hop: HostName::new("relay-b"),
+                next_hop_generation: relay_b_generation,
+                learned_epoch: 10,
+            });
+
+        let plan = mgr.disconnect_peer(&HostName::new("relay-a"), relay_a_generation);
+        let request_id = match &plan.resync_requests[0] {
+            RoutedPeerMessage::RequestResync { request_id, .. } => *request_id,
+            other => panic!("expected request_resync, got {:?}", other),
+        };
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
+                    request_id,
+                    requester_host: HostName::new("local"),
+                    responder_host: HostName::new("target"),
+                    remaining_hops: 4,
+                    repo_identity: baseline.repo_identity.clone(),
+                    repo_path: baseline.repo_path.clone(),
+                    clock: baseline.clock.clone(),
+                    seq: 1,
+                    data: Box::new(ProviderData::default()),
+                }),
+                connection_generation: relay_b_generation,
+                connection_peer: HostName::new("relay-b"),
+            })
+            .await;
+
+        assert_eq!(result, HandleResult::Updated(test_repo()));
+        let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+        assert!(!state.stale);
+        assert_eq!(state.via_peer, HostName::new("relay-b"));
     }
 
     #[tokio::test]
