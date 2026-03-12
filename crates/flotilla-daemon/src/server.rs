@@ -12,7 +12,9 @@ use tracing::{debug, error, info, warn};
 use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_protocol::{Command, DaemonEvent, HostName, Message, PeerDataMessage};
+use flotilla_protocol::{
+    Command, DaemonEvent, HostName, Message, PeerConnectionState, PeerDataMessage,
+};
 
 use crate::peer::{HandleResult, PeerManager, SshTransport};
 
@@ -206,6 +208,27 @@ impl DaemonServer {
                 // Spawn resilient per-peer forwarding tasks with reconnect loop.
                 // On disconnect, stale peer data is cleared from the daemon overlay
                 // so the UI doesn't show checkouts from unreachable hosts.
+                // Emit initial connecting status for all peers
+                for name in &peer_names {
+                    peer_daemon.send_event(DaemonEvent::PeerStatusChanged {
+                        host: name.clone(),
+                        status: PeerConnectionState::Connecting,
+                    });
+                }
+
+                // Emit connected/disconnected based on initial connect results
+                for name in &peer_names {
+                    let status = if initial_rx_map.contains_key(name) {
+                        PeerConnectionState::Connected
+                    } else {
+                        PeerConnectionState::Disconnected
+                    };
+                    peer_daemon.send_event(DaemonEvent::PeerStatusChanged {
+                        host: name.clone(),
+                        status,
+                    });
+                }
+
                 for peer_name in peer_names {
                     let tx = peer_data_tx_for_ssh.clone();
                     let pm = Arc::clone(&peer_manager);
@@ -219,12 +242,20 @@ impl DaemonServer {
                                 return; // Main channel closed, stop entirely
                             }
                             info!(peer = %peer_name, "SSH connection dropped, will reconnect");
+                            daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
+                                host: peer_name.clone(),
+                                status: PeerConnectionState::Disconnected,
+                            });
                             clear_peer_data(&pm, &daemon_for_cleanup, &peer_name).await;
                         }
 
                         // Reconnect loop with exponential backoff
                         let mut attempt: u32 = 1;
                         loop {
+                            daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
+                                host: peer_name.clone(),
+                                status: PeerConnectionState::Reconnecting,
+                            });
                             let delay = crate::peer::SshTransport::backoff_delay(attempt);
                             info!(
                                 peer = %peer_name,
@@ -242,6 +273,10 @@ impl DaemonServer {
                             match reconnect_result {
                                 Ok(mut inbound_rx) => {
                                     info!(peer = %peer_name, "reconnected successfully");
+                                    daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
+                                        host: peer_name.clone(),
+                                        status: PeerConnectionState::Connected,
+                                    });
                                     attempt = 1;
                                     if !forward_until_closed(&tx, &mut inbound_rx, &peer_name).await
                                     {
@@ -251,6 +286,10 @@ impl DaemonServer {
                                         peer = %peer_name,
                                         "SSH connection dropped, will reconnect"
                                     );
+                                    daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
+                                        host: peer_name.clone(),
+                                        status: PeerConnectionState::Disconnected,
+                                    });
                                     clear_peer_data(&pm, &daemon_for_cleanup, &peer_name).await;
                                 }
                                 Err(e) => {
@@ -962,7 +1001,7 @@ mod tests {
     fn checkout(branch: &str) -> Checkout {
         Checkout {
             branch: branch.to_string(),
-            is_trunk: false,
+            is_main: false,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
             working_tree: None,

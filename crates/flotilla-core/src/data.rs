@@ -1,12 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
-
-fn local_hostname() -> &'static str {
-    static HOSTNAME: OnceLock<String> = OnceLock::new();
-    HOSTNAME.get_or_init(|| gethostname::gethostname().to_string_lossy().into_owned())
-}
+use std::sync::Arc;
 
 // Re-export protocol types that are used throughout the crate and by consumers.
 pub use flotilla_protocol::{CheckoutRef, CheckoutStatus, WorkItemIdentity, WorkItemKind};
@@ -298,7 +293,7 @@ fn group_to_work_item(
             (CorItemKind::Checkout, ProviderItemKey::Checkout(path)) => {
                 if checkout_ref.is_none() {
                     let is_main_checkout =
-                        providers.checkouts.get(path).is_some_and(|co| co.is_trunk);
+                        providers.checkouts.get(path).is_some_and(|co| co.is_main);
                     checkout_ref = Some(CheckoutRef {
                         key: path.clone(),
                         is_main_checkout,
@@ -368,7 +363,7 @@ fn group_to_work_item(
         .unwrap_or_default();
 
     let source = match &anchor {
-        CorrelatedAnchor::Checkout(_) => Some(local_hostname().to_string()),
+        CorrelatedAnchor::Checkout(co) => Some(co.key.host.to_string()),
         CorrelatedAnchor::ChangeRequest(key) => providers
             .change_requests
             .get(key.as_str())
@@ -614,15 +609,16 @@ pub fn group_work_items(
     let mut entries: Vec<GroupEntry> = Vec::new();
     let mut selectable: Vec<usize> = Vec::new();
 
-    // Checkouts -- main first, then local (children/siblings) before external, then by path
+    // Checkouts -- group by host, then main first within host, then proximity, then path
     checkout_items.sort_by_cached_key(|item| {
+        let host_name = item.host.to_string();
         let main_tier = u8::from(!item.is_main_checkout);
         let key = item.checkout_key();
         let proximity_tier = key
             .map(|p| checkout_sort_tier(&p.path, repo_root))
             .unwrap_or(1);
         let path_key = key.map(|p| p.path.to_path_buf());
-        (main_tier, proximity_tier, path_key)
+        (host_name, main_tier, proximity_tier, path_key)
     });
     if !checkout_items.is_empty() {
         entries.push(GroupEntry::Header(SectionHeader(labels.checkouts.clone())));
@@ -915,10 +911,10 @@ mod tests {
         })
     }
 
-    fn make_checkout(branch: &str, path: &str, is_trunk: bool) -> Checkout {
+    fn make_checkout(branch: &str, path: &str, is_main: bool) -> Checkout {
         Checkout {
             branch: branch.to_string(),
-            is_trunk,
+            is_main,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
             working_tree: None,

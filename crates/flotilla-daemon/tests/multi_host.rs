@@ -85,7 +85,7 @@ fn test_repo() -> RepoIdentity {
 fn make_checkout(branch: &str) -> Checkout {
     Checkout {
         branch: branch.to_string(),
-        is_trunk: false,
+        is_main: false,
         trunk_ahead_behind: None,
         remote_ahead_behind: None,
         working_tree: None,

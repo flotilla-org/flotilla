@@ -21,7 +21,7 @@ use crate::app::{
 use crate::event_log::{self, LevelExt};
 use crate::ui_helpers;
 use flotilla_core::data::{GroupEntry, SectionHeader};
-use flotilla_protocol::{HostName, ProviderData, WorkItem};
+use flotilla_protocol::{ProviderData, WorkItem};
 
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
@@ -206,6 +206,31 @@ fn render_status_bar(
     if let Some(err) = &model.status_message {
         let msg = format!(" Error: {}", err);
         let status = Paragraph::new(msg).style(Style::default().fg(Color::Red));
+        frame.render_widget(status, area);
+        return;
+    }
+
+    // Show disconnected/reconnecting peers as a warning
+    let problem_peers: Vec<&PeerHostStatus> = model
+        .peer_hosts
+        .iter()
+        .filter(|p| !matches!(p.status, PeerStatus::Connected))
+        .collect();
+    if !problem_peers.is_empty() {
+        let names: Vec<String> = problem_peers
+            .iter()
+            .map(|p| {
+                let icon = match p.status {
+                    PeerStatus::Disconnected => "\u{25cb}",  // ○
+                    PeerStatus::Connecting => "\u{25d0}",    // ◐
+                    PeerStatus::Reconnecting => "\u{25d0}",  // ◐
+                    PeerStatus::Connected => "\u{25cf}",     // ● (shouldn't reach here)
+                };
+                format!("{icon} {}", p.name)
+            })
+            .collect();
+        let msg = format!(" Hosts: {}", names.join("  "));
+        let status = Paragraph::new(msg).style(Style::default().fg(Color::Yellow));
         frame.render_widget(status, area);
         return;
     }
@@ -400,7 +425,6 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
                         &col_widths,
                         model.active_repo_root(),
                         prev_source.as_deref(),
-                        model.my_host.as_ref(),
                     );
                     prev_source = item.source.clone();
                     if is_multi_selected {
@@ -484,7 +508,6 @@ fn build_item_row<'a>(
     col_widths: &[u16],
     repo_root: &Path,
     prev_source: Option<&str>,
-    my_host: Option<&HostName>,
 ) -> Row<'a> {
     let session_status = item
         .session_key
@@ -494,12 +517,9 @@ fn build_item_row<'a>(
     let (icon, icon_color) =
         ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
 
-    let is_remote = my_host.is_some_and(|h| h != &item.host);
     let source_display = match item.source.as_deref() {
         Some(s) if prev_source == Some(s) => String::new(),
-        Some(s) if is_remote => format!("{}:{}", item.host, s),
         Some(s) => s.to_string(),
-        None if is_remote => item.host.to_string(),
         None => String::new(),
     };
 
@@ -1180,6 +1200,7 @@ fn render_hosts_status(frame: &mut Frame, area: Rect, hosts: &[PeerHostStatus]) 
             let (icon, style) = match h.status {
                 PeerStatus::Connected => ("\u{25cf}", Style::default().fg(Color::Green)),
                 PeerStatus::Disconnected => ("\u{25cb}", Style::default().fg(Color::Red)),
+                PeerStatus::Connecting => ("\u{25d0}", Style::default().fg(Color::Yellow)),
                 PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(Color::Yellow)),
             };
             ListItem::new(Line::from(vec![

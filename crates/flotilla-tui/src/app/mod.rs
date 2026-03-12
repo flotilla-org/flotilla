@@ -19,8 +19,8 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::data::{self, GroupEntry, SectionLabels};
 use flotilla_protocol::{
-    Command, DaemonEvent, HostName, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot,
-    SnapshotDelta, WorkItem,
+    Command, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo,
+    RepoLabels, Snapshot, SnapshotDelta, WorkItem,
 };
 use std::collections::VecDeque;
 
@@ -39,7 +39,19 @@ pub enum ProviderStatus {
 pub enum PeerStatus {
     Connected,
     Disconnected,
+    Connecting,
     Reconnecting,
+}
+
+impl From<PeerConnectionState> for PeerStatus {
+    fn from(state: PeerConnectionState) -> Self {
+        match state {
+            PeerConnectionState::Connected => PeerStatus::Connected,
+            PeerConnectionState::Disconnected => PeerStatus::Disconnected,
+            PeerConnectionState::Connecting => PeerStatus::Connecting,
+            PeerConnectionState::Reconnecting => PeerStatus::Reconnecting,
+        }
+    }
 }
 
 /// Status of a configured remote peer host, for display in the config view.
@@ -235,6 +247,22 @@ impl App {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
                     tracing::info!(%command_id, "command finished");
                     executor::handle_result(result, self);
+                }
+            }
+            DaemonEvent::PeerStatusChanged { host, status } => {
+                let peer_status = PeerStatus::from(status);
+                if let Some(existing) = self
+                    .model
+                    .peer_hosts
+                    .iter_mut()
+                    .find(|p| p.name == host)
+                {
+                    existing.status = peer_status;
+                } else {
+                    self.model.peer_hosts.push(PeerHostStatus {
+                        name: host,
+                        status: peer_status,
+                    });
                 }
             }
         }
@@ -451,7 +479,6 @@ impl App {
         );
         self.model.repo_order.push(path.clone());
         self.ui.repo_ui.insert(path, RepoUiState::default());
-        self.switch_tab(self.model.repo_order.len() - 1);
     }
 
     fn handle_repo_removed(&mut self, path: &Path) {
@@ -791,7 +818,7 @@ mod tests {
             ),
             flotilla_protocol::Checkout {
                 branch: "feat".into(),
-                is_trunk: false,
+                is_main: false,
                 trunk_ahead_behind: None,
                 remote_ahead_behind: None,
                 working_tree: None,
@@ -963,7 +990,8 @@ mod tests {
             app.model.repo_order.last().unwrap(),
             Path::new("/tmp/new-repo")
         );
-        assert_eq!(app.model.active_repo, 1);
+        // Adding a repo should not switch to it (it may arrive asynchronously)
+        assert_eq!(app.model.active_repo, 0);
     }
 
     #[test]

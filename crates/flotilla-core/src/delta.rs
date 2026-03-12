@@ -147,7 +147,7 @@ mod tests {
     fn checkout(branch: &str) -> Checkout {
         Checkout {
             branch: branch.into(),
-            is_trunk: false,
+            is_main: false,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
             working_tree: None,

@@ -155,7 +155,28 @@ impl RepoModel {
     /// messages rather than local filesystem scanning.
     pub fn new_virtual() -> Self {
         let registry = ProviderRegistry::new();
-        let labels = labels_from_registry(&registry);
+        let labels = RepoLabels {
+            checkouts: CategoryLabels {
+                section: "Checkouts".into(),
+                noun: "checkout".into(),
+                abbr: "CO".into(),
+            },
+            code_review: CategoryLabels {
+                section: "Change Requests".into(),
+                noun: "PR".into(),
+                abbr: "PR".into(),
+            },
+            issues: CategoryLabels {
+                section: "Issues".into(),
+                noun: "issue".into(),
+                abbr: "I".into(),
+            },
+            sessions: CategoryLabels {
+                section: "Sessions".into(),
+                noun: "session".into(),
+                abbr: "S".into(),
+            },
+        };
         Self {
             registry: Arc::new(registry),
             data: DataStore::default(),
@@ -602,8 +623,10 @@ mod tests {
         assert!(model.registry.issue_trackers.is_empty());
         assert!(model.registry.cloud_agents.is_empty());
         assert!(model.registry.workspace_manager.is_none());
-        assert_eq!(model.labels.checkouts.section, "\u{2014}");
-        assert_eq!(model.labels.code_review.section, "\u{2014}");
+        assert_eq!(model.labels.checkouts.section, "Checkouts");
+        assert_eq!(model.labels.code_review.section, "Change Requests");
+        assert_eq!(model.labels.issues.section, "Issues");
+        assert_eq!(model.labels.sessions.section, "Sessions");
         assert!(!model.data.loading);
     }
 

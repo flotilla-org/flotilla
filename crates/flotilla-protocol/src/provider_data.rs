@@ -25,7 +25,7 @@ pub enum AssociationKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkout {
     pub branch: String,
-    pub is_trunk: bool,
+    pub is_main: bool,
     pub trunk_ahead_behind: Option<AheadBehind>,
     pub remote_ahead_behind: Option<AheadBehind>,
     pub working_tree: Option<WorkingTreeStatus>,
@@ -232,7 +232,7 @@ mod tests {
         let cases = vec![
             Checkout {
                 branch: "main".into(),
-                is_trunk: true,
+                is_main: true,
                 trunk_ahead_behind: None,
                 remote_ahead_behind: None,
                 working_tree: None,
@@ -242,7 +242,7 @@ mod tests {
             },
             Checkout {
                 branch: "feat-x".into(),
-                is_trunk: false,
+                is_main: false,
                 trunk_ahead_behind: Some(AheadBehind {
                     ahead: 2,
                     behind: 1,
@@ -490,7 +490,7 @@ mod tests {
             hp("/repos/proj"),
             Checkout {
                 branch: "main".into(),
-                is_trunk: true,
+                is_main: true,
                 trunk_ahead_behind: None,
                 remote_ahead_behind: None,
                 working_tree: None,

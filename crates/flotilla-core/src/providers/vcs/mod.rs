@@ -298,7 +298,7 @@ pub(crate) mod checkout_test_support {
             .expect("create_checkout should succeed");
 
         assert_eq!(checkout.branch, "feature/remote-only");
-        assert!(!checkout.is_trunk);
+        assert!(!checkout.is_main);
 
         let commit = checkout
             .last_commit

@@ -137,7 +137,7 @@ impl GitCheckoutManager {
         &self,
         path: &Path,
         branch: &str,
-        is_trunk: bool,
+        is_main: bool,
         default_branch: &str,
     ) -> (PathBuf, Checkout) {
         let host_path =
@@ -152,7 +152,7 @@ impl GitCheckoutManager {
 
         let (trunk_ab, remote_ab, wt_status, commit, issue_links) = tokio::join!(
             async {
-                if !is_trunk {
+                if !is_main {
                     run!(
                         self.runner,
                         "git",
@@ -201,7 +201,7 @@ impl GitCheckoutManager {
             path.to_path_buf(),
             Checkout {
                 branch: branch.to_string(),
-                is_trunk,
+                is_main,
                 trunk_ahead_behind: trunk_ab,
                 remote_ahead_behind: remote_ab,
                 working_tree: wt_status,
@@ -246,9 +246,11 @@ impl super::CheckoutManager for GitCheckoutManager {
 
         let futures: Vec<_> = entries
             .iter()
-            .map(|(path, branch)| {
-                let is_trunk = *branch == default_branch;
-                self.enrich_checkout(path, branch, is_trunk, &default_branch)
+            .enumerate()
+            .map(|(i, (path, branch))| {
+                // The first worktree in porcelain output is always the main worktree
+                let is_main = i == 0;
+                self.enrich_checkout(path, branch, is_main, &default_branch)
             })
             .collect();
         Ok(futures::future::join_all(futures).await)
@@ -357,9 +359,9 @@ impl super::CheckoutManager for GitCheckoutManager {
                 )?;
             }
         }
-        let is_trunk = branch == default_branch;
+        // A newly created worktree is never the main worktree
         Ok(self
-            .enrich_checkout(&wt_path, branch, is_trunk, &default_branch)
+            .enrich_checkout(&wt_path, branch, false, &default_branch)
             .await)
     }
 

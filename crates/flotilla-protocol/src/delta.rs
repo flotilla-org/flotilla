@@ -116,7 +116,7 @@ mod tests {
             key: hp("/repos/wt-1"),
             op: EntryOp::Added(Checkout {
                 branch: "feat-x".into(),
-                is_trunk: false,
+                is_main: false,
                 trunk_ahead_behind: None,
                 remote_ahead_behind: None,
                 working_tree: None,

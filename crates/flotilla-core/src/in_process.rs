@@ -1009,6 +1009,11 @@ impl InProcessDaemon {
         let event = choose_event(proto_snapshot, delta_entry);
         let _ = self.event_tx.send(event);
     }
+
+    /// Send an arbitrary event to all subscribers.
+    pub fn send_event(&self, event: DaemonEvent) {
+        let _ = self.event_tx.send(event);
+    }
 }
 
 #[async_trait]
@@ -1378,7 +1383,7 @@ mod tests {
     fn checkout_with_issue(issue_id: &str) -> Checkout {
         Checkout {
             branch: "main".into(),
-            is_trunk: true,
+            is_main: true,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
             working_tree: None,

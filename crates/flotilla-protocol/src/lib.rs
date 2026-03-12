@@ -157,6 +157,21 @@ pub enum DaemonEvent {
         repo: std::path::PathBuf,
         result: commands::CommandResult,
     },
+    /// A peer host's connection status changed.
+    #[serde(rename = "peer_status")]
+    PeerStatusChanged {
+        host: HostName,
+        status: PeerConnectionState,
+    },
+}
+
+/// Peer connection state as seen by the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerConnectionState {
+    Connected,
+    Disconnected,
+    Connecting,
+    Reconnecting,
 }
 
 /// A delta update for a repo snapshot.

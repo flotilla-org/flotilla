@@ -332,7 +332,7 @@ mod tests {
     fn git_status_display_empty() {
         let co = Checkout {
             branch: "main".into(),
-            is_trunk: true,
+            is_main: true,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
             working_tree: None,
@@ -347,7 +347,7 @@ mod tests {
     fn git_status_display_all_flags() {
         let co = Checkout {
             branch: "feat".into(),
-            is_trunk: false,
+            is_main: false,
             trunk_ahead_behind: Some(AheadBehind {
                 ahead: 3,
                 behind: 0,
@@ -369,7 +369,7 @@ mod tests {
     fn git_status_display_partial() {
         let co = Checkout {
             branch: "fix".into(),
-            is_trunk: false,
+            is_main: false,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
             working_tree: Some(WorkingTreeStatus {
