@@ -599,7 +599,9 @@ pub fn group_work_items(
                 .checkout_key()
                 .map(|p| checkout_sort_tier(p, repo_root))
                 .unwrap_or(1);
-            tier_a.cmp(&tier_b).then_with(|| a.checkout_key().cmp(&b.checkout_key()))
+            tier_a
+                .cmp(&tier_b)
+                .then_with(|| a.checkout_key().cmp(&b.checkout_key()))
         }
     });
     if !checkout_items.is_empty() {
@@ -1909,9 +1911,9 @@ mod tests {
             branches,
             vec![
                 Some("main".to_string()),           // main always first
-                Some("checkout-order".to_string()),  // siblings next
+                Some("checkout-order".to_string()), // siblings next
                 Some("low-hang-13".to_string()),
-                Some("codex-detached".to_string()),  // external worktrees last
+                Some("codex-detached".to_string()), // external worktrees last
             ]
         );
     }

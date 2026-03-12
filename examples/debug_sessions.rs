@@ -106,8 +106,12 @@ async fn main() {
         .iter()
         .map(|item| correlation_result_to_work_item(item, &snapshot.correlation_groups))
         .collect();
-    let table_view =
-        data::group_work_items(&work_items, &snapshot.providers, &section_labels, &repo_root);
+    let table_view = data::group_work_items(
+        &work_items,
+        &snapshot.providers,
+        &section_labels,
+        &repo_root,
+    );
     for (i, entry) in table_view.table_entries.iter().enumerate() {
         match entry {
             data::GroupEntry::Header(h) => {
