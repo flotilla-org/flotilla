@@ -55,6 +55,13 @@ impl SshTransport {
     /// The local forwarded socket will be placed at
     /// `~/.config/flotilla/peers/<host-name>.sock`.
     pub fn new(host_name: HostName, config: RemoteHostConfig) -> Self {
+        // Sanitise: reject host names containing path separators to prevent
+        // path traversal (e.g. `../` in hosts.toml).
+        let name_str = host_name.as_str();
+        assert!(
+            !name_str.contains('/') && !name_str.contains('\\') && !name_str.contains('\0'),
+            "peer host name must not contain path separators: {name_str:?}"
+        );
         let local_socket_path = peers_dir().join(format!("{}.sock", host_name));
 
         Self {

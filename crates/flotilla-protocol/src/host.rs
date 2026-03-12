@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
+use tracing::warn;
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -21,10 +22,7 @@ impl HostName {
         let name = gethostname::gethostname()
             .into_string()
             .unwrap_or_else(|os| {
-                eprintln!(
-                    "warning: hostname is not valid UTF-8 ({:?}), falling back to \"localhost\"",
-                    os
-                );
+                warn!(hostname = ?os, "hostname is not valid UTF-8, falling back to \"localhost\"");
                 "localhost".to_string()
             });
         Self(name)

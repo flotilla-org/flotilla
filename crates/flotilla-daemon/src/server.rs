@@ -18,6 +18,9 @@ use flotilla_protocol::{
 
 use crate::peer::{HandleResult, PeerManager, SshTransport};
 
+/// Map of connected peer clients: host name → (connection ID, message sender).
+type PeerClientMap = HashMap<HostName, (u64, mpsc::Sender<Message>)>;
+
 /// The daemon server that listens on a Unix socket and dispatches requests
 /// to an `InProcessDaemon`.
 pub struct DaemonServer {
@@ -33,8 +36,12 @@ pub struct DaemonServer {
     peer_data_tx: mpsc::Sender<PeerDataMessage>,
     peer_data_rx: Option<mpsc::Receiver<PeerDataMessage>>,
     /// Map of connected peer clients, keyed by their host name.
-    /// Each entry holds a sender that can push messages back to that peer's socket.
-    peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>>,
+    /// Each entry holds a connection ID and sender. The ID lets disconnect
+    /// detect whether a newer connection has replaced it (avoiding removal
+    /// of a live replacement).
+    peer_clients: Arc<Mutex<PeerClientMap>>,
+    /// Monotonic counter for peer connection IDs.
+    next_peer_conn_id: Arc<AtomicUsize>,
     /// Manages connections to remote peer hosts and stores their provider data.
     peer_manager: Arc<Mutex<PeerManager>>,
 }
@@ -100,6 +107,7 @@ impl DaemonServer {
             peer_data_tx,
             peer_data_rx: Some(peer_data_rx),
             peer_clients: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_conn_id: Arc::new(AtomicUsize::new(1)),
             peer_manager: Arc::new(Mutex::new(peer_manager)),
         }
     }
@@ -116,7 +124,7 @@ impl DaemonServer {
     ///
     /// The PeerManager uses this to send `Message::PeerData` back to specific
     /// connected peer daemons.
-    pub fn peer_clients(&self) -> Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>> {
+    pub fn peer_clients(&self) -> Arc<Mutex<PeerClientMap>> {
         Arc::clone(&self.peer_clients)
     }
 
@@ -150,6 +158,7 @@ impl DaemonServer {
         let socket_path = self.socket_path.clone();
         let client_notify = self.client_notify;
         let peer_data_tx = self.peer_data_tx;
+        let self_next_peer_conn_id = self.next_peer_conn_id;
         let peer_clients = self.peer_clients;
 
         // Spawn idle timeout watcher (disabled for follower-mode daemons
@@ -529,6 +538,7 @@ impl DaemonServer {
                             let shutdown_rx = shutdown_rx.clone();
                             let peer_data_tx = peer_data_tx.clone();
                             let peer_clients = Arc::clone(&peer_clients);
+                            let next_peer_conn_id = Arc::clone(&self_next_peer_conn_id);
 
                             tokio::spawn(async move {
                                 handle_client(
@@ -537,6 +547,7 @@ impl DaemonServer {
                                     shutdown_rx,
                                     peer_data_tx,
                                     peer_clients,
+                                    next_peer_conn_id,
                                 )
                                 .await;
                                 let count = client_count.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -658,7 +669,7 @@ async fn clear_peer_data(
 async fn send_local_to_peers(
     daemon: &Arc<InProcessDaemon>,
     peer_manager: &Arc<Mutex<PeerManager>>,
-    peer_clients: &Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>>,
+    peer_clients: &Arc<Mutex<PeerClientMap>>,
     host_name: &HostName,
     clock: &mut flotilla_protocol::VectorClock,
     repo_path: &std::path::Path,
@@ -693,7 +704,7 @@ async fn send_local_to_peers(
     let clients = peer_clients.lock().await;
     if !clients.is_empty() {
         let wire_msg = Message::PeerData(Box::new(msg));
-        for (name, tx) in clients.iter() {
+        for (name, (_conn_id, tx)) in clients.iter() {
             debug!(peer = %name, "sending snapshot to inbound peer client");
             let _ = tx.send(wire_msg.clone()).await;
         }
@@ -737,7 +748,8 @@ async fn handle_client(
     daemon: Arc<InProcessDaemon>,
     mut shutdown_rx: watch::Receiver<bool>,
     peer_data_tx: mpsc::Sender<PeerDataMessage>,
-    peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>>,
+    peer_clients: Arc<Mutex<PeerClientMap>>,
+    next_peer_conn_id: Arc<AtomicUsize>,
 ) {
     let (read_half, write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
@@ -780,8 +792,9 @@ async fn handle_client(
         }
     });
 
-    // Track whether this client has registered as a peer, and under what name.
+    // Track whether this client has registered as a peer, and under what name/ID.
     let mut peer_host_name: Option<HostName> = None;
+    let mut peer_conn_id: u64 = 0;
 
     // Read request lines and dispatch
     let mut lines = reader.lines();
@@ -810,7 +823,10 @@ async fn handle_client(
 
                                 // Register this client as a peer on first PeerData message.
                                 if peer_host_name.is_none() {
-                                    debug!(host = %origin, "registering peer client");
+                                    peer_conn_id = next_peer_conn_id
+                                        .fetch_add(1, Ordering::SeqCst)
+                                        as u64;
+                                    debug!(host = %origin, %peer_conn_id, "registering peer client");
                                     peer_host_name = Some(origin.clone());
                                     let mut clients = peer_clients.lock().await;
                                     if clients.contains_key(&origin) {
@@ -819,7 +835,8 @@ async fn handle_client(
                                             "duplicate peer hostname — overwriting previous connection"
                                         );
                                     }
-                                    clients.insert(origin, outbound_tx.clone());
+                                    clients
+                                        .insert(origin, (peer_conn_id, outbound_tx.clone()));
                                 }
 
                                 if let Err(e) = peer_data_tx.send(*peer_msg).await {
@@ -849,10 +866,19 @@ async fn handle_client(
         }
     }
 
-    // Unregister peer client on disconnect.
+    // Unregister peer client on disconnect — but only if the map still holds
+    // OUR connection. A second connection from the same host may have overwritten
+    // the entry; removing it here would break replication to the newer connection.
     if let Some(host) = peer_host_name {
-        debug!(%host, "unregistering peer client");
-        peer_clients.lock().await.remove(&host);
+        let mut clients = peer_clients.lock().await;
+        if let Some((stored_id, _)) = clients.get(&host) {
+            if *stored_id == peer_conn_id {
+                debug!(%host, "unregistering peer client");
+                clients.remove(&host);
+            } else {
+                debug!(%host, "peer client replaced by newer connection, skipping removal");
+            }
+        }
     }
 
     // Abort the event forwarder and relay tasks
@@ -1234,7 +1260,7 @@ mod tests {
         // Inserting via one handle is visible via another
         let map2 = server.peer_clients();
         let (tx, _rx) = mpsc::channel(1);
-        map.lock().await.insert(HostName::new("laptop"), tx);
+        map.lock().await.insert(HostName::new("laptop"), (1, tx));
         assert_eq!(map2.lock().await.len(), 1);
     }
 
@@ -1255,7 +1281,7 @@ mod tests {
     async fn handle_client_forwards_peer_data_and_registers_peer() {
         let (_tmp, daemon) = empty_daemon().await;
         let (peer_data_tx, mut peer_data_rx) = mpsc::channel(16);
-        let peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>> =
+        let peer_clients: Arc<Mutex<PeerClientMap>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1264,7 +1290,15 @@ mod tests {
         // Spawn handle_client on the server side
         let pc = Arc::clone(&peer_clients);
         let handle = tokio::spawn(async move {
-            handle_client(server_stream, daemon, shutdown_rx, peer_data_tx, pc).await;
+            handle_client(
+                server_stream,
+                daemon,
+                shutdown_rx,
+                peer_data_tx,
+                pc,
+                Arc::new(AtomicUsize::new(1)),
+            )
+            .await;
         });
 
         // Send a PeerData message from the client side
@@ -1361,7 +1395,7 @@ mod tests {
     async fn handle_client_relays_outbound_peer_messages() {
         let (_tmp, daemon) = empty_daemon().await;
         let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
-        let peer_clients: Arc<Mutex<HashMap<HostName, mpsc::Sender<Message>>>> =
+        let peer_clients: Arc<Mutex<PeerClientMap>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1370,7 +1404,15 @@ mod tests {
         // Spawn handle_client on the server side
         let pc = Arc::clone(&peer_clients);
         let handle = tokio::spawn(async move {
-            handle_client(server_stream, daemon, shutdown_rx, peer_data_tx, pc).await;
+            handle_client(
+                server_stream,
+                daemon,
+                shutdown_rx,
+                peer_data_tx,
+                pc,
+                Arc::new(AtomicUsize::new(1)),
+            )
+            .await;
         });
 
         let (read_half, write_half) = client_stream.into_split();
@@ -1391,7 +1433,7 @@ mod tests {
         let relay_msg = Message::PeerData(Box::new(test_peer_msg("other-host")));
         {
             let map = peer_clients.lock().await;
-            let sender = map
+            let (_conn_id, sender) = map
                 .get(&HostName::new("relay-target"))
                 .expect("peer should be registered");
             sender.send(relay_msg).await.expect("send relay");

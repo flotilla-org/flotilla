@@ -14,8 +14,8 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use flotilla_protocol::{
-    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, ProviderError, RepoInfo,
-    Snapshot,
+    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState,
+    ProviderError, RepoInfo, Snapshot,
 };
 
 use flotilla_protocol::ProviderData;
@@ -288,6 +288,9 @@ pub struct InProcessDaemon {
     /// Maps RepoIdentity → local repo path, built during repo setup.
     /// Used to route inbound peer data to the correct local repo.
     repo_identities: RwLock<HashMap<flotilla_protocol::RepoIdentity, PathBuf>>,
+    /// Current peer connection status, updated via `set_peer_status()` and
+    /// replayed to late-subscribing clients via `replay_since()`.
+    peer_status: RwLock<HashMap<HostName, PeerConnectionState>>,
 }
 
 impl InProcessDaemon {
@@ -370,6 +373,7 @@ impl InProcessDaemon {
             follower,
             peer_providers: RwLock::new(HashMap::new()),
             repo_identities: RwLock::new(identities),
+            peer_status: RwLock::new(HashMap::new()),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -905,7 +909,7 @@ impl InProcessDaemon {
     /// an empty provider registry and an idle refresh handle.
     ///
     /// The `synthetic_path` serves as a stable key for tab identity (e.g.
-    /// `<remote>/desktop//home/dev/repo`). The `provider_data` is the
+    /// `<remote>/desktop/home/dev/repo`). The `provider_data` is the
     /// initial merged data from peer snapshots.
     ///
     /// Emits `DaemonEvent::RepoAdded` so the TUI creates a tab.
@@ -1011,7 +1015,21 @@ impl InProcessDaemon {
     }
 
     /// Send an arbitrary event to all subscribers.
+    ///
+    /// If the event is a `PeerStatusChanged`, also records the status so
+    /// `replay_since` can include it for late-subscribing clients.
     pub fn send_event(&self, event: DaemonEvent) {
+        if let DaemonEvent::PeerStatusChanged {
+            ref host,
+            ref status,
+        } = event
+        {
+            // Use try_write to avoid blocking; if contended, the replay
+            // will use a slightly stale value — acceptable for display.
+            if let Ok(mut map) = self.peer_status.try_write() {
+                map.insert(host.clone(), *status);
+            }
+        }
         let _ = self.event_tx.send(event);
     }
 }
@@ -1336,6 +1354,15 @@ impl DaemonHandle for InProcessDaemon {
                     events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
                 }
             }
+        }
+
+        // Include current peer status so late-subscribing clients see it
+        let peer_status = self.peer_status.read().await;
+        for (host, status) in peer_status.iter() {
+            events.push(DaemonEvent::PeerStatusChanged {
+                host: host.clone(),
+                status: *status,
+            });
         }
 
         Ok(events)

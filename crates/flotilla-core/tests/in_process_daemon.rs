@@ -378,7 +378,7 @@ async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
     let daemon = InProcessDaemon::new(vec![], config).await;
     let mut rx = daemon.subscribe();
 
-    let synthetic_path = PathBuf::from("<remote>/desktop//home/dev/repo");
+    let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     daemon
         .add_virtual_repo(synthetic_path.clone(), ProviderData::default())
         .await
@@ -414,7 +414,7 @@ async fn add_virtual_repo_is_idempotent() {
     let config = Arc::new(ConfigStore::new());
     let daemon = InProcessDaemon::new(vec![], config).await;
 
-    let synthetic_path = PathBuf::from("<remote>/desktop//home/dev/repo");
+    let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     daemon
         .add_virtual_repo(synthetic_path.clone(), ProviderData::default())
         .await

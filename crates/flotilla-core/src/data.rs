@@ -436,6 +436,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
         });
     }
 
+    let local_host = flotilla_protocol::HostName::local();
     for (key, terminal) in &providers.managed_terminals {
         let mut keys = vec![crate::providers::types::CorrelationKey::Branch(
             terminal.id.checkout.clone(),
@@ -443,7 +444,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
         if !terminal.working_directory.as_os_str().is_empty() {
             keys.push(crate::providers::types::CorrelationKey::CheckoutPath(
                 flotilla_protocol::HostPath::new(
-                    flotilla_protocol::HostName::local(),
+                    local_host.clone(),
                     terminal.working_directory.clone(),
                 ),
             ));
