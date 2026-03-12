@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::HostPath;
+use crate::host::{HostName, HostPath};
 use crate::provider_data::{Issue, ProviderData};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +57,8 @@ pub struct RepoInfo {
 pub struct Snapshot {
     pub seq: u64,
     pub repo: PathBuf,
+    /// The daemon's host identity.
+    pub host_name: HostName,
     pub work_items: Vec<WorkItem>,
     pub providers: ProviderData,
     pub provider_health: HashMap<String, HashMap<String, bool>>,
@@ -81,6 +83,8 @@ pub struct ProviderError {
 pub struct WorkItem {
     pub kind: WorkItemKind,
     pub identity: WorkItemIdentity,
+    /// Which host this item originates from.
+    pub host: HostName,
     pub branch: Option<String>,
     pub description: String,
     pub checkout: Option<CheckoutRef>,
@@ -224,6 +228,7 @@ mod tests {
         let empty = Snapshot {
             seq: 0,
             repo: PathBuf::from("/repos/empty"),
+            host_name: HostName::new("test-host"),
             work_items: vec![],
             providers: ProviderData::default(),
             provider_health: HashMap::new(),
@@ -240,10 +245,12 @@ mod tests {
         let populated = Snapshot {
             seq: 42,
             repo: PathBuf::from("/repos/project"),
+            host_name: HostName::new("test-host"),
             work_items: vec![
                 WorkItem {
                     kind: WorkItemKind::Checkout,
                     identity: WorkItemIdentity::Checkout(hp("/repos/project/wt")),
+                    host: HostName::new("test-host"),
                     branch: Some("feat-x".into()),
                     description: "Feature X".into(),
                     checkout: Some(CheckoutRef {
@@ -261,6 +268,7 @@ mod tests {
                 WorkItem {
                     kind: WorkItemKind::Session,
                     identity: WorkItemIdentity::Session("s1".into()),
+                    host: HostName::new("test-host"),
                     branch: None,
                     description: "Session one".into(),
                     checkout: None,
@@ -302,6 +310,7 @@ mod tests {
             WorkItem {
                 kind: WorkItemKind::Issue,
                 identity: WorkItemIdentity::Issue("GH-1".into()),
+                host: HostName::new("test-host"),
                 branch: None,
                 description: "Fix bug".into(),
                 checkout: None,
@@ -316,6 +325,7 @@ mod tests {
             WorkItem {
                 kind: WorkItemKind::Checkout,
                 identity: WorkItemIdentity::Checkout(hp("/wt")),
+                host: HostName::new("test-host"),
                 branch: Some("main".into()),
                 description: "Main".into(),
                 checkout: Some(CheckoutRef {
@@ -351,6 +361,7 @@ mod tests {
         let json = r#"{
             "kind": "Issue",
             "identity": {"Issue": "X"},
+            "host": "test-host",
             "branch": null,
             "description": "test",
             "checkout": null,

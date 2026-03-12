@@ -11,3 +11,6 @@ pub mod provider_data;
 pub mod providers;
 pub mod refresh;
 pub mod template;
+
+// Re-export host types from protocol for convenience.
+pub use flotilla_protocol::HostName;

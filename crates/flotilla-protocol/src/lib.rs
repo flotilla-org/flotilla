@@ -259,9 +259,11 @@ mod tests {
         let snapshot = Snapshot {
             seq: 7,
             repo: PathBuf::from("/tmp/my-repo"),
+            host_name: HostName::new("test-host"),
             work_items: vec![WorkItem {
                 kind: WorkItemKind::Checkout,
                 identity: WorkItemIdentity::Checkout(hp("/tmp/my-repo/wt")),
+                host: HostName::new("test-host"),
                 branch: Some("feature-x".to_string()),
                 description: "Feature X".to_string(),
                 checkout: Some(CheckoutRef {

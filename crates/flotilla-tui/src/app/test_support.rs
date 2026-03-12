@@ -100,6 +100,7 @@ pub(crate) fn snapshot(repo: &Path) -> Snapshot {
     Snapshot {
         seq: 1,
         repo: repo.to_path_buf(),
+        host_name: flotilla_protocol::HostName::local(),
         work_items: vec![],
         providers: ProviderData::default(),
         provider_health: HashMap::new(),

@@ -726,6 +726,7 @@ mod tests {
         Snapshot {
             seq,
             repo: repo.to_path_buf(),
+            host_name: flotilla_protocol::HostName::new("test-host"),
             work_items: vec![],
             providers: flotilla_protocol::ProviderData::default(),
             provider_health: HashMap::new(),

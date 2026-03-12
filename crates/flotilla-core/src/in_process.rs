@@ -14,7 +14,8 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use flotilla_protocol::{
-    AssociationKey, Command, DaemonEvent, DeltaEntry, Issue, ProviderError, RepoInfo, Snapshot,
+    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, ProviderError, RepoInfo,
+    Snapshot,
 };
 
 use flotilla_protocol::ProviderData;
@@ -82,6 +83,7 @@ fn build_repo_snapshot(
     base: &RefreshSnapshot,
     cache: &IssueCache,
     search_results: &Option<Vec<(String, Issue)>>,
+    host_name: &HostName,
 ) -> Snapshot {
     let providers = Arc::new(inject_issues(&base.providers, cache, search_results));
     let (work_items, correlation_groups) = crate::data::correlate(&providers);
@@ -92,7 +94,7 @@ fn build_repo_snapshot(
         errors: base.errors.clone(),
         provider_health: base.provider_health.clone(),
     };
-    let mut snapshot = snapshot_to_proto(path, seq, &re_snapshot);
+    let mut snapshot = snapshot_to_proto(path, seq, &re_snapshot, host_name);
     snapshot.issue_total = cache.total_count;
     snapshot.issue_has_more = cache.has_more;
     snapshot.issue_search_results = search_results.clone();
@@ -246,6 +248,7 @@ pub struct InProcessDaemon {
     config: Arc<ConfigStore>,
     runner: Arc<dyn CommandRunner>,
     next_command_id: AtomicU64,
+    host_name: HostName,
 }
 
 impl InProcessDaemon {
@@ -294,6 +297,7 @@ impl InProcessDaemon {
             config,
             runner,
             next_command_id: AtomicU64::new(1),
+            host_name: HostName::local(),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -392,7 +396,8 @@ impl InProcessDaemon {
             state.model.data.provider_health = snapshot.provider_health.clone();
             state.model.data.loading = false;
 
-            let mut proto_snapshot = snapshot_to_proto(&path, state.seq + 1, &re_snapshot);
+            let mut proto_snapshot =
+                snapshot_to_proto(&path, state.seq + 1, &re_snapshot, &self.host_name);
             proto_snapshot.provider_health =
                 crate::convert::health_to_proto(&state.model.data.provider_health);
             proto_snapshot.issue_total = issue_total;
@@ -763,6 +768,7 @@ impl InProcessDaemon {
             &state.last_snapshot,
             &state.issue_cache,
             &state.search_results,
+            &self.host_name,
         );
 
         // Compute and log delta
@@ -797,6 +803,7 @@ impl DaemonHandle for InProcessDaemon {
             &state.last_snapshot,
             &state.issue_cache,
             &state.search_results,
+            &self.host_name,
         ))
     }
 
@@ -1037,6 +1044,7 @@ impl DaemonHandle for InProcessDaemon {
                     &state.last_snapshot,
                     &state.issue_cache,
                     &state.search_results,
+                    &self.host_name,
                 )
             };
 
@@ -1207,6 +1215,7 @@ mod tests {
         let snapshot = Snapshot {
             seq: 2,
             repo: repo.clone(),
+            host_name: HostName::local(),
             work_items: vec![],
             providers: ProviderData::default(),
             provider_health: HashMap::new(),
@@ -1247,6 +1256,7 @@ mod tests {
         let snapshot = Snapshot {
             seq: 3,
             repo: PathBuf::from("/tmp/repo"),
+            host_name: HostName::local(),
             work_items: vec![],
             providers: ProviderData::default(),
             provider_health: HashMap::new(),
@@ -1294,6 +1304,7 @@ mod tests {
             &RefreshSnapshot::default(),
             &cache,
             &None,
+            &HostName::local(),
         );
         assert_eq!(snap.seq, 7);
         assert_eq!(snap.issue_total, Some(5));

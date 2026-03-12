@@ -199,6 +199,20 @@ impl CorrelationResult {
         }
     }
 
+    /// Derive the host for this item.
+    ///
+    /// For checkout-anchored items, uses the checkout's HostPath host.
+    /// For all other items, falls back to the provided local host name.
+    pub fn host(&self, local_host: &flotilla_protocol::HostName) -> flotilla_protocol::HostName {
+        match self {
+            CorrelationResult::Correlated(c) => match &c.anchor {
+                CorrelatedAnchor::Checkout(co) => co.key.host.clone(),
+                _ => local_host.clone(),
+            },
+            _ => local_host.clone(),
+        }
+    }
+
     pub fn identity(&self) -> WorkItemIdentity {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
@@ -936,7 +950,11 @@ mod tests {
 
     // Convert CorrelationResult to protocol WorkItem for group_work_items tests
     fn to_proto(item: &CorrelationResult) -> flotilla_protocol::WorkItem {
-        crate::convert::correlation_result_to_work_item(item, &[])
+        crate::convert::correlation_result_to_work_item(
+            item,
+            &[],
+            &flotilla_protocol::HostName::new("test-host"),
+        )
     }
 
     fn new_providers() -> ProviderData {

@@ -388,6 +388,7 @@ mod tests {
         flotilla_protocol::WorkItem {
             kind: flotilla_protocol::WorkItemKind::Checkout,
             identity,
+            host: flotilla_protocol::HostName::new("test-host"),
             branch: None,
             description: desc.into(),
             checkout: None,

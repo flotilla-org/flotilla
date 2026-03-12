@@ -104,7 +104,13 @@ async fn main() {
     let work_items: Vec<_> = snapshot
         .work_items
         .iter()
-        .map(|item| correlation_result_to_work_item(item, &snapshot.correlation_groups))
+        .map(|item| {
+            correlation_result_to_work_item(
+                item,
+                &snapshot.correlation_groups,
+                &flotilla_core::HostName::local(),
+            )
+        })
         .collect();
     let table_view = data::group_work_items(&work_items, &snapshot.providers, &section_labels);
     for (i, entry) in table_view.table_entries.iter().enumerate() {

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use flotilla_protocol::{CheckoutRef, ProviderError, Snapshot, WorkItem};
+use flotilla_protocol::{CheckoutRef, HostName, ProviderError, Snapshot, WorkItem};
 
 use crate::data::{CorrelationResult, RefreshError};
 use crate::providers::correlation::{CorrelatedGroup, ItemKind as CorItemKind};
@@ -15,9 +15,11 @@ use crate::refresh::RefreshSnapshot;
 pub fn correlation_result_to_work_item(
     item: &CorrelationResult,
     groups: &[CorrelatedGroup],
+    host_name: &HostName,
 ) -> WorkItem {
     let kind = item.kind();
     let identity = item.identity();
+    let host = item.host(host_name);
 
     let checkout = item.checkout().map(|co| CheckoutRef {
         key: co.key.clone(),
@@ -33,6 +35,7 @@ pub fn correlation_result_to_work_item(
     WorkItem {
         kind,
         identity,
+        host,
         branch: item.branch().map(|s| s.to_string()),
         description: item.description().to_string(),
         checkout,
@@ -89,14 +92,22 @@ pub fn health_to_proto(
     nested
 }
 
-pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot) -> Snapshot {
+pub fn snapshot_to_proto(
+    repo: &Path,
+    seq: u64,
+    refresh: &RefreshSnapshot,
+    host_name: &HostName,
+) -> Snapshot {
     Snapshot {
         seq,
         repo: repo.to_path_buf(),
+        host_name: host_name.clone(),
         work_items: refresh
             .work_items
             .iter()
-            .map(|item| correlation_result_to_work_item(item, &refresh.correlation_groups))
+            .map(|item| {
+                correlation_result_to_work_item(item, &refresh.correlation_groups, host_name)
+            })
             .collect(),
         providers: (*refresh.providers).clone(),
         provider_health: health_to_proto(&refresh.provider_health),
@@ -118,6 +129,10 @@ mod tests {
         HostPath::new(HostName::new("test-host"), PathBuf::from(path))
     }
 
+    fn test_host() -> HostName {
+        HostName::new("test-host")
+    }
+
     #[test]
     fn convert_correlated_checkout() {
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
@@ -135,13 +150,15 @@ mod tests {
             source: None,
         });
 
-        let proto = correlation_result_to_work_item(&item, &[]);
+        let proto = correlation_result_to_work_item(&item, &[], &test_host());
 
         assert_eq!(proto.kind, WorkItemKind::Checkout);
         assert_eq!(
             proto.identity,
             WorkItemIdentity::Checkout(hp("/repos/my-project/wt-1"))
         );
+        // Checkout-anchored items derive host from HostPath
+        assert_eq!(proto.host, test_host());
         assert_eq!(proto.branch.as_deref(), Some("feature-login"));
         assert_eq!(proto.description, "Implement login flow");
 
@@ -164,10 +181,11 @@ mod tests {
             source: String::new(),
         });
 
-        let proto = correlation_result_to_work_item(&item, &[]);
+        let proto = correlation_result_to_work_item(&item, &[], &test_host());
 
         assert_eq!(proto.kind, WorkItemKind::Issue);
         assert_eq!(proto.identity, WorkItemIdentity::Issue("42".to_string()));
+        assert_eq!(proto.host, test_host());
         assert_eq!(proto.description, "Fix the login bug");
         assert_eq!(proto.issue_keys, vec!["42"]);
         assert!(proto.branch.is_none());
@@ -195,7 +213,7 @@ mod tests {
             correlation_group_idx: 0,
             source: Some(hostname.clone()),
         });
-        let proto = correlation_result_to_work_item(&item, &[]);
+        let proto = correlation_result_to_work_item(&item, &[], &test_host());
         assert_eq!(proto.source, Some(hostname));
     }
 
@@ -212,8 +230,10 @@ mod tests {
             correlation_group_idx: 0,
             source: Some("Claude".to_string()),
         });
-        let proto = correlation_result_to_work_item(&item, &[]);
+        let proto = correlation_result_to_work_item(&item, &[], &test_host());
         assert_eq!(proto.source, Some("Claude".to_string()));
+        // Session-anchored items use the provided local host name
+        assert_eq!(proto.host, test_host());
     }
 
     #[test]
@@ -223,7 +243,7 @@ mod tests {
             description: "Fix the bug".to_string(),
             source: "GitHub".to_string(),
         });
-        let proto = correlation_result_to_work_item(&item, &[]);
+        let proto = correlation_result_to_work_item(&item, &[], &test_host());
         assert_eq!(proto.source, Some("GitHub".to_string()));
     }
 
@@ -232,7 +252,30 @@ mod tests {
         let item = CorrelationResult::Standalone(StandaloneResult::RemoteBranch {
             branch: "origin/feat".to_string(),
         });
-        let proto = correlation_result_to_work_item(&item, &[]);
+        let proto = correlation_result_to_work_item(&item, &[], &test_host());
         assert_eq!(proto.source, Some("git".to_string()));
+    }
+
+    #[test]
+    fn convert_checkout_host_from_host_path() {
+        let remote_host = HostName::new("remote-server");
+        let item = CorrelationResult::Correlated(CorrelatedWorkItem {
+            anchor: CorrelatedAnchor::Checkout(CheckoutRef {
+                key: HostPath::new(remote_host.clone(), PathBuf::from("/repos/proj")),
+                is_main_checkout: false,
+            }),
+            branch: Some("feat".to_string()),
+            description: "Feature".to_string(),
+            linked_change_request: None,
+            linked_session: None,
+            linked_issues: vec![],
+            workspace_refs: vec![],
+            correlation_group_idx: 0,
+            source: None,
+        });
+        let local = HostName::new("local-machine");
+        let proto = correlation_result_to_work_item(&item, &[], &local);
+        // Should use the checkout's HostPath host, not the local fallback
+        assert_eq!(proto.host, remote_host);
     }
 }
