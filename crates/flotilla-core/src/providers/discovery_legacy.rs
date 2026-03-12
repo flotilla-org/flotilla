@@ -8,6 +8,7 @@ use crate::providers::code_review::github::GitHubCodeReview;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
 use crate::providers::coding_agent::codex::CodexCodingAgent;
 use crate::providers::coding_agent::cursor::CursorCodingAgent;
+use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::github_api::GhApiClient;
 use crate::providers::issue_tracker::github::GitHubIssueTracker;
 use crate::providers::registry::ProviderRegistry;
@@ -181,19 +182,45 @@ pub async fn detect_providers(
     if repo_root.join(".git").exists() {
         registry.vcs.insert(
             "git".to_string(),
-            Arc::new(GitVcs::new(Arc::clone(&runner))),
+            (
+                ProviderDescriptor {
+                    name: "git".into(),
+                    display_name: "Git".into(),
+                    abbreviation: "".into(),
+                    section_label: "".into(),
+                    item_noun: "".into(),
+                },
+                Arc::new(GitVcs::new(Arc::clone(&runner))),
+            ),
         );
         info!(%repo_name, "VCS → git");
     }
 
     // 2. Checkout manager: config-driven provider selection
     let co_config = config.resolve_checkouts_config(repo_root);
+    let wt_descriptor = ProviderDescriptor {
+        name: "wt".into(),
+        display_name: "wt".into(),
+        abbreviation: "WT".into(),
+        section_label: "Checkouts".into(),
+        item_noun: "worktree".into(),
+    };
+    let git_cm_descriptor = ProviderDescriptor {
+        name: "git".into(),
+        display_name: "git".into(),
+        abbreviation: "WT".into(),
+        section_label: "Checkouts".into(),
+        item_noun: "worktree".into(),
+    };
     match co_config.provider.as_str() {
         "wt" => {
             if runner.exists("wt", &["--version"]).await {
                 registry.checkout_managers.insert(
                     "git".to_string(),
-                    Arc::new(WtCheckoutManager::new(Arc::clone(&runner))),
+                    (
+                        wt_descriptor,
+                        Arc::new(WtCheckoutManager::new(Arc::clone(&runner))),
+                    ),
                 );
                 info!(%repo_name, "Checkout mgr → wt (forced)");
             } else {
@@ -202,14 +229,20 @@ pub async fn detect_providers(
                 );
                 registry.checkout_managers.insert(
                     "git".to_string(),
-                    Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
+                    (
+                        git_cm_descriptor,
+                        Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
+                    ),
                 );
             }
         }
         "git" => {
             registry.checkout_managers.insert(
                 "git".to_string(),
-                Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
+                (
+                    git_cm_descriptor,
+                    Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
+                ),
             );
             info!(%repo_name, "Checkout mgr → git (forced)");
         }
@@ -218,13 +251,19 @@ pub async fn detect_providers(
             if runner.exists("wt", &["--version"]).await {
                 registry.checkout_managers.insert(
                     "git".to_string(),
-                    Arc::new(WtCheckoutManager::new(Arc::clone(&runner))),
+                    (
+                        wt_descriptor,
+                        Arc::new(WtCheckoutManager::new(Arc::clone(&runner))),
+                    ),
                 );
                 info!(%repo_name, "Checkout mgr → wt");
             } else {
                 registry.checkout_managers.insert(
                     "git".to_string(),
-                    Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
+                    (
+                        git_cm_descriptor,
+                        Arc::new(GitCheckoutManager::new(co_config, Arc::clone(&runner))),
+                    ),
                 );
                 info!(%repo_name, "Checkout mgr → git (fallback)");
             }
@@ -241,21 +280,39 @@ pub async fn detect_providers(
                     Arc::new(GhApiClient::new(Arc::clone(&runner)));
                 registry.code_review.insert(
                     "github".to_string(),
-                    Arc::new(GitHubCodeReview::new(
-                        "github".to_string(),
-                        slug.clone(),
-                        Arc::clone(&api),
-                        Arc::clone(&runner),
-                    )),
+                    (
+                        ProviderDescriptor {
+                            name: "github".into(),
+                            display_name: "GitHub Pull Requests".into(),
+                            abbreviation: "PR".into(),
+                            section_label: "Pull Requests".into(),
+                            item_noun: "pull request".into(),
+                        },
+                        Arc::new(GitHubCodeReview::new(
+                            "github".to_string(),
+                            slug.clone(),
+                            Arc::clone(&api),
+                            Arc::clone(&runner),
+                        )),
+                    ),
                 );
                 registry.issue_trackers.insert(
                     "github".to_string(),
-                    Arc::new(GitHubIssueTracker::new(
-                        "github".to_string(),
-                        slug,
-                        api,
-                        Arc::clone(&runner),
-                    )),
+                    (
+                        ProviderDescriptor {
+                            name: "github".into(),
+                            display_name: "GitHub Issues".into(),
+                            abbreviation: "#".into(),
+                            section_label: "Issues".into(),
+                            item_noun: "issue".into(),
+                        },
+                        Arc::new(GitHubIssueTracker::new(
+                            "github".to_string(),
+                            slug,
+                            api,
+                            Arc::clone(&runner),
+                        )),
+                    ),
                 );
                 info!(%repo_name, "Code review → GitHub");
                 info!(%repo_name, "Issue tracker → GitHub");
@@ -275,10 +332,19 @@ pub async fn detect_providers(
     {
         registry.cloud_agents.insert(
             "cursor".to_string(),
-            Arc::new(CursorCodingAgent::new(
-                "cursor".to_string(),
-                Arc::new(crate::providers::ReqwestHttpClient::new()),
-            )),
+            (
+                ProviderDescriptor {
+                    name: "cursor".into(),
+                    display_name: "Cursor Cloud Agents".into(),
+                    abbreviation: "Agt".into(),
+                    section_label: "Cloud Agents".into(),
+                    item_noun: "agent".into(),
+                },
+                Arc::new(CursorCodingAgent::new(
+                    "cursor".to_string(),
+                    Arc::new(crate::providers::ReqwestHttpClient::new()),
+                )),
+            ),
         );
         info!(%repo_name, "Cloud agent → Cursor Cloud Agents");
     }
@@ -287,10 +353,19 @@ pub async fn detect_providers(
     if super::coding_agent::codex::codex_auth_file_exists() {
         registry.cloud_agents.insert(
             "codex".to_string(),
-            Arc::new(CodexCodingAgent::new(
-                "codex".to_string(),
-                Arc::new(crate::providers::ReqwestHttpClient::new()),
-            )),
+            (
+                ProviderDescriptor {
+                    name: "codex".into(),
+                    display_name: "Codex".into(),
+                    abbreviation: "Cdx".into(),
+                    section_label: "Cloud Agents".into(),
+                    item_noun: "task".into(),
+                },
+                Arc::new(CodexCodingAgent::new(
+                    "codex".to_string(),
+                    Arc::new(crate::providers::ReqwestHttpClient::new()),
+                )),
+            ),
         );
         info!(%repo_name, "Cloud agent → Codex");
     }
@@ -299,15 +374,33 @@ pub async fn detect_providers(
     if let Some(claude_bin) = resolve_claude_path(&*runner).await {
         registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(ClaudeCodingAgent::new(
-                "claude".to_string(),
-                Arc::clone(&runner),
-                Arc::new(crate::providers::ReqwestHttpClient::new()),
-            )),
+            (
+                ProviderDescriptor {
+                    name: "claude".into(),
+                    display_name: "Claude Code Web".into(),
+                    abbreviation: "Agt".into(),
+                    section_label: "Cloud Agents".into(),
+                    item_noun: "agent".into(),
+                },
+                Arc::new(ClaudeCodingAgent::new(
+                    "claude".to_string(),
+                    Arc::clone(&runner),
+                    Arc::new(crate::providers::ReqwestHttpClient::new()),
+                )),
+            ),
         );
         registry.ai_utilities.insert(
             "claude".to_string(),
-            Arc::new(ClaudeAiUtility::new(claude_bin, Arc::clone(&runner))),
+            (
+                ProviderDescriptor {
+                    name: "claude".into(),
+                    display_name: "Claude AI".into(),
+                    abbreviation: "".into(),
+                    section_label: "".into(),
+                    item_noun: "".into(),
+                },
+                Arc::new(ClaudeAiUtility::new(claude_bin, Arc::clone(&runner))),
+            ),
         );
         info!(%repo_name, "Cloud agent → Claude Code Web");
         info!(%repo_name, "AI utility → Claude");
@@ -319,7 +412,13 @@ pub async fn detect_providers(
         let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
         if cmux_bin.exists() {
             registry.workspace_manager = Some((
-                "cmux".to_string(),
+                ProviderDescriptor {
+                    name: "cmux".into(),
+                    display_name: "cmux Workspaces".into(),
+                    abbreviation: "".into(),
+                    section_label: "".into(),
+                    item_noun: "".into(),
+                },
                 Arc::new(CmuxWorkspaceManager::new(Arc::clone(&runner))),
             ));
             info!(%repo_name, "Workspace mgr → cmux");
@@ -330,14 +429,26 @@ pub async fn detect_providers(
             .is_ok()
         {
             registry.workspace_manager = Some((
-                "zellij".to_string(),
+                ProviderDescriptor {
+                    name: "zellij".into(),
+                    display_name: "zellij Workspaces".into(),
+                    abbreviation: "".into(),
+                    section_label: "".into(),
+                    item_noun: "".into(),
+                },
                 Arc::new(ZellijWorkspaceManager::new(Arc::clone(&runner))),
             ));
             info!(%repo_name, "Workspace mgr → zellij");
         }
     } else if std::env::var("TMUX").is_ok() {
         registry.workspace_manager = Some((
-            "tmux".to_string(),
+            ProviderDescriptor {
+                name: "tmux".into(),
+                display_name: "tmux Workspaces".into(),
+                abbreviation: "".into(),
+                section_label: "".into(),
+                item_noun: "".into(),
+            },
             Arc::new(TmuxWorkspaceManager::new(Arc::clone(&runner))),
         ));
         info!(%repo_name, "Workspace mgr → tmux");
@@ -346,7 +457,13 @@ pub async fn detect_providers(
         let cmux_bin = Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux");
         if cmux_bin.exists() {
             registry.workspace_manager = Some((
-                "cmux".to_string(),
+                ProviderDescriptor {
+                    name: "cmux".into(),
+                    display_name: "cmux Workspaces".into(),
+                    abbreviation: "".into(),
+                    section_label: "".into(),
+                    item_noun: "".into(),
+                },
                 Arc::new(CmuxWorkspaceManager::new(Arc::clone(&runner))),
             ));
             info!(%repo_name, "Workspace mgr → cmux (binary found, not running inside cmux)");
@@ -357,7 +474,13 @@ pub async fn detect_providers(
     if runner.exists("shpool", &["version"]).await {
         let shpool_socket = crate::config::flotilla_config_dir().join("shpool/shpool.socket");
         registry.terminal_pool = Some((
-            "shpool".into(),
+            ProviderDescriptor {
+                name: "shpool".into(),
+                display_name: "shpool".into(),
+                abbreviation: "".into(),
+                section_label: "".into(),
+                item_noun: "".into(),
+            },
             Arc::new(
                 crate::providers::terminal::shpool::ShpoolTerminalPool::create(
                     Arc::clone(&runner),
@@ -369,7 +492,13 @@ pub async fn detect_providers(
         info!(%repo_name, "Terminal pool → shpool");
     } else {
         registry.terminal_pool = Some((
-            "passthrough".into(),
+            ProviderDescriptor {
+                name: "passthrough".into(),
+                display_name: "passthrough".into(),
+                abbreviation: "".into(),
+                section_label: "".into(),
+                item_noun: "".into(),
+            },
             Arc::new(crate::providers::terminal::passthrough::PassthroughTerminalPool),
         ));
         info!(%repo_name, "Terminal pool → passthrough (no persistence)");

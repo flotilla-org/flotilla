@@ -16,40 +16,40 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
             .checkout_managers
             .values()
             .next()
-            .map(|cm| CategoryLabels {
-                section: cm.section_label().into(),
-                noun: cm.item_noun().into(),
-                abbr: cm.abbreviation().into(),
+            .map(|(desc, _)| CategoryLabels {
+                section: desc.section_label.clone(),
+                noun: desc.item_noun.clone(),
+                abbr: desc.abbreviation.clone(),
             })
             .unwrap_or_default(),
         code_review: registry
             .code_review
             .values()
             .next()
-            .map(|cr| CategoryLabels {
-                section: cr.section_label().into(),
-                noun: cr.item_noun().into(),
-                abbr: cr.abbreviation().into(),
+            .map(|(desc, _)| CategoryLabels {
+                section: desc.section_label.clone(),
+                noun: desc.item_noun.clone(),
+                abbr: desc.abbreviation.clone(),
             })
             .unwrap_or_default(),
         issues: registry
             .issue_trackers
             .values()
             .next()
-            .map(|it| CategoryLabels {
-                section: it.section_label().into(),
-                noun: it.item_noun().into(),
-                abbr: it.abbreviation().into(),
+            .map(|(desc, _)| CategoryLabels {
+                section: desc.section_label.clone(),
+                noun: desc.item_noun.clone(),
+                abbr: desc.abbreviation.clone(),
             })
             .unwrap_or_default(),
         sessions: registry
             .cloud_agents
             .values()
             .next()
-            .map(|ca| CategoryLabels {
-                section: ca.section_label().into(),
-                noun: ca.item_noun().into(),
-                abbr: ca.abbreviation().into(),
+            .map(|(desc, _)| CategoryLabels {
+                section: desc.section_label.clone(),
+                noun: desc.item_noun.clone(),
+                abbr: desc.abbreviation.clone(),
             })
             .unwrap_or_default(),
     }
@@ -60,7 +60,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     let vcs: Vec<String> = registry
         .vcs
         .values()
-        .map(|v| v.display_name().into())
+        .map(|(d, _)| d.display_name.clone())
         .collect();
     if !vcs.is_empty() {
         names.insert("vcs".into(), vcs);
@@ -68,7 +68,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     let cms: Vec<String> = registry
         .checkout_managers
         .values()
-        .map(|v| v.display_name().into())
+        .map(|(d, _)| d.display_name.clone())
         .collect();
     if !cms.is_empty() {
         names.insert("checkout_manager".into(), cms);
@@ -76,7 +76,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     let crs: Vec<String> = registry
         .code_review
         .values()
-        .map(|v| v.display_name().into())
+        .map(|(d, _)| d.display_name.clone())
         .collect();
     if !crs.is_empty() {
         names.insert("code_review".into(), crs);
@@ -84,7 +84,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     let its: Vec<String> = registry
         .issue_trackers
         .values()
-        .map(|v| v.display_name().into())
+        .map(|(d, _)| d.display_name.clone())
         .collect();
     if !its.is_empty() {
         names.insert("issue_tracker".into(), its);
@@ -92,7 +92,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     let cas: Vec<String> = registry
         .cloud_agents
         .values()
-        .map(|v| v.display_name().into())
+        .map(|(d, _)| d.display_name.clone())
         .collect();
     if !cas.is_empty() {
         names.insert("cloud_agent".into(), cas);
@@ -100,16 +100,16 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     let ais: Vec<String> = registry
         .ai_utilities
         .values()
-        .map(|v| v.display_name().into())
+        .map(|(d, _)| d.display_name.clone())
         .collect();
     if !ais.is_empty() {
         names.insert("ai_utility".into(), ais);
     }
-    if let Some((_, wm)) = &registry.workspace_manager {
-        names.insert("workspace_manager".into(), vec![wm.display_name().into()]);
+    if let Some((desc, _)) = &registry.workspace_manager {
+        names.insert("workspace_manager".into(), vec![desc.display_name.clone()]);
     }
-    if let Some((_, tp)) = &registry.terminal_pool {
-        names.insert("terminal_pool".into(), vec![tp.display_name().into()]);
+    if let Some((desc, _)) = &registry.terminal_pool {
+        names.insert("terminal_pool".into(), vec![desc.display_name.clone()]);
     }
     names
 }
@@ -192,6 +192,7 @@ mod tests {
     use crate::providers::ai_utility::AiUtility;
     use crate::providers::code_review::CodeReview;
     use crate::providers::coding_agent::CloudAgentService;
+    use crate::providers::discovery::ProviderDescriptor;
     use crate::providers::issue_tracker::IssueTracker;
     use crate::providers::vcs::{CheckoutManager, Vcs};
     use crate::providers::workspace::WorkspaceManager;
@@ -417,18 +418,94 @@ mod tests {
     /// Build a ProviderRegistry with all provider slots populated.
     fn full_registry() -> ProviderRegistry {
         let mut reg = ProviderRegistry::new();
-        reg.vcs.insert("vcs".into(), Arc::new(StubVcs));
-        reg.checkout_managers
-            .insert("cm".into(), Arc::new(StubCheckoutManager));
-        reg.code_review
-            .insert("cr".into(), Arc::new(StubCodeReview));
-        reg.issue_trackers
-            .insert("it".into(), Arc::new(StubIssueTracker));
-        reg.cloud_agents
-            .insert("ca".into(), Arc::new(StubCloudAgent));
-        reg.ai_utilities
-            .insert("ai".into(), Arc::new(StubAiUtility));
-        reg.workspace_manager = Some(("wm".into(), Arc::new(StubWorkspaceManager)));
+        reg.vcs.insert(
+            "vcs".into(),
+            (
+                ProviderDescriptor {
+                    name: "vcs".into(),
+                    display_name: "StubVcs".into(),
+                    abbreviation: "".into(),
+                    section_label: "".into(),
+                    item_noun: "".into(),
+                },
+                Arc::new(StubVcs),
+            ),
+        );
+        reg.checkout_managers.insert(
+            "cm".into(),
+            (
+                ProviderDescriptor {
+                    name: "cm".into(),
+                    display_name: "StubCM".into(),
+                    abbreviation: "WT".into(),
+                    section_label: "Checkouts".into(),
+                    item_noun: "worktree".into(),
+                },
+                Arc::new(StubCheckoutManager),
+            ),
+        );
+        reg.code_review.insert(
+            "cr".into(),
+            (
+                ProviderDescriptor {
+                    name: "cr".into(),
+                    display_name: "StubCR".into(),
+                    abbreviation: "PR".into(),
+                    section_label: "Pull Requests".into(),
+                    item_noun: "pull request".into(),
+                },
+                Arc::new(StubCodeReview),
+            ),
+        );
+        reg.issue_trackers.insert(
+            "it".into(),
+            (
+                ProviderDescriptor {
+                    name: "it".into(),
+                    display_name: "StubIT".into(),
+                    abbreviation: "#".into(),
+                    section_label: "GitHub Issues".into(),
+                    item_noun: "issue".into(),
+                },
+                Arc::new(StubIssueTracker),
+            ),
+        );
+        reg.cloud_agents.insert(
+            "ca".into(),
+            (
+                ProviderDescriptor {
+                    name: "ca".into(),
+                    display_name: "StubCA".into(),
+                    abbreviation: "CS".into(),
+                    section_label: "Cloud Agents".into(),
+                    item_noun: "session".into(),
+                },
+                Arc::new(StubCloudAgent),
+            ),
+        );
+        reg.ai_utilities.insert(
+            "ai".into(),
+            (
+                ProviderDescriptor {
+                    name: "ai".into(),
+                    display_name: "StubAI".into(),
+                    abbreviation: "".into(),
+                    section_label: "".into(),
+                    item_noun: "".into(),
+                },
+                Arc::new(StubAiUtility),
+            ),
+        );
+        reg.workspace_manager = Some((
+            ProviderDescriptor {
+                name: "wm".into(),
+                display_name: "StubWM".into(),
+                abbreviation: "".into(),
+                section_label: "".into(),
+                item_noun: "".into(),
+            },
+            Arc::new(StubWorkspaceManager),
+        ));
         reg
     }
 
@@ -475,10 +552,32 @@ mod tests {
     fn labels_with_partial_registry() {
         // Only checkout_managers and coding_agents registered.
         let mut reg = ProviderRegistry::new();
-        reg.checkout_managers
-            .insert("cm".into(), Arc::new(StubCheckoutManager));
-        reg.cloud_agents
-            .insert("ca".into(), Arc::new(StubCloudAgent));
+        reg.checkout_managers.insert(
+            "cm".into(),
+            (
+                ProviderDescriptor {
+                    name: "cm".into(),
+                    display_name: "StubCM".into(),
+                    abbreviation: "WT".into(),
+                    section_label: "Checkouts".into(),
+                    item_noun: "worktree".into(),
+                },
+                Arc::new(StubCheckoutManager),
+            ),
+        );
+        reg.cloud_agents.insert(
+            "ca".into(),
+            (
+                ProviderDescriptor {
+                    name: "ca".into(),
+                    display_name: "StubCA".into(),
+                    abbreviation: "CS".into(),
+                    section_label: "Cloud Agents".into(),
+                    item_noun: "session".into(),
+                },
+                Arc::new(StubCloudAgent),
+            ),
+        );
 
         let labels = labels_from_registry(&reg);
 
@@ -538,8 +637,19 @@ mod tests {
     #[test]
     fn provider_names_partial_registry() {
         let mut reg = ProviderRegistry::new();
-        reg.code_review
-            .insert("cr".into(), Arc::new(StubCodeReview));
+        reg.code_review.insert(
+            "cr".into(),
+            (
+                ProviderDescriptor {
+                    name: "cr".into(),
+                    display_name: "StubCR".into(),
+                    abbreviation: "PR".into(),
+                    section_label: "Pull Requests".into(),
+                    item_noun: "pull request".into(),
+                },
+                Arc::new(StubCodeReview),
+            ),
+        );
 
         let names = provider_names_from_registry(&reg);
         assert_eq!(names.len(), 1);

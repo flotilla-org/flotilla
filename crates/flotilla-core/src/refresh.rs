@@ -181,7 +181,7 @@ async fn refresh_providers(
         registry
             .checkout_managers
             .values()
-            .map(|cm| (cm.display_name().to_string(), cm.list_checkouts(repo_root)))
+            .map(|(desc, cm)| (desc.display_name.clone(), cm.list_checkouts(repo_root)))
             .collect(),
     );
 
@@ -189,9 +189,9 @@ async fn refresh_providers(
         registry
             .code_review
             .values()
-            .map(|cr| {
+            .map(|(desc, cr)| {
                 (
-                    cr.display_name().to_string(),
+                    desc.display_name.clone(),
                     cr.list_change_requests(repo_root, 20),
                 )
             })
@@ -202,7 +202,7 @@ async fn refresh_providers(
         registry
             .cloud_agents
             .values()
-            .map(|ca| (ca.display_name().to_string(), ca.list_sessions(criteria)))
+            .map(|(desc, ca)| (desc.display_name.clone(), ca.list_sessions(criteria)))
             .collect(),
     );
 
@@ -210,9 +210,9 @@ async fn refresh_providers(
         registry
             .vcs
             .values()
-            .map(|vcs| {
+            .map(|(desc, vcs)| {
                 (
-                    vcs.display_name().to_string(),
+                    desc.display_name.clone(),
                     vcs.list_remote_branches(repo_root),
                 )
             })
@@ -223,9 +223,9 @@ async fn refresh_providers(
         registry
             .code_review
             .values()
-            .map(|cr| {
+            .map(|(desc, cr)| {
                 (
-                    cr.display_name().to_string(),
+                    desc.display_name.clone(),
                     cr.list_merged_branch_names(repo_root, 50),
                 )
             })
@@ -233,8 +233,8 @@ async fn refresh_providers(
     );
 
     let ws_fut = async {
-        if let Some((_, ws_mgr)) = &registry.workspace_manager {
-            let name = ws_mgr.display_name().to_string();
+        if let Some((desc, ws_mgr)) = &registry.workspace_manager {
+            let name = desc.display_name.clone();
             match ws_mgr.list_workspaces().await {
                 Ok(entries) => (entries, vec![]),
                 Err(e) => (vec![], vec![(name, e)]),
@@ -245,8 +245,8 @@ async fn refresh_providers(
     };
 
     let tp_fut = async {
-        if let Some((_, tp)) = &registry.terminal_pool {
-            let name = tp.display_name().to_string();
+        if let Some((desc, tp)) = &registry.terminal_pool {
+            let name = desc.display_name.clone();
             match tp.list_terminals().await {
                 Ok(entries) => (entries, vec![]),
                 Err(e) => (vec![], vec![(name, e)]),
@@ -354,7 +354,7 @@ fn compute_provider_health(
         registry
             .cloud_agents
             .values()
-            .map(|ca| ca.display_name().to_string()),
+            .map(|(desc, _)| desc.display_name.clone()),
         &["sessions"],
     );
     insert_category_health(
@@ -364,7 +364,7 @@ fn compute_provider_health(
         registry
             .code_review
             .values()
-            .map(|cr| cr.display_name().to_string()),
+            .map(|(desc, _)| desc.display_name.clone()),
         &["PRs", "merged"],
     );
     insert_category_health(
@@ -374,7 +374,7 @@ fn compute_provider_health(
         registry
             .checkout_managers
             .values()
-            .map(|cm| cm.display_name().to_string()),
+            .map(|(desc, _)| desc.display_name.clone()),
         &["checkouts"],
     );
     insert_category_health(
@@ -384,26 +384,26 @@ fn compute_provider_health(
         registry
             .vcs
             .values()
-            .map(|vcs| vcs.display_name().to_string()),
+            .map(|(desc, _)| desc.display_name.clone()),
         &["branches"],
     );
 
-    if let Some((_, ws)) = &registry.workspace_manager {
+    if let Some((desc, _)) = &registry.workspace_manager {
         insert_category_health(
             &mut health,
             errors,
             "workspace_manager",
-            [ws.display_name().to_string()],
+            [desc.display_name.clone()],
             &["workspaces"],
         );
     }
 
-    if let Some((_, tp)) = &registry.terminal_pool {
+    if let Some((desc, _)) = &registry.terminal_pool {
         insert_category_health(
             &mut health,
             errors,
             "terminal_pool",
-            [tp.display_name().to_string()],
+            [desc.display_name.clone()],
             &["terminals"],
         );
     }
@@ -422,9 +422,20 @@ mod tests {
 
     use crate::providers::code_review::CodeReview;
     use crate::providers::coding_agent::CloudAgentService;
+    use crate::providers::discovery::ProviderDescriptor;
     use crate::providers::types::*;
     use crate::providers::vcs::{CheckoutManager, Vcs};
     use crate::providers::workspace::WorkspaceManager;
+
+    fn desc(name: &str) -> ProviderDescriptor {
+        ProviderDescriptor {
+            name: name.into(),
+            display_name: name.into(),
+            abbreviation: "".into(),
+            section_label: "".into(),
+            item_noun: "".into(),
+        }
+    }
 
     struct MockCheckoutManager {
         result: Result<Vec<(PathBuf, Checkout)>, String>,
@@ -804,12 +815,13 @@ mod tests {
     #[test]
     fn compute_provider_health_maps_error_categories() {
         let mut registry = ProviderRegistry::new();
-        registry
-            .cloud_agents
-            .insert("claude".to_string(), Arc::new(MockCloudAgent::ok(vec![])));
+        registry.cloud_agents.insert(
+            "claude".to_string(),
+            (desc("MockCA"), Arc::new(MockCloudAgent::ok(vec![]))),
+        );
         registry.code_review.insert(
             "github".to_string(),
-            Arc::new(MockCodeReview::ok(vec![], vec![])),
+            (desc("MockCR"), Arc::new(MockCodeReview::ok(vec![], vec![]))),
         );
 
         let cases = vec![
@@ -864,37 +876,49 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.checkout_managers.insert(
             "wt".to_string(),
-            Arc::new(MockCheckoutManager::ok(vec![(
-                PathBuf::from("/tmp/wt/feat-a"),
-                make_checkout("feat-a"),
-            )])),
+            (
+                desc("wt"),
+                Arc::new(MockCheckoutManager::ok(vec![(
+                    PathBuf::from("/tmp/wt/feat-a"),
+                    make_checkout("feat-a"),
+                )])),
+            ),
         );
         registry.code_review.insert(
             "github".to_string(),
-            Arc::new(MockCodeReview::ok(
-                vec![(
-                    "42".to_string(),
-                    make_change_request("Add feature", "feat-a"),
-                )],
-                vec!["shared".to_string()],
-            )),
+            (
+                desc("github"),
+                Arc::new(MockCodeReview::ok(
+                    vec![(
+                        "42".to_string(),
+                        make_change_request("Add feature", "feat-a"),
+                    )],
+                    vec!["shared".to_string()],
+                )),
+            ),
         );
         registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCloudAgent::ok(vec![(
-                "sess-1".to_string(),
-                make_session("Debug", "sess-1"),
-            )])),
+            (
+                desc("claude"),
+                Arc::new(MockCloudAgent::ok(vec![(
+                    "sess-1".to_string(),
+                    make_session("Debug", "sess-1"),
+                )])),
+            ),
         );
         registry.vcs.insert(
             "git".to_string(),
-            Arc::new(MockVcs::ok(vec![
-                "remote-only".to_string(),
-                "shared".to_string(),
-            ])),
+            (
+                desc("git"),
+                Arc::new(MockVcs::ok(vec![
+                    "remote-only".to_string(),
+                    "shared".to_string(),
+                ])),
+            ),
         );
         registry.workspace_manager = Some((
-            "cmux".to_string(),
+            desc("cmux"),
             Arc::new(MockWorkspaceManager::ok(vec![(
                 "ws-1".to_string(),
                 make_workspace("dev"),
@@ -925,7 +949,10 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.checkout_managers.insert(
             "wt".to_string(),
-            Arc::new(MockCheckoutManager::failing("checkout failed")),
+            (
+                desc("wt"),
+                Arc::new(MockCheckoutManager::failing("checkout failed")),
+            ),
         );
 
         let mut pd = ProviderData::default();
@@ -940,25 +967,34 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.checkout_managers.insert(
             "wt".to_string(),
-            Arc::new(MockCheckoutManager::ok(vec![(
-                PathBuf::from("/tmp/wt/feat-a"),
-                make_checkout("feat-a"),
-            )])),
+            (
+                desc("wt"),
+                Arc::new(MockCheckoutManager::ok(vec![(
+                    PathBuf::from("/tmp/wt/feat-a"),
+                    make_checkout("feat-a"),
+                )])),
+            ),
         );
         registry.code_review.insert(
             "github".to_string(),
-            Arc::new(MockCodeReview::failing("pr fail", "merged fail")),
+            (
+                desc("github"),
+                Arc::new(MockCodeReview::failing("pr fail", "merged fail")),
+            ),
         );
         registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCloudAgent::failing("sessions fail")),
+            (
+                desc("claude"),
+                Arc::new(MockCloudAgent::failing("sessions fail")),
+            ),
         );
         registry.vcs.insert(
             "git".to_string(),
-            Arc::new(MockVcs::failing("branches fail")),
+            (desc("git"), Arc::new(MockVcs::failing("branches fail"))),
         );
         registry.workspace_manager = Some((
-            "cmux".to_string(),
+            desc("cmux"),
             Arc::new(MockWorkspaceManager::failing("workspaces fail")),
         ));
 
@@ -1001,7 +1037,10 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCloudAgent::failing("agent offline")),
+            (
+                desc("MockCA"),
+                Arc::new(MockCloudAgent::failing("agent offline")),
+            ),
         );
 
         let handle = RepoRefreshHandle::spawn(
@@ -1044,11 +1083,17 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCloudAgent::ok_named("Claude", vec![])),
+            (
+                desc("Claude"),
+                Arc::new(MockCloudAgent::ok_named("Claude", vec![])),
+            ),
         );
         registry.cloud_agents.insert(
             "cursor".to_string(),
-            Arc::new(MockCloudAgent::ok_named("Cursor", vec![])),
+            (
+                desc("Cursor"),
+                Arc::new(MockCloudAgent::ok_named("Cursor", vec![])),
+            ),
         );
 
         // Only Cursor fails
@@ -1074,11 +1119,17 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.cloud_agents.insert(
             "claude".to_string(),
-            Arc::new(MockCloudAgent::ok_named("Claude", vec![])),
+            (
+                desc("Claude"),
+                Arc::new(MockCloudAgent::ok_named("Claude", vec![])),
+            ),
         );
         registry.cloud_agents.insert(
             "cursor".to_string(),
-            Arc::new(MockCloudAgent::failing_named("Cursor", "auth failed")),
+            (
+                desc("Cursor"),
+                Arc::new(MockCloudAgent::failing_named("Cursor", "auth failed")),
+            ),
         );
 
         let handle = RepoRefreshHandle::spawn(
