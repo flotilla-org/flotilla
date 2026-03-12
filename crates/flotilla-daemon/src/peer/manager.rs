@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use flotilla_protocol::{
-    HostName, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity,
-    VectorClock,
+    ConfigLabel, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData,
+    RepoIdentity, RoutedPeerMessage, VectorClock,
 };
 
 use super::transport::{PeerSender, PeerTransport};
@@ -42,11 +43,74 @@ pub enum HandleResult {
     Ignored,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionMeta {
+    pub direction: ConnectionDirection,
+    pub config_label: Option<ConfigLabel>,
+    pub expected_peer: Option<HostName>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboundPeerEnvelope {
+    pub msg: PeerWireMessage,
+    pub connection_generation: u64,
+    pub connection_peer: HostName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHop {
+    pub next_hop: HostName,
+    pub next_hop_generation: u64,
+    pub learned_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteState {
+    pub primary: RouteHop,
+    pub fallbacks: Vec<RouteHop>,
+    pub candidates: Vec<RouteHop>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReversePathKey {
+    pub request_id: u64,
+    pub requester_host: HostName,
+    pub target_host: HostName,
+    pub repo_identity: RepoIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePathHop {
+    pub next_hop: HostName,
+    pub next_hop_generation: u64,
+    pub learned_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingResyncRequest {
+    pub deadline_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct DisconnectPlan {
+    pub affected_repos: Vec<RepoIdentity>,
+    pub resync_requests: Vec<RoutedPeerMessage>,
+}
+
 /// Per-repo state received from a single peer host.
 pub struct PerRepoPeerState {
     pub provider_data: ProviderData,
     pub repo_path: PathBuf,
     pub seq: u64,
+    pub via_peer: HostName,
+    pub via_generation: u64,
+    pub stale: bool,
 }
 
 /// Manages connections to remote peer hosts and stores their provider data.
@@ -58,6 +122,13 @@ pub struct PeerManager {
     local_host: HostName,
     peers: HashMap<HostName, Box<dyn PeerTransport>>,
     senders: HashMap<HostName, Arc<dyn PeerSender>>,
+    transport_peers: HashMap<ConfigLabel, HostName>,
+    generations: HashMap<HostName, u64>,
+    routes: HashMap<HostName, RouteState>,
+    reverse_paths: HashMap<ReversePathKey, ReversePathHop>,
+    pending_resync_requests: HashMap<ReversePathKey, PendingResyncRequest>,
+    route_epoch: u64,
+    request_id_counter: u64,
     peer_data: HashMap<HostName, HashMap<RepoIdentity, PerRepoPeerState>>,
     /// RepoIdentity values that exist only on remote peers — no local repo
     /// matches. Each maps to the synthetic path used for tab identity.
@@ -74,6 +145,13 @@ impl PeerManager {
             local_host,
             peers: HashMap::new(),
             senders: HashMap::new(),
+            transport_peers: HashMap::new(),
+            generations: HashMap::new(),
+            routes: HashMap::new(),
+            reverse_paths: HashMap::new(),
+            pending_resync_requests: HashMap::new(),
+            route_epoch: 0,
+            request_id_counter: 0,
             peer_data: HashMap::new(),
             known_remote_repos: HashMap::new(),
             last_seen_clocks: HashMap::new(),
@@ -91,24 +169,73 @@ impl PeerManager {
         self.senders.insert(name, sender);
     }
 
-    /// Process an inbound PeerDataMessage.
-    ///
-    /// - Snapshot: stores provider_data and seq, returns Updated.
-    /// - Delta: for Phase 1 we don't apply deltas, so we return NeedsResync.
-    /// - RequestResync: returns ResyncRequested so the caller can send a snapshot.
-    pub fn handle_peer_data(&mut self, msg: PeerDataMessage) -> HandleResult {
+    fn next_route_epoch(&mut self) -> u64 {
+        self.route_epoch = self.route_epoch.saturating_add(1);
+        self.route_epoch
+    }
+
+    pub fn next_request_id(&mut self) -> u64 {
+        self.request_id_counter = self.request_id_counter.saturating_add(1);
+        self.request_id_counter
+    }
+
+    pub fn current_generation(&self, name: &HostName) -> Option<u64> {
+        self.generations.get(name).copied()
+    }
+
+    fn generation_is_current(&self, name: &HostName, generation: u64) -> bool {
+        generation != 0 && self.generations.get(name).copied() == Some(generation)
+    }
+
+    fn install_direct_route(&mut self, host: &HostName, generation: u64) {
+        let learned_epoch = self.next_route_epoch();
+        self.routes.insert(
+            host.clone(),
+            RouteState {
+                primary: RouteHop {
+                    next_hop: host.clone(),
+                    next_hop_generation: generation,
+                    learned_epoch,
+                },
+                fallbacks: Vec::new(),
+                candidates: Vec::new(),
+            },
+        );
+    }
+
+    pub fn activate_connection(
+        &mut self,
+        host: HostName,
+        sender: Arc<dyn PeerSender>,
+        meta: ConnectionMeta,
+    ) -> u64 {
+        let generation = self
+            .generations
+            .get(&host)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.generations.insert(host.clone(), generation);
+        self.senders.insert(host.clone(), sender);
+        self.install_direct_route(&host, generation);
+
+        if let Some(label) = meta.config_label {
+            self.transport_peers.insert(label, host);
+        }
+
+        generation
+    }
+
+    fn store_snapshot_from(
+        &mut self,
+        via_peer: &HostName,
+        via_generation: u64,
+        msg: PeerDataMessage,
+    ) -> HandleResult {
         let origin = msg.origin_host.clone();
         let repo = msg.repo_identity.clone();
         let repo_path = msg.repo_path.clone();
 
-        // Ignore messages from ourselves
-        if origin == self.local_host {
-            debug!(host = %origin, "ignoring peer data from self");
-            return HandleResult::Ignored;
-        }
-
-        // Vector clock dedup: drop if the incoming clock is dominated by
-        // (i.e. ≤ in every entry) our last-seen clock for this origin+repo.
         let dedup_key = (origin.clone(), repo.clone());
         if let Some(last_seen) = self.last_seen_clocks.get(&dedup_key) {
             if msg.clock.dominated_by(last_seen) {
@@ -121,7 +248,6 @@ impl PeerManager {
             }
         }
 
-        // Update last-seen clock (merge to handle concurrent paths)
         self.last_seen_clocks
             .entry(dedup_key)
             .or_default()
@@ -129,22 +255,34 @@ impl PeerManager {
 
         match msg.kind {
             PeerDataKind::Snapshot { data, seq } => {
-                debug!(
-                    origin = %origin,
-                    repo = %repo,
-                    %seq,
-                    "received peer snapshot"
-                );
-
-                let repo_states = self.peer_data.entry(origin).or_default();
+                let repo_states = self.peer_data.entry(origin.clone()).or_default();
                 repo_states.insert(
                     repo.clone(),
                     PerRepoPeerState {
                         provider_data: *data,
                         repo_path,
                         seq,
+                        via_peer: via_peer.clone(),
+                        via_generation,
+                        stale: false,
                     },
                 );
+
+                if !self.routes.contains_key(&origin) {
+                    let learned_epoch = self.next_route_epoch();
+                    self.routes.insert(
+                        origin.clone(),
+                        RouteState {
+                            primary: RouteHop {
+                                next_hop: via_peer.clone(),
+                                next_hop_generation: via_generation,
+                                learned_epoch,
+                            },
+                            fallbacks: Vec::new(),
+                            candidates: Vec::new(),
+                        },
+                    );
+                }
 
                 HandleResult::Updated(repo)
             }
@@ -153,8 +291,6 @@ impl PeerManager {
                 prev_seq,
                 changes: _,
             } => {
-                // Phase 1: we don't apply deltas. Check if we have state and
-                // whether the seq is contiguous. Either way, request resync.
                 debug!(
                     origin = %origin,
                     repo = %repo,
@@ -165,21 +301,174 @@ impl PeerManager {
 
                 HandleResult::NeedsResync { from: origin, repo }
             }
-            PeerDataKind::RequestResync { since_seq } => {
-                debug!(
-                    from = %origin,
-                    repo = %repo,
-                    %since_seq,
-                    "peer requested resync"
+            PeerDataKind::RequestResync { since_seq } => HandleResult::ResyncRequested {
+                from: origin,
+                repo,
+                since_seq,
+            },
+        }
+    }
+
+    pub async fn handle_inbound(&mut self, env: InboundPeerEnvelope) -> HandleResult {
+        if !self.generation_is_current(&env.connection_peer, env.connection_generation) {
+            debug!(
+                peer = %env.connection_peer,
+                generation = env.connection_generation,
+                "dropping stale-generation peer message"
+            );
+            return HandleResult::Ignored;
+        }
+
+        match env.msg {
+            PeerWireMessage::Data(msg) => {
+                if msg.origin_host == self.local_host {
+                    debug!(host = %msg.origin_host, "ignoring peer data from self");
+                    return HandleResult::Ignored;
+                }
+                self.store_snapshot_from(&env.connection_peer, env.connection_generation, msg)
+            }
+            PeerWireMessage::Routed(msg) => self.handle_routed(env.connection_peer, env.connection_generation, msg).await,
+        }
+    }
+
+    async fn handle_routed(
+        &mut self,
+        connection_peer: HostName,
+        connection_generation: u64,
+        msg: RoutedPeerMessage,
+    ) -> HandleResult {
+        match msg {
+            RoutedPeerMessage::RequestResync {
+                request_id,
+                requester_host,
+                target_host,
+                remaining_hops,
+                repo_identity,
+                since_seq,
+            } => {
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+                if target_host == self.local_host {
+                    return HandleResult::ResyncRequested {
+                        from: requester_host,
+                        repo: repo_identity,
+                        since_seq,
+                    };
+                }
+
+                let key = ReversePathKey {
+                    request_id,
+                    requester_host: requester_host.clone(),
+                    target_host: target_host.clone(),
+                    repo_identity: repo_identity.clone(),
+                };
+                let learned_at = self.next_route_epoch();
+                self.reverse_paths.insert(
+                    key,
+                    ReversePathHop {
+                        next_hop: connection_peer,
+                        next_hop_generation: connection_generation,
+                        learned_at,
+                    },
                 );
 
-                HandleResult::ResyncRequested {
-                    from: origin,
-                    repo,
+                let forwarded = RoutedPeerMessage::RequestResync {
+                    request_id,
+                    requester_host,
+                    target_host: target_host.clone(),
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    repo_identity,
                     since_seq,
+                };
+                let _ = self
+                    .send_to(&target_host, PeerWireMessage::Routed(forwarded))
+                    .await;
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::ResyncSnapshot {
+                request_id,
+                requester_host,
+                responder_host,
+                remaining_hops,
+                repo_identity,
+                repo_path,
+                clock,
+                seq,
+                data,
+            } => {
+                let key = ReversePathKey {
+                    request_id,
+                    requester_host: requester_host.clone(),
+                    target_host: responder_host.clone(),
+                    repo_identity: repo_identity.clone(),
+                };
+
+                if requester_host == self.local_host {
+                    if self.pending_resync_requests.remove(&key).is_none() {
+                        return HandleResult::Ignored;
+                    }
+                    return self.store_snapshot_from(
+                        &connection_peer,
+                        connection_generation,
+                        PeerDataMessage {
+                            origin_host: responder_host,
+                            repo_identity,
+                            repo_path,
+                            clock,
+                            kind: PeerDataKind::Snapshot { data, seq },
+                        },
+                    );
                 }
+
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+
+                let Some(reverse_hop) = self.reverse_paths.get(&key).cloned() else {
+                    return HandleResult::Ignored;
+                };
+                if !self.generation_is_current(
+                    &reverse_hop.next_hop,
+                    reverse_hop.next_hop_generation,
+                ) {
+                    self.reverse_paths.remove(&key);
+                    return HandleResult::Ignored;
+                }
+
+                let forwarded = RoutedPeerMessage::ResyncSnapshot {
+                    request_id,
+                    requester_host,
+                    responder_host,
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    repo_identity,
+                    repo_path,
+                    clock,
+                    seq,
+                    data,
+                };
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop) {
+                    let _ = sender.send(PeerWireMessage::Routed(forwarded)).await;
+                }
+                self.reverse_paths.remove(&key);
+                HandleResult::Ignored
             }
         }
+    }
+
+    /// Process an inbound PeerDataMessage.
+    ///
+    /// - Snapshot: stores provider_data and seq, returns Updated.
+    /// - Delta: for Phase 1 we don't apply deltas, so we return NeedsResync.
+    /// - RequestResync: returns ResyncRequested so the caller can send a snapshot.
+    pub fn handle_peer_data(&mut self, msg: PeerDataMessage) -> HandleResult {
+        let origin = msg.origin_host.clone();
+        if origin == self.local_host {
+            debug!(host = %origin, "ignoring peer data from self");
+            return HandleResult::Ignored;
+        }
+        let generation = self.generations.get(&origin).copied().unwrap_or(1);
+        self.store_snapshot_from(&origin, generation, msg)
     }
 
     /// Forward a message to all connected peers except the origin, self,
@@ -262,7 +551,15 @@ impl PeerManager {
                 Ok((sender, subscribe_result)) => {
                     info!(peer = %name, "peer transport connected");
                     if let Some(sender) = sender {
-                        self.register_sender(name.clone(), sender);
+                        self.activate_connection(
+                            name.clone(),
+                            sender,
+                            ConnectionMeta {
+                                direction: ConnectionDirection::Outbound,
+                                config_label: None,
+                                expected_peer: Some(name.clone()),
+                            },
+                        );
                     }
                     match subscribe_result {
                         Ok(rx) => receivers.push((name.clone(), rx)),
@@ -356,12 +653,20 @@ impl PeerManager {
     }
 
     /// Send a message to a specific peer by name.
-    pub async fn send_to(&self, name: &HostName, msg: PeerDataMessage) -> Result<(), String> {
-        let sender = self
-            .senders
+    pub async fn send_to(&self, name: &HostName, msg: PeerWireMessage) -> Result<(), String> {
+        if let Some(sender) = self.senders.get(name) {
+            return sender.send(msg).await;
+        }
+
+        let route = self
+            .routes
             .get(name)
             .ok_or_else(|| format!("unknown peer: {name}"))?;
-        sender.send(PeerWireMessage::Data(msg)).await
+        let sender = self
+            .senders
+            .get(&route.primary.next_hop)
+            .ok_or_else(|| format!("missing next hop sender: {}", route.primary.next_hop))?;
+        sender.send(msg).await
     }
 
     /// Reconnect a specific peer: disconnect, then connect + subscribe.
@@ -387,10 +692,38 @@ impl PeerManager {
         };
 
         if let Some(sender) = sender {
-            self.register_sender(name.clone(), sender);
+            self.activate_connection(
+                name.clone(),
+                sender,
+                ConnectionMeta {
+                    direction: ConnectionDirection::Outbound,
+                    config_label: None,
+                    expected_peer: Some(name.clone()),
+                },
+            );
         }
 
         Ok(rx)
+    }
+
+    pub fn disconnect_peer(&mut self, name: &HostName, generation: u64) -> DisconnectPlan {
+        if !self.generation_is_current(name, generation) {
+            return DisconnectPlan {
+                affected_repos: Vec::new(),
+                resync_requests: Vec::new(),
+            };
+        }
+
+        self.senders.remove(name);
+        self.generations.remove(name);
+        self.routes.remove(name);
+        self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
+        self.pending_resync_requests.retain(|_, _| true);
+
+        DisconnectPlan {
+            affected_repos: self.remove_peer_data(name),
+            resync_requests: Vec::new(),
+        }
     }
 }
 
@@ -764,10 +1097,223 @@ mod tests {
         });
         mgr.register_sender(HostName::new("peer"), sender);
 
-        mgr.send_to(&HostName::new("peer"), snapshot_msg("local", 1))
+        mgr.send_to(
+            &HostName::new("peer"),
+            PeerWireMessage::Data(snapshot_msg("local", 1)),
+        )
             .await
             .expect("send succeeds");
 
         assert_eq!(sent.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn activate_connection_supersedes_older_sender() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let first_sent = Arc::new(Mutex::new(Vec::new()));
+        let second_sent = Arc::new(Mutex::new(Vec::new()));
+        let first_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::clone(&first_sent),
+        });
+        let second_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::clone(&second_sent),
+        });
+
+        let gen1 = mgr.activate_connection(
+            HostName::new("peer"),
+            first_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+        let gen2 = mgr.activate_connection(
+            HostName::new("peer"),
+            second_sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        assert_eq!(gen1, 1);
+        assert_eq!(gen2, 2);
+        mgr.send_to(
+            &HostName::new("peer"),
+            PeerWireMessage::Data(snapshot_msg("local", 1)),
+        )
+        .await
+        .expect("send succeeds");
+
+        assert!(first_sent.lock().expect("lock").is_empty());
+        assert_eq!(second_sent.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_inbound_message_is_dropped() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let generation = mgr.activate_connection(
+            HostName::new("peer"),
+            sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+        assert_eq!(generation, 1);
+        let _ = mgr.activate_connection(
+            HostName::new("peer"),
+            Arc::new(MockPeerSender {
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Data(snapshot_msg("peer", 1)),
+                connection_generation: generation,
+                connection_peer: HostName::new("peer"),
+            })
+            .await;
+
+        assert_eq!(result, HandleResult::Ignored);
+        assert!(mgr.get_peer_data().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_to_uses_route_primary_when_no_direct_sender() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let via_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::clone(&sent),
+        });
+        mgr.register_sender(HostName::new("relay"), via_sender);
+        mgr.generations.insert(HostName::new("relay"), 1);
+        mgr.routes.insert(
+            HostName::new("target"),
+            RouteState {
+                primary: RouteHop {
+                    next_hop: HostName::new("relay"),
+                    next_hop_generation: 1,
+                    learned_epoch: 1,
+                },
+                fallbacks: Vec::new(),
+                candidates: Vec::new(),
+            },
+        );
+
+        mgr.send_to(
+            &HostName::new("target"),
+            PeerWireMessage::Routed(RoutedPeerMessage::RequestResync {
+                request_id: 1,
+                requester_host: HostName::new("local"),
+                target_host: HostName::new("target"),
+                remaining_hops: 3,
+                repo_identity: test_repo(),
+                since_seq: 0,
+            }),
+        )
+        .await
+        .expect("send succeeds");
+
+        assert_eq!(sent.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_to_returns_error_when_no_direct_sender_or_route() {
+        let mgr = PeerManager::new(HostName::new("local"));
+        let err = mgr
+            .send_to(
+                &HostName::new("missing"),
+                PeerWireMessage::Data(snapshot_msg("local", 1)),
+            )
+            .await
+            .expect_err("missing route should error");
+        assert!(err.contains("unknown peer"));
+    }
+
+    #[tokio::test]
+    async fn late_resync_snapshot_is_dropped_without_pending_request() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let generation = mgr.activate_connection(
+            HostName::new("relay"),
+            sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
+                    request_id: 1,
+                    requester_host: HostName::new("local"),
+                    responder_host: HostName::new("target"),
+                    remaining_hops: 3,
+                    repo_identity: test_repo(),
+                    repo_path: PathBuf::from("/home/dev/repo"),
+                    clock: VectorClock::default(),
+                    seq: 1,
+                    data: Box::new(ProviderData::default()),
+                }),
+                connection_generation: generation,
+                connection_peer: HostName::new("relay"),
+            })
+            .await;
+
+        assert_eq!(result, HandleResult::Ignored);
+        assert!(mgr.get_peer_data().is_empty());
+    }
+
+    #[tokio::test]
+    async fn routed_request_resync_is_dropped_when_hop_budget_exhausted() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::clone(&sent),
+        });
+        let generation = mgr.activate_connection(
+            HostName::new("relay"),
+            sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+            },
+        );
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Routed(RoutedPeerMessage::RequestResync {
+                    request_id: 1,
+                    requester_host: HostName::new("requester"),
+                    target_host: HostName::new("target"),
+                    remaining_hops: 0,
+                    repo_identity: test_repo(),
+                    since_seq: 0,
+                }),
+                connection_generation: generation,
+                connection_peer: HostName::new("relay"),
+            })
+            .await;
+
+        assert_eq!(result, HandleResult::Ignored);
+        assert!(sent.lock().expect("lock").is_empty());
     }
 }

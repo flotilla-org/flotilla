@@ -436,7 +436,10 @@ impl DaemonServer {
                                         },
                                     };
                                     // Send via PeerManager transport (works for SSH peers)
-                                    if let Err(e) = pm.send_to(&from, response).await {
+                                    if let Err(e) = pm
+                                        .send_to(&from, PeerWireMessage::Data(response))
+                                        .await
+                                    {
                                         warn!(
                                             peer = %from,
                                             err = %e,
@@ -461,7 +464,10 @@ impl DaemonServer {
                                 },
                             };
                             // Send via PeerManager transport (works for SSH peers)
-                            if let Err(e) = pm.send_to(&from, request).await {
+                            if let Err(e) = pm
+                                .send_to(&from, PeerWireMessage::Data(request))
+                                .await
+                            {
                                 warn!(
                                     peer = %from,
                                     err = %e,
@@ -707,7 +713,10 @@ async fn send_local_to_peers(
     };
     for peer_name in peer_names {
         let pm = peer_manager.lock().await;
-        if let Err(e) = pm.send_to(&peer_name, msg.clone()).await {
+        if let Err(e) = pm
+            .send_to(&peer_name, PeerWireMessage::Data(msg.clone()))
+            .await
+        {
             debug!(peer = %peer_name, err = %e, "failed to send snapshot to peer");
         }
         drop(pm);
