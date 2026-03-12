@@ -10,16 +10,16 @@ Currently, `start_daemon()` reuses an existing live daemon without checking whet
 
 ### `ensure_config()` returns whether config changed
 
-Change the return type from `()` to `bool`. Returns `true` when the config file was written (missing or stale), `false` when it already matched the embedded content. No new logic needed — the existing `needs_write` variable already captures this.
+Change the return type from `()` to `bool`. Returns `true` when the config file was successfully written (missing or stale), `false` when it already matched or when the write failed. This prevents killing a good daemon when the new config couldn't be persisted. The existing `needs_write` variable captures the comparison; the return value is gated on both `needs_write` and `fs::write` succeeding.
 
 ### New `stop_daemon()` helper
 
 A `#[cfg(unix)]` async method that gracefully stops a running daemon:
 
-1. Read pid from `daemonized-shpool.pid` (sibling of socket file).
+1. Read pid from `daemonized-shpool.pid` (sibling of socket file). Handle missing pid file gracefully (log and return — if there's no pid file, we can't signal the daemon).
 2. Send `SIGTERM` via `libc::kill(pid, libc::SIGTERM)`.
 3. Poll `is_process_alive(pid)` up to 20 times with 100ms sleep (2s timeout, same pattern as `start_daemon`'s socket polling).
-4. Remove socket and pid files after the process exits (or after timeout).
+4. Remove socket and pid files after the process exits (or after timeout). This removal is load-bearing: `start_daemon()` checks `socket_path.exists()` as its first guard and returns early if true, so the socket must be gone for the replacement daemon to spawn.
 5. If the process won't die within the timeout, log a warning but continue — the new daemon may fail to bind the socket, but shpool's auto-daemonize fallback from `attach` still works.
 
 Non-unix stub is a no-op.
@@ -35,7 +35,7 @@ if config_changed && socket_path.exists() {
 Self::start_daemon(&socket_path, &config_path).await;
 ```
 
-After `clean_stale_socket()`, if the socket still exists the daemon is alive. If `config_changed` is also true, stop the daemon so `start_daemon()` will spawn a replacement with the new config.
+After `clean_stale_socket()`, if the socket still exists the daemon is alive. If `config_changed` is also true, log `info!("shpool config changed, restarting daemon")` and stop the daemon so `start_daemon()` will spawn a replacement with the new config.
 
 ### Testing
 
