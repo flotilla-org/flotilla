@@ -1068,19 +1068,23 @@ impl DaemonHandle for InProcessDaemon {
         let config_base = self.config.base_path().to_path_buf();
         let _ = self.event_tx.send(DaemonEvent::CommandStarted { command_id: id, repo: repo_path.clone(), description });
 
-        let plan = executor::build_plan(command, repo_path.clone(), registry, providers_data, runner, config_base).await;
+        // Spawn the entire build_plan + execution so execute() returns the
+        // command_id immediately. This keeps the TUI event loop responsive —
+        // build_plan runs execute() inline for Immediate commands, which may
+        // do network I/O (e.g. GenerateBranchName, ArchiveSession).
+        let active_ref = Arc::clone(&self.active_command);
+        tokio::spawn(async move {
+            let plan = executor::build_plan(command, repo_path.clone(), registry, providers_data, runner, config_base).await;
 
-        match plan {
-            ExecutionPlan::Immediate(result) => {
-                refresh_trigger.notify_one();
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
-            }
-            ExecutionPlan::Steps(step_plan) => {
-                let token = CancellationToken::new();
-                *self.active_command.lock().await = Some(ActiveCommand { command_id: id, token: token.clone() });
+            match plan {
+                ExecutionPlan::Immediate(result) => {
+                    refresh_trigger.notify_one();
+                    let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
+                }
+                ExecutionPlan::Steps(step_plan) => {
+                    let token = CancellationToken::new();
+                    *active_ref.lock().await = Some(ActiveCommand { command_id: id, token: token.clone() });
 
-                let active_ref = Arc::clone(&self.active_command);
-                tokio::spawn(async move {
                     let result = run_step_plan(step_plan, id, repo_path.clone(), token, event_tx.clone()).await;
                     refresh_trigger.notify_one();
                     let mut guard = active_ref.lock().await;
@@ -1088,9 +1092,9 @@ impl DaemonHandle for InProcessDaemon {
                         *guard = None;
                     }
                     let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
-                });
+                }
             }
-        }
+        });
 
         Ok(id)
     }

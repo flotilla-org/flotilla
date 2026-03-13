@@ -174,10 +174,7 @@ async fn build_create_checkout_plan(
                         if let Some((_, tp)) = &registry.terminal_pool {
                             resolve_terminal_pool(&mut config, tp.as_ref()).await;
                         }
-                        if let Err(e) = ws_mgr.create_workspace(&config).await {
-                            // Checkout was created but workspace failed — log but don't fail
-                            error!(err = %e, "workspace creation failed after checkout");
-                        }
+                        ws_mgr.create_workspace(&config).await.map_err(|e| format!("workspace creation failed after checkout: {e}"))?;
                     }
                     Ok(StepOutcome::Completed)
                 })
