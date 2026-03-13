@@ -64,21 +64,28 @@ jobs:
     name: Dylint
     runs-on: ubuntu-latest
     needs: fmt
+    env:
+      DYLINT_NIGHTLY: nightly-2026-03-12
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-03-12
           components: llvm-tools-preview, rustc-dev
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-dylint dylint-link --locked
       - uses: actions/cache@v4
         with:
           path: |
+            ~/.cargo/bin/cargo-dylint
+            ~/.cargo/bin/dylint-link
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-dylint-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-dylint-nightly-2026-03-12-${{ hashFiles('lints/**/Cargo.lock', 'Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-dylint-
+            ${{ runner.os }}-dylint-nightly-2026-03-12-
+      - name: Install cargo-dylint
+        run: |
+          command -v cargo-dylint && command -v dylint-link || cargo install cargo-dylint dylint-link --locked
       - run: cargo dylint --all -- --all-targets

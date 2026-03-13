@@ -96,12 +96,12 @@ impl PathFinder<'_, '_> {
 
         let path_str: String = path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::");
 
-        // Skip proc-macro-generated paths whose span text doesn't match
+        // Skip proc-macro-generated paths whose span text doesn't match the AST path
         // (e.g. serde derive generates `mod::serialize` with span on `"mod"`).
-        if let Ok(snippet) = self.cx.sess().source_map().span_to_snippet(path.span) {
-            if snippet != path_str {
-                return;
-            }
+        // Also skip if snippet lookup fails (synthetic/dummy spans).
+        match self.cx.sess().source_map().span_to_snippet(path.span) {
+            Ok(snippet) if snippet == path_str => {} // real source path; proceed
+            _ => return,                             // synthetic, dummy, or mismatch; skip
         }
 
         self.cx.emit_span_lint(
