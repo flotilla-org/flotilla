@@ -124,13 +124,16 @@ impl TestNetwork {
     /// Process messages across all peers until quiescent.
     /// Safety limit of 100 rounds to prevent infinite loops.
     pub async fn settle(&mut self) {
-        for _ in 0..100 {
+        for round in 0..100 {
             let mut total = 0;
             for i in 0..self.peers.len() {
                 total += self.process_peer(i).await;
             }
             if total == 0 {
-                break;
+                return;
+            }
+            if round == 99 {
+                panic!("settle did not quiesce after 100 rounds — possible relay loop");
             }
         }
     }
