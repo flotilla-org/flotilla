@@ -3,7 +3,10 @@
 //! Takes a `Command`, the repo context, and returns a `CommandResult`.
 //! No UI state mutation — all results are carried in the return value.
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use flotilla_protocol::{Command, CommandResult, ManagedTerminalId};
 use tracing::{debug, error, info, warn};
@@ -18,10 +21,36 @@ use crate::{
         types::{CloudAgentSession, CorrelationKey, WorkspaceConfig},
         CommandRunner,
     },
+    step::{Step, StepOutcome, StepPlan},
     template::{
         WorkspaceTemplate, {self},
     },
 };
+
+/// The result of `build_plan`: either an immediate result or a multi-step plan.
+pub enum ExecutionPlan {
+    /// Command completed synchronously — no steps needed.
+    Immediate(CommandResult),
+    /// Command requires multiple steps with cancellation support.
+    Steps(StepPlan),
+}
+
+/// Build an execution plan for a command.
+///
+/// Multi-step commands (CreateCheckout, TeleportSession, RemoveCheckout) return
+/// `ExecutionPlan::Steps` with cancellation points between steps. All other
+/// commands delegate to `execute()` and return `ExecutionPlan::Immediate`.
+pub async fn build_plan(
+    cmd: Command,
+    repo_root: PathBuf,
+    registry: Arc<ProviderRegistry>,
+    providers_data: Arc<ProviderData>,
+    runner: Arc<dyn CommandRunner>,
+    config_base: PathBuf,
+) -> ExecutionPlan {
+    let result = execute(cmd, &repo_root, &*registry, &*providers_data, &*runner, &config_base).await;
+    ExecutionPlan::Immediate(result)
+}
 
 /// Execute a `Command` against the given repo context.
 ///
