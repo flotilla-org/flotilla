@@ -109,11 +109,28 @@ pub struct PendingResyncRequest {
     pub deadline_at: Instant,
 }
 
+/// Pre-computed overlay update to apply to InProcessDaemon after releasing the PeerManager lock.
+///
+/// For `SetProviders`, the caller resolves `identity` → local path at apply time
+/// (not at computation time) so the path is always fresh, avoiding TOCTOU if a repo
+/// is added or removed concurrently with the disconnect.
+#[derive(Debug, Clone)]
+pub enum OverlayUpdate {
+    /// Update peer_providers for a repo with remaining peer data.
+    /// The caller resolves `identity` to the current local path at apply time.
+    SetProviders { identity: RepoIdentity, peers: Vec<(HostName, ProviderData)> },
+    /// Remove a virtual repo — no peers remain.
+    RemoveRepo { identity: RepoIdentity, path: PathBuf },
+}
+
 #[derive(Debug, Clone)]
 pub struct DisconnectPlan {
     pub was_active: bool,
     pub affected_repos: Vec<RepoIdentity>,
     pub resync_requests: Vec<RoutedPeerMessage>,
+    /// Pre-computed overlay state for each affected repo, captured atomically
+    /// with the disconnect under the same lock.
+    pub overlay_updates: Vec<OverlayUpdate>,
 }
 
 /// Per-repo state received from a single peer host.
@@ -769,6 +786,16 @@ impl PeerManager {
         self.senders.iter().map(|(name, sender)| (name.clone(), Arc::clone(sender))).collect()
     }
 
+    /// Returns the sender for a peer only if the given generation matches
+    /// the peer's current generation. Used by targeted sends to avoid
+    /// sending to a connection that has been superseded.
+    pub fn get_sender_if_current(&self, peer: &HostName, generation: u64) -> Option<Arc<dyn PeerSender>> {
+        if !self.generation_is_current(peer, generation) {
+            return None;
+        }
+        self.senders.get(peer).cloned()
+    }
+
     pub fn resolve_sender(&self, name: &HostName) -> Result<Arc<dyn PeerSender>, String> {
         if let Some(sender) = self.senders.get(name) {
             return Ok(Arc::clone(sender));
@@ -866,7 +893,12 @@ impl PeerManager {
 
     pub fn disconnect_peer(&mut self, name: &HostName, generation: u64) -> DisconnectPlan {
         if !self.generation_is_current(name, generation) {
-            return DisconnectPlan { was_active: false, affected_repos: Vec::new(), resync_requests: Vec::new() };
+            return DisconnectPlan {
+                was_active: false,
+                affected_repos: Vec::new(),
+                resync_requests: Vec::new(),
+                overlay_updates: Vec::new(),
+            };
         }
 
         self.senders.remove(name);
@@ -952,7 +984,26 @@ impl PeerManager {
 
         self.last_seen_clocks.retain(|(host, _), _| host != name);
 
-        DisconnectPlan { was_active: true, affected_repos, resync_requests }
+        // Compute overlay updates atomically while still holding &mut self.
+        // The caller resolves identity → path at apply time to avoid TOCTOU
+        // with concurrent add_repo/remove_repo.
+        let mut overlay_updates = Vec::new();
+        for repo_id in &affected_repos {
+            if self.has_peer_data_for(repo_id) {
+                // Repo still has data from other peers — collect remaining peer data
+                let peers: Vec<(HostName, ProviderData)> = self
+                    .peer_data
+                    .iter()
+                    .filter_map(|(host, repos)| repos.get(repo_id).map(|state| (host.clone(), state.provider_data.clone())))
+                    .collect();
+                overlay_updates.push(OverlayUpdate::SetProviders { identity: repo_id.clone(), peers });
+            } else if let Some(synthetic_path) = self.unregister_remote_repo(repo_id) {
+                // Remote-only, no peers remain — remove the virtual tab
+                overlay_updates.push(OverlayUpdate::RemoveRepo { identity: repo_id.clone(), path: synthetic_path });
+            }
+        }
+
+        DisconnectPlan { was_active: true, affected_repos, resync_requests, overlay_updates }
     }
 }
 
@@ -2038,5 +2089,79 @@ mod tests {
         assert_eq!(affected, vec![test_repo()]);
         assert!(!mgr.pending_resync_requests.iter().any(|(key, _)| key.request_id == 7));
         assert!(!mgr.peer_data.get(&HostName::new("target")).is_some_and(|repos| repos.contains_key(&test_repo())));
+    }
+
+    #[tokio::test]
+    async fn disconnect_peer_returns_overlay_updates_for_remaining_peers() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+
+        handle_test_peer_data(&mut mgr, snapshot_msg("desktop", 1), || {
+            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
+        })
+        .await;
+        handle_test_peer_data(&mut mgr, snapshot_msg("laptop", 1), || {
+            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
+        })
+        .await;
+
+        let desktop_generation = mgr.current_generation(&HostName::new("desktop")).expect("desktop connected");
+
+        let plan = mgr.disconnect_peer(&HostName::new("desktop"), desktop_generation);
+
+        assert!(plan.was_active);
+        assert_eq!(plan.overlay_updates.len(), 1);
+        match &plan.overlay_updates[0] {
+            OverlayUpdate::SetProviders { identity, peers } => {
+                assert_eq!(identity, &test_repo());
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].0, HostName::new("laptop"));
+            }
+            other => panic!("expected SetProviders, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_peer_returns_remove_repo_for_remote_only_with_no_remaining_peers() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+
+        handle_test_peer_data(&mut mgr, snapshot_msg("desktop", 1), || {
+            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
+        })
+        .await;
+
+        let desktop_generation = mgr.current_generation(&HostName::new("desktop")).expect("desktop connected");
+
+        let synthetic_path = PathBuf::from("/virtual/github.com/owner/repo");
+        mgr.register_remote_repo(test_repo(), synthetic_path.clone());
+
+        let plan = mgr.disconnect_peer(&HostName::new("desktop"), desktop_generation);
+
+        assert!(plan.was_active);
+        assert_eq!(plan.overlay_updates.len(), 1);
+        match &plan.overlay_updates[0] {
+            OverlayUpdate::RemoveRepo { identity, path } => {
+                assert_eq!(identity, &test_repo());
+                assert_eq!(path, &synthetic_path);
+            }
+            other => panic!("expected RemoveRepo, got {:?}", other),
+        }
+        assert!(!mgr.is_remote_repo(&test_repo()));
+    }
+
+    #[tokio::test]
+    async fn get_sender_if_current_returns_sender_for_matching_generation() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
+        let generation = accepted_generation(mgr.activate_connection(HostName::new("peer"), sender, ConnectionMeta {
+            direction: ConnectionDirection::Inbound,
+            config_label: None,
+            expected_peer: None,
+            config_backed: false,
+        }));
+
+        assert!(mgr.get_sender_if_current(&HostName::new("peer"), generation).is_some());
+        assert!(mgr.get_sender_if_current(&HostName::new("peer"), generation + 1).is_none());
+        assert!(mgr.get_sender_if_current(&HostName::new("unknown"), 1).is_none());
     }
 }

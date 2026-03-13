@@ -8,7 +8,7 @@ pub mod transport;
 pub use channel_transport::{channel_transport_pair, ChannelTransport};
 pub use manager::{
     synthetic_repo_path, ActivationResult, ConnectionDirection, ConnectionMeta, DisconnectPlan, HandleResult, InboundPeerEnvelope,
-    PeerManager, PendingResyncRequest, PerRepoPeerState, ReversePathHop, ReversePathKey, RouteHop, RouteState,
+    OverlayUpdate, PeerManager, PendingResyncRequest, PerRepoPeerState, ReversePathHop, ReversePathKey, RouteHop, RouteState,
 };
 pub use merge::merge_provider_data;
 pub use ssh_transport::SshTransport;

@@ -420,6 +420,14 @@ impl InProcessDaemon {
         identities.iter().find(|(_, path)| path.as_path() == repo_path).map(|(id, _)| id.clone())
     }
 
+    /// Returns the paths of all locally tracked repos.
+    ///
+    /// Only local repo paths, not remote/virtual ones. Used by the outbound
+    /// task to send local state to a newly connected peer.
+    pub async fn tracked_repo_paths(&self) -> Vec<PathBuf> {
+        self.repos.read().await.keys().cloned().collect()
+    }
+
     /// Get the local-only provider data for a repo (without peer overlay).
     ///
     /// Used by the outbound replication task to send only this host's
