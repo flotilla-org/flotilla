@@ -40,13 +40,11 @@ pub(crate) fn format_status_json(repos: &[flotilla_protocol::snapshot::RepoInfo]
 }
 
 /// Extract a short display name from a repo path (last path component).
-#[allow(dead_code)] // Used by format_event_human; wired into run_watch in the next task.
 fn repo_name(path: &std::path::Path) -> &str {
     path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown")
 }
 
 /// Format a `CommandResult` as a short human-readable string.
-#[allow(dead_code)] // Used by format_event_human; wired into run_watch in the next task.
 fn format_command_result(result: &flotilla_protocol::commands::CommandResult) -> String {
     use flotilla_protocol::commands::CommandResult;
     match result {
@@ -58,7 +56,6 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandResult) ->
     }
 }
 
-#[allow(dead_code)] // Wired into run_watch in the next task.
 pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> String {
     use flotilla_protocol::{DaemonEvent, PeerConnectionState};
     match event {
@@ -111,17 +108,22 @@ pub async fn run_status(socket_path: &Path, format: OutputFormat) -> Result<(), 
 }
 
 pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
-    let _ = format;
     let daemon = SocketDaemon::connect(socket_path).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
 
     let mut rx = daemon.subscribe();
-    println!("watching events (Ctrl-C to stop)...");
+
+    if matches!(format, OutputFormat::Human) {
+        eprintln!("watching events (Ctrl-C to stop)...");
+    }
 
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let json = serde_json::to_string_pretty(&event).unwrap_or_else(|_| format!("{event:?}"));
-                println!("{json}");
+                let line = match format {
+                    OutputFormat::Human => format_event_human(&event),
+                    OutputFormat::Json => flotilla_protocol::output::json_line(&event),
+                };
+                println!("{line}");
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("warning: skipped {n} events");
