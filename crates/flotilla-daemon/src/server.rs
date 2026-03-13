@@ -733,7 +733,7 @@ async fn disconnect_peer_and_rebuild(
 ) -> crate::peer::DisconnectPlan {
     let plan = {
         let mut pm = peer_manager.lock().await;
-        pm.disconnect_peer(peer_name, generation)
+        pm.disconnect_peer(peer_name, generation, &HashMap::new())
     };
     let affected_repos = plan.affected_repos.clone();
     let resync_requests = plan.resync_requests.clone();
