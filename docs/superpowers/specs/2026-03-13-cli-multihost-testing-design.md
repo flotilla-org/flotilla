@@ -136,11 +136,11 @@ This is scoped to Issue 3 (control commands) and is the most significant protoco
 | Role | Providers | Coding Agent | Session Manager | Notes |
 |------|-----------|-------------|-----------------|-------|
 | `workstation` | Full (`gh`, all providers) | claude | tmux + zellij, shpool | Leader, workspace transfer testing |
-| `follower-codex` | Local only (VCS, workspace) | codex (stub) | shpool | Persistent sessions |
-| `follower-gemini` | Local only (VCS, workspace) | gemini (stub) | No shpool | Direct SSH spawn |
+| `follower-codex` | Local only (VCS, workspace) | codex | shpool | Persistent sessions |
+| `follower-gemini` | Local only (VCS, workspace) | gemini | No shpool | Direct SSH spawn |
 | `jumpbox` | Minimal (SSH only) | None | None | Follower mode, relay only |
 
-Coding agents in test containers are stubs — enough to be detected by provider discovery (binary present, auth file exists) but not calling real APIs. The tests validate that flotilla discovers and reports the right providers per host, not that the agents function.
+Coding agents in test containers are real installations — binaries are present and discoverable by provider discovery. Auth configuration is handled at test runtime. This allows future tests to exercise agent functionality beyond just discovery validation.
 
 ### Topologies
 
