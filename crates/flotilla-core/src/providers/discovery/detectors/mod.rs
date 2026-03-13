@@ -21,6 +21,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(EnvVarDetector::new("ZELLIJ")),
         Box::new(CommandDetector::new("zellij", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("shpool", &["--version"], parse_first_dotted_version)),
+        Box::new(CommandDetector::new("gemini", &["--version"], parse_first_dotted_version)),
     ]
 }
 
@@ -73,6 +74,7 @@ mod tests {
             ("cursor-agent", "agent", "0.1.0\n", Some("0.1.0")),
             ("zellij-binary", "zellij", "zellij 0.40.1\n", Some("0.40.1")),
             ("shpool", "shpool", "shpool 0.9.0\n", Some("0.9.0")),
+            ("gemini", "gemini", "gemini 1.0.0\n", Some("1.0.0")),
         ];
 
         for (_detector_name, command, output, version) in cases {
