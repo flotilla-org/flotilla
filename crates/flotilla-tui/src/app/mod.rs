@@ -236,6 +236,7 @@ impl App {
                     executor::handle_result(result, self);
                 }
             }
+            DaemonEvent::CommandStepUpdate { .. } => {}
             DaemonEvent::PeerStatusChanged { host, status } => {
                 let peer_status = PeerStatus::from(status);
                 if let Some(existing) = self.model.peer_hosts.iter_mut().find(|p| p.name == host) {

@@ -495,6 +495,7 @@ fn handle_event(
         DaemonEvent::RepoAdded(_)
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
+        | DaemonEvent::CommandStepUpdate { .. }
         | DaemonEvent::PeerStatusChanged { .. } => {
             let _ = event_tx.send(event);
         }
