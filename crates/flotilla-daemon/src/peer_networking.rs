@@ -18,9 +18,9 @@ use crate::peer::{merge_provider_data, synthetic_repo_path, HandleResult, Inboun
 /// Notification sent from connection sites to the outbound task when a
 /// peer connects or reconnects. The outbound task responds by sending
 /// current local state for all repos to the specific peer.
-pub(crate) struct PeerConnectedNotice {
-    pub(crate) peer: HostName,
-    pub(crate) generation: u64,
+pub struct PeerConnectedNotice {
+    pub peer: HostName,
+    pub generation: u64,
 }
 
 /// Manages peer networking lifecycle: SSH connections, inbound message
@@ -95,8 +95,11 @@ impl PeerNetworkingTask {
     /// 2. Inbound message processor (relay + handle + overlay updates)
     /// 3. Outbound snapshot broadcaster
     ///
+    /// Returns a `peer_connected_tx` sender that callers (e.g. `handle_client`)
+    /// use to notify the outbound broadcaster when a socket peer connects.
+    ///
     /// Consumes `self` — call only once.
-    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(mut self) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) {
         let peer_data_rx = self.peer_data_rx.take().expect("spawn() called twice");
         let (peer_connected_tx, peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
 
@@ -507,9 +510,12 @@ impl PeerNetworkingTask {
             }
         });
 
-        // Return a handle for the caller (not currently awaited, but available
-        // for graceful-shutdown coordination in the future).
-        tokio::spawn(async {})
+        // Return handles for the caller.
+        // The JoinHandle is available for graceful-shutdown coordination.
+        // The peer_connected_tx lets DaemonServer notify the outbound broadcaster
+        // when socket peers connect, so they receive current local state.
+        let handle = tokio::spawn(async {});
+        (handle, peer_connected_tx)
     }
 }
 

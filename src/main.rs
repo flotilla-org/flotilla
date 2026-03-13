@@ -120,7 +120,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
             // Spawn peer networking if peers are configured
             match flotilla_daemon::peer_networking::PeerNetworkingTask::new(Arc::clone(&d), &config_clone) {
                 Ok((peer_networking, _peer_manager, _peer_data_tx)) => {
-                    peer_networking.spawn();
+                    let _ = peer_networking.spawn();
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "peer networking not started in embedded mode");

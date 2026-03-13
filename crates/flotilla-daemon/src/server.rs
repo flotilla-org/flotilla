@@ -124,11 +124,12 @@ impl DaemonServer {
         let client_notify = self.client_notify;
         let peer_data_tx = self.peer_data_tx;
         let peer_manager = self.peer_manager;
-        let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
 
-        // Spawn peer networking task
+        // Spawn peer networking task — returns a peer_connected_tx that
+        // handle_client uses to notify the outbound broadcaster when
+        // socket peers connect.
         let peer_networking = self.peer_networking.take().expect("run() called twice");
-        let _peer_handle = peer_networking.spawn();
+        let (_peer_handle, peer_connected_tx) = peer_networking.spawn();
 
         // Spawn idle timeout watcher (disabled for follower-mode daemons
         // which serve peer connections and should stay up indefinitely)
