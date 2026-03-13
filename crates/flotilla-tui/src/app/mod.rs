@@ -22,7 +22,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot, SnapshotDelta,
-    WorkItem,
+    StepStatus, WorkItem,
 };
 pub use intent::Intent;
 use tui_input::Input;
@@ -191,6 +191,7 @@ pub struct App {
     pub ui: UiState,
     pub proto_commands: CommandQueue,
     pub in_flight: HashMap<u64, InFlightCommand>,
+    pub pending_cancel: Option<u64>,
     pub should_quit: bool,
 }
 
@@ -205,7 +206,16 @@ impl App {
             RepoViewLayoutConfig::Right => RepoViewLayout::Right,
             RepoViewLayoutConfig::Below => RepoViewLayout::Below,
         };
-        Self { daemon, config, model, ui, proto_commands: Default::default(), in_flight: HashMap::new(), should_quit: false }
+        Self {
+            daemon,
+            config,
+            model,
+            ui,
+            proto_commands: Default::default(),
+            in_flight: HashMap::new(),
+            pending_cancel: None,
+            should_quit: false,
+        }
     }
 
     pub fn persist_layout(&self) {
@@ -234,6 +244,24 @@ impl App {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
                     tracing::info!(%command_id, "command finished");
                     executor::handle_result(result, self);
+                }
+            }
+            DaemonEvent::CommandStepUpdate { command_id, description, step_index, step_count, status, .. } => {
+                if let Some(cmd) = self.in_flight.get_mut(&command_id) {
+                    match status {
+                        StepStatus::Started => {
+                            cmd.description = format!("{} ({}/{})", description, step_index + 1, step_count);
+                        }
+                        StepStatus::Skipped => {
+                            tracing::info!(%command_id, %description, "step skipped");
+                        }
+                        StepStatus::Succeeded => {
+                            tracing::info!(%command_id, %description, "step succeeded");
+                        }
+                        StepStatus::Failed { ref message } => {
+                            tracing::warn!(%command_id, %description, error = %message, "step failed");
+                        }
+                    }
                 }
             }
             DaemonEvent::PeerStatusChanged { host, status } => {

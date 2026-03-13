@@ -204,6 +204,14 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
             }
         }
 
+        // ── Drain pending cancel ──
+        if let Some(command_id) = app.pending_cancel.take() {
+            let daemon = app.daemon.clone();
+            tokio::spawn(async move {
+                let _ = daemon.cancel(command_id).await;
+            });
+        }
+
         // ── Process queued commands ──
         while let Some(cmd) = app.proto_commands.take_next() {
             app::executor::dispatch(cmd, &mut app).await;

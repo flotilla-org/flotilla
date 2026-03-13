@@ -102,7 +102,7 @@ impl Command {
 }
 
 /// Result returned from command execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandResult {
     Ok,
@@ -110,9 +110,20 @@ pub enum CommandResult {
     BranchNameGenerated { name: String, issue_ids: Vec<(String, String)> },
     CheckoutStatus(CheckoutStatus),
     Error { message: String },
+    Cancelled,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Status of an individual step within a multi-step command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StepStatus {
+    Skipped,
+    Started,
+    Succeeded,
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CheckoutStatus {
     pub branch: String,
     pub change_request_status: Option<String>,
@@ -188,6 +199,7 @@ mod tests {
                 base_detection_warning: Some("warning text".into()),
             }),
             CommandResult::Error { message: "something failed".into() },
+            CommandResult::Cancelled,
         ];
 
         for result in cases {
@@ -200,6 +212,18 @@ mod tests {
         let result = CommandResult::CheckoutCreated { branch: "x".into() };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("checkout_created"));
+    }
+
+    #[test]
+    fn step_status_roundtrip() {
+        use crate::test_helpers::assert_roundtrip;
+
+        let cases = vec![StepStatus::Skipped, StepStatus::Started, StepStatus::Succeeded, StepStatus::Failed {
+            message: "workspace creation failed".into(),
+        }];
+        for case in cases {
+            assert_roundtrip(&case);
+        }
     }
 
     #[test]

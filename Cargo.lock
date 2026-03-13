@@ -1074,6 +1074,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "urlencoding",

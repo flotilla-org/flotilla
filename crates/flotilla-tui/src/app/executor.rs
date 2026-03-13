@@ -87,5 +87,8 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
         CommandResult::Error { message } => {
             app.model.status_message = Some(message);
         }
+        CommandResult::Cancelled => {
+            app.model.status_message = Some("Command cancelled".into());
+        }
     }
 }

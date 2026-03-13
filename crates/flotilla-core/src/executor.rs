@@ -3,7 +3,10 @@
 //! Takes a `Command`, the repo context, and returns a `CommandResult`.
 //! No UI state mutation — all results are carried in the return value.
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use flotilla_protocol::{Command, CommandResult, ManagedTerminalId};
 use tracing::{debug, error, info, warn};
@@ -18,10 +21,347 @@ use crate::{
         types::{CloudAgentSession, CorrelationKey, WorkspaceConfig},
         CommandRunner,
     },
+    step::{Step, StepOutcome, StepPlan},
     template::{
         WorkspaceTemplate, {self},
     },
 };
+
+/// The result of `build_plan`: either an immediate result or a multi-step plan.
+pub enum ExecutionPlan {
+    /// Command completed synchronously — no steps needed.
+    Immediate(CommandResult),
+    /// Command requires multiple steps with cancellation support.
+    Steps(StepPlan),
+}
+
+/// Build an execution plan for a command.
+///
+/// Multi-step commands (CreateCheckout, TeleportSession, RemoveCheckout) return
+/// `ExecutionPlan::Steps` with cancellation points between steps. All other
+/// commands delegate to `execute()` and return `ExecutionPlan::Immediate`.
+pub async fn build_plan(
+    cmd: Command,
+    repo_root: PathBuf,
+    registry: Arc<ProviderRegistry>,
+    providers_data: Arc<ProviderData>,
+    runner: Arc<dyn CommandRunner>,
+    config_base: PathBuf,
+) -> ExecutionPlan {
+    let local_host = flotilla_protocol::HostName::local();
+
+    match cmd {
+        Command::CreateCheckout { branch, create_branch, issue_ids } => {
+            build_create_checkout_plan(
+                branch,
+                create_branch,
+                issue_ids,
+                repo_root,
+                registry,
+                providers_data,
+                runner,
+                config_base,
+                local_host,
+            )
+            .await
+        }
+
+        Command::TeleportSession { session_id, branch, checkout_key } => {
+            build_teleport_session_plan(session_id, branch, checkout_key, repo_root, registry, providers_data, config_base, local_host)
+                .await
+        }
+
+        Command::RemoveCheckout { branch, terminal_keys } => build_remove_checkout_plan(branch, terminal_keys, repo_root, registry),
+
+        cmd => {
+            let result = execute(cmd, &repo_root, &registry, &providers_data, &*runner, &config_base).await;
+            ExecutionPlan::Immediate(result)
+        }
+    }
+}
+
+/// Build a step plan for `CreateCheckout`.
+///
+/// Steps:
+/// 1. Create the checkout (skipped if it already exists on the local host)
+/// 2. Link issues to the branch (skipped if no issue_ids)
+/// 3. Create workspace (reads checkout path from shared slot)
+#[allow(clippy::too_many_arguments)]
+async fn build_create_checkout_plan(
+    branch: String,
+    create_branch: bool,
+    issue_ids: Vec<(String, String)>,
+    repo_root: PathBuf,
+    registry: Arc<ProviderRegistry>,
+    providers_data: Arc<ProviderData>,
+    runner: Arc<dyn CommandRunner>,
+    config_base: PathBuf,
+    local_host: flotilla_protocol::HostName,
+) -> ExecutionPlan {
+    // Shared slot for the checkout path — pre-populated if the checkout already exists.
+    let checkout_path_slot: Arc<tokio::sync::Mutex<Option<PathBuf>>> = {
+        let existing = providers_data.checkouts.iter().find_map(|(hp, co)| {
+            if hp.host == local_host && co.branch == branch {
+                Some(hp.path.clone())
+            } else {
+                None
+            }
+        });
+        Arc::new(tokio::sync::Mutex::new(existing))
+    };
+
+    let mut steps = Vec::new();
+
+    // Step 1: Create checkout
+    {
+        let slot = Arc::clone(&checkout_path_slot);
+        let branch = branch.clone();
+        let repo_root = repo_root.clone();
+        let registry = Arc::clone(&registry);
+        steps.push(Step {
+            description: format!("Create checkout for branch {branch}"),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    // Skip if checkout already exists
+                    if slot.lock().await.is_some() {
+                        return Ok(StepOutcome::Skipped);
+                    }
+                    let cm = registry
+                        .checkout_managers
+                        .values()
+                        .next()
+                        .map(|(_, cm)| Arc::clone(cm))
+                        .ok_or_else(|| "No checkout manager available".to_string())?;
+                    let (path, _checkout) = cm.create_checkout(&repo_root, &branch, create_branch).await?;
+                    info!(checkout_path = %path.display(), "created checkout");
+                    *slot.lock().await = Some(path);
+                    Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch }))
+                })
+            }),
+        });
+    }
+
+    // Step 2: Link issues (only if non-empty)
+    if !issue_ids.is_empty() {
+        let branch = branch.clone();
+        let repo_root = repo_root.clone();
+        let runner = Arc::clone(&runner);
+        steps.push(Step {
+            description: "Link issues to branch".to_string(),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    write_branch_issue_links(&repo_root, &branch, &issue_ids, &*runner).await;
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    // Step 3: Create workspace
+    {
+        let slot = Arc::clone(&checkout_path_slot);
+        let branch = branch.clone();
+        let repo_root = repo_root.clone();
+        let registry = Arc::clone(&registry);
+        let config_base = config_base.clone();
+        steps.push(Step {
+            description: "Create workspace".to_string(),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    let checkout_path = slot.lock().await.clone().ok_or_else(|| "checkout path not available".to_string())?;
+                    if let Some((_, ws_mgr)) = &registry.workspace_manager {
+                        let mut config = workspace_config(&repo_root, &branch, &checkout_path, "claude", &config_base);
+                        if let Some((_, tp)) = &registry.terminal_pool {
+                            resolve_terminal_pool(&mut config, tp.as_ref()).await;
+                        }
+                        ws_mgr.create_workspace(&config).await.map_err(|e| format!("workspace creation failed after checkout: {e}"))?;
+                    }
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    ExecutionPlan::Steps(StepPlan::new(steps))
+}
+
+/// Build a step plan for `TeleportSession`.
+///
+/// Steps:
+/// 1. Resolve attach command from the session's cloud agent provider
+/// 2. Ensure checkout exists (skipped if checkout_key references a known checkout, or no branch)
+/// 3. Create workspace with the teleport (attach) command
+#[allow(clippy::too_many_arguments)]
+async fn build_teleport_session_plan(
+    session_id: String,
+    branch: Option<String>,
+    checkout_key: Option<PathBuf>,
+    repo_root: PathBuf,
+    registry: Arc<ProviderRegistry>,
+    providers_data: Arc<ProviderData>,
+    config_base: PathBuf,
+    local_host: flotilla_protocol::HostName,
+) -> ExecutionPlan {
+    // Shared slot for the teleport (attach) command — populated by step 1.
+    let teleport_cmd_slot: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+
+    // Shared slot for checkout path — pre-populated if checkout_key references a known checkout.
+    let checkout_path_slot: Arc<tokio::sync::Mutex<Option<PathBuf>>> = {
+        let existing = checkout_key.as_ref().and_then(|key| {
+            let host_key = flotilla_protocol::HostPath::new(local_host.clone(), key.clone());
+            providers_data.checkouts.get(&host_key).map(|_| key.clone())
+        });
+        Arc::new(tokio::sync::Mutex::new(existing))
+    };
+
+    let mut steps = Vec::new();
+
+    // Step 1: Resolve attach command
+    {
+        let slot = Arc::clone(&teleport_cmd_slot);
+        let session_id = session_id.clone();
+        let registry = Arc::clone(&registry);
+        let providers_data = Arc::clone(&providers_data);
+        steps.push(Step {
+            description: format!("Resolve attach command for session {session_id}"),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    let cmd = resolve_attach_command(&session_id, &registry, &providers_data).await?;
+                    *slot.lock().await = Some(cmd);
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    // Step 2: Ensure checkout if needed
+    // Only runs when there's no pre-existing checkout and a branch is provided.
+    {
+        let slot = Arc::clone(&checkout_path_slot);
+        let branch = branch.clone();
+        let repo_root = repo_root.clone();
+        let registry = Arc::clone(&registry);
+        steps.push(Step {
+            description: "Ensure checkout for teleport".to_string(),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    // Already have a checkout path — skip
+                    if slot.lock().await.is_some() {
+                        return Ok(StepOutcome::Skipped);
+                    }
+                    let branch_name = match &branch {
+                        Some(b) => b.clone(),
+                        None => return Ok(StepOutcome::Skipped),
+                    };
+                    let cm = registry
+                        .checkout_managers
+                        .values()
+                        .next()
+                        .map(|(_, cm)| Arc::clone(cm))
+                        .ok_or_else(|| "No checkout manager available".to_string())?;
+                    let (path, _checkout) = cm.create_checkout(&repo_root, &branch_name, false).await?;
+                    *slot.lock().await = Some(path);
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    // Step 3: Create workspace with teleport command
+    {
+        let teleport_slot = Arc::clone(&teleport_cmd_slot);
+        let path_slot = Arc::clone(&checkout_path_slot);
+        let branch = branch.clone();
+        let repo_root = repo_root.clone();
+        let registry = Arc::clone(&registry);
+        let config_base = config_base.clone();
+        steps.push(Step {
+            description: "Create workspace with teleport command".to_string(),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    let path =
+                        path_slot.lock().await.clone().ok_or_else(|| "Could not determine checkout path for teleport".to_string())?;
+                    let teleport_cmd = teleport_slot.lock().await.clone().ok_or_else(|| "Attach command not resolved".to_string())?;
+                    let name = branch.as_deref().unwrap_or("session");
+                    if let Some((_, ws_mgr)) = &registry.workspace_manager {
+                        let mut config = workspace_config(&repo_root, name, &path, &teleport_cmd, &config_base);
+                        if let Some((_, tp)) = &registry.terminal_pool {
+                            resolve_terminal_pool(&mut config, tp.as_ref()).await;
+                        }
+                        // Unlike CreateCheckout, teleport fails entirely if the workspace
+                        // can't be created — the checkout may already have existed.
+                        ws_mgr.create_workspace(&config).await?;
+                    }
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    ExecutionPlan::Steps(StepPlan::new(steps))
+}
+
+/// Build a step plan for `RemoveCheckout`.
+///
+/// Steps:
+/// 1. Remove the checkout via the checkout manager
+/// 2. Clean up correlated terminal sessions (best-effort)
+fn build_remove_checkout_plan(
+    branch: String,
+    terminal_keys: Vec<ManagedTerminalId>,
+    repo_root: PathBuf,
+    registry: Arc<ProviderRegistry>,
+) -> ExecutionPlan {
+    let mut steps = Vec::new();
+
+    // Step 1: Remove checkout
+    {
+        let branch = branch.clone();
+        let repo_root = repo_root.clone();
+        let registry = Arc::clone(&registry);
+        steps.push(Step {
+            description: format!("Remove checkout for branch {branch}"),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    let cm = registry
+                        .checkout_managers
+                        .values()
+                        .next()
+                        .map(|(_, cm)| Arc::clone(cm))
+                        .ok_or_else(|| "No checkout manager available".to_string())?;
+                    cm.remove_checkout(&repo_root, &branch).await?;
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    // Step 2: Clean up terminal sessions (best-effort)
+    if !terminal_keys.is_empty() {
+        let registry = Arc::clone(&registry);
+        steps.push(Step {
+            description: "Clean up terminal sessions".to_string(),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    if let Some((_, tp)) = &registry.terminal_pool {
+                        for terminal_id in &terminal_keys {
+                            if let Err(e) = tp.kill_terminal(terminal_id).await {
+                                warn!(
+                                    terminal = %terminal_id,
+                                    err = %e,
+                                    "failed to kill terminal session (best-effort)"
+                                );
+                            }
+                        }
+                    }
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    ExecutionPlan::Steps(StepPlan::new(steps))
+}
 
 /// Execute a `Command` against the given repo context.
 ///
@@ -1534,5 +1874,143 @@ mod tests {
         assert_eq!(config.working_directory, PathBuf::from("/repo/wt"));
         assert_eq!(config.template_vars.get("main_command"), Some(&"claude".to_string()));
         assert!(config.template_yaml.is_none(), "no template file should exist at test paths");
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper to run build_plan with Arc-wrapped arguments
+    // -----------------------------------------------------------------------
+
+    async fn run_build_plan(
+        command: Command,
+        registry: ProviderRegistry,
+        providers_data: ProviderData,
+        runner: MockRunner,
+    ) -> ExecutionPlan {
+        build_plan(command, repo_root(), Arc::new(registry), Arc::new(providers_data), Arc::new(runner), config_base()).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: build_plan
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn build_plan_create_checkout_returns_steps() {
+        let mut registry = empty_registry();
+        registry
+            .checkout_managers
+            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
+        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        let data = empty_data();
+        let runner = runner_ok();
+
+        let plan = run_build_plan(
+            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
+            registry,
+            data,
+            runner,
+        )
+        .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // At least 2 steps: checkout + workspace
+                assert!(step_plan.steps.len() >= 2, "expected at least 2 steps, got {}", step_plan.steps.len());
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_create_checkout_skips_existing() {
+        let mut registry = empty_registry();
+        registry
+            .checkout_managers
+            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
+        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        let mut data = empty_data();
+        // Pre-populate with an existing checkout for the branch
+        data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(
+            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
+            registry,
+            data,
+            runner,
+        )
+        .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // Still has steps (checkout step is present but will skip at runtime,
+                // workspace step is present). The plan is structurally the same;
+                // the skip happens when the step action runs.
+                assert!(step_plan.steps.len() >= 2, "expected at least 2 steps, got {}", step_plan.steps.len());
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_teleport_session_returns_steps() {
+        let mut registry = empty_registry();
+        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
+        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        let mut data = empty_data();
+        let path = PathBuf::from("/repo/wt-feat");
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+        data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(
+            Command::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
+            registry,
+            data,
+            runner,
+        )
+        .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // 3 steps: resolve attach, ensure checkout, create workspace
+                assert_eq!(step_plan.steps.len(), 3, "expected 3 steps, got {}", step_plan.steps.len());
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_remove_checkout_returns_steps() {
+        let mut registry = empty_registry();
+        registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old"))));
+        let runner = runner_ok();
+
+        let plan =
+            run_build_plan(Command::RemoveCheckout { branch: "old".to_string(), terminal_keys: vec![] }, registry, empty_data(), runner)
+                .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // At least 1 step: remove checkout
+                assert!(!step_plan.steps.is_empty(), "expected at least 1 step");
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_simple_command_returns_immediate() {
+        let mut registry = empty_registry();
+        registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(Command::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
+
+        match plan {
+            ExecutionPlan::Immediate(result) => {
+                assert_ok(result);
+            }
+            ExecutionPlan::Steps(_) => panic!("expected Immediate, got Steps"),
+        }
     }
 }

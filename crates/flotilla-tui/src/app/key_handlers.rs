@@ -83,7 +83,10 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
-                if self.active_ui().active_search_query.is_some() {
+                // Cancellation takes priority over other Esc actions while a command is running.
+                if let Some(&command_id) = self.in_flight.keys().next() {
+                    self.pending_cancel = Some(command_id);
+                } else if self.active_ui().active_search_query.is_some() {
                     self.clear_active_issue_search(ClearDispatch::OnlyIfActive);
                 } else if self.active_ui().show_providers {
                     self.active_ui_mut().show_providers = false;

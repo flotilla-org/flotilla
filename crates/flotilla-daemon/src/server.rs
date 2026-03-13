@@ -1080,6 +1080,17 @@ async fn dispatch_request(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, 
             }
         }
 
+        "cancel" => {
+            let command_id: u64 = match params.get("command_id").and_then(|v| v.as_u64()) {
+                Some(id) => id,
+                None => return Message::error_response(id, "missing or invalid 'command_id'".to_string()),
+            };
+            match daemon.cancel(command_id).await {
+                Ok(()) => Message::empty_ok_response(id),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
+
         "refresh" => {
             let repo = match extract_repo_path(&params) {
                 Ok(p) => p,

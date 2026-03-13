@@ -495,6 +495,7 @@ fn handle_event(
         DaemonEvent::RepoAdded(_)
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
+        | DaemonEvent::CommandStepUpdate { .. }
         | DaemonEvent::PeerStatusChanged { .. } => {
             let _ = event_tx.send(event);
         }
@@ -578,6 +579,11 @@ impl DaemonHandle for SocketDaemon {
     async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
         let resp = self.request("execute", serde_json::json!({ "repo": repo, "command": command })).await?;
         resp.parse::<u64>()
+    }
+
+    async fn cancel(&self, command_id: u64) -> Result<(), String> {
+        let resp = self.request("cancel", serde_json::json!({ "command_id": command_id })).await?;
+        resp.parse_empty()
     }
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {

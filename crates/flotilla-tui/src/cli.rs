@@ -57,6 +57,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandResult) ->
         CommandResult::BranchNameGenerated { name, .. } => format!("branch name: {name}"),
         CommandResult::CheckoutStatus(_) => "checkout status received".to_string(),
         CommandResult::Error { message } => format!("error: {message}"),
+        CommandResult::Cancelled => "cancelled".to_string(),
     }
 }
 
@@ -86,6 +87,9 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
         }
         DaemonEvent::CommandFinished { repo, result, .. } => {
             format!("[command]  {}: finished \u{2192} {}", repo_name(repo), format_command_result(result))
+        }
+        DaemonEvent::CommandStepUpdate { repo, description, step_index, step_count, .. } => {
+            format!("[step]     {}: {} ({}/{})", repo_name(repo), description, step_index + 1, step_count)
         }
         DaemonEvent::PeerStatusChanged { host, status } => {
             let state = match status {

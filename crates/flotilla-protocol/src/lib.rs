@@ -30,7 +30,7 @@ pub(crate) mod test_helpers {
     }
 }
 
-pub use commands::{CheckoutStatus, Command, CommandResult};
+pub use commands::{CheckoutStatus, Command, CommandResult, StepStatus};
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
@@ -136,6 +136,15 @@ pub enum DaemonEvent {
     CommandStarted { command_id: u64, repo: std::path::PathBuf, description: String },
     #[serde(rename = "command_finished")]
     CommandFinished { command_id: u64, repo: std::path::PathBuf, result: commands::CommandResult },
+    #[serde(rename = "command_step_update")]
+    CommandStepUpdate {
+        command_id: u64,
+        repo: std::path::PathBuf,
+        step_index: usize,
+        step_count: usize,
+        description: String,
+        status: commands::StepStatus,
+    },
     /// A peer host's connection status changed.
     #[serde(rename = "peer_status")]
     PeerStatusChanged { host: HostName, status: PeerConnectionState },
