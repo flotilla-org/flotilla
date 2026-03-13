@@ -113,8 +113,12 @@ impl PeerNetworkingTask {
         let peer_connected_tx_for_ssh = peer_connected_tx.clone();
         let peer_daemon = Arc::clone(&daemon);
 
+        // Spawn a parent task that owns all peer networking work.
+        // The returned JoinHandle tracks this task for shutdown coordination.
+        let handle = tokio::spawn(async move {
+
         // Task group 1 & 2: SSH connection loops + inbound processor
-        tokio::spawn(async move {
+        let inbound_handle = tokio::spawn(async move {
             let mut rx = peer_data_rx;
             let mut resync_sweep = tokio::time::interval(Duration::from_secs(5));
 
@@ -440,7 +444,7 @@ impl PeerNetworkingTask {
         // Task group 3: Outbound snapshot broadcaster
         let outbound_daemon = Arc::clone(&daemon);
         let mut peer_connected_rx = peer_connected_rx;
-        tokio::spawn(async move {
+        let outbound_handle = tokio::spawn(async move {
             let mut event_rx = outbound_daemon.subscribe();
             let mut outbound_clock = flotilla_protocol::VectorClock::default();
             let host_name = outbound_daemon.host_name().clone();
@@ -510,11 +514,15 @@ impl PeerNetworkingTask {
             }
         });
 
-        // Return handles for the caller.
-        // The JoinHandle is available for graceful-shutdown coordination.
+        // Wait for both task groups — if either exits, the other will
+        // eventually follow (channels close).
+        let _ = inbound_handle.await;
+        let _ = outbound_handle.await;
+
+        }); // end parent task
+
         // The peer_connected_tx lets DaemonServer notify the outbound broadcaster
         // when socket peers connect, so they receive current local state.
-        let handle = tokio::spawn(async {});
         (handle, peer_connected_tx)
     }
 }
