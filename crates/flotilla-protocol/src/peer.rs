@@ -98,6 +98,20 @@ pub enum RoutedPeerMessage {
         seq: u64,
         data: Box<ProviderData>,
     },
+    CommandRequest {
+        request_id: u64,
+        requester_host: HostName,
+        target_host: HostName,
+        remaining_hops: u8,
+        command: Box<crate::Command>,
+    },
+    CommandResponse {
+        request_id: u64,
+        requester_host: HostName,
+        responder_host: HostName,
+        remaining_hops: u8,
+        result: Box<crate::CommandResult>,
+    },
 }
 
 /// The payload kind within a peer data exchange.
@@ -118,6 +132,7 @@ pub enum PeerDataKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Command, CommandAction, CommandResult, RepoSelector};
 
     #[test]
     fn vector_clock_tick_increments() {
@@ -238,6 +253,54 @@ mod tests {
                 assert_eq!(changes.len(), 1);
             }
             other => panic!("expected Delta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn routed_command_request_roundtrip() {
+        let msg = RoutedPeerMessage::CommandRequest {
+            request_id: 42,
+            requester_host: HostName::new("workstation"),
+            target_host: HostName::new("feta"),
+            remaining_hops: 7,
+            command: Box::new(Command {
+                host: Some(HostName::new("feta")),
+                action: CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) },
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RoutedPeerMessage::CommandRequest { request_id, requester_host, target_host, remaining_hops, .. } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(requester_host, HostName::new("workstation"));
+                assert_eq!(target_host, HostName::new("feta"));
+                assert_eq!(remaining_hops, 7);
+            }
+            other => panic!("expected CommandRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn routed_command_response_roundtrip() {
+        let msg = RoutedPeerMessage::CommandResponse {
+            request_id: 42,
+            requester_host: HostName::new("workstation"),
+            responder_host: HostName::new("feta"),
+            remaining_hops: 7,
+            result: Box::new(CommandResult::RepoAdded { path: PathBuf::from("/srv/repo") }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RoutedPeerMessage::CommandResponse { request_id, requester_host, responder_host, remaining_hops, result } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(requester_host, HostName::new("workstation"));
+                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(remaining_hops, 7);
+                assert!(matches!(*result, CommandResult::RepoAdded { .. }));
+            }
+            other => panic!("expected CommandResponse, got {:?}", other),
         }
     }
 }

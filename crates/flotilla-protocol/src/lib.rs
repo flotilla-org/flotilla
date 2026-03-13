@@ -31,7 +31,7 @@ pub(crate) mod test_helpers {
     }
 }
 
-pub use commands::{CheckoutStatus, Command, CommandResult, StepStatus};
+pub use commands::{CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandResult, RepoSelector, StepStatus};
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
@@ -138,12 +138,13 @@ pub enum DaemonEvent {
     #[serde(rename = "repo_removed")]
     RepoRemoved { path: std::path::PathBuf },
     #[serde(rename = "command_started")]
-    CommandStarted { command_id: u64, repo: std::path::PathBuf, description: String },
+    CommandStarted { command_id: u64, host: HostName, repo: std::path::PathBuf, description: String },
     #[serde(rename = "command_finished")]
-    CommandFinished { command_id: u64, repo: std::path::PathBuf, result: commands::CommandResult },
+    CommandFinished { command_id: u64, host: HostName, repo: std::path::PathBuf, result: commands::CommandResult },
     #[serde(rename = "command_step_update")]
     CommandStepUpdate {
         command_id: u64,
+        host: HostName,
         repo: std::path::PathBuf,
         step_index: usize,
         step_count: usize,
@@ -378,14 +379,16 @@ mod tests {
     fn daemon_event_command_started_roundtrip() {
         let event = DaemonEvent::CommandStarted {
             command_id: 42,
+            host: HostName::new("desktop"),
             repo: PathBuf::from("/tmp/repo"),
             description: "Creating checkout...".to_string(),
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
         match decoded {
-            DaemonEvent::CommandStarted { command_id, repo, description } => {
+            DaemonEvent::CommandStarted { command_id, host, repo, description } => {
                 assert_eq!(command_id, 42);
+                assert_eq!(host, HostName::new("desktop"));
                 assert_eq!(repo, PathBuf::from("/tmp/repo"));
                 assert_eq!(description, "Creating checkout...");
             }
@@ -397,17 +400,22 @@ mod tests {
     fn daemon_event_command_finished_roundtrip() {
         let event = DaemonEvent::CommandFinished {
             command_id: 42,
+            host: HostName::new("desktop"),
             repo: PathBuf::from("/tmp/repo"),
-            result: CommandResult::CheckoutCreated { branch: "feat-x".into() },
+            result: CommandResult::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/tmp/repo/feat-x") },
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
         match decoded {
-            DaemonEvent::CommandFinished { command_id, repo, result } => {
+            DaemonEvent::CommandFinished { command_id, host, repo, result } => {
                 assert_eq!(command_id, 42);
+                assert_eq!(host, HostName::new("desktop"));
                 assert_eq!(repo, PathBuf::from("/tmp/repo"));
                 match result {
-                    CommandResult::CheckoutCreated { branch } => assert_eq!(branch, "feat-x"),
+                    CommandResult::CheckoutCreated { branch, path } => {
+                        assert_eq!(branch, "feat-x");
+                        assert_eq!(path, PathBuf::from("/tmp/repo/feat-x"));
+                    }
                     other => panic!("expected CheckoutCreated, got {:?}", other),
                 }
             }
