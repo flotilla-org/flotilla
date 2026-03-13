@@ -110,6 +110,7 @@ pub enum CommandResult {
     BranchNameGenerated { name: String, issue_ids: Vec<(String, String)> },
     CheckoutStatus(CheckoutStatus),
     Error { message: String },
+    Cancelled,
 }
 
 /// Status of an individual step within a multi-step command.
@@ -198,6 +199,7 @@ mod tests {
                 base_detection_warning: Some("warning text".into()),
             }),
             CommandResult::Error { message: "something failed".into() },
+            CommandResult::Cancelled,
         ];
 
         for result in cases {
