@@ -271,17 +271,19 @@ impl DaemonServer {
                                 return; // Main channel closed, stop entirely
                             }
                             info!(peer = %peer_name, "SSH connection dropped, will reconnect");
-                            daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
-                                host: peer_name.clone(),
-                                status: PeerConnectionState::Disconnected,
-                            });
-                            disconnect_peer_and_rebuild(
+                            let plan = disconnect_peer_and_rebuild(
                                 &pm,
                                 &daemon_for_cleanup,
                                 &peer_name,
                                 generation,
                             )
                             .await;
+                            if plan.was_active {
+                                daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
+                                    host: peer_name.clone(),
+                                    status: PeerConnectionState::Disconnected,
+                                });
+                            }
                         }
 
                         // Reconnect loop with exponential backoff
@@ -327,17 +329,19 @@ impl DaemonServer {
                                         peer = %peer_name,
                                         "SSH connection dropped, will reconnect"
                                     );
-                                    daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
-                                        host: peer_name.clone(),
-                                        status: PeerConnectionState::Disconnected,
-                                    });
-                                    disconnect_peer_and_rebuild(
+                                    let plan = disconnect_peer_and_rebuild(
                                         &pm,
                                         &daemon_for_cleanup,
                                         &peer_name,
                                         generation,
                                     )
                                     .await;
+                                    if plan.was_active {
+                                        daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
+                                            host: peer_name.clone(),
+                                            status: PeerConnectionState::Disconnected,
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(
@@ -375,6 +379,9 @@ impl DaemonServer {
                             },
                         ) => (responder_host.clone(), repo_path.clone()),
                         PeerWireMessage::Routed(_) => (env.connection_peer.clone(), PathBuf::new()),
+                        PeerWireMessage::Goodbye { .. } => {
+                            (env.connection_peer.clone(), PathBuf::new())
+                        }
                     };
 
                     let mut pm = peer_manager_task.lock().await;
@@ -738,13 +745,16 @@ async fn disconnect_peer_and_rebuild(
     daemon: &Arc<InProcessDaemon>,
     peer_name: &HostName,
     generation: u64,
-) {
+) -> crate::peer::DisconnectPlan {
     let plan = {
         let mut pm = peer_manager.lock().await;
         pm.disconnect_peer(peer_name, generation)
     };
-    rebuild_peer_overlays(peer_manager, daemon, plan.affected_repos).await;
-    dispatch_resync_requests(peer_manager, plan.resync_requests).await;
+    let affected_repos = plan.affected_repos.clone();
+    let resync_requests = plan.resync_requests.clone();
+    rebuild_peer_overlays(peer_manager, daemon, affected_repos).await;
+    dispatch_resync_requests(peer_manager, resync_requests).await;
+    plan
 }
 
 /// Send local-only provider data to all peers for a given repo.
@@ -988,7 +998,7 @@ async fn handle_client(
 
             let generation = {
                 let mut pm = peer_manager.lock().await;
-                pm.activate_connection(
+                match pm.activate_connection(
                     host_name.clone(),
                     Arc::new(SocketPeerSender {
                         tx: outbound_tx.clone(),
@@ -997,8 +1007,20 @@ async fn handle_client(
                         direction: ConnectionDirection::Inbound,
                         config_label: None,
                         expected_peer: None,
+                        config_backed: false,
                     },
-                )
+                ) {
+                    crate::peer::ActivationResult::Accepted { generation, .. } => generation,
+                    crate::peer::ActivationResult::Rejected { reason } => {
+                        let _ = write_message(
+                            &writer,
+                            &Message::Peer(Box::new(PeerWireMessage::Goodbye { reason })),
+                        )
+                        .await;
+                        relay_task.abort();
+                        return;
+                    }
+                }
             };
             daemon.send_event(DaemonEvent::PeerStatusChanged {
                 host: host_name.clone(),
@@ -1049,11 +1071,14 @@ async fn handle_client(
                 }
             }
 
-            disconnect_peer_and_rebuild(&peer_manager, &daemon, &host_name, generation).await;
-            daemon.send_event(DaemonEvent::PeerStatusChanged {
-                host: host_name,
-                status: PeerConnectionState::Disconnected,
-            });
+            let plan =
+                disconnect_peer_and_rebuild(&peer_manager, &daemon, &host_name, generation).await;
+            if plan.was_active {
+                daemon.send_event(DaemonEvent::PeerStatusChanged {
+                    host: host_name,
+                    status: PeerConnectionState::Disconnected,
+                });
+            }
             relay_task.abort();
         }
         other => {
@@ -1761,6 +1786,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let client_count = Arc::new(AtomicUsize::new(0));
+        let client_notify = Arc::new(Notify::new());
+
+        let (client_stream_a, server_stream_a) = tokio::net::UnixStream::pair().expect("pair a");
+        let (client_stream_b, server_stream_b) = tokio::net::UnixStream::pair().expect("pair b");
+
+        let expected_server_host = daemon.host_name().clone();
+        let daemon_a = Arc::clone(&daemon);
+        let daemon_b = Arc::clone(&daemon);
+        let pm_a = Arc::clone(&peer_manager);
+        let pm_b = Arc::clone(&peer_manager);
+        let tx_a = peer_data_tx.clone();
+        let tx_b = peer_data_tx.clone();
+        let count_a = Arc::clone(&client_count);
+        let count_b = Arc::clone(&client_count);
+        let notify_a = Arc::clone(&client_notify);
+        let notify_b = Arc::clone(&client_notify);
+        let shutdown_rx_a = shutdown_rx.clone();
+        let shutdown_rx_b = shutdown_rx.clone();
+
+        let handle_a = tokio::spawn(async move {
+            handle_client(
+                server_stream_a,
+                daemon_a,
+                shutdown_rx_a,
+                tx_a,
+                pm_a,
+                count_a,
+                notify_a,
+            )
+            .await;
+        });
+        let handle_b = tokio::spawn(async move {
+            handle_client(
+                server_stream_b,
+                daemon_b,
+                shutdown_rx_b,
+                tx_b,
+                pm_b,
+                count_b,
+                notify_b,
+            )
+            .await;
+        });
+
+        async fn send_peer_hello(
+            stream: tokio::net::UnixStream,
+            expected_server_host: &HostName,
+        ) -> (
+            tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+            tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>,
+        ) {
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half).lines();
+            let mut writer = BufWriter::new(write_half);
+            let hello = Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                host_name: HostName::new("peer"),
+            };
+            let hello_json = serde_json::to_string(&hello).expect("serialize hello");
+            writer
+                .write_all(hello_json.as_bytes())
+                .await
+                .expect("write hello");
+            writer.write_all(b"\n").await.expect("newline");
+            writer.flush().await.expect("flush");
+
+            let line = reader
+                .next_line()
+                .await
+                .expect("read hello response")
+                .expect("hello response line");
+            let msg: Message = serde_json::from_str(&line).expect("parse hello response");
+            match msg {
+                Message::Hello { host_name, .. } => {
+                    assert_eq!(host_name, expected_server_host.clone())
+                }
+                other => panic!("expected hello response, got {other:?}"),
+            }
+
+            (reader, writer)
+        }
+
+        let (_reader_a, writer_a) = send_peer_hello(client_stream_a, &expected_server_host).await;
+        let (mut reader_b, writer_b) = send_peer_hello(client_stream_b, &expected_server_host).await;
+
+        let goodbye = tokio::time::timeout(Duration::from_secs(2), reader_b.next_line())
+            .await
+            .expect("timeout waiting for goodbye")
+            .expect("read goodbye line")
+            .expect("goodbye line");
+        let goodbye_msg: Message = serde_json::from_str(&goodbye).expect("parse goodbye");
+        match goodbye_msg {
+            Message::Peer(inner) => match *inner {
+                PeerWireMessage::Goodbye {
+                    reason: flotilla_protocol::GoodbyeReason::Superseded,
+                } => {}
+                other => panic!("expected superseded goodbye, got {other:?}"),
+            },
+            other => panic!("expected peer goodbye, got {other:?}"),
+        }
+
+        drop(writer_a);
+        drop(writer_b);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle_a).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle_b).await;
+    }
+
+    #[tokio::test]
     async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
         let (_tmp, daemon) = empty_daemon().await;
         let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
@@ -1857,15 +1996,21 @@ mod tests {
             let sender: Arc<dyn PeerSender> = Arc::new(super::SocketPeerSender {
                 tx: mpsc::channel(1).0,
             });
-            pm.activate_connection(
+            match pm.activate_connection(
                 HostName::new("peer-a"),
                 sender,
                 crate::peer::ConnectionMeta {
                     direction: crate::peer::ConnectionDirection::Inbound,
                     config_label: None,
                     expected_peer: None,
+                    config_backed: false,
                 },
-            )
+            ) {
+                crate::peer::ActivationResult::Accepted { generation, .. } => generation,
+                crate::peer::ActivationResult::Rejected { reason } => {
+                    panic!("expected peer-a activation to succeed, got {:?}", reason)
+                }
+            }
         };
 
         disconnect_peer_and_rebuild(&peer_manager, &daemon, &HostName::new("peer-a"), gen_a).await;

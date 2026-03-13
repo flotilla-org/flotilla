@@ -74,19 +74,20 @@ The config-backed flag is candidate-specific, not just peer-specific:
 This preserves the distinction between "I intended to own this connection" and
 "a connection from that peer exists."
 
+Config backing affects long-term ownership and reconnect policy. It does not
+choose the winning live socket.
+
 ### Arbitration Rule
 
 When a new connection for peer `P` reaches `activate_connection(...)`, compare
 it with the existing active connection for `P` if one exists.
 
-Winner order:
+Winner rule:
 
-1. A connection backed by explicit local outbound config for `P` beats one that
-   is not.
-2. If both are equally config-backed or equally unconfigured, pick a single
-   winning physical connection for peer pair `(local, P)` using a deterministic
+1. If two simultaneous physical connections exist for peer pair `(local, P)`,
+   pick a single winning physical connection for the pair using a deterministic
    stable host-identity rule.
-3. Connection direction is only a local heuristic inside that winning
+2. Connection direction is only a local heuristic inside that winning
    physical-connection rule. It must not be applied independently on both sides
    in a way that can cause both legs to be dropped.
 
@@ -94,6 +95,14 @@ The critical requirement is that both peers derive complementary keep/drop
 behavior for the same pair of simultaneous sockets. The arbitration rule must
 choose one physical connection, not merely prefer "outbound" as an abstract
 class.
+
+In other words:
+
+- the pairwise physical-connection tie-break decides which currently-live
+  socket survives
+- `config_backed` decides who should own reconnect responsibility over time
+- the pairwise physical-connection tie-break decides which currently-live
+  socket survives when both sides connected at once
 
 ### Duplicate Retirement
 
