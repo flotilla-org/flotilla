@@ -135,6 +135,9 @@ Use these labels when creating or triaging issues. Combine as appropriate (e.g. 
 | `refactor` | Code restructuring for maintainability |
 | `ui` | UI/UX and rendering changes |
 | `testing` | Test coverage and testing infrastructure |
+| `multi-host` | Multi-host peering and networking |
+| `protocol` | Wire protocol, message format, handshake |
+| `cli` | CLI commands and output formatting |
 | `infrastructure` | Build, CI, and tooling |
 | `integration` | New provider or tool integration |
 | `vision` | Long-term direction, ambitious features |
