@@ -71,6 +71,8 @@ pub async fn build_plan(
                 .await
         }
 
+        Command::RemoveCheckout { branch, terminal_keys } => build_remove_checkout_plan(branch, terminal_keys, repo_root, registry),
+
         cmd => {
             let result = execute(cmd, &repo_root, &*registry, &*providers_data, &*runner, &config_base).await;
             ExecutionPlan::Immediate(result)
@@ -290,6 +292,68 @@ async fn build_teleport_session_plan(
                         // Unlike CreateCheckout, teleport fails entirely if the workspace
                         // can't be created — the checkout may already have existed.
                         ws_mgr.create_workspace(&config).await.map_err(|e| e)?;
+                    }
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    ExecutionPlan::Steps(StepPlan::new(steps))
+}
+
+/// Build a step plan for `RemoveCheckout`.
+///
+/// Steps:
+/// 1. Remove the checkout via the checkout manager
+/// 2. Clean up correlated terminal sessions (best-effort)
+fn build_remove_checkout_plan(
+    branch: String,
+    terminal_keys: Vec<ManagedTerminalId>,
+    repo_root: PathBuf,
+    registry: Arc<ProviderRegistry>,
+) -> ExecutionPlan {
+    let mut steps = Vec::new();
+
+    // Step 1: Remove checkout
+    {
+        let branch = branch.clone();
+        let repo_root = repo_root.clone();
+        let registry = Arc::clone(&registry);
+        steps.push(Step {
+            description: format!("Remove checkout for branch {branch}"),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    let cm = registry
+                        .checkout_managers
+                        .values()
+                        .next()
+                        .map(|(_, cm)| Arc::clone(cm))
+                        .ok_or_else(|| "No checkout manager available".to_string())?;
+                    cm.remove_checkout(&repo_root, &branch).await?;
+                    Ok(StepOutcome::Completed)
+                })
+            }),
+        });
+    }
+
+    // Step 2: Clean up terminal sessions (best-effort)
+    if !terminal_keys.is_empty() {
+        let registry = Arc::clone(&registry);
+        steps.push(Step {
+            description: "Clean up terminal sessions".to_string(),
+            action: Box::new(move || {
+                Box::pin(async move {
+                    if let Some((_, tp)) = &registry.terminal_pool {
+                        for terminal_id in &terminal_keys {
+                            if let Err(e) = tp.kill_terminal(terminal_id).await {
+                                warn!(
+                                    terminal = %terminal_id,
+                                    err = %e,
+                                    "failed to kill terminal session (best-effort)"
+                                );
+                            }
+                        }
                     }
                     Ok(StepOutcome::Completed)
                 })
