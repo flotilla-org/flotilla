@@ -1044,6 +1044,7 @@ dependencies = [
  "flotilla-protocol",
  "libc",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

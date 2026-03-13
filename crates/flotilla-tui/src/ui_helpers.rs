@@ -4,6 +4,7 @@ use flotilla_protocol::{ChangeRequestStatus, Checkout, SessionStatus, WorkItemKi
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::Color,
+    widgets::Block,
 };
 
 /// Truncate a string to `max` characters, appending '…' if truncated.
@@ -25,6 +26,28 @@ pub fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let [area] = Layout::vertical([Constraint::Percentage(percent_y)]).flex(Flex::Center).areas(area);
     let [area] = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center).areas(area);
     area
+}
+
+/// Calculate a centered popup area and its bordered inner area.
+///
+/// Returns `(outer_area, inner_area)` where `inner_area` is the content area
+/// inside a `Block::bordered()` with the given title.
+pub fn popup_frame(container: Rect, percent_x: u16, percent_y: u16, title: &str) -> (Rect, Rect) {
+    let area = popup_area(container, percent_x, percent_y);
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    (area, inner)
+}
+
+/// Render a popup frame: clear the area and draw a bordered block with title.
+/// Returns `(outer_area, inner_area)` for the caller to render content into.
+pub fn render_popup_frame(frame: &mut ratatui::Frame, container: Rect, percent_x: u16, percent_y: u16, title: &str) -> (Rect, Rect) {
+    let area = popup_area(container, percent_x, percent_y);
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    (area, inner)
 }
 
 /// Return (icon, color) for a work item based on its kind, workspace status,
@@ -222,6 +245,20 @@ mod tests {
         assert!(popup.height <= 25);
         assert!(popup.x > 0);
         assert!(popup.y > 0);
+    }
+
+    #[test]
+    fn popup_frame_returns_inner_area() {
+        let area = Rect::new(0, 0, 100, 50);
+        let (popup, inner) = popup_frame(area, 50, 50, " Test ");
+        // Popup should be centered
+        assert!(popup.x > 0);
+        assert!(popup.y > 0);
+        // Inner should be inset by border (1px each side)
+        assert_eq!(inner.x, popup.x + 1);
+        assert_eq!(inner.y, popup.y + 1);
+        assert_eq!(inner.width, popup.width - 2);
+        assert_eq!(inner.height, popup.height - 2);
     }
 
     #[test]

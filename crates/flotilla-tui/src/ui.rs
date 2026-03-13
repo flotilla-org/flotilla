@@ -701,12 +701,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
         return;
     };
 
-    let area = ui_helpers::popup_area(frame.area(), 50, 20);
-    frame.render_widget(Clear, area);
-
-    let inner = Block::bordered().title(" New Branch ");
-    let inner_area = inner.inner(area);
-    frame.render_widget(inner, area);
+    let (_area, inner_area) = ui_helpers::render_popup_frame(frame, frame.area(), 50, 20, " New Branch ");
 
     if *kind == BranchInputKind::Generating {
         let paragraph = Paragraph::new("  Generating branch name...").style(Style::default().fg(Color::Yellow));
@@ -926,13 +921,8 @@ fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
         return;
     };
 
-    let area = ui_helpers::popup_area(frame.area(), 60, 60);
+    let (area, inner) = ui_helpers::render_popup_frame(frame, frame.area(), 60, 60, " Add Repository ");
     ui.layout.file_picker_area = area;
-    frame.render_widget(Clear, area);
-
-    let block = Block::bordered().title(" Add Repository ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0)]).split(inner);
 
