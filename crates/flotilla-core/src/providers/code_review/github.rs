@@ -166,30 +166,19 @@ impl super::CodeReview for GitHubCodeReview {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::path::PathBuf;
 
     use super::*;
     use crate::providers::{
         code_review::CodeReview,
-        github_api::GhApi,
+        github_test_support::{build_api_and_runner, repo_root_for_recording},
         replay::{
             Masks, {self},
         },
-        CommandRunner,
     };
 
     fn fixture(name: &str) -> String {
         format!("{}/src/providers/code_review/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
-    }
-
-    fn repo_root_for_recording() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
-    }
-
-    fn build_api_and_runner(session: &replay::Session) -> (Arc<dyn GhApi>, Arc<dyn CommandRunner>) {
-        let runner = replay::test_runner(session);
-        let api = replay::test_gh_api(session);
-        (api, runner)
     }
 
     #[tokio::test]

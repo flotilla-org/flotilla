@@ -146,9 +146,10 @@ mod tests {
     use super::*;
     use crate::providers::{
         github_api::{GhApi, GhApiResponse},
+        github_test_support::{build_api_and_runner, repo_root_for_recording},
         issue_tracker::IssueTracker,
         testing::MockRunner,
-        ChannelLabel, CommandRunner,
+        ChannelLabel,
     };
 
     struct MockGhApi {
@@ -185,16 +186,6 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         format!("{}/src/providers/issue_tracker/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
-    }
-
-    fn repo_root_for_recording() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
-    }
-
-    fn build_api_and_runner(session: &replay::Session) -> (Arc<dyn GhApi>, Arc<dyn CommandRunner>) {
-        let runner = replay::test_runner(session);
-        let api = replay::test_gh_api(session);
-        (api, runner)
     }
 
     #[tokio::test]

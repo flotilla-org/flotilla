@@ -391,6 +391,23 @@ pub mod testing {
 }
 
 #[cfg(test)]
+pub(crate) mod github_test_support {
+    use std::{path::PathBuf, sync::Arc};
+
+    use crate::providers::{github_api::GhApi, replay, CommandRunner};
+
+    pub fn repo_root_for_recording() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+    }
+
+    pub fn build_api_and_runner(session: &replay::Session) -> (Arc<dyn GhApi>, Arc<dyn CommandRunner>) {
+        let runner = replay::test_runner(session);
+        let api = replay::test_gh_api(session);
+        (api, runner)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
