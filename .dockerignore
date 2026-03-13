@@ -1,0 +1,8 @@
+target/
+.git/
+docs/
+tests/
+!tests/integration/docker/
+*.md
+.github/
+.vscode/
