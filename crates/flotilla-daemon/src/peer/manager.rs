@@ -1089,6 +1089,8 @@ impl PeerManager {
                     for repo_id in &affected_for_origin {
                         if let Some(state) = repos.get_mut(repo_id) {
                             state.stale = true;
+                            state.via_peer = next_hop.next_hop.clone();
+                            state.via_generation = next_hop.next_hop_generation;
                         }
                     }
                 }
@@ -2343,6 +2345,91 @@ mod tests {
         let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
         assert!(!state.stale);
         assert_eq!(state.via_peer, HostName::new("relay-b"));
+    }
+
+    #[tokio::test]
+    async fn consecutive_failovers_reissue_resync_for_stale_snapshot() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let relay_a_generation = accepted_generation(mgr.activate_connection(
+            HostName::new("relay-a"),
+            Arc::new(MockPeerSender {
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+                config_backed: false,
+            },
+        ));
+        let relay_b_generation = accepted_generation(mgr.activate_connection(
+            HostName::new("relay-b"),
+            Arc::new(MockPeerSender {
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+                config_backed: false,
+            },
+        ));
+        let relay_c_generation = accepted_generation(mgr.activate_connection(
+            HostName::new("relay-c"),
+            Arc::new(MockPeerSender {
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ConnectionMeta {
+                direction: ConnectionDirection::Inbound,
+                config_label: None,
+                expected_peer: None,
+                config_backed: false,
+            },
+        ));
+
+        let baseline = snapshot_msg("target", 1);
+        let _ = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Data(baseline.clone()),
+                connection_generation: relay_a_generation,
+                connection_peer: HostName::new("relay-a"),
+            })
+            .await;
+
+        mgr.routes
+            .get_mut(&HostName::new("target"))
+            .expect("route exists")
+            .fallbacks = vec![
+            RouteHop {
+                next_hop: HostName::new("relay-b"),
+                next_hop_generation: relay_b_generation,
+                learned_epoch: 10,
+            },
+            RouteHop {
+                next_hop: HostName::new("relay-c"),
+                next_hop_generation: relay_c_generation,
+                learned_epoch: 20,
+            },
+        ];
+
+        let first_plan = mgr.disconnect_peer(&HostName::new("relay-a"), relay_a_generation);
+        assert_eq!(first_plan.resync_requests.len(), 1);
+        let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+        assert!(state.stale);
+
+        let second_plan = mgr.disconnect_peer(&HostName::new("relay-c"), relay_c_generation);
+
+        assert_eq!(second_plan.resync_requests.len(), 1);
+        match &second_plan.resync_requests[0] {
+            RoutedPeerMessage::RequestResync { target_host, .. } => {
+                assert_eq!(target_host, &HostName::new("target"));
+            }
+            other => panic!("expected request_resync, got {:?}", other),
+        }
+        assert_eq!(
+            mgr.routes[&HostName::new("target")].primary.next_hop,
+            HostName::new("relay-b")
+        );
     }
 
     #[tokio::test]

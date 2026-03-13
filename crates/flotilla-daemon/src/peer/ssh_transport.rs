@@ -647,6 +647,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        feature = "skip-no-sandbox-tests",
+        ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include"
+    )]
     async fn connect_socket_preserves_peer_message_buffered_after_hello() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("peer.sock");
