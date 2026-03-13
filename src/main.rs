@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use clap::Parser;
 use color_eyre::Result;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_protocol::output::OutputFormat;
 use flotilla_tui::{app, event_log};
 use tracing::info;
 
@@ -39,9 +40,17 @@ enum SubCommand {
         timeout: u64,
     },
     /// Print repo list and state
-    Status,
+    Status {
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
     /// Stream daemon events to stdout
-    Watch,
+    Watch {
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -61,8 +70,8 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, *timeout).await,
-        Some(SubCommand::Status) => run_status(&cli).await,
-        Some(SubCommand::Watch) => run_watch(&cli).await,
+        Some(SubCommand::Status { json }) => run_status(&cli, OutputFormat::from_json_flag(*json)).await,
+        Some(SubCommand::Watch { json }) => run_watch(&cli, OutputFormat::from_json_flag(*json)).await,
         None => run_tui(cli).await,
     }
 }
@@ -154,10 +163,26 @@ async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     flotilla_daemon::cli::run(&cli.socket_path(), timeout_secs).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-async fn run_status(cli: &Cli) -> Result<()> {
-    flotilla_tui::cli::run_status(&cli.socket_path()).await.map_err(|e| color_eyre::eyre::eyre!(e))
+/// Reset SIGPIPE so piped CLI commands (e.g. `watch | head`) exit cleanly.
+/// Only called for CLI subcommands — not the TUI (which needs terminal restore on exit)
+/// or the daemon (which shouldn't be killed by a broken stdout pipe).
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: libc::signal is safe to call before I/O begins. Tokio does not configure SIGPIPE.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
-async fn run_watch(cli: &Cli) -> Result<()> {
-    flotilla_tui::cli::run_watch(&cli.socket_path()).await.map_err(|e| color_eyre::eyre::eyre!(e))
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
+async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    flotilla_tui::cli::run_status(&cli.socket_path(), format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    flotilla_tui::cli::run_watch(&cli.socket_path(), format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }

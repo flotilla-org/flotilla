@@ -2,6 +2,7 @@ pub mod commands;
 pub mod delta;
 pub mod framing;
 mod host;
+pub mod output;
 pub mod peer;
 pub mod provider_data;
 pub mod snapshot;
