@@ -815,7 +815,6 @@ mod orchestrator_tests {
     use super::*;
     use crate::config::ConfigStore;
     use crate::providers::discovery::detectors;
-    use crate::providers::discovery::factories;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use tempfile::tempdir;
 

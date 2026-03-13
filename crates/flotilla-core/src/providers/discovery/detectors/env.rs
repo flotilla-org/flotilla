@@ -57,8 +57,13 @@ mod tests {
     use super::*;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
 
+    // Tests that manipulate the ZELLIJ env var must not run concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn zellij_detector_inside() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
         // Env var set + binary found → both assertions
         unsafe {
             std::env::set_var("ZELLIJ", "0");
@@ -89,6 +94,8 @@ mod tests {
 
     #[tokio::test]
     async fn zellij_detector_not_inside_binary_found() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
         // Env var not set, but binary is available → BinaryAvailable only
         unsafe {
             std::env::remove_var("ZELLIJ");
@@ -110,6 +117,8 @@ mod tests {
 
     #[tokio::test]
     async fn zellij_detector_not_inside_no_binary() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
         // Env var not set, binary not found → empty
         unsafe {
             std::env::remove_var("ZELLIJ");
