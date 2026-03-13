@@ -105,6 +105,11 @@ impl EnvironmentBag {
         Self::default()
     }
 
+    /// Public read access to the raw assertions, for conversion to protocol types.
+    pub fn assertions(&self) -> &[EnvironmentAssertion] {
+        &self.assertions
+    }
+
     pub fn with(mut self, assertion: EnvironmentAssertion) -> Self {
         self.assertions.push(assertion);
         self
@@ -605,6 +610,22 @@ mod tests {
     fn repo_identity_none_when_no_remote() {
         let bag = EnvironmentBag::new();
         assert!(bag.repo_identity().is_none());
+    }
+
+    #[test]
+    fn environment_bag_assertions_accessor() {
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::BinaryAvailable {
+                name: "git".into(),
+                path: PathBuf::from("/usr/bin/git"),
+                version: Some("2.40".into()),
+            })
+            .with(EnvironmentAssertion::AuthFileExists {
+                provider: "github".into(),
+                path: PathBuf::from("/home/user/.config/gh/hosts.yml"),
+            });
+        assert_eq!(bag.assertions().len(), 2);
+        assert!(matches!(bag.assertions()[0], EnvironmentAssertion::BinaryAvailable { ref name, .. } if name == "git"));
     }
 }
 
