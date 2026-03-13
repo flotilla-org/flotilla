@@ -14,7 +14,8 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot, SnapshotDelta, WorkItem,
+    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoDetailResponse, RepoInfo, RepoLabels, RepoProvidersResponse,
+    RepoWorkResponse, Snapshot, SnapshotDelta, StatusResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
@@ -72,6 +73,22 @@ impl DaemonHandle for StubDaemon {
 
     async fn replay_since(&self, _last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String> {
         Ok(vec![])
+    }
+
+    async fn get_status(&self) -> Result<StatusResponse, String> {
+        Ok(StatusResponse { repos: vec![] })
+    }
+
+    async fn get_repo_detail(&self, _slug: &str) -> Result<RepoDetailResponse, String> {
+        Err("stub".into())
+    }
+
+    async fn get_repo_providers(&self, _slug: &str) -> Result<RepoProvidersResponse, String> {
+        Err("stub".into())
+    }
+
+    async fn get_repo_work(&self, _slug: &str) -> Result<RepoWorkResponse, String> {
+        Err("stub".into())
     }
 }
 

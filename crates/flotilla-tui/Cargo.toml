@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 time = { version = "0.3.47", features = ["local-offset"] }
 futures = "0.3"
+comfy-table = "7.2.2"
 
 [dev-dependencies]
 async-trait = { workspace = true }
