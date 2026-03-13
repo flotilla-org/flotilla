@@ -1,10 +1,8 @@
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
-use crate::delta::Change;
-use crate::provider_data::ProviderData;
-use crate::{HostName, RepoIdentity};
+use serde::{Deserialize, Serialize};
+
+use crate::{delta::Change, provider_data::ProviderData, HostName, RepoIdentity};
 
 /// Logical clock for causal ordering and deduplication of peer messages.
 ///
@@ -111,11 +109,7 @@ pub enum PeerDataKind {
     Snapshot { data: Box<ProviderData>, seq: u64 },
     /// Incremental delta — only provider-data variants (Checkout, Branch, Workspace, Session, Issue).
     #[serde(rename = "delta")]
-    Delta {
-        changes: Vec<Change>,
-        seq: u64,
-        prev_seq: u64,
-    },
+    Delta { changes: Vec<Change>, seq: u64, prev_seq: u64 },
     /// Request the peer to resend data from the given sequence number.
     #[serde(rename = "request_resync")]
     RequestResync { since_seq: u64 },
@@ -145,14 +139,8 @@ mod tests {
         b.tick(&HostName::new("x")); // {x: 1}
         b.tick(&HostName::new("x")); // {x: 2}
 
-        assert!(
-            a.dominated_by(&b),
-            "a{{x:1}} should be dominated by b{{x:2}}"
-        );
-        assert!(
-            !b.dominated_by(&a),
-            "b{{x:2}} should not be dominated by a{{x:1}}"
-        );
+        assert!(a.dominated_by(&b), "a{{x:1}} should be dominated by b{{x:2}}");
+        assert!(!b.dominated_by(&a), "b{{x:2}} should not be dominated by a{{x:1}}");
 
         // Equal clocks dominate each other
         let c = a.clone();
@@ -201,16 +189,10 @@ mod tests {
     fn peer_data_message_snapshot_roundtrip() {
         let msg = PeerDataMessage {
             origin_host: HostName::new("desktop"),
-            repo_identity: RepoIdentity {
-                authority: "github.com".into(),
-                path: "owner/repo".into(),
-            },
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repo_path: PathBuf::from("/home/dev/repo"),
             clock: VectorClock::default(),
-            kind: PeerDataKind::Snapshot {
-                data: Box::new(ProviderData::default()),
-                seq: 1,
-            },
+            kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
@@ -222,20 +204,14 @@ mod tests {
     fn peer_data_message_request_resync() {
         let msg = PeerDataMessage {
             origin_host: HostName::new("cloud"),
-            repo_identity: RepoIdentity {
-                authority: "github.com".into(),
-                path: "owner/repo".into(),
-            },
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repo_path: PathBuf::from("/opt/repo"),
             clock: VectorClock::default(),
             kind: PeerDataKind::RequestResync { since_seq: 5 },
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(
-            back.kind,
-            PeerDataKind::RequestResync { since_seq: 5 }
-        ));
+        assert!(matches!(back.kind, PeerDataKind::RequestResync { since_seq: 5 }));
     }
 
     #[test]
@@ -244,19 +220,11 @@ mod tests {
 
         let msg = PeerDataMessage {
             origin_host: HostName::new("laptop"),
-            repo_identity: RepoIdentity {
-                authority: "github.com".into(),
-                path: "owner/repo".into(),
-            },
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repo_path: PathBuf::from("/home/dev/repo"),
             clock: VectorClock::default(),
             kind: PeerDataKind::Delta {
-                changes: vec![Change::Branch {
-                    key: "feat-x".into(),
-                    op: EntryOp::Added(Branch {
-                        status: BranchStatus::Remote,
-                    }),
-                }],
+                changes: vec![Change::Branch { key: "feat-x".into(), op: EntryOp::Added(Branch { status: BranchStatus::Remote }) }],
                 seq: 3,
                 prev_seq: 2,
             },
@@ -264,11 +232,7 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
         match back.kind {
-            PeerDataKind::Delta {
-                changes,
-                seq,
-                prev_seq,
-            } => {
+            PeerDataKind::Delta { changes, seq, prev_seq } => {
                 assert_eq!(seq, 3);
                 assert_eq!(prev_seq, 2);
                 assert_eq!(changes.len(), 1);

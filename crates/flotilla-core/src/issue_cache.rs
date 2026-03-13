@@ -1,9 +1,7 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use indexmap::IndexMap;
+use std::{collections::HashSet, sync::Arc};
 
 use flotilla_protocol::{Issue, IssueChangeset, IssuePage};
+use indexmap::IndexMap;
 
 pub struct IssueCache {
     entries: Arc<IndexMap<String, Issue>>,
@@ -59,10 +57,7 @@ impl IssueCache {
     }
 
     pub fn missing_ids(&self, ids: &[String]) -> Vec<String> {
-        ids.iter()
-            .filter(|id| !self.entries.contains_key(id.as_str()))
-            .cloned()
-            .collect()
+        ids.iter().filter(|id| !self.entries.contains_key(id.as_str())).cloned().collect()
     }
 
     pub fn add_pinned(&mut self, issues: Vec<(String, Issue)>) {
@@ -95,15 +90,8 @@ impl IssueCache {
     /// Reset pagination state for a full re-fetch. Pinned issues and the
     /// pinned set are preserved; everything else is cleared.
     pub fn reset(&mut self) {
-        let pinned_issues: Vec<(String, Issue)> = self
-            .pinned
-            .iter()
-            .filter_map(|id| {
-                self.entries
-                    .get(id)
-                    .map(|issue| (id.clone(), issue.clone()))
-            })
-            .collect();
+        let pinned_issues: Vec<(String, Issue)> =
+            self.pinned.iter().filter_map(|id| self.entries.get(id).map(|issue| (id.clone(), issue.clone()))).collect();
 
         let entries = Arc::make_mut(&mut self.entries);
         entries.clear();
@@ -126,26 +114,19 @@ mod tests {
     use super::*;
 
     fn issue(id: &str) -> (String, Issue) {
-        (
-            id.to_string(),
-            Issue {
-                title: format!("Issue {}", id),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )
+        (id.to_string(), Issue {
+            title: format!("Issue {}", id),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })
     }
 
     #[test]
     fn merge_page_appends_issues() {
         let mut cache = IssueCache::new();
-        let page = IssuePage {
-            issues: vec![issue("1"), issue("2")],
-            total_count: Some(10),
-            has_more: true,
-        };
+        let page = IssuePage { issues: vec![issue("1"), issue("2")], total_count: Some(10), has_more: true };
         cache.merge_page(page);
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.total_count, Some(10));
@@ -155,11 +136,7 @@ mod tests {
     #[test]
     fn pin_issues_marks_as_pinned() {
         let mut cache = IssueCache::new();
-        cache.merge_page(IssuePage {
-            issues: vec![issue("1"), issue("2")],
-            total_count: None,
-            has_more: false,
-        });
+        cache.merge_page(IssuePage { issues: vec![issue("1"), issue("2")], total_count: None, has_more: false });
         cache.pin(&["1".to_string()]);
         assert!(cache.pinned.contains("1"));
         assert!(!cache.pinned.contains("2"));
@@ -168,11 +145,7 @@ mod tests {
     #[test]
     fn missing_ids_returns_unpinned_absent_ids() {
         let mut cache = IssueCache::new();
-        cache.merge_page(IssuePage {
-            issues: vec![issue("1")],
-            total_count: None,
-            has_more: false,
-        });
+        cache.merge_page(IssuePage { issues: vec![issue("1")], total_count: None, has_more: false });
         let missing = cache.missing_ids(&["1".to_string(), "3".to_string(), "5".to_string()]);
         assert_eq!(missing, vec!["3", "5"]);
     }
@@ -188,11 +161,7 @@ mod tests {
     #[test]
     fn to_index_map_returns_all_entries() {
         let mut cache = IssueCache::new();
-        cache.merge_page(IssuePage {
-            issues: vec![issue("1"), issue("2")],
-            total_count: None,
-            has_more: false,
-        });
+        cache.merge_page(IssuePage { issues: vec![issue("1"), issue("2")], total_count: None, has_more: false });
         cache.add_pinned(vec![issue("99")]);
         let map = cache.to_index_map();
         assert_eq!(map.len(), 3);
@@ -201,24 +170,17 @@ mod tests {
     #[test]
     fn apply_changeset_upserts_and_evicts() {
         let mut cache = IssueCache::new();
-        cache.merge_page(IssuePage {
-            issues: vec![issue("1"), issue("2"), issue("3")],
-            total_count: None,
-            has_more: false,
-        });
+        cache.merge_page(IssuePage { issues: vec![issue("1"), issue("2"), issue("3")], total_count: None, has_more: false });
 
         let changeset = IssueChangeset {
             updated: vec![
-                (
-                    "2".to_string(),
-                    Issue {
-                        title: "Updated Issue 2".to_string(),
-                        labels: vec!["changed".to_string()],
-                        association_keys: vec![],
-                        provider_name: String::new(),
-                        provider_display_name: String::new(),
-                    },
-                ),
+                ("2".to_string(), Issue {
+                    title: "Updated Issue 2".to_string(),
+                    labels: vec!["changed".to_string()],
+                    association_keys: vec![],
+                    provider_name: String::new(),
+                    provider_display_name: String::new(),
+                }),
                 issue("4"),
             ],
             closed_ids: vec!["3".to_string()],
@@ -237,17 +199,9 @@ mod tests {
     fn apply_changeset_preserves_pinned_on_close() {
         let mut cache = IssueCache::new();
         cache.add_pinned(vec![issue("99")]);
-        cache.merge_page(IssuePage {
-            issues: vec![issue("1")],
-            total_count: None,
-            has_more: false,
-        });
+        cache.merge_page(IssuePage { issues: vec![issue("1")], total_count: None, has_more: false });
 
-        let changeset = IssueChangeset {
-            updated: vec![],
-            closed_ids: vec!["99".to_string(), "1".to_string()],
-            has_more: false,
-        };
+        let changeset = IssueChangeset { updated: vec![], closed_ids: vec!["99".to_string(), "1".to_string()], has_more: false };
         cache.apply_changeset(changeset);
 
         let map = cache.to_index_map();
@@ -261,10 +215,7 @@ mod tests {
         assert!(cache.last_refreshed_at.is_none());
 
         cache.mark_refreshed("2026-03-09T12:00:00Z".to_string());
-        assert_eq!(
-            cache.last_refreshed_at.as_deref(),
-            Some("2026-03-09T12:00:00Z")
-        );
+        assert_eq!(cache.last_refreshed_at.as_deref(), Some("2026-03-09T12:00:00Z"));
 
         cache.reset();
         assert!(cache.last_refreshed_at.is_none(), "reset clears timestamp");
@@ -273,11 +224,7 @@ mod tests {
     #[test]
     fn reset_clears_non_pinned_entries() {
         let mut cache = IssueCache::new();
-        cache.merge_page(IssuePage {
-            issues: vec![issue("1"), issue("2")],
-            total_count: Some(10),
-            has_more: true,
-        });
+        cache.merge_page(IssuePage { issues: vec![issue("1"), issue("2")], total_count: Some(10), has_more: true });
         cache.add_pinned(vec![issue("99")]);
         assert_eq!(cache.next_page, 2);
 

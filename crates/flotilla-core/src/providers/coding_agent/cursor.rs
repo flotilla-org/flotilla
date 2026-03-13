@@ -1,11 +1,13 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tracing::warn;
 
-use crate::providers::types::*;
-use crate::providers::{http_execute, HttpClient};
+use crate::providers::{http_execute, types::*, HttpClient};
 
 pub struct CursorCodingAgent {
     provider_name: String,
@@ -15,11 +17,7 @@ pub struct CursorCodingAgent {
 
 impl CursorCodingAgent {
     pub fn new(provider_name: String, http: Arc<dyn HttpClient>) -> Self {
-        Self {
-            provider_name,
-            http,
-            auth_warned: AtomicBool::new(false),
-        }
+        Self { provider_name, http, auth_warned: AtomicBool::new(false) }
     }
 
     fn api_key() -> Result<String, String> {
@@ -58,8 +56,7 @@ impl CursorCodingAgent {
                 return Err(format!("agent list failed (HTTP {status}): {body}"));
             }
 
-            let page: ListAgentsResponse = serde_json::from_slice(resp.body())
-                .map_err(|e| format!("agent list parse error: {e}"))?;
+            let page: ListAgentsResponse = serde_json::from_slice(resp.body()).map_err(|e| format!("agent list parse error: {e}"))?;
             all_agents.extend(page.agents);
             cursor = page.next_cursor;
             if cursor.is_none() {
@@ -143,10 +140,7 @@ fn repo_slug_from_cursor_repository(repository: &str) -> Option<String> {
         }
     }
 
-    if let Some(rest) = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-    {
+    if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
         if let Some((_, path)) = rest.split_once('/') {
             if path.contains('/') {
                 return Some(path.trim_matches('/').to_string());
@@ -171,18 +165,12 @@ fn repo_slug_from_cursor_repository(repository: &str) -> Option<String> {
 
 #[async_trait]
 impl super::CloudAgentService for CursorCodingAgent {
-    async fn list_sessions(
-        &self,
-        criteria: &RepoCriteria,
-    ) -> Result<Vec<(String, CloudAgentSession)>, String> {
+    async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
         let agents = match self.fetch_agents().await {
             Ok(agents) => agents,
             Err(e) if e.contains("CURSOR_API_KEY is not set") || e.contains("authentication") => {
                 if !self.auth_warned.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        provider = "cursor",
-                        "Cursor sessions unavailable: set CURSOR_API_KEY"
-                    );
+                    warn!(provider = "cursor", "Cursor sessions unavailable: set CURSOR_API_KEY");
                 }
                 return Ok(vec![]);
             }
@@ -199,37 +187,23 @@ impl super::CloudAgentService for CursorCodingAgent {
             .filter(|a| a.session_status() != SessionStatus::Expired)
             .filter(|a| a.repo_slug().is_some_and(|r| r == *slug))
             .map(|a| {
-                let mut correlation_keys = vec![CorrelationKey::SessionRef(
-                    provider_name.clone(),
-                    a.id.clone(),
-                )];
+                let mut correlation_keys = vec![CorrelationKey::SessionRef(provider_name.clone(), a.id.clone())];
                 if let Some(branch) = a.branch() {
                     correlation_keys.push(CorrelationKey::Branch(branch.to_string()));
                 }
-                let title = if a.name.is_empty() {
-                    a.id.clone()
-                } else {
-                    a.name.clone()
-                };
+                let title = if a.name.is_empty() { a.id.clone() } else { a.name.clone() };
 
-                (
-                    a.id.clone(),
-                    CloudAgentSession {
-                        title,
-                        status: a.session_status(),
-                        model: None,
-                        // Cursor API has no updatedAt; createdAt is the best proxy.
-                        updated_at: if a.created_at.is_empty() {
-                            None
-                        } else {
-                            Some(a.created_at)
-                        },
-                        correlation_keys,
-                        provider_name: provider_name.clone(),
-                        provider_display_name: "Cursor".into(),
-                        item_noun: "Agent".into(),
-                    },
-                )
+                (a.id.clone(), CloudAgentSession {
+                    title,
+                    status: a.session_status(),
+                    model: None,
+                    // Cursor API has no updatedAt; createdAt is the best proxy.
+                    updated_at: if a.created_at.is_empty() { None } else { Some(a.created_at) },
+                    correlation_keys,
+                    provider_name: provider_name.clone(),
+                    provider_display_name: "Cursor".into(),
+                    item_noun: "Agent".into(),
+                })
             })
             .collect())
     }
@@ -254,12 +228,8 @@ mod tests {
             name: "Session".to_string(),
             status: status.to_string(),
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
-            source: CursorSource {
-                repository: repository.to_string(),
-            },
-            target: CursorTarget {
-                branch_name: branch.to_string(),
-            },
+            source: CursorSource { repository: repository.to_string() },
+            target: CursorTarget { branch_name: branch.to_string() },
         }
     }
 
@@ -278,11 +248,7 @@ mod tests {
             ("repo-only", None),
         ];
         for (input, expected) in cases {
-            assert_eq!(
-                repo_slug_from_cursor_repository(input),
-                expected.map(str::to_string),
-                "{input}"
-            );
+            assert_eq!(repo_slug_from_cursor_repository(input), expected.map(str::to_string), "{input}");
         }
     }
 
@@ -298,11 +264,7 @@ mod tests {
             ("UNKNOWN_STATUS", SessionStatus::Idle),
         ];
         for (status, expected) in status_cases {
-            assert_eq!(
-                cursor_agent(status, "", "").session_status(),
-                expected,
-                "{status}"
-            );
+            assert_eq!(cursor_agent(status, "", "").session_status(), expected, "{status}");
         }
 
         let agent = cursor_agent("RUNNING", "github.com/owner/repo", "feature/one");

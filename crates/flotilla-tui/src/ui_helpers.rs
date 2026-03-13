@@ -1,9 +1,10 @@
 use std::path::Path;
 
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::Color;
-
 use flotilla_protocol::{ChangeRequestStatus, Checkout, SessionStatus, WorkItemKind};
+use ratatui::{
+    layout::{Constraint, Flex, Layout, Rect},
+    style::Color,
+};
 
 /// Truncate a string to `max` characters, appending '…' if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
@@ -21,22 +22,14 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 /// Calculate a centered popup rectangle within `area`.
 pub fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let [area] = Layout::vertical([Constraint::Percentage(percent_y)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [area] = Layout::horizontal([Constraint::Percentage(percent_x)])
-        .flex(Flex::Center)
-        .areas(area);
+    let [area] = Layout::vertical([Constraint::Percentage(percent_y)]).flex(Flex::Center).areas(area);
+    let [area] = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center).areas(area);
     area
 }
 
 /// Return (icon, color) for a work item based on its kind, workspace status,
 /// and optional session status.
-pub fn work_item_icon(
-    kind: &WorkItemKind,
-    has_workspace: bool,
-    session_status: Option<&SessionStatus>,
-) -> (&'static str, Color) {
+pub fn work_item_icon(kind: &WorkItemKind, has_workspace: bool, session_status: Option<&SessionStatus>) -> (&'static str, Color) {
     match kind {
         WorkItemKind::Checkout => {
             if has_workspace {
@@ -77,28 +70,16 @@ pub fn change_request_status_icon(status: &ChangeRequestStatus) -> &'static str 
 /// Build the git status indicator string (e.g. "MS?↑") from a checkout.
 pub fn git_status_display(checkout: &Checkout) -> String {
     let mut s = String::new();
-    if checkout
-        .working_tree
-        .as_ref()
-        .is_some_and(|w| w.modified > 0)
-    {
+    if checkout.working_tree.as_ref().is_some_and(|w| w.modified > 0) {
         s.push('M');
     }
     if checkout.working_tree.as_ref().is_some_and(|w| w.staged > 0) {
         s.push('S');
     }
-    if checkout
-        .working_tree
-        .as_ref()
-        .is_some_and(|w| w.untracked > 0)
-    {
+    if checkout.working_tree.as_ref().is_some_and(|w| w.untracked > 0) {
         s.push('?');
     }
-    if checkout
-        .trunk_ahead_behind
-        .as_ref()
-        .is_some_and(|m| m.ahead > 0)
-    {
+    if checkout.trunk_ahead_behind.as_ref().is_some_and(|m| m.ahead > 0) {
         s.push('↑');
     }
     s
@@ -132,10 +113,7 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
     }
 
     // Ideal padding = width of the parent-directory portion of main_display.
-    let repo_name_len = repo_root
-        .file_name()
-        .map(|n| n.to_string_lossy().len())
-        .unwrap_or(0);
+    let repo_name_len = repo_root.file_name().map(|n| n.to_string_lossy().len()).unwrap_or(0);
     let ideal_padding = main_display.len().saturating_sub(repo_name_len);
 
     // Cap padding so it never exceeds half the column — leaves room for the name
@@ -156,10 +134,7 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
     if let Some(root_parent) = repo_root.parent() {
         if let Ok(rel) = path.strip_prefix(root_parent) {
             let rel_str = rel.to_string_lossy();
-            let root_name = repo_root
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
+            let root_name = repo_root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
             // Only handle paths whose first component starts with the repo name
             // (e.g. "flotilla.quick-wins/..." but not "unrelated/...")
             if rel_str.starts_with(root_name.as_ref()) {
@@ -208,8 +183,9 @@ pub fn workspace_indicator(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use flotilla_protocol::{AheadBehind, WorkingTreeStatus};
+
+    use super::*;
 
     #[test]
     fn truncate_empty_max() {
@@ -264,16 +240,14 @@ mod tests {
 
     #[test]
     fn work_item_icon_session_running() {
-        let (icon, color) =
-            work_item_icon(&WorkItemKind::Session, false, Some(&SessionStatus::Running));
+        let (icon, color) = work_item_icon(&WorkItemKind::Session, false, Some(&SessionStatus::Running));
         assert_eq!(icon, "▶");
         assert_eq!(color, Color::Magenta);
     }
 
     #[test]
     fn work_item_icon_session_idle() {
-        let (icon, color) =
-            work_item_icon(&WorkItemKind::Session, false, Some(&SessionStatus::Idle));
+        let (icon, color) = work_item_icon(&WorkItemKind::Session, false, Some(&SessionStatus::Idle));
         assert_eq!(icon, "◆");
         assert_eq!(color, Color::Magenta);
     }
@@ -316,14 +290,8 @@ mod tests {
 
     #[test]
     fn change_request_status_icon_all() {
-        assert_eq!(
-            change_request_status_icon(&ChangeRequestStatus::Merged),
-            "✓"
-        );
-        assert_eq!(
-            change_request_status_icon(&ChangeRequestStatus::Closed),
-            "✗"
-        );
+        assert_eq!(change_request_status_icon(&ChangeRequestStatus::Merged), "✓");
+        assert_eq!(change_request_status_icon(&ChangeRequestStatus::Closed), "✗");
         assert_eq!(change_request_status_icon(&ChangeRequestStatus::Open), "");
         assert_eq!(change_request_status_icon(&ChangeRequestStatus::Draft), "");
     }
@@ -348,16 +316,9 @@ mod tests {
         let co = Checkout {
             branch: "feat".into(),
             is_main: false,
-            trunk_ahead_behind: Some(AheadBehind {
-                ahead: 3,
-                behind: 0,
-            }),
+            trunk_ahead_behind: Some(AheadBehind { ahead: 3, behind: 0 }),
             remote_ahead_behind: None,
-            working_tree: Some(WorkingTreeStatus {
-                modified: 2,
-                staged: 1,
-                untracked: 4,
-            }),
+            working_tree: Some(WorkingTreeStatus { modified: 2, staged: 1, untracked: 4 }),
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
@@ -372,11 +333,7 @@ mod tests {
             is_main: false,
             trunk_ahead_behind: None,
             remote_ahead_behind: None,
-            working_tree: Some(WorkingTreeStatus {
-                modified: 1,
-                staged: 0,
-                untracked: 0,
-            }),
+            working_tree: Some(WorkingTreeStatus { modified: 1, staged: 0, untracked: 0 }),
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
@@ -457,10 +414,7 @@ mod tests {
     fn shorten_path_nested_worktree() {
         let root = Path::new("/dev/project");
         let wt = Path::new("/dev/project/.worktrees/group/feat-auth");
-        assert_eq!(
-            shorten_path(wt, root, 40),
-            "     .worktrees/group/feat-auth"
-        );
+        assert_eq!(shorten_path(wt, root, 40), "     .worktrees/group/feat-auth");
     }
 
     #[test]
@@ -495,10 +449,7 @@ mod tests {
         // padding = len("/dev/") = 5, +2 extra = 7
         let root = Path::new("/dev/flotilla");
         let wt = Path::new("/dev/flotilla.quick-wins/.claude/worktrees/agent-abc");
-        assert_eq!(
-            shorten_path(wt, root, 60),
-            "       .claude/worktrees/agent-abc"
-        );
+        assert_eq!(shorten_path(wt, root, 60), "       .claude/worktrees/agent-abc");
     }
 
     #[test]

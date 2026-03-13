@@ -30,17 +30,7 @@ impl ChannelLabel {
     /// Extract host from a URL via simple string parsing.
     /// "https://api.example.com/v1/foo" → "api.example.com"
     pub fn http_from_url(url: &str) -> Self {
-        let host = url
-            .split("://")
-            .nth(1)
-            .unwrap_or(url)
-            .split('/')
-            .next()
-            .unwrap_or(url)
-            .split(':')
-            .next()
-            .unwrap_or(url)
-            .to_string();
+        let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url).split(':').next().unwrap_or(url).to_string();
         ChannelLabel::Http(host)
     }
 }
@@ -157,23 +147,11 @@ pub struct CommandOutput {
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run a command and return stdout on success, stderr on failure.
-    async fn run(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<String, String>;
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String>;
 
     /// Run a command and return full output regardless of exit status.
     /// `Err` only if the process could not be spawned at all.
-    async fn run_output(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<CommandOutput, String>;
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String>;
 
     /// Check if a command is available by running it.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool;
@@ -184,13 +162,7 @@ pub struct ProcessCommandRunner;
 
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
-    async fn run(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        _label: &ChannelLabel,
-    ) -> Result<String, String> {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         let output = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
@@ -205,13 +177,7 @@ impl CommandRunner for ProcessCommandRunner {
         }
     }
 
-    async fn run_output(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        _label: &ChannelLabel,
-    ) -> Result<CommandOutput, String> {
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
         let output = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
@@ -243,10 +209,8 @@ macro_rules! run {
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
         let __args = $args;
         let __cmd = $cmd;
-        let __label = $crate::providers::command_channel_label_with::<
-            { $crate::providers::REPLAY_LABELS_ENABLED },
-            _,
-        >(__cmd, __args, &$labeler);
+        let __label =
+            $crate::providers::command_channel_label_with::<{ $crate::providers::REPLAY_LABELS_ENABLED }, _>(__cmd, __args, &$labeler);
         $runner.run(__cmd, __args, $cwd, &__label).await
     }};
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
@@ -262,10 +226,8 @@ macro_rules! run_output {
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
         let __args = $args;
         let __cmd = $cmd;
-        let __label = $crate::providers::command_channel_label_with::<
-            { $crate::providers::REPLAY_LABELS_ENABLED },
-            _,
-        >(__cmd, __args, &$labeler);
+        let __label =
+            $crate::providers::command_channel_label_with::<{ $crate::providers::REPLAY_LABELS_ENABLED }, _>(__cmd, __args, &$labeler);
         $runner.run_output(__cmd, __args, $cwd, &__label).await
     }};
     ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
@@ -281,10 +243,8 @@ pub(crate) use run_output;
 macro_rules! gh_api_get {
     ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
         let __endpoint = $endpoint;
-        let __label = $crate::providers::gh_api_channel_label_with::<
-            { $crate::providers::REPLAY_LABELS_ENABLED },
-            _,
-        >("GET", __endpoint, &$labeler);
+        let __label =
+            $crate::providers::gh_api_channel_label_with::<{ $crate::providers::REPLAY_LABELS_ENABLED }, _>("GET", __endpoint, &$labeler);
         $api.get(__endpoint, $repo_root, &__label).await
     }};
     ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
@@ -299,18 +259,14 @@ pub(crate) use gh_api_get;
 macro_rules! gh_api_get_with_headers {
     ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
         let __endpoint = $endpoint;
-        let __label = $crate::providers::gh_api_channel_label_with::<
-            { $crate::providers::REPLAY_LABELS_ENABLED },
-            _,
-        >("GET", __endpoint, &$labeler);
-        $api.get_with_headers(__endpoint, $repo_root, &__label)
-            .await
+        let __label =
+            $crate::providers::gh_api_channel_label_with::<{ $crate::providers::REPLAY_LABELS_ENABLED }, _>("GET", __endpoint, &$labeler);
+        $api.get_with_headers(__endpoint, $repo_root, &__label).await
     }};
     ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
         let __endpoint = $endpoint;
         let __label = $crate::providers::gh_api_channel_label("GET", __endpoint);
-        $api.get_with_headers(__endpoint, $repo_root, &__label)
-            .await
+        $api.get_with_headers(__endpoint, $repo_root, &__label).await
     }};
 }
 pub(crate) use gh_api_get_with_headers;
@@ -319,10 +275,7 @@ pub(crate) use gh_api_get_with_headers;
 macro_rules! http_execute {
     ($http:expr, $request:expr, $labeler:expr $(,)?) => {{
         let __request = $request;
-        let __label = $crate::providers::http_channel_label_with::<
-            { $crate::providers::REPLAY_LABELS_ENABLED },
-            _,
-        >(
+        let __label = $crate::providers::http_channel_label_with::<{ $crate::providers::REPLAY_LABELS_ENABLED }, _>(
             __request.method().as_str(),
             __request.url().as_str(),
             &$labeler,
@@ -331,10 +284,7 @@ macro_rules! http_execute {
     }};
     ($http:expr, $request:expr $(,)?) => {{
         let __request = $request;
-        let __label = $crate::providers::http_channel_label(
-            __request.method().as_str(),
-            __request.url().as_str(),
-        );
+        let __label = $crate::providers::http_channel_label(__request.method().as_str(), __request.url().as_str());
         $http.execute(__request, &__label).await
     }};
 }
@@ -348,11 +298,7 @@ pub(crate) use http_execute;
 /// reqwest is built on, trivially constructable in tests).
 #[async_trait]
 pub trait HttpClient: Send + Sync {
-    async fn execute(
-        &self,
-        request: reqwest::Request,
-        label: &ChannelLabel,
-    ) -> Result<http::Response<bytes::Bytes>, String>;
+    async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String>;
 }
 
 /// Production implementation that delegates to `reqwest::Client`.
@@ -362,9 +308,7 @@ pub struct ReqwestHttpClient {
 
 impl ReqwestHttpClient {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        Self { client: reqwest::Client::new() }
     }
 }
 
@@ -376,16 +320,8 @@ impl Default for ReqwestHttpClient {
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
-    async fn execute(
-        &self,
-        request: reqwest::Request,
-        _label: &ChannelLabel,
-    ) -> Result<http::Response<bytes::Bytes>, String> {
-        let resp = self
-            .client
-            .execute(request)
-            .await
-            .map_err(|e| e.to_string())?;
+    async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+        let resp = self.client.execute(request).await.map_err(|e| e.to_string())?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let body = resp.bytes().await.map_err(|e| e.to_string())?;
@@ -405,11 +341,7 @@ pub async fn resolve_claude_path(runner: &dyn CommandRunner) -> Option<String> {
     }
     let known_paths = [dirs::home_dir().map(|h| h.join(".claude/local/claude"))];
     for path in known_paths.into_iter().flatten() {
-        if path.is_file()
-            && runner
-                .exists(path.to_str().unwrap_or(""), &["--version"])
-                .await
-        {
+        if path.is_file() && runner.exists(path.to_str().unwrap_or(""), &["--version"]).await {
             return Some(path.to_string_lossy().to_string());
         }
     }
@@ -421,9 +353,11 @@ pub mod replay;
 
 #[cfg(test)]
 pub mod testing {
-    use super::*;
-    use async_trait::async_trait;
     use std::collections::VecDeque;
+
+    use async_trait::async_trait;
+
+    use super::*;
 
     /// A mock command runner that returns canned responses in order.
     /// Each call to `run()` pops the next response from the queue.
@@ -433,46 +367,20 @@ pub mod testing {
 
     impl MockRunner {
         pub fn new(responses: Vec<Result<String, String>>) -> Self {
-            Self {
-                responses: std::sync::Mutex::new(responses.into()),
-            }
+            Self { responses: std::sync::Mutex::new(responses.into()) }
         }
     }
 
     #[async_trait]
     impl CommandRunner for MockRunner {
-        async fn run(
-            &self,
-            _cmd: &str,
-            _args: &[&str],
-            _cwd: &Path,
-            _label: &ChannelLabel,
-        ) -> Result<String, String> {
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("MockRunner: no more responses")
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.responses.lock().unwrap().pop_front().expect("MockRunner: no more responses")
         }
 
-        async fn run_output(
-            &self,
-            cmd: &str,
-            args: &[&str],
-            cwd: &Path,
-            label: &ChannelLabel,
-        ) -> Result<CommandOutput, String> {
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
             match self.run(cmd, args, cwd, label).await {
-                Ok(stdout) => Ok(CommandOutput {
-                    stdout,
-                    stderr: String::new(),
-                    success: true,
-                }),
-                Err(stderr) => Ok(CommandOutput {
-                    stdout: String::new(),
-                    stderr,
-                    success: false,
-                }),
+                Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
+                Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
             }
         }
 
@@ -484,8 +392,9 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     struct PanicLabeler;
 
@@ -540,21 +449,13 @@ mod tests {
 
     #[test]
     fn http_label_enabled_uses_labeler() {
-        let label = http_channel_label_with::<true, _>(
-            "POST",
-            "https://api.example.com/v1",
-            &TaskId("http"),
-        );
+        let label = http_channel_label_with::<true, _>("POST", "https://api.example.com/v1", &TaskId("http"));
         assert_eq!(label, ChannelLabel::Http("http".to_string()));
     }
 
     #[test]
     fn http_label_disabled_skips_labeler() {
-        let label = http_channel_label_with::<false, _>(
-            "POST",
-            "https://api.example.com/v1",
-            &PanicLabeler,
-        );
+        let label = http_channel_label_with::<false, _>("POST", "https://api.example.com/v1", &PanicLabeler);
         assert_eq!(label, ChannelLabel::Noop);
     }
 }

@@ -4,17 +4,17 @@ pub mod zellij;
 
 use std::collections::HashMap;
 
-use crate::providers::types::{Workspace, WorkspaceConfig};
-use crate::template::{self, PaneLayout, PaneTemplate, SurfaceTemplate, WorkspaceTemplate};
 use async_trait::async_trait;
+
+use crate::{
+    providers::types::{Workspace, WorkspaceConfig},
+    template::{self, PaneLayout, PaneTemplate, SurfaceTemplate, WorkspaceTemplate},
+};
 
 #[async_trait]
 pub trait WorkspaceManager: Send + Sync {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String>;
-    async fn create_workspace(
-        &self,
-        config: &WorkspaceConfig,
-    ) -> Result<(String, Workspace), String>;
+    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<(String, Workspace), String>;
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String>;
 }
 
@@ -39,11 +39,7 @@ pub(crate) fn resolve_template(config: &WorkspaceConfig) -> PaneLayout {
     } else {
         // No terminal pool — render template vars into content commands directly
         let rendered = tmpl.render(&config.template_vars);
-        let fallback: Vec<(String, String)> = rendered
-            .content
-            .iter()
-            .map(|e| (e.role.clone(), e.command.clone()))
-            .collect();
+        let fallback: Vec<(String, String)> = rendered.content.iter().map(|e| (e.role.clone(), e.command.clone())).collect();
         build_pane_layout(&rendered, &fallback)
     }
 }
@@ -58,29 +54,16 @@ fn build_pane_layout(tmpl: &WorkspaceTemplate, resolved: &[(String, String)]) ->
     // Group resolved commands by role, preserving order
     let mut role_cmds: HashMap<&str, Vec<&str>> = HashMap::new();
     for (role, cmd) in resolved {
-        role_cmds
-            .entry(role.as_str())
-            .or_default()
-            .push(cmd.as_str());
+        role_cmds.entry(role.as_str()).or_default().push(cmd.as_str());
     }
 
     let mut panes = Vec::new();
     for slot in &tmpl.layout {
         let cmds = role_cmds.get(slot.slot.as_str());
         let surfaces = if let Some(cmds) = cmds {
-            cmds.iter()
-                .map(|cmd| SurfaceTemplate {
-                    name: None,
-                    command: cmd.to_string(),
-                    active: false,
-                })
-                .collect()
+            cmds.iter().map(|cmd| SurfaceTemplate { name: None, command: cmd.to_string(), active: false }).collect()
         } else {
-            vec![SurfaceTemplate {
-                name: None,
-                command: String::new(),
-                active: false,
-            }]
+            vec![SurfaceTemplate { name: None, command: String::new(), active: false }]
         };
         panes.push(PaneTemplate {
             name: slot.slot.clone(),
@@ -103,28 +86,11 @@ mod tests {
     fn build_pane_layout_maps_layout_to_panes() {
         let tmpl = WorkspaceTemplate {
             content: vec![
-                ContentEntry {
-                    role: "shell".into(),
-                    content_type: "terminal".into(),
-                    command: "bash".into(),
-                    count: None,
-                },
-                ContentEntry {
-                    role: "agent".into(),
-                    content_type: "terminal".into(),
-                    command: "claude".into(),
-                    count: Some(2),
-                },
+                ContentEntry { role: "shell".into(), content_type: "terminal".into(), command: "bash".into(), count: None },
+                ContentEntry { role: "agent".into(), content_type: "terminal".into(), command: "claude".into(), count: Some(2) },
             ],
             layout: vec![
-                LayoutSlot {
-                    slot: "shell".into(),
-                    split: None,
-                    parent: None,
-                    overflow: None,
-                    gap: None,
-                    focus: true,
-                },
+                LayoutSlot { slot: "shell".into(), split: None, parent: None, overflow: None, gap: None, focus: true },
                 LayoutSlot {
                     slot: "agent".into(),
                     split: Some("right".into()),
@@ -165,14 +131,7 @@ mod tests {
         // Layout slot with no matching resolved commands
         let tmpl = WorkspaceTemplate {
             content: vec![],
-            layout: vec![LayoutSlot {
-                slot: "missing".into(),
-                split: None,
-                parent: None,
-                overflow: None,
-                gap: None,
-                focus: false,
-            }],
+            layout: vec![LayoutSlot { slot: "missing".into(), split: None, parent: None, overflow: None, gap: None, focus: false }],
         };
         let resolved: Vec<(String, String)> = vec![];
 

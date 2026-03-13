@@ -12,11 +12,13 @@ We are in a **no backwards compatibility** phase. Protocol types, snapshot forma
 cargo build                          # build
 cargo test                           # all tests
 cargo clippy                         # lint
+cargo +nightly fmt                   # format (nightly required for import grouping)
+cargo dylint --all -- --all-targets  # custom lints (requires cargo-dylint + dylint-link)
 cargo run -- --repo-root /path       # run with explicit repo
 cargo run                            # run, auto-detect repo from cwd
 ```
 
-Before pushing, always run `cargo fmt`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`.
+Before pushing, always run `cargo +nightly fmt`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`.
 
 In the Codex sandbox, prefer `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped.
 
@@ -100,6 +102,8 @@ Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `ChangeReques
 - **Errors**: Provider methods return `Result<T, String>`. App-level uses `color_eyre::Result`.
 - **Async**: `async-trait` for provider traits, `tokio::join!` for parallel refresh.
 - **Enums over bools**: Prefer enum variants for state (e.g. `UiMode`, `Intent`, `WorkItemKind`).
+- **Formatting**: `cargo +nightly fmt` — uses `max_width=140`, `imports_granularity="Crate"`, `group_imports="StdExternalCrate"`. See `rustfmt.toml`.
+- **Inline paths**: Prefer `use` imports over long inline `crate::`/`self::`/`super::` paths (>3 segments). Enforced by a Dylint lint (`cargo dylint --all -- --all-targets`). Config in `dylint.toml`.
 - **Imports**: std first, external crates, then `use crate::...`.
 - **Adding dependencies is fine** when they solve a real problem — don't reinvent the wheel.
 - **`expect` over `unwrap`**: Prefer `.expect("reason")` over `.unwrap()` — it avoids having to reason about whether each `unwrap` is safe.

@@ -1,7 +1,10 @@
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 
 /// Global flotilla config from ~/.config/flotilla/config.toml
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -34,10 +37,7 @@ pub struct CheckoutsConfig {
 
 impl Default for CheckoutsConfig {
     fn default() -> Self {
-        Self {
-            path: Self::default_path(),
-            provider: Self::default_provider(),
-        }
+        Self { path: Self::default_path(), provider: Self::default_provider() }
     }
 }
 
@@ -142,15 +142,12 @@ impl<'de> Deserialize<'de> for HostsConfig {
             .into_iter()
             .map(|(label, host)| {
                 let expected_host_name = host.expected_host_name.unwrap_or_else(|| label.clone());
-                (
-                    label,
-                    RemoteHostConfig {
-                        hostname: host.hostname,
-                        expected_host_name,
-                        user: host.user,
-                        daemon_socket: host.daemon_socket,
-                    },
-                )
+                (label, RemoteHostConfig {
+                    hostname: host.hostname,
+                    expected_host_name,
+                    user: host.user,
+                    daemon_socket: host.daemon_socket,
+                })
             })
             .collect();
         Ok(Self { hosts })
@@ -173,9 +170,7 @@ struct RepoConfig {
 
 /// Default flotilla config directory (used for socket path defaults etc.)
 pub fn flotilla_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/flotilla")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla")
 }
 
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
@@ -214,20 +209,12 @@ impl Default for ConfigStore {
 impl ConfigStore {
     /// Production constructor — uses ~/.config/flotilla/
     pub fn new() -> Self {
-        Self {
-            base: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("~"))
-                .join(".config/flotilla"),
-            global_config: OnceLock::new(),
-        }
+        Self { base: dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla"), global_config: OnceLock::new() }
     }
 
     /// Test constructor — uses provided base path
     pub fn with_base(base: impl Into<PathBuf>) -> Self {
-        Self {
-            base: base.into(),
-            global_config: OnceLock::new(),
-        }
+        Self { base: base.into(), global_config: OnceLock::new() }
     }
 
     /// The base config directory path.
@@ -276,9 +263,7 @@ impl ConfigStore {
         if file.exists() {
             return;
         }
-        let config = RepoConfig {
-            path: path.to_string_lossy().to_string(),
-        };
+        let config = RepoConfig { path: path.to_string_lossy().to_string() };
         if let Ok(content) = toml::to_string(&config) {
             let _ = std::fs::write(file, content);
         }
@@ -317,11 +302,7 @@ impl ConfigStore {
                     std::fs::read_to_string(&path)
                         .ok()
                         .and_then(|content| {
-                            toml::from_str(&content)
-                                .map_err(
-                                    |e| tracing::warn!(path = %path.display(), err = %e, "failed to parse"),
-                                )
-                                .ok()
+                            toml::from_str(&content).map_err(|e| tracing::warn!(path = %path.display(), err = %e, "failed to parse")).ok()
                         })
                         .unwrap_or_default()
                 })
@@ -363,10 +344,8 @@ impl ConfigStore {
     pub fn load_hosts(&self) -> Result<HostsConfig, String> {
         let path = self.base_path().join("hosts.toml");
         if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-            toml::from_str(&content)
-                .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+            let content = std::fs::read_to_string(&path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+            toml::from_str(&content).map_err(|err| format!("failed to parse {}: {err}", path.display()))
         } else {
             Ok(HostsConfig::default())
         }
@@ -393,14 +372,8 @@ impl ConfigStore {
                 Ok(repo_cfg) => {
                     let repo_co = &repo_cfg.vcs.git.checkouts;
                     return CheckoutsConfig {
-                        path: repo_co
-                            .path
-                            .clone()
-                            .unwrap_or_else(|| global.vcs.git.checkouts.path.clone()),
-                        provider: repo_co
-                            .provider
-                            .clone()
-                            .unwrap_or_else(|| global.vcs.git.checkouts.provider.clone()),
+                        path: repo_co.path.clone().unwrap_or_else(|| global.vcs.git.checkouts.path.clone()),
+                        provider: repo_co.provider.clone().unwrap_or_else(|| global.vcs.git.checkouts.provider.clone()),
                     };
                 }
                 Err(e) => {
@@ -415,9 +388,10 @@ impl ConfigStore {
 /// Collect repo roots: persisted (in saved tab order) first, then CLI args, then auto-detect from cwd.
 /// Persists any new repos and saves tab order.
 pub fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBuf> {
-    use crate::providers::vcs::git::GitVcs;
-    use crate::providers::vcs::Vcs;
-    use crate::providers::ProcessCommandRunner;
+    use crate::providers::{
+        vcs::{git::GitVcs, Vcs},
+        ProcessCommandRunner,
+    };
 
     let mut repo_roots: Vec<PathBuf> = Vec::new();
 
@@ -470,8 +444,9 @@ pub fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<Pa
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     fn make_dir(base: &Path, name: &str) -> PathBuf {
         let path = base.join(name);
@@ -497,11 +472,7 @@ mod tests {
             (".", "."),
         ];
         for (input, expected) in cases {
-            assert_eq!(
-                path_to_slug(Path::new(input)),
-                expected,
-                "unexpected slug for input: {input}"
-            );
+            assert_eq!(path_to_slug(Path::new(input)), expected, "unexpected slug for input: {input}");
         }
     }
 
@@ -596,29 +567,20 @@ mod tests {
         let root = tempdir().unwrap();
 
         let missing_store = ConfigStore::with_base(root.path().join("missing"));
-        assert_eq!(
-            missing_store.load_config().vcs.git.checkouts.provider,
-            "auto"
-        );
+        assert_eq!(missing_store.load_config().vcs.git.checkouts.provider, "auto");
 
         let invalid_base = root.path().join("invalid");
         std::fs::create_dir_all(&invalid_base).unwrap();
         std::fs::write(invalid_base.join("config.toml"), "this is not valid {{toml").unwrap();
         let invalid_store = ConfigStore::with_base(&invalid_base);
-        assert_eq!(
-            invalid_store.load_config().vcs.git.checkouts.provider,
-            "auto"
-        );
+        assert_eq!(invalid_store.load_config().vcs.git.checkouts.provider, "auto");
     }
 
     #[test]
     fn load_config_parses_full_overrides() {
         let dir = tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[vcs.git.checkouts]\npath = \"/custom/{{ branch }}\"\nprovider = \"worktree\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[vcs.git.checkouts]\npath = \"/custom/{{ branch }}\"\nprovider = \"worktree\"\n")
+            .unwrap();
         let store = ConfigStore::with_base(dir.path());
         let cfg = store.load_config();
         assert_eq!(cfg.vcs.git.checkouts.path, "/custom/{{ branch }}");
@@ -628,11 +590,7 @@ mod tests {
     #[test]
     fn load_config_partial_override_keeps_defaults() {
         let dir = tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[vcs.git.checkouts]\nprovider = \"worktree\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[vcs.git.checkouts]\nprovider = \"worktree\"\n").unwrap();
         let store = ConfigStore::with_base(dir.path());
         let cfg = store.load_config();
         assert_eq!(cfg.vcs.git.checkouts.provider, "worktree");
@@ -642,11 +600,7 @@ mod tests {
     #[test]
     fn load_config_parses_layout() {
         let dir = tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[ui.preview]\nlayout = \"zoom\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[ui.preview]\nlayout = \"zoom\"\n").unwrap();
 
         let store = ConfigStore::with_base(dir.path());
         let cfg = store.load_config();
@@ -656,11 +610,7 @@ mod tests {
     #[test]
     fn save_layout_writes_global_config() {
         let dir = tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[vcs.git.checkouts]\nprovider = \"worktree\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[vcs.git.checkouts]\nprovider = \"worktree\"\n").unwrap();
 
         let store = ConfigStore::with_base(dir.path());
         store.save_layout(RepoViewLayoutConfig::Right);
@@ -676,10 +626,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = ConfigStore::with_base(dir.path());
 
-        assert_eq!(
-            store.load_config().ui.preview.layout,
-            RepoViewLayoutConfig::Auto
-        );
+        assert_eq!(store.load_config().ui.preview.layout, RepoViewLayoutConfig::Auto);
 
         store.save_layout(RepoViewLayoutConfig::Below);
 
@@ -691,20 +638,12 @@ mod tests {
     fn load_config_is_cached() {
         let dir = tempdir().unwrap();
         let base = dir.path();
-        std::fs::write(
-            base.join("config.toml"),
-            "[vcs.git.checkouts]\nprovider = \"first\"\n",
-        )
-        .unwrap();
+        std::fs::write(base.join("config.toml"), "[vcs.git.checkouts]\nprovider = \"first\"\n").unwrap();
 
         let store = ConfigStore::with_base(base);
         assert_eq!(store.load_config().vcs.git.checkouts.provider, "first");
 
-        std::fs::write(
-            base.join("config.toml"),
-            "[vcs.git.checkouts]\nprovider = \"second\"\n",
-        )
-        .unwrap();
+        std::fs::write(base.join("config.toml"), "[vcs.git.checkouts]\nprovider = \"second\"\n").unwrap();
         assert_eq!(store.load_config().vcs.git.checkouts.provider, "first");
     }
 
@@ -712,11 +651,7 @@ mod tests {
     fn resolve_checkouts_config_uses_global_when_repo_file_missing_or_invalid() {
         let dir = tempdir().unwrap();
         let base = dir.path();
-        std::fs::write(
-            base.join("config.toml"),
-            "[vcs.git.checkouts]\npath = \"/global/path\"\nprovider = \"global-prov\"\n",
-        )
-        .unwrap();
+        std::fs::write(base.join("config.toml"), "[vcs.git.checkouts]\npath = \"/global/path\"\nprovider = \"global-prov\"\n").unwrap();
 
         let repo = make_dir(base, "repo");
         let store = ConfigStore::with_base(base);
@@ -736,32 +671,16 @@ mod tests {
     fn resolve_checkouts_config_repo_override_merges_with_global() {
         let dir = tempdir().unwrap();
         let base = dir.path();
-        std::fs::write(
-            base.join("config.toml"),
-            "[vcs.git.checkouts]\npath = \"/global/path\"\nprovider = \"global-prov\"\n",
-        )
-        .unwrap();
+        std::fs::write(base.join("config.toml"), "[vcs.git.checkouts]\npath = \"/global/path\"\nprovider = \"global-prov\"\n").unwrap();
 
         let repo = make_dir(base, "repo");
         let store = ConfigStore::with_base(base);
         let slug = path_to_slug(&repo);
 
         let cases = [
-            (
-                "[vcs.git.checkouts]\npath = \"/repo/path\"\nprovider = \"repo-prov\"\n",
-                "/repo/path",
-                "repo-prov",
-            ),
-            (
-                "[vcs.git.checkouts]\npath = \"/repo/path-only\"\n",
-                "/repo/path-only",
-                "global-prov",
-            ),
-            (
-                "[vcs.git.checkouts]\nprovider = \"repo-only\"\n",
-                "/global/path",
-                "repo-only",
-            ),
+            ("[vcs.git.checkouts]\npath = \"/repo/path\"\nprovider = \"repo-prov\"\n", "/repo/path", "repo-prov"),
+            ("[vcs.git.checkouts]\npath = \"/repo/path-only\"\n", "/repo/path-only", "global-prov"),
+            ("[vcs.git.checkouts]\nprovider = \"repo-only\"\n", "/global/path", "repo-only"),
         ];
 
         for (override_toml, expected_path, expected_provider) in cases {
@@ -777,10 +696,7 @@ mod tests {
     #[test]
     fn defaults_have_expected_values_and_base_path_roundtrips() {
         let checkouts = CheckoutsConfig::default();
-        assert_eq!(
-            checkouts.path,
-            "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}"
-        );
+        assert_eq!(checkouts.path, "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}");
         assert_eq!(checkouts.provider, "auto");
 
         let repo_override = RepoCheckoutsOverride::default();
@@ -880,9 +796,7 @@ host_name = "my-desktop"
         )
         .unwrap();
         let store = ConfigStore::with_base(base);
-        let err = store
-            .load_hosts()
-            .expect_err("invalid hosts config should error");
+        let err = store.load_hosts().expect_err("invalid hosts config should error");
         assert!(err.contains("failed to parse"));
     }
 
@@ -899,11 +813,7 @@ host_name = "my-desktop"
     fn load_daemon_config_from_file() {
         let dir = tempdir().unwrap();
         let base = dir.path();
-        std::fs::write(
-            base.join("daemon.toml"),
-            "follower = true\nhost_name = \"my-host\"\n",
-        )
-        .unwrap();
+        std::fs::write(base.join("daemon.toml"), "follower = true\nhost_name = \"my-host\"\n").unwrap();
         let store = ConfigStore::with_base(base);
         let config = store.load_daemon_config();
         assert!(config.follower);

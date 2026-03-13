@@ -1,12 +1,14 @@
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
-use super::github_api::{GhApi, GhApiResponse};
 use super::{
+    github_api::{GhApi, GhApiResponse},
     ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler,
 };
 
@@ -65,16 +67,11 @@ impl Interaction {
             Interaction::Command { label: Some(l), .. } => ChannelLabel::Command(l.clone()),
             Interaction::Command { cmd, args, .. } => {
                 let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                let request = ChannelRequest::Command {
-                    cmd,
-                    args: &args_refs,
-                };
+                let request = ChannelRequest::Command { cmd, args: &args_refs };
                 DefaultLabeler.label_for(&request)
             }
             Interaction::GhApi { label: Some(l), .. } => ChannelLabel::GhApi(l.clone()),
-            Interaction::GhApi {
-                method, endpoint, ..
-            } => {
+            Interaction::GhApi { method, endpoint, .. } => {
                 let request = ChannelRequest::GhApi { method, endpoint };
                 DefaultLabeler.label_for(&request)
             }
@@ -124,16 +121,10 @@ fn load_rounds_from_str(yaml: &str) -> Vec<Round> {
     // If present, parse as RoundLog and propagate errors directly
     // (don't fall through to flat format, which gives misleading errors).
     if yaml.trim_start().starts_with("rounds:") {
-        let round_log: RoundLog = serde_yml::from_str(yaml)
-            .unwrap_or_else(|e| panic!("Failed to parse multi-round fixture YAML: {e}"));
-        return round_log
-            .rounds
-            .into_iter()
-            .map(|log| Round::from_interactions(log.interactions))
-            .collect();
+        let round_log: RoundLog = serde_yml::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse multi-round fixture YAML: {e}"));
+        return round_log.rounds.into_iter().map(|log| Round::from_interactions(log.interactions)).collect();
     }
-    let log: InteractionLog =
-        serde_yml::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse fixture YAML: {e}"));
+    let log: InteractionLog = serde_yml::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse fixture YAML: {e}"));
     vec![Round::from_interactions(log.interactions)]
 }
 
@@ -152,8 +143,7 @@ impl Masks {
     /// More specific (longer) values must be added before shorter prefixes
     /// to avoid partial replacement during masking.
     pub fn add(&mut self, concrete: impl Into<String>, placeholder: impl Into<String>) {
-        self.substitutions
-            .push((concrete.into(), placeholder.into()));
+        self.substitutions.push((concrete.into(), placeholder.into()));
     }
 
     /// Apply masks: replace concrete values with placeholders (for recording).
@@ -189,20 +179,15 @@ struct ReplayerInner {
 impl Replayer {
     /// Load a replayer from a YAML fixture file.
     pub fn from_file(path: impl AsRef<Path>, masks: Masks) -> Self {
-        let content = std::fs::read_to_string(path.as_ref())
-            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", path.as_ref().display()));
+        let content =
+            std::fs::read_to_string(path.as_ref()).unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", path.as_ref().display()));
         Self::from_str(&content, masks)
     }
 
     /// Load a replayer from an inline YAML string.
     pub fn from_str(yaml: &str, masks: Masks) -> Self {
         let rounds = load_rounds_from_str(yaml);
-        Self {
-            inner: Arc::new(Mutex::new(ReplayerInner {
-                rounds: rounds.into(),
-                masks,
-            })),
-        }
+        Self { inner: Arc::new(Mutex::new(ReplayerInner { rounds: rounds.into(), masks })) }
     }
 
     /// Consume the next interaction matching the given channel label from the current round.
@@ -210,10 +195,7 @@ impl Replayer {
     /// Panics if no matching interaction is found in the current round.
     pub(crate) fn next(&self, label: &ChannelLabel) -> Interaction {
         let mut inner = self.inner.lock().expect("replayer lock poisoned");
-        let round = inner
-            .rounds
-            .front_mut()
-            .expect("Replayer: no more rounds — all interactions consumed");
+        let round = inner.rounds.front_mut().expect("Replayer: no more rounds — all interactions consumed");
         if !round.queues.contains_key(label) {
             panic!(
                 "Replayer: no queue for channel {:?} in current round (available: {:?})",
@@ -221,16 +203,8 @@ impl Replayer {
                 round.queues.keys().collect::<Vec<_>>()
             );
         }
-        let queue = round
-            .queues
-            .get_mut(label)
-            .expect("Replayer: channel verified present");
-        let interaction = queue.pop_front().unwrap_or_else(|| {
-            panic!(
-                "Replayer: channel {:?} queue is empty in current round",
-                label
-            )
-        });
+        let queue = round.queues.get_mut(label).expect("Replayer: channel verified present");
+        let interaction = queue.pop_front().unwrap_or_else(|| panic!("Replayer: channel {:?} queue is empty in current round", label));
         // Remove queue if drained
         if queue.is_empty() {
             round.queues.remove(label);
@@ -248,16 +222,8 @@ impl Replayer {
     pub fn assert_complete(&self) {
         let inner = self.inner.lock().expect("replayer lock poisoned");
         if let Some(round) = inner.rounds.front() {
-            let remaining: Vec<_> = round
-                .queues
-                .iter()
-                .map(|(label, q)| format!("{label:?} ({} remaining)", q.len()))
-                .collect();
-            panic!(
-                "Replayer: {} round(s) with unconsumed interactions: {}",
-                inner.rounds.len(),
-                remaining.join(", ")
-            );
+            let remaining: Vec<_> = round.queues.iter().map(|(label, q)| format!("{label:?} ({} remaining)", q.len())).collect();
+            panic!("Replayer: {} round(s) with unconsumed interactions: {}", inner.rounds.len(), remaining.join(", "));
         }
     }
 }
@@ -319,24 +285,14 @@ impl Recorder {
             round.sort_by_key(|a| a.channel_label());
         }
 
-        let round_log = RoundLog {
-            rounds: inner
-                .rounds
-                .iter()
-                .map(|interactions| InteractionLog {
-                    interactions: interactions.clone(),
-                })
-                .collect(),
-        };
+        let round_log =
+            RoundLog { rounds: inner.rounds.iter().map(|interactions| InteractionLog { interactions: interactions.clone() }).collect() };
 
-        let yaml =
-            serde_yml::to_string(&round_log).expect("Failed to serialize recorded interactions");
+        let yaml = serde_yml::to_string(&round_log).expect("Failed to serialize recorded interactions");
         if let Some(parent) = inner.file_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(&inner.file_path, yaml).unwrap_or_else(|e| {
-            panic!("Failed to write fixture {}: {e}", inner.file_path.display())
-        });
+        std::fs::write(&inner.file_path, yaml).unwrap_or_else(|e| panic!("Failed to write fixture {}: {e}", inner.file_path.display()));
     }
 }
 
@@ -431,10 +387,7 @@ pub fn test_session(fixture_path: &str, masks: Masks) -> Session {
 /// In replay mode: returns a `ReplayRunner`.
 pub fn test_runner(session: &Session) -> Arc<dyn CommandRunner> {
     if session.is_recording() {
-        Arc::new(RecordingRunner::new(
-            session.clone(),
-            Arc::new(super::ProcessCommandRunner),
-        ))
+        Arc::new(RecordingRunner::new(session.clone(), Arc::new(super::ProcessCommandRunner)))
     } else {
         Arc::new(ReplayRunner::new(session.clone()))
     }
@@ -453,38 +406,18 @@ impl ReplayRunner {
 
 #[async_trait]
 impl CommandRunner for ReplayRunner {
-    async fn run(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<String, String> {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let interaction = self.session.next(label);
-        let Interaction::Command {
-            cmd: expected_cmd,
-            args: expected_args,
-            cwd: expected_cwd,
-            stdout,
-            stderr,
-            exit_code,
-            ..
-        } = interaction
+        let Interaction::Command { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, stdout, stderr, exit_code, .. } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
         };
 
         assert_eq!(cmd, expected_cmd, "ReplayRunner: command mismatch");
         let actual_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        assert_eq!(
-            actual_args, expected_args,
-            "ReplayRunner: args mismatch for '{cmd}'"
-        );
+        assert_eq!(actual_args, expected_args, "ReplayRunner: args mismatch for '{cmd}'");
         let actual_cwd = cwd.to_string_lossy();
-        assert_eq!(
-            actual_cwd, expected_cwd,
-            "ReplayRunner: cwd mismatch for '{cmd}'"
-        );
+        assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
 
         if exit_code == 0 {
             Ok(stdout.unwrap_or_default())
@@ -493,44 +426,20 @@ impl CommandRunner for ReplayRunner {
         }
     }
 
-    async fn run_output(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<CommandOutput, String> {
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let interaction = self.session.next(label);
-        let Interaction::Command {
-            cmd: expected_cmd,
-            args: expected_args,
-            cwd: expected_cwd,
-            stdout,
-            stderr,
-            exit_code,
-            ..
-        } = interaction
+        let Interaction::Command { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, stdout, stderr, exit_code, .. } = interaction
         else {
             panic!("ReplayRunner: expected command interaction");
         };
 
         assert_eq!(cmd, expected_cmd, "ReplayRunner: command mismatch");
         let actual_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        assert_eq!(
-            actual_args, expected_args,
-            "ReplayRunner: args mismatch for '{cmd}'"
-        );
+        assert_eq!(actual_args, expected_args, "ReplayRunner: args mismatch for '{cmd}'");
         let actual_cwd = cwd.to_string_lossy();
-        assert_eq!(
-            actual_cwd, expected_cwd,
-            "ReplayRunner: cwd mismatch for '{cmd}'"
-        );
+        assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
 
-        Ok(CommandOutput {
-            stdout: stdout.unwrap_or_default(),
-            stderr: stderr.unwrap_or_default(),
-            success: exit_code == 0,
-        })
+        Ok(CommandOutput { stdout: stdout.unwrap_or_default(), stderr: stderr.unwrap_or_default(), success: exit_code == 0 })
     }
 
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
@@ -563,11 +472,7 @@ impl ReplayHttpClient {
 
 #[async_trait]
 impl super::HttpClient for ReplayHttpClient {
-    async fn execute(
-        &self,
-        request: reqwest::Request,
-        label: &ChannelLabel,
-    ) -> Result<http::Response<bytes::Bytes>, String> {
+    async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
         let interaction = self.session.next(label);
         let Interaction::Http {
             method: expected_method,
@@ -584,42 +489,19 @@ impl super::HttpClient for ReplayHttpClient {
         };
 
         // Validate request matches fixture
-        assert_eq!(
-            request.method().as_str(),
-            expected_method,
-            "ReplayHttpClient: method mismatch for URL '{}'",
-            request.url()
-        );
-        assert_eq!(
-            request.url().as_str(),
-            expected_url,
-            "ReplayHttpClient: URL mismatch"
-        );
+        assert_eq!(request.method().as_str(), expected_method, "ReplayHttpClient: method mismatch for URL '{}'", request.url());
+        assert_eq!(request.url().as_str(), expected_url, "ReplayHttpClient: URL mismatch");
 
         // Validate headers the fixture cares about (subset matching)
         for (key, expected_value) in &expected_headers {
-            let actual = request
-                .headers()
-                .get(key)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            assert_eq!(
-                actual, expected_value,
-                "ReplayHttpClient: header '{key}' mismatch for '{expected_method} {expected_url}'"
-            );
+            let actual = request.headers().get(key).and_then(|v| v.to_str().ok()).unwrap_or("");
+            assert_eq!(actual, expected_value, "ReplayHttpClient: header '{key}' mismatch for '{expected_method} {expected_url}'");
         }
 
         // Validate body if fixture specifies one
         if let Some(ref expected) = expected_body {
-            let actual_body = request
-                .body()
-                .and_then(|b| b.as_bytes())
-                .map(|b| String::from_utf8_lossy(b).to_string())
-                .unwrap_or_default();
-            assert_eq!(
-                actual_body, *expected,
-                "ReplayHttpClient: body mismatch for '{expected_method} {expected_url}'"
-            );
+            let actual_body = request.body().and_then(|b| b.as_bytes()).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+            assert_eq!(actual_body, *expected, "ReplayHttpClient: body mismatch for '{expected_method} {expected_url}'");
         }
 
         // Build response from fixture data
@@ -627,35 +509,19 @@ impl super::HttpClient for ReplayHttpClient {
         for (key, value) in &response_headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
-        builder
-            .body(bytes::Bytes::from(response_body))
-            .map_err(|e| e.to_string())
+        builder.body(bytes::Bytes::from(response_body)).map_err(|e| e.to_string())
     }
 }
 
 #[async_trait]
 impl GhApi for ReplayGhApi {
-    async fn get(
-        &self,
-        endpoint: &str,
-        _repo_root: &Path,
-        label: &ChannelLabel,
-    ) -> Result<String, String> {
+    async fn get(&self, endpoint: &str, _repo_root: &Path, label: &ChannelLabel) -> Result<String, String> {
         let interaction = self.session.next(label);
-        let Interaction::GhApi {
-            endpoint: expected_endpoint,
-            status,
-            body,
-            ..
-        } = interaction
-        else {
+        let Interaction::GhApi { endpoint: expected_endpoint, status, body, .. } = interaction else {
             panic!("ReplayGhApi: expected gh_api interaction");
         };
 
-        assert_eq!(
-            endpoint, expected_endpoint,
-            "ReplayGhApi: endpoint mismatch"
-        );
+        assert_eq!(endpoint, expected_endpoint, "ReplayGhApi: endpoint mismatch");
 
         if (200..300).contains(&status) {
             Ok(body)
@@ -664,46 +530,20 @@ impl GhApi for ReplayGhApi {
         }
     }
 
-    async fn get_with_headers(
-        &self,
-        endpoint: &str,
-        _repo_root: &Path,
-        label: &ChannelLabel,
-    ) -> Result<GhApiResponse, String> {
+    async fn get_with_headers(&self, endpoint: &str, _repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String> {
         let interaction = self.session.next(label);
-        let Interaction::GhApi {
-            endpoint: expected_endpoint,
-            status,
-            body,
-            headers,
-            ..
-        } = interaction
-        else {
+        let Interaction::GhApi { endpoint: expected_endpoint, status, body, headers, .. } = interaction else {
             panic!("ReplayGhApi: expected gh_api interaction");
         };
 
-        assert_eq!(
-            endpoint, expected_endpoint,
-            "ReplayGhApi: endpoint mismatch"
-        );
+        assert_eq!(endpoint, expected_endpoint, "ReplayGhApi: endpoint mismatch");
 
         let etag = headers.get("etag").cloned();
-        let has_next_page = headers
-            .get("has_next_page")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let total_count = headers
-            .get("total_count")
-            .and_then(|v| v.parse::<u32>().ok());
+        let has_next_page = headers.get("has_next_page").map(|v| v == "true").unwrap_or(false);
+        let total_count = headers.get("total_count").and_then(|v| v.parse::<u32>().ok());
 
         if (200..300).contains(&status) || status == 304 {
-            Ok(GhApiResponse {
-                status,
-                etag,
-                body,
-                has_next_page,
-                total_count,
-            })
+            Ok(GhApiResponse { status, etag, body, has_next_page, total_count })
         } else {
             Err(format!("HTTP {status}: {body}"))
         }
@@ -728,15 +568,7 @@ fn explicit_label(label: &ChannelLabel, default: &ChannelLabel) -> Option<String
 
 fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
-        Interaction::Command {
-            label,
-            cmd,
-            args,
-            cwd,
-            stdout,
-            stderr,
-            exit_code,
-        } => Interaction::Command {
+        Interaction::Command { label, cmd, args, cwd, stdout, stderr, exit_code } => Interaction::Command {
             label: label.clone(),
             cmd: masks.unmask(cmd),
             args: args.iter().map(|a| masks.unmask(a)).collect(),
@@ -745,49 +577,26 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stderr: stderr.as_ref().map(|s| masks.unmask(s)),
             exit_code: *exit_code,
         },
-        Interaction::GhApi {
-            label,
-            method,
-            endpoint,
-            status,
-            body,
-            headers,
-        } => Interaction::GhApi {
+        Interaction::GhApi { label, method, endpoint, status, body, headers } => Interaction::GhApi {
             label: label.clone(),
             method: method.clone(),
             endpoint: masks.unmask(endpoint),
             status: *status,
             body: masks.unmask(body),
-            headers: headers
-                .iter()
-                .map(|(k, v)| (k.clone(), masks.unmask(v)))
-                .collect(),
+            headers: headers.iter().map(|(k, v)| (k.clone(), masks.unmask(v))).collect(),
         },
-        Interaction::Http {
-            label,
-            method,
-            url,
-            request_headers,
-            request_body,
-            status,
-            response_body,
-            response_headers,
-        } => Interaction::Http {
-            label: label.clone(),
-            method: method.clone(),
-            url: masks.unmask(url),
-            request_headers: request_headers
-                .iter()
-                .map(|(k, v)| (k.clone(), masks.unmask(v)))
-                .collect(),
-            request_body: request_body.as_ref().map(|s| masks.unmask(s)),
-            status: *status,
-            response_body: masks.unmask(response_body),
-            response_headers: response_headers
-                .iter()
-                .map(|(k, v)| (k.clone(), masks.unmask(v)))
-                .collect(),
-        },
+        Interaction::Http { label, method, url, request_headers, request_body, status, response_body, response_headers } => {
+            Interaction::Http {
+                label: label.clone(),
+                method: method.clone(),
+                url: masks.unmask(url),
+                request_headers: request_headers.iter().map(|(k, v)| (k.clone(), masks.unmask(v))).collect(),
+                request_body: request_body.as_ref().map(|s| masks.unmask(s)),
+                status: *status,
+                response_body: masks.unmask(response_body),
+                response_headers: response_headers.iter().map(|(k, v)| (k.clone(), masks.unmask(v))).collect(),
+            }
+        }
     }
 }
 
@@ -805,13 +614,7 @@ impl RecordingRunner {
 
 #[async_trait]
 impl CommandRunner for RecordingRunner {
-    async fn run(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<String, String> {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let result = self.inner.run(cmd, args, cwd, label).await;
 
         let request = ChannelRequest::Command { cmd, args };
@@ -836,13 +639,7 @@ impl CommandRunner for RecordingRunner {
         result
     }
 
-    async fn run_output(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<CommandOutput, String> {
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let result = self.inner.run_output(cmd, args, cwd, label).await;
 
         let request = ChannelRequest::Command { cmd, args };
@@ -899,18 +696,10 @@ impl RecordingGhApi {
 
 #[async_trait]
 impl GhApi for RecordingGhApi {
-    async fn get(
-        &self,
-        endpoint: &str,
-        repo_root: &Path,
-        label: &ChannelLabel,
-    ) -> Result<String, String> {
+    async fn get(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<String, String> {
         let result = self.inner.get(endpoint, repo_root, label).await;
 
-        let request = ChannelRequest::GhApi {
-            method: "GET",
-            endpoint,
-        };
+        let request = ChannelRequest::GhApi { method: "GET", endpoint };
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
@@ -940,21 +729,10 @@ impl GhApi for RecordingGhApi {
         result
     }
 
-    async fn get_with_headers(
-        &self,
-        endpoint: &str,
-        repo_root: &Path,
-        label: &ChannelLabel,
-    ) -> Result<GhApiResponse, String> {
-        let result = self
-            .inner
-            .get_with_headers(endpoint, repo_root, label)
-            .await;
+    async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String> {
+        let result = self.inner.get_with_headers(endpoint, repo_root, label).await;
 
-        let request = ChannelRequest::GhApi {
-            method: "GET",
-            endpoint,
-        };
+        let request = ChannelRequest::GhApi { method: "GET", endpoint };
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
@@ -1025,27 +803,14 @@ impl RecordingHttpClient {
 
 #[async_trait]
 impl super::HttpClient for RecordingHttpClient {
-    async fn execute(
-        &self,
-        request: reqwest::Request,
-        label: &ChannelLabel,
-    ) -> Result<http::Response<bytes::Bytes>, String> {
+    async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
         let method = request.method().to_string();
         let url = request.url().to_string();
-        let request_headers: HashMap<String, String> = request
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-        let request_body = request
-            .body()
-            .and_then(|b| b.as_bytes())
-            .map(|b| String::from_utf8_lossy(b).to_string());
+        let request_headers: HashMap<String, String> =
+            request.headers().iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect();
+        let request_body = request.body().and_then(|b| b.as_bytes()).map(|b| String::from_utf8_lossy(b).to_string());
 
-        let chan_request = ChannelRequest::Http {
-            method: &method,
-            url: &url,
-        };
+        let chan_request = ChannelRequest::Http { method: &method, url: &url };
         let default = DefaultLabeler.label_for(&chan_request);
         let explicit = explicit_label(label, &default);
 
@@ -1053,11 +818,8 @@ impl super::HttpClient for RecordingHttpClient {
 
         match &result {
             Ok(resp) => {
-                let response_headers: HashMap<String, String> = resp
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                    .collect();
+                let response_headers: HashMap<String, String> =
+                    resp.headers().iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect();
                 self.session.record(Interaction::Http {
                     label: explicit,
                     method,
@@ -1101,15 +863,7 @@ pub fn test_http_client(session: &Session) -> Arc<dyn super::HttpClient> {
 
 fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
-        Interaction::Command {
-            label,
-            cmd,
-            args,
-            cwd,
-            stdout,
-            stderr,
-            exit_code,
-        } => Interaction::Command {
+        Interaction::Command { label, cmd, args, cwd, stdout, stderr, exit_code } => Interaction::Command {
             label: label.clone(),
             cmd: masks.mask(cmd),
             args: args.iter().map(|a| masks.mask(a)).collect(),
@@ -1118,49 +872,26 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stderr: stderr.as_ref().map(|s| masks.mask(s)),
             exit_code: *exit_code,
         },
-        Interaction::GhApi {
-            label,
-            method,
-            endpoint,
-            status,
-            body,
-            headers,
-        } => Interaction::GhApi {
+        Interaction::GhApi { label, method, endpoint, status, body, headers } => Interaction::GhApi {
             label: label.clone(),
             method: method.clone(),
             endpoint: masks.mask(endpoint),
             status: *status,
             body: masks.mask(body),
-            headers: headers
-                .iter()
-                .map(|(k, v)| (k.clone(), masks.mask(v)))
-                .collect(),
+            headers: headers.iter().map(|(k, v)| (k.clone(), masks.mask(v))).collect(),
         },
-        Interaction::Http {
-            label,
-            method,
-            url,
-            request_headers,
-            request_body,
-            status,
-            response_body,
-            response_headers,
-        } => Interaction::Http {
-            label: label.clone(),
-            method: method.clone(),
-            url: masks.mask(url),
-            request_headers: request_headers
-                .iter()
-                .map(|(k, v)| (k.clone(), masks.mask(v)))
-                .collect(),
-            request_body: request_body.as_ref().map(|s| masks.mask(s)),
-            status: *status,
-            response_body: masks.mask(response_body),
-            response_headers: response_headers
-                .iter()
-                .map(|(k, v)| (k.clone(), masks.mask(v)))
-                .collect(),
-        },
+        Interaction::Http { label, method, url, request_headers, request_body, status, response_body, response_headers } => {
+            Interaction::Http {
+                label: label.clone(),
+                method: method.clone(),
+                url: masks.mask(url),
+                request_headers: request_headers.iter().map(|(k, v)| (k.clone(), masks.mask(v))).collect(),
+                request_body: request_body.as_ref().map(|s| masks.mask(s)),
+                status: *status,
+                response_body: masks.mask(response_body),
+                response_headers: response_headers.iter().map(|(k, v)| (k.clone(), masks.mask(v))).collect(),
+            }
+        }
     }
 }
 
@@ -1229,13 +960,9 @@ interactions:
         let session = Session::replaying(&path, masks);
         let runner = Arc::new(ReplayRunner::new(session.clone()));
 
-        use crate::providers::vcs::git::GitVcs;
-        use crate::providers::vcs::Vcs;
+        use crate::providers::vcs::{git::GitVcs, Vcs};
         let git = GitVcs::new(runner);
-        let branches = git
-            .list_local_branches(Path::new("/test/repo"))
-            .await
-            .unwrap();
+        let branches = git.list_local_branches(Path::new("/test/repo")).await.unwrap();
 
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].name, "main");
@@ -1351,9 +1078,7 @@ interactions:
 
         let endpoint = "/repos/owner/repo/issues?per_page=100";
         let label = ChannelLabel::GhApi(endpoint.to_string());
-        let result = api
-            .get_with_headers(endpoint, Path::new("/repo"), &label)
-            .await;
+        let result = api.get_with_headers(endpoint, Path::new("/repo"), &label).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status, 200);
@@ -1383,9 +1108,7 @@ interactions:
 
         let endpoint = "/repos/owner/repo/issues";
         let label = ChannelLabel::GhApi(endpoint.to_string());
-        let result = api
-            .get_with_headers(endpoint, Path::new("/repo"), &label)
-            .await;
+        let result = api.get_with_headers(endpoint, Path::new("/repo"), &label).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status, 200);
@@ -1404,10 +1127,7 @@ interactions:
 
         // Record phase: use MockRunner as the "real" backend
         {
-            let mock = Arc::new(MockRunner::new(vec![
-                Ok("hello\n".into()),
-                Err("not found".into()),
-            ]));
+            let mock = Arc::new(MockRunner::new(vec![Ok("hello\n".into()), Err("not found".into())]));
             let session = Session::recording(&fixture_path, Masks::new());
             let recorder = RecordingRunner::new(session.clone(), mock);
 
@@ -1465,10 +1185,7 @@ interactions:
             .unwrap();
 
         let label = ChannelLabel::http_from_url("https://example.test/v1/sessions");
-        let response = client
-            .execute(request, &label)
-            .await
-            .expect("replay should work");
+        let response = client.execute(request, &label).await.expect("replay should work");
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(response.body().as_ref(), br#"{"data":[]}"#);
         session.assert_complete();
@@ -1536,10 +1253,7 @@ interactions:
             exit_code: 0,
         };
         // DefaultLabeler uses subcommand: "git status"
-        assert_eq!(
-            cmd.channel_label(),
-            ChannelLabel::Command("git status".into())
-        );
+        assert_eq!(cmd.channel_label(), ChannelLabel::Command("git status".into()));
 
         let cmd_no_args = Interaction::Command {
             label: None,
@@ -1550,10 +1264,7 @@ interactions:
             stderr: None,
             exit_code: 0,
         };
-        assert_eq!(
-            cmd_no_args.channel_label(),
-            ChannelLabel::Command("git".into())
-        );
+        assert_eq!(cmd_no_args.channel_label(), ChannelLabel::Command("git".into()));
 
         let api = Interaction::GhApi {
             label: None,
@@ -1563,10 +1274,7 @@ interactions:
             body: "[]".into(),
             headers: HashMap::new(),
         };
-        assert_eq!(
-            api.channel_label(),
-            ChannelLabel::GhApi("repos/owner/repo/pulls".into())
-        );
+        assert_eq!(api.channel_label(), ChannelLabel::GhApi("repos/owner/repo/pulls".into()));
 
         let http = Interaction::Http {
             label: None,
@@ -1578,47 +1286,26 @@ interactions:
             response_body: "{}".into(),
             response_headers: HashMap::new(),
         };
-        assert_eq!(
-            http.channel_label(),
-            ChannelLabel::Http("api.claude.ai".into())
-        );
+        assert_eq!(http.channel_label(), ChannelLabel::Http("api.claude.ai".into()));
     }
 
     #[test]
     fn default_labeler_uses_subcommand() {
-        let request = ChannelRequest::Command {
-            cmd: "git",
-            args: &["branch", "--list"],
-        };
-        assert_eq!(
-            DefaultLabeler.label_for(&request),
-            ChannelLabel::Command("git branch".into())
-        );
+        let request = ChannelRequest::Command { cmd: "git", args: &["branch", "--list"] };
+        assert_eq!(DefaultLabeler.label_for(&request), ChannelLabel::Command("git branch".into()));
     }
 
     #[test]
     fn default_labeler_no_args_uses_cmd() {
-        let request = ChannelRequest::Command {
-            cmd: "git",
-            args: &[],
-        };
-        assert_eq!(
-            DefaultLabeler.label_for(&request),
-            ChannelLabel::Command("git".into())
-        );
+        let request = ChannelRequest::Command { cmd: "git", args: &[] };
+        assert_eq!(DefaultLabeler.label_for(&request), ChannelLabel::Command("git".into()));
     }
 
     #[test]
     fn task_id_overrides_label() {
         use super::super::TaskId;
-        let request = ChannelRequest::Command {
-            cmd: "git",
-            args: &["rev-list", "--left-right", "--count", "HEAD...main"],
-        };
-        assert_eq!(
-            TaskId("trunk-ab").label_for(&request),
-            ChannelLabel::Command("trunk-ab".into())
-        );
+        let request = ChannelRequest::Command { cmd: "git", args: &["rev-list", "--left-right", "--count", "HEAD...main"] };
+        assert_eq!(TaskId("trunk-ab").label_for(&request), ChannelLabel::Command("trunk-ab".into()));
     }
 
     #[test]
@@ -1640,12 +1327,8 @@ interactions:
         let rounds = load_rounds_from_str(yaml);
         assert_eq!(rounds.len(), 1);
         assert_eq!(rounds[0].queues.len(), 2);
-        assert!(rounds[0]
-            .queues
-            .contains_key(&ChannelLabel::Command("git status".into())));
-        assert!(rounds[0]
-            .queues
-            .contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
+        assert!(rounds[0].queues.contains_key(&ChannelLabel::Command("git status".into())));
+        assert!(rounds[0].queues.contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
     }
 
     #[test]
@@ -1669,13 +1352,9 @@ rounds:
         let rounds = load_rounds_from_str(yaml);
         assert_eq!(rounds.len(), 2);
         assert_eq!(rounds[0].queues.len(), 1);
-        assert!(rounds[0]
-            .queues
-            .contains_key(&ChannelLabel::Command("git status".into())));
+        assert!(rounds[0].queues.contains_key(&ChannelLabel::Command("git status".into())));
         assert_eq!(rounds[1].queues.len(), 1);
-        assert!(rounds[1]
-            .queues
-            .contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
+        assert!(rounds[1].queues.contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
     }
 
     #[test]
@@ -1902,14 +1581,8 @@ rounds:
         recorder.save();
 
         let content = std::fs::read_to_string(&path).expect("read fixture");
-        assert!(
-            content.contains("{repo}"),
-            "expected masked value in output"
-        );
-        assert!(
-            !content.contains("/Users/bob/dev/repo"),
-            "expected concrete value to be masked"
-        );
+        assert!(content.contains("{repo}"), "expected masked value in output");
+        assert!(!content.contains("/Users/bob/dev/repo"), "expected concrete value to be masked");
     }
 
     #[tokio::test]
@@ -1921,10 +1594,7 @@ rounds:
 
         // Record phase with barriers
         {
-            let mock = Arc::new(MockRunner::new(vec![
-                Ok("branch-list\n".into()),
-                Ok("status-ok\n".into()),
-            ]));
+            let mock = Arc::new(MockRunner::new(vec![Ok("branch-list\n".into()), Ok("status-ok\n".into())]));
             let session = Session::recording(&fixture_path, Masks::new());
             let runner = RecordingRunner::new(session.clone(), mock);
 
@@ -1982,29 +1652,8 @@ rounds:
 
         // Consume in REVERSE order — works because TaskId puts them on different channels
         let (remote, trunk) = tokio::join!(
-            async {
-                run!(
-                    runner,
-                    "git",
-                    &[
-                        "rev-list",
-                        "--left-right",
-                        "--count",
-                        "HEAD...origin/feature"
-                    ],
-                    cwd,
-                    TaskId("remote-ab")
-                )
-            },
-            async {
-                run!(
-                    runner,
-                    "git",
-                    &["rev-list", "--left-right", "--count", "HEAD...main"],
-                    cwd,
-                    TaskId("trunk-ab")
-                )
-            },
+            async { run!(runner, "git", &["rev-list", "--left-right", "--count", "HEAD...origin/feature"], cwd, TaskId("remote-ab")) },
+            async { run!(runner, "git", &["rev-list", "--left-right", "--count", "HEAD...main"], cwd, TaskId("trunk-ab")) },
         );
 
         assert_eq!(remote.unwrap().trim(), "0\t5");
@@ -2035,10 +1684,9 @@ rounds:
         let cwd = Path::new("/test");
 
         // Consume in reverse order — works because "git status" and "git log" are different channels
-        let (log, status) = tokio::join!(
-            async { run!(runner, "git", &["log", "-1", "--format=%h\t%s"], cwd) },
-            async { run!(runner, "git", &["status", "--porcelain"], cwd) },
-        );
+        let (log, status) = tokio::join!(async { run!(runner, "git", &["log", "-1", "--format=%h\t%s"], cwd) }, async {
+            run!(runner, "git", &["status", "--porcelain"], cwd)
+        },);
 
         assert_eq!(log.unwrap().trim(), "abc1234\tcommit msg");
         assert_eq!(status.unwrap().trim(), "M file.txt");

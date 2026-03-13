@@ -1,10 +1,11 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
-
 use flotilla_protocol::{Command, DaemonEvent, RepoInfo, Snapshot};
+use tokio::sync::broadcast;
 
 /// The boundary between daemon and client.
 /// Both InProcessDaemon and SocketDaemon implement this.
@@ -39,8 +40,5 @@ pub trait DaemonHandle: Send + Sync {
     /// - If not replayable (seq too old or unknown): returns `SnapshotFull`
     ///
     /// Repos not in `last_seen` get a `SnapshotFull`.
-    async fn replay_since(
-        &self,
-        last_seen: &HashMap<PathBuf, u64>,
-    ) -> Result<Vec<DaemonEvent>, String>;
+    async fn replay_since(&self, last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String>;
 }

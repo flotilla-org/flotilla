@@ -1,10 +1,11 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::{HostName, HostPath};
-use crate::provider_data::{Issue, ProviderData};
+use crate::{
+    host::{HostName, HostPath},
+    provider_data::{Issue, ProviderData},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryLabels {
@@ -14,16 +15,8 @@ pub struct CategoryLabels {
 }
 
 impl CategoryLabels {
-    pub fn new(
-        section: impl Into<String>,
-        noun: impl Into<String>,
-        abbr: impl Into<String>,
-    ) -> Self {
-        Self {
-            section: section.into(),
-            noun: noun.into(),
-            abbr: abbr.into(),
-        }
+    pub fn new(section: impl Into<String>, noun: impl Into<String>, abbr: impl Into<String>) -> Self {
+        Self { section: section.into(), noun: noun.into(), abbr: abbr.into() }
     }
 
     pub fn noun_capitalized(&self) -> String {
@@ -37,11 +30,7 @@ impl CategoryLabels {
 
 impl Default for CategoryLabels {
     fn default() -> Self {
-        Self {
-            section: "—".into(),
-            noun: "item".into(),
-            abbr: "".into(),
-        }
+        Self { section: "—".into(), noun: "item".into(), abbr: "".into() }
     }
 }
 
@@ -148,9 +137,7 @@ pub struct CheckoutRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::HostName;
-    use crate::provider_data::ProviderData;
-    use crate::test_helpers::assert_json_roundtrip;
+    use crate::{host::HostName, provider_data::ProviderData, test_helpers::assert_json_roundtrip};
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::new("test-host"), PathBuf::from(path))
@@ -163,44 +150,20 @@ mod tests {
         assert_eq!(defaults.noun, "item");
         assert_eq!(defaults.abbr, "");
 
-        let labels = CategoryLabels {
-            section: "Worktrees".into(),
-            noun: "worktree".into(),
-            abbr: "WT".into(),
-        };
+        let labels = CategoryLabels { section: "Worktrees".into(), noun: "worktree".into(), abbr: "WT".into() };
         assert_eq!(labels.noun_capitalized(), "Worktree");
 
-        let empty_noun = CategoryLabels {
-            section: "S".into(),
-            noun: "".into(),
-            abbr: "".into(),
-        };
+        let empty_noun = CategoryLabels { section: "S".into(), noun: "".into(), abbr: "".into() };
         assert_eq!(empty_noun.noun_capitalized(), "");
     }
 
     #[test]
     fn repo_labels_and_repo_info_roundtrip() {
         let labels = RepoLabels {
-            checkouts: CategoryLabels {
-                section: "Worktrees".into(),
-                noun: "worktree".into(),
-                abbr: "WT".into(),
-            },
-            code_review: CategoryLabels {
-                section: "Pull Requests".into(),
-                noun: "PR".into(),
-                abbr: "PR".into(),
-            },
-            issues: CategoryLabels {
-                section: "Issues".into(),
-                noun: "issue".into(),
-                abbr: "I".into(),
-            },
-            cloud_agents: CategoryLabels {
-                section: "Sessions".into(),
-                noun: "session".into(),
-                abbr: "S".into(),
-            },
+            checkouts: CategoryLabels { section: "Worktrees".into(), noun: "worktree".into(), abbr: "WT".into() },
+            code_review: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "PR".into() },
+            issues: CategoryLabels { section: "Issues".into(), noun: "issue".into(), abbr: "I".into() },
+            cloud_agents: CategoryLabels { section: "Sessions".into(), noun: "session".into(), abbr: "S".into() },
         };
         assert_json_roundtrip(&labels);
 
@@ -212,10 +175,7 @@ mod tests {
                 ("vcs".to_string(), vec!["git".to_string()]),
                 ("code_review".to_string(), vec!["github".to_string()]),
             ]),
-            provider_health: HashMap::from([(
-                "vcs".to_string(),
-                HashMap::from([("Git".to_string(), true)]),
-            )]),
+            provider_health: HashMap::from([("vcs".to_string(), HashMap::from([("Git".to_string(), true)]))]),
             loading: true,
         };
         let json = serde_json::to_string(&info).expect("serialize");
@@ -225,10 +185,7 @@ mod tests {
         assert!(decoded.loading);
         assert_eq!(decoded.provider_names.len(), 2);
         assert_eq!(decoded.provider_names["vcs"], vec!["git".to_string()]);
-        assert_eq!(
-            decoded.provider_names["code_review"],
-            vec!["github".to_string()]
-        );
+        assert_eq!(decoded.provider_names["code_review"], vec!["github".to_string()]);
         assert_eq!(decoded.provider_health.len(), 1);
         assert!(decoded.provider_health["vcs"]["Git"]);
         assert_eq!(decoded.labels.checkouts.section, "Worktrees");
@@ -267,10 +224,7 @@ mod tests {
                     host: HostName::new("test-host"),
                     branch: Some("feat-x".into()),
                     description: "Feature X".into(),
-                    checkout: Some(CheckoutRef {
-                        key: hp("/repos/project/wt"),
-                        is_main_checkout: false,
-                    }),
+                    checkout: Some(CheckoutRef { key: hp("/repos/project/wt"), is_main_checkout: false }),
                     change_request_key: None,
                     session_key: None,
                     issue_keys: vec![],
@@ -298,15 +252,8 @@ mod tests {
                 },
             ],
             providers: ProviderData::default(),
-            provider_health: HashMap::from([(
-                "vcs".to_string(),
-                HashMap::from([("Git".to_string(), true)]),
-            )]),
-            errors: vec![ProviderError {
-                category: "github".into(),
-                provider: String::new(),
-                message: "not found".into(),
-            }],
+            provider_health: HashMap::from([("vcs".to_string(), HashMap::from([("Git".to_string(), true)]))]),
+            errors: vec![ProviderError { category: "github".into(), provider: String::new(), message: "not found".into() }],
             issue_total: None,
             issue_has_more: false,
             issue_search_results: None,
@@ -345,10 +292,7 @@ mod tests {
                 host: HostName::new("test-host"),
                 branch: Some("main".into()),
                 description: "Main".into(),
-                checkout: Some(CheckoutRef {
-                    key: hp("/repos/main"),
-                    is_main_checkout: true,
-                }),
+                checkout: Some(CheckoutRef { key: hp("/repos/main"), is_main_checkout: true }),
                 change_request_key: Some("PR#1".into()),
                 session_key: Some("sess-1".into()),
                 issue_keys: vec!["I-1".into(), "I-2".into()],
@@ -414,13 +358,9 @@ mod tests {
 
     #[test]
     fn work_item_kind_and_identity_roundtrip_all_variants() {
-        for kind in [
-            WorkItemKind::Checkout,
-            WorkItemKind::Session,
-            WorkItemKind::ChangeRequest,
-            WorkItemKind::RemoteBranch,
-            WorkItemKind::Issue,
-        ] {
+        for kind in
+            [WorkItemKind::Checkout, WorkItemKind::Session, WorkItemKind::ChangeRequest, WorkItemKind::RemoteBranch, WorkItemKind::Issue]
+        {
             assert_json_roundtrip(&kind);
         }
 
@@ -438,16 +378,10 @@ mod tests {
 
     #[test]
     fn checkout_ref_roundtrip_covers_both_boolean_values() {
-        let cases = vec![
-            CheckoutRef {
-                key: hp("/repos/proj/wt-1"),
-                is_main_checkout: true,
-            },
-            CheckoutRef {
-                key: hp("/tmp/wt"),
-                is_main_checkout: false,
-            },
-        ];
+        let cases = vec![CheckoutRef { key: hp("/repos/proj/wt-1"), is_main_checkout: true }, CheckoutRef {
+            key: hp("/tmp/wt"),
+            is_main_checkout: false,
+        }];
         for case in &cases {
             let json = serde_json::to_string(case).expect("serialize");
             let decoded: CheckoutRef = serde_json::from_str(&json).expect("deserialize");

@@ -1,17 +1,14 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
-
 use flotilla_core::config::{flotilla_config_dir, RemoteHostConfig};
-use flotilla_protocol::{
-    ConfigLabel, GoodbyeReason, HostName, Message, PeerWireMessage, PROTOCOL_VERSION,
+use flotilla_protocol::{ConfigLabel, GoodbyeReason, HostName, Message, PeerWireMessage, PROTOCOL_VERSION};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
+    sync::mpsc,
 };
+use tracing::{debug, error, info, warn};
 
 use super::transport::{PeerConnectionStatus, PeerSender, PeerTransport};
 
@@ -37,24 +34,14 @@ struct ChannelPeerSender {
 #[async_trait]
 impl PeerSender for ChannelPeerSender {
     async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
-        let tx = self
-            .tx
-            .lock()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "outbound channel closed".to_string())?;
-        tx.send(msg)
-            .await
-            .map_err(|_| "outbound channel closed".to_string())
+        let tx = self.tx.lock().await.as_ref().cloned().ok_or_else(|| "outbound channel closed".to_string())?;
+        tx.send(msg).await.map_err(|_| "outbound channel closed".to_string())
     }
 
     async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
         let tx = self.tx.lock().await.take();
         if let Some(tx) = tx {
-            tx.send(PeerWireMessage::Goodbye { reason })
-                .await
-                .map_err(|_| "outbound channel closed".to_string())?;
+            tx.send(PeerWireMessage::Goodbye { reason }).await.map_err(|_| "outbound channel closed".to_string())?;
         }
         Ok(())
     }
@@ -89,18 +76,12 @@ impl SshTransport {
     ///
     /// The local forwarded socket will be placed at
     /// `~/.config/flotilla/peers/<host-name>.sock`.
-    pub fn new(
-        local_host: HostName,
-        config_label: ConfigLabel,
-        config: RemoteHostConfig,
-    ) -> Result<Self, String> {
+    pub fn new(local_host: HostName, config_label: ConfigLabel, config: RemoteHostConfig) -> Result<Self, String> {
         // Sanitise: reject host names containing path separators to prevent
         // path traversal (e.g. `../` in hosts.toml).
         let name_str = config_label.0.as_str();
         if name_str.contains('/') || name_str.contains('\\') || name_str.contains('\0') {
-            return Err(format!(
-                "peer host name must not contain path separators: {name_str:?}"
-            ));
+            return Err(format!("peer host name must not contain path separators: {name_str:?}"));
         }
         let local_socket_path = peers_dir().join(format!("{}.sock", config_label.0));
         let expected_host_name = HostName::new(&config.expected_host_name);
@@ -126,14 +107,9 @@ impl SshTransport {
 
         // Ensure peers directory exists
         let peers = peers_dir();
-        std::fs::create_dir_all(&peers)
-            .map_err(|e| format!("failed to create peers directory: {e}"))?;
+        std::fs::create_dir_all(&peers).map_err(|e| format!("failed to create peers directory: {e}"))?;
 
-        let forward_spec = format!(
-            "{}:{}",
-            self.local_socket_path.display(),
-            self.config.daemon_socket
-        );
+        let forward_spec = format!("{}:{}", self.local_socket_path.display(), self.config.daemon_socket);
 
         let destination = match &self.config.user {
             Some(user) => format!("{user}@{}", self.config.hostname),
@@ -195,10 +171,7 @@ impl SshTransport {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for forwarded socket at {}",
-                    self.local_socket_path.display()
-                ));
+                return Err(format!("timed out waiting for forwarded socket at {}", self.local_socket_path.display()));
             }
 
             tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
@@ -210,21 +183,10 @@ impl SshTransport {
     async fn connect_socket(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
         let mut stream = UnixStream::connect(&self.local_socket_path)
             .await
-            .map_err(|e| {
-                format!(
-                    "failed to connect to forwarded socket {}: {e}",
-                    self.local_socket_path.display()
-                )
-            })?;
+            .map_err(|e| format!("failed to connect to forwarded socket {}: {e}", self.local_socket_path.display()))?;
 
-        Self::write_message_line(
-            &mut stream,
-            &Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                host_name: self.local_host.clone(),
-            },
-        )
-        .await?;
+        Self::write_message_line(&mut stream, &Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: self.local_host.clone() })
+            .await?;
 
         let (read_half, write_half) = stream.into_split();
         let mut lines = BufReader::new(read_half).lines();
@@ -233,8 +195,7 @@ impl SshTransport {
             .await
             .map_err(|e| format!("failed to read peer hello: {e}"))?
             .ok_or_else(|| "peer closed before sending hello".to_string())?;
-        let hello =
-            serde_json::from_str(&line).map_err(|e| format!("failed to parse peer hello: {e}"))?;
+        let hello = serde_json::from_str(&line).map_err(|e| format!("failed to parse peer hello: {e}"))?;
         Self::validate_remote_hello(&self.expected_host_name, hello)?;
 
         // Inbound: reader task → inbound channel → subscriber
@@ -369,29 +330,18 @@ impl SshTransport {
     ///
     /// Uses capped exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, ...
     pub fn backoff_delay(attempt: u32) -> Duration {
-        let delay = INITIAL_BACKOFF
-            .checked_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
-            .unwrap_or(MAX_BACKOFF);
+        let delay = INITIAL_BACKOFF.checked_mul(2u32.saturating_pow(attempt.saturating_sub(1))).unwrap_or(MAX_BACKOFF);
         std::cmp::min(delay, MAX_BACKOFF)
     }
 
     fn validate_remote_hello(expected_host_name: &HostName, hello: Message) -> Result<(), String> {
         match hello {
-            Message::Hello {
-                protocol_version,
-                host_name,
-            } => {
+            Message::Hello { protocol_version, host_name } => {
                 if protocol_version != PROTOCOL_VERSION {
-                    return Err(format!(
-                        "peer protocol version mismatch: expected {}, got {}",
-                        PROTOCOL_VERSION, protocol_version
-                    ));
+                    return Err(format!("peer protocol version mismatch: expected {}, got {}", PROTOCOL_VERSION, protocol_version));
                 }
                 if host_name != *expected_host_name {
-                    return Err(format!(
-                        "peer host mismatch: expected {}, got {}",
-                        expected_host_name, host_name
-                    ));
+                    return Err(format!("peer host mismatch: expected {}, got {}", expected_host_name, host_name));
                 }
                 Ok(())
             }
@@ -400,20 +350,10 @@ impl SshTransport {
     }
 
     async fn write_message_line(stream: &mut UnixStream, msg: &Message) -> Result<(), String> {
-        let json = serde_json::to_string(msg)
-            .map_err(|e| format!("failed to serialize peer message: {e}"))?;
-        stream
-            .write_all(json.as_bytes())
-            .await
-            .map_err(|e| format!("failed to write peer message: {e}"))?;
-        stream
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("failed to terminate peer message: {e}"))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| format!("failed to flush peer message: {e}"))?;
+        let json = serde_json::to_string(msg).map_err(|e| format!("failed to serialize peer message: {e}"))?;
+        stream.write_all(json.as_bytes()).await.map_err(|e| format!("failed to write peer message: {e}"))?;
+        stream.write_all(b"\n").await.map_err(|e| format!("failed to terminate peer message: {e}"))?;
+        stream.flush().await.map_err(|e| format!("failed to flush peer message: {e}"))?;
         Ok(())
     }
 }
@@ -471,17 +411,13 @@ impl PeerTransport for SshTransport {
 
         // Return the receiver from connect(). This is a one-shot call —
         // the receiver is produced during connect() and consumed here.
-        self.inbound_rx
-            .take()
-            .ok_or_else(|| "already subscribed (receiver already taken)".to_string())
+        self.inbound_rx.take().ok_or_else(|| "already subscribed (receiver already taken)".to_string())
     }
 
     fn sender(&self) -> Option<Arc<dyn PeerSender>> {
-        self.outbound_tx.as_ref().map(|tx| {
-            Arc::new(ChannelPeerSender {
-                tx: tokio::sync::Mutex::new(Some(tx.clone())),
-            }) as Arc<dyn PeerSender>
-        })
+        self.outbound_tx
+            .as_ref()
+            .map(|tx| Arc::new(ChannelPeerSender { tx: tokio::sync::Mutex::new(Some(tx.clone())) }) as Arc<dyn PeerSender>)
     }
 }
 
@@ -500,8 +436,9 @@ impl Drop for SshTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use flotilla_protocol::PeerDataMessage;
+
+    use super::*;
 
     #[test]
     fn backoff_delay_exponential_with_cap() {
@@ -524,16 +461,8 @@ mod tests {
             user: Some("dev".to_string()),
             daemon_socket: "/run/user/1000/flotilla.sock".to_string(),
         };
-        let transport = SshTransport::new(
-            HostName::new("local"),
-            ConfigLabel("my-server".to_string()),
-            config,
-        )
-        .expect("valid host name");
-        assert!(transport
-            .local_socket_path
-            .to_string_lossy()
-            .ends_with("peers/my-server.sock"));
+        let transport = SshTransport::new(HostName::new("local"), ConfigLabel("my-server".to_string()), config).expect("valid host name");
+        assert!(transport.local_socket_path.to_string_lossy().ends_with("peers/my-server.sock"));
     }
 
     #[test]
@@ -544,11 +473,7 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        match SshTransport::new(
-            HostName::new("local"),
-            ConfigLabel("../evil".to_string()),
-            config,
-        ) {
+        match SshTransport::new(HostName::new("local"), ConfigLabel("../evil".to_string()), config) {
             Err(e) => assert!(e.contains("path separators"), "unexpected error: {e}"),
             Ok(_) => panic!("should reject host name with path separators"),
         }
@@ -562,32 +487,20 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        let transport = SshTransport::new(
-            HostName::new("local"),
-            ConfigLabel("remote".to_string()),
-            config,
-        )
-        .expect("valid host name");
+        let transport = SshTransport::new(HostName::new("local"), ConfigLabel("remote".to_string()), config).expect("valid host name");
         assert_eq!(transport.status(), PeerConnectionStatus::Disconnected);
     }
 
     #[test]
     fn validate_remote_hello_accepts_matching_protocol_and_host() {
-        let hello = Message::Hello {
-            protocol_version: flotilla_protocol::PROTOCOL_VERSION,
-            host_name: HostName::new("remote"),
-        };
+        let hello = Message::Hello { protocol_version: flotilla_protocol::PROTOCOL_VERSION, host_name: HostName::new("remote") };
 
-        SshTransport::validate_remote_hello(&HostName::new("remote"), hello)
-            .expect("matching hello should be accepted");
+        SshTransport::validate_remote_hello(&HostName::new("remote"), hello).expect("matching hello should be accepted");
     }
 
     #[test]
     fn validate_remote_hello_rejects_wrong_protocol_version() {
-        let hello = Message::Hello {
-            protocol_version: flotilla_protocol::PROTOCOL_VERSION + 1,
-            host_name: HostName::new("remote"),
-        };
+        let hello = Message::Hello { protocol_version: flotilla_protocol::PROTOCOL_VERSION + 1, host_name: HostName::new("remote") };
 
         let err = SshTransport::validate_remote_hello(&HostName::new("remote"), hello)
             .expect_err("unexpected protocol version should be rejected");
@@ -596,13 +509,10 @@ mod tests {
 
     #[test]
     fn validate_remote_hello_rejects_unexpected_host_name() {
-        let hello = Message::Hello {
-            protocol_version: flotilla_protocol::PROTOCOL_VERSION,
-            host_name: HostName::new("someone-else"),
-        };
+        let hello = Message::Hello { protocol_version: flotilla_protocol::PROTOCOL_VERSION, host_name: HostName::new("someone-else") };
 
-        let err = SshTransport::validate_remote_hello(&HostName::new("remote"), hello)
-            .expect_err("unexpected host name should be rejected");
+        let err =
+            SshTransport::validate_remote_hello(&HostName::new("remote"), hello).expect_err("unexpected host name should be rejected");
         assert!(err.contains("host"));
     }
 
@@ -614,16 +524,8 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        let transport = SshTransport::new(
-            HostName::new("local"),
-            ConfigLabel("remote".to_string()),
-            config,
-        )
-        .expect("valid host name");
-        assert!(
-            transport.sender().is_none(),
-            "disconnected transport should not expose a sender"
-        );
+        let transport = SshTransport::new(HostName::new("local"), ConfigLabel("remote".to_string()), config).expect("valid host name");
+        assert!(transport.sender().is_none(), "disconnected transport should not expose a sender");
     }
 
     #[tokio::test]
@@ -634,12 +536,7 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        let mut transport = SshTransport::new(
-            HostName::new("local"),
-            ConfigLabel("remote".to_string()),
-            config,
-        )
-        .expect("valid host name");
+        let mut transport = SshTransport::new(HostName::new("local"), ConfigLabel("remote".to_string()), config).expect("valid host name");
 
         let result = transport.subscribe().await;
         assert!(result.is_err());
@@ -647,10 +544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(
-        feature = "skip-no-sandbox-tests",
-        ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include"
-    )]
+    #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
     async fn connect_socket_preserves_peer_message_buffered_after_hello() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("peer.sock");
@@ -662,12 +556,7 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/daemon.sock".to_string(),
         };
-        let mut transport = SshTransport::new(
-            HostName::new("local"),
-            ConfigLabel("remote".to_string()),
-            config,
-        )
-        .expect("valid host name");
+        let mut transport = SshTransport::new(HostName::new("local"), ConfigLabel("remote".to_string()), config).expect("valid host name");
         transport.local_socket_path = socket_path.clone();
 
         let server = tokio::spawn(async move {
@@ -675,31 +564,17 @@ mod tests {
             let mut line = String::new();
             let mut reader = BufReader::new(&mut stream);
             reader.read_line(&mut line).await.expect("read hello");
-            let hello = serde_json::to_string(&Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                host_name: HostName::new("remote"),
-            })
-            .expect("serialize hello");
-            let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(
-                PeerDataMessage {
-                    origin_host: HostName::new("remote"),
-                    repo_identity: flotilla_protocol::RepoIdentity {
-                        authority: "github.com".into(),
-                        path: "owner/repo".into(),
-                    },
-                    repo_path: PathBuf::from("/home/remote/repo"),
-                    clock: flotilla_protocol::VectorClock::default(),
-                    kind: flotilla_protocol::PeerDataKind::Snapshot {
-                        data: Box::new(flotilla_protocol::ProviderData::default()),
-                        seq: 1,
-                    },
-                },
-            ))))
+            let hello = serde_json::to_string(&Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("remote") })
+                .expect("serialize hello");
+            let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
+                origin_host: HostName::new("remote"),
+                repo_identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+                repo_path: PathBuf::from("/home/remote/repo"),
+                clock: flotilla_protocol::VectorClock::default(),
+                kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(flotilla_protocol::ProviderData::default()), seq: 1 },
+            }))))
             .expect("serialize peer");
-            stream
-                .write_all(format!("{hello}\n{peer}\n").as_bytes())
-                .await
-                .expect("write hello and peer");
+            stream.write_all(format!("{hello}\n{peer}\n").as_bytes()).await.expect("write hello and peer");
         });
 
         let mut inbound = transport.connect_socket().await.expect("connect socket");
@@ -733,23 +608,13 @@ mod tests {
             user: None,
             daemon_socket: "/tmp/flotilla-test-daemon.sock".to_string(),
         };
-        let mut transport = SshTransport::new(
-            HostName::new("local-test"),
-            ConfigLabel("localhost-test".to_string()),
-            config,
-        )
-        .expect("valid host name");
+        let mut transport =
+            SshTransport::new(HostName::new("local-test"), ConfigLabel("localhost-test".to_string()), config).expect("valid host name");
 
-        transport
-            .connect()
-            .await
-            .expect("should connect to localhost daemon");
+        transport.connect().await.expect("should connect to localhost daemon");
         assert_eq!(transport.status(), PeerConnectionStatus::Connected);
 
-        transport
-            .disconnect()
-            .await
-            .expect("should disconnect cleanly");
+        transport.disconnect().await.expect("should disconnect cleanly");
         assert_eq!(transport.status(), PeerConnectionStatus::Disconnected);
     }
 }

@@ -1,10 +1,8 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use tui_input::backend::crossterm::EventHandler as InputEventHandler;
-use tui_input::Input;
-
 use flotilla_protocol::Command;
+use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{App, DirEntry, UiMode};
 
@@ -21,26 +19,17 @@ impl App {
         }
 
         let needs_refresh = {
-            let UiMode::FilePicker {
-                ref mut input,
-                ref mut dir_entries,
-                ref mut selected,
-            } = self.ui.mode
-            else {
+            let UiMode::FilePicker { ref mut input, ref mut dir_entries, ref mut selected } = self.ui.mode else {
                 return;
             };
             match key.code {
-                KeyCode::Down | KeyCode::Char('j')
-                    if key.modifiers.is_empty() || key.code == KeyCode::Down =>
-                {
+                KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() || key.code == KeyCode::Down => {
                     if !dir_entries.is_empty() {
                         *selected = (*selected + 1).min(dir_entries.len() - 1);
                     }
                     false
                 }
-                KeyCode::Up | KeyCode::Char('k')
-                    if key.modifiers.is_empty() || key.code == KeyCode::Up =>
-                {
+                KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() || key.code == KeyCode::Up => {
                     *selected = selected.saturating_sub(1);
                     false
                 }
@@ -50,10 +39,7 @@ impl App {
                         let base = if current.ends_with('/') {
                             current.clone()
                         } else {
-                            current
-                                .rsplit_once('/')
-                                .map(|(prefix, _)| format!("{prefix}/"))
-                                .unwrap_or_default()
+                            current.rsplit_once('/').map(|(prefix, _)| format!("{prefix}/")).unwrap_or_default()
                         };
                         let new_path = format!("{}{}/", base, entry.name);
                         *input = Input::from(new_path.as_str());
@@ -75,12 +61,7 @@ impl App {
 
     fn activate_dir_entry(&mut self) {
         let (entry, base) = {
-            let UiMode::FilePicker {
-                ref input,
-                ref dir_entries,
-                selected,
-            } = self.ui.mode
-            else {
+            let UiMode::FilePicker { ref input, ref dir_entries, selected } = self.ui.mode else {
                 return;
             };
             let Some(entry) = dir_entries.get(selected).cloned() else {
@@ -90,10 +71,7 @@ impl App {
             let base = if current.ends_with('/') {
                 current
             } else {
-                current
-                    .rsplit_once('/')
-                    .map(|(prefix, _)| format!("{prefix}/"))
-                    .unwrap_or_default()
+                current.rsplit_once('/').map(|(prefix, _)| format!("{prefix}/")).unwrap_or_default()
             };
             (entry, base)
         };
@@ -101,17 +79,11 @@ impl App {
         if entry.is_git_repo && !entry.is_added {
             let path = PathBuf::from(format!("{}{}", base, entry.name));
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            self.proto_commands
-                .push(Command::AddRepo { path: canonical });
+            self.proto_commands.push(Command::AddRepo { path: canonical });
             self.ui.mode = UiMode::Normal;
         } else if entry.is_dir {
             let new_path = format!("{}{}/", base, entry.name);
-            if let UiMode::FilePicker {
-                ref mut input,
-                ref mut selected,
-                ..
-            } = self.ui.mode
-            {
+            if let UiMode::FilePicker { ref mut input, ref mut selected, .. } = self.ui.mode {
                 *input = Input::from(new_path.as_str());
                 *selected = 0;
             }
@@ -133,19 +105,13 @@ impl App {
         let la = self.ui.layout.file_picker_list_area;
         if x >= la.x && x < la.x + la.width && y >= la.y && y < la.y + la.height {
             let row = (y - la.y) as usize;
-            let len = if let UiMode::FilePicker {
-                ref dir_entries, ..
-            } = self.ui.mode
-            {
+            let len = if let UiMode::FilePicker { ref dir_entries, .. } = self.ui.mode {
                 dir_entries.len()
             } else {
                 return;
             };
             if row < len {
-                if let UiMode::FilePicker {
-                    ref mut selected, ..
-                } = self.ui.mode
-                {
+                if let UiMode::FilePicker { ref mut selected, .. } = self.ui.mode {
                     *selected = row;
                 }
                 self.activate_dir_entry();
@@ -155,12 +121,7 @@ impl App {
 
     pub fn refresh_dir_listing(&mut self) {
         let Self { model, ui, .. } = self;
-        let UiMode::FilePicker {
-            ref input,
-            ref mut dir_entries,
-            ..
-        } = ui.mode
-        else {
+        let UiMode::FilePicker { ref input, ref mut dir_entries, .. } = ui.mode else {
             return;
         };
 
@@ -168,17 +129,11 @@ impl App {
         let dir = if path_str.ends_with('/') {
             PathBuf::from(&path_str)
         } else {
-            PathBuf::from(&path_str)
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_default()
+            PathBuf::from(&path_str).parent().map(|p| p.to_path_buf()).unwrap_or_default()
         };
 
         let filter = if !path_str.ends_with('/') {
-            PathBuf::from(&path_str)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_lowercase())
-                .unwrap_or_default()
+            PathBuf::from(&path_str).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
         } else {
             String::new()
         };
@@ -201,12 +156,7 @@ impl App {
                 let is_git_repo = path.join(".git").exists();
                 let canonical = std::fs::canonicalize(&path).unwrap_or(path);
                 let is_added = model.repos.contains_key(&canonical);
-                entries.push(DirEntry {
-                    name,
-                    is_dir,
-                    is_git_repo,
-                    is_added,
-                });
+                entries.push(DirEntry { name, is_dir, is_git_repo, is_added });
             }
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -216,12 +166,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::test_support::{
-        default_repo_model, dir_entry, enter_file_picker, key, stub_app,
-    };
     use flotilla_protocol::{Command, RepoLabels};
     use tui_input::Input;
+
+    use super::*;
+    use crate::app::test_support::{default_repo_model, dir_entry, enter_file_picker, key, stub_app};
 
     // ── handle_file_picker_key tests ─────────────────────────────────
 
@@ -236,10 +185,7 @@ mod tests {
     #[test]
     fn down_advances_selection() {
         let mut app = stub_app();
-        let entries = vec![
-            dir_entry("aaa", false, false),
-            dir_entry("bbb", false, false),
-        ];
+        let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
 
         app.handle_file_picker_key(key(KeyCode::Down));
@@ -254,10 +200,7 @@ mod tests {
     #[test]
     fn down_stays_at_end() {
         let mut app = stub_app();
-        let entries = vec![
-            dir_entry("aaa", false, false),
-            dir_entry("bbb", false, false),
-        ];
+        let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
 
         // Move to end
@@ -275,11 +218,7 @@ mod tests {
     #[test]
     fn up_decrements_selection() {
         let mut app = stub_app();
-        let entries = vec![
-            dir_entry("aaa", false, false),
-            dir_entry("bbb", false, false),
-            dir_entry("ccc", false, false),
-        ];
+        let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false), dir_entry("ccc", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
 
         // First move down twice, then up once
@@ -327,10 +266,7 @@ mod tests {
     #[test]
     fn tab_completes_directory_name() {
         let mut app = stub_app();
-        let entries = vec![
-            dir_entry("alpha", false, false),
-            dir_entry("bar", false, false),
-        ];
+        let entries = vec![dir_entry("alpha", false, false), dir_entry("bar", false, false)];
         app.ui.mode = UiMode::FilePicker {
             input: Input::from("foo/"),
             dir_entries: entries,
@@ -339,12 +275,7 @@ mod tests {
 
         app.handle_file_picker_key(key(KeyCode::Tab));
 
-        if let UiMode::FilePicker {
-            ref input,
-            selected,
-            ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref input, selected, .. } = app.ui.mode {
             assert_eq!(input.value(), "foo/bar/");
             assert_eq!(selected, 0);
         } else {
@@ -355,10 +286,7 @@ mod tests {
     #[test]
     fn j_advances_selection() {
         let mut app = stub_app();
-        let entries = vec![
-            dir_entry("aaa", false, false),
-            dir_entry("bbb", false, false),
-        ];
+        let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
 
         app.handle_file_picker_key(key(KeyCode::Char('j')));
@@ -373,15 +301,8 @@ mod tests {
     #[test]
     fn k_decrements_selection() {
         let mut app = stub_app();
-        let entries = vec![
-            dir_entry("aaa", false, false),
-            dir_entry("bbb", false, false),
-        ];
-        app.ui.mode = UiMode::FilePicker {
-            input: Input::from("/tmp/"),
-            dir_entries: entries,
-            selected: 1,
-        };
+        let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
+        app.ui.mode = UiMode::FilePicker { input: Input::from("/tmp/"), dir_entries: entries, selected: 1 };
 
         app.handle_file_picker_key(key(KeyCode::Char('k')));
 
@@ -403,12 +324,7 @@ mod tests {
 
         let mut app = stub_app();
         let parent_path = format!("{}/", tmp.path().to_string_lossy());
-        let entries = vec![DirEntry {
-            name: "my-repo".to_string(),
-            is_dir: true,
-            is_git_repo: true,
-            is_added: false,
-        }];
+        let entries = vec![DirEntry { name: "my-repo".to_string(), is_dir: true, is_git_repo: true, is_added: false }];
         enter_file_picker(&mut app, &parent_path, entries);
 
         app.handle_file_picker_key(key(KeyCode::Enter));
@@ -438,23 +354,13 @@ mod tests {
 
         let base = format!("{}/", tmp.path().display());
         let mut app = stub_app();
-        let entries = vec![DirEntry {
-            name: "existing-repo".to_string(),
-            is_dir: true,
-            is_git_repo: true,
-            is_added: true,
-        }];
+        let entries = vec![DirEntry { name: "existing-repo".to_string(), is_dir: true, is_git_repo: true, is_added: true }];
         enter_file_picker(&mut app, &base, entries);
 
         app.handle_file_picker_key(key(KeyCode::Enter));
 
         // It should navigate into the directory (is_dir branch)
-        if let UiMode::FilePicker {
-            ref input,
-            selected,
-            ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref input, selected, .. } = app.ui.mode {
             assert_eq!(input.value(), format!("{base}existing-repo/"));
             assert_eq!(selected, 0);
         } else {
@@ -473,12 +379,7 @@ mod tests {
 
         app.handle_file_picker_key(key(KeyCode::Enter));
 
-        if let UiMode::FilePicker {
-            ref input,
-            selected,
-            ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref input, selected, .. } = app.ui.mode {
             assert_eq!(input.value(), "/base/path/subdir/");
             assert_eq!(selected, 0);
         } else {
@@ -520,11 +421,7 @@ mod tests {
         // Path "foo/ba" means base is "foo/" (rsplit_once on '/')
         let mut app = stub_app();
         let entries = vec![dir_entry("bar", false, false)];
-        app.ui.mode = UiMode::FilePicker {
-            input: Input::from("foo/ba"),
-            dir_entries: entries,
-            selected: 0,
-        };
+        app.ui.mode = UiMode::FilePicker { input: Input::from("foo/ba"), dir_entries: entries, selected: 0 };
 
         app.handle_file_picker_key(key(KeyCode::Enter));
 
@@ -551,10 +448,7 @@ mod tests {
 
         app.refresh_dir_listing();
 
-        if let UiMode::FilePicker {
-            ref dir_entries, ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
             let names: Vec<&str> = dir_entries.iter().map(|e| e.name.as_str()).collect();
             assert!(names.contains(&"alpha"), "should contain alpha");
             assert!(names.contains(&"beta"), "should contain beta");
@@ -577,15 +471,9 @@ mod tests {
 
         app.refresh_dir_listing();
 
-        if let UiMode::FilePicker {
-            ref dir_entries, ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
             let names: Vec<&str> = dir_entries.iter().map(|e| e.name.as_str()).collect();
-            assert!(
-                !names.contains(&".hidden"),
-                "hidden dirs should be filtered"
-            );
+            assert!(!names.contains(&".hidden"), "hidden dirs should be filtered");
             assert!(names.contains(&"visible"));
             assert_eq!(dir_entries.len(), 1);
         } else {
@@ -607,16 +495,10 @@ mod tests {
 
         app.refresh_dir_listing();
 
-        if let UiMode::FilePicker {
-            ref dir_entries, ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
             let names: Vec<&str> = dir_entries.iter().map(|e| e.name.as_str()).collect();
             // Case-insensitive prefix match: both "Foo" and "foobar" match "foo"
-            assert!(
-                names.contains(&"Foo"),
-                "Foo should match (case-insensitive)"
-            );
+            assert!(names.contains(&"Foo"), "Foo should match (case-insensitive)");
             assert!(names.contains(&"foobar"), "foobar should match");
             assert!(!names.contains(&"baz"), "baz should not match prefix 'foo'");
             assert_eq!(dir_entries.len(), 2);
@@ -641,10 +523,7 @@ mod tests {
 
         app.refresh_dir_listing();
 
-        if let UiMode::FilePicker {
-            ref dir_entries, ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
             let repo_entry = dir_entries.iter().find(|e| e.name == "my-repo").unwrap();
             assert!(repo_entry.is_git_repo, "should detect .git subdir");
 
@@ -665,23 +544,15 @@ mod tests {
 
         // Add the canonical path of repo_dir to model.repos so it's "already added"
         let canonical = std::fs::canonicalize(&repo_dir).unwrap();
-        app.model
-            .repos
-            .insert(canonical, default_repo_model(RepoLabels::default()));
+        app.model.repos.insert(canonical, default_repo_model(RepoLabels::default()));
 
         let dir_path = format!("{}/", tmp.path().to_string_lossy());
         enter_file_picker(&mut app, &dir_path, vec![]);
 
         app.refresh_dir_listing();
 
-        if let UiMode::FilePicker {
-            ref dir_entries, ..
-        } = app.ui.mode
-        {
-            let entry = dir_entries
-                .iter()
-                .find(|e| e.name == "tracked-repo")
-                .unwrap();
+        if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
+            let entry = dir_entries.iter().find(|e| e.name == "tracked-repo").unwrap();
             assert!(entry.is_added, "repo in model.repos should be marked added");
         } else {
             panic!("expected FilePicker mode");
@@ -701,10 +572,7 @@ mod tests {
 
         app.refresh_dir_listing();
 
-        if let UiMode::FilePicker {
-            ref dir_entries, ..
-        } = app.ui.mode
-        {
+        if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
             let names: Vec<&str> = dir_entries.iter().map(|e| e.name.as_str()).collect();
             assert_eq!(names, vec!["alpha", "mike", "zulu"]);
         } else {

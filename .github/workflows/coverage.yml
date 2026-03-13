@@ -1,4 +1,4 @@
-name: Coverage
+name: Nightly
 
 on:
   schedule:
@@ -11,7 +11,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: coverage
+  group: nightly
   cancel-in-progress: true
 
 jobs:
@@ -35,7 +35,7 @@ jobs:
           fi
 
   coverage:
-    name: Generate report
+    name: Coverage
     needs: check-changes
     if: needs.check-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
@@ -71,23 +71,74 @@ jobs:
           fi
           printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PERCENT" "$COLOR" \
             > target/llvm-cov/html/badge.json
-      # NOTE: deploy-pages replaces the entire site. If adding more pages,
-      # refactor to merge artifacts from multiple workflows before deploying.
-      - name: Stage under coverage/
-        run: |
-          mkdir -p _site/coverage
-          cp -r target/llvm-cov/html/* _site/coverage/
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
-          path: _site/
+          name: coverage-site
+          path: target/llvm-cov/html/
+
+  dylint:
+    name: Dylint
+    needs: check-changes
+    if: needs.check-changes.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-12
+          components: llvm-tools-preview, rustc-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-dylint
+            ~/.cargo/bin/dylint-link
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-dylint-nightly-2026-03-12-${{ hashFiles('lints/**/Cargo.lock', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dylint-nightly-2026-03-12-
+      - name: Install cargo-dylint
+        run: |
+          command -v cargo-dylint && command -v dylint-link || cargo install cargo-dylint dylint-link --locked
+      - run: cargo dylint --all -- --all-targets
+      - name: Write badge JSON
+        if: always()
+        run: |
+          mkdir -p _badges
+          if [ "${{ job.status }}" = "success" ]; then
+            printf '{"schemaVersion":1,"label":"dylint","message":"passing","color":"brightgreen"}\n' > _badges/dylint.json
+          else
+            printf '{"schemaVersion":1,"label":"dylint","message":"failing","color":"red"}\n' > _badges/dylint.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dylint-badge
+          path: _badges/
 
   deploy:
     name: Deploy to Pages
-    needs: coverage
+    needs: [coverage, dylint]
+    if: always() && needs.coverage.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-site
+          path: _site/coverage/
+      - uses: actions/download-artifact@v4
+        if: needs.dylint.result == 'success' || needs.dylint.result == 'failure'
+        with:
+          name: dylint-badge
+          path: _site/badges/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site/
       - id: deployment
         uses: actions/deploy-pages@v4

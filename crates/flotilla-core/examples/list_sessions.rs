@@ -4,21 +4,18 @@
 //! Usage:
 //!   cargo run -p flotilla-core --example list_sessions -- owner/repo
 
-use flotilla_core::providers::coding_agent::claude::ClaudeCodingAgent;
-use flotilla_core::providers::coding_agent::cursor::CursorCodingAgent;
-use flotilla_core::providers::coding_agent::CloudAgentService;
-use flotilla_core::providers::types::RepoCriteria;
 use std::sync::Arc;
+
+use flotilla_core::providers::{
+    coding_agent::{claude::ClaudeCodingAgent, cursor::CursorCodingAgent, CloudAgentService},
+    types::RepoCriteria,
+};
 
 #[tokio::main]
 async fn main() {
-    let slug = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "rjwittams/flotilla".to_string());
+    let slug = std::env::args().nth(1).unwrap_or_else(|| "rjwittams/flotilla".to_string());
 
-    let criteria = RepoCriteria {
-        repo_slug: Some(slug.clone()),
-    };
+    let criteria = RepoCriteria { repo_slug: Some(slug.clone()) };
 
     println!("Listing sessions for {slug}\n");
 
@@ -31,13 +28,7 @@ async fn main() {
                 Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
             )),
         ),
-        (
-            "cursor",
-            Arc::new(CursorCodingAgent::new(
-                "cursor".to_string(),
-                Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
-            )),
-        ),
+        ("cursor", Arc::new(CursorCodingAgent::new("cursor".to_string(), Arc::new(flotilla_core::providers::ReqwestHttpClient::new())))),
     ];
 
     for (name, provider) in &providers {

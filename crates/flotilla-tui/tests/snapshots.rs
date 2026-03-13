@@ -1,20 +1,14 @@
 mod support;
 
-use flotilla_protocol::{ProviderData, SessionStatus};
-use flotilla_tui::app::{
-    BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, UiMode,
-};
 use std::path::PathBuf;
+
+use flotilla_protocol::{ProviderData, SessionStatus};
+use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, UiMode};
 use support::*;
 use tui_input::Input;
 
 fn picker_entry(name: &str, is_git_repo: bool, is_added: bool) -> flotilla_tui::app::DirEntry {
-    flotilla_tui::app::DirEntry {
-        name: name.to_string(),
-        is_dir: true,
-        is_git_repo,
-        is_added,
-    }
+    flotilla_tui::app::DirEntry { name: name.to_string(), is_dir: true, is_git_repo, is_added }
 }
 
 #[test]
@@ -64,8 +58,7 @@ fn tab_bar_multiple_repos() {
 
 #[test]
 fn status_bar_with_error() {
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_status_message("GitHub API rate limit exceeded");
+    let mut harness = TestHarness::single_repo("my-project").with_status_message("GitHub API rate limit exceeded");
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -88,11 +81,7 @@ fn help_screen_clamps_scroll_state_after_render() {
 #[test]
 fn action_menu() {
     let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::ActionMenu {
-        items: vec![
-            Intent::CreateWorkspace,
-            Intent::OpenChangeRequest,
-            Intent::RemoveCheckout,
-        ],
+        items: vec![Intent::CreateWorkspace, Intent::OpenChangeRequest, Intent::RemoveCheckout],
         index: 0,
     });
     let output = harness.render_to_string();
@@ -103,16 +92,13 @@ fn action_menu() {
 fn config_screen() {
     let mut harness = TestHarness::single_repo("my-project")
         .with_mode(UiMode::Config)
-        .with_provider_names(
-            "my-project",
-            vec![
-                ("code_review", "GitHub"),
-                ("issue_tracker", "GitHub"),
-                ("vcs", "Git"),
-                ("checkout_manager", "Git Worktrees"),
-                ("cloud_agent", "Claude"),
-            ],
-        )
+        .with_provider_names("my-project", vec![
+            ("code_review", "GitHub"),
+            ("issue_tracker", "GitHub"),
+            ("vcs", "Git"),
+            ("checkout_manager", "Git Worktrees"),
+            ("cloud_agent", "Claude"),
+        ])
         .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
@@ -121,8 +107,7 @@ fn config_screen() {
 #[test]
 fn selected_item_preview() {
     let mut providers = ProviderData::default();
-    let (path, checkout) =
-        make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
+    let (path, checkout) = make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
     providers.checkouts.insert(path, checkout);
     let (id, cr) = make_change_request("99", "Build analytics dashboard", "feat-dashboard");
     providers.change_requests.insert(id, cr);
@@ -140,8 +125,7 @@ fn selected_item_preview() {
 #[test]
 fn selected_item_preview_below() {
     let mut providers = ProviderData::default();
-    let (path, checkout) =
-        make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
+    let (path, checkout) = make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
     providers.checkouts.insert(path, checkout);
     let (id, cr) = make_change_request("99", "Build analytics dashboard", "feat-dashboard");
     providers.change_requests.insert(id, cr);
@@ -163,18 +147,12 @@ fn selected_item_preview_below() {
 #[test]
 fn zoom_layout_uses_full_content_area() {
     let mut providers = ProviderData::default();
-    let (path, checkout) =
-        make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
+    let (path, checkout) = make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
     providers.checkouts.insert(path, checkout);
 
-    let items = vec![make_work_item_checkout(
-        "feat-dashboard",
-        "/test/my-project/feat-dashboard",
-    )];
+    let items = vec![make_work_item_checkout("feat-dashboard", "/test/my-project/feat-dashboard")];
 
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_provider_data(providers, items)
-        .with_layout(RepoViewLayout::Zoom);
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items).with_layout(RepoViewLayout::Zoom);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -238,27 +216,13 @@ fn preview_session() {
 #[test]
 fn status_bar_with_multiple_in_flight_commands() {
     let mut harness = TestHarness::single_repo("my-project");
-    harness.in_flight.insert(
-        1,
-        InFlightCommand {
-            repo: PathBuf::from("/test/my-project"),
-            description: "Refreshing repository...".into(),
-        },
-    );
-    harness.in_flight.insert(
-        2,
-        InFlightCommand {
-            repo: PathBuf::from("/test/my-project"),
-            description: "Refreshing repository...".into(),
-        },
-    );
-    harness.in_flight.insert(
-        3,
-        InFlightCommand {
-            repo: PathBuf::from("/test/other-project"),
-            description: "Should not render".into(),
-        },
-    );
+    harness
+        .in_flight
+        .insert(1, InFlightCommand { repo: PathBuf::from("/test/my-project"), description: "Refreshing repository...".into() });
+    harness
+        .in_flight
+        .insert(2, InFlightCommand { repo: PathBuf::from("/test/my-project"), description: "Refreshing repository...".into() });
+    harness.in_flight.insert(3, InFlightCommand { repo: PathBuf::from("/test/other-project"), description: "Should not render".into() });
 
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
@@ -277,9 +241,7 @@ fn branch_input_generating_popup() {
 
 #[test]
 fn issue_search_mode_status_bar() {
-    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::IssueSearch {
-        input: Input::from("auth timeout"),
-    });
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::IssueSearch { input: Input::from("auth timeout") });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -288,16 +250,12 @@ fn issue_search_mode_status_bar() {
 fn file_picker_popup() {
     let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::FilePicker {
         input: Input::from("/test"),
-        dir_entries: vec![
-            picker_entry("repo-a", true, false),
-            picker_entry("repo-b", true, true),
-            flotilla_tui::app::DirEntry {
-                name: "notes.txt".into(),
-                is_dir: false,
-                is_git_repo: false,
-                is_added: false,
-            },
-        ],
+        dir_entries: vec![picker_entry("repo-a", true, false), picker_entry("repo-b", true, true), flotilla_tui::app::DirEntry {
+            name: "notes.txt".into(),
+            is_dir: false,
+            is_git_repo: false,
+            is_added: false,
+        }],
         selected: 1,
     });
     let output = harness.render_to_string();
@@ -332,11 +290,7 @@ fn delete_confirm_with_uncommitted_files() {
             merge_commit_sha: None,
             unpushed_commits: vec!["abc1234 work in progress".into()],
             has_uncommitted: true,
-            uncommitted_files: vec![
-                " M src/main.rs".into(),
-                " M src/lib.rs".into(),
-                "?? TODO.txt".into(),
-            ],
+            uncommitted_files: vec![" M src/main.rs".into(), " M src/lib.rs".into(), "?? TODO.txt".into()],
             base_detection_warning: None,
         }),
         loading: false,
@@ -349,21 +303,19 @@ fn delete_confirm_with_uncommitted_files() {
 #[test]
 fn delete_confirm_with_many_uncommitted_files() {
     let files: Vec<String> = (0..15).map(|i| format!(" M src/file_{}.rs", i)).collect();
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_height(50)
-        .with_mode(UiMode::DeleteConfirm {
-            info: Some(flotilla_protocol::CheckoutStatus {
-                branch: "feat-big-wip".into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: true,
-                uncommitted_files: files,
-                base_detection_warning: None,
-            }),
-            loading: false,
-            terminal_keys: vec![],
-        });
+    let mut harness = TestHarness::single_repo("my-project").with_height(50).with_mode(UiMode::DeleteConfirm {
+        info: Some(flotilla_protocol::CheckoutStatus {
+            branch: "feat-big-wip".into(),
+            change_request_status: None,
+            merge_commit_sha: None,
+            unpushed_commits: vec![],
+            has_uncommitted: true,
+            uncommitted_files: files,
+            base_detection_warning: None,
+        }),
+        loading: false,
+        terminal_keys: vec![],
+    });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -371,15 +323,12 @@ fn delete_confirm_with_many_uncommitted_files() {
 #[test]
 fn providers_overlay() {
     let mut harness = TestHarness::single_repo("my-project")
-        .with_provider_names(
-            "my-project",
-            vec![
-                ("vcs", "Git"),
-                ("checkout_manager", "Git Worktrees"),
-                ("code_review", "GitHub"),
-                ("cloud_agent", "Claude"),
-            ],
-        )
+        .with_provider_names("my-project", vec![
+            ("vcs", "Git"),
+            ("checkout_manager", "Git Worktrees"),
+            ("code_review", "GitHub"),
+            ("cloud_agent", "Claude"),
+        ])
         .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok)
         .with_provider_status("my-project", "code_review", "GitHub", ProviderStatus::Error);
     let repo = harness.model.repo_order[0].clone();
@@ -404,13 +353,8 @@ fn config_screen_cross_repo_worst_wins() {
 fn debug_panel_with_correlation_details() {
     let mut item = support::checkout_item("feat-xyz", "/test/my-project/feat-xyz", false);
     item.description = "Feature branch checkout".into();
-    item.debug_group = vec![
-        "Group #12".into(),
-        "branch: feat-xyz".into(),
-        "checkout: /test/my-project/feat-xyz".into(),
-    ];
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_provider_data(ProviderData::default(), vec![item]);
+    item.debug_group = vec!["Group #12".into(), "branch: feat-xyz".into(), "checkout: /test/my-project/feat-xyz".into()];
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(ProviderData::default(), vec![item]);
     harness.ui.show_debug = true;
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);

@@ -1,17 +1,18 @@
 //! Cloud agent and AI utility factories for Claude-based providers.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::config::ConfigStore;
-use crate::providers::ai_utility::claude::ClaudeAiUtility;
-use crate::providers::ai_utility::AiUtility;
-use crate::providers::coding_agent::claude::ClaudeCodingAgent;
-use crate::providers::coding_agent::CloudAgentService;
-use crate::providers::discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
-use crate::providers::{CommandRunner, ReqwestHttpClient};
+use crate::{
+    config::ConfigStore,
+    providers::{
+        ai_utility::{claude::ClaudeAiUtility, AiUtility},
+        coding_agent::{claude::ClaudeCodingAgent, CloudAgentService},
+        discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement},
+        CommandRunner, ReqwestHttpClient,
+    },
+};
 
 // ---------------------------------------------------------------------------
 // ClaudeCodingAgentFactory
@@ -36,11 +37,7 @@ impl Factory for ClaudeCodingAgentFactory {
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         if env.find_binary("claude").is_some() {
             let http = Arc::new(ReqwestHttpClient::new());
-            Ok(Arc::new(ClaudeCodingAgent::new(
-                "claude".into(),
-                runner,
-                http,
-            )))
+            Ok(Arc::new(ClaudeCodingAgent::new("claude".into(), runner, http)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("claude".into())])
         }
@@ -83,22 +80,16 @@ impl Factory for ClaudeAiUtilityFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::sync::Arc;
-
-    use crate::config::ConfigStore;
-    use crate::providers::discovery::test_support::DiscoveryMockRunner;
-    use crate::providers::discovery::{
-        EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
-    };
+    use std::{path::Path, sync::Arc};
 
     use super::{ClaudeAiUtilityFactory, ClaudeCodingAgentFactory};
+    use crate::{
+        config::ConfigStore,
+        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
+    };
 
     fn bag_with_claude_binary() -> EnvironmentBag {
-        EnvironmentBag::new().with(EnvironmentAssertion::binary(
-            "claude",
-            "/usr/local/bin/claude",
-        ))
+        EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
     }
 
     // ── ClaudeCodingAgentFactory tests ──
@@ -109,9 +100,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeCodingAgentFactory
-            .probe(&bag, &config, Path::new("/repo"), runner)
-            .await;
+        let result = ClaudeCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -121,9 +110,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeCodingAgentFactory
-            .probe(&bag, &config, Path::new("/repo"), runner)
-            .await;
+        let result = ClaudeCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without claude binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("claude".into())));
     }
@@ -146,9 +133,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeAiUtilityFactory
-            .probe(&bag, &config, Path::new("/repo"), runner)
-            .await;
+        let result = ClaudeAiUtilityFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -158,9 +143,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeAiUtilityFactory
-            .probe(&bag, &config, Path::new("/repo"), runner)
-            .await;
+        let result = ClaudeAiUtilityFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without claude binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("claude".into())));
     }

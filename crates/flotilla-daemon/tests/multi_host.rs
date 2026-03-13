@@ -7,25 +7,22 @@
 //! - Host attribution appears correctly on work items via InProcessDaemon
 //! - Peer data relay excludes the origin host
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
-use indexmap::IndexMap;
-use tokio::sync::mpsc;
-
-use flotilla_core::config::ConfigStore;
-use flotilla_core::daemon::DaemonHandle;
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_daemon::peer::merge::merge_provider_data;
-use flotilla_daemon::peer::test_support::handle_test_peer_data;
+use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_daemon::peer::{
-    HandleResult, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
+    merge::merge_provider_data, test_support::handle_test_peer_data, HandleResult, PeerConnectionStatus, PeerManager, PeerSender,
+    PeerTransport,
 };
 use flotilla_protocol::{
-    Checkout, GoodbyeReason, HostName, HostPath, PeerDataKind, PeerDataMessage, PeerWireMessage,
-    ProviderData, RepoIdentity, VectorClock,
+    Checkout, GoodbyeReason, HostName, HostPath, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, VectorClock,
 };
+use indexmap::IndexMap;
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Mock transport
@@ -39,13 +36,8 @@ struct MockTransport {
 impl MockTransport {
     fn with_sender() -> (Self, Arc<Mutex<Vec<PeerWireMessage>>>) {
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
-            sent: Arc::clone(&sent),
-        });
-        let transport = Self {
-            status: PeerConnectionStatus::Connected,
-            sender: Some(sender),
-        };
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
+        let transport = Self { status: PeerConnectionStatus::Connected, sender: Some(sender) };
         (transport, sent)
     }
 }
@@ -62,10 +54,7 @@ impl PeerSender for MockPeerSender {
     }
 
     async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
-        self.sent
-            .lock()
-            .expect("lock poisoned")
-            .push(PeerWireMessage::Goodbye { reason });
+        self.sent.lock().expect("lock poisoned").push(PeerWireMessage::Goodbye { reason });
         Ok(())
     }
 }
@@ -101,10 +90,7 @@ impl PeerTransport for MockTransport {
 // ---------------------------------------------------------------------------
 
 fn test_repo() -> RepoIdentity {
-    RepoIdentity {
-        authority: "github.com".into(),
-        path: "owner/repo".into(),
-    }
+    RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
 }
 
 fn make_checkout(branch: &str) -> Checkout {
@@ -130,10 +116,7 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
         repo_identity: test_repo(),
         repo_path: PathBuf::from("/home/dev/repo"),
         clock,
-        kind: PeerDataKind::Snapshot {
-            data: Box::new(data),
-            seq,
-        },
+        kind: PeerDataKind::Snapshot { data: Box::new(data), seq },
     }
 }
 
@@ -147,18 +130,12 @@ async fn peer_manager_stores_snapshot_and_returns_updated() {
 
     // Build provider data with a checkout from the follower
     let mut follower_data = ProviderData::default();
-    follower_data.checkouts.insert(
-        HostPath::new(HostName::new("follower"), "/home/dev/repo"),
-        make_checkout("feature-branch"),
-    );
+    follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/home/dev/repo"), make_checkout("feature-branch"));
 
     let msg = snapshot_msg("follower", 1, follower_data);
-    let result = handle_test_peer_data(&mut mgr, msg, || {
-        Arc::new(MockPeerSender {
-            sent: Arc::new(Mutex::new(Vec::new())),
-        }) as Arc<dyn PeerSender>
-    })
-    .await;
+    let result =
+        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
+            .await;
 
     // Should return Updated with the repo identity
     assert_eq!(result, HandleResult::Updated(test_repo()));
@@ -166,10 +143,7 @@ async fn peer_manager_stores_snapshot_and_returns_updated() {
     // Verify stored data is accessible
     let peer_data = mgr.get_peer_data();
     let follower_host = HostName::new("follower");
-    assert!(
-        peer_data.contains_key(&follower_host),
-        "peer data should contain follower host"
-    );
+    assert!(peer_data.contains_key(&follower_host), "peer data should contain follower host");
 
     let repo_state = &peer_data[&follower_host][&test_repo()];
     assert_eq!(repo_state.seq, 1);
@@ -177,14 +151,8 @@ async fn peer_manager_stores_snapshot_and_returns_updated() {
 
     // Verify the checkout is in the stored provider data
     let hp = HostPath::new(HostName::new("follower"), "/home/dev/repo");
-    assert!(
-        repo_state.provider_data.checkouts.contains_key(&hp),
-        "stored provider data should contain the follower's checkout"
-    );
-    assert_eq!(
-        repo_state.provider_data.checkouts[&hp].branch,
-        "feature-branch"
-    );
+    assert!(repo_state.provider_data.checkouts.contains_key(&hp), "stored provider data should contain the follower's checkout");
+    assert_eq!(repo_state.provider_data.checkouts[&hp].branch, "feature-branch");
 }
 
 // ---------------------------------------------------------------------------
@@ -196,20 +164,14 @@ fn merge_combines_checkouts_from_leader_and_follower() {
     // Leader has a checkout on "laptop"
     let local_host = HostName::new("laptop");
     let local = ProviderData {
-        checkouts: IndexMap::from([(
-            HostPath::new(local_host.clone(), "/home/dev/repo/main"),
-            make_checkout("main"),
-        )]),
+        checkouts: IndexMap::from([(HostPath::new(local_host.clone(), "/home/dev/repo/main"), make_checkout("main"))]),
         ..Default::default()
     };
 
     // Follower has a checkout on "desktop"
     let peer_host = HostName::new("desktop");
     let peer_data = ProviderData {
-        checkouts: IndexMap::from([(
-            HostPath::new(peer_host.clone(), "/home/dev/repo/feature"),
-            make_checkout("feature-x"),
-        )]),
+        checkouts: IndexMap::from([(HostPath::new(peer_host.clone(), "/home/dev/repo/feature"), make_checkout("feature-x"))]),
         ..Default::default()
     };
 
@@ -217,20 +179,14 @@ fn merge_combines_checkouts_from_leader_and_follower() {
 
     // Both checkouts should be present
     assert_eq!(merged.checkouts.len(), 2);
-    assert!(merged
-        .checkouts
-        .contains_key(&HostPath::new(local_host, "/home/dev/repo/main")));
-    assert!(merged
-        .checkouts
-        .contains_key(&HostPath::new(peer_host, "/home/dev/repo/feature")));
+    assert!(merged.checkouts.contains_key(&HostPath::new(local_host, "/home/dev/repo/main")));
+    assert!(merged.checkouts.contains_key(&HostPath::new(peer_host, "/home/dev/repo/feature")));
 
     // Verify branch names are correct
-    let laptop_checkout =
-        &merged.checkouts[&HostPath::new(HostName::new("laptop"), "/home/dev/repo/main")];
+    let laptop_checkout = &merged.checkouts[&HostPath::new(HostName::new("laptop"), "/home/dev/repo/main")];
     assert_eq!(laptop_checkout.branch, "main");
 
-    let desktop_checkout =
-        &merged.checkouts[&HostPath::new(HostName::new("desktop"), "/home/dev/repo/feature")];
+    let desktop_checkout = &merged.checkouts[&HostPath::new(HostName::new("desktop"), "/home/dev/repo/feature")];
     assert_eq!(desktop_checkout.branch, "feature-x");
 }
 
@@ -248,48 +204,29 @@ async fn peer_manager_to_merge_end_to_end() {
 
     // Follower sends its checkout data
     let mut follower_data = ProviderData::default();
-    follower_data.checkouts.insert(
-        HostPath::new(HostName::new("follower"), "/opt/code/repo"),
-        make_checkout("experiment"),
-    );
+    follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/opt/code/repo"), make_checkout("experiment"));
 
     let msg = snapshot_msg("follower", 1, follower_data);
-    let result = handle_test_peer_data(&mut mgr, msg, || {
-        Arc::new(MockPeerSender {
-            sent: Arc::new(Mutex::new(Vec::new())),
-        }) as Arc<dyn PeerSender>
-    })
-    .await;
+    let result =
+        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
+            .await;
     assert_eq!(result, HandleResult::Updated(test_repo()));
 
     // Leader has its own local data
     let mut local_data = ProviderData::default();
-    local_data.checkouts.insert(
-        HostPath::new(leader_host.clone(), "/home/dev/repo"),
-        make_checkout("main"),
-    );
+    local_data.checkouts.insert(HostPath::new(leader_host.clone(), "/home/dev/repo"), make_checkout("main"));
 
     // Collect peer data in the format merge_provider_data expects
     let peer_data = mgr.get_peer_data();
-    let peers: Vec<(HostName, &ProviderData)> = peer_data
-        .iter()
-        .flat_map(|(host, repos)| {
-            repos
-                .values()
-                .map(move |state| (host.clone(), &state.provider_data))
-        })
-        .collect();
+    let peers: Vec<(HostName, &ProviderData)> =
+        peer_data.iter().flat_map(|(host, repos)| repos.values().map(move |state| (host.clone(), &state.provider_data))).collect();
 
     let merged = merge_provider_data(&local_data, &leader_host, &peers);
 
     // Should contain checkouts from both hosts
     assert_eq!(merged.checkouts.len(), 2);
-    assert!(merged
-        .checkouts
-        .contains_key(&HostPath::new(leader_host, "/home/dev/repo")));
-    assert!(merged
-        .checkouts
-        .contains_key(&HostPath::new(HostName::new("follower"), "/opt/code/repo")));
+    assert!(merged.checkouts.contains_key(&HostPath::new(leader_host, "/home/dev/repo")));
+    assert!(merged.checkouts.contains_key(&HostPath::new(HostName::new("follower"), "/opt/code/repo")));
 }
 
 // ---------------------------------------------------------------------------
@@ -325,21 +262,12 @@ async fn daemon_snapshot_has_correct_host_attribution() {
     .expect("timeout waiting for snapshot");
 
     // The snapshot should carry the local machine's host name
-    assert_eq!(
-        snapshot.host_name,
-        HostName::local(),
-        "snapshot host_name should be the local machine's hostname"
-    );
+    assert_eq!(snapshot.host_name, HostName::local(), "snapshot host_name should be the local machine's hostname");
 
     // If there are work items (there should be at least a main checkout),
     // they should all carry the local host name.
     for item in &snapshot.work_items {
-        assert_eq!(
-            item.host,
-            HostName::local(),
-            "work item {:?} should have local host attribution",
-            item.identity
-        );
+        assert_eq!(item.host, HostName::local(), "work item {:?} should have local host attribution", item.identity);
     }
 }
 
@@ -367,29 +295,15 @@ async fn relay_excludes_origin_and_sends_to_other_peers() {
 
     // Data arrives from follower-a
     let mut data = ProviderData::default();
-    data.checkouts.insert(
-        HostPath::new(HostName::new("follower-a"), "/home/dev/repo"),
-        make_checkout("feature"),
-    );
+    data.checkouts.insert(HostPath::new(HostName::new("follower-a"), "/home/dev/repo"), make_checkout("feature"));
     let msg = snapshot_msg("follower-a", 1, data);
 
     // Relay should forward to b and c, but not back to a
     mgr.relay(&HostName::new("follower-a"), &msg).await;
 
-    assert!(
-        sent_a.lock().expect("lock").is_empty(),
-        "origin (follower-a) should NOT receive relayed message"
-    );
-    assert_eq!(
-        sent_b.lock().expect("lock").len(),
-        1,
-        "follower-b should receive exactly one relayed message"
-    );
-    assert_eq!(
-        sent_c.lock().expect("lock").len(),
-        1,
-        "follower-c should receive exactly one relayed message"
-    );
+    assert!(sent_a.lock().expect("lock").is_empty(), "origin (follower-a) should NOT receive relayed message");
+    assert_eq!(sent_b.lock().expect("lock").len(), 1, "follower-b should receive exactly one relayed message");
+    assert_eq!(sent_c.lock().expect("lock").len(), 1, "follower-c should receive exactly one relayed message");
 }
 
 // ---------------------------------------------------------------------------
@@ -414,15 +328,8 @@ async fn relay_excludes_self_even_if_registered_as_peer() {
     let msg = snapshot_msg("remote", 1, ProviderData::default());
     mgr.relay(&HostName::new("remote"), &msg).await;
 
-    assert!(
-        sent_self.lock().expect("lock").is_empty(),
-        "self (leader) should NOT receive relayed message"
-    );
-    assert_eq!(
-        sent_other.lock().expect("lock").len(),
-        1,
-        "follower should receive the relayed message"
-    );
+    assert!(sent_self.lock().expect("lock").is_empty(), "self (leader) should NOT receive relayed message");
+    assert_eq!(sent_other.lock().expect("lock").len(), 1, "follower should receive the relayed message");
 }
 
 // ---------------------------------------------------------------------------
@@ -434,18 +341,12 @@ async fn peer_manager_ignores_messages_from_self() {
     let mut mgr = PeerManager::new(HostName::new("leader"));
 
     let msg = snapshot_msg("leader", 1, ProviderData::default());
-    let result = handle_test_peer_data(&mut mgr, msg, || {
-        Arc::new(MockPeerSender {
-            sent: Arc::new(Mutex::new(Vec::new())),
-        }) as Arc<dyn PeerSender>
-    })
-    .await;
+    let result =
+        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
+            .await;
 
     assert_eq!(result, HandleResult::Ignored);
-    assert!(
-        mgr.get_peer_data().is_empty(),
-        "no data should be stored for messages from self"
-    );
+    assert!(mgr.get_peer_data().is_empty(), "no data should be stored for messages from self");
 }
 
 // ---------------------------------------------------------------------------
@@ -458,34 +359,24 @@ async fn peer_manager_handles_multiple_peers_and_repos() {
 
     // Follower A sends data
     let mut data_a = ProviderData::default();
-    data_a.checkouts.insert(
-        HostPath::new(HostName::new("follower-a"), "/home/a/repo"),
-        make_checkout("branch-a"),
-    );
+    data_a.checkouts.insert(HostPath::new(HostName::new("follower-a"), "/home/a/repo"), make_checkout("branch-a"));
     let msg_a = snapshot_msg("follower-a", 1, data_a);
 
     // Follower B sends data
     let mut data_b = ProviderData::default();
-    data_b.checkouts.insert(
-        HostPath::new(HostName::new("follower-b"), "/home/b/repo"),
-        make_checkout("branch-b"),
-    );
+    data_b.checkouts.insert(HostPath::new(HostName::new("follower-b"), "/home/b/repo"), make_checkout("branch-b"));
     let msg_b = snapshot_msg("follower-b", 2, data_b);
 
     assert_eq!(
         handle_test_peer_data(&mut mgr, msg_a, || {
-            Arc::new(MockPeerSender {
-                sent: Arc::new(Mutex::new(Vec::new())),
-            }) as Arc<dyn PeerSender>
+            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
         })
         .await,
         HandleResult::Updated(test_repo())
     );
     assert_eq!(
         handle_test_peer_data(&mut mgr, msg_b, || {
-            Arc::new(MockPeerSender {
-                sent: Arc::new(Mutex::new(Vec::new())),
-            }) as Arc<dyn PeerSender>
+            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
         })
         .await,
         HandleResult::Updated(test_repo())
@@ -496,16 +387,10 @@ async fn peer_manager_handles_multiple_peers_and_repos() {
 
     // Verify each peer's checkout is accessible
     let a_data = &peer_data[&HostName::new("follower-a")][&test_repo()].provider_data;
-    assert_eq!(
-        a_data.checkouts[&HostPath::new(HostName::new("follower-a"), "/home/a/repo")].branch,
-        "branch-a"
-    );
+    assert_eq!(a_data.checkouts[&HostPath::new(HostName::new("follower-a"), "/home/a/repo")].branch, "branch-a");
 
     let b_data = &peer_data[&HostName::new("follower-b")][&test_repo()].provider_data;
-    assert_eq!(
-        b_data.checkouts[&HostPath::new(HostName::new("follower-b"), "/home/b/repo")].branch,
-        "branch-b"
-    );
+    assert_eq!(b_data.checkouts[&HostPath::new(HostName::new("follower-b"), "/home/b/repo")].branch, "branch-b");
 }
 
 // ---------------------------------------------------------------------------
@@ -518,31 +403,22 @@ fn merge_preserves_local_service_data_with_peer_checkouts() {
 
     let local_host = HostName::new("leader");
     let mut local = ProviderData::default();
-    local.checkouts.insert(
-        HostPath::new(local_host.clone(), "/home/dev/repo"),
-        make_checkout("main"),
-    );
-    local.change_requests.insert(
-        "PR-42".into(),
-        ChangeRequest {
-            title: "Add feature".into(),
-            branch: "feature".into(),
-            status: ChangeRequestStatus::Open,
-            body: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        },
-    );
+    local.checkouts.insert(HostPath::new(local_host.clone(), "/home/dev/repo"), make_checkout("main"));
+    local.change_requests.insert("PR-42".into(), ChangeRequest {
+        title: "Add feature".into(),
+        branch: "feature".into(),
+        status: ChangeRequestStatus::Open,
+        body: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+        provider_name: String::new(),
+        provider_display_name: String::new(),
+    });
 
     // Follower only has checkouts (no service data — as expected in follower mode)
     let peer_host = HostName::new("follower");
     let peer_data = ProviderData {
-        checkouts: IndexMap::from([(
-            HostPath::new(peer_host.clone(), "/opt/repo"),
-            make_checkout("feature"),
-        )]),
+        checkouts: IndexMap::from([(HostPath::new(peer_host.clone(), "/opt/repo"), make_checkout("feature"))]),
         ..Default::default()
     };
 
@@ -561,8 +437,10 @@ fn merge_preserves_local_service_data_with_peer_checkouts() {
 
 #[tokio::test]
 async fn delta_message_returns_needs_resync() {
-    use flotilla_protocol::delta::{Branch, BranchStatus, EntryOp};
-    use flotilla_protocol::Change;
+    use flotilla_protocol::{
+        delta::{Branch, BranchStatus, EntryOp},
+        Change,
+    };
 
     let mut mgr = PeerManager::new(HostName::new("leader"));
 
@@ -572,29 +450,18 @@ async fn delta_message_returns_needs_resync() {
         repo_path: PathBuf::from("/home/dev/repo"),
         clock: VectorClock::default(),
         kind: PeerDataKind::Delta {
-            changes: vec![Change::Branch {
-                key: "feat-x".into(),
-                op: EntryOp::Added(Branch {
-                    status: BranchStatus::Remote,
-                }),
-            }],
+            changes: vec![Change::Branch { key: "feat-x".into(), op: EntryOp::Added(Branch { status: BranchStatus::Remote }) }],
             seq: 2,
             prev_seq: 1,
         },
     };
 
-    let result = handle_test_peer_data(&mut mgr, msg, || {
-        Arc::new(MockPeerSender {
-            sent: Arc::new(Mutex::new(Vec::new())),
-        }) as Arc<dyn PeerSender>
-    })
-    .await;
+    let result =
+        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
+            .await;
     assert_eq!(
         result,
-        HandleResult::NeedsResync {
-            from: HostName::new("follower"),
-            repo: test_repo(),
-        },
+        HandleResult::NeedsResync { from: HostName::new("follower"), repo: test_repo() },
         "Phase 1: deltas should trigger NeedsResync"
     );
 }
@@ -610,8 +477,7 @@ async fn follower_mode_has_only_local_providers() {
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon =
-        InProcessDaemon::new_with_options(vec![repo], config, true, HostName::local()).await;
+    let daemon = InProcessDaemon::new_with_options(vec![repo], config, true, HostName::local()).await;
 
     assert!(daemon.is_follower(), "daemon should be in follower mode");
 
@@ -621,28 +487,13 @@ async fn follower_mode_has_only_local_providers() {
     let provider_names = &repos[0].provider_names;
 
     // Local providers should be present
-    assert!(
-        provider_names.contains_key("vcs"),
-        "follower should have VCS provider"
-    );
+    assert!(provider_names.contains_key("vcs"), "follower should have VCS provider");
 
     // External providers should be absent
-    assert!(
-        !provider_names.contains_key("code_review"),
-        "follower should NOT have code_review"
-    );
-    assert!(
-        !provider_names.contains_key("issue_tracker"),
-        "follower should NOT have issue_tracker"
-    );
-    assert!(
-        !provider_names.contains_key("cloud_agent"),
-        "follower should NOT have cloud_agent"
-    );
-    assert!(
-        !provider_names.contains_key("ai_utility"),
-        "follower should NOT have ai_utility"
-    );
+    assert!(!provider_names.contains_key("code_review"), "follower should NOT have code_review");
+    assert!(!provider_names.contains_key("issue_tracker"), "follower should NOT have issue_tracker");
+    assert!(!provider_names.contains_key("cloud_agent"), "follower should NOT have cloud_agent");
+    assert!(!provider_names.contains_key("ai_utility"), "follower should NOT have ai_utility");
 }
 
 // ---------------------------------------------------------------------------
@@ -655,27 +506,17 @@ async fn peer_snapshot_update_overwrites_previous() {
 
     // First snapshot from follower with branch "old-branch"
     let mut data1 = ProviderData::default();
-    data1.checkouts.insert(
-        HostPath::new(HostName::new("follower"), "/repo"),
-        make_checkout("old-branch"),
-    );
+    data1.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), make_checkout("old-branch"));
     handle_test_peer_data(&mut mgr, snapshot_msg("follower", 1, data1), || {
-        Arc::new(MockPeerSender {
-            sent: Arc::new(Mutex::new(Vec::new())),
-        }) as Arc<dyn PeerSender>
+        Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
     })
     .await;
 
     // Second snapshot with branch "new-branch"
     let mut data2 = ProviderData::default();
-    data2.checkouts.insert(
-        HostPath::new(HostName::new("follower"), "/repo"),
-        make_checkout("new-branch"),
-    );
+    data2.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), make_checkout("new-branch"));
     let result = handle_test_peer_data(&mut mgr, snapshot_msg("follower", 2, data2), || {
-        Arc::new(MockPeerSender {
-            sent: Arc::new(Mutex::new(Vec::new())),
-        }) as Arc<dyn PeerSender>
+        Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
     })
     .await;
     assert_eq!(result, HandleResult::Updated(test_repo()));

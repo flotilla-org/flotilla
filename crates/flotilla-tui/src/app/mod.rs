@@ -9,25 +9,24 @@ pub mod test_builders;
 mod test_support;
 pub mod ui_state;
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use tui_input::Input;
-
-use flotilla_core::config::{ConfigStore, RepoViewLayoutConfig};
-use flotilla_core::daemon::DaemonHandle;
-use flotilla_core::data::{self, GroupEntry, SectionLabels};
+use flotilla_core::{
+    config::{ConfigStore, RepoViewLayoutConfig},
+    daemon::DaemonHandle,
+    data::{self, GroupEntry, SectionLabels},
+};
 use flotilla_protocol::{
-    Command, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo,
-    RepoLabels, Snapshot, SnapshotDelta, WorkItem,
+    Command, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot, SnapshotDelta,
+    WorkItem,
 };
-use std::collections::VecDeque;
-
 pub use intent::Intent;
-pub use ui_state::{
-    BranchInputKind, DirEntry, RepoUiState, RepoViewLayout, TabId, UiMode, UiState,
-};
+use tui_input::Input;
+pub use ui_state::{BranchInputKind, DirEntry, RepoUiState, RepoViewLayout, TabId, UiMode, UiState};
 
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,21 +114,18 @@ impl TuiModel {
         let mut repos = HashMap::new();
         let mut order = Vec::new();
         for info in repos_info {
-            repos.insert(
-                info.path.clone(),
-                TuiRepoModel {
-                    providers: Arc::new(ProviderData::default()),
-                    labels: info.labels,
-                    provider_names: info.provider_names,
-                    provider_health: info.provider_health,
-                    loading: info.loading,
-                    issue_has_more: false,
-                    issue_total: None,
-                    issue_search_active: false,
-                    issue_fetch_pending: false,
-                    issue_initial_requested: false,
-                },
-            );
+            repos.insert(info.path.clone(), TuiRepoModel {
+                providers: Arc::new(ProviderData::default()),
+                labels: info.labels,
+                provider_names: info.provider_names,
+                provider_health: info.provider_health,
+                loading: info.loading,
+                issue_has_more: false,
+                issue_total: None,
+                issue_search_active: false,
+                issue_fetch_pending: false,
+                issue_initial_requested: false,
+            });
             order.push(info.path);
         }
         Self {
@@ -156,9 +152,7 @@ impl TuiModel {
     }
 
     pub fn repo_name(path: &Path) -> String {
-        path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string())
+        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string())
     }
 }
 
@@ -179,16 +173,9 @@ fn format_error_status(errors: &[ProviderError], repo_path: &Path) -> Option<Str
         if e.category == "issues" && e.message.contains("has disabled issues") {
             continue;
         }
-        let provider_suffix = if e.provider.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", e.provider)
-        };
+        let provider_suffix = if e.provider.is_empty() { String::new() } else { format!(" ({})", e.provider) };
         tracing::error!(%name, category = %e.category, provider = %e.provider, message = %e.message, "provider error");
-        all_errors.push(format!(
-            "{name}: {}{provider_suffix}: {}",
-            e.category, e.message
-        ));
+        all_errors.push(format!("{name}: {}{provider_suffix}: {}", e.category, e.message));
     }
     if all_errors.is_empty() {
         None
@@ -208,11 +195,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        daemon: Arc<dyn DaemonHandle>,
-        repos_info: Vec<RepoInfo>,
-        config: Arc<ConfigStore>,
-    ) -> Self {
+    pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>) -> Self {
         let model = TuiModel::from_repo_info(repos_info);
         let mut ui = UiState::new(&model.repo_order);
         let loaded_config = config.load_config();
@@ -222,15 +205,7 @@ impl App {
             RepoViewLayoutConfig::Right => RepoViewLayout::Right,
             RepoViewLayoutConfig::Below => RepoViewLayout::Below,
         };
-        Self {
-            daemon,
-            config,
-            model,
-            ui,
-            proto_commands: Default::default(),
-            in_flight: HashMap::new(),
-            should_quit: false,
-        }
+        Self { daemon, config, model, ui, proto_commands: Default::default(), in_flight: HashMap::new(), should_quit: false }
     }
 
     pub fn persist_layout(&self) {
@@ -251,18 +226,11 @@ impl App {
             DaemonEvent::SnapshotDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoRemoved { path } => self.handle_repo_removed(&path),
-            DaemonEvent::CommandStarted {
-                command_id,
-                repo,
-                description,
-            } => {
+            DaemonEvent::CommandStarted { command_id, repo, description } => {
                 tracing::info!(%command_id, %description, "command started");
-                self.in_flight
-                    .insert(command_id, InFlightCommand { repo, description });
+                self.in_flight.insert(command_id, InFlightCommand { repo, description });
             }
-            DaemonEvent::CommandFinished {
-                command_id, result, ..
-            } => {
+            DaemonEvent::CommandFinished { command_id, result, .. } => {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
                     tracing::info!(%command_id, "command finished");
                     executor::handle_result(result, self);
@@ -273,10 +241,7 @@ impl App {
                 if let Some(existing) = self.model.peer_hosts.iter_mut().find(|p| p.name == host) {
                     existing.status = peer_status;
                 } else {
-                    self.model.peer_hosts.push(PeerHostStatus {
-                        name: host,
-                        status: peer_status,
-                    });
+                    self.model.peer_hosts.push(PeerHostStatus { name: host, status: peer_status });
                 }
                 self.model.peer_hosts.sort_by(|a, b| a.name.cmp(&b.name));
             }
@@ -309,30 +274,19 @@ impl App {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.cloud_agents.section.clone(),
         };
-        let table_view =
-            data::group_work_items(&snap.work_items, &rm.providers, &section_labels, &path);
+        let table_view = data::group_work_items(&snap.work_items, &rm.providers, &section_labels, &path);
 
         // Provider health -> model-level statuses (now 1:1)
         for (category, providers) in &rm.provider_health {
             for (provider_name, &healthy) in providers {
-                let status = if healthy {
-                    ProviderStatus::Ok
-                } else {
-                    ProviderStatus::Error
-                };
+                let status = if healthy { ProviderStatus::Ok } else { ProviderStatus::Error };
                 let key = (path.clone(), category.clone(), provider_name.clone());
                 self.model.provider_statuses.insert(key, status);
             }
         }
 
         // Remove stale provider_statuses entries for providers no longer in health map
-        self.model.provider_statuses.retain(|k, _| {
-            k.0 != path
-                || rm
-                    .provider_health
-                    .get(&k.1)
-                    .is_some_and(|ps| ps.contains_key(&k.2))
-        });
+        self.model.provider_statuses.retain(|k, _| k.0 != path || rm.provider_health.get(&k.1).is_some_and(|ps| ps.contains_key(&k.2)));
 
         // Change detection badge for inactive tabs
         let active_idx = self.model.active_repo;
@@ -357,10 +311,7 @@ impl App {
         if !rm.issue_initial_requested {
             rm.issue_initial_requested = true;
             let visible = self.ui.layout.table_area.height.saturating_sub(2) as usize;
-            self.proto_commands.push(Command::SetIssueViewport {
-                repo: path,
-                visible_count: visible.max(20),
-            });
+            self.proto_commands.push(Command::SetIssueViewport { repo: path, visible_count: visible.max(20) });
         }
     }
 
@@ -388,19 +339,11 @@ impl App {
                 flotilla_protocol::Change::ProviderHealth {
                     category,
                     provider,
-                    op:
-                        flotilla_protocol::EntryOp::Added(v) | flotilla_protocol::EntryOp::Updated(v),
+                    op: flotilla_protocol::EntryOp::Added(v) | flotilla_protocol::EntryOp::Updated(v),
                 } => {
-                    rm.provider_health
-                        .entry(category.clone())
-                        .or_default()
-                        .insert(provider.clone(), *v);
+                    rm.provider_health.entry(category.clone()).or_default().insert(provider.clone(), *v);
                 }
-                flotilla_protocol::Change::ProviderHealth {
-                    category,
-                    provider,
-                    op: flotilla_protocol::EntryOp::Removed,
-                } => {
+                flotilla_protocol::Change::ProviderHealth { category, provider, op: flotilla_protocol::EntryOp::Removed } => {
                     if let Some(providers) = rm.provider_health.get_mut(category) {
                         providers.remove(provider);
                         if providers.is_empty() {
@@ -422,39 +365,25 @@ impl App {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.cloud_agents.section.clone(),
         };
-        let table_view =
-            data::group_work_items(&delta.work_items, &rm.providers, &section_labels, &path);
+        let table_view = data::group_work_items(&delta.work_items, &rm.providers, &section_labels, &path);
 
         // Provider health -> model-level statuses (now 1:1)
         for (category, providers) in &rm.provider_health {
             for (provider_name, &healthy) in providers {
-                let status = if healthy {
-                    ProviderStatus::Ok
-                } else {
-                    ProviderStatus::Error
-                };
+                let status = if healthy { ProviderStatus::Ok } else { ProviderStatus::Error };
                 let key = (path.clone(), category.clone(), provider_name.clone());
                 self.model.provider_statuses.insert(key, status);
             }
         }
 
         // Remove stale provider_statuses entries for providers no longer in health map
-        self.model.provider_statuses.retain(|k, _| {
-            k.0 != path
-                || rm
-                    .provider_health
-                    .get(&k.1)
-                    .is_some_and(|ps| ps.contains_key(&k.2))
-        });
+        self.model.provider_statuses.retain(|k, _| k.0 != path || rm.provider_health.get(&k.1).is_some_and(|ps| ps.contains_key(&k.2)));
 
         // Change detection badge — any non-empty delta on inactive tab
-        let has_data_changes = delta.changes.iter().any(|c| {
-            !matches!(
-                c,
-                flotilla_protocol::Change::ProviderHealth { .. }
-                    | flotilla_protocol::Change::ErrorsChanged(_)
-            )
-        });
+        let has_data_changes = delta
+            .changes
+            .iter()
+            .any(|c| !matches!(c, flotilla_protocol::Change::ProviderHealth { .. } | flotilla_protocol::Change::ErrorsChanged(_)));
         if has_data_changes {
             let active_idx = self.model.active_repo;
             let i = self.model.repo_order.iter().position(|p| p == &path);
@@ -477,21 +406,18 @@ impl App {
         if self.model.repos.contains_key(&path) {
             return;
         }
-        self.model.repos.insert(
-            path.clone(),
-            TuiRepoModel {
-                providers: Arc::new(ProviderData::default()),
-                labels: info.labels,
-                provider_names: info.provider_names,
-                provider_health: info.provider_health,
-                loading: info.loading,
-                issue_has_more: false,
-                issue_total: None,
-                issue_search_active: false,
-                issue_fetch_pending: false,
-                issue_initial_requested: false,
-            },
-        );
+        self.model.repos.insert(path.clone(), TuiRepoModel {
+            providers: Arc::new(ProviderData::default()),
+            labels: info.labels,
+            provider_names: info.provider_names,
+            provider_health: info.provider_health,
+            loading: info.loading,
+            issue_has_more: false,
+            issue_total: None,
+            issue_search_active: false,
+            issue_fetch_pending: false,
+            issue_initial_requested: false,
+        });
         self.model.repo_order.push(path.clone());
         self.ui.repo_ui.insert(path, RepoUiState::default());
     }
@@ -513,16 +439,12 @@ impl App {
     // ── Convenience accessors ──
 
     pub fn active_ui(&self) -> &RepoUiState {
-        self.ui
-            .active_repo_ui(&self.model.repo_order, self.model.active_repo)
+        self.ui.active_repo_ui(&self.model.repo_order, self.model.active_repo)
     }
 
     pub fn active_ui_mut(&mut self) -> &mut RepoUiState {
         let key = &self.model.repo_order[self.model.active_repo];
-        self.ui
-            .repo_ui
-            .get_mut(key)
-            .expect("active repo must have UI state")
+        self.ui.repo_ui.get_mut(key).expect("active repo must have UI state")
     }
 
     pub fn selected_work_item(&self) -> Option<&WorkItem> {
@@ -533,24 +455,12 @@ impl App {
         }
     }
 
-    pub fn prefill_branch_input(
-        &mut self,
-        branch_name: &str,
-        pending_issue_ids: Vec<(String, String)>,
-    ) {
-        self.ui.mode = UiMode::BranchInput {
-            input: Input::from(branch_name),
-            kind: BranchInputKind::Manual,
-            pending_issue_ids,
-        };
+    pub fn prefill_branch_input(&mut self, branch_name: &str, pending_issue_ids: Vec<(String, String)>) {
+        self.ui.mode = UiMode::BranchInput { input: Input::from(branch_name), kind: BranchInputKind::Manual, pending_issue_ids };
     }
 
     pub(super) fn enter_branch_input(&mut self, kind: BranchInputKind) {
-        self.ui.mode = UiMode::BranchInput {
-            input: Input::default(),
-            kind,
-            pending_issue_ids: Vec::new(),
-        };
+        self.ui.mode = UiMode::BranchInput { input: Input::default(), kind, pending_issue_ids: Vec::new() };
     }
 
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
@@ -559,11 +469,7 @@ impl App {
             let parent_str = format!("{}/", parent.display());
             input = Input::from(parent_str.as_str());
         }
-        self.ui.mode = UiMode::FilePicker {
-            input,
-            dir_entries: Vec::new(),
-            selected: 0,
-        };
+        self.ui.mode = UiMode::FilePicker { input, dir_entries: Vec::new(), selected: 0 };
         self.refresh_dir_listing();
     }
 
@@ -586,10 +492,11 @@ pub enum ClearDispatch {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crossterm::event::KeyCode;
     use tempfile::tempdir;
     use test_support::*;
+
+    use super::*;
 
     // -- CommandQueue --
 
@@ -599,10 +506,7 @@ mod tests {
         q.push(Command::Refresh);
         q.push(Command::OpenChangeRequest { id: "1".into() });
         assert!(matches!(q.take_next(), Some(Command::Refresh)));
-        assert!(matches!(
-            q.take_next(),
-            Some(Command::OpenChangeRequest { .. })
-        ));
+        assert!(matches!(q.take_next(), Some(Command::OpenChangeRequest { .. })));
     }
 
     #[test]
@@ -615,10 +519,7 @@ mod tests {
 
     #[test]
     fn repo_name_extracts_directory_name() {
-        assert_eq!(
-            TuiModel::repo_name(Path::new("/home/user/project")),
-            "project"
-        );
+        assert_eq!(TuiModel::repo_name(Path::new("/home/user/project")), "project");
     }
 
     #[test]
@@ -631,10 +532,8 @@ mod tests {
 
     #[test]
     fn from_repo_info_builds_correct_model() {
-        let repos_info = vec![
-            repo_info("/tmp/repo-a", "repo-a", RepoLabels::default()),
-            repo_info("/tmp/repo-b", "repo-b", RepoLabels::default()),
-        ];
+        let repos_info =
+            vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default()), repo_info("/tmp/repo-b", "repo-b", RepoLabels::default())];
         let model = TuiModel::from_repo_info(repos_info);
         assert_eq!(model.repos.len(), 2);
         assert_eq!(model.repo_order.len(), 2);
@@ -646,10 +545,7 @@ mod tests {
 
     #[test]
     fn from_repo_info_preserves_order() {
-        let repos_info = vec![
-            repo_info("/z", "z", RepoLabels::default()),
-            repo_info("/a", "a", RepoLabels::default()),
-        ];
+        let repos_info = vec![repo_info("/z", "z", RepoLabels::default()), repo_info("/a", "a", RepoLabels::default())];
         let model = TuiModel::from_repo_info(repos_info);
         assert_eq!(model.repo_order[0], PathBuf::from("/z"));
         assert_eq!(model.repo_order[1], PathBuf::from("/a"));
@@ -665,19 +561,11 @@ mod tests {
     #[test]
     fn app_new_loads_layout_from_config() {
         let dir = tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[ui.preview]\nlayout = \"below\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[ui.preview]\nlayout = \"below\"\n").unwrap();
 
         let daemon: Arc<dyn DaemonHandle> = Arc::new(test_support::StubDaemon::new());
         let config = Arc::new(ConfigStore::with_base(dir.path()));
-        let app = App::new(
-            daemon,
-            vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())],
-            config,
-        );
+        let app = App::new(daemon, vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())], config);
 
         assert_eq!(app.ui.view_layout, RepoViewLayout::Below);
     }
@@ -687,11 +575,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let daemon: Arc<dyn DaemonHandle> = Arc::new(test_support::StubDaemon::new());
         let config = Arc::new(ConfigStore::with_base(dir.path()));
-        let mut app = App::new(
-            daemon,
-            vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())],
-            config,
-        );
+        let mut app = App::new(daemon, vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())], config);
 
         app.ui.view_layout = RepoViewLayout::Right;
         app.persist_layout();
@@ -720,20 +604,13 @@ mod tests {
 
     #[test]
     fn format_error_status_suppresses_issues_disabled() {
-        let errors = vec![provider_error(
-            "issues",
-            "github",
-            "repo has disabled issues",
-        )];
+        let errors = vec![provider_error("issues", "github", "repo has disabled issues")];
         assert!(format_error_status(&errors, Path::new("/repo")).is_none());
     }
 
     #[test]
     fn format_error_status_mixed_suppressed_and_real() {
-        let errors = vec![
-            provider_error("issues", "github", "repo has disabled issues"),
-            provider_error("vcs", "git", "not a git repo"),
-        ];
+        let errors = vec![provider_error("issues", "github", "repo has disabled issues"), provider_error("vcs", "git", "not a git repo")];
         let msg = format_error_status(&errors, Path::new("/repo")).unwrap();
         assert!(msg.contains("not a git repo"));
         assert!(!msg.contains("disabled issues"));
@@ -748,10 +625,7 @@ mod tests {
 
     #[test]
     fn format_error_status_multiple_errors_joined() {
-        let errors = vec![
-            provider_error("vcs", "git", "err1"),
-            provider_error("cr", "gh", "err2"),
-        ];
+        let errors = vec![provider_error("vcs", "git", "err1"), provider_error("cr", "gh", "err2")];
         let msg = format_error_status(&errors, Path::new("/r")).unwrap();
         assert!(msg.contains("; "));
     }
@@ -789,20 +663,11 @@ mod tests {
         let repo = active_repo_path(&app);
 
         let mut snap = snapshot(&repo);
-        snap.provider_health.insert(
-            "vcs".into(),
-            HashMap::from([("git".into(), true), ("wt".into(), false)]),
-        );
+        snap.provider_health.insert("vcs".into(), HashMap::from([("git".into(), true), ("wt".into(), false)]));
         app.apply_snapshot(snap);
 
-        assert_eq!(
-            app.model.provider_statuses[&(repo.clone(), "vcs".into(), "git".into())],
-            ProviderStatus::Ok,
-        );
-        assert_eq!(
-            app.model.provider_statuses[&(repo.clone(), "vcs".into(), "wt".into())],
-            ProviderStatus::Error,
-        );
+        assert_eq!(app.model.provider_statuses[&(repo.clone(), "vcs".into(), "git".into())], ProviderStatus::Ok,);
+        assert_eq!(app.model.provider_statuses[&(repo.clone(), "vcs".into(), "wt".into())], ProviderStatus::Error,);
     }
 
     #[test]
@@ -868,10 +733,7 @@ mod tests {
         snap2.work_items = vec![checkout_item("feat", "/wt", false)];
         let mut different_providers = ProviderData::default();
         different_providers.checkouts.insert(
-            flotilla_protocol::HostPath::new(
-                flotilla_protocol::HostName::new("test-host"),
-                PathBuf::from("/wt"),
-            ),
+            flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from("/wt")),
             flotilla_protocol::Checkout {
                 branch: "feat".into(),
                 is_main: false,
@@ -921,20 +783,14 @@ mod tests {
         let mut app = stub_app();
         let repo = active_repo_path(&app);
 
-        let change = delta(
-            &repo,
-            vec![flotilla_protocol::Change::ProviderHealth {
-                category: "vcs".into(),
-                provider: "git".into(),
-                op: flotilla_protocol::EntryOp::Added(true),
-            }],
-        );
+        let change = delta(&repo, vec![flotilla_protocol::Change::ProviderHealth {
+            category: "vcs".into(),
+            provider: "git".into(),
+            op: flotilla_protocol::EntryOp::Added(true),
+        }]);
         app.apply_delta(change);
 
-        assert_eq!(
-            app.model.provider_statuses[&(repo.clone(), "vcs".into(), "git".into())],
-            ProviderStatus::Ok,
-        );
+        assert_eq!(app.model.provider_statuses[&(repo.clone(), "vcs".into(), "git".into())], ProviderStatus::Ok,);
         assert!(app.model.repos[&repo].provider_health["vcs"]["git"]);
     }
 
@@ -943,23 +799,13 @@ mod tests {
         let mut app = stub_app();
         let repo = active_repo_path(&app);
 
-        app.model
-            .repos
-            .get_mut(&repo)
-            .unwrap()
-            .provider_health
-            .entry("vcs".into())
-            .or_default()
-            .insert("git".into(), true);
+        app.model.repos.get_mut(&repo).unwrap().provider_health.entry("vcs".into()).or_default().insert("git".into(), true);
 
-        let change = delta(
-            &repo,
-            vec![flotilla_protocol::Change::ProviderHealth {
-                category: "vcs".into(),
-                provider: "git".into(),
-                op: flotilla_protocol::EntryOp::Removed,
-            }],
-        );
+        let change = delta(&repo, vec![flotilla_protocol::Change::ProviderHealth {
+            category: "vcs".into(),
+            provider: "git".into(),
+            op: flotilla_protocol::EntryOp::Removed,
+        }]);
         app.apply_delta(change);
 
         assert!(!app.model.repos[&repo].provider_health.contains_key("vcs"));
@@ -970,20 +816,10 @@ mod tests {
         let mut app = stub_app();
         let repo = active_repo_path(&app);
 
-        let change = delta(
-            &repo,
-            vec![flotilla_protocol::Change::ErrorsChanged(vec![
-                provider_error("cr", "gh", "broken"),
-            ])],
-        );
+        let change = delta(&repo, vec![flotilla_protocol::Change::ErrorsChanged(vec![provider_error("cr", "gh", "broken")])]);
         app.apply_delta(change);
 
-        assert!(app
-            .model
-            .status_message
-            .as_ref()
-            .unwrap()
-            .contains("broken"));
+        assert!(app.model.status_message.as_ref().unwrap().contains("broken"));
     }
 
     #[test]
@@ -991,22 +827,19 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         let inactive_repo = app.model.repo_order[1].clone();
 
-        let change = delta(
-            &inactive_repo,
-            vec![flotilla_protocol::Change::Session {
-                key: "s1".into(),
-                op: flotilla_protocol::EntryOp::Added(flotilla_protocol::CloudAgentSession {
-                    title: "new session".into(),
-                    status: flotilla_protocol::SessionStatus::Running,
-                    model: None,
-                    updated_at: None,
-                    correlation_keys: vec![],
-                    provider_name: String::new(),
-                    provider_display_name: String::new(),
-                    item_noun: String::new(),
-                }),
-            }],
-        );
+        let change = delta(&inactive_repo, vec![flotilla_protocol::Change::Session {
+            key: "s1".into(),
+            op: flotilla_protocol::EntryOp::Added(flotilla_protocol::CloudAgentSession {
+                title: "new session".into(),
+                status: flotilla_protocol::SessionStatus::Running,
+                model: None,
+                updated_at: None,
+                correlation_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
+            }),
+        }]);
         app.apply_delta(change);
 
         assert!(app.ui.repo_ui[&inactive_repo].has_unseen_changes);
@@ -1017,14 +850,11 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         let inactive_repo = app.model.repo_order[1].clone();
 
-        let change = delta(
-            &inactive_repo,
-            vec![flotilla_protocol::Change::ProviderHealth {
-                category: "vcs".into(),
-                provider: "git".into(),
-                op: flotilla_protocol::EntryOp::Added(true),
-            }],
-        );
+        let change = delta(&inactive_repo, vec![flotilla_protocol::Change::ProviderHealth {
+            category: "vcs".into(),
+            provider: "git".into(),
+            op: flotilla_protocol::EntryOp::Added(true),
+        }]);
         app.apply_delta(change);
 
         assert!(!app.ui.repo_ui[&inactive_repo].has_unseen_changes);
@@ -1042,10 +872,7 @@ mod tests {
 
         assert_eq!(app.model.repos.len(), 2);
         assert!(app.model.repos.contains_key(Path::new("/tmp/new-repo")));
-        assert_eq!(
-            app.model.repo_order.last().unwrap(),
-            Path::new("/tmp/new-repo")
-        );
+        assert_eq!(app.model.repo_order.last().unwrap(), Path::new("/tmp/new-repo"));
         // Adding a repo should not switch to it (it may arrive asynchronously)
         assert_eq!(app.model.active_repo, 0);
     }
@@ -1054,11 +881,7 @@ mod tests {
     fn handle_repo_added_duplicate_is_noop() {
         let mut app = stub_app();
         let existing_path = app.model.repo_order[0].clone();
-        let info = repo_info(
-            existing_path.to_str().unwrap(),
-            "dup",
-            RepoLabels::default(),
-        );
+        let info = repo_info(existing_path.to_str().unwrap(), "dup", RepoLabels::default());
         app.handle_repo_added(info);
         assert_eq!(app.model.repos.len(), 1);
     }
@@ -1103,11 +926,7 @@ mod tests {
         let mut app = stub_app();
         let repo = app.model.repo_order[0].clone();
 
-        app.handle_daemon_event(DaemonEvent::CommandStarted {
-            command_id: 99,
-            repo: repo.clone(),
-            description: "test cmd".into(),
-        });
+        app.handle_daemon_event(DaemonEvent::CommandStarted { command_id: 99, repo: repo.clone(), description: "test cmd".into() });
 
         assert!(app.in_flight.contains_key(&99));
         assert_eq!(app.in_flight[&99].description, "test cmd");
@@ -1135,11 +954,7 @@ mod tests {
         let mut app = stub_app();
         app.prefill_branch_input("my-branch", vec![("gh".into(), "1".into())]);
         match &app.ui.mode {
-            UiMode::BranchInput {
-                input,
-                kind,
-                pending_issue_ids,
-            } => {
+            UiMode::BranchInput { input, kind, pending_issue_ids } => {
                 assert_eq!(input.value(), "my-branch");
                 assert_eq!(*kind, BranchInputKind::Manual);
                 assert_eq!(pending_issue_ids.len(), 1);
@@ -1153,10 +968,7 @@ mod tests {
     #[test]
     fn close_confirm_y_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-        };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
@@ -1166,10 +978,7 @@ mod tests {
     #[test]
     fn close_confirm_enter_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-        };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
@@ -1179,10 +988,7 @@ mod tests {
     #[test]
     fn close_confirm_esc_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-        };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());
@@ -1191,10 +997,7 @@ mod tests {
     #[test]
     fn close_confirm_n_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-        };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
         app.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());

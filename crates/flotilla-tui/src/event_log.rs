@@ -1,11 +1,9 @@
-use std::collections::VecDeque;
-use std::sync::{LazyLock, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{LazyLock, Mutex},
+};
 
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer;
+use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// Entry returned to the UI. Either a real log line or a retention marker.
 #[derive(Debug, Clone)]
@@ -75,10 +73,7 @@ struct LevelBucket {
 
 impl LevelBucket {
     fn new(capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::with_capacity(capacity),
-            capacity,
-        }
+        Self { entries: VecDeque::with_capacity(capacity), capacity }
     }
 
     fn push(&mut self, entry: LogEntry) {
@@ -123,25 +118,14 @@ impl EventLog {
     fn push(&mut self, level: tracing::Level, message: String) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let entry = LogEntry {
-            seq,
-            hms: wall_hms(),
-            level,
-            message,
-        };
+        let entry = LogEntry { seq, hms: wall_hms(), level, message };
         self.bucket_mut(&level).push(entry);
     }
 
     /// Merge all matching buckets into chronological order, inserting retention markers.
     fn snapshot(&self, filter: &tracing::Level) -> Vec<DisplayEntry> {
         // Collect all levels that pass the filter
-        let all_levels = [
-            tracing::Level::ERROR,
-            tracing::Level::WARN,
-            tracing::Level::INFO,
-            tracing::Level::DEBUG,
-            tracing::Level::TRACE,
-        ];
+        let all_levels = [tracing::Level::ERROR, tracing::Level::WARN, tracing::Level::INFO, tracing::Level::DEBUG, tracing::Level::TRACE];
 
         let buckets: Vec<(&VecDeque<LogEntry>, tracing::Level)> = all_levels
             .iter()
@@ -159,10 +143,7 @@ impl EventLog {
             .collect();
 
         // Find the global earliest seq across all included levels
-        let global_min_seq = buckets
-            .iter()
-            .filter_map(|(entries, _)| entries.front().map(|e| e.seq))
-            .min();
+        let global_min_seq = buckets.iter().filter_map(|(entries, _)| entries.front().map(|e| e.seq)).min();
 
         // Levels whose oldest entry is newer than the global oldest need a marker
         let mut needs_marker: Vec<(u64, tracing::Level)> = Vec::new();
@@ -197,8 +178,7 @@ impl EventLog {
 /// Local wall-clock time as (hour, minute, second).
 fn wall_hms() -> (u8, u8, u8) {
     let now = time::OffsetDateTime::now_utc();
-    let local =
-        now.to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
+    let local = now.to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
     (local.hour(), local.minute(), local.second())
 }
 
@@ -213,17 +193,10 @@ pub fn get_entries(filter: &tracing::Level) -> Vec<DisplayEntry> {
 struct TuiLayer;
 
 impl<S: tracing::Subscriber> Layer<S> for TuiLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         let level = *event.metadata().level();
 
-        let mut visitor = MessageVisitor {
-            message: String::new(),
-            provider: None,
-        };
+        let mut visitor = MessageVisitor { message: String::new(), provider: None };
         event.record(&mut visitor);
 
         let display = format_log_message(&visitor.message, visitor.provider.as_deref());
@@ -263,58 +236,38 @@ impl tracing::field::Visit for MessageVisitor {
 /// Initialize tracing: file appender + TUI in-memory layer.
 /// Call once at startup.
 pub fn init() {
-    let log_dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".config/flotilla");
+    let log_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".config/flotilla");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let file_appender = tracing_appender::rolling::never(&log_dir, "flotilla.log");
 
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file_appender)
-        .with_ansi(false)
-        .with_target(false);
+    let file_layer = tracing_subscriber::fmt::layer().with_writer(file_appender).with_ansi(false).with_target(false);
 
     // Hardcoded directives are appended after RUST_LOG and take precedence,
     // so these noisy crates stay at INFO even if RUST_LOG sets them to DEBUG.
     let filter = ["h2=info", "hyper=info", "reqwest=info", "rustls=info"]
         .into_iter()
-        .fold(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::DEBUG.into())
-                .from_env_lossy(),
-            |f, d| f.add_directive(d.parse().expect("valid directive")),
-        );
+        .fold(EnvFilter::builder().with_default_directive(LevelFilter::DEBUG.into()).from_env_lossy(), |f, d| {
+            f.add_directive(d.parse().expect("valid directive"))
+        });
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(file_layer)
-        .with(TuiLayer)
-        .init();
+    tracing_subscriber::registry().with(filter).with(file_layer).with(TuiLayer).init();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tracing::Level;
+
+    use super::*;
 
     // ── LevelExt: filter_label ──────────────────────────────────────────
 
     #[test]
     fn filter_label_all_variants() {
-        let cases = [
-            (Level::ERROR, "ERROR"),
-            (Level::WARN, "WARN"),
-            (Level::INFO, "INFO"),
-            (Level::DEBUG, "DEBUG"),
-            (Level::TRACE, "TRACE"),
-        ];
+        let cases =
+            [(Level::ERROR, "ERROR"), (Level::WARN, "WARN"), (Level::INFO, "INFO"), (Level::DEBUG, "DEBUG"), (Level::TRACE, "TRACE")];
         for (level, expected) in &cases {
-            assert_eq!(
-                level.filter_label(),
-                *expected,
-                "filter_label for {level:?}"
-            );
+            assert_eq!(level.filter_label(), *expected, "filter_label for {level:?}");
         }
     }
 
@@ -347,50 +300,18 @@ mod tests {
     fn includes_all_variants() {
         // (filter_level, entry_level, expected)
         let cases: &[(Level, &[Level], &[Level])] = &[
-            (
-                Level::ERROR,
-                &[Level::ERROR],
-                &[Level::WARN, Level::INFO, Level::DEBUG, Level::TRACE],
-            ),
-            (
-                Level::WARN,
-                &[Level::ERROR, Level::WARN],
-                &[Level::INFO, Level::DEBUG, Level::TRACE],
-            ),
-            (
-                Level::INFO,
-                &[Level::ERROR, Level::WARN, Level::INFO],
-                &[Level::DEBUG, Level::TRACE],
-            ),
-            (
-                Level::DEBUG,
-                &[Level::ERROR, Level::WARN, Level::INFO, Level::DEBUG],
-                &[Level::TRACE],
-            ),
-            (
-                Level::TRACE,
-                &[
-                    Level::ERROR,
-                    Level::WARN,
-                    Level::INFO,
-                    Level::DEBUG,
-                    Level::TRACE,
-                ],
-                &[],
-            ),
+            (Level::ERROR, &[Level::ERROR], &[Level::WARN, Level::INFO, Level::DEBUG, Level::TRACE]),
+            (Level::WARN, &[Level::ERROR, Level::WARN], &[Level::INFO, Level::DEBUG, Level::TRACE]),
+            (Level::INFO, &[Level::ERROR, Level::WARN, Level::INFO], &[Level::DEBUG, Level::TRACE]),
+            (Level::DEBUG, &[Level::ERROR, Level::WARN, Level::INFO, Level::DEBUG], &[Level::TRACE]),
+            (Level::TRACE, &[Level::ERROR, Level::WARN, Level::INFO, Level::DEBUG, Level::TRACE], &[]),
         ];
         for (filter, included, excluded) in cases {
             for entry_level in *included {
-                assert!(
-                    filter.includes(entry_level),
-                    "{filter:?} should include {entry_level:?}"
-                );
+                assert!(filter.includes(entry_level), "{filter:?} should include {entry_level:?}");
             }
             for entry_level in *excluded {
-                assert!(
-                    !filter.includes(entry_level),
-                    "{filter:?} should exclude {entry_level:?}"
-                );
+                assert!(!filter.includes(entry_level), "{filter:?} should exclude {entry_level:?}");
             }
         }
     }
@@ -399,13 +320,7 @@ mod tests {
 
     #[test]
     fn capacity_for_all_variants() {
-        let cases = [
-            (Level::ERROR, 100),
-            (Level::WARN, 100),
-            (Level::INFO, 200),
-            (Level::DEBUG, 300),
-            (Level::TRACE, 300),
-        ];
+        let cases = [(Level::ERROR, 100), (Level::WARN, 100), (Level::INFO, 200), (Level::DEBUG, 300), (Level::TRACE, 300)];
         for (level, expected) in &cases {
             assert_eq!(capacity_for(level), *expected, "capacity_for {level:?}");
         }
@@ -414,12 +329,7 @@ mod tests {
     // ── LevelBucket ─────────────────────────────────────────────────────
 
     fn make_entry(seq: u64, level: Level, msg: &str) -> LogEntry {
-        LogEntry {
-            seq,
-            hms: (12, 0, 0),
-            level,
-            message: msg.to_string(),
-        }
+        LogEntry { seq, hms: (12, 0, 0), level, message: msg.to_string() }
     }
 
     fn snapshot_messages(snap: &[DisplayEntry]) -> Vec<&str> {
@@ -513,9 +423,7 @@ mod tests {
 
         let snap = log.snapshot(&Level::INFO);
         assert_eq!(snapshot_messages(&snap), vec!["first", "second", "third"]);
-        assert!(snap
-            .iter()
-            .all(|entry| !matches!(entry, DisplayEntry::RetentionMarker(_))));
+        assert!(snap.iter().all(|entry| !matches!(entry, DisplayEntry::RetentionMarker(_))));
     }
 
     #[test]
@@ -537,10 +445,7 @@ mod tests {
 
         // TRACE filter: all
         let snap = log.snapshot(&Level::TRACE);
-        let log_count = snap
-            .iter()
-            .filter(|e| matches!(e, DisplayEntry::Log(_)))
-            .count();
+        let log_count = snap.iter().filter(|e| matches!(e, DisplayEntry::Log(_))).count();
         assert_eq!(log_count, 5);
     }
 
@@ -567,10 +472,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            markers.contains(&&Level::ERROR),
-            "Expected a retention marker for ERROR level"
-        );
+        assert!(markers.contains(&&Level::ERROR), "Expected a retention marker for ERROR level");
     }
 
     #[test]

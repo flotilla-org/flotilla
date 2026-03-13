@@ -3,9 +3,8 @@
 
 use std::hash::Hash;
 
-use indexmap::IndexMap;
-
 use flotilla_protocol::{Change, EntryOp, ProviderData, ProviderError, WorkItem, WorkItemIdentity};
+use indexmap::IndexMap;
 
 /// Diff two IndexMaps, producing `(key, EntryOp)` pairs for all differences.
 ///
@@ -114,28 +113,19 @@ pub fn diff_errors(prev: &[ProviderError], curr: &[ProviderError]) -> Option<Cha
 /// Not currently called in production — kept for the client-side materialization
 /// path (delta replay on reconnect) planned in later PRs.
 pub fn diff_work_items(prev: &[WorkItem], curr: &[WorkItem]) -> Vec<Change> {
-    let prev_map: IndexMap<WorkItemIdentity, WorkItem> = prev
-        .iter()
-        .map(|wi| (wi.identity.clone(), wi.clone()))
-        .collect();
-    let curr_map: IndexMap<WorkItemIdentity, WorkItem> = curr
-        .iter()
-        .map(|wi| (wi.identity.clone(), wi.clone()))
-        .collect();
-    diff_indexmap(&prev_map, &curr_map)
-        .into_iter()
-        .map(|(identity, op)| Change::WorkItem { identity, op })
-        .collect()
+    let prev_map: IndexMap<WorkItemIdentity, WorkItem> = prev.iter().map(|wi| (wi.identity.clone(), wi.clone())).collect();
+    let curr_map: IndexMap<WorkItemIdentity, WorkItem> = curr.iter().map(|wi| (wi.identity.clone(), wi.clone())).collect();
+    diff_indexmap(&prev_map, &curr_map).into_iter().map(|(identity, op)| Change::WorkItem { identity, op }).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::delta::{Branch, BranchStatus};
     use flotilla_protocol::{
-        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, HostName, HostPath, Issue,
-        ProviderError, SessionStatus, Workspace,
+        delta::{Branch, BranchStatus},
+        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, HostName, HostPath, Issue, ProviderError, SessionStatus,
+        Workspace,
     };
 
     use super::*;
@@ -194,11 +184,7 @@ mod tests {
     }
 
     fn workspace(name: &str) -> Workspace {
-        Workspace {
-            name: name.into(),
-            directories: vec![],
-            correlation_keys: vec![],
-        }
+        Workspace { name: name.into(), directories: vec![], correlation_keys: vec![] }
     }
 
     // --- diff_indexmap tests ---
@@ -249,10 +235,8 @@ mod tests {
 
     #[test]
     fn value_unchanged_key_not_emitted() {
-        let prev: IndexMap<String, i32> =
-            IndexMap::from([("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]);
-        let curr: IndexMap<String, i32> =
-            IndexMap::from([("a".into(), 1), ("b".into(), 99), ("c".into(), 3)]);
+        let prev: IndexMap<String, i32> = IndexMap::from([("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]);
+        let curr: IndexMap<String, i32> = IndexMap::from([("a".into(), 1), ("b".into(), 99), ("c".into(), 3)]);
         let changes = diff_indexmap(&prev, &curr);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0], ("b".into(), EntryOp::Updated(99)));
@@ -275,10 +259,7 @@ mod tests {
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::Checkout {
-                key,
-                op: EntryOp::Added(co),
-            } => {
+            Change::Checkout { key, op: EntryOp::Added(co) } => {
                 assert_eq!(key, &hp("/wt/feat"));
                 assert_eq!(co.branch, "feat");
             }
@@ -294,10 +275,7 @@ mod tests {
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::Checkout {
-                key,
-                op: EntryOp::Removed,
-            } => {
+            Change::Checkout { key, op: EntryOp::Removed } => {
                 assert_eq!(key, &hp("/wt/old"));
             }
             other => panic!("unexpected change: {other:?}"),
@@ -307,18 +285,13 @@ mod tests {
     #[test]
     fn diff_change_request_updated() {
         let mut prev = ProviderData::default();
-        prev.change_requests
-            .insert("42".into(), change_request("old title"));
+        prev.change_requests.insert("42".into(), change_request("old title"));
         let mut curr = ProviderData::default();
-        curr.change_requests
-            .insert("42".into(), change_request("new title"));
+        curr.change_requests.insert("42".into(), change_request("new title"));
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::ChangeRequest {
-                key,
-                op: EntryOp::Updated(cr),
-            } => {
+            Change::ChangeRequest { key, op: EntryOp::Updated(cr) } => {
                 assert_eq!(key, "42");
                 assert_eq!(cr.title, "new title");
             }
@@ -329,28 +302,14 @@ mod tests {
     #[test]
     fn diff_branch_added_and_removed() {
         let mut prev = ProviderData::default();
-        prev.branches.insert(
-            "old-branch".into(),
-            Branch {
-                status: BranchStatus::Remote,
-            },
-        );
+        prev.branches.insert("old-branch".into(), Branch { status: BranchStatus::Remote });
         let mut curr = ProviderData::default();
-        curr.branches.insert(
-            "new-branch".into(),
-            Branch {
-                status: BranchStatus::Merged,
-            },
-        );
+        curr.branches.insert("new-branch".into(), Branch { status: BranchStatus::Merged });
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 2);
         // One added, one removed
-        let added = changes.iter().any(
-            |c| matches!(c, Change::Branch { key, op: EntryOp::Added(_) } if key == "new-branch"),
-        );
-        let removed = changes.iter().any(
-            |c| matches!(c, Change::Branch { key, op: EntryOp::Removed } if key == "old-branch"),
-        );
+        let added = changes.iter().any(|c| matches!(c, Change::Branch { key, op: EntryOp::Added(_) } if key == "new-branch"));
+        let removed = changes.iter().any(|c| matches!(c, Change::Branch { key, op: EntryOp::Removed } if key == "old-branch"));
         assert!(added, "expected new-branch Added");
         assert!(removed, "expected old-branch Removed");
     }
@@ -370,15 +329,9 @@ mod tests {
 
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 3);
-        let has_issue_update = changes
-            .iter()
-            .any(|c| matches!(c, Change::Issue { key, op: EntryOp::Updated(_) } if key == "1"));
-        let has_ws_add = changes
-            .iter()
-            .any(|c| matches!(c, Change::Workspace { key, op: EntryOp::Added(_) } if key == "w1"));
-        let has_session_remove = changes
-            .iter()
-            .any(|c| matches!(c, Change::Session { key, op: EntryOp::Removed } if key == "s1"));
+        let has_issue_update = changes.iter().any(|c| matches!(c, Change::Issue { key, op: EntryOp::Updated(_) } if key == "1"));
+        let has_ws_add = changes.iter().any(|c| matches!(c, Change::Workspace { key, op: EntryOp::Added(_) } if key == "w1"));
+        let has_session_remove = changes.iter().any(|c| matches!(c, Change::Session { key, op: EntryOp::Removed } if key == "s1"));
         assert!(has_issue_update, "expected issue Updated");
         assert!(has_ws_add, "expected workspace Added");
         assert!(has_session_remove, "expected session Removed");
@@ -412,21 +365,12 @@ mod tests {
 
     #[test]
     fn diff_work_items_added() {
-        let curr = vec![work_item(
-            flotilla_protocol::WorkItemIdentity::Session("s1".into()),
-            "new session",
-        )];
+        let curr = vec![work_item(flotilla_protocol::WorkItemIdentity::Session("s1".into()), "new session")];
         let changes = diff_work_items(&[], &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::WorkItem {
-                identity,
-                op: EntryOp::Added(wi),
-            } => {
-                assert_eq!(
-                    identity,
-                    &flotilla_protocol::WorkItemIdentity::Session("s1".into())
-                );
+            Change::WorkItem { identity, op: EntryOp::Added(wi) } => {
+                assert_eq!(identity, &flotilla_protocol::WorkItemIdentity::Session("s1".into()));
                 assert_eq!(wi.description, "new session");
             }
             other => panic!("unexpected: {other:?}"),
@@ -435,16 +379,11 @@ mod tests {
 
     #[test]
     fn diff_work_items_removed() {
-        let prev = vec![work_item(
-            flotilla_protocol::WorkItemIdentity::Issue("i1".into()),
-            "old issue",
-        )];
+        let prev = vec![work_item(flotilla_protocol::WorkItemIdentity::Issue("i1".into()), "old issue")];
         let changes = diff_work_items(&prev, &[]);
         assert_eq!(changes.len(), 1);
-        assert!(
-            matches!(&changes[0], Change::WorkItem { identity, op: EntryOp::Removed }
-            if *identity == flotilla_protocol::WorkItemIdentity::Issue("i1".into()))
-        );
+        assert!(matches!(&changes[0], Change::WorkItem { identity, op: EntryOp::Removed }
+            if *identity == flotilla_protocol::WorkItemIdentity::Issue("i1".into())));
     }
 
     #[test]
@@ -455,10 +394,7 @@ mod tests {
         let changes = diff_work_items(&prev, &curr);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            Change::WorkItem {
-                identity,
-                op: EntryOp::Updated(wi),
-            } => {
+            Change::WorkItem { identity, op: EntryOp::Updated(wi) } => {
                 assert_eq!(identity, &id);
                 assert_eq!(wi.description, "new desc");
             }
@@ -468,10 +404,7 @@ mod tests {
 
     #[test]
     fn diff_work_items_unchanged() {
-        let items = vec![work_item(
-            flotilla_protocol::WorkItemIdentity::RemoteBranch("feat".into()),
-            "remote branch",
-        )];
+        let items = vec![work_item(flotilla_protocol::WorkItemIdentity::RemoteBranch("feat".into()), "remote branch")];
         assert!(diff_work_items(&items, &items).is_empty());
     }
 
@@ -479,17 +412,11 @@ mod tests {
     fn diff_identical_snapshots_no_changes() {
         let mut pd = ProviderData::default();
         pd.checkouts.insert(hp("/wt/main"), checkout("main"));
-        pd.change_requests
-            .insert("1".into(), change_request("pr 1"));
+        pd.change_requests.insert("1".into(), change_request("pr 1"));
         pd.issues.insert("10".into(), issue("task"));
         pd.sessions.insert("s1".into(), session("sess"));
         pd.workspaces.insert("w1".into(), workspace("dev"));
-        pd.branches.insert(
-            "feat".into(),
-            Branch {
-                status: BranchStatus::Remote,
-            },
-        );
+        pd.branches.insert("feat".into(), Branch { status: BranchStatus::Remote });
         assert!(diff_provider_data(&pd, &pd).is_empty());
     }
 
@@ -508,17 +435,11 @@ mod tests {
         let prev = ProviderData::default();
         let mut curr = ProviderData::default();
         curr.checkouts.insert(hp("/wt/feat"), checkout("feat"));
-        curr.change_requests
-            .insert("1".into(), change_request("pr"));
+        curr.change_requests.insert("1".into(), change_request("pr"));
         curr.issues.insert("10".into(), issue("bug"));
         curr.sessions.insert("s1".into(), session("sess"));
         curr.workspaces.insert("w1".into(), workspace("dev"));
-        curr.branches.insert(
-            "main".into(),
-            Branch {
-                status: BranchStatus::Remote,
-            },
-        );
+        curr.branches.insert("main".into(), Branch { status: BranchStatus::Remote });
         assert_roundtrip(&prev, &curr);
     }
 
@@ -552,28 +473,17 @@ mod tests {
     fn roundtrip_identical() {
         let mut pd = ProviderData::default();
         pd.checkouts.insert(hp("/wt/main"), checkout("main"));
-        pd.branches.insert(
-            "feat".into(),
-            Branch {
-                status: BranchStatus::Merged,
-            },
-        );
+        pd.branches.insert("feat".into(), Branch { status: BranchStatus::Merged });
         assert_roundtrip(&pd, &pd);
     }
 
     #[test]
     fn apply_added_then_removed() {
         let mut pd = ProviderData::default();
-        let changes = vec![
-            Change::Issue {
-                key: "1".into(),
-                op: EntryOp::Added(issue("task")),
-            },
-            Change::Issue {
-                key: "1".into(),
-                op: EntryOp::Removed,
-            },
-        ];
+        let changes = vec![Change::Issue { key: "1".into(), op: EntryOp::Added(issue("task")) }, Change::Issue {
+            key: "1".into(),
+            op: EntryOp::Removed,
+        }];
         apply_changes(&mut pd, changes);
         assert!(pd.issues.is_empty());
     }
@@ -581,11 +491,7 @@ mod tests {
     // --- diff_errors tests ---
 
     fn provider_error(category: &str, message: &str) -> ProviderError {
-        ProviderError {
-            category: category.into(),
-            provider: String::new(),
-            message: message.into(),
-        }
+        ProviderError { category: category.into(), provider: String::new(), message: message.into() }
     }
 
     #[test]
@@ -623,10 +529,7 @@ mod tests {
 
     #[test]
     fn diff_errors_same_no_change() {
-        let errors = vec![
-            provider_error("git", "error 1"),
-            provider_error("github", "error 2"),
-        ];
+        let errors = vec![provider_error("git", "error 1"), provider_error("github", "error 2")];
         assert!(diff_errors(&errors, &errors).is_none());
     }
 

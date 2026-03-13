@@ -6,7 +6,11 @@ members = [
     "crates/flotilla-daemon",
     "crates/flotilla-tui",
 ]
+exclude = ["lints/long_inline_paths"]
 resolver = "2"
+
+[workspace.metadata.dylint]
+libraries = [{ path = "lints/long_inline_paths" }]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

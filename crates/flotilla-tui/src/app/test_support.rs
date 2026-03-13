@@ -1,23 +1,27 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use flotilla_core::config::ConfigStore;
-use flotilla_core::daemon::DaemonHandle;
-use flotilla_core::data::{GroupEntry, GroupedWorkItems};
+use flotilla_core::{
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    data::{GroupEntry, GroupedWorkItems},
+};
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot,
-    SnapshotDelta, WorkItem,
+    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot, SnapshotDelta, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
 
-use super::{App, DirEntry, TuiRepoModel, UiMode};
-
 // Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
 pub(crate) use super::test_builders::*;
+use super::{App, DirEntry, TuiRepoModel, UiMode};
 
 pub(crate) struct StubDaemon {
     tx: broadcast::Sender<DaemonEvent>,
@@ -62,10 +66,7 @@ impl DaemonHandle for StubDaemon {
         Ok(())
     }
 
-    async fn replay_since(
-        &self,
-        _last_seen: &HashMap<PathBuf, u64>,
-    ) -> Result<Vec<DaemonEvent>, String> {
+    async fn replay_since(&self, _last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String> {
         Ok(vec![])
     }
 }
@@ -75,15 +76,7 @@ pub(crate) fn stub_app() -> App {
 }
 
 pub(crate) fn stub_app_with_repos(count: usize) -> App {
-    let repos_info = (0..count)
-        .map(|i| {
-            repo_info(
-                format!("/tmp/repo-{i}"),
-                format!("repo-{i}"),
-                RepoLabels::default(),
-            )
-        })
-        .collect();
+    let repos_info = (0..count).map(|i| repo_info(format!("/tmp/repo-{i}"), format!("repo-{i}"), RepoLabels::default())).collect();
     stub_app_with_repo_infos(repos_info)
 }
 
@@ -92,11 +85,7 @@ pub(crate) fn active_repo_path(app: &App) -> PathBuf {
 }
 
 pub(crate) fn provider_error(category: &str, provider: &str, message: &str) -> ProviderError {
-    ProviderError {
-        category: category.into(),
-        provider: provider.into(),
-        message: message.into(),
-    }
+    ProviderError { category: category.into(), provider: provider.into(), message: message.into() }
 }
 
 pub(crate) fn snapshot(repo: &Path) -> Snapshot {
@@ -148,14 +137,8 @@ pub(crate) fn key(code: KeyCode) -> KeyEvent {
 
 pub(crate) fn grouped_items(items: Vec<WorkItem>) -> GroupedWorkItems {
     let selectable_indices = (0..items.len()).collect();
-    let table_entries = items
-        .into_iter()
-        .map(|item| GroupEntry::Item(Box::new(item)))
-        .collect();
-    GroupedWorkItems {
-        table_entries,
-        selectable_indices,
-    }
+    let table_entries = items.into_iter().map(|item| GroupEntry::Item(Box::new(item))).collect();
+    GroupedWorkItems { table_entries, selectable_indices }
 }
 
 pub(crate) fn issue_table_entries(count: usize) -> GroupedWorkItems {
@@ -179,20 +162,11 @@ pub(crate) fn setup_selectable_table(app: &mut App, items: Vec<WorkItem>) {
 }
 
 pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry>) {
-    app.ui.mode = UiMode::FilePicker {
-        input: Input::from(path),
-        dir_entries: entries,
-        selected: 0,
-    };
+    app.ui.mode = UiMode::FilePicker { input: Input::from(path), dir_entries: entries, selected: 0 };
 }
 
 pub(crate) fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
-    DirEntry {
-        name: name.to_string(),
-        is_dir: true,
-        is_git_repo,
-        is_added,
-    }
+    DirEntry { name: name.to_string(), is_dir: true, is_git_repo, is_added }
 }
 
 fn default_repo_info() -> RepoInfo {

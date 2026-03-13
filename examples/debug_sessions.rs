@@ -2,24 +2,23 @@
 //!
 //! Run with: cargo run --example debug_sessions -- --repo-root ~/dev/reticulate
 
-use flotilla_core::config::ConfigStore;
-use flotilla_core::convert::correlation_result_to_work_item;
-use flotilla_core::data;
-use flotilla_core::providers::discovery::{self, detectors, FactoryRegistry, ProcessEnvVars};
-use flotilla_core::providers::types::RepoCriteria;
-use flotilla_core::providers::{CommandRunner, ProcessCommandRunner};
-use flotilla_core::refresh::RepoRefreshHandle;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use flotilla_core::{
+    config::ConfigStore,
+    convert::correlation_result_to_work_item,
+    data,
+    providers::{
+        discovery::{self, detectors, FactoryRegistry, ProcessEnvVars},
+        types::RepoCriteria,
+        CommandRunner, ProcessCommandRunner,
+    },
+    refresh::RepoRefreshHandle,
+};
 
 #[tokio::main]
 async fn main() {
-    let repo_root = std::env::args()
-        .skip_while(|a| a != "--repo-root")
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let repo_root = std::env::args().skip_while(|a| a != "--repo-root").nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
 
     println!("Repo root: {}", repo_root.display());
 
@@ -33,16 +32,8 @@ async fn main() {
     let host_bag = discovery::run_host_detectors(&host_dets, &*runner, &ProcessEnvVars).await;
     let factories = FactoryRegistry::default_all();
 
-    let result = discovery::discover_providers(
-        &host_bag,
-        &repo_root,
-        &repo_dets,
-        &factories,
-        &config,
-        Arc::clone(&runner),
-        &ProcessEnvVars,
-    )
-    .await;
+    let result =
+        discovery::discover_providers(&host_bag, &repo_root, &repo_dets, &factories, &config, Arc::clone(&runner), &ProcessEnvVars).await;
     let registry = result.registry;
     let repo_slug = result.repo_slug;
     println!("  checkout_managers: {}", registry.checkout_managers.len());
@@ -50,10 +41,7 @@ async fn main() {
     println!("  issue_trackers: {}", registry.issue_trackers.len());
     println!("  cloud_agents: {}", registry.cloud_agents.len());
     println!("  vcs: {}", registry.vcs.len());
-    println!(
-        "  workspace_manager: {}",
-        registry.workspace_manager.is_some()
-    );
+    println!("  workspace_manager: {}", registry.workspace_manager.is_some());
 
     // Step 2: Spawn background refresh and wait for first snapshot
     println!("\n=== Step 2: Background refresh ===");
@@ -61,12 +49,7 @@ async fn main() {
     println!("  repo_criteria: {:?}", criteria);
 
     let registry = Arc::new(registry);
-    let handle = RepoRefreshHandle::spawn(
-        repo_root.clone(),
-        registry,
-        criteria,
-        Duration::from_secs(60),
-    );
+    let handle = RepoRefreshHandle::spawn(repo_root.clone(), registry, criteria, Duration::from_secs(60));
 
     // Wait for the first snapshot
     let mut rx = handle.snapshot_rx.clone();
@@ -82,16 +65,10 @@ async fn main() {
 
     println!("\n  Checkouts: {}", snapshot.providers.checkouts.len());
     for (i, (_path, co)) in snapshot.providers.checkouts.iter().enumerate() {
-        println!(
-            "    [{i}] branch={:?} keys={:?}",
-            co.branch, co.correlation_keys
-        );
+        println!("    [{i}] branch={:?} keys={:?}", co.branch, co.correlation_keys);
     }
 
-    println!(
-        "\n  Change Requests: {}",
-        snapshot.providers.change_requests.len()
-    );
+    println!("\n  Change Requests: {}", snapshot.providers.change_requests.len());
     for (i, (_id, cr)) in snapshot.providers.change_requests.iter().enumerate() {
         println!(
             "    [{i}] title={:?} branch={:?} corr_keys={:?} assoc_keys={:?}",
@@ -101,18 +78,12 @@ async fn main() {
 
     println!("\n  Sessions: {}", snapshot.providers.sessions.len());
     for (i, (_id, s)) in snapshot.providers.sessions.iter().enumerate() {
-        println!(
-            "    [{i}] title={:?} status={:?} keys={:?}",
-            s.title, s.status, s.correlation_keys
-        );
+        println!("    [{i}] title={:?} status={:?} keys={:?}", s.title, s.status, s.correlation_keys);
     }
 
     println!("\n  Workspaces: {}", snapshot.providers.workspaces.len());
     for (i, (_ref, ws)) in snapshot.providers.workspaces.iter().enumerate() {
-        println!(
-            "    [{i}] name={:?} dirs={:?} keys={:?}",
-            ws.name, ws.directories, ws.correlation_keys
-        );
+        println!("    [{i}] name={:?} dirs={:?} keys={:?}", ws.name, ws.directories, ws.correlation_keys);
     }
 
     // Step 3: Show resulting table entries
@@ -121,20 +92,9 @@ async fn main() {
     let work_items: Vec<_> = snapshot
         .work_items
         .iter()
-        .map(|item| {
-            correlation_result_to_work_item(
-                item,
-                &snapshot.correlation_groups,
-                &flotilla_core::HostName::local(),
-            )
-        })
+        .map(|item| correlation_result_to_work_item(item, &snapshot.correlation_groups, &flotilla_core::HostName::local()))
         .collect();
-    let table_view = data::group_work_items(
-        &work_items,
-        &snapshot.providers,
-        &section_labels,
-        &repo_root,
-    );
+    let table_view = data::group_work_items(&work_items, &snapshot.providers, &section_labels, &repo_root);
     for (i, entry) in table_view.table_entries.iter().enumerate() {
         match entry {
             data::GroupEntry::Header(h) => {

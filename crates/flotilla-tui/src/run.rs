@@ -1,15 +1,17 @@
-use crate::app::{self, App, TabId, UiMode};
-use crate::event::{self, Event};
-use crate::event_log::LevelExt;
-use crate::ui;
+use std::{io::stdout, time::Duration};
 
 use color_eyre::Result;
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyCode, MouseButton, MouseEventKind,
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture, KeyCode, MouseButton, MouseEventKind},
+    execute,
 };
-use crossterm::execute;
-use std::io::stdout;
-use std::time::Duration;
+
+use crate::{
+    app::{self, App, TabId, UiMode},
+    event::{self, Event},
+    event_log::LevelExt,
+    ui,
+};
 
 /// Run the TUI event loop: replay initial state, then process events until quit.
 ///
@@ -21,11 +23,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     let daemon_rx = app.daemon.subscribe();
 
     // Get initial state via replay_since (works for both in-process and socket).
-    let replay_events = app
-        .daemon
-        .replay_since(&std::collections::HashMap::new())
-        .await
-        .unwrap_or_default();
+    let replay_events = app.daemon.replay_since(&std::collections::HashMap::new()).await.unwrap_or_default();
     for event in replay_events {
         app.handle_daemon_event(event);
     }
@@ -103,8 +101,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 
                             // Check event log filter area (click cycles level)
                             let ef = app.ui.layout.event_log_filter_area;
-                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height
-                            {
+                            if x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height {
                                 app.ui.event_log.filter = app.ui.event_log.filter.cycle();
                                 app.ui.event_log.count = 0;
                                 tab_clicked = true;
@@ -117,12 +114,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                                     .layout
                                     .tab_areas
                                     .iter()
-                                    .find(|(_, r)| {
-                                        x >= r.x
-                                            && x < r.x + r.width
-                                            && y >= r.y
-                                            && y < r.y + r.height
-                                    })
+                                    .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
                                     .map(|(id, _)| id.clone());
 
                                 match hit {
@@ -158,8 +150,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                         MouseEventKind::Drag(MouseButton::Left) => {
                             if let Some(dragging_idx) = app.ui.drag.dragging_tab {
                                 if !app.ui.drag.active {
-                                    let dx = (m.column as i16 - app.ui.drag.start_x as i16)
-                                        .unsigned_abs();
+                                    let dx = (m.column as i16 - app.ui.drag.start_x as i16).unsigned_abs();
                                     if dx >= 2 {
                                         app.ui.drag.active = true;
                                     }
@@ -206,17 +197,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         if scroll_delta != 0 {
             let (col, row) = last_scroll_pos.unwrap_or((0, 0));
             let abs = scroll_delta.unsigned_abs() as usize;
-            let kind = if scroll_delta > 0 {
-                MouseEventKind::ScrollDown
-            } else {
-                MouseEventKind::ScrollUp
-            };
-            let synthetic = crossterm::event::MouseEvent {
-                kind,
-                column: col,
-                row,
-                modifiers: crossterm::event::KeyModifiers::NONE,
-            };
+            let kind = if scroll_delta > 0 { MouseEventKind::ScrollDown } else { MouseEventKind::ScrollUp };
+            let synthetic = crossterm::event::MouseEvent { kind, column: col, row, modifiers: crossterm::event::KeyModifiers::NONE };
             for _ in 0..abs {
                 app.handle_mouse(synthetic);
             }

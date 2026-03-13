@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    ChangeRequest, Checkout, CloudAgentSession, HostPath, Issue, ProviderError, WorkItem,
-    WorkItemIdentity, Workspace,
-};
+use crate::{ChangeRequest, Checkout, CloudAgentSession, HostPath, Issue, ProviderError, WorkItem, WorkItemIdentity, Workspace};
 
 /// Operation on a keyed collection entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,10 +79,13 @@ pub struct DeltaEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_helpers::{assert_json_roundtrip, assert_roundtrip};
-    use crate::HostName;
     use std::path::PathBuf;
+
+    use super::*;
+    use crate::{
+        test_helpers::{assert_json_roundtrip, assert_roundtrip},
+        HostName,
+    };
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::new("test-host"), PathBuf::from(path))
@@ -130,10 +130,7 @@ mod tests {
 
     #[test]
     fn change_branch_removed_roundtrip() {
-        let change = Change::Branch {
-            key: "feature/old".into(),
-            op: EntryOp::Removed,
-        };
+        let change = Change::Branch { key: "feature/old".into(), op: EntryOp::Removed };
         assert_json_roundtrip(&change);
     }
 }

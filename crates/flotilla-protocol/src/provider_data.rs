@@ -182,8 +182,7 @@ pub struct ProviderData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::assert_roundtrip;
-    use crate::HostName;
+    use crate::{test_helpers::assert_roundtrip, HostName};
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::new("test-host"), PathBuf::from(path))
@@ -207,19 +206,9 @@ mod tests {
 
     #[test]
     fn primitive_structs_roundtrip_and_defaults() {
-        assert_roundtrip(&AheadBehind {
-            ahead: 3,
-            behind: 7,
-        });
-        assert_roundtrip(&CommitInfo {
-            short_sha: "abc1234".into(),
-            message: "fix: resolve flaky test".into(),
-        });
-        assert_roundtrip(&WorkingTreeStatus {
-            staged: 2,
-            modified: 5,
-            untracked: 10,
-        });
+        assert_roundtrip(&AheadBehind { ahead: 3, behind: 7 });
+        assert_roundtrip(&CommitInfo { short_sha: "abc1234".into(), message: "fix: resolve flaky test".into() });
+        assert_roundtrip(&WorkingTreeStatus { staged: 2, modified: 5, untracked: 10 });
 
         let status = WorkingTreeStatus::default();
         assert_eq!(status.staged, 0);
@@ -243,27 +232,11 @@ mod tests {
             Checkout {
                 branch: "feat-x".into(),
                 is_main: false,
-                trunk_ahead_behind: Some(AheadBehind {
-                    ahead: 2,
-                    behind: 1,
-                }),
-                remote_ahead_behind: Some(AheadBehind {
-                    ahead: 0,
-                    behind: 3,
-                }),
-                working_tree: Some(WorkingTreeStatus {
-                    staged: 1,
-                    modified: 2,
-                    untracked: 3,
-                }),
-                last_commit: Some(CommitInfo {
-                    short_sha: "abc".into(),
-                    message: "feat: add login".into(),
-                }),
-                correlation_keys: vec![
-                    CorrelationKey::Branch("feat-x".into()),
-                    CorrelationKey::CheckoutPath(hp("/repos/proj/wt-1")),
-                ],
+                trunk_ahead_behind: Some(AheadBehind { ahead: 2, behind: 1 }),
+                remote_ahead_behind: Some(AheadBehind { ahead: 0, behind: 3 }),
+                working_tree: Some(WorkingTreeStatus { staged: 1, modified: 2, untracked: 3 }),
+                last_commit: Some(CommitInfo { short_sha: "abc".into(), message: "feat: add login".into() }),
+                correlation_keys: vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(hp("/repos/proj/wt-1"))],
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
             },
         ];
@@ -301,12 +274,7 @@ mod tests {
             assert_roundtrip(case);
         }
 
-        for status in [
-            ChangeRequestStatus::Open,
-            ChangeRequestStatus::Draft,
-            ChangeRequestStatus::Merged,
-            ChangeRequestStatus::Closed,
-        ] {
+        for status in [ChangeRequestStatus::Open, ChangeRequestStatus::Draft, ChangeRequestStatus::Merged, ChangeRequestStatus::Closed] {
             assert_roundtrip(&status);
         }
     }
@@ -339,10 +307,7 @@ mod tests {
                 status: SessionStatus::Running,
                 model: Some("opus-4".into()),
                 updated_at: Some("2026-03-07T12:00:00Z".into()),
-                correlation_keys: vec![CorrelationKey::SessionRef(
-                    "claude".into(),
-                    "sess-abc".into(),
-                )],
+                correlation_keys: vec![CorrelationKey::SessionRef("claude".into(), "sess-abc".into())],
                 provider_name: String::new(),
                 provider_display_name: String::new(),
                 item_noun: String::new(),
@@ -362,29 +327,17 @@ mod tests {
             assert_roundtrip(case);
         }
 
-        for status in [
-            SessionStatus::Running,
-            SessionStatus::Idle,
-            SessionStatus::Archived,
-            SessionStatus::Expired,
-        ] {
+        for status in [SessionStatus::Running, SessionStatus::Idle, SessionStatus::Archived, SessionStatus::Expired] {
             assert_roundtrip(&status);
         }
 
         let workspace_cases = vec![
             Workspace {
                 name: "dev-session".into(),
-                directories: vec![
-                    PathBuf::from("/repos/proj/wt-1"),
-                    PathBuf::from("/repos/proj/wt-2"),
-                ],
+                directories: vec![PathBuf::from("/repos/proj/wt-1"), PathBuf::from("/repos/proj/wt-2")],
                 correlation_keys: vec![CorrelationKey::CheckoutPath(hp("/repos/proj/wt-1"))],
             },
-            Workspace {
-                name: "n".into(),
-                directories: vec![],
-                correlation_keys: vec![],
-            },
+            Workspace { name: "n".into(), directories: vec![], correlation_keys: vec![] },
         ];
         for case in &workspace_cases {
             assert_roundtrip(case);
@@ -395,11 +348,7 @@ mod tests {
     fn managed_terminal_roundtrip() {
         use crate::test_helpers::assert_roundtrip;
 
-        let id = ManagedTerminalId {
-            checkout: "my-feature".into(),
-            role: "shell".into(),
-            index: 0,
-        };
+        let id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
         assert_roundtrip(&id);
 
         let terminal = ManagedTerminal {
@@ -433,72 +382,56 @@ mod tests {
     #[test]
     fn issue_changeset_roundtrip() {
         let changeset = IssueChangeset {
-            updated: vec![(
-                "42".into(),
-                Issue {
-                    title: "Updated issue".into(),
-                    labels: vec!["bug".into()],
-                    association_keys: vec![],
-                    provider_name: String::new(),
-                    provider_display_name: String::new(),
-                },
-            )],
+            updated: vec![("42".into(), Issue {
+                title: "Updated issue".into(),
+                labels: vec!["bug".into()],
+                association_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            })],
             closed_ids: vec!["7".into(), "13".into()],
             has_more: false,
         };
         assert_roundtrip(&changeset);
 
         // Empty changeset
-        let empty = IssueChangeset {
-            updated: vec![],
-            closed_ids: vec![],
-            has_more: false,
-        };
+        let empty = IssueChangeset { updated: vec![], closed_ids: vec![], has_more: false };
         assert_roundtrip(&empty);
     }
 
     #[test]
     fn provider_data_roundtrip_and_preserves_indexmap_order() {
         let mut pd = ProviderData::default();
-        pd.change_requests.insert(
-            "3".into(),
-            ChangeRequest {
-                title: "Third".into(),
-                branch: "b3".into(),
-                status: ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
-        pd.change_requests.insert(
-            "1".into(),
-            ChangeRequest {
-                title: "First".into(),
-                branch: "b1".into(),
-                status: ChangeRequestStatus::Draft,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
-        pd.checkouts.insert(
-            hp("/repos/proj"),
-            Checkout {
-                branch: "main".into(),
-                is_main: true,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-            },
-        );
+        pd.change_requests.insert("3".into(), ChangeRequest {
+            title: "Third".into(),
+            branch: "b3".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
+        pd.change_requests.insert("1".into(), ChangeRequest {
+            title: "First".into(),
+            branch: "b1".into(),
+            status: ChangeRequestStatus::Draft,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
+        pd.checkouts.insert(hp("/repos/proj"), Checkout {
+            branch: "main".into(),
+            is_main: true,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+        });
 
         assert_roundtrip(&pd);
 

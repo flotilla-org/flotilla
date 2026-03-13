@@ -1,13 +1,9 @@
-use flotilla_core::config::ConfigStore;
-use flotilla_core::daemon::DaemonHandle;
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_tui::app;
-use flotilla_tui::event_log;
+use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
-use std::path::PathBuf;
-use std::sync::Arc;
+use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_tui::{app, event_log};
 use tracing::info;
 
 /// Flotilla: TUI dashboard for managing development workspaces
@@ -50,15 +46,11 @@ enum SubCommand {
 
 impl Cli {
     fn config_dir(&self) -> PathBuf {
-        self.config_dir
-            .clone()
-            .unwrap_or_else(flotilla_core::config::flotilla_config_dir)
+        self.config_dir.clone().unwrap_or_else(flotilla_core::config::flotilla_config_dir)
     }
 
     fn socket_path(&self) -> PathBuf {
-        self.socket
-            .clone()
-            .unwrap_or_else(|| self.config_dir().join("flotilla.sock"))
+        self.socket.clone().unwrap_or_else(|| self.config_dir().join("flotilla.sock"))
     }
 }
 
@@ -115,14 +107,9 @@ async fn run_tui(cli: Cli) -> Result<()> {
             Ok(d as Arc<dyn DaemonHandle>)
         } else {
             let socket_path = cli.socket_path();
-            flotilla_tui::socket::connect_or_spawn(
-                &socket_path,
-                &cli.config_dir(),
-                cli.config_dir.as_deref(),
-                cli.socket.as_deref(),
-            )
-            .await
-            .map(|d| d as Arc<dyn DaemonHandle>)
+            flotilla_tui::socket::connect_or_spawn(&socket_path, &cli.config_dir(), cli.config_dir.as_deref(), cli.socket.as_deref())
+                .await
+                .map(|d| d as Arc<dyn DaemonHandle>)
         };
         daemon
     });
@@ -164,19 +151,13 @@ async fn run_tui(cli: Cli) -> Result<()> {
 }
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
-    flotilla_daemon::cli::run(&cli.socket_path(), timeout_secs)
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e))
+    flotilla_daemon::cli::run(&cli.socket_path(), timeout_secs).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 async fn run_status(cli: &Cli) -> Result<()> {
-    flotilla_tui::cli::run_status(&cli.socket_path())
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e))
+    flotilla_tui::cli::run_status(&cli.socket_path()).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 async fn run_watch(cli: &Cli) -> Result<()> {
-    flotilla_tui::cli::run_watch(&cli.socket_path())
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e))
+    flotilla_tui::cli::run_watch(&cli.socket_path()).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }

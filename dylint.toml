@@ -1,0 +1,3 @@
+# Inline path lint configuration.
+# Paths with more than this many segments (including crate/self/super prefix) warn.
+max_inline_segments = 3

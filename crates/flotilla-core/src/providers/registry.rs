@@ -1,13 +1,17 @@
-use crate::providers::ai_utility::AiUtility;
-use crate::providers::code_review::CodeReview;
-use crate::providers::coding_agent::CloudAgentService;
-use crate::providers::discovery::ProviderDescriptor;
-use crate::providers::issue_tracker::IssueTracker;
-use crate::providers::terminal::TerminalPool;
-use crate::providers::vcs::{CheckoutManager, Vcs};
-use crate::providers::workspace::WorkspaceManager;
-use indexmap::IndexMap;
 use std::sync::Arc;
+
+use indexmap::IndexMap;
+
+use crate::providers::{
+    ai_utility::AiUtility,
+    code_review::CodeReview,
+    coding_agent::CloudAgentService,
+    discovery::ProviderDescriptor,
+    issue_tracker::IssueTracker,
+    terminal::TerminalPool,
+    vcs::{CheckoutManager, Vcs},
+    workspace::WorkspaceManager,
+};
 
 pub struct ProviderRegistry {
     pub vcs: IndexMap<String, (ProviderDescriptor, Arc<dyn Vcs>)>,

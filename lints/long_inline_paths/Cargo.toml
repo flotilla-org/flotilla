@@ -1,0 +1,18 @@
+[package]
+name = "long_inline_paths"
+version = "0.1.0"
+description = "Dylint lint: warn on long inline crate::/self::/super:: paths"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "5.0.0"
+
+[dev-dependencies]
+dylint_testing = "5.0.0"
+
+[package.metadata.rust-analyzer]
+rustc_private = true

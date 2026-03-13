@@ -1,5 +1,7 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use flotilla_protocol::{ManagedTerminal, ManagedTerminalId, TerminalStatus};
@@ -25,10 +27,7 @@ impl ShpoolTerminalPool {
     /// Create a new ShpoolTerminalPool, cleaning up stale sockets and
     /// spawning the daemon with flotilla's managed config.
     pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
-        let config_path = socket_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("config.toml");
+        let config_path = socket_path.parent().unwrap_or(Path::new(".")).join("config.toml");
         let config_stale = Self::config_needs_update(&config_path);
         Self::clean_stale_socket(&socket_path);
         if config_stale && socket_path.exists() {
@@ -53,26 +52,15 @@ impl ShpoolTerminalPool {
             Self::write_config(&config_path);
         }
         Self::start_daemon(&socket_path, &config_path).await;
-        Self {
-            runner,
-            socket_path,
-            config_path,
-        }
+        Self { runner, socket_path, config_path }
     }
 
     /// Sync constructor for tests — skips daemon lifecycle.
     #[cfg(test)]
     pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
-        let config_path = socket_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("config.toml");
+        let config_path = socket_path.parent().unwrap_or(Path::new(".")).join("config.toml");
         Self::write_config(&config_path);
-        Self {
-            runner,
-            socket_path,
-            config_path,
-        }
+        Self { runner, socket_path, config_path }
     }
 
     /// Check if a process is alive. Returns true for both "alive and ours"
@@ -95,14 +83,8 @@ impl ShpoolTerminalPool {
         use sysinfo::{Pid, System};
         let mut sys = System::new();
         let sysinfo_pid = Pid::from(pid as usize);
-        sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]),
-            true,
-            sysinfo::ProcessRefreshKind::nothing(),
-        );
-        sys.process(sysinfo_pid)
-            .map(|p| p.name().to_string_lossy().contains(expected_name))
-            .unwrap_or(false)
+        sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]), true, sysinfo::ProcessRefreshKind::nothing());
+        sys.process(sysinfo_pid).map(|p| p.name().to_string_lossy().contains(expected_name)).unwrap_or(false)
     }
 
     /// Remove stale shpool socket and pid files when the daemon is dead.
@@ -314,18 +296,13 @@ impl ShpoolTerminalPool {
 
     /// Parse the JSON output of `shpool list --json`.
     fn parse_list_json(json: &str) -> Result<Vec<ManagedTerminal>, String> {
-        let parsed: serde_json::Value =
-            serde_json::from_str(json).map_err(|e| format!("failed to parse shpool list: {e}"))?;
+        let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("failed to parse shpool list: {e}"))?;
 
-        let sessions = parsed["sessions"]
-            .as_array()
-            .ok_or("shpool list: no sessions array")?;
+        let sessions = parsed["sessions"].as_array().ok_or("shpool list: no sessions array")?;
 
         let mut terminals = Vec::new();
         for session in sessions {
-            let name = session["name"]
-                .as_str()
-                .ok_or("shpool session missing name")?;
+            let name = session["name"].as_str().ok_or("shpool session missing name")?;
 
             // Only show flotilla-managed sessions (prefixed "flotilla/")
             let Some(rest) = name.strip_prefix("flotilla/") else {
@@ -342,10 +319,7 @@ impl ShpoolTerminalPool {
             };
             let index: u32 = index_str.parse().unwrap_or(0);
 
-            let status_str = session["status"]
-                .as_str()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let status_str = session["status"].as_str().unwrap_or("").to_ascii_lowercase();
             let status = match status_str.as_str() {
                 "attached" => TerminalStatus::Running,
                 "disconnected" => TerminalStatus::Disconnected,
@@ -353,13 +327,9 @@ impl ShpoolTerminalPool {
             };
 
             terminals.push(ManagedTerminal {
-                id: ManagedTerminalId {
-                    checkout: checkout.into(),
-                    role: role.into(),
-                    index,
-                },
+                id: ManagedTerminalId { checkout: checkout.into(), role: role.into(), index },
                 role: role.into(),
-                command: String::new(), // shpool doesn't report the original command
+                command: String::new(),            // shpool doesn't report the original command
                 working_directory: PathBuf::new(), // populated separately if needed
                 status,
             });
@@ -374,19 +344,7 @@ impl TerminalPool for ShpoolTerminalPool {
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
-        let result = run!(
-            self.runner,
-            "shpool",
-            &[
-                "--socket",
-                &socket_path_str,
-                "-c",
-                &config_path_str,
-                "list",
-                "--json"
-            ],
-            Path::new("/")
-        );
+        let result = run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "list", "--json"], Path::new("/"));
 
         match result {
             Ok(json) => Self::parse_list_json(&json),
@@ -397,23 +355,13 @@ impl TerminalPool for ShpoolTerminalPool {
         }
     }
 
-    async fn ensure_running(
-        &self,
-        _id: &ManagedTerminalId,
-        _command: &str,
-        _cwd: &Path,
-    ) -> Result<(), String> {
+    async fn ensure_running(&self, _id: &ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<(), String> {
         // No-op: shpool creates sessions on first `attach`. The actual session
         // creation happens when the workspace manager runs the attach_command.
         Ok(())
     }
 
-    async fn attach_command(
-        &self,
-        id: &ManagedTerminalId,
-        command: &str,
-        cwd: &Path,
-    ) -> Result<String, String> {
+    async fn attach_command(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<String, String> {
         let session_name = format!("flotilla/{id}");
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
@@ -451,20 +399,8 @@ impl TerminalPool for ShpoolTerminalPool {
         let session_name = format!("flotilla/{id}");
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
-        run!(
-            self.runner,
-            "shpool",
-            &[
-                "--socket",
-                &socket_path_str,
-                "-c",
-                &config_path_str,
-                "kill",
-                &session_name
-            ],
-            Path::new("/")
-        )
-        .map(|_| ())
+        run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "kill", &session_name], Path::new("/"))
+            .map(|_| ())
     }
 }
 
@@ -486,8 +422,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let config_path = dir.path().join("config.toml");
         assert!(ShpoolTerminalPool::write_config(&config_path));
-        let content =
-            std::fs::read_to_string(&config_path).expect("config should have been written");
+        let content = std::fs::read_to_string(&config_path).expect("config should have been written");
         assert!(content.contains("prompt_prefix = \"\""));
         assert!(content.contains("TERMINFO"));
         assert!(content.contains("COLORTERM"));
@@ -589,29 +524,15 @@ mod tests {
     #[tokio::test]
     async fn ensure_running_is_noop() {
         let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
-        let id = ManagedTerminalId {
-            checkout: "feat".into(),
-            role: "shell".into(),
-            index: 0,
-        };
-        assert!(pool
-            .ensure_running(&id, "bash", Path::new("/home/dev"))
-            .await
-            .is_ok());
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
+        assert!(pool.ensure_running(&id, "bash", Path::new("/home/dev")).await.is_ok());
     }
 
     #[tokio::test]
     async fn attach_command_includes_cmd_dir_and_config() {
         let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
-        let id = ManagedTerminalId {
-            checkout: "feat".into(),
-            role: "shell".into(),
-            index: 0,
-        };
-        let cmd = pool
-            .attach_command(&id, "bash", Path::new("/home/dev"))
-            .await
-            .unwrap();
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
+        let cmd = pool.attach_command(&id, "bash", Path::new("/home/dev")).await.unwrap();
         assert!(cmd.contains("shpool"));
         assert!(cmd.contains("attach"));
         assert!(cmd.contains("--cmd"));
@@ -621,24 +542,14 @@ mod tests {
         assert!(cmd.contains("/home/dev"));
         assert!(cmd.contains("flotilla/feat/shell/0"));
         assert!(cmd.contains("-c"), "should pass config file: {cmd}");
-        assert!(
-            cmd.contains("config.toml"),
-            "should reference config.toml: {cmd}"
-        );
+        assert!(cmd.contains("config.toml"), "should reference config.toml: {cmd}");
     }
 
     #[tokio::test]
     async fn attach_command_empty_cmd_omits_cmd_flag() {
         let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
-        let id = ManagedTerminalId {
-            checkout: "feat".into(),
-            role: "shell".into(),
-            index: 0,
-        };
-        let cmd = pool
-            .attach_command(&id, "", Path::new("/home/dev"))
-            .await
-            .unwrap();
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
+        let cmd = pool.attach_command(&id, "", Path::new("/home/dev")).await.unwrap();
         assert!(cmd.contains("shpool"));
         assert!(cmd.contains("attach"));
         assert!(!cmd.contains("--cmd"));
@@ -648,9 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_terminals_returns_empty_when_daemon_not_running() {
-        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![Err(
-            "connection refused".into()
-        )])));
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![Err("connection refused".into())])));
         let terminals = pool.list_terminals().await.unwrap();
         assert!(terminals.is_empty());
     }
@@ -748,19 +657,10 @@ mod tests {
 
         ShpoolTerminalPool::stop_daemon(&socket_path, "sleep").await;
 
-        assert!(
-            !socket_path.exists(),
-            "socket should be removed after SIGTERM"
-        );
-        assert!(
-            !pid_path.exists(),
-            "pid file should be removed after SIGTERM"
-        );
+        assert!(!socket_path.exists(), "socket should be removed after SIGTERM");
+        assert!(!pid_path.exists(), "pid file should be removed after SIGTERM");
         // Process should be dead
-        assert!(
-            !ShpoolTerminalPool::is_process_alive(pid as i32),
-            "process should be dead after SIGTERM"
-        );
+        assert!(!ShpoolTerminalPool::is_process_alive(pid as i32), "process should be dead after SIGTERM");
     }
 
     #[tokio::test]
@@ -789,10 +689,7 @@ mod tests {
         assert!(!socket_path.exists(), "socket should be removed");
         assert!(!pid_path.exists(), "pid file should be removed");
         // Process should still be alive — we didn't SIGTERM it
-        assert!(
-            ShpoolTerminalPool::is_process_alive(pid as i32),
-            "non-shpool process should NOT be killed"
-        );
+        assert!(ShpoolTerminalPool::is_process_alive(pid as i32), "non-shpool process should NOT be killed");
 
         // Clean up the sleep process
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };

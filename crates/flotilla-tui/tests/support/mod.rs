@@ -1,24 +1,17 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use ratatui::backend::TestBackend;
-use ratatui::Terminal;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use flotilla_core::data::{group_work_items, SectionLabels};
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
-    CorrelationKey, Issue, ProviderData, RepoLabels, SessionStatus, WorkItem,
+    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, ProviderData, RepoLabels,
+    SessionStatus, WorkItem,
 };
-use flotilla_tui::app::{
-    InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState,
-};
-use flotilla_tui::ui;
-
 // Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
-pub use flotilla_tui::app::test_builders::{
-    checkout_item, issue_item, pr_item, repo_info, session_item,
+pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
+use flotilla_tui::{
+    app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState},
+    ui,
 };
+use ratatui::{backend::TestBackend, Terminal};
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
@@ -37,13 +30,7 @@ impl TestHarness {
         let info = test_repo_info("empty");
         let model = TuiModel::from_repo_info(vec![info]);
         let ui = UiState::new(&model.repo_order);
-        Self {
-            model,
-            ui,
-            in_flight: HashMap::new(),
-            width: WIDTH,
-            height: HEIGHT,
-        }
+        Self { model, ui, in_flight: HashMap::new(), width: WIDTH, height: HEIGHT }
     }
 
     /// Single repo with given name, empty data.
@@ -51,13 +38,7 @@ impl TestHarness {
         let info = test_repo_info(name);
         let model = TuiModel::from_repo_info(vec![info]);
         let ui = UiState::new(&model.repo_order);
-        Self {
-            model,
-            ui,
-            in_flight: HashMap::new(),
-            width: WIDTH,
-            height: HEIGHT,
-        }
+        Self { model, ui, in_flight: HashMap::new(), width: WIDTH, height: HEIGHT }
     }
 
     /// Multiple repos by name, all with empty data.
@@ -65,13 +46,7 @@ impl TestHarness {
         let infos = names.iter().map(|n| test_repo_info(n)).collect();
         let model = TuiModel::from_repo_info(infos);
         let ui = UiState::new(&model.repo_order);
-        Self {
-            model,
-            ui,
-            in_flight: HashMap::new(),
-            width: WIDTH,
-            height: HEIGHT,
-        }
+        Self { model, ui, in_flight: HashMap::new(), width: WIDTH, height: HEIGHT }
     }
 
     /// Override the terminal height for this test.
@@ -108,26 +83,15 @@ impl TestHarness {
         let path = PathBuf::from(format!("/test/{repo}"));
         let rm = self.model.repos.get_mut(&path).unwrap();
         for (category, name) in names {
-            rm.provider_names
-                .entry(category.to_string())
-                .or_default()
-                .push(name.to_string());
+            rm.provider_names.entry(category.to_string()).or_default().push(name.to_string());
         }
         self
     }
 
     /// Set a provider status for a repo.
-    pub fn with_provider_status(
-        mut self,
-        repo: &str,
-        category: &str,
-        provider: &str,
-        status: ProviderStatus,
-    ) -> Self {
+    pub fn with_provider_status(mut self, repo: &str, category: &str, provider: &str, status: ProviderStatus) -> Self {
         let path = PathBuf::from(format!("/test/{repo}"));
-        self.model
-            .provider_statuses
-            .insert((path, category.to_string(), provider.to_string()), status);
+        self.model.provider_statuses.insert((path, category.to_string(), provider.to_string()), status);
         self
     }
 
@@ -170,26 +134,10 @@ fn test_repo_info(name: &str) -> flotilla_protocol::RepoInfo {
 
 fn test_labels() -> RepoLabels {
     RepoLabels {
-        checkouts: CategoryLabels {
-            section: "Checkouts".into(),
-            noun: "worktree".into(),
-            abbr: "WT".into(),
-        },
-        code_review: CategoryLabels {
-            section: "Pull Requests".into(),
-            noun: "PR".into(),
-            abbr: "PR".into(),
-        },
-        issues: CategoryLabels {
-            section: "Issues".into(),
-            noun: "issue".into(),
-            abbr: "IS".into(),
-        },
-        cloud_agents: CategoryLabels {
-            section: "Sessions".into(),
-            noun: "session".into(),
-            abbr: "SS".into(),
-        },
+        checkouts: CategoryLabels { section: "Checkouts".into(), noun: "worktree".into(), abbr: "WT".into() },
+        code_review: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "PR".into() },
+        issues: CategoryLabels { section: "Issues".into(), noun: "issue".into(), abbr: "IS".into() },
+        cloud_agents: CategoryLabels { section: "Sessions".into(), noun: "session".into(), abbr: "SS".into() },
     }
 }
 
@@ -209,13 +157,8 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
 
 // ── Provider data builders (unique to snapshot tests) ───────────────────
 
-pub fn make_checkout(
-    branch: &str,
-    path: &str,
-    is_main: bool,
-) -> (flotilla_protocol::HostPath, Checkout) {
-    let key =
-        flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from(path));
+pub fn make_checkout(branch: &str, path: &str, is_main: bool) -> (flotilla_protocol::HostPath, Checkout) {
+    let key = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from(path));
     let checkout = Checkout {
         branch: branch.to_string(),
         is_main,
@@ -223,10 +166,7 @@ pub fn make_checkout(
         remote_ahead_behind: None,
         working_tree: None,
         last_commit: None,
-        correlation_keys: vec![
-            CorrelationKey::Branch(branch.to_string()),
-            CorrelationKey::CheckoutPath(key.clone()),
-        ],
+        correlation_keys: vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(key.clone())],
         association_keys: vec![],
     };
     (key, checkout)

@@ -26,19 +26,14 @@ pub fn merge_provider_data(
         // Merge managed terminals with host-namespaced keys
         for (name, terminal) in &peer_data.managed_terminals {
             let namespaced = format!("{}:{}", peer_host, name);
-            merged
-                .managed_terminals
-                .insert(namespaced, terminal.clone());
+            merged.managed_terminals.insert(namespaced, terminal.clone());
         }
 
         // Merge branches from peers. Followers don't run the remote-branch
         // provider, so peer branch maps are expected to be empty.
         // "or_insert" keeps local data if both sides have the same key.
         for (name, branch) in &peer_data.branches {
-            merged
-                .branches
-                .entry(name.clone())
-                .or_insert_with(|| branch.clone());
+            merged.branches.entry(name.clone()).or_insert_with(|| branch.clone());
         }
 
         // Merge workspaces from peers
@@ -51,22 +46,13 @@ pub fn merge_provider_data(
         // Followers don't poll external APIs so their maps are empty — no
         // conflict. We merge unconditionally so followers see leader's data.
         for (key, cr) in &peer_data.change_requests {
-            merged
-                .change_requests
-                .entry(key.clone())
-                .or_insert_with(|| cr.clone());
+            merged.change_requests.entry(key.clone()).or_insert_with(|| cr.clone());
         }
         for (key, issue) in &peer_data.issues {
-            merged
-                .issues
-                .entry(key.clone())
-                .or_insert_with(|| issue.clone());
+            merged.issues.entry(key.clone()).or_insert_with(|| issue.clone());
         }
         for (key, session) in &peer_data.sessions {
-            merged
-                .sessions
-                .entry(key.clone())
-                .or_insert_with(|| session.clone());
+            merged.sessions.entry(key.clone()).or_insert_with(|| session.clone());
         }
     }
 

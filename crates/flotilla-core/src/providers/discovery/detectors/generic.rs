@@ -2,8 +2,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::providers::discovery::{EnvVars, EnvironmentAssertion, HostDetector};
-use crate::providers::{run, CommandRunner};
+use crate::providers::{
+    discovery::{EnvVars, EnvironmentAssertion, HostDetector},
+    run, CommandRunner,
+};
 
 pub type VersionParser = fn(&str) -> Option<String>;
 
@@ -19,14 +21,8 @@ impl EnvVarDetector {
 
 #[async_trait]
 impl HostDetector for EnvVarDetector {
-    async fn detect(
-        &self,
-        _runner: &dyn CommandRunner,
-        env: &dyn EnvVars,
-    ) -> Vec<EnvironmentAssertion> {
-        env.get(self.key)
-            .map(|value| vec![EnvironmentAssertion::env_var(self.key, value)])
-            .unwrap_or_default()
+    async fn detect(&self, _runner: &dyn CommandRunner, env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
+        env.get(self.key).map(|value| vec![EnvironmentAssertion::env_var(self.key, value)]).unwrap_or_default()
     }
 }
 
@@ -37,34 +33,18 @@ pub struct CommandDetector {
 }
 
 impl CommandDetector {
-    pub fn new(
-        command: &'static str,
-        args: &'static [&'static str],
-        version_parser: VersionParser,
-    ) -> Self {
-        Self {
-            command,
-            args,
-            version_parser,
-        }
+    pub fn new(command: &'static str, args: &'static [&'static str], version_parser: VersionParser) -> Self {
+        Self { command, args, version_parser }
     }
 }
 
 #[async_trait]
 impl HostDetector for CommandDetector {
-    async fn detect(
-        &self,
-        runner: &dyn CommandRunner,
-        _env: &dyn EnvVars,
-    ) -> Vec<EnvironmentAssertion> {
+    async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
         run!(runner, self.command, self.args, Path::new("."))
             .ok()
             .map(|output| match (self.version_parser)(&output) {
-                Some(version) => vec![EnvironmentAssertion::versioned_binary(
-                    self.command,
-                    self.command,
-                    version,
-                )],
+                Some(version) => vec![EnvironmentAssertion::versioned_binary(self.command, self.command, version)],
                 None => vec![EnvironmentAssertion::binary(self.command, self.command)],
             })
             .unwrap_or_default()
@@ -117,18 +97,16 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
-    use std::path::PathBuf;
 
     #[test]
     fn parse_first_dotted_version_handles_supported_outputs() {
         let cases = [
             ("git version 2.43.0\n", Some("2.43.0")),
-            (
-                "gh version 2.49.0 (2024-05-13)\nhttps://github.com/cli/cli\n",
-                Some("2.49.0"),
-            ),
+            ("gh version 2.49.0 (2024-05-13)\nhttps://github.com/cli/cli\n", Some("2.49.0")),
             ("1.0.20 (Claude Code)\n", Some("1.0.20")),
             ("zellij 0.40.1\n", Some("0.40.1")),
             ("0.1.0\n", Some("0.1.0")),
@@ -158,9 +136,7 @@ mod tests {
     #[tokio::test]
     async fn command_detector_uses_command_name_for_assertion() {
         let detector = CommandDetector::new("gh", &["--version"], parse_first_dotted_version);
-        let runner = DiscoveryMockRunner::builder()
-            .on_run("gh", &["--version"], Ok("gh version 2.49.0\n".into()))
-            .build();
+        let runner = DiscoveryMockRunner::builder().on_run("gh", &["--version"], Ok("gh version 2.49.0\n".into())).build();
 
         let assertions = detector.detect(&runner, &TestEnvVars::default()).await;
 

@@ -3,13 +3,14 @@ pub use flotilla_core::merge::merge_provider_data;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
     use flotilla_protocol::{
-        ChangeRequest, ChangeRequestStatus, Checkout, HostName, HostPath, ManagedTerminal,
-        ManagedTerminalId, ProviderData, TerminalStatus,
+        ChangeRequest, ChangeRequestStatus, Checkout, HostName, HostPath, ManagedTerminal, ManagedTerminalId, ProviderData, TerminalStatus,
     };
     use indexmap::IndexMap;
-    use std::path::PathBuf;
+
+    use super::*;
 
     fn make_checkout(branch: &str) -> Checkout {
         Checkout {
@@ -26,11 +27,7 @@ mod tests {
 
     fn make_terminal(name: &str) -> ManagedTerminal {
         ManagedTerminal {
-            id: ManagedTerminalId {
-                checkout: "main".into(),
-                role: "shell".into(),
-                index: 0,
-            },
+            id: ManagedTerminalId { checkout: "main".into(), role: "shell".into(), index: 0 },
             role: "shell".into(),
             command: "$SHELL".into(),
             working_directory: PathBuf::from(format!("/home/dev/{name}")),
@@ -41,41 +38,24 @@ mod tests {
     #[test]
     fn merge_combines_checkouts_from_multiple_hosts() {
         let local = ProviderData {
-            checkouts: IndexMap::from([(
-                HostPath::new(HostName::new("laptop"), "/home/dev/repo"),
-                make_checkout("main"),
-            )]),
+            checkouts: IndexMap::from([(HostPath::new(HostName::new("laptop"), "/home/dev/repo"), make_checkout("main"))]),
             ..Default::default()
         };
         let remote = ProviderData {
-            checkouts: IndexMap::from([(
-                HostPath::new(HostName::new("desktop"), "/home/dev/repo"),
-                make_checkout("feature"),
-            )]),
+            checkouts: IndexMap::from([(HostPath::new(HostName::new("desktop"), "/home/dev/repo"), make_checkout("feature"))]),
             ..Default::default()
         };
-        let merged = merge_provider_data(
-            &local,
-            &HostName::new("laptop"),
-            &[(HostName::new("desktop"), &remote)],
-        );
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.checkouts.len(), 2);
-        assert!(merged
-            .checkouts
-            .contains_key(&HostPath::new(HostName::new("laptop"), "/home/dev/repo")));
-        assert!(merged
-            .checkouts
-            .contains_key(&HostPath::new(HostName::new("desktop"), "/home/dev/repo")));
+        assert!(merged.checkouts.contains_key(&HostPath::new(HostName::new("laptop"), "/home/dev/repo")));
+        assert!(merged.checkouts.contains_key(&HostPath::new(HostName::new("desktop"), "/home/dev/repo")));
     }
 
     #[test]
     fn merge_does_not_duplicate_local_checkouts() {
         let local_host = HostName::new("laptop");
         let local = ProviderData {
-            checkouts: IndexMap::from([(
-                HostPath::new(local_host.clone(), "/home/dev/repo"),
-                make_checkout("main"),
-            )]),
+            checkouts: IndexMap::from([(HostPath::new(local_host.clone(), "/home/dev/repo"), make_checkout("main"))]),
             ..Default::default()
         };
         let merged = merge_provider_data(&local, &local_host, &[]);
@@ -86,14 +66,8 @@ mod tests {
     fn merge_namespaces_terminal_names() {
         let local = ProviderData::default();
         let mut remote = ProviderData::default();
-        remote
-            .managed_terminals
-            .insert("session1".into(), make_terminal("session1"));
-        let merged = merge_provider_data(
-            &local,
-            &HostName::new("laptop"),
-            &[(HostName::new("desktop"), &remote)],
-        );
+        remote.managed_terminals.insert("session1".into(), make_terminal("session1"));
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert!(merged.managed_terminals.contains_key("desktop:session1"));
         assert!(!merged.managed_terminals.contains_key("session1"));
     }
@@ -101,25 +75,18 @@ mod tests {
     #[test]
     fn merge_preserves_local_service_data() {
         let mut local = ProviderData::default();
-        local.change_requests.insert(
-            "PR-1".into(),
-            ChangeRequest {
-                title: "Fix bug".into(),
-                branch: "fix-bug".into(),
-                status: ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
+        local.change_requests.insert("PR-1".into(), ChangeRequest {
+            title: "Fix bug".into(),
+            branch: "fix-bug".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
         let remote = ProviderData::default();
-        let merged = merge_provider_data(
-            &local,
-            &HostName::new("laptop"),
-            &[(HostName::new("desktop"), &remote)],
-        );
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.change_requests.len(), 1);
         assert!(merged.change_requests.contains_key("PR-1"));
     }
@@ -127,28 +94,18 @@ mod tests {
     #[test]
     fn merge_combines_terminals_from_multiple_peers() {
         let mut local = ProviderData::default();
-        local
-            .managed_terminals
-            .insert("local-shell".into(), make_terminal("local"));
+        local.managed_terminals.insert("local-shell".into(), make_terminal("local"));
 
         let mut peer_a = ProviderData::default();
-        peer_a
-            .managed_terminals
-            .insert("shell".into(), make_terminal("peer-a"));
+        peer_a.managed_terminals.insert("shell".into(), make_terminal("peer-a"));
 
         let mut peer_b = ProviderData::default();
-        peer_b
-            .managed_terminals
-            .insert("shell".into(), make_terminal("peer-b"));
+        peer_b.managed_terminals.insert("shell".into(), make_terminal("peer-b"));
 
-        let merged = merge_provider_data(
-            &local,
-            &HostName::new("laptop"),
-            &[
-                (HostName::new("desktop"), &peer_a),
-                (HostName::new("server"), &peer_b),
-            ],
-        );
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[
+            (HostName::new("desktop"), &peer_a),
+            (HostName::new("server"), &peer_b),
+        ]);
         assert_eq!(merged.managed_terminals.len(), 3);
         assert!(merged.managed_terminals.contains_key("local-shell"));
         assert!(merged.managed_terminals.contains_key("desktop:shell"));
@@ -158,23 +115,17 @@ mod tests {
     #[test]
     fn merge_with_empty_peers_returns_local_unchanged() {
         let mut local = ProviderData::default();
-        local.checkouts.insert(
-            HostPath::new(HostName::new("laptop"), "/repo"),
-            make_checkout("main"),
-        );
-        local.change_requests.insert(
-            "PR-1".into(),
-            ChangeRequest {
-                title: "T".into(),
-                branch: "b".into(),
-                status: ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
+        local.checkouts.insert(HostPath::new(HostName::new("laptop"), "/repo"), make_checkout("main"));
+        local.change_requests.insert("PR-1".into(), ChangeRequest {
+            title: "T".into(),
+            branch: "b".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[]);
         assert_eq!(merged, local);
     }
@@ -184,19 +135,9 @@ mod tests {
         // If a peer sends updated checkout data for the same HostPath,
         // the peer's version should overwrite the local one.
         let host_path = HostPath::new(HostName::new("desktop"), "/repo");
-        let local = ProviderData {
-            checkouts: IndexMap::from([(host_path.clone(), make_checkout("old-branch"))]),
-            ..Default::default()
-        };
-        let remote = ProviderData {
-            checkouts: IndexMap::from([(host_path.clone(), make_checkout("new-branch"))]),
-            ..Default::default()
-        };
-        let merged = merge_provider_data(
-            &local,
-            &HostName::new("laptop"),
-            &[(HostName::new("desktop"), &remote)],
-        );
+        let local = ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("old-branch"))]), ..Default::default() };
+        let remote = ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("new-branch"))]), ..Default::default() };
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.checkouts.len(), 1);
         assert_eq!(merged.checkouts[&host_path].branch, "new-branch");
     }

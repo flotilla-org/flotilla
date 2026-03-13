@@ -1,17 +1,21 @@
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::path::Path;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::Path,
+    sync::Arc,
+};
 
 // Re-export protocol types that are used throughout the crate and by consumers.
 pub use flotilla_protocol::{CheckoutRef, CheckoutStatus, WorkItemIdentity, WorkItemKind};
 
-use crate::provider_data::ProviderData;
-use crate::providers::correlation::{
-    self, CorrelatedGroup, CorrelatedItem, ItemKind as CorItemKind, ProviderItemKey,
+use crate::{
+    provider_data::ProviderData,
+    providers::{
+        correlation::{self, CorrelatedGroup, CorrelatedItem, ItemKind as CorItemKind, ProviderItemKey},
+        run,
+        types::{AssociationKey, CorrelationKey},
+    },
 };
-use crate::providers::run;
-use crate::providers::types::AssociationKey;
 
 #[derive(Debug, Clone)]
 pub struct RefreshError {
@@ -68,14 +72,8 @@ pub struct CorrelatedWorkItem {
 
 #[derive(Debug, Clone)]
 pub enum StandaloneResult {
-    Issue {
-        key: String,
-        description: String,
-        source: String,
-    },
-    RemoteBranch {
-        branch: String,
-    },
+    Issue { key: String, description: String, source: String },
+    RemoteBranch { branch: String },
 }
 
 #[derive(Debug, Clone)]
@@ -102,9 +100,7 @@ impl CorrelationResult {
     pub fn branch(&self) -> Option<&str> {
         match self {
             CorrelationResult::Correlated(c) => c.branch.as_deref(),
-            CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch }) => {
-                Some(branch.as_str())
-            }
+            CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch }) => Some(branch.as_str()),
             CorrelationResult::Standalone(StandaloneResult::Issue { .. }) => None,
         }
     }
@@ -112,9 +108,7 @@ impl CorrelationResult {
     pub fn description(&self) -> &str {
         match self {
             CorrelationResult::Correlated(c) => &c.description,
-            CorrelationResult::Standalone(StandaloneResult::Issue { description, .. }) => {
-                description
-            }
+            CorrelationResult::Standalone(StandaloneResult::Issue { description, .. }) => description,
             CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch }) => branch,
         }
     }
@@ -160,9 +154,7 @@ impl CorrelationResult {
     pub fn issue_keys(&self) -> &[String] {
         match self {
             CorrelationResult::Correlated(c) => &c.linked_issues,
-            CorrelationResult::Standalone(StandaloneResult::Issue { key, .. }) => {
-                std::slice::from_ref(key)
-            }
+            CorrelationResult::Standalone(StandaloneResult::Issue { key, .. }) => std::slice::from_ref(key),
             CorrelationResult::Standalone(StandaloneResult::RemoteBranch { .. }) => &[],
         }
     }
@@ -220,16 +212,12 @@ impl CorrelationResult {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
                 CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(co.key.clone()),
-                CorrelatedAnchor::ChangeRequest(key) => {
-                    WorkItemIdentity::ChangeRequest(key.clone())
-                }
+                CorrelatedAnchor::ChangeRequest(key) => WorkItemIdentity::ChangeRequest(key.clone()),
                 CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
             },
             CorrelationResult::Standalone(s) => match s {
                 StandaloneResult::Issue { key, .. } => WorkItemIdentity::Issue(key.clone()),
-                StandaloneResult::RemoteBranch { branch } => {
-                    WorkItemIdentity::RemoteBranch(branch.clone())
-                }
+                StandaloneResult::RemoteBranch { branch } => WorkItemIdentity::RemoteBranch(branch.clone()),
             },
         }
     }
@@ -266,22 +254,13 @@ pub struct SectionLabels {
 
 impl Default for SectionLabels {
     fn default() -> Self {
-        Self {
-            checkouts: "Checkouts".into(),
-            code_review: "Change Requests".into(),
-            issues: "Issues".into(),
-            sessions: "Sessions".into(),
-        }
+        Self { checkouts: "Checkouts".into(), code_review: "Change Requests".into(), issues: "Issues".into(), sessions: "Sessions".into() }
     }
 }
 
 /// Convert a correlation group into a CorrelationResult.
 /// Returns None for groups that contain only workspaces (no checkout, PR, or session).
-fn group_to_work_item(
-    providers: &ProviderData,
-    group: &CorrelatedGroup,
-    group_idx: usize,
-) -> Option<CorrelationResult> {
+fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_idx: usize) -> Option<CorrelationResult> {
     let mut checkout_ref: Option<CheckoutRef> = None;
     let mut change_request_key: Option<String> = None;
     let mut session_key: Option<String> = None;
@@ -292,12 +271,8 @@ fn group_to_work_item(
         match (&item.kind, &item.source_key) {
             (CorItemKind::Checkout, ProviderItemKey::Checkout(path)) => {
                 if checkout_ref.is_none() {
-                    let is_main_checkout =
-                        providers.checkouts.get(path).is_some_and(|co| co.is_main);
-                    checkout_ref = Some(CheckoutRef {
-                        key: path.clone(),
-                        is_main_checkout,
-                    });
+                    let is_main_checkout = providers.checkouts.get(path).is_some_and(|co| co.is_main);
+                    checkout_ref = Some(CheckoutRef { key: path.clone(), is_main_checkout });
                 }
             }
             (CorItemKind::ChangeRequest, ProviderItemKey::ChangeRequest(id)) => {
@@ -325,11 +300,7 @@ fn group_to_work_item(
     }
 
     let (anchor, linked_change_request, linked_session) = if let Some(co) = checkout_ref {
-        (
-            CorrelatedAnchor::Checkout(co),
-            change_request_key,
-            session_key,
-        )
+        (CorrelatedAnchor::Checkout(co), change_request_key, session_key)
     } else if let Some(key) = change_request_key {
         (CorrelatedAnchor::ChangeRequest(key), None, session_key)
     } else if let Some(key) = session_key {
@@ -349,31 +320,18 @@ fn group_to_work_item(
         _ => linked_session.as_deref(),
     };
 
-    let pr_title = pr_ref
-        .and_then(|k| providers.change_requests.get(k))
-        .map(|cr| cr.title.clone())
-        .filter(|t| !t.is_empty());
-    let session_title = session_ref
-        .and_then(|k| providers.sessions.get(k))
-        .map(|s| s.title.clone())
-        .filter(|t| !t.is_empty());
-    let description = pr_title
-        .or(session_title)
-        .or_else(|| branch.clone())
-        .unwrap_or_default();
+    let pr_title = pr_ref.and_then(|k| providers.change_requests.get(k)).map(|cr| cr.title.clone()).filter(|t| !t.is_empty());
+    let session_title = session_ref.and_then(|k| providers.sessions.get(k)).map(|s| s.title.clone()).filter(|t| !t.is_empty());
+    let description = pr_title.or(session_title).or_else(|| branch.clone()).unwrap_or_default();
 
     let source = match &anchor {
         CorrelatedAnchor::Checkout(co) => Some(co.key.host.to_string()),
-        CorrelatedAnchor::ChangeRequest(key) => providers
-            .change_requests
-            .get(key.as_str())
-            .map(|cr| cr.provider_display_name.clone())
-            .filter(|s| !s.is_empty()),
-        CorrelatedAnchor::Session(key) => providers
-            .sessions
-            .get(key.as_str())
-            .map(|s| s.provider_display_name.clone())
-            .filter(|s| !s.is_empty()),
+        CorrelatedAnchor::ChangeRequest(key) => {
+            providers.change_requests.get(key.as_str()).map(|cr| cr.provider_display_name.clone()).filter(|s| !s.is_empty())
+        }
+        CorrelatedAnchor::Session(key) => {
+            providers.sessions.get(key.as_str()).map(|s| s.provider_display_name.clone()).filter(|s| !s.is_empty())
+        }
     };
 
     Some(CorrelationResult::Correlated(CorrelatedWorkItem {
@@ -438,16 +396,12 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
 
     let local_host = flotilla_protocol::HostName::local();
     for (key, terminal) in &providers.managed_terminals {
-        let mut keys = vec![crate::providers::types::CorrelationKey::Branch(
-            terminal.id.checkout.clone(),
-        )];
+        let mut keys = vec![CorrelationKey::Branch(terminal.id.checkout.clone())];
         if !terminal.working_directory.as_os_str().is_empty() {
-            keys.push(crate::providers::types::CorrelationKey::CheckoutPath(
-                flotilla_protocol::HostPath::new(
-                    local_host.clone(),
-                    terminal.working_directory.clone(),
-                ),
-            ));
+            keys.push(CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
+                local_host.clone(),
+                terminal.working_directory.clone(),
+            )));
         }
         items.push(CorrelatedItem {
             provider_name: "terminal".to_string(),
@@ -538,10 +492,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
     }
 
     // Add remote-only branches
-    let known_branches: HashSet<String> = work_items
-        .iter()
-        .filter_map(|wi| wi.branch().map(|b| b.to_string()))
-        .collect();
+    let known_branches: HashSet<String> = work_items.iter().filter_map(|wi| wi.branch().map(|b| b.to_string())).collect();
     for (b, branch_info) in &providers.branches {
         if branch_info.status == flotilla_protocol::BranchStatus::Remote
             && b.as_str() != "HEAD"
@@ -549,9 +500,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
             && b.as_str() != "master"
             && !known_branches.contains(b.as_str())
         {
-            work_items.push(CorrelationResult::Standalone(
-                StandaloneResult::RemoteBranch { branch: b.clone() },
-            ));
+            work_items.push(CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch: b.clone() }));
         }
     }
 
@@ -569,10 +518,7 @@ fn checkout_sort_tier(path: &Path, repo_root: &Path) -> u8 {
     // Sibling (e.g. repo_root.branch-name)
     if let Some(parent) = repo_root.parent() {
         if let Ok(rel) = path.strip_prefix(parent) {
-            let root_name = repo_root
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
+            let root_name = repo_root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
             if rel.to_string_lossy().starts_with(root_name.as_ref()) {
                 return 0;
             }
@@ -615,9 +561,7 @@ pub fn group_work_items(
         let host_name = item.host.to_string();
         let main_tier = u8::from(!item.is_main_checkout);
         let key = item.checkout_key();
-        let proximity_tier = key
-            .map(|p| checkout_sort_tier(&p.path, repo_root))
-            .unwrap_or(1);
+        let proximity_tier = key.map(|p| checkout_sort_tier(&p.path, repo_root)).unwrap_or(1);
         let path_key = key.map(|p| p.path.to_path_buf());
         (host_name, main_tier, proximity_tier, path_key)
     });
@@ -631,14 +575,8 @@ pub fn group_work_items(
 
     // Sessions -- grouped by provider, then sorted by updated_at descending
     session_items.sort_by(|a, b| {
-        let a_ses = a
-            .session_key
-            .as_deref()
-            .and_then(|k| providers.sessions.get(k));
-        let b_ses = b
-            .session_key
-            .as_deref()
-            .and_then(|k| providers.sessions.get(k));
+        let a_ses = a.session_key.as_deref().and_then(|k| providers.sessions.get(k));
+        let b_ses = b.session_key.as_deref().and_then(|k| providers.sessions.get(k));
         let a_provider = a_ses.map(|s| s.provider_name.as_str()).unwrap_or("");
         let b_provider = b_ses.map(|s| s.provider_name.as_str()).unwrap_or("");
         a_provider.cmp(b_provider).then_with(|| {
@@ -657,20 +595,12 @@ pub fn group_work_items(
 
     // PRs -- sorted by id descending
     pr_items.sort_by(|a, b| {
-        let a_num = a
-            .change_request_key
-            .as_deref()
-            .and_then(|k| k.parse::<i64>().ok());
-        let b_num = b
-            .change_request_key
-            .as_deref()
-            .and_then(|k| k.parse::<i64>().ok());
+        let a_num = a.change_request_key.as_deref().and_then(|k| k.parse::<i64>().ok());
+        let b_num = b.change_request_key.as_deref().and_then(|k| k.parse::<i64>().ok());
         b_num.cmp(&a_num)
     });
     if !pr_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader(
-            labels.code_review.clone(),
-        )));
+        entries.push(GroupEntry::Header(SectionHeader(labels.code_review.clone())));
         for item in pr_items {
             selectable.push(entries.len());
             entries.push(GroupEntry::Item(Box::new(item.clone())));
@@ -701,10 +631,7 @@ pub fn group_work_items(
         }
     }
 
-    GroupedWorkItems {
-        table_entries: entries,
-        selectable_indices: selectable,
-    }
+    GroupedWorkItems { table_entries: entries, selectable_indices: selectable }
 }
 
 pub async fn fetch_checkout_status(
@@ -726,28 +653,15 @@ pub async fn fetch_checkout_status(
     let (unpushed_result, uncommitted, pr_info) = tokio::join!(
         async {
             let base = async {
-                let upstream = run!(
-                    runner,
-                    "git",
-                    &[
-                        "rev-parse",
-                        "--abbrev-ref",
-                        &format!("{branch_for_base}@{{upstream}}"),
-                    ],
-                    &repo_for_base,
-                );
+                let upstream =
+                    run!(runner, "git", &["rev-parse", "--abbrev-ref", &format!("{branch_for_base}@{{upstream}}"),], &repo_for_base,);
                 if let Ok(ref u) = upstream {
                     let u = u.trim();
                     if !u.is_empty() {
                         return Ok(u.to_string());
                     }
                 }
-                let remote_head = run!(
-                    runner,
-                    "git",
-                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
-                    &repo_for_base,
-                );
+                let remote_head = run!(runner, "git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], &repo_for_base,);
                 if let Ok(ref rh) = remote_head {
                     let rh = rh.trim();
                     if !rh.is_empty() {
@@ -760,17 +674,8 @@ pub async fn fetch_checkout_status(
 
             match base {
                 Ok(base_ref) => {
-                    let log = run!(
-                        runner,
-                        "git",
-                        &[
-                            "log",
-                            &format!("{base_ref}..{branch_for_base}"),
-                            "--oneline",
-                        ],
-                        &repo_for_base,
-                    )
-                    .unwrap_or_default();
+                    let log = run!(runner, "git", &["log", &format!("{base_ref}..{branch_for_base}"), "--oneline",], &repo_for_base,)
+                        .unwrap_or_default();
                     Ok(log)
                 }
                 Err(warning) => Err(warning),
@@ -785,55 +690,32 @@ pub async fn fetch_checkout_status(
         },
         async {
             if let Some(ref num) = cr_id {
-                run!(
-                    runner,
-                    "gh",
-                    &["pr", "view", num, "--json", "state,mergeCommit"],
-                    &repo2,
-                )
-                .ok()
+                run!(runner, "gh", &["pr", "view", num, "--json", "state,mergeCommit"], &repo2,).ok()
             } else {
                 None
             }
         },
     );
 
-    let mut info = CheckoutStatus {
-        branch: branch.to_string(),
-        ..Default::default()
-    };
+    let mut info = CheckoutStatus { branch: branch.to_string(), ..Default::default() };
 
     match unpushed_result {
         Ok(log_output) => {
-            info.unpushed_commits = log_output
-                .lines()
-                .map(|l| l.to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
+            info.unpushed_commits = log_output.lines().map(|l| l.to_string()).filter(|l| !l.is_empty()).collect();
         }
         Err(warning) => {
             info.base_detection_warning = Some(warning);
         }
     }
 
-    info.uncommitted_files = uncommitted
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.to_string())
-        .collect();
+    info.uncommitted_files = uncommitted.lines().filter(|l| !l.trim().is_empty()).map(|l| l.to_string()).collect();
     info.has_uncommitted = !info.uncommitted_files.is_empty();
 
     if let Some(pr_json) = pr_info {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pr_json) {
-            info.change_request_status = v
-                .get("state")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            info.merge_commit_sha = v
-                .get("mergeCommit")
-                .and_then(|mc| mc.get("oid"))
-                .and_then(|s| s.as_str())
-                .map(|s| s[..7.min(s.len())].to_string());
+            info.change_request_status = v.get("state").and_then(|s| s.as_str()).map(|s| s.to_string());
+            info.merge_commit_sha =
+                v.get("mergeCommit").and_then(|mc| mc.get("oid")).and_then(|s| s.as_str()).map(|s| s[..7.min(s.len())].to_string());
         }
     }
 
@@ -842,16 +724,13 @@ pub async fn fetch_checkout_status(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::provider_data::ProviderData;
-    use crate::providers::types::*;
     use std::path::PathBuf;
 
+    use super::*;
+    use crate::{provider_data::ProviderData, providers::types::*};
+
     fn hp(path: &str) -> flotilla_protocol::HostPath {
-        flotilla_protocol::HostPath::new(
-            flotilla_protocol::HostName::new("test-host"),
-            PathBuf::from(path),
-        )
+        flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path))
     }
 
     // -----------------------------------------------------------------------
@@ -877,10 +756,7 @@ mod tests {
         CorrelationResult::Correlated(CorrelatedWorkItem {
             branch: branch.map(|s| s.to_string()),
             description: branch.unwrap_or("").to_string(),
-            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef {
-                key: hp(path),
-                is_main_checkout: is_main,
-            }))
+            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp(path), is_main_checkout: is_main }))
         })
     }
 
@@ -907,9 +783,7 @@ mod tests {
     }
 
     fn remote_branch_item(branch: &str) -> CorrelationResult {
-        CorrelationResult::Standalone(StandaloneResult::RemoteBranch {
-            branch: branch.to_string(),
-        })
+        CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch: branch.to_string() })
     }
 
     fn make_checkout(branch: &str, path: &str, is_main: bool) -> Checkout {
@@ -920,10 +794,7 @@ mod tests {
             remote_ahead_behind: None,
             working_tree: None,
             last_commit: None,
-            correlation_keys: vec![
-                CorrelationKey::Branch(branch.to_string()),
-                CorrelationKey::CheckoutPath(hp(path)),
-            ],
+            correlation_keys: vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(hp(path))],
             association_keys: vec![],
         }
     }
@@ -946,10 +817,7 @@ mod tests {
         if let Some(b) = branch {
             keys.push(CorrelationKey::Branch(b.to_string()));
         }
-        keys.push(CorrelationKey::SessionRef(
-            "claude".to_string(),
-            id.to_string(),
-        ));
+        keys.push(CorrelationKey::SessionRef("claude".to_string(), id.to_string()));
         CloudAgentSession {
             title: title.to_string(),
             status: SessionStatus::Running,
@@ -972,26 +840,13 @@ mod tests {
         }
     }
 
-    fn make_workspace(
-        _ws_ref: &str,
-        name: &str,
-        directories: Vec<PathBuf>,
-        correlation_keys: Vec<CorrelationKey>,
-    ) -> Workspace {
-        Workspace {
-            name: name.to_string(),
-            directories,
-            correlation_keys,
-        }
+    fn make_workspace(_ws_ref: &str, name: &str, directories: Vec<PathBuf>, correlation_keys: Vec<CorrelationKey>) -> Workspace {
+        Workspace { name: name.to_string(), directories, correlation_keys }
     }
 
     // Convert CorrelationResult to protocol WorkItem for group_work_items tests
     fn to_proto(item: &CorrelationResult) -> flotilla_protocol::WorkItem {
-        crate::convert::correlation_result_to_work_item(
-            item,
-            &[],
-            &flotilla_protocol::HostName::new("test-host"),
-        )
+        crate::convert::correlation_result_to_work_item(item, &[], &flotilla_protocol::HostName::new("test-host"))
     }
 
     fn new_providers() -> ProviderData {
@@ -1070,11 +925,7 @@ mod tests {
 
     #[test]
     fn refresh_error_display() {
-        let err = RefreshError {
-            category: "github",
-            provider: "GitHub".to_string(),
-            message: "rate limited".to_string(),
-        };
+        let err = RefreshError { category: "github", provider: "GitHub".to_string(), message: "rate limited".to_string() };
         assert_eq!(format!("{err}"), "github/GitHub: rate limited");
     }
 
@@ -1239,10 +1090,7 @@ mod tests {
     fn change_request_key_from_linked_on_checkout() {
         let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             linked_change_request: Some("99".to_string()),
-            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef {
-                key: hp("/tmp/wt"),
-                is_main_checkout: false,
-            }))
+            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
         });
         assert_eq!(wi.change_request_key(), Some("99"));
     }
@@ -1267,10 +1115,7 @@ mod tests {
     fn session_key_from_linked_on_checkout() {
         let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             linked_session: Some("linked-sess".to_string()),
-            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef {
-                key: hp("/tmp/wt"),
-                is_main_checkout: false,
-            }))
+            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
         });
         assert_eq!(wi.session_key(), Some("linked-sess"));
     }
@@ -1288,10 +1133,7 @@ mod tests {
     fn issue_keys_from_correlated_with_linked_issues() {
         let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             linked_issues: vec!["10".to_string(), "20".to_string()],
-            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef {
-                key: hp("/tmp/wt"),
-                is_main_checkout: false,
-            }))
+            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
         });
         assert_eq!(wi.issue_keys(), &["10".to_string(), "20".to_string()]);
     }
@@ -1316,10 +1158,7 @@ mod tests {
     fn workspace_refs_from_correlated() {
         let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
             workspace_refs: vec!["ws-1".to_string()],
-            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef {
-                key: hp("/tmp/wt"),
-                is_main_checkout: false,
-            }))
+            ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
         });
         assert_eq!(wi.workspace_refs(), &["ws-1".to_string()]);
     }
@@ -1380,19 +1219,13 @@ mod tests {
     #[test]
     fn identity_pr() {
         let wi = cr_item("42", "PR");
-        assert_eq!(
-            wi.identity(),
-            WorkItemIdentity::ChangeRequest("42".to_string())
-        );
+        assert_eq!(wi.identity(), WorkItemIdentity::ChangeRequest("42".to_string()));
     }
 
     #[test]
     fn identity_session() {
         let wi = session_item("sess-1", "title");
-        assert_eq!(
-            wi.identity(),
-            WorkItemIdentity::Session("sess-1".to_string())
-        );
+        assert_eq!(wi.identity(), WorkItemIdentity::Session("sess-1".to_string()));
     }
 
     #[test]
@@ -1404,10 +1237,7 @@ mod tests {
     #[test]
     fn identity_remote_branch() {
         let wi = remote_branch_item("feature/x");
-        assert_eq!(
-            wi.identity(),
-            WorkItemIdentity::RemoteBranch("feature/x".to_string())
-        );
+        assert_eq!(wi.identity(), WorkItemIdentity::RemoteBranch("feature/x".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -1425,9 +1255,7 @@ mod tests {
     #[test]
     fn correlate_single_checkout() {
         let mut providers = new_providers();
-        providers
-            .checkouts
-            .insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
+        providers.checkouts.insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
 
         let (items, groups) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1439,9 +1267,7 @@ mod tests {
     #[test]
     fn correlate_trunk_checkout_marked_as_main() {
         let mut providers = new_providers();
-        providers
-            .checkouts
-            .insert(hp("/tmp/main"), make_checkout("main", "/tmp/main", true));
+        providers.checkouts.insert(hp("/tmp/main"), make_checkout("main", "/tmp/main", true));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1451,14 +1277,8 @@ mod tests {
     #[test]
     fn correlate_checkout_and_pr_merge_on_branch() {
         let mut providers = new_providers();
-        providers.checkouts.insert(
-            hp("/tmp/feat-x"),
-            make_checkout("feat-x", "/tmp/feat-x", false),
-        );
-        providers.change_requests.insert(
-            "10".to_string(),
-            make_change_request("10", "Add auth", "feat-x"),
-        );
+        providers.checkouts.insert(hp("/tmp/feat-x"), make_checkout("feat-x", "/tmp/feat-x", false));
+        providers.change_requests.insert("10".to_string(), make_change_request("10", "Add auth", "feat-x"));
 
         let (items, _) = correlate(&providers);
         // Should merge into one work item
@@ -1472,18 +1292,9 @@ mod tests {
     #[test]
     fn correlate_checkout_pr_session_merge_on_branch() {
         let mut providers = new_providers();
-        providers.checkouts.insert(
-            hp("/tmp/feat-y"),
-            make_checkout("feat-y", "/tmp/feat-y", false),
-        );
-        providers.change_requests.insert(
-            "20".to_string(),
-            make_change_request("20", "Improve perf", "feat-y"),
-        );
-        providers.sessions.insert(
-            "sess-a".to_string(),
-            make_session("sess-a", "Debug perf", Some("feat-y")),
-        );
+        providers.checkouts.insert(hp("/tmp/feat-y"), make_checkout("feat-y", "/tmp/feat-y", false));
+        providers.change_requests.insert("20".to_string(), make_change_request("20", "Improve perf", "feat-y"));
+        providers.sessions.insert("sess-a".to_string(), make_session("sess-a", "Debug perf", Some("feat-y")));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1495,10 +1306,7 @@ mod tests {
     #[test]
     fn correlate_session_only_becomes_session_anchor() {
         let mut providers = new_providers();
-        providers.sessions.insert(
-            "sess-lonely".to_string(),
-            make_session("sess-lonely", "Solo session", None),
-        );
+        providers.sessions.insert("sess-lonely".to_string(), make_session("sess-lonely", "Solo session", None));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1509,10 +1317,7 @@ mod tests {
     #[test]
     fn correlate_pr_only_becomes_cr_anchor() {
         let mut providers = new_providers();
-        providers.change_requests.insert(
-            "50".to_string(),
-            make_change_request("50", "Orphan PR", "no-checkout-branch"),
-        );
+        providers.change_requests.insert("50".to_string(), make_change_request("50", "Orphan PR", "no-checkout-branch"));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1523,9 +1328,7 @@ mod tests {
     #[test]
     fn correlate_standalone_issue_appears_as_issue() {
         let mut providers = new_providers();
-        providers
-            .issues
-            .insert("100".to_string(), make_issue("100", "Standalone bug"));
+        providers.issues.insert("100".to_string(), make_issue("100", "Standalone bug"));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1536,12 +1339,9 @@ mod tests {
     #[test]
     fn correlate_remote_branches_appear_as_standalone() {
         let mut providers = new_providers();
-        providers.branches.insert(
-            "feature/remote-only".to_string(),
-            flotilla_protocol::delta::Branch {
-                status: flotilla_protocol::BranchStatus::Remote,
-            },
-        );
+        providers.branches.insert("feature/remote-only".to_string(), flotilla_protocol::delta::Branch {
+            status: flotilla_protocol::BranchStatus::Remote,
+        });
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1552,21 +1352,11 @@ mod tests {
     #[test]
     fn correlate_remote_branches_excludes_head_main_master() {
         let mut providers = new_providers();
-        let remote = flotilla_protocol::delta::Branch {
-            status: flotilla_protocol::BranchStatus::Remote,
-        };
-        providers
-            .branches
-            .insert("HEAD".to_string(), remote.clone());
-        providers
-            .branches
-            .insert("main".to_string(), remote.clone());
-        providers
-            .branches
-            .insert("master".to_string(), remote.clone());
-        providers
-            .branches
-            .insert("feature/visible".to_string(), remote);
+        let remote = flotilla_protocol::delta::Branch { status: flotilla_protocol::BranchStatus::Remote };
+        providers.branches.insert("HEAD".to_string(), remote.clone());
+        providers.branches.insert("main".to_string(), remote.clone());
+        providers.branches.insert("master".to_string(), remote.clone());
+        providers.branches.insert("feature/visible".to_string(), remote);
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1577,36 +1367,24 @@ mod tests {
     fn correlate_remote_branches_excludes_already_known() {
         let mut providers = new_providers();
         // A checkout on branch "feat-z"
-        providers.checkouts.insert(
-            hp("/tmp/feat-z"),
-            make_checkout("feat-z", "/tmp/feat-z", false),
-        );
+        providers.checkouts.insert(hp("/tmp/feat-z"), make_checkout("feat-z", "/tmp/feat-z", false));
         // Same branch also in remote
-        providers.branches.insert(
-            "feat-z".to_string(),
-            flotilla_protocol::delta::Branch {
-                status: flotilla_protocol::BranchStatus::Remote,
-            },
-        );
+        providers
+            .branches
+            .insert("feat-z".to_string(), flotilla_protocol::delta::Branch { status: flotilla_protocol::BranchStatus::Remote });
 
         let (items, _) = correlate(&providers);
         // Should only have the checkout, not a duplicate remote
-        let remote_items: Vec<_> = items
-            .iter()
-            .filter(|wi| wi.kind() == WorkItemKind::RemoteBranch)
-            .collect();
+        let remote_items: Vec<_> = items.iter().filter(|wi| wi.kind() == WorkItemKind::RemoteBranch).collect();
         assert!(remote_items.is_empty());
     }
 
     #[test]
     fn correlate_merged_branches_excluded() {
         let mut providers = new_providers();
-        providers.branches.insert(
-            "already-merged".to_string(),
-            flotilla_protocol::delta::Branch {
-                status: flotilla_protocol::BranchStatus::Merged,
-            },
-        );
+        providers
+            .branches
+            .insert("already-merged".to_string(), flotilla_protocol::delta::Branch { status: flotilla_protocol::BranchStatus::Merged });
 
         let (items, _) = correlate(&providers);
         assert!(items.is_empty());
@@ -1615,22 +1393,14 @@ mod tests {
     #[test]
     fn correlate_pr_links_issue_via_association_key() {
         let mut providers = new_providers();
-        providers
-            .checkouts
-            .insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
+        providers.checkouts.insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
         let mut cr = make_change_request("5", "Impl feature", "feat");
-        cr.association_keys
-            .push(AssociationKey::IssueRef("gh".to_string(), "77".to_string()));
+        cr.association_keys.push(AssociationKey::IssueRef("gh".to_string(), "77".to_string()));
         providers.change_requests.insert("5".to_string(), cr);
-        providers
-            .issues
-            .insert("77".to_string(), make_issue("77", "Feature request"));
+        providers.issues.insert("77".to_string(), make_issue("77", "Feature request"));
 
         let (items, _) = correlate(&providers);
-        let checkout = items
-            .iter()
-            .find(|wi| wi.kind() == WorkItemKind::Checkout)
-            .expect("should have checkout");
+        let checkout = items.iter().find(|wi| wi.kind() == WorkItemKind::Checkout).expect("should have checkout");
         assert!(checkout.issue_keys().contains(&"77".to_string()));
         // Issue should not appear standalone
         assert!(!items.iter().any(|wi| wi.kind() == WorkItemKind::Issue));
@@ -1642,41 +1412,26 @@ mod tests {
 
         let co_path = hp("/tmp/feat-x");
         let mut co = make_checkout("feat-x", "/tmp/feat-x", false);
-        co.association_keys
-            .push(AssociationKey::IssueRef("github".into(), "42".into()));
+        co.association_keys.push(AssociationKey::IssueRef("github".into(), "42".into()));
         providers.checkouts.insert(co_path, co);
-        providers
-            .issues
-            .insert("42".to_string(), make_issue("42", "Fix the thing"));
+        providers.issues.insert("42".to_string(), make_issue("42", "Fix the thing"));
 
         let (work_items, _groups) = correlate(&providers);
-        let checkout_wi = work_items
-            .iter()
-            .find(|wi| wi.kind() == WorkItemKind::Checkout)
-            .expect("should have a checkout work item");
+        let checkout_wi = work_items.iter().find(|wi| wi.kind() == WorkItemKind::Checkout).expect("should have a checkout work item");
         assert!(
             checkout_wi.issue_keys().contains(&"42".to_string()),
             "checkout should link issue 42 via association key, got: {:?}",
             checkout_wi.issue_keys()
         );
-        let standalone_issues: Vec<_> = work_items
-            .iter()
-            .filter(|wi| wi.kind() == WorkItemKind::Issue)
-            .collect();
-        assert!(
-            standalone_issues.is_empty(),
-            "issue 42 should be linked, not standalone"
-        );
+        let standalone_issues: Vec<_> = work_items.iter().filter(|wi| wi.kind() == WorkItemKind::Issue).collect();
+        assert!(standalone_issues.is_empty(), "issue 42 should be linked, not standalone");
     }
 
     #[test]
     fn correlate_workspace_only_group_is_skipped() {
         // A workspace with no checkout/PR/session should be excluded
         let mut providers = new_providers();
-        providers.workspaces.insert(
-            "ws-orphan".to_string(),
-            make_workspace("ws-orphan", "orphan", vec![], vec![]),
-        );
+        providers.workspaces.insert("ws-orphan".to_string(), make_workspace("ws-orphan", "orphan", vec![], vec![]));
 
         let (items, _) = correlate(&providers);
         assert!(items.is_empty(), "workspace-only group should be skipped");
@@ -1686,18 +1441,10 @@ mod tests {
     fn correlate_workspace_linked_to_checkout() {
         let mut providers = new_providers();
         let co_path = hp("/tmp/feat-ws");
-        providers.checkouts.insert(
-            co_path.clone(),
-            make_checkout("feat-ws", "/tmp/feat-ws", false),
-        );
+        providers.checkouts.insert(co_path.clone(), make_checkout("feat-ws", "/tmp/feat-ws", false));
         providers.workspaces.insert(
             "ws-1".to_string(),
-            make_workspace(
-                "ws-1",
-                "dev-session",
-                vec![co_path.path.clone()],
-                vec![CorrelationKey::CheckoutPath(co_path)],
-            ),
+            make_workspace("ws-1", "dev-session", vec![co_path.path.clone()], vec![CorrelationKey::CheckoutPath(co_path)]),
         );
 
         let (items, _) = correlate(&providers);
@@ -1708,17 +1455,9 @@ mod tests {
     #[test]
     fn correlate_description_prefers_pr_title() {
         let mut providers = new_providers();
-        providers
-            .checkouts
-            .insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
-        providers.change_requests.insert(
-            "1".to_string(),
-            make_change_request("1", "My PR Title", "feat"),
-        );
-        providers.sessions.insert(
-            "s1".to_string(),
-            make_session("s1", "My Session Title", Some("feat")),
-        );
+        providers.checkouts.insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
+        providers.change_requests.insert("1".to_string(), make_change_request("1", "My PR Title", "feat"));
+        providers.sessions.insert("s1".to_string(), make_session("s1", "My Session Title", Some("feat")));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items[0].description(), "My PR Title");
@@ -1727,13 +1466,8 @@ mod tests {
     #[test]
     fn correlate_description_falls_back_to_session_title() {
         let mut providers = new_providers();
-        providers
-            .checkouts
-            .insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
-        providers.sessions.insert(
-            "s1".to_string(),
-            make_session("s1", "Session Title", Some("feat")),
-        );
+        providers.checkouts.insert(hp("/tmp/feat"), make_checkout("feat", "/tmp/feat", false));
+        providers.sessions.insert("s1".to_string(), make_session("s1", "Session Title", Some("feat")));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items[0].description(), "Session Title");
@@ -1742,10 +1476,7 @@ mod tests {
     #[test]
     fn correlate_description_falls_back_to_branch() {
         let mut providers = new_providers();
-        providers.checkouts.insert(
-            hp("/tmp/my-branch"),
-            make_checkout("my-branch", "/tmp/my-branch", false),
-        );
+        providers.checkouts.insert(hp("/tmp/my-branch"), make_checkout("my-branch", "/tmp/my-branch", false));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items[0].description(), "my-branch");
@@ -1754,18 +1485,9 @@ mod tests {
     #[test]
     fn correlate_multiple_items_sharing_branch_merge() {
         let mut providers = new_providers();
-        providers.checkouts.insert(
-            hp("/tmp/shared"),
-            make_checkout("shared-branch", "/tmp/shared", false),
-        );
-        providers.change_requests.insert(
-            "1".to_string(),
-            make_change_request("1", "PR on shared", "shared-branch"),
-        );
-        providers.sessions.insert(
-            "s1".to_string(),
-            make_session("s1", "Session on shared", Some("shared-branch")),
-        );
+        providers.checkouts.insert(hp("/tmp/shared"), make_checkout("shared-branch", "/tmp/shared", false));
+        providers.change_requests.insert("1".to_string(), make_change_request("1", "PR on shared", "shared-branch"));
+        providers.sessions.insert("s1".to_string(), make_session("s1", "Session on shared", Some("shared-branch")));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1, "all items should merge into one");
@@ -1778,12 +1500,8 @@ mod tests {
     #[test]
     fn correlate_two_checkouts_stay_separate() {
         let mut providers = new_providers();
-        providers
-            .checkouts
-            .insert(hp("/tmp/a"), make_checkout("branch-a", "/tmp/a", false));
-        providers
-            .checkouts
-            .insert(hp("/tmp/b"), make_checkout("branch-b", "/tmp/b", false));
+        providers.checkouts.insert(hp("/tmp/a"), make_checkout("branch-a", "/tmp/a", false));
+        providers.checkouts.insert(hp("/tmp/b"), make_checkout("branch-b", "/tmp/b", false));
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 2);
@@ -1797,16 +1515,12 @@ mod tests {
         // An association key pointing to a non-existent issue should be ignored
         let mut providers = new_providers();
         let mut cr = make_change_request("5", "PR", "feat");
-        cr.association_keys
-            .push(AssociationKey::IssueRef("gh".into(), "999".into()));
+        cr.association_keys.push(AssociationKey::IssueRef("gh".into(), "999".into()));
         providers.change_requests.insert("5".to_string(), cr);
         // Note: no issue "999" in providers.issues
 
         let (items, _) = correlate(&providers);
-        let cr_item = items
-            .iter()
-            .find(|wi| wi.kind() == WorkItemKind::ChangeRequest)
-            .unwrap();
+        let cr_item = items.iter().find(|wi| wi.kind() == WorkItemKind::ChangeRequest).unwrap();
         assert!(cr_item.issue_keys().is_empty());
     }
 
@@ -1855,16 +1569,7 @@ mod tests {
         assert_eq!(result.table_entries.len(), 10);
 
         let headers = header_titles(&result.table_entries);
-        assert_eq!(
-            headers,
-            vec![
-                "Checkouts",
-                "Sessions",
-                "Change Requests",
-                "Remote Branches",
-                "Issues",
-            ]
-        );
+        assert_eq!(headers, vec!["Checkouts", "Sessions", "Change Requests", "Remote Branches", "Issues",]);
     }
 
     #[test]
@@ -1880,15 +1585,12 @@ mod tests {
         let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let branches = item_branches(&result.table_entries);
-        assert_eq!(
-            branches,
-            vec![
-                Some("main".to_string()),     // main always first
-                Some("a-branch".to_string()), // then by path ascending
-                Some("m-branch".to_string()),
-                Some("z-branch".to_string()),
-            ]
-        );
+        assert_eq!(branches, vec![
+            Some("main".to_string()),     // main always first
+            Some("a-branch".to_string()), // then by path ascending
+            Some("m-branch".to_string()),
+            Some("z-branch".to_string()),
+        ]);
     }
 
     #[test]
@@ -1900,40 +1602,21 @@ mod tests {
         let providers = new_providers();
         let labels = default_labels();
         let items = vec![
-            to_proto(&checkout_item(
-                "/Users/robert/dev/flotilla",
-                Some("main"),
-                true,
-            )),
-            to_proto(&checkout_item(
-                "/Users/robert/.codex/worktrees/0cf6/flotilla",
-                Some("codex-detached"),
-                false,
-            )),
-            to_proto(&checkout_item(
-                "/Users/robert/dev/flotilla.checkout-order",
-                Some("checkout-order"),
-                false,
-            )),
-            to_proto(&checkout_item(
-                "/Users/robert/dev/flotilla.low-hang-13",
-                Some("low-hang-13"),
-                false,
-            )),
+            to_proto(&checkout_item("/Users/robert/dev/flotilla", Some("main"), true)),
+            to_proto(&checkout_item("/Users/robert/.codex/worktrees/0cf6/flotilla", Some("codex-detached"), false)),
+            to_proto(&checkout_item("/Users/robert/dev/flotilla.checkout-order", Some("checkout-order"), false)),
+            to_proto(&checkout_item("/Users/robert/dev/flotilla.low-hang-13", Some("low-hang-13"), false)),
         ];
         let repo_root = Path::new("/Users/robert/dev/flotilla");
         let result = group_work_items(&items, &providers, &labels, repo_root);
 
         let branches = item_branches(&result.table_entries);
-        assert_eq!(
-            branches,
-            vec![
-                Some("main".to_string()),           // main always first
-                Some("checkout-order".to_string()), // siblings next
-                Some("low-hang-13".to_string()),
-                Some("codex-detached".to_string()), // external worktrees last
-            ]
-        );
+        assert_eq!(branches, vec![
+            Some("main".to_string()),           // main always first
+            Some("checkout-order".to_string()), // siblings next
+            Some("low-hang-13".to_string()),
+            Some("codex-detached".to_string()), // external worktrees last
+        ]);
     }
 
     #[test]
@@ -1963,31 +1646,18 @@ mod tests {
         let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let issue_keys = issue_key_groups(&result.table_entries);
-        assert_eq!(
-            issue_keys,
-            vec![
-                vec!["10".to_string()],
-                vec!["3".to_string()],
-                vec!["1".to_string()]
-            ]
-        );
+        assert_eq!(issue_keys, vec![vec!["10".to_string()], vec!["3".to_string()], vec!["1".to_string()]]);
     }
 
     #[test]
     fn group_work_items_remote_branches_sorted_by_name() {
         let providers = new_providers();
         let labels = default_labels();
-        let items = vec![
-            to_proto(&remote_branch_item("z-remote")),
-            to_proto(&remote_branch_item("a-remote")),
-        ];
+        let items = vec![to_proto(&remote_branch_item("z-remote")), to_proto(&remote_branch_item("a-remote"))];
         let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let branches = item_branches(&result.table_entries);
-        assert_eq!(
-            branches,
-            vec![Some("a-remote".to_string()), Some("z-remote".to_string()),]
-        );
+        assert_eq!(branches, vec![Some("a-remote".to_string()), Some("z-remote".to_string()),]);
     }
 
     #[test]
@@ -2036,55 +1706,43 @@ mod tests {
         let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let headers = header_titles(&result.table_entries);
-        assert_eq!(
-            headers,
-            vec!["Checkouts", "Agents", "Pull Requests", "Tickets"]
-        );
+        assert_eq!(headers, vec!["Checkouts", "Agents", "Pull Requests", "Tickets"]);
     }
 
     #[test]
     fn group_work_items_sessions_sorted_by_updated_at_descending() {
         let mut providers = new_providers();
         // Populate providers with sessions that have updated_at
-        providers.sessions.insert(
-            "s-old".to_string(),
-            CloudAgentSession {
-                title: "Old".to_string(),
-                status: SessionStatus::Idle,
-                model: None,
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        );
-        providers.sessions.insert(
-            "s-new".to_string(),
-            CloudAgentSession {
-                title: "New".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-03-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        );
-        providers.sessions.insert(
-            "s-mid".to_string(),
-            CloudAgentSession {
-                title: "Mid".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-02-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        );
+        providers.sessions.insert("s-old".to_string(), CloudAgentSession {
+            title: "Old".to_string(),
+            status: SessionStatus::Idle,
+            model: None,
+            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
+        providers.sessions.insert("s-new".to_string(), CloudAgentSession {
+            title: "New".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-03-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
+        providers.sessions.insert("s-mid".to_string(), CloudAgentSession {
+            title: "Mid".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-02-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
 
         let labels = default_labels();
         let si1 = to_proto(&session_item("s-old", "Old"));
@@ -2101,45 +1759,36 @@ mod tests {
     #[test]
     fn group_work_items_sessions_grouped_by_provider_then_time() {
         let mut providers = new_providers();
-        providers.sessions.insert(
-            "s-claude-old".to_string(),
-            CloudAgentSession {
-                title: "Claude Old".to_string(),
-                status: SessionStatus::Idle,
-                model: None,
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: "claude".to_string(),
-                provider_display_name: "Claude".to_string(),
-                item_noun: "Agent".to_string(),
-            },
-        );
-        providers.sessions.insert(
-            "s-codex-new".to_string(),
-            CloudAgentSession {
-                title: "Codex New".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-03-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: "codex".to_string(),
-                provider_display_name: "Codex".to_string(),
-                item_noun: "Task".to_string(),
-            },
-        );
-        providers.sessions.insert(
-            "s-claude-new".to_string(),
-            CloudAgentSession {
-                title: "Claude New".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-02-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: "claude".to_string(),
-                provider_display_name: "Claude".to_string(),
-                item_noun: "Agent".to_string(),
-            },
-        );
+        providers.sessions.insert("s-claude-old".to_string(), CloudAgentSession {
+            title: "Claude Old".to_string(),
+            status: SessionStatus::Idle,
+            model: None,
+            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: "claude".to_string(),
+            provider_display_name: "Claude".to_string(),
+            item_noun: "Agent".to_string(),
+        });
+        providers.sessions.insert("s-codex-new".to_string(), CloudAgentSession {
+            title: "Codex New".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-03-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: "codex".to_string(),
+            provider_display_name: "Codex".to_string(),
+            item_noun: "Task".to_string(),
+        });
+        providers.sessions.insert("s-claude-new".to_string(), CloudAgentSession {
+            title: "Claude New".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-02-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: "claude".to_string(),
+            provider_display_name: "Claude".to_string(),
+            item_noun: "Agent".to_string(),
+        });
 
         let labels = default_labels();
         let items = vec![
@@ -2200,34 +1849,18 @@ mod tests {
         let mut providers = new_providers();
 
         // trunk checkout
-        providers
-            .checkouts
-            .insert(hp("/repo"), make_checkout("main", "/repo", true));
+        providers.checkouts.insert(hp("/repo"), make_checkout("main", "/repo", true));
         // feature checkout + PR
-        providers.checkouts.insert(
-            hp("/repo.feat"),
-            make_checkout("feat-login", "/repo.feat", false),
-        );
-        providers.change_requests.insert(
-            "10".to_string(),
-            make_change_request("10", "Add login", "feat-login"),
-        );
+        providers.checkouts.insert(hp("/repo.feat"), make_checkout("feat-login", "/repo.feat", false));
+        providers.change_requests.insert("10".to_string(), make_change_request("10", "Add login", "feat-login"));
         // standalone session
-        providers.sessions.insert(
-            "s-solo".to_string(),
-            make_session("s-solo", "Solo work", None),
-        );
+        providers.sessions.insert("s-solo".to_string(), make_session("s-solo", "Solo work", None));
         // standalone issue
-        providers
-            .issues
-            .insert("55".to_string(), make_issue("55", "Improve docs"));
+        providers.issues.insert("55".to_string(), make_issue("55", "Improve docs"));
         // remote-only branch
-        providers.branches.insert(
-            "experiment/alpha".to_string(),
-            flotilla_protocol::delta::Branch {
-                status: flotilla_protocol::BranchStatus::Remote,
-            },
-        );
+        providers
+            .branches
+            .insert("experiment/alpha".to_string(), flotilla_protocol::delta::Branch { status: flotilla_protocol::BranchStatus::Remote });
 
         let (work_items, _) = correlate(&providers);
 
@@ -2241,18 +1874,12 @@ mod tests {
         assert!(kinds.contains(&WorkItemKind::RemoteBranch));
 
         // The feat checkout should have the PR linked
-        let feat = work_items
-            .iter()
-            .find(|wi| wi.branch() == Some("feat-login"))
-            .expect("should have feat-login");
+        let feat = work_items.iter().find(|wi| wi.branch() == Some("feat-login")).expect("should have feat-login");
         assert_eq!(feat.change_request_key(), Some("10"));
         assert!(!feat.is_main_checkout());
 
         // main checkout should be flagged as main
-        let main_item = work_items
-            .iter()
-            .find(|wi| wi.branch() == Some("main"))
-            .expect("should have main");
+        let main_item = work_items.iter().find(|wi| wi.branch() == Some("main")).expect("should have main");
         assert!(main_item.is_main_checkout());
 
         // Now group them
@@ -2261,11 +1888,7 @@ mod tests {
         let grouped = group_work_items(&proto_items, &providers, &labels, Path::new("/tmp"));
 
         // Should have sections for checkouts, sessions, remote, issues
-        let header_count = grouped
-            .table_entries
-            .iter()
-            .filter(|e| matches!(e, GroupEntry::Header(_)))
-            .count();
+        let header_count = grouped.table_entries.iter().filter(|e| matches!(e, GroupEntry::Header(_))).count();
         assert_eq!(header_count, 4, "should have exactly 4 section headers");
 
         // All items should be selectable
@@ -2280,31 +1903,18 @@ mod tests {
     fn correlate_terminal_ids_populated_when_managed_terminal_shares_branch() {
         let mut providers = new_providers();
 
-        let co_path = flotilla_protocol::HostPath::new(
-            flotilla_protocol::HostName::local(),
-            "/tmp/feat-term",
-        );
-        providers.checkouts.insert(
-            co_path.clone(),
-            make_checkout("feat-term", "/tmp/feat-term", false),
-        );
+        let co_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), "/tmp/feat-term");
+        providers.checkouts.insert(co_path.clone(), make_checkout("feat-term", "/tmp/feat-term", false));
 
-        let terminal_id = flotilla_protocol::ManagedTerminalId {
-            checkout: "feat-term".to_string(),
-            role: "dev".to_string(),
-            index: 0,
-        };
+        let terminal_id = flotilla_protocol::ManagedTerminalId { checkout: "feat-term".to_string(), role: "dev".to_string(), index: 0 };
         let terminal_key = terminal_id.to_string();
-        providers.managed_terminals.insert(
-            terminal_key.clone(),
-            flotilla_protocol::ManagedTerminal {
-                id: terminal_id.clone(),
-                role: "dev".to_string(),
-                command: "bash".to_string(),
-                working_directory: PathBuf::from("/tmp/feat-term"),
-                status: flotilla_protocol::TerminalStatus::Running,
-            },
-        );
+        providers.managed_terminals.insert(terminal_key.clone(), flotilla_protocol::ManagedTerminal {
+            id: terminal_id.clone(),
+            role: "dev".to_string(),
+            command: "bash".to_string(),
+            working_directory: PathBuf::from("/tmp/feat-term"),
+            status: flotilla_protocol::TerminalStatus::Running,
+        });
 
         let (items, _) = correlate(&providers);
 
@@ -2313,10 +1923,7 @@ mod tests {
         assert_eq!(items[0].kind(), WorkItemKind::Checkout);
 
         let terminal_ids = items[0].terminal_ids();
-        assert!(
-            !terminal_ids.is_empty(),
-            "terminal_ids should be non-empty after correlation"
-        );
+        assert!(!terminal_ids.is_empty(), "terminal_ids should be non-empty after correlation");
         assert_eq!(terminal_ids[0], terminal_id);
     }
 }

@@ -1,11 +1,9 @@
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use tui_input::backend::crossterm::EventHandler as InputEventHandler;
-use tui_input::Input;
-
 use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, WorkItem};
+use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{App, BranchInputKind, ClearDispatch, Intent, UiMode};
 
@@ -122,9 +120,7 @@ impl App {
                 }
             }
             KeyCode::Char('/') => {
-                self.ui.mode = UiMode::IssueSearch {
-                    input: Input::default(),
-                };
+                self.ui.mode = UiMode::IssueSearch { input: Input::default() };
             }
             KeyCode::Char('c') => {
                 let sp = self.active_ui().show_providers;
@@ -165,12 +161,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(si) = self.row_at_mouse(mouse.column, mouse.row) {
                     let now = Instant::now();
-                    let is_double_click = self
-                        .ui
-                        .double_click
-                        .last_time
-                        .map(|t| now.duration_since(t).as_millis() < 400)
-                        .unwrap_or(false)
+                    let is_double_click = self.ui.double_click.last_time.map(|t| now.duration_since(t).as_millis() < 400).unwrap_or(false)
                         && self.ui.double_click.last_selectable_idx == Some(si);
 
                     let table_idx = self.active_ui().table_view.selectable_indices[si];
@@ -278,9 +269,7 @@ impl App {
         all_issue_keys.dedup();
         if !all_issue_keys.is_empty() {
             self.enter_branch_input(BranchInputKind::Generating);
-            self.proto_commands.push(Command::GenerateBranchName {
-                issue_keys: all_issue_keys,
-            });
+            self.proto_commands.push(Command::GenerateBranchName { issue_keys: all_issue_keys });
         }
         self.active_ui_mut().multi_selected.clear();
     }
@@ -299,19 +288,14 @@ impl App {
         // the caller somehow bypassed the menu/availability filter.
         if !intent.is_allowed_for_host(item, &self.model.my_host) {
             tracing::warn!(?intent, host = %item.host, "blocked intent on remote item");
-            self.model.status_message =
-                Some("Cannot perform this action on a remote item".to_string());
+            self.model.status_message = Some("Cannot perform this action on a remote item".to_string());
             return;
         }
 
         if let Some(cmd) = intent.resolve(item, self) {
             match intent {
                 Intent::RemoveCheckout => {
-                    self.ui.mode = UiMode::DeleteConfirm {
-                        info: None,
-                        loading: true,
-                        terminal_keys: item.terminal_keys.clone(),
-                    };
+                    self.ui.mode = UiMode::DeleteConfirm { info: None, loading: true, terminal_keys: item.terminal_keys.clone() };
                 }
                 Intent::GenerateBranchName => {
                     self.enter_branch_input(BranchInputKind::Generating);
@@ -341,11 +325,7 @@ impl App {
         let items: Vec<Intent> = Intent::all_in_menu_order()
             .iter()
             .copied()
-            .filter(|a| {
-                a.is_available(&item)
-                    && a.is_allowed_for_host(&item, my_host)
-                    && a.resolve(&item, self).is_some()
-            })
+            .filter(|a| a.is_available(&item) && a.is_allowed_for_host(&item, my_host) && a.resolve(&item, self).is_some())
             .collect();
 
         if items.is_empty() {
@@ -369,11 +349,7 @@ impl App {
             }
             return;
         }
-        let UiMode::ActionMenu {
-            ref items,
-            ref mut index,
-        } = self.ui.mode
-        else {
+        let UiMode::ActionMenu { ref items, ref mut index } = self.ui.mode else {
             return;
         };
         match key.code {
@@ -391,13 +367,7 @@ impl App {
 
     fn handle_branch_input_key(&mut self, key: KeyEvent) {
         // Ignore keys while generating
-        if matches!(
-            self.ui.mode,
-            UiMode::BranchInput {
-                kind: BranchInputKind::Generating,
-                ..
-            }
-        ) {
+        if matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }) {
             return;
         }
 
@@ -406,22 +376,13 @@ impl App {
             return;
         }
         if key.code == KeyCode::Enter {
-            let (branch, issue_ids) = if let UiMode::BranchInput {
-                ref input,
-                ref mut pending_issue_ids,
-                ..
-            } = self.ui.mode
-            {
+            let (branch, issue_ids) = if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
                 (input.value().to_string(), std::mem::take(pending_issue_ids))
             } else {
                 return;
             };
             if !branch.is_empty() {
-                self.proto_commands.push(Command::CreateCheckout {
-                    branch,
-                    create_branch: true,
-                    issue_ids,
-                });
+                self.proto_commands.push(Command::CreateCheckout { branch, create_branch: true, issue_ids });
             }
             self.ui.mode = UiMode::Normal;
             return;
@@ -445,10 +406,7 @@ impl App {
                 };
                 if !query.is_empty() {
                     let repo = self.model.active_repo_root().clone();
-                    self.proto_commands.push(Command::SearchIssues {
-                        repo,
-                        query: query.clone(),
-                    });
+                    self.proto_commands.push(Command::SearchIssues { repo, query: query.clone() });
                     self.active_ui_mut().active_search_query = Some(query);
                 }
                 self.ui.mode = UiMode::Normal;
@@ -467,16 +425,9 @@ impl App {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if !loading {
                     // Extract branch from CheckoutStatus and send RemoveCheckout
-                    if let UiMode::DeleteConfirm {
-                        info: Some(ref info),
-                        ref terminal_keys,
-                        ..
-                    } = self.ui.mode
-                    {
-                        self.proto_commands.push(Command::RemoveCheckout {
-                            branch: info.branch.clone(),
-                            terminal_keys: terminal_keys.clone(),
-                        });
+                    if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, .. } = self.ui.mode {
+                        self.proto_commands
+                            .push(Command::RemoveCheckout { branch: info.branch.clone(), terminal_keys: terminal_keys.clone() });
                     }
                     self.ui.mode = UiMode::Normal;
                 }
@@ -492,8 +443,7 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if let UiMode::CloseConfirm { ref id, .. } = self.ui.mode {
-                    self.proto_commands
-                        .push(Command::CloseChangeRequest { id: id.clone() });
+                    self.proto_commands.push(Command::CloseChangeRequest { id: id.clone() });
                 }
                 self.ui.mode = UiMode::Normal;
             }
@@ -523,13 +473,13 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::test_support::{
-        checkout_item, key, setup_selectable_table as setup_table, stub_app,
-    };
+    use std::path::PathBuf;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use flotilla_protocol::{CheckoutStatus, Command, HostName, HostPath, WorkItemIdentity};
-    use std::path::PathBuf;
+
+    use super::{super::RepoViewLayout, *};
+    use crate::app::test_support::{checkout_item, key, setup_selectable_table as setup_table, stub_app};
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::local(), PathBuf::from(path))
@@ -577,10 +527,7 @@ mod tests {
     #[test]
     fn question_mark_in_other_modes_does_not_toggle() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::OpenChangeRequest],
-            index: 0,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest], index: 0 };
         app.handle_key(key(KeyCode::Char('?')));
         assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
     }
@@ -706,9 +653,7 @@ mod tests {
     fn normal_esc_clears_multi_select_second() {
         let mut app = stub_app();
         setup_table(&mut app, vec![make_work_item("a")]);
-        app.active_ui_mut()
-            .multi_selected
-            .insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
+        app.active_ui_mut().multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
         assert!(!app.active_ui().multi_selected.is_empty());
         app.handle_key(key(KeyCode::Esc));
         assert!(app.active_ui().multi_selected.is_empty());
@@ -727,13 +672,7 @@ mod tests {
     fn normal_n_enters_branch_input() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::BranchInput {
-                kind: BranchInputKind::Manual,
-                ..
-            }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Manual, .. }));
     }
 
     #[test]
@@ -742,10 +681,7 @@ mod tests {
         setup_table(&mut app, vec![make_work_item("a")]);
         app.handle_key(key(KeyCode::Char('d')));
         // RemoveCheckout resolves to FetchCheckoutStatus, then sets DeleteConfirm mode
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::DeleteConfirm { loading: true, .. }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command::FetchCheckoutStatus { .. }));
     }
@@ -805,10 +741,7 @@ mod tests {
     #[test]
     fn menu_esc_returns_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
-            index: 0,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
     }
@@ -816,10 +749,7 @@ mod tests {
     #[test]
     fn menu_j_advances_index() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
-            index: 0,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
         app.handle_key(key(KeyCode::Char('j')));
         match app.ui.mode {
             UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
@@ -830,10 +760,7 @@ mod tests {
     #[test]
     fn menu_k_decrements_index() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
-            index: 1,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 1 };
         app.handle_key(key(KeyCode::Char('k')));
         match app.ui.mode {
             UiMode::ActionMenu { index, .. } => assert_eq!(index, 0),
@@ -844,10 +771,7 @@ mod tests {
     #[test]
     fn menu_j_stays_at_end() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
-            index: 1,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 1 };
         app.handle_key(key(KeyCode::Char('j')));
         match app.ui.mode {
             UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
@@ -858,10 +782,7 @@ mod tests {
     #[test]
     fn menu_k_stays_at_zero() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace],
-            index: 0,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
         app.handle_key(key(KeyCode::Char('k')));
         match app.ui.mode {
             UiMode::ActionMenu { index, .. } => assert_eq!(index, 0),
@@ -874,11 +795,7 @@ mod tests {
     #[test]
     fn branch_input_esc_returns_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput {
-            input: Input::from("my-branch"),
-            kind: BranchInputKind::Manual,
-            pending_issue_ids: vec![],
-        };
+        app.ui.mode = UiMode::BranchInput { input: Input::from("my-branch"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
     }
@@ -886,20 +803,12 @@ mod tests {
     #[test]
     fn branch_input_enter_creates_checkout() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput {
-            input: Input::from("my-branch"),
-            kind: BranchInputKind::Manual,
-            pending_issue_ids: vec![],
-        };
+        app.ui.mode = UiMode::BranchInput { input: Input::from("my-branch"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::CreateCheckout {
-                branch,
-                create_branch,
-                issue_ids,
-            } => {
+            Command::CreateCheckout { branch, create_branch, issue_ids } => {
                 assert_eq!(branch, "my-branch");
                 assert!(create_branch);
                 assert!(issue_ids.is_empty());
@@ -929,11 +838,7 @@ mod tests {
     #[test]
     fn branch_input_enter_empty_does_not_create() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput {
-            input: Input::default(),
-            kind: BranchInputKind::Manual,
-            pending_issue_ids: vec![],
-        };
+        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());
@@ -942,31 +847,15 @@ mod tests {
     #[test]
     fn branch_input_ignored_while_generating() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput {
-            input: Input::from("partial"),
-            kind: BranchInputKind::Generating,
-            pending_issue_ids: vec![],
-        };
+        app.ui.mode = UiMode::BranchInput { input: Input::from("partial"), kind: BranchInputKind::Generating, pending_issue_ids: vec![] };
         // Enter should be ignored
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::BranchInput {
-                kind: BranchInputKind::Generating,
-                ..
-            }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
         assert!(app.proto_commands.take_next().is_none());
 
         // Esc should also be ignored
         app.handle_key(key(KeyCode::Esc));
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::BranchInput {
-                kind: BranchInputKind::Generating,
-                ..
-            }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
     }
 
     // ── handle_issue_search_key ──────────────────────────────────────
@@ -974,9 +863,7 @@ mod tests {
     #[test]
     fn issue_search_esc_clears_and_returns() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch {
-            input: Input::from("some query"),
-        };
+        app.ui.mode = UiMode::IssueSearch { input: Input::from("some query") };
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
@@ -991,9 +878,7 @@ mod tests {
     #[test]
     fn issue_search_enter_submits_query() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch {
-            input: Input::from("bug fix"),
-        };
+        app.ui.mode = UiMode::IssueSearch { input: Input::from("bug fix") };
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
@@ -1009,9 +894,7 @@ mod tests {
     #[test]
     fn issue_search_enter_empty_no_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch {
-            input: Input::default(),
-        };
+        app.ui.mode = UiMode::IssueSearch { input: Input::default() };
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());
@@ -1052,17 +935,10 @@ mod tests {
     #[test]
     fn delete_confirm_ignores_while_loading() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: None,
-            loading: true,
-            terminal_keys: vec![],
-        };
+        app.ui.mode = UiMode::DeleteConfirm { info: None, loading: true, terminal_keys: vec![] };
         app.handle_key(key(KeyCode::Char('y')));
         // Should still be in DeleteConfirm mode
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::DeleteConfirm { loading: true, .. }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1104,10 +980,7 @@ mod tests {
                 // SwitchToWorkspace should NOT be available (no workspace_refs)
                 assert!(!items.contains(&Intent::SwitchToWorkspace));
             }
-            other => panic!(
-                "expected ActionMenu, got {:?}",
-                std::mem::discriminant(other)
-            ),
+            other => panic!("expected ActionMenu, got {:?}", std::mem::discriminant(other)),
         }
     }
 
@@ -1201,10 +1074,7 @@ mod tests {
         let mut app = stub_app();
         let item = make_work_item("a");
         app.resolve_and_push(Intent::RemoveCheckout, &item);
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::DeleteConfirm { loading: true, .. }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command::FetchCheckoutStatus { .. }));
     }
@@ -1215,13 +1085,7 @@ mod tests {
         let mut item = make_work_item("a");
         item.issue_keys = vec!["ISSUE-1".into()];
         app.resolve_and_push(Intent::GenerateBranchName, &item);
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::BranchInput {
-                kind: BranchInputKind::Generating,
-                ..
-            }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
             Command::GenerateBranchName { issue_keys } => {
@@ -1238,10 +1102,7 @@ mod tests {
         let mut app = stub_app();
         let item = make_work_item("a");
         setup_table(&mut app, vec![item]);
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::CreateWorkspace, Intent::RemoveCheckout],
-            index: 0,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::CreateWorkspace, Intent::RemoveCheckout], index: 0 };
         app.execute_menu_action();
         let cmd = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command::CreateWorkspaceForCheckout { .. }));
@@ -1252,10 +1113,7 @@ mod tests {
         let mut app = stub_app();
         let item = make_work_item("a");
         setup_table(&mut app, vec![item]);
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::CreateWorkspace],
-            index: 0,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::CreateWorkspace], index: 0 };
         app.handle_key(key(KeyCode::Enter));
         // CreateWorkspace doesn't change the mode itself, so handle_menu_key resets to Normal
         assert!(matches!(app.ui.mode, UiMode::Normal));
@@ -1266,16 +1124,10 @@ mod tests {
         let mut app = stub_app();
         let item = make_work_item("a");
         setup_table(&mut app, vec![item]);
-        app.ui.mode = UiMode::ActionMenu {
-            items: vec![Intent::RemoveCheckout],
-            index: 0,
-        };
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::RemoveCheckout], index: 0 };
         app.handle_key(key(KeyCode::Enter));
         // RemoveCheckout sets DeleteConfirm mode, which should be preserved
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::DeleteConfirm { loading: true, .. }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
     }
 
     // ── j/k navigation in normal mode ────────────────────────────────
@@ -1283,14 +1135,7 @@ mod tests {
     #[test]
     fn normal_j_selects_next() {
         let mut app = stub_app();
-        setup_table(
-            &mut app,
-            vec![
-                make_work_item("a"),
-                make_work_item("b"),
-                make_work_item("c"),
-            ],
-        );
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b"), make_work_item("c")]);
         assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
@@ -1321,23 +1166,13 @@ mod tests {
         setup_table(&mut app, vec![item_a, item_b]);
 
         // Multi-select both items
-        app.active_ui_mut()
-            .multi_selected
-            .insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
-        app.active_ui_mut()
-            .multi_selected
-            .insert(WorkItemIdentity::Checkout(hp("/tmp/b")));
+        app.active_ui_mut().multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
+        app.active_ui_mut().multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/b")));
 
         app.action_enter();
 
         // Should set BranchInput with generating=true
-        assert!(matches!(
-            app.ui.mode,
-            UiMode::BranchInput {
-                kind: BranchInputKind::Generating,
-                ..
-            }
-        ));
+        assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
             Command::GenerateBranchName { issue_keys } => {
@@ -1356,9 +1191,7 @@ mod tests {
         let item_a = make_work_item("a"); // no issue_keys
         setup_table(&mut app, vec![item_a]);
 
-        app.active_ui_mut()
-            .multi_selected
-            .insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
+        app.active_ui_mut().multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
 
         app.action_enter();
 
@@ -1373,11 +1206,7 @@ mod tests {
     #[test]
     fn delete_confirm_y_with_no_info_does_not_push_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: None,
-            loading: false,
-            terminal_keys: vec![],
-        };
+        app.ui.mode = UiMode::DeleteConfirm { info: None, loading: false, terminal_keys: vec![] };
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         // No info means no branch to extract, so no command pushed
@@ -1397,10 +1226,7 @@ mod tests {
             UiMode::ActionMenu { items, .. } => {
                 assert!(items.contains(&Intent::OpenChangeRequest));
             }
-            other => panic!(
-                "expected ActionMenu, got {:?}",
-                std::mem::discriminant(other)
-            ),
+            other => panic!("expected ActionMenu, got {:?}", std::mem::discriminant(other)),
         }
     }
 
@@ -1420,22 +1246,22 @@ mod tests {
     #[test]
     fn l_cycles_layout_in_normal_mode() {
         let mut app = stub_app();
-        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Auto);
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Auto);
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Zoom);
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Zoom);
         assert!(matches!(app.ui.mode, UiMode::Normal));
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Right);
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Right);
         assert!(matches!(app.ui.mode, UiMode::Normal));
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Below);
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Below);
         assert!(matches!(app.ui.mode, UiMode::Normal));
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.ui.view_layout, super::super::RepoViewLayout::Auto);
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Auto);
         assert!(matches!(app.ui.mode, UiMode::Normal));
     }
 
