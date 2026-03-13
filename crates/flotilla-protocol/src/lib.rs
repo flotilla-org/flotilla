@@ -5,6 +5,7 @@ mod host;
 pub mod output;
 pub mod peer;
 pub mod provider_data;
+pub mod query;
 pub mod snapshot;
 
 pub use host::{HostName, HostPath, RepoIdentity};
@@ -36,6 +37,10 @@ pub use provider_data::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
     IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId, ProviderData, SessionStatus, TerminalStatus, WorkingTreeStatus,
     Workspace,
+};
+pub use query::{
+    DiscoveryEntry, ProviderHealthMap, ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse,
+    StatusResponse, UnmetRequirementInfo,
 };
 use serde::{Deserialize, Serialize};
 pub use snapshot::{CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem, WorkItemIdentity, WorkItemKind};

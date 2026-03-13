@@ -5,13 +5,59 @@
 
 use std::{collections::HashMap, path::Path};
 
-use flotilla_protocol::{CheckoutRef, HostName, ProviderError, Snapshot, WorkItem};
+use flotilla_protocol::{CheckoutRef, DiscoveryEntry, HostName, ProviderError, Snapshot, WorkItem};
 
 use crate::{
     data::{CorrelationResult, RefreshError},
-    providers::correlation::{CorrelatedGroup, ItemKind as CorItemKind},
+    providers::{
+        correlation::{CorrelatedGroup, ItemKind as CorItemKind},
+        discovery::EnvironmentAssertion,
+    },
     refresh::RefreshSnapshot,
 };
+
+pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> DiscoveryEntry {
+    let mut detail = HashMap::new();
+    let kind = match assertion {
+        EnvironmentAssertion::BinaryAvailable { name, path, version } => {
+            detail.insert("name".into(), name.clone());
+            detail.insert("path".into(), path.display().to_string());
+            if let Some(v) = version {
+                detail.insert("version".into(), v.clone());
+            }
+            "binary_available"
+        }
+        EnvironmentAssertion::EnvVarSet { key, .. } => {
+            detail.insert("key".into(), key.clone());
+            detail.insert("value".into(), "<set>".into());
+            "env_var_set"
+        }
+        EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
+            detail.insert("root".into(), root.display().to_string());
+            detail.insert("kind".into(), format!("{kind:?}"));
+            detail.insert("is_main_checkout".into(), is_main_checkout.to_string());
+            "vcs_checkout_detected"
+        }
+        EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
+            detail.insert("platform".into(), format!("{platform:?}"));
+            detail.insert("owner".into(), owner.clone());
+            detail.insert("repo".into(), repo.clone());
+            detail.insert("remote_name".into(), remote_name.clone());
+            "remote_host"
+        }
+        EnvironmentAssertion::AuthFileExists { provider, path } => {
+            detail.insert("provider".into(), provider.clone());
+            detail.insert("path".into(), path.display().to_string());
+            "auth_file_exists"
+        }
+        EnvironmentAssertion::SocketAvailable { name, path } => {
+            detail.insert("name".into(), name.clone());
+            detail.insert("path".into(), path.display().to_string());
+            "socket_available"
+        }
+    };
+    DiscoveryEntry { kind: kind.into(), detail }
+}
 
 pub fn correlation_result_to_work_item(item: &CorrelationResult, groups: &[CorrelatedGroup], host_name: &HostName) -> WorkItem {
     let kind = item.kind();
@@ -97,7 +143,38 @@ mod tests {
     use flotilla_protocol::{HostName, HostPath, WorkItemIdentity, WorkItemKind};
 
     use super::*;
-    use crate::data::{CorrelatedAnchor, CorrelatedWorkItem, StandaloneResult};
+    use crate::{
+        data::{CorrelatedAnchor, CorrelatedWorkItem, StandaloneResult},
+        providers::discovery::EnvironmentAssertion,
+    };
+
+    #[test]
+    fn convert_binary_available() {
+        let assertion =
+            EnvironmentAssertion::BinaryAvailable { name: "git".into(), path: PathBuf::from("/usr/bin/git"), version: Some("2.40".into()) };
+        let entry = assertion_to_discovery_entry(&assertion);
+        assert_eq!(entry.kind, "binary_available");
+        assert_eq!(entry.detail["name"], "git");
+        assert_eq!(entry.detail["path"], "/usr/bin/git");
+        assert_eq!(entry.detail["version"], "2.40");
+    }
+
+    #[test]
+    fn convert_auth_file_exists() {
+        let assertion =
+            EnvironmentAssertion::AuthFileExists { provider: "github".into(), path: PathBuf::from("/home/.config/gh/hosts.yml") };
+        let entry = assertion_to_discovery_entry(&assertion);
+        assert_eq!(entry.kind, "auth_file_exists");
+        assert_eq!(entry.detail["provider"], "github");
+    }
+
+    #[test]
+    fn convert_socket_available() {
+        let assertion = EnvironmentAssertion::SocketAvailable { name: "shpool".into(), path: PathBuf::from("/tmp/shpool.sock") };
+        let entry = assertion_to_discovery_entry(&assertion);
+        assert_eq!(entry.kind, "socket_available");
+        assert_eq!(entry.detail["name"], "shpool");
+    }
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::new("test-host"), PathBuf::from(path))

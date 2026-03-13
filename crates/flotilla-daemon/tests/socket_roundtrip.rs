@@ -91,3 +91,96 @@ async fn socket_roundtrip() {
     // Clean up
     server_handle.abort();
 }
+
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
+async fn query_commands_roundtrip() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let socket_path = tmp.path().join("test.sock");
+
+    // Use workspace root (a real git repo) as the test repo.
+    // CARGO_MANIFEST_DIR points to crates/flotilla-daemon; go up two levels.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo = manifest_dir.parent().expect("parent").parent().expect("grandparent").to_path_buf();
+
+    // Start daemon server
+    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let server = DaemonServer::new(vec![repo.clone()], config, socket_path.clone(), Duration::from_secs(300))
+        .await
+        .expect("server config should be valid");
+
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    // Connect client with retry.
+    let connect_deadline = Instant::now() + Duration::from_secs(10);
+    let client = loop {
+        match flotilla_client::SocketDaemon::connect(&socket_path).await {
+            Ok(client) => break client,
+            Err(connect_err) => {
+                if server_handle.is_finished() {
+                    match server_handle.await {
+                        Ok(Ok(())) => panic!("daemon server exited before client connected (last connect error: {connect_err})"),
+                        Ok(Err(server_err)) => {
+                            if server_err.contains("Operation not permitted") {
+                                eprintln!(
+                                    "skipping query_commands_roundtrip: unix socket bind not permitted in this environment: {server_err}"
+                                );
+                                return;
+                            }
+                            panic!("daemon server failed before client connected: {server_err} (last connect error: {connect_err})")
+                        }
+                        Err(join_err) => {
+                            panic!("daemon server task panicked before client connected: {join_err} (last connect error: {connect_err})")
+                        }
+                    }
+                }
+                if Instant::now() >= connect_deadline {
+                    server_handle.abort();
+                    panic!("timed out connecting to daemon: {connect_err}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    // Wait for initial data to be available by polling get_state until it
+    // returns a snapshot. The initial snapshot event fires during/before
+    // connect, so subscribe+recv would race and miss it.
+    let data_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if client.get_state(&repo).await.is_ok() {
+            break;
+        }
+        if Instant::now() >= data_deadline {
+            server_handle.abort();
+            panic!("timed out waiting for initial snapshot data");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Test get_status
+    let status = client.get_status().await.expect("get_status");
+    assert!(!status.repos.is_empty(), "status should list at least one repo");
+    assert_eq!(status.repos[0].path, repo);
+
+    // Test get_repo_detail by repo directory name
+    let repo_name = repo.file_name().expect("repo file_name").to_str().expect("repo name utf8");
+    let detail = client.get_repo_detail(repo_name).await.expect("get_repo_detail");
+    assert_eq!(detail.path, repo);
+
+    // Test get_repo_providers
+    let providers = client.get_repo_providers(repo_name).await.expect("get_repo_providers");
+    assert_eq!(providers.path, repo);
+    assert!(!providers.providers.is_empty(), "should have at least VCS provider");
+
+    // Test get_repo_work
+    let work = client.get_repo_work(repo_name).await.expect("get_repo_work");
+    assert_eq!(work.path, repo);
+
+    // Test slug resolution error for nonexistent repo
+    let err = client.get_repo_detail("nonexistent").await;
+    assert!(err.is_err(), "nonexistent slug should return error");
+
+    // Clean up
+    server_handle.abort();
+}

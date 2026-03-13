@@ -15,7 +15,8 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError, RepoInfo, Snapshot,
+    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSummary, RepoWorkResponse, Snapshot, StatusResponse, UnmetRequirementInfo,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -30,7 +31,7 @@ use crate::{
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
     providers::{
-        discovery::{discover_providers, DiscoveryResult, EnvironmentBag, FactoryRegistry, ProcessEnvVars, RepoDetector},
+        discovery::{discover_providers, DiscoveryResult, EnvironmentBag, FactoryRegistry, ProcessEnvVars, RepoDetector, UnmetRequirement},
         CommandRunner,
     },
     refresh::RefreshSnapshot,
@@ -169,6 +170,9 @@ const DELTA_LOG_CAPACITY: usize = 16;
 
 struct RepoState {
     model: RepoModel,
+    slug: Option<String>,
+    repo_bag: EnvironmentBag,
+    unmet: Vec<(String, UnmetRequirement)>,
     seq: u64,
     last_snapshot: Arc<RefreshSnapshot>,
     issue_cache: IssueCache,
@@ -333,7 +337,7 @@ impl InProcessDaemon {
             if repos.contains_key(&path) {
                 continue;
             }
-            let DiscoveryResult { registry, repo_slug, bag, unmet } =
+            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } =
                 discovery::discover_providers(&host_bag, &path, &repo_detectors, &factories, &config, Arc::clone(&runner), &ProcessEnvVars)
                     .await;
             if !unmet.is_empty() {
@@ -341,14 +345,18 @@ impl InProcessDaemon {
             }
 
             // RepoIdentity from the merged bag
-            if let Some(identity) = bag.repo_identity() {
+            if let Some(identity) = host_repo_bag.repo_identity() {
                 identities.insert(identity, path.clone());
             }
 
+            let slug = repo_slug.clone();
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
             repos.insert(path.clone(), RepoState {
                 model,
+                slug,
+                repo_bag,
+                unmet,
                 seq: 0,
                 last_snapshot: Arc::new(RefreshSnapshot::default()),
                 issue_cache: IssueCache::new(),
@@ -895,6 +903,9 @@ impl InProcessDaemon {
             }
             repos.insert(synthetic_path.clone(), RepoState {
                 model,
+                slug: None,
+                repo_bag: EnvironmentBag::new(),
+                unmet: Vec::new(),
                 seq: 0,
                 last_snapshot: Arc::new(RefreshSnapshot::default()),
                 issue_cache: IssueCache::new(),
@@ -1183,7 +1194,7 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let DiscoveryResult { registry, repo_slug, bag, unmet } = discover_providers(
+        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
             &self.host_bag,
             &path,
             &self.repo_detectors,
@@ -1196,6 +1207,7 @@ impl DaemonHandle for InProcessDaemon {
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
+        let slug = repo_slug.clone();
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
         model.data.loading = true;
 
@@ -1217,6 +1229,9 @@ impl DaemonHandle for InProcessDaemon {
             }
             repos.insert(path.clone(), RepoState {
                 model,
+                slug,
+                repo_bag,
+                unmet,
                 seq: 0,
                 last_snapshot: Arc::new(RefreshSnapshot::default()),
                 issue_cache: IssueCache::new(),
@@ -1232,7 +1247,7 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Register RepoIdentity for peer routing
-        if let Some(identity) = bag.repo_identity() {
+        if let Some(identity) = host_repo_bag.repo_identity() {
             self.repo_identities.write().await.insert(identity, path.clone());
         }
 
@@ -1339,6 +1354,138 @@ impl DaemonHandle for InProcessDaemon {
         let _ = self.event_tx.send(DaemonEvent::RepoRemoved { path });
 
         Ok(())
+    }
+
+    async fn get_status(&self) -> Result<StatusResponse, String> {
+        let peer_providers = self.peer_providers.read().await;
+        let repos = self.repos.read().await;
+        let repo_order = self.repo_order.read().await;
+        let mut summaries = Vec::new();
+
+        for path in repo_order.iter() {
+            let Some(state) = repos.get(path) else { continue };
+            let peer_overlay = peer_providers.get(path).cloned();
+            let snapshot = build_repo_snapshot_with_peers(
+                path,
+                state.seq,
+                &state.last_snapshot,
+                &state.issue_cache,
+                &state.search_results,
+                &self.host_name,
+                peer_overlay.as_deref(),
+            );
+            summaries.push(RepoSummary {
+                path: path.clone(),
+                slug: state.slug.clone(),
+                provider_health: snapshot.provider_health,
+                work_item_count: snapshot.work_items.len(),
+                error_count: snapshot.errors.len(),
+            });
+        }
+        Ok(StatusResponse { repos: summaries })
+    }
+
+    async fn get_repo_detail(&self, slug: &str) -> Result<RepoDetailResponse, String> {
+        let repos = self.repos.read().await;
+        let path = {
+            let entries: Vec<_> = repos.iter().map(|(path, state)| (path.as_path(), state.slug.as_deref())).collect();
+            crate::resolve::resolve_repo(slug, entries.into_iter()).map_err(|e| e.to_string())?
+        };
+        let peer_overlay = {
+            let pp = self.peer_providers.read().await;
+            pp.get(&path).cloned()
+        };
+        let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
+        let snapshot = build_repo_snapshot_with_peers(
+            &path,
+            state.seq,
+            &state.last_snapshot,
+            &state.issue_cache,
+            &state.search_results,
+            &self.host_name,
+            peer_overlay.as_deref(),
+        );
+        Ok(RepoDetailResponse {
+            path,
+            slug: state.slug.clone(),
+            provider_health: snapshot.provider_health,
+            work_items: snapshot.work_items,
+            errors: snapshot.errors,
+        })
+    }
+
+    async fn get_repo_providers(&self, slug: &str) -> Result<RepoProvidersResponse, String> {
+        let repos = self.repos.read().await;
+        let path = {
+            let entries: Vec<_> = repos.iter().map(|(path, state)| (path.as_path(), state.slug.as_deref())).collect();
+            crate::resolve::resolve_repo(slug, entries.into_iter()).map_err(|e| e.to_string())?
+        };
+        let peer_overlay = {
+            let pp = self.peer_providers.read().await;
+            pp.get(&path).cloned()
+        };
+        let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
+        let snapshot = build_repo_snapshot_with_peers(
+            &path,
+            state.seq,
+            &state.last_snapshot,
+            &state.issue_cache,
+            &state.search_results,
+            &self.host_name,
+            peer_overlay.as_deref(),
+        );
+
+        let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+        let repo_discovery = state.repo_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+
+        let provider_infos = state
+            .model
+            .registry
+            .provider_infos()
+            .into_iter()
+            .map(|(category, name)| {
+                let healthy = snapshot.provider_health.get(&category).and_then(|providers| providers.get(&name)).copied().unwrap_or(true);
+                ProviderInfo { category, name, healthy }
+            })
+            .collect();
+
+        let unmet_requirements = state
+            .unmet
+            .iter()
+            .map(|(factory, req)| UnmetRequirementInfo { factory: factory.clone(), requirement: format!("{req:?}") })
+            .collect();
+
+        Ok(RepoProvidersResponse {
+            path,
+            slug: state.slug.clone(),
+            host_discovery,
+            repo_discovery,
+            providers: provider_infos,
+            unmet_requirements,
+        })
+    }
+
+    async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String> {
+        let repos = self.repos.read().await;
+        let path = {
+            let entries: Vec<_> = repos.iter().map(|(path, state)| (path.as_path(), state.slug.as_deref())).collect();
+            crate::resolve::resolve_repo(slug, entries.into_iter()).map_err(|e| e.to_string())?
+        };
+        let peer_overlay = {
+            let pp = self.peer_providers.read().await;
+            pp.get(&path).cloned()
+        };
+        let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
+        let snapshot = build_repo_snapshot_with_peers(
+            &path,
+            state.seq,
+            &state.last_snapshot,
+            &state.issue_cache,
+            &state.search_results,
+            &self.host_name,
+            peer_overlay.as_deref(),
+        );
+        Ok(RepoWorkResponse { path, slug: state.slug.clone(), work_items: snapshot.work_items })
     }
 }
 

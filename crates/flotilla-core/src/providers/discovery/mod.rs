@@ -105,6 +105,11 @@ impl EnvironmentBag {
         Self::default()
     }
 
+    /// Public read access to the raw assertions, for conversion to protocol types.
+    pub fn assertions(&self) -> &[EnvironmentAssertion] {
+        &self.assertions
+    }
+
     pub fn with(mut self, assertion: EnvironmentAssertion) -> Self {
         self.assertions.push(assertion);
         self
@@ -330,9 +335,10 @@ pub struct FactoryRegistry {
 
 pub struct DiscoveryResult {
     pub registry: ProviderRegistry,
-    pub bag: EnvironmentBag,
+    pub host_repo_bag: EnvironmentBag,
+    pub repo_bag: EnvironmentBag,
     pub repo_slug: Option<String>,
-    pub unmet: Vec<UnmetRequirement>,
+    pub unmet: Vec<(String, UnmetRequirement)>,
 }
 
 pub async fn run_host_detectors(detectors: &[Box<dyn HostDetector>], runner: &dyn CommandRunner, env: &dyn EnvVars) -> EnvironmentBag {
@@ -365,7 +371,7 @@ pub async fn discover_providers(
         config: &ConfigStore,
         repo_root: &Path,
         runner: &Arc<dyn CommandRunner>,
-        unmet: &mut Vec<UnmetRequirement>,
+        unmet: &mut Vec<(String, UnmetRequirement)>,
         mut insert: F,
     ) where
         F: FnMut(ProviderDescriptor, Arc<T>),
@@ -373,7 +379,10 @@ pub async fn discover_providers(
         for factory in factories {
             match factory.probe(env, config, repo_root, runner.clone()).await {
                 Ok(provider) => insert(factory.descriptor(), provider),
-                Err(reqs) => unmet.extend(reqs),
+                Err(reqs) => {
+                    let name = factory.descriptor().name.clone();
+                    unmet.extend(reqs.into_iter().map(|r| (name.clone(), r)));
+                }
             }
         }
     }
@@ -384,12 +393,15 @@ pub async fn discover_providers(
         config: &ConfigStore,
         repo_root: &Path,
         runner: &Arc<dyn CommandRunner>,
-        unmet: &mut Vec<UnmetRequirement>,
+        unmet: &mut Vec<(String, UnmetRequirement)>,
     ) -> Option<(ProviderDescriptor, Arc<T>)> {
         for factory in factories {
             match factory.probe(env, config, repo_root, runner.clone()).await {
                 Ok(provider) => return Some((factory.descriptor(), provider)),
-                Err(reqs) => unmet.extend(reqs),
+                Err(reqs) => {
+                    let name = factory.descriptor().name.clone();
+                    unmet.extend(reqs.into_iter().map(|r| (name.clone(), r)));
+                }
             }
         }
         None
@@ -423,7 +435,7 @@ pub async fn discover_providers(
 
     let repo_slug = combined.repo_slug();
 
-    DiscoveryResult { registry, bag: combined, repo_slug, unmet }
+    DiscoveryResult { registry, host_repo_bag: combined, repo_bag, repo_slug, unmet }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +618,22 @@ mod tests {
         let bag = EnvironmentBag::new();
         assert!(bag.repo_identity().is_none());
     }
+
+    #[test]
+    fn environment_bag_assertions_accessor() {
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::BinaryAvailable {
+                name: "git".into(),
+                path: PathBuf::from("/usr/bin/git"),
+                version: Some("2.40".into()),
+            })
+            .with(EnvironmentAssertion::AuthFileExists {
+                provider: "github".into(),
+                path: PathBuf::from("/home/user/.config/gh/hosts.yml"),
+            });
+        assert_eq!(bag.assertions().len(), 2);
+        assert!(matches!(bag.assertions()[0], EnvironmentAssertion::BinaryAvailable { ref name, .. } if name == "git"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -667,8 +695,8 @@ mod orchestrator_tests {
         assert!(!result.registry.vcs.is_empty(), "expected at least one VCS provider");
 
         // The combined bag should have both host assertions (binary) and repo assertions (checkout)
-        assert!(result.bag.find_binary("git").is_some(), "host binary should be in combined bag");
-        assert!(result.bag.find_vcs_checkout(VcsKind::Git).is_some(), "repo checkout should be in combined bag");
+        assert!(result.host_repo_bag.find_binary("git").is_some(), "host binary should be in combined bag");
+        assert!(result.host_repo_bag.find_vcs_checkout(VcsKind::Git).is_some(), "repo checkout should be in combined bag");
     }
 
     #[tokio::test]

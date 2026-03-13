@@ -51,6 +51,32 @@ enum SubCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Query a specific repo
+    Repo {
+        /// Repo path, name, or slug (e.g. "owner/repo")
+        slug: String,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        command: Option<RepoSubCommand>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum RepoSubCommand {
+    /// Show provider discovery and instances
+    Providers {
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show work items
+    Work {
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -72,6 +98,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, *timeout).await,
         Some(SubCommand::Status { json }) => run_status(&cli, OutputFormat::from_json_flag(*json)).await,
         Some(SubCommand::Watch { json }) => run_watch(&cli, OutputFormat::from_json_flag(*json)).await,
+        Some(SubCommand::Repo { slug, json, command }) => run_repo(&cli, slug, OutputFormat::from_json_flag(*json), command.as_ref()).await,
         None => run_tui(cli).await,
     }
 }
@@ -185,4 +212,26 @@ async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
 async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     flotilla_tui::cli::run_watch(&cli.socket_path(), format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_repo(cli: &Cli, slug: &str, format: OutputFormat, command: Option<&RepoSubCommand>) -> Result<()> {
+    reset_sigpipe();
+    let socket_path = cli.socket_path();
+    let config_dir = cli.config_dir();
+    let daemon = flotilla_tui::socket::connect_or_spawn(&socket_path, &config_dir, cli.config_dir.as_deref(), cli.socket.as_deref())
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e))?;
+
+    let result = match command {
+        None => flotilla_tui::cli::run_repo_detail(&*daemon, slug, format).await,
+        Some(RepoSubCommand::Providers { json: sub_json }) => {
+            let fmt = if *sub_json { OutputFormat::Json } else { format };
+            flotilla_tui::cli::run_repo_providers(&*daemon, slug, fmt).await
+        }
+        Some(RepoSubCommand::Work { json: sub_json }) => {
+            let fmt = if *sub_json { OutputFormat::Json } else { format };
+            flotilla_tui::cli::run_repo_work(&*daemon, slug, fmt).await
+        }
+    };
+    result.map_err(|e| color_eyre::eyre::eyre!(e))
 }

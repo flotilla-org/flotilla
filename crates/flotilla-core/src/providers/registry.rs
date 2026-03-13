@@ -46,6 +46,39 @@ impl Default for ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    /// Build a list of provider info summaries for all registered providers.
+    /// Category strings match the keys used in `compute_provider_health`.
+    pub fn provider_infos(&self) -> Vec<(String, String)> {
+        let mut infos = Vec::new();
+        for (desc, _) in self.vcs.values() {
+            infos.push(("vcs".into(), desc.display_name.clone()));
+        }
+        for (desc, _) in self.checkout_managers.values() {
+            infos.push(("checkout_manager".into(), desc.display_name.clone()));
+        }
+        for (desc, _) in self.code_review.values() {
+            infos.push(("code_review".into(), desc.display_name.clone()));
+        }
+        for (desc, _) in self.issue_trackers.values() {
+            infos.push(("issue_tracker".into(), desc.display_name.clone()));
+        }
+        for (desc, _) in self.cloud_agents.values() {
+            infos.push(("cloud_agent".into(), desc.display_name.clone()));
+        }
+        for (desc, _) in self.ai_utilities.values() {
+            infos.push(("ai_utility".into(), desc.display_name.clone()));
+        }
+        if let Some((desc, _)) = &self.workspace_manager {
+            infos.push(("workspace_manager".into(), desc.display_name.clone()));
+        }
+        if let Some((desc, _)) = &self.terminal_pool {
+            infos.push(("terminal_pool".into(), desc.display_name.clone()));
+        }
+        infos
+    }
+}
+
+impl ProviderRegistry {
     /// Remove external (network-polling) providers, keeping only local ones.
     ///
     /// Local providers (kept): VCS, CheckoutManagers, WorkspaceManager, TerminalPool
@@ -59,5 +92,17 @@ impl ProviderRegistry {
         self.issue_trackers.clear();
         self.cloud_agents.clear();
         self.ai_utilities.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_infos_from_empty_registry() {
+        let registry = ProviderRegistry::new();
+        let infos = registry.provider_infos();
+        assert!(infos.is_empty());
     }
 }

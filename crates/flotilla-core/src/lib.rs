@@ -11,6 +11,7 @@ pub mod model;
 pub mod provider_data;
 pub mod providers;
 pub mod refresh;
+pub mod resolve;
 pub mod step;
 pub mod template;
 

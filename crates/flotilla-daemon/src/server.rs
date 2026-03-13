@@ -1284,6 +1284,44 @@ async fn dispatch_request(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, 
             }
         }
 
+        "get_status" => match daemon.get_status().await {
+            Ok(status) => Message::ok_response(id, &status),
+            Err(e) => Message::error_response(id, e),
+        },
+
+        "get_repo_detail" => {
+            let slug = match extract_str_param(&params, "slug") {
+                Ok(s) => s,
+                Err(e) => return Message::error_response(id, e),
+            };
+            match daemon.get_repo_detail(&slug).await {
+                Ok(detail) => Message::ok_response(id, &detail),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
+
+        "get_repo_providers" => {
+            let slug = match extract_str_param(&params, "slug") {
+                Ok(s) => s,
+                Err(e) => return Message::error_response(id, e),
+            };
+            match daemon.get_repo_providers(&slug).await {
+                Ok(providers) => Message::ok_response(id, &providers),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
+
+        "get_repo_work" => {
+            let slug = match extract_str_param(&params, "slug") {
+                Ok(s) => s,
+                Err(e) => return Message::error_response(id, e),
+            };
+            match daemon.get_repo_work(&slug).await {
+                Ok(work) => Message::ok_response(id, &work),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
+
         unknown => Message::error_response(id, format!("unknown method: {unknown}")),
     }
 }
@@ -1296,6 +1334,11 @@ fn extract_repo_path(params: &serde_json::Value) -> Result<PathBuf, String> {
 /// Extract a named path field from params as a PathBuf.
 fn extract_path_param(params: &serde_json::Value, field: &str) -> Result<PathBuf, String> {
     params.get(field).and_then(|v| v.as_str()).map(PathBuf::from).ok_or_else(|| format!("missing '{field}' parameter"))
+}
+
+/// Extract a named string field from params.
+fn extract_str_param(params: &serde_json::Value, field: &str) -> Result<String, String> {
+    params.get(field).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| format!("missing '{field}' parameter"))
 }
 
 #[cfg(test)]

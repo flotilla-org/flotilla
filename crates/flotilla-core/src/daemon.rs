@@ -4,7 +4,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{Command, DaemonEvent, RepoInfo, Snapshot};
+use flotilla_protocol::{
+    Command, DaemonEvent, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse,
+};
 use tokio::sync::broadcast;
 
 /// The boundary between daemon and client.
@@ -45,4 +47,16 @@ pub trait DaemonHandle: Send + Sync {
     ///
     /// Repos not in `last_seen` get a `SnapshotFull`.
     async fn replay_since(&self, last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String>;
+
+    /// High-level status: repos, health, counts.
+    async fn get_status(&self) -> Result<StatusResponse, String>;
+
+    /// Repo detail: work items, provider health, errors.
+    async fn get_repo_detail(&self, slug: &str) -> Result<RepoDetailResponse, String>;
+
+    /// Repo discovery: host/repo assertions, providers, unmet requirements.
+    async fn get_repo_providers(&self, slug: &str) -> Result<RepoProvidersResponse, String>;
+
+    /// Repo work items.
+    async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String>;
 }

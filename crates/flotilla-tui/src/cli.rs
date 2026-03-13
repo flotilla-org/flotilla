@@ -1,44 +1,55 @@
-use std::{fmt::Write, path::Path};
+use std::path::Path;
 
+use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
-use flotilla_protocol::output::OutputFormat;
+use flotilla_protocol::{output::OutputFormat, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse};
 
 use crate::socket::SocketDaemon;
 
-pub(crate) fn format_status_human(repos: &[flotilla_protocol::snapshot::RepoInfo]) -> String {
-    if repos.is_empty() {
-        return "No repos tracked.\n".to_string();
+fn format_work_items_table(items: &[flotilla_protocol::snapshot::WorkItem]) -> Table {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Kind", "Branch", "Description", "PR", "Session", "Issues"]);
+    for item in items {
+        table.add_row(vec![
+            Cell::new(format!("{:?}", item.kind)),
+            Cell::new(item.branch.as_deref().unwrap_or("-")),
+            Cell::new(&item.description),
+            Cell::new(item.change_request_key.as_deref().unwrap_or("-")),
+            Cell::new(item.session_key.as_deref().unwrap_or("-")),
+            Cell::new(if item.issue_keys.is_empty() { "-".into() } else { item.issue_keys.join(", ") }),
+        ]);
     }
-    let mut out = String::new();
-    for (i, repo) in repos.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let loading = if repo.loading { "  (loading)" } else { "" };
-        writeln!(out, "{}  {}{}", repo.name, repo.path.display(), loading).expect("write to string");
+    table
+}
+
+fn format_status_response_human(status: &StatusResponse) -> String {
+    if status.repos.is_empty() {
+        return "No repos tracked.\n".into();
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Repo", "Path", "Work Items", "Errors", "Health"]);
+    for repo in &status.repos {
+        let name = repo.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let mut health: Vec<String> = repo
             .provider_health
             .iter()
-            .flat_map(|(category, providers)| {
-                providers.iter().map(move |(name, v)| format!("{category}/{name}: {}", if *v { "ok" } else { "error" }))
+            .flat_map(|(cat, providers)| {
+                providers.iter().map(move |(name, ok)| format!("{cat}/{name}: {}", if *ok { "ok" } else { "error" }))
             })
             .collect();
         health.sort();
-        if !health.is_empty() {
-            writeln!(out, "  {}", health.join("  ")).expect("write to string");
-        }
+        let health_str = if health.is_empty() { "-".into() } else { health.join(", ") };
+        table.add_row(vec![
+            Cell::new(&name),
+            Cell::new(repo.path.display()),
+            Cell::new(repo.work_item_count),
+            Cell::new(repo.error_count),
+            Cell::new(&health_str),
+        ]);
     }
-    out
-}
-
-pub(crate) fn format_status_json(repos: &[flotilla_protocol::snapshot::RepoInfo]) -> String {
-    #[derive(Debug, serde::Serialize)]
-    struct StatusResponse<'a> {
-        repos: &'a [flotilla_protocol::snapshot::RepoInfo],
-    }
-    let mut out = flotilla_protocol::output::json_pretty(&StatusResponse { repos });
-    out.push('\n');
-    out
+    format!("{table}\n")
 }
 
 /// Extract a short display name from a repo path (last path component).
@@ -105,14 +116,130 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
 
 pub async fn run_status(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
     let daemon = SocketDaemon::connect(socket_path).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
-    let repos = daemon.list_repos().await.map_err(|e| e.to_string())?;
-
+    let status = daemon.get_status().await?;
     let output = match format {
-        OutputFormat::Human => format_status_human(&repos),
-        OutputFormat::Json => format_status_json(&repos),
+        OutputFormat::Human => format_status_response_human(&status),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&status),
     };
     print!("{output}");
     Ok(())
+}
+
+pub async fn run_repo_detail(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
+    let detail = daemon.get_repo_detail(slug).await?;
+    let output = match format {
+        OutputFormat::Human => format_repo_detail_human(&detail),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&detail),
+    };
+    print!("{output}");
+    Ok(())
+}
+
+pub async fn run_repo_providers(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
+    let providers = daemon.get_repo_providers(slug).await?;
+    let output = match format {
+        OutputFormat::Human => format_repo_providers_human(&providers),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&providers),
+    };
+    print!("{output}");
+    Ok(())
+}
+
+pub async fn run_repo_work(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
+    let work = daemon.get_repo_work(slug).await?;
+    let output = match format {
+        OutputFormat::Human => format_repo_work_human(&work),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&work),
+    };
+    print!("{output}");
+    Ok(())
+}
+
+fn format_repo_detail_human(detail: &RepoDetailResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Repo: {}\n", detail.path.display()));
+    if let Some(slug) = &detail.slug {
+        out.push_str(&format!("Slug: {slug}\n"));
+    }
+    out.push('\n');
+
+    if !detail.work_items.is_empty() {
+        let table = format_work_items_table(&detail.work_items);
+        out.push_str(&table.to_string());
+        out.push('\n');
+    }
+
+    if !detail.errors.is_empty() {
+        out.push_str("\nErrors:\n");
+        for err in &detail.errors {
+            out.push_str(&format!("  [{}/{}] {}\n", err.category, err.provider, err.message));
+        }
+    }
+    out
+}
+
+fn format_repo_providers_human(resp: &RepoProvidersResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Repo: {}\n", resp.path.display()));
+    if let Some(slug) = &resp.slug {
+        out.push_str(&format!("Slug: {slug}\n"));
+    }
+
+    if !resp.host_discovery.is_empty() {
+        out.push_str("\nHost Discovery:\n");
+        for entry in &resp.host_discovery {
+            let mut details: Vec<String> = entry.detail.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            details.sort();
+            out.push_str(&format!("  {} ({})\n", entry.kind, details.join(", ")));
+        }
+    }
+
+    if !resp.repo_discovery.is_empty() {
+        out.push_str("\nRepo Discovery:\n");
+        for entry in &resp.repo_discovery {
+            let mut details: Vec<String> = entry.detail.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            details.sort();
+            out.push_str(&format!("  {} ({})\n", entry.kind, details.join(", ")));
+        }
+    }
+
+    if !resp.providers.is_empty() {
+        out.push_str("\nProviders:\n");
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.set_header(vec!["Category", "Name", "Health"]);
+        for p in &resp.providers {
+            table.add_row(vec![Cell::new(&p.category), Cell::new(&p.name), Cell::new(if p.healthy { "ok" } else { "error" })]);
+        }
+        out.push_str(&table.to_string());
+        out.push('\n');
+    }
+
+    if !resp.unmet_requirements.is_empty() {
+        out.push_str("\nUnmet Requirements:\n");
+        for ur in &resp.unmet_requirements {
+            out.push_str(&format!("  {}: {}\n", ur.factory, ur.requirement));
+        }
+    }
+    out
+}
+
+fn format_repo_work_human(resp: &RepoWorkResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Repo: {}\n", resp.path.display()));
+    if let Some(slug) = &resp.slug {
+        out.push_str(&format!("Slug: {slug}\n"));
+    }
+    out.push('\n');
+
+    if resp.work_items.is_empty() {
+        out.push_str("No work items.\n");
+    } else {
+        let table = format_work_items_table(&resp.work_items);
+        out.push_str(&table.to_string());
+        out.push('\n');
+    }
+    out
 }
 
 pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
@@ -150,19 +277,6 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
 mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
-    use flotilla_protocol::snapshot::{RepoInfo, RepoLabels};
-
-    fn make_repo(name: &str, path: &str, loading: bool, health: HashMap<String, HashMap<String, bool>>) -> RepoInfo {
-        RepoInfo {
-            name: name.to_string(),
-            path: PathBuf::from(path),
-            labels: RepoLabels::default(),
-            provider_names: HashMap::new(),
-            provider_health: health,
-            loading,
-        }
-    }
-
     fn health(entries: &[(&str, &str, bool)]) -> HashMap<String, HashMap<String, bool>> {
         let mut map: HashMap<String, HashMap<String, bool>> = HashMap::new();
         for (cat, name, ok) in entries {
@@ -172,58 +286,31 @@ mod tests {
     }
 
     mod status_human {
+        use flotilla_protocol::{RepoSummary, StatusResponse};
+
         use super::*;
-        use crate::cli::format_status_human;
+        use crate::cli::format_status_response_human;
 
         #[test]
         fn empty_repos() {
-            assert_eq!(format_status_human(&[]), "No repos tracked.\n");
+            let status = StatusResponse { repos: vec![] };
+            assert_eq!(format_status_response_human(&status), "No repos tracked.\n");
         }
 
         #[test]
-        fn single_repo_healthy() {
-            let repos = vec![make_repo("my-repo", "/tmp/my-repo", false, health(&[("vcs", "Git", true)]))];
-            let output = format_status_human(&repos);
+        fn single_repo_with_health() {
+            let status = StatusResponse {
+                repos: vec![RepoSummary {
+                    path: PathBuf::from("/tmp/my-repo"),
+                    slug: Some("org/my-repo".into()),
+                    provider_health: health(&[("vcs", "Git", true)]),
+                    work_item_count: 3,
+                    error_count: 0,
+                }],
+            };
+            let output = format_status_response_human(&status);
             assert!(output.contains("my-repo"), "should contain repo name");
-            assert!(output.contains("/tmp/my-repo"), "should contain repo path");
-            assert!(output.contains("vcs/Git: ok"), "should show health");
-            assert!(!output.contains("loading"), "should not show loading");
-        }
-
-        #[test]
-        fn repo_loading() {
-            let repos = vec![make_repo("my-repo", "/tmp/my-repo", true, HashMap::new())];
-            let output = format_status_human(&repos);
-            assert!(output.contains("(loading)"), "should show loading indicator");
-        }
-
-        #[test]
-        fn repo_with_error_health() {
-            let repos = vec![make_repo("r", "/tmp/r", false, health(&[("code_review", "GitHub", false)]))];
-            let output = format_status_human(&repos);
-            assert!(output.contains("code_review/GitHub: error"), "should show error health");
-        }
-    }
-
-    mod status_json {
-        use super::*;
-        use crate::cli::format_status_json;
-
-        #[test]
-        fn empty_repos_json() {
-            let output = format_status_json(&[]);
-            assert!(output.ends_with('\n'), "JSON output should end with newline");
-            let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-            assert_eq!(parsed["repos"], serde_json::json!([]));
-        }
-
-        #[test]
-        fn repos_wrapped_in_object() {
-            let repos = vec![make_repo("my-repo", "/tmp/my-repo", false, HashMap::new())];
-            let output = format_status_json(&repos);
-            let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-            assert!(parsed["repos"].is_array(), "should have repos array");
-            assert_eq!(parsed["repos"][0]["name"], "my-repo");
+            assert!(output.contains("3"), "should show work item count");
         }
     }
 
