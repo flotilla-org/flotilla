@@ -74,7 +74,7 @@ pub async fn build_plan(
         Command::RemoveCheckout { branch, terminal_keys } => build_remove_checkout_plan(branch, terminal_keys, repo_root, registry),
 
         cmd => {
-            let result = execute(cmd, &repo_root, &*registry, &*providers_data, &*runner, &config_base).await;
+            let result = execute(cmd, &repo_root, &registry, &providers_data, &*runner, &config_base).await;
             ExecutionPlan::Immediate(result)
         }
     }
@@ -86,6 +86,7 @@ pub async fn build_plan(
 /// 1. Create the checkout (skipped if it already exists on the local host)
 /// 2. Link issues to the branch (skipped if no issue_ids)
 /// 3. Create workspace (reads checkout path from shared slot)
+#[allow(clippy::too_many_arguments)]
 async fn build_create_checkout_plan(
     branch: String,
     create_branch: bool,
@@ -193,6 +194,7 @@ async fn build_create_checkout_plan(
 /// 1. Resolve attach command from the session's cloud agent provider
 /// 2. Ensure checkout exists (skipped if checkout_key references a known checkout, or no branch)
 /// 3. Create workspace with the teleport (attach) command
+#[allow(clippy::too_many_arguments)]
 async fn build_teleport_session_plan(
     session_id: String,
     branch: Option<String>,
@@ -291,7 +293,7 @@ async fn build_teleport_session_plan(
                         }
                         // Unlike CreateCheckout, teleport fails entirely if the workspace
                         // can't be created — the checkout may already have existed.
-                        ws_mgr.create_workspace(&config).await.map_err(|e| e)?;
+                        ws_mgr.create_workspace(&config).await?;
                     }
                     Ok(StepOutcome::Completed)
                 })
