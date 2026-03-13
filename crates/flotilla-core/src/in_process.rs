@@ -192,6 +192,9 @@ struct RepoState {
     last_broadcast_errors: Vec<ProviderError>,
     /// Bounded delta log for replay on client reconnect.
     delta_log: VecDeque<DeltaEntry>,
+    /// Incremented only when local provider data changes (not peer data merges).
+    /// Used by the outbound peer task to avoid re-sending unchanged local data.
+    local_data_version: u64,
 }
 
 impl RepoState {
@@ -391,6 +394,7 @@ impl InProcessDaemon {
                     last_broadcast_health: HashMap::new(),
                     last_broadcast_errors: Vec::new(),
                     delta_log: VecDeque::new(),
+                    local_data_version: 0,
                 },
             );
             order.push(path);
@@ -473,7 +477,7 @@ impl InProcessDaemon {
             &state.issue_cache,
             &state.search_results,
         );
-        Some((providers, state.seq))
+        Some((providers, state.local_data_version))
     }
 
     /// Update the peer provider data overlay for a repo and trigger re-broadcast.
@@ -604,6 +608,7 @@ impl InProcessDaemon {
             );
 
             state.seq += 1;
+            state.local_data_version += 1;
             state.last_snapshot = snapshot;
 
             let event = choose_event(proto_snapshot, delta_entry);
@@ -996,6 +1001,7 @@ impl InProcessDaemon {
                     last_broadcast_health: HashMap::new(),
                     last_broadcast_errors: Vec::new(),
                     delta_log: VecDeque::new(),
+                    local_data_version: 0,
                 },
             );
             order.push(synthetic_path.clone());
@@ -1309,6 +1315,7 @@ impl DaemonHandle for InProcessDaemon {
                     last_broadcast_health: HashMap::new(),
                     last_broadcast_errors: Vec::new(),
                     delta_log: VecDeque::new(),
+                    local_data_version: 0,
                 },
             );
             order.push(path.clone());

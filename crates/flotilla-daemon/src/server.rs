@@ -598,38 +598,46 @@ impl DaemonServer {
             let mut event_rx = outbound_daemon.subscribe();
             let mut outbound_clock = flotilla_protocol::VectorClock::default();
             let host_name = outbound_daemon.host_name().clone();
+            let mut last_sent_versions: std::collections::HashMap<std::path::PathBuf, u64> =
+                std::collections::HashMap::new();
 
             loop {
-                match event_rx.recv().await {
-                    Ok(DaemonEvent::SnapshotFull(snapshot)) => {
-                        send_local_to_peers(
-                            &outbound_daemon,
-                            &outbound_peer_manager,
-                            &host_name,
-                            &mut outbound_clock,
-                            &snapshot.repo,
-                        )
-                        .await;
-                    }
-                    Ok(DaemonEvent::SnapshotDelta(delta)) => {
-                        // Deltas also indicate local data changed — send full
-                        // local providers to peers (we don't replicate deltas).
-                        send_local_to_peers(
-                            &outbound_daemon,
-                            &outbound_peer_manager,
-                            &host_name,
-                            &mut outbound_clock,
-                            &delta.repo,
-                        )
-                        .await;
-                    }
-                    Ok(_) => {} // Ignore non-data events
+                let repo_path = match event_rx.recv().await {
+                    Ok(DaemonEvent::SnapshotFull(snapshot)) => Some(snapshot.repo.clone()),
+                    Ok(DaemonEvent::SnapshotDelta(delta)) => Some(delta.repo.clone()),
+                    Ok(_) => None,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "outbound peer event subscriber lagged");
+                        None
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
                     }
+                };
+                if let Some(repo_path) = repo_path {
+                    // Only send to peers when local data has actually changed.
+                    // get_local_providers returns a local_data_version that only
+                    // increments on real provider refreshes, not peer data merges.
+                    // This prevents a feedback loop: peer data arrives → merged →
+                    // broadcast_snapshot → outbound task → send unchanged local
+                    // data back to peers → they re-send → loop forever.
+                    if let Some((_, version)) =
+                        outbound_daemon.get_local_providers(&repo_path).await
+                    {
+                        let last = last_sent_versions.get(&repo_path).copied().unwrap_or(0);
+                        if version <= last {
+                            continue;
+                        }
+                        last_sent_versions.insert(repo_path.clone(), version);
+                    }
+                    send_local_to_peers(
+                        &outbound_daemon,
+                        &outbound_peer_manager,
+                        &host_name,
+                        &mut outbound_clock,
+                        &repo_path,
+                    )
+                    .await;
                 }
             }
         });
