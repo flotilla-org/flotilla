@@ -420,14 +420,6 @@ impl InProcessDaemon {
         identities.iter().find(|(_, path)| path.as_path() == repo_path).map(|(id, _)| id.clone())
     }
 
-    /// Snapshot of all RepoIdentity to local path mappings.
-    ///
-    /// Used by the disconnect path to pass the mapping into PeerManager
-    /// so overlay updates can be computed atomically under the PeerManager lock.
-    pub async fn repo_identity_snapshot(&self) -> HashMap<flotilla_protocol::RepoIdentity, PathBuf> {
-        self.repo_identities.read().await.clone()
-    }
-
     /// Returns the paths of all locally tracked repos.
     ///
     /// Only local repo paths, not remote/virtual ones. Used by the outbound
