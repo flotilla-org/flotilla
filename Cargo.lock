@@ -1031,6 +1031,7 @@ dependencies = [
  "flotilla-daemon",
  "flotilla-protocol",
  "flotilla-tui",
+ "libc",
  "ratatui",
  "tokio",
  "tracing",

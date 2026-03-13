@@ -65,6 +65,13 @@ impl Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Reset SIGPIPE to default behavior so piped CLI commands (e.g. `watch | head`)
+    // exit cleanly instead of panicking on broken pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     color_eyre::install()?;
     let cli = Cli::parse();
 
