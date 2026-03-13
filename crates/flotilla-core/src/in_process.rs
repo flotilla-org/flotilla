@@ -15,7 +15,8 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError, RepoInfo, Snapshot,
+    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -1345,6 +1346,22 @@ impl DaemonHandle for InProcessDaemon {
         let _ = self.event_tx.send(DaemonEvent::RepoRemoved { path });
 
         Ok(())
+    }
+
+    async fn get_status(&self) -> Result<StatusResponse, String> {
+        todo!("Task 8")
+    }
+
+    async fn get_repo_detail(&self, _slug: &str) -> Result<RepoDetailResponse, String> {
+        todo!("Task 8")
+    }
+
+    async fn get_repo_providers(&self, _slug: &str) -> Result<RepoProvidersResponse, String> {
+        todo!("Task 8")
+    }
+
+    async fn get_repo_work(&self, _slug: &str) -> Result<RepoWorkResponse, String> {
+        todo!("Task 8")
     }
 }
 

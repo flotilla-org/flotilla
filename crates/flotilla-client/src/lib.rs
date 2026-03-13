@@ -10,7 +10,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
-use flotilla_protocol::{Command, DaemonEvent, Message, RawResponse, RepoInfo, Snapshot};
+use flotilla_protocol::{
+    Command, DaemonEvent, Message, RawResponse, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot,
+    StatusResponse,
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
     net::UnixStream,
@@ -623,6 +626,22 @@ impl DaemonHandle for SocketDaemon {
         }
 
         Ok(events)
+    }
+
+    async fn get_status(&self) -> Result<StatusResponse, String> {
+        todo!("Task 10")
+    }
+
+    async fn get_repo_detail(&self, _slug: &str) -> Result<RepoDetailResponse, String> {
+        todo!("Task 10")
+    }
+
+    async fn get_repo_providers(&self, _slug: &str) -> Result<RepoProvidersResponse, String> {
+        todo!("Task 10")
+    }
+
+    async fn get_repo_work(&self, _slug: &str) -> Result<RepoWorkResponse, String> {
+        todo!("Task 10")
     }
 }
 
