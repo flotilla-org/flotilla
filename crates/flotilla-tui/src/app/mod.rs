@@ -22,7 +22,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot, SnapshotDelta,
-    WorkItem,
+    StepStatus, WorkItem,
 };
 pub use intent::Intent;
 use tui_input::Input;
@@ -236,7 +236,24 @@ impl App {
                     executor::handle_result(result, self);
                 }
             }
-            DaemonEvent::CommandStepUpdate { .. } => {}
+            DaemonEvent::CommandStepUpdate { command_id, description, step_index, step_count, status, .. } => {
+                if let Some(cmd) = self.in_flight.get_mut(&command_id) {
+                    match status {
+                        StepStatus::Started => {
+                            cmd.description = format!("{} ({}/{})", description, step_index + 1, step_count);
+                        }
+                        StepStatus::Skipped => {
+                            tracing::info!(command_id, %description, "step skipped");
+                        }
+                        StepStatus::Succeeded => {
+                            tracing::info!(command_id, %description, "step succeeded");
+                        }
+                        StepStatus::Failed { ref message } => {
+                            tracing::warn!(command_id, %description, error = %message, "step failed");
+                        }
+                    }
+                }
+            }
             DaemonEvent::PeerStatusChanged { host, status } => {
                 let peer_status = PeerStatus::from(status);
                 if let Some(existing) = self.model.peer_hosts.iter_mut().find(|p| p.name == host) {
