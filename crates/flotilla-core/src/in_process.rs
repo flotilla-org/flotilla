@@ -30,7 +30,7 @@ use crate::{
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
     providers::{
-        discovery::{discover_providers, DiscoveryResult, EnvironmentBag, FactoryRegistry, ProcessEnvVars, RepoDetector},
+        discovery::{discover_providers, DiscoveryResult, EnvironmentBag, FactoryRegistry, ProcessEnvVars, RepoDetector, UnmetRequirement},
         CommandRunner,
     },
     refresh::RefreshSnapshot,
@@ -169,6 +169,9 @@ const DELTA_LOG_CAPACITY: usize = 16;
 
 struct RepoState {
     model: RepoModel,
+    slug: Option<String>,
+    repo_bag: EnvironmentBag,
+    unmet: Vec<(String, UnmetRequirement)>,
     seq: u64,
     last_snapshot: Arc<RefreshSnapshot>,
     issue_cache: IssueCache,
@@ -333,7 +336,7 @@ impl InProcessDaemon {
             if repos.contains_key(&path) {
                 continue;
             }
-            let DiscoveryResult { registry, repo_slug, bag, unmet } =
+            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } =
                 discovery::discover_providers(&host_bag, &path, &repo_detectors, &factories, &config, Arc::clone(&runner), &ProcessEnvVars)
                     .await;
             if !unmet.is_empty() {
@@ -341,14 +344,18 @@ impl InProcessDaemon {
             }
 
             // RepoIdentity from the merged bag
-            if let Some(identity) = bag.repo_identity() {
+            if let Some(identity) = host_repo_bag.repo_identity() {
                 identities.insert(identity, path.clone());
             }
 
+            let slug = repo_slug.clone();
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
             repos.insert(path.clone(), RepoState {
                 model,
+                slug,
+                repo_bag,
+                unmet,
                 seq: 0,
                 last_snapshot: Arc::new(RefreshSnapshot::default()),
                 issue_cache: IssueCache::new(),
@@ -887,6 +894,9 @@ impl InProcessDaemon {
             }
             repos.insert(synthetic_path.clone(), RepoState {
                 model,
+                slug: None,
+                repo_bag: EnvironmentBag::new(),
+                unmet: Vec::new(),
                 seq: 0,
                 last_snapshot: Arc::new(RefreshSnapshot::default()),
                 issue_cache: IssueCache::new(),
@@ -1175,7 +1185,7 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let DiscoveryResult { registry, repo_slug, bag, unmet } = discover_providers(
+        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
             &self.host_bag,
             &path,
             &self.repo_detectors,
@@ -1188,6 +1198,7 @@ impl DaemonHandle for InProcessDaemon {
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
+        let slug = repo_slug.clone();
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
         model.data.loading = true;
 
@@ -1209,6 +1220,9 @@ impl DaemonHandle for InProcessDaemon {
             }
             repos.insert(path.clone(), RepoState {
                 model,
+                slug,
+                repo_bag,
+                unmet,
                 seq: 0,
                 last_snapshot: Arc::new(RefreshSnapshot::default()),
                 issue_cache: IssueCache::new(),
@@ -1224,7 +1238,7 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Register RepoIdentity for peer routing
-        if let Some(identity) = bag.repo_identity() {
+        if let Some(identity) = host_repo_bag.repo_identity() {
             self.repo_identities.write().await.insert(identity, path.clone());
         }
 
