@@ -118,15 +118,10 @@ impl super::Vcs for GitVcs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::vcs::checkout_test_support::git;
     use crate::providers::{replay, vcs::Vcs};
 
     // ── Setup helpers (only called in record mode) ──
-
-    /// Run a git command in `repo`, panicking on failure.
-    fn git(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").args(args).current_dir(repo).stdin(std::process::Stdio::null()).output().unwrap();
-        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
-    }
 
     /// Create a temp git repo with branches: main, feature/foo, fix-bar.
     /// Two commits on main, so commit_log has something to show.
