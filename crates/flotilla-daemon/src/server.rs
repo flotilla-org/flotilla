@@ -731,14 +731,40 @@ async fn disconnect_peer_and_rebuild(
     peer_name: &HostName,
     generation: u64,
 ) -> crate::peer::DisconnectPlan {
+    // Snapshot identity mapping before acquiring PeerManager lock.
+    // This mapping is stable during disconnect — local repos aren't
+    // removed by peer disconnect.
+    let local_repo_paths = daemon.repo_identity_snapshot().await;
+
     let plan = {
         let mut pm = peer_manager.lock().await;
-        pm.disconnect_peer(peer_name, generation, &HashMap::new())
+        pm.disconnect_peer(peer_name, generation, &local_repo_paths)
     };
-    let affected_repos = plan.affected_repos.clone();
-    let resync_requests = plan.resync_requests.clone();
-    rebuild_peer_overlays(peer_manager, daemon, affected_repos).await;
-    dispatch_resync_requests(peer_manager, resync_requests).await;
+
+    // Apply pre-computed overlay updates outside the PeerManager lock.
+    for update in &plan.overlay_updates {
+        match update {
+            crate::peer::OverlayUpdate::SetProviders { path, peers } => {
+                daemon.set_peer_providers(path, peers.clone()).await;
+            }
+            crate::peer::OverlayUpdate::RemoveRepo { identity, path } => {
+                info!(
+                    repo = %identity,
+                    path = %path.display(),
+                    "removing virtual repo — no peers remaining"
+                );
+                if let Err(e) = daemon.remove_repo(path).await {
+                    warn!(
+                        repo = %identity,
+                        err = %e,
+                        "failed to remove virtual repo"
+                    );
+                }
+            }
+        }
+    }
+
+    dispatch_resync_requests(peer_manager, plan.resync_requests.clone()).await;
     plan
 }
 
