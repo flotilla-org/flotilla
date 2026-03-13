@@ -37,8 +37,7 @@ impl PeerSender for SocketPeerSender {
             .as_ref()
             .cloned()
             .ok_or_else(|| "socket peer outbound channel closed".to_string())?;
-        tx
-            .send(Message::Peer(Box::new(msg)))
+        tx.send(Message::Peer(Box::new(msg)))
             .await
             .map_err(|_| "socket peer outbound channel closed".to_string())
     }
@@ -306,6 +305,21 @@ impl DaemonServer {
                         // Reconnect loop with exponential backoff
                         let mut attempt: u32 = 1;
                         loop {
+                            if let Some(delay) = {
+                                let mut pm = pm.lock().await;
+                                pm.reconnect_suppressed_until(&peer_name).map(|deadline| {
+                                    deadline.saturating_duration_since(Instant::now())
+                                })
+                            } {
+                                info!(
+                                    peer = %peer_name,
+                                    delay_secs = delay.as_secs(),
+                                    "reconnect suppressed after peer retirement"
+                                );
+                                tokio::time::sleep(delay).await;
+                                attempt = 1;
+                                continue;
+                            }
                             daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
                                 host: peer_name.clone(),
                                 status: PeerConnectionState::Reconnecting,
@@ -354,10 +368,12 @@ impl DaemonServer {
                                     )
                                     .await;
                                     if plan.was_active {
-                                        daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
-                                            host: peer_name.clone(),
-                                            status: PeerConnectionState::Disconnected,
-                                        });
+                                        daemon_for_cleanup.send_event(
+                                            DaemonEvent::PeerStatusChanged {
+                                                host: peer_name.clone(),
+                                                status: PeerConnectionState::Disconnected,
+                                            },
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -551,6 +567,9 @@ impl DaemonServer {
                                     "failed to send resync request"
                                 );
                             }
+                        }
+                        HandleResult::ReconnectSuppressed { peer } => {
+                            info!(peer = %peer, "peer requested reconnect suppression");
                         }
                         HandleResult::Ignored => {}
                     }
@@ -1904,7 +1923,8 @@ mod tests {
         }
 
         let (_reader_a, writer_a) = send_peer_hello(client_stream_a, &expected_server_host).await;
-        let (mut reader_b, writer_b) = send_peer_hello(client_stream_b, &expected_server_host).await;
+        let (mut reader_b, writer_b) =
+            send_peer_hello(client_stream_b, &expected_server_host).await;
 
         let goodbye = tokio::time::timeout(Duration::from_secs(2), reader_b.next_line())
             .await

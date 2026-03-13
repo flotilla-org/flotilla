@@ -44,8 +44,7 @@ impl PeerSender for ChannelPeerSender {
             .as_ref()
             .cloned()
             .ok_or_else(|| "outbound channel closed".to_string())?;
-        tx
-            .send(msg)
+        tx.send(msg)
             .await
             .map_err(|_| "outbound channel closed".to_string())
     }
@@ -486,13 +485,11 @@ impl PeerTransport for SshTransport {
     }
 
     fn sender(&self) -> Option<Arc<dyn PeerSender>> {
-        self.outbound_tx
-            .as_ref()
-            .map(|tx| {
-                Arc::new(ChannelPeerSender {
-                    tx: tokio::sync::Mutex::new(Some(tx.clone())),
-                }) as Arc<dyn PeerSender>
-            })
+        self.outbound_tx.as_ref().map(|tx| {
+            Arc::new(ChannelPeerSender {
+                tx: tokio::sync::Mutex::new(Some(tx.clone())),
+            }) as Arc<dyn PeerSender>
+        })
     }
 }
 

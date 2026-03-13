@@ -38,6 +38,8 @@ pub enum HandleResult {
         repo: RepoIdentity,
         since_seq: u64,
     },
+    /// Peer intentionally retired this connection; reconnect should be suppressed briefly.
+    ReconnectSuppressed { peer: HostName },
     /// A delta was received but cannot be applied (seq gap or not yet implemented).
     /// Caller should request a full resync from the origin.
     NeedsResync { from: HostName, repo: RepoIdentity },
@@ -67,8 +69,13 @@ struct ActiveConnection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivationResult {
-    Accepted { generation: u64, displaced: Option<u64> },
-    Rejected { reason: GoodbyeReason },
+    Accepted {
+        generation: u64,
+        displaced: Option<u64>,
+    },
+    Rejected {
+        reason: GoodbyeReason,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +147,7 @@ pub struct PeerManager {
     senders: HashMap<HostName, Arc<dyn PeerSender>>,
     active_connections: HashMap<HostName, ActiveConnection>,
     displaced_senders: HashMap<(HostName, u64), Arc<dyn PeerSender>>,
+    reconnect_suppressed_until: HashMap<HostName, Instant>,
     transport_peers: HashMap<ConfigLabel, HostName>,
     generations: HashMap<HostName, u64>,
     routes: HashMap<HostName, RouteState>,
@@ -162,6 +170,7 @@ pub struct PeerManager {
 
 impl PeerManager {
     const RESYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    const GOODBYE_RECONNECT_SUPPRESSION: Duration = Duration::from_secs(15);
     pub(crate) const DEFAULT_ROUTED_HOPS: u8 = 8;
 
     /// Create a new PeerManager with no peers.
@@ -172,6 +181,7 @@ impl PeerManager {
             senders: HashMap::new(),
             active_connections: HashMap::new(),
             displaced_senders: HashMap::new(),
+            reconnect_suppressed_until: HashMap::new(),
             transport_peers: HashMap::new(),
             generations: HashMap::new(),
             routes: HashMap::new(),
@@ -273,7 +283,20 @@ impl PeerManager {
     }
 
     pub fn current_generation(&self, name: &HostName) -> Option<u64> {
-        self.active_connections.get(name).map(|active| active.generation)
+        self.active_connections
+            .get(name)
+            .map(|active| active.generation)
+    }
+
+    pub fn reconnect_suppressed_until(&mut self, name: &HostName) -> Option<Instant> {
+        match self.reconnect_suppressed_until.get(name).copied() {
+            Some(deadline) if deadline > Instant::now() => Some(deadline),
+            Some(_) => {
+                self.reconnect_suppressed_until.remove(name);
+                None
+            }
+            None => None,
+        }
     }
 
     fn generation_is_current(&self, name: &HostName, generation: u64) -> bool {
@@ -562,7 +585,17 @@ impl PeerManager {
                 self.handle_routed(env.connection_peer, env.connection_generation, msg)
                     .await
             }
-            PeerWireMessage::Goodbye { .. } => HandleResult::Ignored,
+            PeerWireMessage::Goodbye { reason } => match reason {
+                GoodbyeReason::Superseded => {
+                    self.reconnect_suppressed_until.insert(
+                        env.connection_peer.clone(),
+                        Instant::now() + Self::GOODBYE_RECONNECT_SUPPRESSION,
+                    );
+                    HandleResult::ReconnectSuppressed {
+                        peer: env.connection_peer,
+                    }
+                }
+            },
         }
     }
 
@@ -961,6 +994,10 @@ impl PeerManager {
         &mut self,
         name: &HostName,
     ) -> Result<(u64, mpsc::Receiver<PeerWireMessage>), String> {
+        if let Some(deadline) = self.reconnect_suppressed_until(name) {
+            return Err(format!("reconnect suppressed until {:?}", deadline));
+        }
+
         let (sender, rx) = {
             let transport = self
                 .peers
@@ -1003,7 +1040,8 @@ impl PeerManager {
                 }
             };
             if let Some(displaced_generation) = displaced {
-                if let Some(displaced_sender) = self.take_displaced_sender(name, displaced_generation)
+                if let Some(displaced_sender) =
+                    self.take_displaced_sender(name, displaced_generation)
                 {
                     let _ = displaced_sender.retire(GoodbyeReason::Superseded).await;
                 }
@@ -1876,6 +1914,47 @@ mod tests {
 
         assert_eq!(result, HandleResult::Ignored);
         assert!(mgr.get_peer_data().is_empty());
+    }
+
+    #[tokio::test]
+    async fn goodbye_superseded_suppresses_reconnect_for_peer() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let generation = accepted_generation(mgr.activate_connection(
+            HostName::new("peer"),
+            sender,
+            ConnectionMeta {
+                direction: ConnectionDirection::Outbound,
+                config_label: Some(ConfigLabel("peer".into())),
+                expected_peer: Some(HostName::new("peer")),
+                config_backed: true,
+            },
+        ));
+        mgr.add_peer(HostName::new("peer"), Box::new(MockTransport::new()));
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::Goodbye {
+                    reason: GoodbyeReason::Superseded,
+                },
+                connection_generation: generation,
+                connection_peer: HostName::new("peer"),
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            HandleResult::ReconnectSuppressed {
+                peer: HostName::new("peer"),
+            }
+        );
+        let err = mgr
+            .reconnect_peer(&HostName::new("peer"))
+            .await
+            .expect_err("reconnect should be suppressed");
+        assert!(err.contains("suppressed"));
     }
 
     #[tokio::test]
