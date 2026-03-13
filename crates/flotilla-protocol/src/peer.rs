@@ -69,6 +69,12 @@ pub struct PeerDataMessage {
 pub enum PeerWireMessage {
     Data(PeerDataMessage),
     Routed(RoutedPeerMessage),
+    Goodbye { reason: GoodbyeReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GoodbyeReason {
+    Superseded,
 }
 
 /// Targeted peer control messages that are routed hop-by-hop rather than flooded.

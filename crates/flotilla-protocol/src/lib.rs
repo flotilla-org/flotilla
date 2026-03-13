@@ -6,7 +6,9 @@ pub mod provider_data;
 pub mod snapshot;
 
 pub use host::{HostName, HostPath, RepoIdentity};
-pub use peer::{PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
+pub use peer::{
+    GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock,
+};
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
@@ -575,6 +577,15 @@ mod tests {
                 data: Box::new(ProviderData::default()),
             },
         )));
+
+        test_helpers::assert_json_roundtrip(&msg);
+    }
+
+    #[test]
+    fn message_peer_goodbye_roundtrip() {
+        let msg = Message::Peer(Box::new(PeerWireMessage::Goodbye {
+            reason: GoodbyeReason::Superseded,
+        }));
 
         test_helpers::assert_json_roundtrip(&msg);
     }
