@@ -22,13 +22,7 @@ pub struct CursorCodingAgentFactory;
 #[async_trait]
 impl CloudAgentFactory for CursorCodingAgentFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "cursor".into(),
-            display_name: "Cursor".into(),
-            abbreviation: "S".into(),
-            section_label: "Sessions".into(),
-            item_noun: "session".into(),
-        }
+        ProviderDescriptor::labeled("cursor", "Cursor", "S", "Sessions", "session")
     }
 
     async fn probe(
@@ -59,7 +53,7 @@ impl CloudAgentFactory for CursorCodingAgentFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::config::ConfigStore;
@@ -71,17 +65,15 @@ mod tests {
     use super::CursorCodingAgentFactory;
 
     fn bag_with_agent_and_api_key() -> EnvironmentBag {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "agent".into(),
-            path: PathBuf::from("/usr/local/bin/agent"),
-            version: None,
-        });
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "CURSOR_API_KEY".into(),
-            value: "cursor-key-123".into(),
-        });
-        bag
+        EnvironmentBag::new()
+            .with(EnvironmentAssertion::binary(
+                "agent",
+                "/usr/local/bin/agent",
+            ))
+            .with(EnvironmentAssertion::env_var(
+                "CURSOR_API_KEY",
+                "cursor-key-123",
+            ))
     }
 
     #[tokio::test]
@@ -98,11 +90,10 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_factory_fails_without_binary() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "CURSOR_API_KEY".into(),
-            value: "cursor-key-123".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var(
+            "CURSOR_API_KEY",
+            "cursor-key-123",
+        ));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -119,12 +110,10 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_factory_fails_without_env_var() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "agent".into(),
-            path: PathBuf::from("/usr/local/bin/agent"),
-            version: None,
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary(
+            "agent",
+            "/usr/local/bin/agent",
+        ));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());

@@ -22,13 +22,7 @@ pub struct CodexCodingAgentFactory;
 #[async_trait]
 impl CloudAgentFactory for CodexCodingAgentFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "codex".into(),
-            display_name: "Codex".into(),
-            abbreviation: "S".into(),
-            section_label: "Sessions".into(),
-            item_noun: "session".into(),
-        }
+        ProviderDescriptor::labeled("codex", "Codex", "S", "Sessions", "session")
     }
 
     async fn probe(
@@ -53,7 +47,7 @@ impl CloudAgentFactory for CodexCodingAgentFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::config::ConfigStore;
@@ -65,12 +59,10 @@ mod tests {
     use super::CodexCodingAgentFactory;
 
     fn bag_with_codex_auth() -> EnvironmentBag {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::AuthFileExists {
-            provider: "codex".into(),
-            path: PathBuf::from("/home/user/.codex/auth.json"),
-        });
-        bag
+        EnvironmentBag::new().with(EnvironmentAssertion::auth_file(
+            "codex",
+            "/home/user/.codex/auth.json",
+        ))
     }
 
     #[tokio::test]

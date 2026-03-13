@@ -25,13 +25,7 @@ pub struct GitVcsFactory;
 #[async_trait]
 impl VcsFactory for GitVcsFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "git".into(),
-            display_name: "Git".into(),
-            abbreviation: "".into(),
-            section_label: "".into(),
-            item_noun: "".into(),
-        }
+        ProviderDescriptor::labeled("git", "Git", "", "", "")
     }
 
     async fn probe(
@@ -58,13 +52,7 @@ pub struct WtCheckoutManagerFactory;
 #[async_trait]
 impl CheckoutManagerFactory for WtCheckoutManagerFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "wt".into(),
-            display_name: "wt".into(),
-            abbreviation: "CO".into(),
-            section_label: "Checkouts".into(),
-            item_noun: "checkout".into(),
-        }
+        ProviderDescriptor::labeled("wt", "wt", "CO", "Checkouts", "checkout")
     }
 
     async fn probe(
@@ -99,13 +87,7 @@ pub struct GitCheckoutManagerFactory;
 #[async_trait]
 impl CheckoutManagerFactory for GitCheckoutManagerFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "git".into(),
-            display_name: "git worktrees".into(),
-            abbreviation: "WT".into(),
-            section_label: "Checkouts".into(),
-            item_noun: "worktree".into(),
-        }
+        ProviderDescriptor::labeled("git", "git worktrees", "WT", "Checkouts", "worktree")
     }
 
     async fn probe(
@@ -137,7 +119,7 @@ impl CheckoutManagerFactory for GitCheckoutManagerFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::config::ConfigStore;
@@ -153,12 +135,11 @@ mod tests {
 
     #[tokio::test]
     async fn git_vcs_factory_succeeds_with_git_checkout() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::VcsCheckoutDetected {
-            root: PathBuf::from("/repo"),
-            kind: VcsKind::Git,
-            is_main_checkout: true,
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::vcs_checkout(
+            "/repo",
+            VcsKind::Git,
+            true,
+        ));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -192,12 +173,8 @@ mod tests {
 
     #[tokio::test]
     async fn wt_factory_succeeds_when_binary_available() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "wt".into(),
-            path: PathBuf::from("/usr/local/bin/wt"),
-            version: None,
-        });
+        let bag =
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("wt", "/usr/local/bin/wt"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -222,12 +199,8 @@ mod tests {
 
     #[tokio::test]
     async fn wt_factory_excluded_by_config_git() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "wt".into(),
-            path: PathBuf::from("/usr/local/bin/wt"),
-            version: None,
-        });
+        let bag =
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("wt", "/usr/local/bin/wt"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let base = dir.path();
         // Write config that forces provider = "git"
@@ -248,12 +221,8 @@ mod tests {
 
     #[tokio::test]
     async fn wt_factory_allowed_by_config_auto() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "wt".into(),
-            path: PathBuf::from("/usr/local/bin/wt"),
-            version: None,
-        });
+        let bag =
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("wt", "/usr/local/bin/wt"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         // Default config has provider = "auto"
@@ -266,12 +235,8 @@ mod tests {
 
     #[tokio::test]
     async fn wt_factory_allowed_by_config_wt() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "wt".into(),
-            path: PathBuf::from("/usr/local/bin/wt"),
-            version: None,
-        });
+        let bag =
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("wt", "/usr/local/bin/wt"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let base = dir.path();
         std::fs::write(
@@ -301,12 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkout_factory_succeeds_when_binary_available() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: None,
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -331,12 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkout_factory_excluded_by_config_wt() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: None,
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let base = dir.path();
         // Write config that forces provider = "wt"
@@ -357,12 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkout_factory_allowed_by_config_auto() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: None,
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -374,12 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkout_factory_allowed_by_config_git() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: None,
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let base = dir.path();
         std::fs::write(

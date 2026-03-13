@@ -18,13 +18,7 @@ pub struct ShpoolTerminalPoolFactory;
 #[async_trait]
 impl TerminalPoolFactory for ShpoolTerminalPoolFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "shpool".into(),
-            display_name: "shpool".into(),
-            abbreviation: "".into(),
-            section_label: "".into(),
-            item_noun: "".into(),
-        }
+        ProviderDescriptor::named("shpool")
     }
 
     async fn probe(
@@ -46,7 +40,7 @@ impl TerminalPoolFactory for ShpoolTerminalPoolFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::config::ConfigStore;
@@ -59,12 +53,10 @@ mod tests {
 
     #[tokio::test]
     async fn shpool_factory_succeeds_with_binary() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "shpool".into(),
-            path: PathBuf::from("/usr/local/bin/shpool"),
-            version: None,
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary(
+            "shpool",
+            "/usr/local/bin/shpool",
+        ));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());

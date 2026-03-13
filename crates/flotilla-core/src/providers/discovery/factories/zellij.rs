@@ -18,13 +18,7 @@ pub struct ZellijWorkspaceManagerFactory;
 #[async_trait]
 impl WorkspaceManagerFactory for ZellijWorkspaceManagerFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "zellij".into(),
-            display_name: "zellij Workspaces".into(),
-            abbreviation: "".into(),
-            section_label: "".into(),
-            item_noun: "".into(),
-        }
+        ProviderDescriptor::labeled("zellij", "zellij Workspaces", "", "", "")
     }
 
     async fn probe(
@@ -61,11 +55,7 @@ mod tests {
 
     #[tokio::test]
     async fn zellij_factory_succeeds_with_env_var_and_version() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "ZELLIJ".into(),
-            value: "0".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("ZELLIJ", "0"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(
@@ -94,11 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn zellij_factory_fails_with_old_version() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "ZELLIJ".into(),
-            value: "0".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("ZELLIJ", "0"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(
@@ -114,11 +100,7 @@ mod tests {
 
     #[tokio::test]
     async fn zellij_factory_fails_when_version_check_errors() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "ZELLIJ".into(),
-            value: "0".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("ZELLIJ", "0"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(

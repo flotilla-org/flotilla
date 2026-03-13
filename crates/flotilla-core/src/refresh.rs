@@ -428,13 +428,7 @@ mod tests {
     use crate::providers::workspace::WorkspaceManager;
 
     fn desc(name: &str) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: name.into(),
-            display_name: name.into(),
-            abbreviation: "".into(),
-            section_label: "".into(),
-            item_noun: "".into(),
-        }
+        ProviderDescriptor::named(name)
     }
 
     struct MockCheckoutManager {

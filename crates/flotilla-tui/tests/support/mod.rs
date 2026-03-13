@@ -141,7 +141,7 @@ impl TestHarness {
             checkouts: rm.labels.checkouts.section.clone(),
             code_review: rm.labels.code_review.section.clone(),
             issues: rm.labels.issues.section.clone(),
-            sessions: rm.labels.sessions.section.clone(),
+            sessions: rm.labels.cloud_agents.section.clone(),
         };
         let table_view = group_work_items(&items, &rm.providers, &section_labels, &path);
 
@@ -185,7 +185,7 @@ fn test_labels() -> RepoLabels {
             noun: "issue".into(),
             abbr: "IS".into(),
         },
-        sessions: CategoryLabels {
+        cloud_agents: CategoryLabels {
             section: "Sessions".into(),
             noun: "session".into(),
             abbr: "SS".into(),

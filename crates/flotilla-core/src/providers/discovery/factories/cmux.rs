@@ -20,13 +20,7 @@ use crate::providers::workspace::WorkspaceManager;
 use crate::providers::CommandRunner;
 
 fn cmux_descriptor() -> ProviderDescriptor {
-    ProviderDescriptor {
-        name: "cmux".into(),
-        display_name: "cmux Workspaces".into(),
-        abbreviation: "".into(),
-        section_label: "".into(),
-        item_noun: "".into(),
-    }
+    ProviderDescriptor::labeled("cmux", "cmux Workspaces", "", "", "")
 }
 
 /// Matches when running *inside* cmux (`CMUX_SOCKET_PATH` is set).
@@ -82,7 +76,7 @@ impl WorkspaceManagerFactory for CmuxBinaryFallbackFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::config::ConfigStore;
@@ -97,11 +91,10 @@ mod tests {
 
     #[tokio::test]
     async fn inside_factory_succeeds_with_socket_env_var() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "CMUX_SOCKET_PATH".into(),
-            value: "/tmp/cmux.sock".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var(
+            "CMUX_SOCKET_PATH",
+            "/tmp/cmux.sock",
+        ));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -113,12 +106,8 @@ mod tests {
 
     #[tokio::test]
     async fn inside_factory_fails_with_only_binary() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "cmux".into(),
-            path: PathBuf::from("/usr/local/bin/cmux"),
-            version: None,
-        });
+        let bag =
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("cmux", "/usr/local/bin/cmux"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -145,12 +134,8 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_factory_succeeds_with_binary() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "cmux".into(),
-            path: PathBuf::from("/usr/local/bin/cmux"),
-            version: None,
-        });
+        let bag =
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("cmux", "/usr/local/bin/cmux"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());

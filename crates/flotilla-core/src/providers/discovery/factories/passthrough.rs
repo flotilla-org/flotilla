@@ -18,13 +18,7 @@ pub struct PassthroughTerminalPoolFactory;
 #[async_trait]
 impl TerminalPoolFactory for PassthroughTerminalPoolFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "passthrough".into(),
-            display_name: "passthrough".into(),
-            abbreviation: "".into(),
-            section_label: "".into(),
-            item_noun: "".into(),
-        }
+        ProviderDescriptor::named("passthrough")
     }
 
     async fn probe(

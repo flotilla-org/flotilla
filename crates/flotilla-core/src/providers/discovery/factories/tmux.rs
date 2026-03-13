@@ -18,13 +18,7 @@ pub struct TmuxWorkspaceManagerFactory;
 #[async_trait]
 impl WorkspaceManagerFactory for TmuxWorkspaceManagerFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "tmux".into(),
-            display_name: "tmux Workspaces".into(),
-            abbreviation: "".into(),
-            section_label: "".into(),
-            item_noun: "".into(),
-        }
+        ProviderDescriptor::labeled("tmux", "tmux Workspaces", "", "", "")
     }
 
     async fn probe(
@@ -57,11 +51,10 @@ mod tests {
 
     #[tokio::test]
     async fn tmux_factory_succeeds_with_env_var() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "TMUX".into(),
-            value: "/tmp/tmux-1001/default,12345,0".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var(
+            "TMUX",
+            "/tmp/tmux-1001/default,12345,0",
+        ));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());

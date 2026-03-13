@@ -1,25 +1,45 @@
 pub mod claude;
 pub mod cmux;
 pub mod codex;
-pub mod cursor;
-pub mod env;
+pub mod generic;
 pub mod git;
-pub mod github;
-pub mod shpool;
-pub mod tmux;
 
 use super::{HostDetector, RepoDetector};
+use generic::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
     vec![
-        Box::new(git::GitBinaryDetector),
-        Box::new(github::GhCliDetector),
+        Box::new(CommandDetector::new(
+            "git",
+            &["--version"],
+            parse_first_dotted_version,
+        )),
+        Box::new(CommandDetector::new(
+            "gh",
+            &["--version"],
+            parse_first_dotted_version,
+        )),
         Box::new(claude::ClaudeDetector),
-        Box::new(cursor::CursorDetector),
+        Box::new(codex::CodexAuthDetector),
+        Box::new(EnvVarDetector::new("CURSOR_API_KEY")),
+        Box::new(CommandDetector::new(
+            "agent",
+            &["--version"],
+            parse_first_dotted_version,
+        )),
         Box::new(cmux::CmuxDetector),
-        Box::new(tmux::TmuxDetector),
-        Box::new(env::ZellijDetector),
-        Box::new(shpool::ShpoolDetector),
+        Box::new(EnvVarDetector::new("TMUX")),
+        Box::new(EnvVarDetector::new("ZELLIJ")),
+        Box::new(CommandDetector::new(
+            "zellij",
+            &["--version"],
+            parse_first_dotted_version,
+        )),
+        Box::new(CommandDetector::new(
+            "shpool",
+            &["--version"],
+            parse_first_dotted_version,
+        )),
     ]
 }
 
@@ -27,13 +47,14 @@ pub fn default_repo_detectors() -> Vec<Box<dyn RepoDetector>> {
     vec![
         Box::new(git::VcsRepoDetector),
         Box::new(git::RemoteHostDetector),
-        Box::new(codex::CodexAuthDetector),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use crate::providers::discovery::EnvironmentAssertion;
 
     #[test]
     fn default_host_detectors_non_empty() {
@@ -43,5 +64,53 @@ mod tests {
     #[test]
     fn default_repo_detectors_non_empty() {
         assert!(!default_repo_detectors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn simple_env_var_detectors_are_table_driven() {
+        let runner = DiscoveryMockRunner::builder().build();
+        let cases = [
+            ("cursor-env", "CURSOR_API_KEY", "cursor-secret"),
+            ("tmux", "TMUX", "/tmp/tmux.sock,123,0"),
+            ("zellij-env", "ZELLIJ", "0"),
+        ];
+
+        for (_detector_name, key, value) in cases {
+            let detector = EnvVarDetector::new(key);
+            let env = TestEnvVars::new([(key, value)]);
+            let assertions = detector.detect(&runner, &env).await;
+
+            assert!(matches!(
+                assertions.as_slice(),
+                [EnvironmentAssertion::EnvVarSet { key: found_key, value: found_value }]
+                if found_key == key && found_value == value
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_command_detectors_are_table_driven() {
+        let cases = [
+            ("git-binary", "git", "git version 2.43.0\n", Some("2.43.0")),
+            ("gh-cli", "gh", "gh version 2.49.0\n", Some("2.49.0")),
+            ("cursor-agent", "agent", "0.1.0\n", Some("0.1.0")),
+            ("zellij-binary", "zellij", "zellij 0.40.1\n", Some("0.40.1")),
+            ("shpool", "shpool", "shpool 0.9.0\n", Some("0.9.0")),
+        ];
+
+        for (_detector_name, command, output, version) in cases {
+            let runner = DiscoveryMockRunner::builder()
+                .on_run(command, &["--version"], Ok(output.into()))
+                .build();
+            let detector =
+                CommandDetector::new(command, &["--version"], parse_first_dotted_version);
+            let assertions = detector.detect(&runner, &TestEnvVars::default()).await;
+
+            assert!(matches!(
+                assertions.as_slice(),
+                [EnvironmentAssertion::BinaryAvailable { name, version: found_version, .. }]
+                if name == command && found_version.as_deref() == version
+            ));
+        }
     }
 }

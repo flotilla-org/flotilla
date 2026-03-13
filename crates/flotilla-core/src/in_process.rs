@@ -323,7 +323,9 @@ impl InProcessDaemon {
         follower: bool,
         host_name: HostName,
     ) -> Arc<Self> {
-        use crate::providers::discovery::{self, detectors, DiscoveryResult, FactoryRegistry};
+        use crate::providers::discovery::{
+            self, detectors, DiscoveryResult, FactoryRegistry, ProcessEnvVars,
+        };
 
         let (event_tx, _) = broadcast::channel(256);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
@@ -334,7 +336,8 @@ impl InProcessDaemon {
         // Run host detection once before the repo loop
         let host_detectors = detectors::default_host_detectors();
         let repo_detectors = detectors::default_repo_detectors();
-        let host_bag = discovery::run_host_detectors(&host_detectors, &*runner).await;
+        let host_bag =
+            discovery::run_host_detectors(&host_detectors, &*runner, &ProcessEnvVars).await;
         let factories = if follower {
             FactoryRegistry::for_follower()
         } else {
@@ -357,6 +360,7 @@ impl InProcessDaemon {
                 &factories,
                 &config,
                 Arc::clone(&runner),
+                &ProcessEnvVars,
             )
             .await;
 
@@ -1256,6 +1260,7 @@ impl DaemonHandle for InProcessDaemon {
             &self.factories,
             &self.config,
             Arc::clone(&self.runner),
+            &crate::providers::discovery::ProcessEnvVars,
         )
         .await;
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);

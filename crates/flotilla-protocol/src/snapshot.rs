@@ -14,6 +14,18 @@ pub struct CategoryLabels {
 }
 
 impl CategoryLabels {
+    pub fn new(
+        section: impl Into<String>,
+        noun: impl Into<String>,
+        abbr: impl Into<String>,
+    ) -> Self {
+        Self {
+            section: section.into(),
+            noun: noun.into(),
+            abbr: abbr.into(),
+        }
+    }
+
     pub fn noun_capitalized(&self) -> String {
         let mut c = self.noun.chars();
         match c.next() {
@@ -38,7 +50,7 @@ pub struct RepoLabels {
     pub checkouts: CategoryLabels,
     pub code_review: CategoryLabels,
     pub issues: CategoryLabels,
-    pub sessions: CategoryLabels,
+    pub cloud_agents: CategoryLabels,
 }
 
 /// Repo info for list_repos response.
@@ -184,7 +196,7 @@ mod tests {
                 noun: "issue".into(),
                 abbr: "I".into(),
             },
-            sessions: CategoryLabels {
+            cloud_agents: CategoryLabels {
                 section: "Sessions".into(),
                 noun: "session".into(),
                 abbr: "S".into(),
@@ -222,7 +234,7 @@ mod tests {
         assert_eq!(decoded.labels.checkouts.section, "Worktrees");
         assert_eq!(decoded.labels.code_review.noun, "PR");
         assert_eq!(decoded.labels.issues.abbr, "I");
-        assert_eq!(decoded.labels.sessions.section, "Sessions");
+        assert_eq!(decoded.labels.cloud_agents.section, "Sessions");
     }
 
     #[test]

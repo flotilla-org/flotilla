@@ -5,6 +5,7 @@
 //! producing `EnvironmentAssertion` values collected into an `EnvironmentBag`.
 //! Factories consume the bag to construct typed provider instances.
 
+use futures::StreamExt;
 pub mod detectors;
 pub mod factories;
 
@@ -13,8 +14,6 @@ pub(crate) mod test_support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use async_trait::async_trait;
 
 use crate::config::ConfigStore;
 use crate::providers::ai_utility::AiUtility;
@@ -26,6 +25,8 @@ use crate::providers::terminal::TerminalPool;
 use crate::providers::vcs::{CheckoutManager, Vcs};
 use crate::providers::workspace::WorkspaceManager;
 use crate::providers::CommandRunner;
+use async_trait::async_trait;
+use futures::stream;
 
 // ---------------------------------------------------------------------------
 // Environment assertion types
@@ -34,7 +35,7 @@ use crate::providers::CommandRunner;
 #[derive(Debug, Clone, PartialEq)]
 pub enum VcsKind {
     Git,
-    Jj,
+    Jujutsu,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +76,71 @@ pub enum EnvironmentAssertion {
     },
 }
 
+impl EnvironmentAssertion {
+    pub fn binary(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self::BinaryAvailable {
+            name: name.into(),
+            path: path.into(),
+            version: None,
+        }
+    }
+
+    pub fn versioned_binary(
+        name: impl Into<String>,
+        path: impl Into<PathBuf>,
+        version: impl Into<String>,
+    ) -> Self {
+        Self::BinaryAvailable {
+            name: name.into(),
+            path: path.into(),
+            version: Some(version.into()),
+        }
+    }
+
+    pub fn env_var(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::EnvVarSet {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn vcs_checkout(root: impl Into<PathBuf>, kind: VcsKind, is_main_checkout: bool) -> Self {
+        Self::VcsCheckoutDetected {
+            root: root.into(),
+            kind,
+            is_main_checkout,
+        }
+    }
+
+    pub fn remote_host(
+        platform: HostPlatform,
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        remote_name: impl Into<String>,
+    ) -> Self {
+        Self::RemoteHost {
+            platform,
+            owner: owner.into(),
+            repo: repo.into(),
+            remote_name: remote_name.into(),
+        }
+    }
+
+    pub fn auth_file(provider: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self::AuthFileExists {
+            provider: provider.into(),
+            path: path.into(),
+        }
+    }
+
+    pub fn socket(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self::SocketAvailable {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EnvironmentBag — typed query over collected assertions
 // ---------------------------------------------------------------------------
@@ -89,12 +155,14 @@ impl EnvironmentBag {
         Self::default()
     }
 
-    pub fn push(&mut self, assertion: EnvironmentAssertion) {
+    pub fn with(mut self, assertion: EnvironmentAssertion) -> Self {
         self.assertions.push(assertion);
+        self
     }
 
-    pub fn extend(&mut self, assertions: Vec<EnvironmentAssertion>) {
+    pub fn extend<I: IntoIterator<Item = EnvironmentAssertion>>(mut self, assertions: I) -> Self {
         self.assertions.extend(assertions);
+        self
     }
 
     pub fn find_binary(&self, name: &str) -> Option<&PathBuf> {
@@ -207,6 +275,18 @@ impl EnvironmentBag {
     }
 }
 
+pub trait EnvVars: Send + Sync {
+    fn get(&self, key: &str) -> Option<String>;
+}
+
+pub struct ProcessEnvVars;
+
+impl EnvVars for ProcessEnvVars {
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unmet requirements and provider descriptor
 // ---------------------------------------------------------------------------
@@ -229,23 +309,55 @@ pub struct ProviderDescriptor {
     pub item_noun: String,
 }
 
+impl ProviderDescriptor {
+    pub fn named(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            display_name: name.clone(),
+            name,
+            abbreviation: String::new(),
+            section_label: String::new(),
+            item_noun: String::new(),
+        }
+    }
+
+    pub fn labeled(
+        name: impl Into<String>,
+        display_name: impl Into<String>,
+        abbreviation: impl Into<String>,
+        section_label: impl Into<String>,
+        item_noun: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            display_name: display_name.into(),
+            abbreviation: abbreviation.into(),
+            section_label: section_label.into(),
+            item_noun: item_noun.into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Detector traits
 // ---------------------------------------------------------------------------
 
 #[async_trait]
 pub trait HostDetector: Send + Sync {
-    fn name(&self) -> &str;
-    async fn detect(&self, runner: &dyn CommandRunner) -> Vec<EnvironmentAssertion>;
+    async fn detect(
+        &self,
+        runner: &dyn CommandRunner,
+        env: &dyn EnvVars,
+    ) -> Vec<EnvironmentAssertion>;
 }
 
 #[async_trait]
 pub trait RepoDetector: Send + Sync {
-    fn name(&self) -> &str;
     async fn detect(
         &self,
         repo_root: &Path,
         runner: &dyn CommandRunner,
+        env: &dyn EnvVars,
     ) -> Vec<EnvironmentAssertion>;
 }
 
@@ -378,13 +490,13 @@ pub struct DiscoveryResult {
 pub async fn run_host_detectors(
     detectors: &[Box<dyn HostDetector>],
     runner: &dyn CommandRunner,
+    env: &dyn EnvVars,
 ) -> EnvironmentBag {
-    let mut bag = EnvironmentBag::new();
-    for detector in detectors {
-        let assertions = detector.detect(runner).await;
-        bag.extend(assertions);
-    }
-    bag
+    stream::iter(detectors)
+        .fold(EnvironmentBag::new(), |bag, det| async move {
+            bag.extend(det.detect(runner, env).await)
+        })
+        .await
 }
 
 pub async fn discover_providers(
@@ -394,143 +506,82 @@ pub async fn discover_providers(
     factories: &FactoryRegistry,
     config: &ConfigStore,
     runner: Arc<dyn CommandRunner>,
+    env: &dyn EnvVars,
 ) -> DiscoveryResult {
+    let runner_ref = &*runner;
     // Phase 1: run repo detectors
-    let mut repo_bag = EnvironmentBag::new();
-    for detector in repo_detectors {
-        let assertions = detector.detect(repo_root, &*runner).await;
-        repo_bag.extend(assertions);
-    }
+    let repo_bag = stream::iter(repo_detectors)
+        .fold(EnvironmentBag::new(), |bag, det| async move {
+            bag.extend(det.detect(repo_root, runner_ref, env).await)
+        })
+        .await;
     let combined = host_bag.merge(&repo_bag);
 
     // Phase 2: run factories
     let mut registry = ProviderRegistry::new();
     let mut unmet = Vec::new();
 
-    // VCS — all factories
-    for factory in &factories.vcs {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry.vcs.insert(desc.name.clone(), (desc, provider));
+    macro_rules! probe_all_map {
+        ($factory_list:expr, $target:expr) => {
+            for factory in $factory_list {
+                match factory
+                    .probe(&combined, config, repo_root, runner.clone())
+                    .await
+                {
+                    Ok(provider) => {
+                        let desc = factory.descriptor();
+                        $target.insert(desc.name.clone(), (desc, provider));
+                    }
+                    Err(reqs) => unmet.extend(reqs),
+                }
             }
-            Err(reqs) => unmet.extend(reqs),
-        }
+        };
     }
 
-    // Checkout managers — first-wins (at-most-one)
-    for factory in &factories.checkout_managers {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry
-                    .checkout_managers
-                    .insert(desc.name.clone(), (desc, provider));
-                break;
+    macro_rules! probe_first_map {
+        ($factory_list:expr, $target:expr) => {
+            for factory in $factory_list {
+                match factory
+                    .probe(&combined, config, repo_root, runner.clone())
+                    .await
+                {
+                    Ok(provider) => {
+                        let desc = factory.descriptor();
+                        $target.insert(desc.name.clone(), (desc, provider));
+                        break;
+                    }
+                    Err(reqs) => unmet.extend(reqs),
+                }
             }
-            Err(reqs) => unmet.extend(reqs),
-        }
+        };
     }
 
-    // Code review — all factories
-    for factory in &factories.code_review {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry
-                    .code_review
-                    .insert(desc.name.clone(), (desc, provider));
+    macro_rules! probe_first_option {
+        ($factory_list:expr, $target:expr) => {
+            for factory in $factory_list {
+                match factory
+                    .probe(&combined, config, repo_root, runner.clone())
+                    .await
+                {
+                    Ok(provider) => {
+                        let desc = factory.descriptor();
+                        $target = Some((desc, provider));
+                        break;
+                    }
+                    Err(reqs) => unmet.extend(reqs),
+                }
             }
-            Err(reqs) => unmet.extend(reqs),
-        }
+        };
     }
 
-    // Issue trackers — all factories
-    for factory in &factories.issue_trackers {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry
-                    .issue_trackers
-                    .insert(desc.name.clone(), (desc, provider));
-            }
-            Err(reqs) => unmet.extend(reqs),
-        }
-    }
-
-    // Cloud agents — all factories
-    for factory in &factories.cloud_agents {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry
-                    .cloud_agents
-                    .insert(desc.name.clone(), (desc, provider));
-            }
-            Err(reqs) => unmet.extend(reqs),
-        }
-    }
-
-    // AI utilities — all factories
-    for factory in &factories.ai_utilities {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry
-                    .ai_utilities
-                    .insert(desc.name.clone(), (desc, provider));
-            }
-            Err(reqs) => unmet.extend(reqs),
-        }
-    }
-
-    // Workspace managers — first-wins (at-most-one)
-    for factory in &factories.workspace_managers {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry.workspace_manager = Some((desc, provider));
-                break;
-            }
-            Err(reqs) => unmet.extend(reqs),
-        }
-    }
-
-    // Terminal pools — first-wins (at-most-one)
-    for factory in &factories.terminal_pools {
-        match factory
-            .probe(&combined, config, repo_root, runner.clone())
-            .await
-        {
-            Ok(provider) => {
-                let desc = factory.descriptor();
-                registry.terminal_pool = Some((desc, provider));
-                break;
-            }
-            Err(reqs) => unmet.extend(reqs),
-        }
-    }
+    probe_all_map!(&factories.vcs, registry.vcs);
+    probe_first_map!(&factories.checkout_managers, registry.checkout_managers);
+    probe_all_map!(&factories.code_review, registry.code_review);
+    probe_all_map!(&factories.issue_trackers, registry.issue_trackers);
+    probe_all_map!(&factories.cloud_agents, registry.cloud_agents);
+    probe_all_map!(&factories.ai_utilities, registry.ai_utilities);
+    probe_first_option!(&factories.workspace_managers, registry.workspace_manager);
+    probe_first_option!(&factories.terminal_pools, registry.terminal_pool);
 
     let repo_slug = combined.repo_slug();
 
@@ -551,47 +602,36 @@ mod tests {
     use super::*;
 
     fn sample_bag() -> EnvironmentBag {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: Some("2.40.0".into()),
-        });
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "gh".into(),
-            path: PathBuf::from("/usr/bin/gh"),
-            version: None,
-        });
-        bag.push(EnvironmentAssertion::EnvVarSet {
-            key: "GITHUB_TOKEN".into(),
-            value: "ghp_abc123".into(),
-        });
-        bag.push(EnvironmentAssertion::VcsCheckoutDetected {
-            root: PathBuf::from("/home/user/project"),
-            kind: VcsKind::Git,
-            is_main_checkout: true,
-        });
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitHub,
-            owner: "acme".into(),
-            repo: "widgets".into(),
-            remote_name: "upstream".into(),
-        });
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitHub,
-            owner: "fork-owner".into(),
-            repo: "widgets".into(),
-            remote_name: "origin".into(),
-        });
-        bag.push(EnvironmentAssertion::AuthFileExists {
-            provider: "github".into(),
-            path: PathBuf::from("/home/user/.config/gh/hosts.yml"),
-        });
-        bag.push(EnvironmentAssertion::SocketAvailable {
-            name: "cmux".into(),
-            path: PathBuf::from("/tmp/cmux.sock"),
-        });
-        bag
+        EnvironmentBag::new()
+            .with(EnvironmentAssertion::versioned_binary(
+                "git",
+                "/usr/bin/git",
+                "2.40.0",
+            ))
+            .with(EnvironmentAssertion::binary("gh", "/usr/bin/gh"))
+            .with(EnvironmentAssertion::env_var("GITHUB_TOKEN", "ghp_abc123"))
+            .with(EnvironmentAssertion::vcs_checkout(
+                "/home/user/project",
+                VcsKind::Git,
+                true,
+            ))
+            .with(EnvironmentAssertion::remote_host(
+                HostPlatform::GitHub,
+                "acme",
+                "widgets",
+                "upstream",
+            ))
+            .with(EnvironmentAssertion::remote_host(
+                HostPlatform::GitHub,
+                "fork-owner",
+                "widgets",
+                "origin",
+            ))
+            .with(EnvironmentAssertion::auth_file(
+                "github",
+                "/home/user/.config/gh/hosts.yml",
+            ))
+            .with(EnvironmentAssertion::socket("cmux", "/tmp/cmux.sock"))
     }
 
     #[test]
@@ -619,19 +659,19 @@ mod tests {
 
     #[test]
     fn find_remote_host_falls_back_to_first() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitHub,
-            owner: "acme".into(),
-            repo: "widgets".into(),
-            remote_name: "upstream".into(),
-        });
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitHub,
-            owner: "other".into(),
-            repo: "widgets".into(),
-            remote_name: "fork".into(),
-        });
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::remote_host(
+                HostPlatform::GitHub,
+                "acme",
+                "widgets",
+                "upstream",
+            ))
+            .with(EnvironmentAssertion::remote_host(
+                HostPlatform::GitHub,
+                "other",
+                "widgets",
+                "fork",
+            ));
         let result = bag.find_remote_host(HostPlatform::GitHub);
         assert_eq!(result, Some(("acme", "widgets", "upstream")));
     }
@@ -654,7 +694,7 @@ mod tests {
         let bag = sample_bag();
         let result = bag.find_vcs_checkout(VcsKind::Git);
         assert_eq!(result, Some((Path::new("/home/user/project"), true)));
-        assert_eq!(bag.find_vcs_checkout(VcsKind::Jj), None);
+        assert_eq!(bag.find_vcs_checkout(VcsKind::Jujutsu), None);
     }
 
     #[test]
@@ -666,13 +706,12 @@ mod tests {
 
     #[test]
     fn repo_slug_falls_back_to_gitlab() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitLab,
-            owner: "gl-org".into(),
-            repo: "project".into(),
-            remote_name: "origin".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host(
+            HostPlatform::GitLab,
+            "gl-org",
+            "project",
+            "origin",
+        ));
         assert_eq!(bag.repo_slug(), Some("gl-org/project".into()));
     }
 
@@ -684,19 +723,8 @@ mod tests {
 
     #[test]
     fn merge_combines_assertions() {
-        let mut bag1 = EnvironmentBag::new();
-        bag1.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: None,
-        });
-
-        let mut bag2 = EnvironmentBag::new();
-        bag2.push(EnvironmentAssertion::BinaryAvailable {
-            name: "gh".into(),
-            path: PathBuf::from("/usr/bin/gh"),
-            version: None,
-        });
+        let bag1 = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
+        let bag2 = EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh"));
 
         let merged = bag1.merge(&bag2);
         assert!(merged.find_binary("git").is_some());
@@ -724,18 +752,9 @@ mod tests {
 
     #[test]
     fn extend_adds_multiple() {
-        let mut bag = EnvironmentBag::new();
-        bag.extend(vec![
-            EnvironmentAssertion::BinaryAvailable {
-                name: "a".into(),
-                path: PathBuf::from("/a"),
-                version: None,
-            },
-            EnvironmentAssertion::BinaryAvailable {
-                name: "b".into(),
-                path: PathBuf::from("/b"),
-                version: None,
-            },
+        let bag = EnvironmentBag::new().extend(vec![
+            EnvironmentAssertion::binary("a", "/a"),
+            EnvironmentAssertion::binary("b", "/b"),
         ]);
         assert!(bag.find_binary("a").is_some());
         assert!(bag.find_binary("b").is_some());
@@ -757,13 +776,13 @@ mod tests {
 
     #[test]
     fn provider_descriptor_fields() {
-        let desc = ProviderDescriptor {
-            name: "github-cr".into(),
-            display_name: "GitHub PRs".into(),
-            abbreviation: "PR".into(),
-            section_label: "Pull Requests".into(),
-            item_noun: "pull request".into(),
-        };
+        let desc = ProviderDescriptor::labeled(
+            "github-cr",
+            "GitHub PRs",
+            "PR",
+            "Pull Requests",
+            "pull request",
+        );
         assert_eq!(desc.name, "github-cr");
         assert_eq!(desc.display_name, "GitHub PRs");
         assert_eq!(desc.abbreviation, "PR");
@@ -772,14 +791,23 @@ mod tests {
     }
 
     #[test]
+    fn provider_descriptor_named_defaults_labels() {
+        let desc = ProviderDescriptor::named("claude");
+        assert_eq!(desc.name, "claude");
+        assert_eq!(desc.display_name, "claude");
+        assert!(desc.abbreviation.is_empty());
+        assert!(desc.section_label.is_empty());
+        assert!(desc.item_noun.is_empty());
+    }
+
+    #[test]
     fn repo_identity_from_github_remote() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitHub,
-            owner: "rjwittams".into(),
-            repo: "flotilla".into(),
-            remote_name: "origin".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host(
+            HostPlatform::GitHub,
+            "rjwittams",
+            "flotilla",
+            "origin",
+        ));
         let identity = bag.repo_identity().expect("should have identity");
         assert_eq!(identity.authority, "github.com");
         assert_eq!(identity.path, "rjwittams/flotilla");
@@ -787,13 +815,12 @@ mod tests {
 
     #[test]
     fn repo_identity_from_gitlab_remote() {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitLab,
-            owner: "gl-org".into(),
-            repo: "project".into(),
-            remote_name: "origin".into(),
-        });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host(
+            HostPlatform::GitLab,
+            "gl-org",
+            "project",
+            "origin",
+        ));
         let identity = bag.repo_identity().expect("should have identity");
         assert_eq!(identity.authority, "gitlab.com");
         assert_eq!(identity.path, "gl-org/project");
@@ -815,7 +842,7 @@ mod orchestrator_tests {
     use super::*;
     use crate::config::ConfigStore;
     use crate::providers::discovery::detectors;
-    use crate::providers::discovery::test_support::DiscoveryMockRunner;
+    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
     use tempfile::tempdir;
 
     /// Build a DiscoveryMockRunner with git binary available plus
@@ -859,23 +886,27 @@ mod orchestrator_tests {
         let config = ConfigStore::with_base(dir.path().join("config"));
 
         // Build host bag with git binary assertion
-        let mut host_bag = EnvironmentBag::new();
-        host_bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: Some("2.40.0".into()),
-        });
-        host_bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "wt".into(),
-            path: PathBuf::from("/usr/bin/wt"),
-            version: None,
-        });
+        let host_bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::versioned_binary(
+                "git",
+                "/usr/bin/git",
+                "2.40.0",
+            ))
+            .with(EnvironmentAssertion::binary("wt", "/usr/bin/wt"));
 
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result =
-            discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner).await;
+        let result = discover_providers(
+            &host_bag,
+            repo_root,
+            &repo_dets,
+            &fact_reg,
+            &config,
+            runner,
+            &TestEnvVars::default(),
+        )
+        .await;
 
         // VCS should be registered (git factory)
         assert!(
@@ -904,23 +935,27 @@ mod orchestrator_tests {
         let config = ConfigStore::with_base(dir.path().join("config"));
 
         // Host bag with both git and wt binaries
-        let mut host_bag = EnvironmentBag::new();
-        host_bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: Some("2.40.0".into()),
-        });
-        host_bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "wt".into(),
-            path: PathBuf::from("/usr/bin/wt"),
-            version: None,
-        });
+        let host_bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::versioned_binary(
+                "git",
+                "/usr/bin/git",
+                "2.40.0",
+            ))
+            .with(EnvironmentAssertion::binary("wt", "/usr/bin/wt"));
 
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result =
-            discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner).await;
+        let result = discover_providers(
+            &host_bag,
+            repo_root,
+            &repo_dets,
+            &fact_reg,
+            &config,
+            runner,
+            &TestEnvVars::default(),
+        )
+        .await;
 
         // Checkout managers use first-wins: should have exactly one
         assert_eq!(
@@ -945,8 +980,16 @@ mod orchestrator_tests {
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result =
-            discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner).await;
+        let result = discover_providers(
+            &host_bag,
+            repo_root,
+            &repo_dets,
+            &fact_reg,
+            &config,
+            runner,
+            &TestEnvVars::default(),
+        )
+        .await;
 
         // With no binaries and no assertions, factories should report unmet
         assert!(
@@ -965,12 +1008,11 @@ mod orchestrator_tests {
         let config = ConfigStore::with_base(dir.path().join("config"));
 
         // Host bag with git binary
-        let mut host_bag = EnvironmentBag::new();
-        host_bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
-            version: Some("2.40.0".into()),
-        });
+        let host_bag = EnvironmentBag::new().with(EnvironmentAssertion::versioned_binary(
+            "git",
+            "/usr/bin/git",
+            "2.40.0",
+        ));
 
         let repo_dets = detectors::default_repo_detectors();
         // Use empty factories — we only care about the bag/slug
@@ -985,8 +1027,16 @@ mod orchestrator_tests {
             terminal_pools: vec![],
         };
 
-        let result =
-            discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner).await;
+        let result = discover_providers(
+            &host_bag,
+            repo_root,
+            &repo_dets,
+            &fact_reg,
+            &config,
+            runner,
+            &TestEnvVars::default(),
+        )
+        .await;
 
         // RemoteHostDetector should have parsed the git remote URL into a
         // RemoteHost assertion, yielding a repo_slug.
@@ -1018,8 +1068,16 @@ mod orchestrator_tests {
             terminal_pools: vec![],
         };
 
-        let result =
-            discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner).await;
+        let result = discover_providers(
+            &host_bag,
+            repo_root,
+            &repo_dets,
+            &fact_reg,
+            &config,
+            runner,
+            &TestEnvVars::default(),
+        )
+        .await;
 
         assert!(result.registry.vcs.is_empty());
         assert!(result.registry.checkout_managers.is_empty());
@@ -1042,7 +1100,7 @@ mod orchestrator_tests {
         );
 
         let host_dets = detectors::default_host_detectors();
-        let bag = run_host_detectors(&host_dets, &*runner).await;
+        let bag = run_host_detectors(&host_dets, &*runner, &TestEnvVars::default()).await;
 
         // At minimum, git binary should be detected
         assert!(

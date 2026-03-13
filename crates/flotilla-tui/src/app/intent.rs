@@ -279,7 +279,7 @@ mod tests {
                 noun: "issue".into(),
                 abbr: "iss".into(),
             },
-            sessions: CategoryLabels {
+            cloud_agents: CategoryLabels {
                 section: "Sessions".into(),
                 noun: "session".into(),
                 abbr: "sess".into(),

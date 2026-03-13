@@ -1,43 +1,13 @@
 //! Git-related detectors: binary availability and repo structure.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 
 use crate::providers::discovery::{
-    EnvironmentAssertion, HostDetector, HostPlatform, RepoDetector, VcsKind,
+    EnvVars, EnvironmentAssertion, HostPlatform, RepoDetector, VcsKind,
 };
 use crate::providers::{run, CommandRunner};
-
-// ---------------------------------------------------------------------------
-// GitBinaryDetector (HostDetector)
-// ---------------------------------------------------------------------------
-
-/// Detects whether `git` is available on the host.
-pub struct GitBinaryDetector;
-
-#[async_trait]
-impl HostDetector for GitBinaryDetector {
-    fn name(&self) -> &str {
-        "git-binary"
-    }
-
-    async fn detect(&self, runner: &dyn CommandRunner) -> Vec<EnvironmentAssertion> {
-        // Single call: proves binary exists and captures version
-        let Ok(output) = run!(runner, "git", &["--version"], Path::new(".")) else {
-            return vec![];
-        };
-        let version = output
-            .trim()
-            .strip_prefix("git version ")
-            .map(|v| v.to_string());
-        vec![EnvironmentAssertion::BinaryAvailable {
-            name: "git".into(),
-            path: PathBuf::from("git"),
-            version,
-        }]
-    }
-}
 
 // ---------------------------------------------------------------------------
 // VcsRepoDetector (RepoDetector)
@@ -48,29 +18,26 @@ pub struct VcsRepoDetector;
 
 #[async_trait]
 impl RepoDetector for VcsRepoDetector {
-    fn name(&self) -> &str {
-        "vcs-repo"
-    }
-
     async fn detect(
         &self,
         repo_root: &Path,
         _runner: &dyn CommandRunner,
+        _env: &dyn EnvVars,
     ) -> Vec<EnvironmentAssertion> {
         let git_path = repo_root.join(".git");
         if git_path.is_dir() {
-            vec![EnvironmentAssertion::VcsCheckoutDetected {
-                root: repo_root.to_path_buf(),
-                kind: VcsKind::Git,
-                is_main_checkout: true,
-            }]
+            vec![EnvironmentAssertion::vcs_checkout(
+                repo_root,
+                VcsKind::Git,
+                true,
+            )]
         } else if git_path.is_file() {
             // .git file indicates a worktree
-            vec![EnvironmentAssertion::VcsCheckoutDetected {
-                root: repo_root.to_path_buf(),
-                kind: VcsKind::Git,
-                is_main_checkout: false,
-            }]
+            vec![EnvironmentAssertion::vcs_checkout(
+                repo_root,
+                VcsKind::Git,
+                false,
+            )]
         } else {
             vec![]
         }
@@ -215,14 +182,11 @@ fn extract_owner_repo(url: &str) -> Option<(String, String)> {
 
 #[async_trait]
 impl RepoDetector for RemoteHostDetector {
-    fn name(&self) -> &str {
-        "remote-host"
-    }
-
     async fn detect(
         &self,
         repo_root: &Path,
         runner: &dyn CommandRunner,
+        _env: &dyn EnvVars,
     ) -> Vec<EnvironmentAssertion> {
         let (remote_name, url) = match preferred_remote(repo_root, runner).await {
             Some(r) => r,
@@ -236,12 +200,12 @@ impl RepoDetector for RemoteHostDetector {
             Some(r) => r,
             None => return vec![],
         };
-        vec![EnvironmentAssertion::RemoteHost {
+        vec![EnvironmentAssertion::remote_host(
             platform,
             owner,
             repo,
             remote_name,
-        }]
+        )]
     }
 }
 
@@ -254,37 +218,6 @@ mod tests {
     use super::*;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
 
-    // -- GitBinaryDetector --
-
-    #[tokio::test]
-    async fn git_binary_detector_found() {
-        let runner = DiscoveryMockRunner::builder()
-            .on_run("git", &["--version"], Ok("git version 2.43.0\n".into()))
-            .build();
-        let assertions = GitBinaryDetector.detect(&runner).await;
-        assert_eq!(assertions.len(), 1);
-        match &assertions[0] {
-            EnvironmentAssertion::BinaryAvailable {
-                name,
-                path,
-                version,
-            } => {
-                assert_eq!(name, "git");
-                assert_eq!(path, &PathBuf::from("git"));
-                assert_eq!(version.as_deref(), Some("2.43.0"));
-            }
-            other => panic!("expected BinaryAvailable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn git_binary_detector_not_found() {
-        // No on_run configured → run! returns Err → empty assertions
-        let runner = DiscoveryMockRunner::builder().build();
-        let assertions = GitBinaryDetector.detect(&runner).await;
-        assert!(assertions.is_empty());
-    }
-
     // -- VcsRepoDetector --
 
     #[tokio::test]
@@ -292,7 +225,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector.detect(dir.path(), &runner).await;
+        let assertions = VcsRepoDetector
+            .detect(
+                dir.path(),
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected {
@@ -313,7 +252,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(dir.path().join(".git"), "gitdir: /some/path\n").expect("write .git file");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector.detect(dir.path(), &runner).await;
+        let assertions = VcsRepoDetector
+            .detect(
+                dir.path(),
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected {
@@ -333,7 +278,13 @@ mod tests {
     async fn vcs_repo_detector_no_git() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector.detect(dir.path(), &runner).await;
+        let assertions = VcsRepoDetector
+            .detect(
+                dir.path(),
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert!(assertions.is_empty());
     }
 
@@ -355,7 +306,13 @@ mod tests {
                 Ok("git@github.com:owner/repo.git\n".into()),
             )
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner).await;
+        let assertions = RemoteHostDetector
+            .detect(
+                repo_root,
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost {
@@ -389,7 +346,13 @@ mod tests {
                 Ok("https://github.com/upstream-owner/repo.git\n".into()),
             )
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner).await;
+        let assertions = RemoteHostDetector
+            .detect(
+                repo_root,
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost {
@@ -423,7 +386,13 @@ mod tests {
                 Ok("https://github.com/owner/repo.git\n".into()),
             )
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner).await;
+        let assertions = RemoteHostDetector
+            .detect(
+                repo_root,
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost {
@@ -452,7 +421,13 @@ mod tests {
             )
             .on_run("git", &["remote"], Ok(String::new()))
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner).await;
+        let assertions = RemoteHostDetector
+            .detect(
+                repo_root,
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert!(assertions.is_empty());
     }
 
@@ -472,7 +447,13 @@ mod tests {
                 Ok("https://gitlab.example.com/org/project.git\n".into()),
             )
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner).await;
+        let assertions = RemoteHostDetector
+            .detect(
+                repo_root,
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost {
@@ -506,7 +487,13 @@ mod tests {
                 Ok("https://bitbucket.org/owner/repo.git\n".into()),
             )
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner).await;
+        let assertions = RemoteHostDetector
+            .detect(
+                repo_root,
+                &runner,
+                &crate::providers::discovery::test_support::TestEnvVars::default(),
+            )
+            .await;
         assert!(assertions.is_empty());
     }
 

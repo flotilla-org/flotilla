@@ -448,7 +448,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
         Cell::from(labels.checkouts.abbr.as_str()),
         Cell::from("WS"),
         Cell::from(labels.code_review.abbr.as_str()),
-        Cell::from(labels.sessions.abbr.as_str()),
+        Cell::from(labels.cloud_agents.abbr.as_str()),
         Cell::from("Issues"),
         Cell::from("Git"),
     ])
@@ -768,7 +768,7 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
         if let Some(ref ses_key) = item.session_key {
             if let Some(ses) = providers.sessions.get(ses_key.as_str()) {
                 let noun = if ses.item_noun.is_empty() {
-                    model.active_labels().sessions.noun_capitalized()
+                    model.active_labels().cloud_agents.noun_capitalized()
                 } else {
                     ses.item_noun.clone()
                 };

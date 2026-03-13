@@ -306,7 +306,7 @@ impl App {
             checkouts: rm.labels.checkouts.section.clone(),
             code_review: rm.labels.code_review.section.clone(),
             issues: rm.labels.issues.section.clone(),
-            sessions: rm.labels.sessions.section.clone(),
+            sessions: rm.labels.cloud_agents.section.clone(),
         };
         let table_view =
             data::group_work_items(&snap.work_items, &rm.providers, &section_labels, &path);
@@ -419,7 +419,7 @@ impl App {
             checkouts: rm.labels.checkouts.section.clone(),
             code_review: rm.labels.code_review.section.clone(),
             issues: rm.labels.issues.section.clone(),
-            sessions: rm.labels.sessions.section.clone(),
+            sessions: rm.labels.cloud_agents.section.clone(),
         };
         let table_view =
             data::group_work_items(&delta.work_items, &rm.providers, &section_labels, &path);

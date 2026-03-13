@@ -11,14 +11,34 @@ pub mod zellij;
 
 use super::FactoryRegistry;
 
+fn workspace_factories() -> Vec<Box<dyn super::WorkspaceManagerFactory>> {
+    vec![
+        Box::new(cmux::CmuxInsideFactory),
+        Box::new(zellij::ZellijWorkspaceManagerFactory),
+        Box::new(tmux::TmuxWorkspaceManagerFactory),
+        Box::new(cmux::CmuxBinaryFallbackFactory),
+    ]
+}
+
+fn terminal_pool_factories() -> Vec<Box<dyn super::TerminalPoolFactory>> {
+    vec![
+        Box::new(shpool::ShpoolTerminalPoolFactory),
+        Box::new(passthrough::PassthroughTerminalPoolFactory),
+    ]
+}
+
+fn checkout_manager_factories() -> Vec<Box<dyn super::CheckoutManagerFactory>> {
+    vec![
+        Box::new(git::WtCheckoutManagerFactory),
+        Box::new(git::GitCheckoutManagerFactory),
+    ]
+}
+
 impl FactoryRegistry {
     pub fn default_all() -> Self {
         Self {
             vcs: vec![Box::new(git::GitVcsFactory)],
-            checkout_managers: vec![
-                Box::new(git::WtCheckoutManagerFactory),
-                Box::new(git::GitCheckoutManagerFactory),
-            ],
+            checkout_managers: checkout_manager_factories(),
             code_review: vec![Box::new(github::GitHubCodeReviewFactory)],
             issue_trackers: vec![Box::new(github::GitHubIssueTrackerFactory)],
             cloud_agents: vec![
@@ -28,40 +48,21 @@ impl FactoryRegistry {
             ],
             ai_utilities: vec![Box::new(claude::ClaudeAiUtilityFactory)],
             // Priority: inside-cmux > inside-zellij > inside-tmux > cmux-binary-fallback
-            workspace_managers: vec![
-                Box::new(cmux::CmuxInsideFactory),
-                Box::new(zellij::ZellijWorkspaceManagerFactory),
-                Box::new(tmux::TmuxWorkspaceManagerFactory),
-                Box::new(cmux::CmuxBinaryFallbackFactory),
-            ],
-            terminal_pools: vec![
-                Box::new(shpool::ShpoolTerminalPoolFactory),
-                Box::new(passthrough::PassthroughTerminalPoolFactory),
-            ],
+            workspace_managers: workspace_factories(),
+            terminal_pools: terminal_pool_factories(),
         }
     }
 
     pub fn for_follower() -> Self {
         Self {
             vcs: vec![Box::new(git::GitVcsFactory)],
-            checkout_managers: vec![
-                Box::new(git::WtCheckoutManagerFactory),
-                Box::new(git::GitCheckoutManagerFactory),
-            ],
+            checkout_managers: checkout_manager_factories(),
             code_review: vec![],
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
-            workspace_managers: vec![
-                Box::new(cmux::CmuxInsideFactory),
-                Box::new(zellij::ZellijWorkspaceManagerFactory),
-                Box::new(tmux::TmuxWorkspaceManagerFactory),
-                Box::new(cmux::CmuxBinaryFallbackFactory),
-            ],
-            terminal_pools: vec![
-                Box::new(shpool::ShpoolTerminalPoolFactory),
-                Box::new(passthrough::PassthroughTerminalPoolFactory),
-            ],
+            workspace_managers: workspace_factories(),
+            terminal_pools: terminal_pool_factories(),
         }
     }
 }

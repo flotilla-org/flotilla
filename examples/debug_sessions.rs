@@ -5,7 +5,7 @@
 use flotilla_core::config::ConfigStore;
 use flotilla_core::convert::correlation_result_to_work_item;
 use flotilla_core::data;
-use flotilla_core::providers::discovery::{self, detectors, FactoryRegistry};
+use flotilla_core::providers::discovery::{self, detectors, FactoryRegistry, ProcessEnvVars};
 use flotilla_core::providers::types::RepoCriteria;
 use flotilla_core::providers::{CommandRunner, ProcessCommandRunner};
 use flotilla_core::refresh::RepoRefreshHandle;
@@ -30,7 +30,7 @@ async fn main() {
 
     let host_dets = detectors::default_host_detectors();
     let repo_dets = detectors::default_repo_detectors();
-    let host_bag = discovery::run_host_detectors(&host_dets, &*runner).await;
+    let host_bag = discovery::run_host_detectors(&host_dets, &*runner, &ProcessEnvVars).await;
     let factories = FactoryRegistry::default_all();
 
     let result = discovery::discover_providers(
@@ -40,6 +40,7 @@ async fn main() {
         &factories,
         &config,
         Arc::clone(&runner),
+        &ProcessEnvVars,
     )
     .await;
     let registry = result.registry;

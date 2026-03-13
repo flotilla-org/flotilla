@@ -1,19 +1,19 @@
-//! Codex auth file repo detector.
+//! Codex auth file host detector.
 //!
 //! Checks whether the Codex auth file (`auth.json`) exists under `$CODEX_HOME`
 //! (or `~/.codex` by default), indicating that the user has authenticated with
 //! the Codex CLI.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::providers::discovery::{EnvironmentAssertion, RepoDetector};
+use crate::providers::discovery::{EnvVars, EnvironmentAssertion, HostDetector};
 use crate::providers::CommandRunner;
 
 /// Returns the Codex home directory: `$CODEX_HOME` or `~/.codex`.
-fn codex_home() -> PathBuf {
-    if let Ok(val) = std::env::var("CODEX_HOME") {
+fn codex_home(env: &dyn EnvVars) -> PathBuf {
+    if let Some(val) = env.get("CODEX_HOME") {
         PathBuf::from(val)
     } else {
         dirs::home_dir()
@@ -26,22 +26,15 @@ fn codex_home() -> PathBuf {
 pub struct CodexAuthDetector;
 
 #[async_trait]
-impl RepoDetector for CodexAuthDetector {
-    fn name(&self) -> &str {
-        "codex-auth"
-    }
-
+impl HostDetector for CodexAuthDetector {
     async fn detect(
         &self,
-        _repo_root: &Path,
         _runner: &dyn CommandRunner,
+        env: &dyn EnvVars,
     ) -> Vec<EnvironmentAssertion> {
-        let auth_path = codex_home().join("auth.json");
+        let auth_path = codex_home(env).join("auth.json");
         if auth_path.exists() {
-            vec![EnvironmentAssertion::AuthFileExists {
-                provider: "codex".into(),
-                path: auth_path,
-            }]
+            vec![EnvironmentAssertion::auth_file("codex", auth_path)]
         } else {
             vec![]
         }
@@ -51,7 +44,7 @@ impl RepoDetector for CodexAuthDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::discovery::test_support::DiscoveryMockRunner;
+    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
 
     #[tokio::test]
     async fn codex_auth_detector_found() {
@@ -59,18 +52,14 @@ mod tests {
         std::fs::write(tmp.path().join("auth.json"), r#"{"auth_mode":"api-key"}"#)
             .expect("write auth.json");
 
-        unsafe {
-            std::env::set_var("CODEX_HOME", tmp.path());
-        }
-
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = CodexAuthDetector
-            .detect(Path::new("/unused"), &runner)
-            .await;
-
-        unsafe {
-            std::env::remove_var("CODEX_HOME");
-        }
+        let env = TestEnvVars::new([(
+            "CODEX_HOME",
+            tmp.path()
+                .to_str()
+                .expect("temp path should be valid utf-8"),
+        )]);
+        let assertions = CodexAuthDetector.detect(&runner, &env).await;
 
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
@@ -85,20 +74,15 @@ mod tests {
     #[tokio::test]
     async fn codex_auth_detector_not_found() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        // Empty dir — no auth.json
-
-        unsafe {
-            std::env::set_var("CODEX_HOME", tmp.path());
-        }
 
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = CodexAuthDetector
-            .detect(Path::new("/unused"), &runner)
-            .await;
-
-        unsafe {
-            std::env::remove_var("CODEX_HOME");
-        }
+        let env = TestEnvVars::new([(
+            "CODEX_HOME",
+            tmp.path()
+                .to_str()
+                .expect("temp path should be valid utf-8"),
+        )]);
+        let assertions = CodexAuthDetector.detect(&runner, &env).await;
 
         assert!(assertions.is_empty());
     }

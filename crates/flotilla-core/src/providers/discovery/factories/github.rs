@@ -17,6 +17,22 @@ use crate::providers::issue_tracker::github::GitHubIssueTracker;
 use crate::providers::issue_tracker::IssueTracker;
 use crate::providers::CommandRunner;
 
+fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
+    let mut unmet = vec![];
+    if env.find_binary("gh").is_none() {
+        unmet.push(UnmetRequirement::MissingBinary("gh".into()));
+    }
+    let remote = env.find_remote_host(HostPlatform::GitHub);
+    if remote.is_none() {
+        unmet.push(UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub));
+    }
+    if !unmet.is_empty() {
+        return Err(unmet);
+    }
+    let (owner, repo, _remote_name) = remote.expect("checked above");
+    Ok(format!("{owner}/{repo}"))
+}
+
 // ---------------------------------------------------------------------------
 // GitHubCodeReviewFactory
 // ---------------------------------------------------------------------------
@@ -26,13 +42,13 @@ pub struct GitHubCodeReviewFactory;
 #[async_trait]
 impl CodeReviewFactory for GitHubCodeReviewFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "github".into(),
-            display_name: "GitHub Pull Requests".into(),
-            abbreviation: "PR".into(),
-            section_label: "Pull Requests".into(),
-            item_noun: "pull request".into(),
-        }
+        ProviderDescriptor::labeled(
+            "github",
+            "GitHub Pull Requests",
+            "PR",
+            "Pull Requests",
+            "pull request",
+        )
     }
 
     async fn probe(
@@ -42,19 +58,7 @@ impl CodeReviewFactory for GitHubCodeReviewFactory {
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CodeReview>, Vec<UnmetRequirement>> {
-        let mut unmet = vec![];
-        if env.find_binary("gh").is_none() {
-            unmet.push(UnmetRequirement::MissingBinary("gh".into()));
-        }
-        let remote = env.find_remote_host(HostPlatform::GitHub);
-        if remote.is_none() {
-            unmet.push(UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub));
-        }
-        if !unmet.is_empty() {
-            return Err(unmet);
-        }
-        let (owner, repo, _remote_name) = remote.expect("checked above");
-        let repo_slug = format!("{owner}/{repo}");
+        let repo_slug = github_repo_slug(env)?;
         let api = Arc::new(GhApiClient::new(runner.clone()));
         Ok(Arc::new(GitHubCodeReview::new(
             "github".into(),
@@ -74,13 +78,7 @@ pub struct GitHubIssueTrackerFactory;
 #[async_trait]
 impl IssueTrackerFactory for GitHubIssueTrackerFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "github".into(),
-            display_name: "GitHub Issues".into(),
-            abbreviation: "#".into(),
-            section_label: "Issues".into(),
-            item_noun: "issue".into(),
-        }
+        ProviderDescriptor::labeled("github", "GitHub Issues", "#", "Issues", "issue")
     }
 
     async fn probe(
@@ -90,19 +88,7 @@ impl IssueTrackerFactory for GitHubIssueTrackerFactory {
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>> {
-        let mut unmet = vec![];
-        if env.find_binary("gh").is_none() {
-            unmet.push(UnmetRequirement::MissingBinary("gh".into()));
-        }
-        let remote = env.find_remote_host(HostPlatform::GitHub);
-        if remote.is_none() {
-            unmet.push(UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub));
-        }
-        if !unmet.is_empty() {
-            return Err(unmet);
-        }
-        let (owner, repo, _remote_name) = remote.expect("checked above");
-        let repo_slug = format!("{owner}/{repo}");
+        let repo_slug = github_repo_slug(env)?;
         let api = Arc::new(GhApiClient::new(runner.clone()));
         Ok(Arc::new(GitHubIssueTracker::new(
             "github".into(),
@@ -119,7 +105,7 @@ impl IssueTrackerFactory for GitHubIssueTrackerFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::config::ConfigStore;
@@ -132,40 +118,27 @@ mod tests {
     use super::{GitHubCodeReviewFactory, GitHubIssueTrackerFactory};
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "gh".into(),
-            path: PathBuf::from("/usr/bin/gh"),
-            version: None,
-        });
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitHub,
-            owner: "acme".into(),
-            repo: "widgets".into(),
-            remote_name: "origin".into(),
-        });
-        bag
+        EnvironmentBag::new()
+            .with(EnvironmentAssertion::binary("gh", "/usr/bin/gh"))
+            .with(EnvironmentAssertion::remote_host(
+                HostPlatform::GitHub,
+                "acme",
+                "widgets",
+                "origin",
+            ))
     }
 
     fn bag_with_github_remote_only() -> EnvironmentBag {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::RemoteHost {
-            platform: HostPlatform::GitHub,
-            owner: "acme".into(),
-            repo: "widgets".into(),
-            remote_name: "origin".into(),
-        });
-        bag
+        EnvironmentBag::new().with(EnvironmentAssertion::remote_host(
+            HostPlatform::GitHub,
+            "acme",
+            "widgets",
+            "origin",
+        ))
     }
 
     fn bag_with_gh_binary_only() -> EnvironmentBag {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "gh".into(),
-            path: PathBuf::from("/usr/bin/gh"),
-            version: None,
-        });
-        bag
+        EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh"))
     }
 
     // ── GitHubCodeReviewFactory tests ──

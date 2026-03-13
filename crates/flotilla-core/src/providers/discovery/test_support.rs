@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::providers::discovery::EnvVars;
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
 
 type ResponseMap = HashMap<(String, String), Vec<Result<String, String>>>;
@@ -24,6 +25,11 @@ pub(crate) struct DiscoveryMockRunner {
     tool_exists: HashMap<String, bool>,
     seen_cwds: Mutex<Vec<PathBuf>>,
     exists_calls: Mutex<Vec<(String, String)>>,
+}
+
+#[derive(Default)]
+pub(crate) struct TestEnvVars {
+    vars: HashMap<String, String>,
 }
 
 impl DiscoveryMockRunner {
@@ -78,6 +84,28 @@ impl DiscoveryMockRunnerBuilder {
             seen_cwds: Mutex::new(Vec::new()),
             exists_calls: Mutex::new(Vec::new()),
         }
+    }
+}
+
+impl TestEnvVars {
+    pub(crate) fn new<K, V, I>(vars: I) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        Self {
+            vars: vars
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+}
+
+impl EnvVars for TestEnvVars {
+    fn get(&self, key: &str) -> Option<String> {
+        self.vars.get(key).cloned()
     }
 }
 

@@ -24,13 +24,7 @@ pub struct ClaudeCodingAgentFactory;
 #[async_trait]
 impl CloudAgentFactory for ClaudeCodingAgentFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "claude".into(),
-            display_name: "Claude".into(),
-            abbreviation: "S".into(),
-            section_label: "Sessions".into(),
-            item_noun: "session".into(),
-        }
+        ProviderDescriptor::labeled("claude", "Claude", "S", "Sessions", "session")
     }
 
     async fn probe(
@@ -62,13 +56,7 @@ pub struct ClaudeAiUtilityFactory;
 #[async_trait]
 impl AiUtilityFactory for ClaudeAiUtilityFactory {
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            name: "claude".into(),
-            display_name: "Claude".into(),
-            abbreviation: "".into(),
-            section_label: "".into(),
-            item_noun: "".into(),
-        }
+        ProviderDescriptor::labeled("claude", "Claude", "", "", "")
     }
 
     async fn probe(
@@ -93,7 +81,7 @@ impl AiUtilityFactory for ClaudeAiUtilityFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::config::ConfigStore;
@@ -105,13 +93,10 @@ mod tests {
     use super::{ClaudeAiUtilityFactory, ClaudeCodingAgentFactory};
 
     fn bag_with_claude_binary() -> EnvironmentBag {
-        let mut bag = EnvironmentBag::new();
-        bag.push(EnvironmentAssertion::BinaryAvailable {
-            name: "claude".into(),
-            path: PathBuf::from("/usr/local/bin/claude"),
-            version: None,
-        });
-        bag
+        EnvironmentBag::new().with(EnvironmentAssertion::binary(
+            "claude",
+            "/usr/local/bin/claude",
+        ))
     }
 
     // ── ClaudeCodingAgentFactory tests ──
