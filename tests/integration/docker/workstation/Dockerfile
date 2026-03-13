@@ -26,10 +26,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# claude CLI from npm-installer stage (copy node, modules, and npm-generated wrapper)
+# claude CLI from npm-installer stage
 COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=npm-installer /usr/local/bin/node /usr/local/bin/node
-COPY --from=npm-installer /usr/local/bin/claude /usr/local/bin/claude
+RUN ln -s ../lib/node_modules/@anthropic-ai/claude-code/cli.js /usr/local/bin/claude
 
 # zellij + shpool from cargo-installer stage
 COPY --from=cargo-installer /usr/local/cargo/bin/zellij /usr/local/bin/zellij
