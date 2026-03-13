@@ -1,13 +1,17 @@
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
+};
+
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tracing::{debug, warn};
 
-use crate::providers::types::*;
-use crate::providers::{http_execute, HttpClient};
+use crate::providers::{http_execute, types::*, HttpClient};
 
 // --- Auth ---
 
@@ -36,9 +40,7 @@ fn codex_home() -> PathBuf {
     if let Ok(val) = std::env::var("CODEX_HOME") {
         PathBuf::from(val)
     } else {
-        dirs::home_dir()
-            .expect("could not determine home directory")
-            .join(".codex")
+        dirs::home_dir().expect("could not determine home directory").join(".codex")
     }
 }
 
@@ -50,20 +52,14 @@ fn parse_auth_file(contents: &str) -> Option<CodexAuth> {
             if tokens.access_token.is_empty() {
                 return None;
             }
-            Some(CodexAuth {
-                bearer_token: tokens.access_token,
-                account_id: tokens.account_id,
-            })
+            Some(CodexAuth { bearer_token: tokens.access_token, account_id: tokens.account_id })
         }
         "api-key" => {
             let key = file.openai_api_key?;
             if key.is_empty() {
                 return None;
             }
-            Some(CodexAuth {
-                bearer_token: key,
-                account_id: None,
-            })
+            Some(CodexAuth { bearer_token: key, account_id: None })
         }
         _ => None,
     }
@@ -153,9 +149,7 @@ fn epoch_to_rfc3339(epoch: f64) -> Option<String> {
     use chrono::{TimeZone, Utc};
     let secs = epoch as i64;
     let nanos = ((epoch - secs as f64) * 1_000_000_000.0).clamp(0.0, 999_999_999.0) as u32;
-    Utc.timestamp_opt(secs, nanos)
-        .single()
-        .map(|dt| dt.to_rfc3339())
+    Utc.timestamp_opt(secs, nanos).single().map(|dt| dt.to_rfc3339())
 }
 
 fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAgentSession) {
@@ -171,19 +165,11 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
         })
         .unwrap_or(SessionStatus::Idle);
 
-    let mut correlation_keys = vec![CorrelationKey::SessionRef(
-        provider_name.to_string(),
-        task.id.clone(),
-    )];
+    let mut correlation_keys = vec![CorrelationKey::SessionRef(provider_name.to_string(), task.id.clone())];
 
     // Extract actual PR details from the nested structure
-    let pr_details: Vec<&PullRequestDetail> = task
-        .pull_requests
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|entry| entry.pull_request.as_ref())
-        .collect();
+    let pr_details: Vec<&PullRequestDetail> =
+        task.pull_requests.as_deref().unwrap_or_default().iter().filter_map(|entry| entry.pull_request.as_ref()).collect();
 
     if !pr_details.is_empty() {
         for pr in &pr_details {
@@ -193,10 +179,7 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
                 }
             }
             if let Some(number) = pr.number {
-                correlation_keys.push(CorrelationKey::ChangeRequestRef(
-                    "github".to_string(),
-                    number.to_string(),
-                ));
+                correlation_keys.push(CorrelationKey::ChangeRequestRef("github".to_string(), number.to_string()));
             }
         }
     } else {
@@ -210,27 +193,20 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
         }
     }
 
-    let title = if task.title.is_empty() {
-        task.id.clone()
-    } else {
-        task.title.clone()
-    };
+    let title = if task.title.is_empty() { task.id.clone() } else { task.title.clone() };
 
     let updated_at = task.updated_at.and_then(epoch_to_rfc3339);
 
-    (
-        task.id.clone(),
-        CloudAgentSession {
-            title,
-            status,
-            model: None,
-            updated_at,
-            correlation_keys,
-            provider_name: provider_name.to_string(),
-            provider_display_name: "Codex".into(),
-            item_noun: "Task".into(),
-        },
-    )
+    (task.id.clone(), CloudAgentSession {
+        title,
+        status,
+        model: None,
+        updated_at,
+        correlation_keys,
+        provider_name: provider_name.to_string(),
+        provider_display_name: "Codex".into(),
+        item_noun: "Task".into(),
+    })
 }
 
 // --- CodexCodingAgent struct and HTTP helpers ---
@@ -262,14 +238,8 @@ impl CodexCodingAgent {
         Self {
             provider_name,
             http,
-            auth_cache: Mutex::new(AuthCache {
-                auth: None,
-                loaded_at: None,
-            }),
-            env_cache: Mutex::new(EnvCache {
-                environment_ids: Vec::new(),
-                loaded_at: None,
-            }),
+            auth_cache: Mutex::new(AuthCache { auth: None, loaded_at: None }),
+            env_cache: Mutex::new(EnvCache { environment_ids: Vec::new(), loaded_at: None }),
             auth_warned: AtomicBool::new(false),
         }
     }
@@ -292,14 +262,8 @@ impl CodexCodingAgent {
         auth
     }
 
-    fn build_request(
-        &self,
-        method: &str,
-        url: &str,
-        auth: &CodexAuth,
-    ) -> Result<reqwest::Request, String> {
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|e| format!("invalid HTTP method: {e}"))?;
+    fn build_request(&self, method: &str, url: &str, auth: &CodexAuth) -> Result<reqwest::Request, String> {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| format!("invalid HTTP method: {e}"))?;
         let mut builder = super::REQUEST_FACTORY
             .request(method, url)
             .header("authorization", format!("Bearer {}", auth.bearer_token))
@@ -307,19 +271,11 @@ impl CodexCodingAgent {
         if let Some(ref account_id) = auth.account_id {
             builder = builder.header("chatgpt-account-id", account_id);
         }
-        builder
-            .build()
-            .map_err(|e| format!("request build error: {e}"))
+        builder.build().map_err(|e| format!("request build error: {e}"))
     }
 
-    async fn fetch_environment_ids(
-        &self,
-        repo_slug: &str,
-        auth: &CodexAuth,
-    ) -> Result<Vec<String>, String> {
-        let (owner, repo) = repo_slug
-            .split_once('/')
-            .ok_or_else(|| format!("invalid repo slug: {repo_slug}"))?;
+    async fn fetch_environment_ids(&self, repo_slug: &str, auth: &CodexAuth) -> Result<Vec<String>, String> {
+        let (owner, repo) = repo_slug.split_once('/').ok_or_else(|| format!("invalid repo slug: {repo_slug}"))?;
         let url = format!("{BASE_URL}/wham/environments/by-repo/github/{owner}/{repo}");
         let request = self.build_request("GET", &url, auth)?;
         let resp = http_execute!(self.http, request)?;
@@ -331,17 +287,11 @@ impl CodexCodingAgent {
             let body = String::from_utf8_lossy(resp.body()).to_string();
             return Err(format!("environment lookup failed (HTTP {status}): {body}"));
         }
-        let envs: Vec<EnvironmentInfo> = serde_json::from_slice(resp.body())
-            .map_err(|e| format!("environment list parse error: {e}"))?;
+        let envs: Vec<EnvironmentInfo> = serde_json::from_slice(resp.body()).map_err(|e| format!("environment list parse error: {e}"))?;
         Ok(envs.into_iter().map(|e| e.id).collect())
     }
 
-    async fn fetch_tasks_page(
-        &self,
-        base_query: &str,
-        cursor: Option<&str>,
-        auth: &CodexAuth,
-    ) -> Result<TaskListResponse, String> {
+    async fn fetch_tasks_page(&self, base_query: &str, cursor: Option<&str>, auth: &CodexAuth) -> Result<TaskListResponse, String> {
         let mut url = format!("{BASE_URL}/wham/tasks/list?task_filter=current&limit=20");
         if !base_query.is_empty() {
             url.push('&');
@@ -364,18 +314,12 @@ impl CodexCodingAgent {
         serde_json::from_slice(resp.body()).map_err(|e| format!("task list parse error: {e}"))
     }
 
-    async fn fetch_all_tasks(
-        &self,
-        base_query: &str,
-        auth: &CodexAuth,
-    ) -> Result<Vec<TaskItem>, String> {
+    async fn fetch_all_tasks(&self, base_query: &str, auth: &CodexAuth) -> Result<Vec<TaskItem>, String> {
         let mut all_items = Vec::new();
         let mut cursor: Option<String> = None;
 
         for _ in 0..10 {
-            let page = self
-                .fetch_tasks_page(base_query, cursor.as_deref(), auth)
-                .await?;
+            let page = self.fetch_tasks_page(base_query, cursor.as_deref(), auth).await?;
             all_items.extend(page.items);
             cursor = page.cursor;
             if cursor.is_none() {
@@ -386,15 +330,8 @@ impl CodexCodingAgent {
         Ok(all_items)
     }
 
-    async fn fetch_tasks_by_label(
-        &self,
-        repo_slug: &str,
-        auth: &CodexAuth,
-    ) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        let repo_name = repo_slug
-            .rsplit_once('/')
-            .map(|(_, name)| name)
-            .unwrap_or(repo_slug);
+    async fn fetch_tasks_by_label(&self, repo_slug: &str, auth: &CodexAuth) -> Result<Vec<(String, CloudAgentSession)>, String> {
+        let repo_name = repo_slug.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo_slug);
 
         let tasks = match self.fetch_all_tasks("", auth).await {
             Ok(tasks) => tasks,
@@ -418,11 +355,7 @@ impl CodexCodingAgent {
         Ok(sessions)
     }
 
-    async fn fetch_tasks(
-        &self,
-        environment_id: &str,
-        auth: &CodexAuth,
-    ) -> Result<Vec<TaskItem>, String> {
+    async fn fetch_tasks(&self, environment_id: &str, auth: &CodexAuth) -> Result<Vec<TaskItem>, String> {
         let query = format!("environment_id={}", urlencoding::encode(environment_id));
         self.fetch_all_tasks(&query, auth).await
     }
@@ -436,10 +369,7 @@ fn is_auth_error(e: &str) -> bool {
 
 #[async_trait]
 impl super::CloudAgentService for CodexCodingAgent {
-    async fn list_sessions(
-        &self,
-        criteria: &RepoCriteria,
-    ) -> Result<Vec<(String, CloudAgentSession)>, String> {
+    async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
         let Some(ref repo_slug) = criteria.repo_slug else {
             return Ok(vec![]);
         };
@@ -452,10 +382,7 @@ impl super::CloudAgentService for CodexCodingAgent {
                 Some(a) => a,
                 None => {
                     if !self.auth_warned.swap(true, Ordering::Relaxed) {
-                        warn!(
-                            provider = "codex",
-                            "Codex sessions unavailable: no auth found in ~/.codex/auth.json"
-                        );
+                        warn!(provider = "codex", "Codex sessions unavailable: no auth found in ~/.codex/auth.json");
                     }
                     return Ok(vec![]);
                 }
@@ -492,18 +419,14 @@ impl super::CloudAgentService for CodexCodingAgent {
                             Some(a) => a,
                             None => {
                                 if !self.auth_warned.swap(true, Ordering::Relaxed) {
-                                    warn!(
-                                        provider = "codex",
-                                        "Codex sessions unavailable: auth refresh failed"
-                                    );
+                                    warn!(provider = "codex", "Codex sessions unavailable: auth refresh failed");
                                 }
                                 return Ok(vec![]);
                             }
                         };
                         match self.fetch_environment_ids(repo_slug, &fresh_auth).await {
                             Ok(ids) => {
-                                let mut cache =
-                                    self.env_cache.lock().expect("env_cache lock poisoned");
+                                let mut cache = self.env_cache.lock().expect("env_cache lock poisoned");
                                 cache.environment_ids = ids.clone();
                                 cache.loaded_at = Some(Instant::now());
                                 auth = fresh_auth;
@@ -543,10 +466,7 @@ impl super::CloudAgentService for CodexCodingAgent {
                         Some(a) => a,
                         None => {
                             if !self.auth_warned.swap(true, Ordering::Relaxed) {
-                                warn!(
-                                    provider = "codex",
-                                    "Codex task fetch failed: auth refresh failed"
-                                );
+                                warn!(provider = "codex", "Codex task fetch failed: auth refresh failed");
                             }
                             return Ok(all_sessions);
                         }
@@ -584,21 +504,15 @@ impl super::CloudAgentService for CodexCodingAgent {
 
 /// Lock shared across test modules that manipulate the `CODEX_HOME` env var.
 #[cfg(test)]
-pub(crate) static CODEX_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+pub(crate) static CODEX_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::coding_agent::CloudAgentService;
-    use crate::providers::replay;
+    use crate::providers::{coding_agent::CloudAgentService, replay};
 
     fn fixture(name: &str) -> String {
-        format!(
-            "{}/src/providers/coding_agent/fixtures/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            name
-        )
+        format!("{}/src/providers/coding_agent/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
     }
 
     // Auth parsing tests
@@ -697,10 +611,7 @@ mod tests {
         assert_eq!(task.updated_at, Some(1710000000.5));
         let display = task.task_status_display.as_ref().expect("has display");
         assert_eq!(display.branch_name.as_deref(), Some("fix/bug"));
-        let turn = display
-            .latest_turn_status_display
-            .as_ref()
-            .expect("has turn");
+        let turn = display.latest_turn_status_display.as_ref().expect("has turn");
         assert_eq!(turn.turn_status.as_deref(), Some("in_progress"));
         let prs = task.pull_requests.as_ref().expect("has PRs");
         let pr = prs[0].pull_request.as_ref().expect("has PR detail");
@@ -746,9 +657,7 @@ mod tests {
             task_status_display: Some(TaskStatusDisplay {
                 environment_label: None,
                 branch_name: Some("feat/cool".to_string()),
-                latest_turn_status_display: Some(LatestTurnStatus {
-                    turn_status: Some("pending".to_string()),
-                }),
+                latest_turn_status_display: Some(LatestTurnStatus { turn_status: Some("pending".to_string()) }),
             }),
             pull_requests: None,
         };
@@ -757,15 +666,8 @@ mod tests {
         assert_eq!(session.status, SessionStatus::Running);
         assert_eq!(session.title, "My Task");
         assert!(session.updated_at.is_some());
-        assert!(session
-            .correlation_keys
-            .contains(&CorrelationKey::SessionRef(
-                "codex".to_string(),
-                "t-1".to_string()
-            )));
-        assert!(session
-            .correlation_keys
-            .contains(&CorrelationKey::Branch("feat/cool".to_string())));
+        assert!(session.correlation_keys.contains(&CorrelationKey::SessionRef("codex".to_string(), "t-1".to_string())));
+        assert!(session.correlation_keys.contains(&CorrelationKey::Branch("feat/cool".to_string())));
     }
 
     #[test]
@@ -777,9 +679,7 @@ mod tests {
             task_status_display: Some(TaskStatusDisplay {
                 environment_label: None,
                 branch_name: None,
-                latest_turn_status_display: Some(LatestTurnStatus {
-                    turn_status: Some("in_progress".to_string()),
-                }),
+                latest_turn_status_display: Some(LatestTurnStatus { turn_status: Some("in_progress".to_string()) }),
             }),
             pull_requests: None,
         };
@@ -796,9 +696,7 @@ mod tests {
             task_status_display: Some(TaskStatusDisplay {
                 environment_label: None,
                 branch_name: Some("main".to_string()),
-                latest_turn_status_display: Some(LatestTurnStatus {
-                    turn_status: Some("completed".to_string()),
-                }),
+                latest_turn_status_display: Some(LatestTurnStatus { turn_status: Some("completed".to_string()) }),
             }),
             pull_requests: None,
         };
@@ -806,12 +704,7 @@ mod tests {
         assert_eq!(session.status, SessionStatus::Idle);
         // Branch is trunk ("main"), so only SessionRef is present
         assert_eq!(session.correlation_keys.len(), 1);
-        assert!(session
-            .correlation_keys
-            .contains(&CorrelationKey::SessionRef(
-                "codex".to_string(),
-                "t-3".to_string()
-            )));
+        assert!(session.correlation_keys.contains(&CorrelationKey::SessionRef("codex".to_string(), "t-3".to_string())));
     }
 
     #[test]
@@ -823,20 +716,13 @@ mod tests {
             task_status_display: Some(TaskStatusDisplay {
                 environment_label: None,
                 branch_name: Some("main".to_string()),
-                latest_turn_status_display: Some(LatestTurnStatus {
-                    turn_status: Some("pending".to_string()),
-                }),
+                latest_turn_status_display: Some(LatestTurnStatus { turn_status: Some("pending".to_string()) }),
             }),
             pull_requests: None,
         };
         let (_, session) = map_task_to_session(&task, "codex");
         assert_eq!(session.correlation_keys.len(), 1);
-        assert!(session
-            .correlation_keys
-            .contains(&CorrelationKey::SessionRef(
-                "codex".to_string(),
-                "t-4".to_string()
-            )));
+        assert!(session.correlation_keys.contains(&CorrelationKey::SessionRef("codex".to_string(), "t-4".to_string())));
     }
 
     #[test]
@@ -848,9 +734,7 @@ mod tests {
             task_status_display: Some(TaskStatusDisplay {
                 environment_label: None,
                 branch_name: Some("main".to_string()),
-                latest_turn_status_display: Some(LatestTurnStatus {
-                    turn_status: Some("completed".to_string()),
-                }),
+                latest_turn_status_display: Some(LatestTurnStatus { turn_status: Some("completed".to_string()) }),
             }),
             pull_requests: Some(vec![TaskPullRequestEntry {
                 pull_request: Some(PullRequestDetail {
@@ -861,30 +745,16 @@ mod tests {
             }]),
         };
         let (_, session) = map_task_to_session(&task, "codex");
-        assert!(session
-            .correlation_keys
-            .contains(&CorrelationKey::Branch("feat/pr-branch".to_string())));
-        assert!(session
-            .correlation_keys
-            .contains(&CorrelationKey::ChangeRequestRef(
-                "github".to_string(),
-                "99".to_string()
-            )));
+        assert!(session.correlation_keys.contains(&CorrelationKey::Branch("feat/pr-branch".to_string())));
+        assert!(session.correlation_keys.contains(&CorrelationKey::ChangeRequestRef("github".to_string(), "99".to_string())));
         // Should NOT have Branch("main") — PR path doesn't add source branch
-        assert!(!session
-            .correlation_keys
-            .contains(&CorrelationKey::Branch("main".to_string())));
+        assert!(!session.correlation_keys.contains(&CorrelationKey::Branch("main".to_string())));
     }
 
     #[test]
     fn map_task_empty_title_uses_id() {
-        let task = TaskItem {
-            id: "t-6".to_string(),
-            title: String::new(),
-            updated_at: None,
-            task_status_display: None,
-            pull_requests: None,
-        };
+        let task =
+            TaskItem { id: "t-6".to_string(), title: String::new(), updated_at: None, task_status_display: None, pull_requests: None };
         let (_, session) = map_task_to_session(&task, "codex");
         assert_eq!(session.title, "t-6");
     }
@@ -900,20 +770,12 @@ mod tests {
         // Prime auth cache with valid credentials
         {
             let mut cache = agent.auth_cache.lock().expect("lock");
-            cache.auth = Some(CodexAuth {
-                bearer_token: "test-token".to_string(),
-                account_id: Some("acc-123".to_string()),
-            });
+            cache.auth = Some(CodexAuth { bearer_token: "test-token".to_string(), account_id: Some("acc-123".to_string()) });
             cache.loaded_at = Some(Instant::now());
         }
 
-        let criteria = RepoCriteria {
-            repo_slug: Some("rjwittams/flotilla".into()),
-        };
-        let sessions = agent
-            .list_sessions(&criteria)
-            .await
-            .expect("should succeed");
+        let criteria = RepoCriteria { repo_slug: Some("rjwittams/flotilla".into()) };
+        let sessions = agent.list_sessions(&criteria).await.expect("should succeed");
 
         assert_eq!(sessions.len(), 2, "expected 2 sessions");
 
@@ -921,33 +783,23 @@ mod tests {
         let (id1, s1) = &sessions[0];
         assert_eq!(id1, "task_1");
         assert_eq!(s1.status, SessionStatus::Idle);
-        assert!(
-            s1.correlation_keys
-                .contains(&CorrelationKey::Branch("feat-x".to_string())),
-            "task_1 should correlate with branch feat-x"
-        );
+        assert!(s1.correlation_keys.contains(&CorrelationKey::Branch("feat-x".to_string())), "task_1 should correlate with branch feat-x");
 
         // Task 2: in_progress -> Running, PR head "codex/review-code", CR ref 208
         let (id2, s2) = &sessions[1];
         assert_eq!(id2, "task_2");
         assert_eq!(s2.status, SessionStatus::Running);
         assert!(
-            s2.correlation_keys
-                .contains(&CorrelationKey::Branch("codex/review-code".to_string())),
+            s2.correlation_keys.contains(&CorrelationKey::Branch("codex/review-code".to_string())),
             "task_2 should correlate with PR head branch"
         );
         assert!(
-            s2.correlation_keys
-                .contains(&CorrelationKey::ChangeRequestRef(
-                    "github".to_string(),
-                    "208".to_string()
-                )),
+            s2.correlation_keys.contains(&CorrelationKey::ChangeRequestRef("github".to_string(), "208".to_string())),
             "task_2 should have ChangeRequestRef for PR 208"
         );
         // Should NOT have Branch("main") — PR path doesn't add source branch
         assert!(
-            !s2.correlation_keys
-                .contains(&CorrelationKey::Branch("main".to_string())),
+            !s2.correlation_keys.contains(&CorrelationKey::Branch("main".to_string())),
             "task_2 should not correlate with trunk branch main"
         );
 
@@ -973,20 +825,12 @@ mod tests {
         // Prime auth cache with expired token (no account_id)
         {
             let mut cache = agent.auth_cache.lock().expect("lock");
-            cache.auth = Some(CodexAuth {
-                bearer_token: "expired-token".to_string(),
-                account_id: None,
-            });
+            cache.auth = Some(CodexAuth { bearer_token: "expired-token".to_string(), account_id: None });
             cache.loaded_at = Some(Instant::now());
         }
 
-        let criteria = RepoCriteria {
-            repo_slug: Some("owner/repo".into()),
-        };
-        let sessions = agent
-            .list_sessions(&criteria)
-            .await
-            .expect("should succeed");
+        let criteria = RepoCriteria { repo_slug: Some("owner/repo".into()) };
+        let sessions = agent.list_sessions(&criteria).await.expect("should succeed");
 
         assert_eq!(sessions.len(), 1, "expected 1 session after auth retry");
         assert_eq!(sessions[0].0, "task_1");
@@ -1013,13 +857,8 @@ mod tests {
         let http = replay::test_http_client(&session);
         let agent = CodexCodingAgent::new("codex".into(), http);
 
-        let criteria = RepoCriteria {
-            repo_slug: Some("owner/repo".into()),
-        };
-        let sessions = agent
-            .list_sessions(&criteria)
-            .await
-            .expect("should succeed");
+        let criteria = RepoCriteria { repo_slug: Some("owner/repo".into()) };
+        let sessions = agent.list_sessions(&criteria).await.expect("should succeed");
 
         assert!(sessions.is_empty(), "expected empty sessions when no auth");
 

@@ -21,17 +21,11 @@ fn workspace_factories() -> Vec<Box<super::WorkspaceManagerFactory>> {
 }
 
 fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
-    vec![
-        Box::new(shpool::ShpoolTerminalPoolFactory),
-        Box::new(passthrough::PassthroughTerminalPoolFactory),
-    ]
+    vec![Box::new(shpool::ShpoolTerminalPoolFactory), Box::new(passthrough::PassthroughTerminalPoolFactory)]
 }
 
 fn checkout_manager_factories() -> Vec<Box<super::CheckoutManagerFactory>> {
-    vec![
-        Box::new(git::WtCheckoutManagerFactory),
-        Box::new(git::GitCheckoutManagerFactory),
-    ]
+    vec![Box::new(git::WtCheckoutManagerFactory), Box::new(git::GitCheckoutManagerFactory)]
 }
 
 impl FactoryRegistry {

@@ -97,14 +97,7 @@ pub fn default_template() -> WorkspaceTemplate {
             command: "{main_command}".to_string(),
             count: None,
         }],
-        layout: vec![LayoutSlot {
-            slot: "main".to_string(),
-            split: None,
-            parent: None,
-            overflow: None,
-            gap: None,
-            focus: true,
-        }],
+        layout: vec![LayoutSlot { slot: "main".to_string(), split: None, parent: None, overflow: None, gap: None, focus: true }],
     }
 }
 
@@ -182,10 +175,7 @@ layout:
 
         let rendered = template.render(&vars);
         assert_eq!(rendered.content[0].command, "claude");
-        assert_eq!(
-            rendered.content[1].command,
-            "cd /dev/project && cargo watch"
-        );
+        assert_eq!(rendered.content[1].command, "cd /dev/project && cargo watch");
     }
 
     #[test]

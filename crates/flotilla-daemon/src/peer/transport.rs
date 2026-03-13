@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use flotilla_protocol::{GoodbyeReason, PeerWireMessage};
 use tokio::sync::mpsc;
 

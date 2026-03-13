@@ -1,15 +1,18 @@
-use crate::data::DataStore;
-use crate::providers::registry::ProviderRegistry;
-use crate::providers::types::RepoCriteria;
-use crate::refresh::RepoRefreshHandle;
-use indexmap::IndexMap;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
-use crate::providers::discovery::ProviderDescriptor;
 pub use flotilla_protocol::{CategoryLabels, RepoLabels};
+use indexmap::IndexMap;
+
+use crate::{
+    data::DataStore,
+    providers::{discovery::ProviderDescriptor, registry::ProviderRegistry, types::RepoCriteria},
+    refresh::RepoRefreshHandle,
+};
 pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     fn labels<T>(map: &IndexMap<String, (ProviderDescriptor, T)>) -> CategoryLabels {
         map.values()
@@ -32,11 +35,7 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
 pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<String, Vec<String>> {
     let mut names: HashMap<String, Vec<String>> = HashMap::new();
 
-    fn collect_names<T>(
-        names: &mut HashMap<String, Vec<String>>,
-        key: impl Into<String>,
-        map: &IndexMap<String, (ProviderDescriptor, T)>,
-    ) {
+    fn collect_names<T>(names: &mut HashMap<String, Vec<String>>, key: impl Into<String>, map: &IndexMap<String, (ProviderDescriptor, T)>) {
         let list: Vec<String> = map.values().map(|(d, _)| d.display_name.clone()).collect();
         if !list.is_empty() {
             names.insert(key.into(), list);
@@ -60,9 +59,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
 
 /// Repo display name (directory basename).
 pub fn repo_name(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string())
+    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
 /// Domain data for a single repository — no UI concerns.
@@ -78,18 +75,8 @@ impl RepoModel {
         let labels = labels_from_registry(&registry);
         let registry = Arc::new(registry);
         let criteria = RepoCriteria { repo_slug };
-        let refresh_handle = RepoRefreshHandle::spawn(
-            repo_root,
-            registry.clone(),
-            criteria,
-            Duration::from_secs(10),
-        );
-        Self {
-            registry,
-            data: DataStore::default(),
-            labels,
-            refresh_handle,
-        }
+        let refresh_handle = RepoRefreshHandle::spawn(repo_root, registry.clone(), criteria, Duration::from_secs(10));
+        Self { registry, data: DataStore::default(), labels, refresh_handle }
     }
 
     /// Create a model for a virtual (remote-only) repo.
@@ -105,39 +92,36 @@ impl RepoModel {
             issues: CategoryLabels::new("Issues", "issue", "I"),
             cloud_agents: CategoryLabels::new("Sessions", "session", "S"),
         };
-        Self {
-            registry: Arc::new(registry),
-            data: DataStore::default(),
-            labels,
-            refresh_handle: RepoRefreshHandle::idle(),
-        }
+        Self { registry: Arc::new(registry), data: DataStore::default(), labels, refresh_handle: RepoRefreshHandle::idle() }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::providers::ai_utility::AiUtility;
-    use crate::providers::code_review::CodeReview;
-    use crate::providers::coding_agent::CloudAgentService;
-    use crate::providers::discovery::ProviderDescriptor;
-    use crate::providers::issue_tracker::IssueTracker;
-    use crate::providers::vcs::{CheckoutManager, Vcs};
-    use crate::providers::workspace::WorkspaceManager;
-    use async_trait::async_trait;
     use std::path::PathBuf;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::providers::{
+        ai_utility::AiUtility,
+        code_review::CodeReview,
+        coding_agent::CloudAgentService,
+        discovery::ProviderDescriptor,
+        issue_tracker::IssueTracker,
+        types::{
+            AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
+            WorkspaceConfig,
+        },
+        vcs::{CheckoutManager, Vcs},
+        workspace::WorkspaceManager,
+    };
 
     fn named_desc(name: &str) -> ProviderDescriptor {
         ProviderDescriptor::named(name)
     }
 
-    fn labeled_desc(
-        name: &str,
-        display_name: &str,
-        abbreviation: &str,
-        section_label: &str,
-        item_noun: &str,
-    ) -> ProviderDescriptor {
+    fn labeled_desc(name: &str, display_name: &str, abbreviation: &str, section_label: &str, item_noun: &str) -> ProviderDescriptor {
         ProviderDescriptor::labeled(name, display_name, abbreviation, section_label, item_noun)
     }
 
@@ -149,62 +133,30 @@ mod tests {
         fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
             None
         }
-        async fn list_local_branches(
-            &self,
-            _: &Path,
-        ) -> Result<Vec<crate::providers::types::BranchInfo>, String> {
+        async fn list_local_branches(&self, _: &Path) -> Result<Vec<BranchInfo>, String> {
             Ok(vec![])
         }
         async fn list_remote_branches(&self, _: &Path) -> Result<Vec<String>, String> {
             Ok(vec![])
         }
-        async fn commit_log(
-            &self,
-            _: &Path,
-            _: &str,
-            _: usize,
-        ) -> Result<Vec<crate::providers::types::CommitInfo>, String> {
+        async fn commit_log(&self, _: &Path, _: &str, _: usize) -> Result<Vec<CommitInfo>, String> {
             Ok(vec![])
         }
-        async fn ahead_behind(
-            &self,
-            _: &Path,
-            _: &str,
-            _: &str,
-        ) -> Result<crate::providers::types::AheadBehind, String> {
-            Ok(crate::providers::types::AheadBehind {
-                ahead: 0,
-                behind: 0,
-            })
+        async fn ahead_behind(&self, _: &Path, _: &str, _: &str) -> Result<AheadBehind, String> {
+            Ok(AheadBehind { ahead: 0, behind: 0 })
         }
-        async fn working_tree_status(
-            &self,
-            _: &Path,
-            _: &Path,
-        ) -> Result<crate::providers::types::WorkingTreeStatus, String> {
-            Ok(crate::providers::types::WorkingTreeStatus {
-                staged: 0,
-                modified: 0,
-                untracked: 0,
-            })
+        async fn working_tree_status(&self, _: &Path, _: &Path) -> Result<WorkingTreeStatus, String> {
+            Ok(WorkingTreeStatus { staged: 0, modified: 0, untracked: 0 })
         }
     }
 
     struct StubCheckoutManager;
     #[async_trait]
     impl CheckoutManager for StubCheckoutManager {
-        async fn list_checkouts(
-            &self,
-            _: &Path,
-        ) -> Result<Vec<(PathBuf, crate::providers::types::Checkout)>, String> {
+        async fn list_checkouts(&self, _: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
             Ok(vec![])
         }
-        async fn create_checkout(
-            &self,
-            _: &Path,
-            _: &str,
-            _: bool,
-        ) -> Result<(PathBuf, crate::providers::types::Checkout), String> {
+        async fn create_checkout(&self, _: &Path, _: &str, _: bool) -> Result<(PathBuf, Checkout), String> {
             Err("stub".into())
         }
         async fn remove_checkout(&self, _: &Path, _: &str) -> Result<(), String> {
@@ -215,18 +167,10 @@ mod tests {
     struct StubCodeReview;
     #[async_trait]
     impl CodeReview for StubCodeReview {
-        async fn list_change_requests(
-            &self,
-            _: &Path,
-            _: usize,
-        ) -> Result<Vec<(String, crate::providers::types::ChangeRequest)>, String> {
+        async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
             Ok(vec![])
         }
-        async fn get_change_request(
-            &self,
-            _: &Path,
-            _: &str,
-        ) -> Result<(String, crate::providers::types::ChangeRequest), String> {
+        async fn get_change_request(&self, _: &Path, _: &str) -> Result<(String, ChangeRequest), String> {
             Err("stub".into())
         }
         async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
@@ -235,11 +179,7 @@ mod tests {
         async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
             Ok(())
         }
-        async fn list_merged_branch_names(
-            &self,
-            _: &Path,
-            _: usize,
-        ) -> Result<Vec<String>, String> {
+        async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
             Ok(vec![])
         }
     }
@@ -247,11 +187,7 @@ mod tests {
     struct StubIssueTracker;
     #[async_trait]
     impl IssueTracker for StubIssueTracker {
-        async fn list_issues(
-            &self,
-            _: &Path,
-            _: usize,
-        ) -> Result<Vec<(String, crate::providers::types::Issue)>, String> {
+        async fn list_issues(&self, _: &Path, _: usize) -> Result<Vec<(String, Issue)>, String> {
             Ok(vec![])
         }
         async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
@@ -262,10 +198,7 @@ mod tests {
     struct StubCloudAgent;
     #[async_trait]
     impl CloudAgentService for StubCloudAgent {
-        async fn list_sessions(
-            &self,
-            _: &RepoCriteria,
-        ) -> Result<Vec<(String, crate::providers::types::CloudAgentSession)>, String> {
+        async fn list_sessions(&self, _: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
             Ok(vec![])
         }
         async fn archive_session(&self, _: &str) -> Result<(), String> {
@@ -287,15 +220,10 @@ mod tests {
     struct StubWorkspaceManager;
     #[async_trait]
     impl WorkspaceManager for StubWorkspaceManager {
-        async fn list_workspaces(
-            &self,
-        ) -> Result<Vec<(String, crate::providers::types::Workspace)>, String> {
+        async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
             Ok(vec![])
         }
-        async fn create_workspace(
-            &self,
-            _: &crate::providers::types::WorkspaceConfig,
-        ) -> Result<(String, crate::providers::types::Workspace), String> {
+        async fn create_workspace(&self, _: &WorkspaceConfig) -> Result<(String, Workspace), String> {
             Err("stub".into())
         }
         async fn select_workspace(&self, _: &str) -> Result<(), String> {
@@ -306,38 +234,14 @@ mod tests {
     /// Build a ProviderRegistry with all provider slots populated.
     fn full_registry() -> ProviderRegistry {
         let mut reg = ProviderRegistry::new();
-        reg.vcs
-            .insert("vcs".into(), (named_desc("StubVcs"), Arc::new(StubVcs)));
-        reg.checkout_managers.insert(
-            "cm".into(),
-            (
-                labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"),
-                Arc::new(StubCheckoutManager),
-            ),
-        );
-        reg.code_review.insert(
-            "cr".into(),
-            (
-                labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"),
-                Arc::new(StubCodeReview),
-            ),
-        );
-        reg.issue_trackers.insert(
-            "it".into(),
-            (
-                labeled_desc("it", "StubIT", "#", "GitHub Issues", "issue"),
-                Arc::new(StubIssueTracker),
-            ),
-        );
-        reg.cloud_agents.insert(
-            "ca".into(),
-            (
-                labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"),
-                Arc::new(StubCloudAgent),
-            ),
-        );
-        reg.ai_utilities
-            .insert("ai".into(), (named_desc("StubAI"), Arc::new(StubAiUtility)));
+        reg.vcs.insert("vcs".into(), (named_desc("StubVcs"), Arc::new(StubVcs)));
+        reg.checkout_managers
+            .insert("cm".into(), (labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"), Arc::new(StubCheckoutManager)));
+        reg.code_review
+            .insert("cr".into(), (labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview)));
+        reg.issue_trackers.insert("it".into(), (labeled_desc("it", "StubIT", "#", "GitHub Issues", "issue"), Arc::new(StubIssueTracker)));
+        reg.cloud_agents.insert("ca".into(), (labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"), Arc::new(StubCloudAgent)));
+        reg.ai_utilities.insert("ai".into(), (named_desc("StubAI"), Arc::new(StubAiUtility)));
         reg.workspace_manager = Some((named_desc("StubWM"), Arc::new(StubWorkspaceManager)));
         reg
     }
@@ -385,20 +289,9 @@ mod tests {
     fn labels_with_partial_registry() {
         // Only checkout_managers and coding_agents registered.
         let mut reg = ProviderRegistry::new();
-        reg.checkout_managers.insert(
-            "cm".into(),
-            (
-                labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"),
-                Arc::new(StubCheckoutManager),
-            ),
-        );
-        reg.cloud_agents.insert(
-            "ca".into(),
-            (
-                labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"),
-                Arc::new(StubCloudAgent),
-            ),
-        );
+        reg.checkout_managers
+            .insert("cm".into(), (labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"), Arc::new(StubCheckoutManager)));
+        reg.cloud_agents.insert("ca".into(), (labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"), Arc::new(StubCloudAgent)));
 
         let labels = labels_from_registry(&reg);
 
@@ -428,50 +321,24 @@ mod tests {
         let names = provider_names_from_registry(&reg);
 
         assert_eq!(names.get("vcs").unwrap(), &vec!["StubVcs".to_string()]);
-        assert_eq!(
-            names.get("checkout_manager").unwrap(),
-            &vec!["StubCM".to_string()]
-        );
-        assert_eq!(
-            names.get("code_review").unwrap(),
-            &vec!["StubCR".to_string()]
-        );
-        assert_eq!(
-            names.get("issue_tracker").unwrap(),
-            &vec!["StubIT".to_string()]
-        );
-        assert_eq!(
-            names.get("cloud_agent").unwrap(),
-            &vec!["StubCA".to_string()]
-        );
-        assert_eq!(
-            names.get("ai_utility").unwrap(),
-            &vec!["StubAI".to_string()]
-        );
-        assert_eq!(
-            names.get("workspace_manager").unwrap(),
-            &vec!["StubWM".to_string()]
-        );
+        assert_eq!(names.get("checkout_manager").unwrap(), &vec!["StubCM".to_string()]);
+        assert_eq!(names.get("code_review").unwrap(), &vec!["StubCR".to_string()]);
+        assert_eq!(names.get("issue_tracker").unwrap(), &vec!["StubIT".to_string()]);
+        assert_eq!(names.get("cloud_agent").unwrap(), &vec!["StubCA".to_string()]);
+        assert_eq!(names.get("ai_utility").unwrap(), &vec!["StubAI".to_string()]);
+        assert_eq!(names.get("workspace_manager").unwrap(), &vec!["StubWM".to_string()]);
         assert_eq!(names.len(), 7);
     }
 
     #[test]
     fn provider_names_partial_registry() {
         let mut reg = ProviderRegistry::new();
-        reg.code_review.insert(
-            "cr".into(),
-            (
-                labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"),
-                Arc::new(StubCodeReview),
-            ),
-        );
+        reg.code_review
+            .insert("cr".into(), (labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview)));
 
         let names = provider_names_from_registry(&reg);
         assert_eq!(names.len(), 1);
-        assert_eq!(
-            names.get("code_review").unwrap(),
-            &vec!["StubCR".to_string()]
-        );
+        assert_eq!(names.get("code_review").unwrap(), &vec!["StubCR".to_string()]);
         assert!(!names.contains_key("vcs"));
     }
 
@@ -512,11 +379,7 @@ mod tests {
     #[tokio::test]
     async fn repo_model_new_initializes_state_and_uses_registry_data() {
         let reg = full_registry();
-        let model = RepoModel::new(
-            PathBuf::from("/tmp/test-repo"),
-            reg,
-            Some("owner/repo".to_string()),
-        );
+        let model = RepoModel::new(PathBuf::from("/tmp/test-repo"), reg, Some("owner/repo".to_string()));
 
         assert_eq!(model.labels.checkouts.section, "Checkouts");
         assert_eq!(model.labels.code_review.section, "Pull Requests");
@@ -579,29 +442,14 @@ mod tests {
 
         // Local providers are kept
         assert!(!reg.vcs.is_empty(), "VCS should be kept");
-        assert!(
-            !reg.checkout_managers.is_empty(),
-            "checkout managers should be kept"
-        );
-        assert!(
-            reg.workspace_manager.is_some(),
-            "workspace manager should be kept"
-        );
+        assert!(!reg.checkout_managers.is_empty(), "checkout managers should be kept");
+        assert!(reg.workspace_manager.is_some(), "workspace manager should be kept");
 
         // External providers are removed
         assert!(reg.code_review.is_empty(), "code review should be removed");
-        assert!(
-            reg.issue_trackers.is_empty(),
-            "issue trackers should be removed"
-        );
-        assert!(
-            reg.cloud_agents.is_empty(),
-            "cloud agents should be removed"
-        );
-        assert!(
-            reg.ai_utilities.is_empty(),
-            "AI utilities should be removed"
-        );
+        assert!(reg.issue_trackers.is_empty(), "issue trackers should be removed");
+        assert!(reg.cloud_agents.is_empty(), "cloud agents should be removed");
+        assert!(reg.ai_utilities.is_empty(), "AI utilities should be removed");
     }
 
     #[test]

@@ -1,0 +1,13 @@
+# Wider lines, fewer chain/arg explosions.
+# Requires nightly rustfmt: `cargo +nightly fmt`
+# CI uses nightly for fmt; stable silently ignores the unstable keys.
+
+max_width = 140
+# "Max" sets all sub-widths (chain, fn_call, attr, array, struct_lit,
+# single_line_if_else) equal to max_width.
+use_small_heuristics = "Max"
+
+# Unstable (nightly-only)
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+overflow_delimited_expr = true

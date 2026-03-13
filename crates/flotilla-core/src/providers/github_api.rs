@@ -1,10 +1,12 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-
-use crate::providers::{run_output, ChannelLabel, CommandRunner};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
+
+use crate::providers::{run_output, ChannelLabel, CommandRunner};
 
 const MAX_PER_PAGE: usize = 100;
 
@@ -55,29 +57,13 @@ pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
         }
     }
 
-    GhApiResponse {
-        status,
-        etag,
-        body,
-        has_next_page,
-        total_count: None,
-    }
+    GhApiResponse { status, etag, body, has_next_page, total_count: None }
 }
 
 #[async_trait]
 pub trait GhApi: Send + Sync {
-    async fn get(
-        &self,
-        endpoint: &str,
-        repo_root: &Path,
-        label: &ChannelLabel,
-    ) -> Result<String, String>;
-    async fn get_with_headers(
-        &self,
-        endpoint: &str,
-        repo_root: &Path,
-        label: &ChannelLabel,
-    ) -> Result<GhApiResponse, String>;
+    async fn get(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<String, String>;
+    async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String>;
 }
 
 /// Cache entry: ETag + the JSON response body from last 200.
@@ -95,10 +81,7 @@ pub struct GhApiClient {
 
 impl GhApiClient {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self {
-            cache: Mutex::new(HashMap::new()),
-            runner,
-        }
+        Self { cache: Mutex::new(HashMap::new()), runner }
     }
 }
 
@@ -106,34 +89,18 @@ impl GhApiClient {
 impl GhApi for GhApiClient {
     /// Fetch a GitHub API endpoint, using cached ETag for conditional requests.
     /// Returns the JSON body (from cache on 304, fresh on 200).
-    async fn get(
-        &self,
-        endpoint: &str,
-        repo_root: &Path,
-        label: &ChannelLabel,
-    ) -> Result<String, String> {
-        self.get_with_headers(endpoint, repo_root, label)
-            .await
-            .map(|r| r.body)
+    async fn get(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<String, String> {
+        self.get_with_headers(endpoint, repo_root, label).await.map(|r| r.body)
     }
 
-    async fn get_with_headers(
-        &self,
-        endpoint: &str,
-        repo_root: &Path,
-        _label: &ChannelLabel,
-    ) -> Result<GhApiResponse, String> {
+    async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
         // Build args
         let cached_etag = {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             cache.get(endpoint).map(|e| e.etag.clone())
         };
 
-        let mut args = vec![
-            "api".to_string(),
-            "--include".to_string(),
-            endpoint.to_string(),
-        ];
+        let mut args = vec!["api".to_string(), "--include".to_string(), endpoint.to_string()];
         if let Some(ref etag) = cached_etag {
             args.push("-H".to_string());
             args.push(format!("If-None-Match: {}", etag));
@@ -167,14 +134,11 @@ impl GhApi for GhApiClient {
 
         if let Some(ref etag) = parsed.etag {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.insert(
-                endpoint.to_string(),
-                CacheEntry {
-                    etag: etag.clone(),
-                    body: parsed.body.clone(),
-                    has_next_page: parsed.has_next_page,
-                },
-            );
+            cache.insert(endpoint.to_string(), CacheEntry {
+                etag: etag.clone(),
+                body: parsed.body.clone(),
+                has_next_page: parsed.has_next_page,
+            });
         }
 
         Ok(parsed)
@@ -209,12 +173,7 @@ mod tests {
         for header in ["Etag: \"x\"", "etag: \"x\"", "ETag: \"x\"", "ETAG: \"x\""] {
             let raw = format!("HTTP/2.0 200 OK\r\n{}\r\n\r\n{{}}", header);
             let result = parse_gh_api_response(&raw);
-            assert_eq!(
-                result.etag,
-                Some("\"x\"".to_string()),
-                "failed for: {}",
-                header
-            );
+            assert_eq!(result.etag, Some("\"x\"".to_string()), "failed for: {}", header);
         }
     }
 

@@ -1,6 +1,6 @@
+use std::{path::Path, sync::Arc};
+
 use async_trait::async_trait;
-use std::path::Path;
-use std::sync::Arc;
 use tracing::info;
 
 use crate::providers::{run, CommandRunner};
@@ -25,18 +25,9 @@ impl super::AiUtility for ClaudeAiUtility {
              Output ONLY the branch name, nothing else. Use kebab-case: {context}"
         );
 
-        match run!(
-            self.runner,
-            &self.claude_bin,
-            &["-p", &prompt],
-            Path::new(".")
-        ) {
+        match run!(self.runner, &self.claude_bin, &["-p", &prompt], Path::new(".")) {
             Ok(output) => {
-                let branch = output
-                    .trim()
-                    .trim_matches(|c| c == '`' || c == '"' || c == '\'')
-                    .trim()
-                    .to_string();
+                let branch = output.trim().trim_matches(|c| c == '`' || c == '"' || c == '\'').trim().to_string();
                 if branch.is_empty() {
                     Err("claude returned empty output".to_string())
                 } else {

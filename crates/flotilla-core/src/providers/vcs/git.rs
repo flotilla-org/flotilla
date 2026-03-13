@@ -1,10 +1,11 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 
-use crate::providers::types::*;
-use crate::providers::{run, CommandRunner};
+use crate::providers::{run, types::*, CommandRunner};
 
 pub struct GitVcs {
     runner: Arc<dyn CommandRunner>,
@@ -49,8 +50,7 @@ impl super::Vcs for GitVcs {
             .stderr(std::process::Stdio::null())
             .output()
             .ok()?;
-        let is_bare = bare_output.status.success()
-            && String::from_utf8_lossy(&bare_output.stdout).trim() == "true";
+        let is_bare = bare_output.status.success() && String::from_utf8_lossy(&bare_output.stdout).trim() == "true";
 
         if is_bare {
             Some(git_dir)
@@ -61,12 +61,7 @@ impl super::Vcs for GitVcs {
     }
 
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
-        let output = run!(
-            self.runner,
-            "git",
-            &["branch", "--list", "--format=%(refname:short)"],
-            repo_root
-        )?;
+        let output = run!(self.runner, "git", &["branch", "--list", "--format=%(refname:short)"], repo_root)?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -85,37 +80,17 @@ impl super::Vcs for GitVcs {
             return Ok(vec![]);
         }
         let remote = remotes.lines().next().unwrap_or("origin");
-        let output = run!(
-            self.runner,
-            "git",
-            &["ls-remote", "--heads", remote],
-            repo_root
-        )?;
+        let output = run!(self.runner, "git", &["ls-remote", "--heads", remote], repo_root)?;
         // Output format: "<sha>\trefs/heads/<branch>"
         Ok(output
             .lines()
-            .filter_map(|line| {
-                line.split('\t')
-                    .nth(1)
-                    .and_then(|r| r.strip_prefix("refs/heads/"))
-                    .map(|s| s.to_string())
-            })
+            .filter_map(|line| line.split('\t').nth(1).and_then(|r| r.strip_prefix("refs/heads/")).map(|s| s.to_string()))
             .collect())
     }
 
-    async fn commit_log(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-        limit: usize,
-    ) -> Result<Vec<CommitInfo>, String> {
+    async fn commit_log(&self, repo_root: &Path, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
         let limit_arg = format!("-{}", limit);
-        let output = run!(
-            self.runner,
-            "git",
-            &["log", branch, "--oneline", &limit_arg],
-            repo_root
-        )?;
+        let output = run!(self.runner, "git", &["log", branch, "--oneline", &limit_arg], repo_root)?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -128,19 +103,9 @@ impl super::Vcs for GitVcs {
             .collect())
     }
 
-    async fn ahead_behind(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-        reference: &str,
-    ) -> Result<AheadBehind, String> {
+    async fn ahead_behind(&self, repo_root: &Path, branch: &str, reference: &str) -> Result<AheadBehind, String> {
         let range = format!("{}...{}", branch, reference);
-        let output = run!(
-            self.runner,
-            "git",
-            &["rev-list", "--count", "--left-right", &range],
-            repo_root
-        )?;
+        let output = run!(self.runner, "git", &["rev-list", "--count", "--left-right", &range], repo_root)?;
         let trimmed = output.trim();
         let mut parts = trimmed.split('\t');
         let ahead: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -148,17 +113,8 @@ impl super::Vcs for GitVcs {
         Ok(AheadBehind { ahead, behind })
     }
 
-    async fn working_tree_status(
-        &self,
-        _repo_root: &Path,
-        checkout_path: &Path,
-    ) -> Result<WorkingTreeStatus, String> {
-        let output = run!(
-            self.runner,
-            "git",
-            &["status", "--porcelain"],
-            checkout_path
-        )?;
+    async fn working_tree_status(&self, _repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String> {
+        let output = run!(self.runner, "git", &["status", "--porcelain"], checkout_path)?;
         Ok(super::parse_porcelain_status(&output))
     }
 }
@@ -166,25 +122,14 @@ impl super::Vcs for GitVcs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::replay;
-    use crate::providers::vcs::Vcs;
+    use crate::providers::{replay, vcs::Vcs};
 
     // ── Setup helpers (only called in record mode) ──
 
     /// Run a git command in `repo`, panicking on failure.
     fn git(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = std::process::Command::new("git").args(args).current_dir(repo).stdin(std::process::Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     }
 
     /// Create a temp git repo with branches: main, feature/foo, fix-bar.
@@ -212,10 +157,7 @@ mod tests {
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@test.com"]);
         git(&repo, &["config", "user.name", "Test"]);
-        git(
-            &repo,
-            &["remote", "add", "origin", remote.to_str().unwrap()],
-        );
+        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
         git(&repo, &["commit", "--allow-empty", "-m", "init"]);
         git(&repo, &["push", "origin", "main"]);
         git(&repo, &["branch", "feature/foo"]);
@@ -264,11 +206,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        format!(
-            "{}/src/providers/vcs/fixtures/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            name
-        )
+        format!("{}/src/providers/vcs/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
     }
 
     // ── Record/replay tests ──
@@ -276,15 +214,8 @@ mod tests {
     #[tokio::test]
     async fn record_replay_list_local_branches() {
         let recording = replay::is_recording();
-        let temp = if recording {
-            Some(setup_branches())
-        } else {
-            None
-        };
-        let repo_path = temp
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let temp = if recording { Some(setup_branches()) } else { None };
+        let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
         masks.add(repo_path.to_str().unwrap(), "{repo}");
@@ -310,15 +241,8 @@ mod tests {
     #[tokio::test]
     async fn record_replay_list_remote_branches() {
         let recording = replay::is_recording();
-        let temp = if recording {
-            Some(setup_remote_branches())
-        } else {
-            None
-        };
-        let repo_path = temp
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let temp = if recording { Some(setup_remote_branches()) } else { None };
+        let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
         masks.add(repo_path.to_str().unwrap(), "{repo}");
@@ -338,15 +262,8 @@ mod tests {
     #[tokio::test]
     async fn record_replay_commit_log() {
         let recording = replay::is_recording();
-        let temp = if recording {
-            Some(setup_branches())
-        } else {
-            None
-        };
-        let repo_path = temp
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let temp = if recording { Some(setup_branches()) } else { None };
+        let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
         masks.add(repo_path.to_str().unwrap(), "{repo}");
@@ -368,15 +285,8 @@ mod tests {
     #[tokio::test]
     async fn record_replay_ahead_behind() {
         let recording = replay::is_recording();
-        let temp = if recording {
-            Some(setup_ahead_behind())
-        } else {
-            None
-        };
-        let repo_path = temp
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let temp = if recording { Some(setup_ahead_behind()) } else { None };
+        let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
         masks.add(repo_path.to_str().unwrap(), "{repo}");
@@ -384,10 +294,7 @@ mod tests {
         let runner = replay::test_runner(&session);
 
         let vcs = GitVcs::new(runner);
-        let ab = vcs
-            .ahead_behind(&repo_path, "feature", "main")
-            .await
-            .unwrap();
+        let ab = vcs.ahead_behind(&repo_path, "feature", "main").await.unwrap();
 
         // feature has 1 commit not in main, main has 2 not in feature
         assert_eq!(ab.ahead, 1);
@@ -399,15 +306,8 @@ mod tests {
     #[tokio::test]
     async fn record_replay_working_tree_status() {
         let recording = replay::is_recording();
-        let temp = if recording {
-            Some(setup_working_tree())
-        } else {
-            None
-        };
-        let repo_path = temp
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let temp = if recording { Some(setup_working_tree()) } else { None };
+        let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
         masks.add(repo_path.to_str().unwrap(), "{repo}");
@@ -415,10 +315,7 @@ mod tests {
         let runner = replay::test_runner(&session);
 
         let vcs = GitVcs::new(runner);
-        let status = vcs
-            .working_tree_status(&repo_path, &repo_path)
-            .await
-            .unwrap();
+        let status = vcs.working_tree_status(&repo_path, &repo_path).await.unwrap();
 
         assert_eq!(status.modified, 1);
         assert_eq!(status.staged, 1);
@@ -442,10 +339,7 @@ mod tests {
         } else {
             None
         };
-        let repo_path = temp
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
         masks.add(repo_path.to_str().unwrap(), "{repo}");

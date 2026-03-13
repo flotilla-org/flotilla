@@ -1,27 +1,24 @@
+use std::{collections::HashMap, path::Path};
+
+use flotilla_core::data::{GroupEntry, SectionHeader};
+use flotilla_protocol::{ProviderData, WorkItem};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Table,
-        Wrap,
-    },
+    widgets::{Block, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
     Frame,
 };
-
 use unicode_width::UnicodeWidthStr;
 
-use std::collections::HashMap;
-use std::path::Path;
-
-use crate::app::{
-    BranchInputKind, InFlightCommand, Intent, PeerHostStatus, PeerStatus, ProviderStatus,
-    RepoViewLayout, TabId, TuiModel, UiMode, UiState,
+use crate::{
+    app::{
+        BranchInputKind, InFlightCommand, Intent, PeerHostStatus, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiModel, UiMode,
+        UiState,
+    },
+    event_log::{self, LevelExt},
+    ui_helpers,
 };
-use crate::event_log::{self, LevelExt};
-use crate::ui_helpers;
-use flotilla_core::data::{GroupEntry, SectionHeader};
-use flotilla_protocol::{ProviderData, WorkItem};
 
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
@@ -64,10 +61,8 @@ fn resolve_auto_preview_position(area: Rect) -> ResolvedPreviewPosition {
     let below_preview_height = area.height.saturating_mul(PREVIEW_SPLIT_BELOW_PERCENT) / 100;
     let below_table_height = area.height.saturating_sub(below_preview_height);
 
-    let right_viable =
-        right_table_width >= MIN_TABLE_WIDTH && right_preview_width >= MIN_PREVIEW_WIDTH;
-    let below_viable =
-        below_table_height >= MIN_TABLE_HEIGHT && below_preview_height >= MIN_PREVIEW_HEIGHT;
+    let right_viable = right_table_width >= MIN_TABLE_WIDTH && right_preview_width >= MIN_PREVIEW_WIDTH;
+    let below_viable = below_table_height >= MIN_TABLE_HEIGHT && below_preview_height >= MIN_PREVIEW_HEIGHT;
 
     match (right_viable, below_viable) {
         (true, false) => ResolvedPreviewPosition::Right,
@@ -84,19 +79,10 @@ fn resolve_auto_preview_position(area: Rect) -> ResolvedPreviewPosition {
     }
 }
 
-pub fn render(
-    model: &TuiModel,
-    ui: &mut UiState,
-    in_flight: &HashMap<u64, InFlightCommand>,
-    frame: &mut Frame,
-) {
+pub fn render(model: &TuiModel, ui: &mut UiState, in_flight: &HashMap<u64, InFlightCommand>, frame: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
         .split(frame.area());
 
     render_tab_bar(model, ui, frame, chunks[0]);
@@ -121,10 +107,7 @@ fn render_tab_bar(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
 
     ui.layout.tab_areas.clear();
     let flotilla_width = TabId::FLOTILLA_LABEL_WIDTH;
-    ui.layout.tab_areas.insert(
-        TabId::Flotilla,
-        Rect::new(area.x, area.y, flotilla_width, 1),
-    );
+    ui.layout.tab_areas.insert(TabId::Flotilla, Rect::new(area.x, area.y, flotilla_width, 1));
     let mut x_offset: u16 = flotilla_width;
 
     for (i, path) in model.repo_order.iter().enumerate() {
@@ -150,10 +133,7 @@ fn render_tab_bar(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
         };
         spans.push(Span::styled(label, style));
 
-        ui.layout.tab_areas.insert(
-            TabId::Repo(i),
-            Rect::new(area.x + x_offset, area.y, label_len, 1),
-        );
+        ui.layout.tab_areas.insert(TabId::Repo(i), Rect::new(area.x + x_offset, area.y, label_len, 1));
         x_offset += label_len;
     }
 
@@ -163,9 +143,7 @@ fn render_tab_bar(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
     x_offset += 3;
     let add_label = Span::styled("[+]", Style::default().fg(Color::Green));
     spans.push(add_label);
-    ui.layout
-        .tab_areas
-        .insert(TabId::Add, Rect::new(area.x + x_offset, area.y, 3, 1));
+    ui.layout.tab_areas.insert(TabId::Add, Rect::new(area.x + x_offset, area.y, 3, 1));
 
     let line = Line::from(spans);
     let title = Paragraph::new(line);
@@ -187,24 +165,15 @@ fn provider_status_badge(status: Option<ProviderStatus>) -> (&'static str, Color
 fn provider_row(label: &str, provider: &str, status: Option<ProviderStatus>) -> Row<'static> {
     let (status_text, status_color) = provider_status_badge(status);
     Row::new(vec![
-        Cell::from(Span::styled(
-            label.to_string(),
-            Style::default().fg(Color::DarkGray),
-        )),
-        Cell::from(Span::styled(
-            provider.to_string(),
-            Style::default().fg(Color::White),
-        )),
+        Cell::from(Span::styled(label.to_string(), Style::default().fg(Color::DarkGray))),
+        Cell::from(Span::styled(provider.to_string(), Style::default().fg(Color::White))),
         Cell::from(Span::styled(status_text, Style::default().fg(status_color))),
     ])
 }
 
 fn provider_empty_row(category: &str) -> Row<'static> {
     Row::new(vec![
-        Cell::from(Span::styled(
-            category.to_string(),
-            Style::default().fg(Color::DarkGray),
-        )),
+        Cell::from(Span::styled(category.to_string(), Style::default().fg(Color::DarkGray))),
         Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
         Cell::from(""),
     ])
@@ -212,28 +181,15 @@ fn provider_empty_row(category: &str) -> Row<'static> {
 
 fn provider_table_header() -> Row<'static> {
     Row::new(vec![
-        Cell::from(Span::styled(
-            "Role",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-        Cell::from(Span::styled(
-            "Provider",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
-        Cell::from(Span::styled(
-            "Status",
-            Style::default().fg(Color::DarkGray).bold(),
-        )),
+        Cell::from(Span::styled("Role", Style::default().fg(Color::DarkGray).bold())),
+        Cell::from(Span::styled("Provider", Style::default().fg(Color::DarkGray).bold())),
+        Cell::from(Span::styled("Status", Style::default().fg(Color::DarkGray).bold())),
     ])
     .height(1)
 }
 
 fn provider_table_widths() -> [Constraint; 3] {
-    [
-        Constraint::Length(16),
-        Constraint::Length(24),
-        Constraint::Length(6),
-    ]
+    [Constraint::Length(16), Constraint::Length(24), Constraint::Length(6)]
 }
 
 fn selected_work_item<'a>(model: &TuiModel, ui: &'a UiState) -> Option<&'a WorkItem> {
@@ -245,13 +201,7 @@ fn selected_work_item<'a>(model: &TuiModel, ui: &'a UiState) -> Option<&'a WorkI
     }
 }
 
-fn render_status_bar(
-    model: &TuiModel,
-    ui: &UiState,
-    in_flight: &HashMap<u64, InFlightCommand>,
-    frame: &mut Frame,
-    area: Rect,
-) {
+fn render_status_bar(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, InFlightCommand>, frame: &mut Frame, area: Rect) {
     if let Some(err) = &model.status_message {
         let msg = format!(" Error: {}", err);
         let status = Paragraph::new(msg).style(Style::default().fg(Color::Red));
@@ -260,11 +210,7 @@ fn render_status_bar(
     }
 
     // Show disconnected/reconnecting peers as a warning
-    let problem_peers: Vec<&PeerHostStatus> = model
-        .peer_hosts
-        .iter()
-        .filter(|p| !matches!(p.status, PeerStatus::Connected))
-        .collect();
+    let problem_peers: Vec<&PeerHostStatus> = model.peer_hosts.iter().filter(|p| !matches!(p.status, PeerStatus::Connected)).collect();
     if !problem_peers.is_empty() {
         let names: Vec<String> = problem_peers
             .iter()
@@ -286,11 +232,7 @@ fn render_status_bar(
 
     // Show in-flight command progress for the active repo
     let active_repo = &model.repo_order[model.active_repo];
-    let active_cmds: Vec<&str> = in_flight
-        .values()
-        .filter(|cmd| &cmd.repo == active_repo)
-        .map(|cmd| cmd.description.as_str())
-        .collect();
+    let active_cmds: Vec<&str> = in_flight.values().filter(|cmd| &cmd.repo == active_repo).map(|cmd| cmd.description.as_str()).collect();
 
     if !active_cmds.is_empty() {
         let msg = if active_cmds.len() == 1 {
@@ -308,34 +250,22 @@ fn render_status_bar(
 
     let text: String = match &ui.mode {
         UiMode::Config => " j/k:scroll log  [/]:switch tab  ?:help  q:quit".into(),
-        UiMode::BranchInput {
-            kind: BranchInputKind::Generating,
-            ..
-        } => " Generating branch name...".into(),
-        UiMode::BranchInput {
-            kind: BranchInputKind::Manual,
-            ..
-        } => " type branch name  enter:create  esc:cancel".into(),
+        UiMode::BranchInput { kind: BranchInputKind::Generating, .. } => " Generating branch name...".into(),
+        UiMode::BranchInput { kind: BranchInputKind::Manual, .. } => " type branch name  enter:create  esc:cancel".into(),
         UiMode::ActionMenu { .. } => " j/k:navigate  enter:select  esc:close".into(),
         UiMode::IssueSearch { ref input } => {
             format!(" / search: {}▏  enter:search  esc:cancel", input.value())
         }
         UiMode::FilePicker { .. } => " j/k:navigate  tab:complete  enter:select  esc:cancel".into(),
-        UiMode::DeleteConfirm { .. } | UiMode::CloseConfirm { .. } => {
-            " y/enter:confirm  n/esc:cancel".into()
-        }
+        UiMode::DeleteConfirm { .. } | UiMode::CloseConfirm { .. } => " y/enter:confirm  n/esc:cancel".into(),
         UiMode::Help => " ?:close help  esc:close help".into(),
         UiMode::Normal => {
             if rui.show_providers {
                 format!(" c:close providers  {layout_status}  [/]:switch tab  ?:help  q:quit")
             } else if let Some(q) = rui.active_search_query.as_deref() {
-                format!(
-                    " search: \"{q}\"  {layout_status}  /:new search  esc:clear  ?:help  q:quit"
-                )
+                format!(" search: \"{q}\"  {layout_status}  /:new search  esc:clear  ?:help  q:quit")
             } else if !rui.multi_selected.is_empty() {
-                format!(
-                    " enter:create branch  space:toggle  {layout_status}  esc:clear  ?:help  q:quit"
-                )
+                format!(" enter:create branch  space:toggle  {layout_status}  esc:clear  ?:help  q:quit")
             } else {
                 let mut s = " enter:open".to_string();
                 if let Some(item) = selected_work_item(model, ui) {
@@ -375,17 +305,11 @@ fn render_content(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
     let chunks = match position {
         ResolvedPreviewPosition::Right => Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(100 - PREVIEW_SPLIT_RIGHT_PERCENT),
-                Constraint::Percentage(PREVIEW_SPLIT_RIGHT_PERCENT),
-            ])
+            .constraints([Constraint::Percentage(100 - PREVIEW_SPLIT_RIGHT_PERCENT), Constraint::Percentage(PREVIEW_SPLIT_RIGHT_PERCENT)])
             .split(area),
         ResolvedPreviewPosition::Below => Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(100 - PREVIEW_SPLIT_BELOW_PERCENT),
-                Constraint::Percentage(PREVIEW_SPLIT_BELOW_PERCENT),
-            ])
+            .constraints([Constraint::Percentage(100 - PREVIEW_SPLIT_BELOW_PERCENT), Constraint::Percentage(PREVIEW_SPLIT_BELOW_PERCENT)])
             .split(area),
     };
 
@@ -403,10 +327,7 @@ fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, are
         if let Some(pnames) = rm.provider_names.get(key) {
             for (i, pname) in pnames.iter().enumerate() {
                 let label = if i == 0 { category } else { "" };
-                let status = model
-                    .provider_statuses
-                    .get(&(path.clone(), key.to_string(), pname.clone()))
-                    .copied();
+                let status = model.provider_statuses.get(&(path.clone(), key.to_string(), pname.clone())).copied();
                 rows.push(provider_row(label, pname, status));
             }
         } else {
@@ -426,17 +347,13 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
     let rui = active_rui(model, ui);
     if rui.show_providers {
         let close_x = area.x + area.width.saturating_sub(5);
-        ui.layout
-            .tab_areas
-            .insert(TabId::Gear, Rect::new(close_x, area.y, 3, 1));
+        ui.layout.tab_areas.insert(TabId::Gear, Rect::new(close_x, area.y, 3, 1));
         render_repo_providers(model, ui, frame, area);
         return;
     }
 
     let gear_x = area.x + area.width.saturating_sub(5);
-    ui.layout
-        .tab_areas
-        .insert(TabId::Gear, Rect::new(gear_x, area.y, 3, 1));
+    ui.layout.tab_areas.insert(TabId::Gear, Rect::new(gear_x, area.y, 3, 1));
 
     let labels = model.active_labels();
     let header = Row::new(vec![
@@ -482,11 +399,8 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
         .table_entries
         .iter()
         .map(|entry| {
-            let is_multi_selected = if let GroupEntry::Item(ref item) = entry {
-                rui.multi_selected.contains(&item.identity)
-            } else {
-                false
-            };
+            let is_multi_selected =
+                if let GroupEntry::Item(ref item) = entry { rui.multi_selected.contains(&item.identity) } else { false };
 
             match entry {
                 GroupEntry::Header(header) => {
@@ -494,13 +408,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
                     build_header_row(header)
                 }
                 GroupEntry::Item(item) => {
-                    let mut row = build_item_row(
-                        item,
-                        &rm.providers,
-                        &col_widths,
-                        model.active_repo_root(),
-                        prev_source.as_deref(),
-                    );
+                    let mut row = build_item_row(item, &rm.providers, &col_widths, model.active_repo_root(), prev_source.as_deref());
                     prev_source = item.source.clone();
                     if is_multi_selected {
                         row = row.style(Style::default().bg(Color::Indexed(236)));
@@ -520,10 +428,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 
     // Now mutably borrow for stateful render
     let key = &model.repo_order[model.active_repo];
-    let rui = ui
-        .repo_ui
-        .get_mut(key)
-        .expect("active repo must have UI state");
+    let rui = ui.repo_ui.get_mut(key).expect("active repo must have UI state");
     frame.render_stateful_widget(table, area, &mut rui.table_state);
 
     // Overlay section headers so they span the full row width, independent of
@@ -538,22 +443,14 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
     for i in 0..visible_rows {
         if let Some(GroupEntry::Header(h)) = rui.table_view.table_entries.get(offset + i) {
             let y = area.y + 2 + i as u16;
-            frame.render_widget(
-                Span::styled(format!("── {h} ──"), header_style),
-                Rect::new(header_x, y, header_w, 1),
-            );
+            frame.render_widget(Span::styled(format!("── {h} ──"), header_style), Rect::new(header_x, y, header_w, 1));
         }
     }
 
     // Ratatui scrolls just enough to show the selected row, but section headers
     // sit one row above the first item in each section.  If the offset lands
     // right after a header, back it up so the header stays visible.
-    if offset > 0
-        && matches!(
-            rui.table_view.table_entries.get(offset - 1),
-            Some(GroupEntry::Header(_))
-        )
-    {
+    if offset > 0 && matches!(rui.table_view.table_entries.get(offset - 1), Some(GroupEntry::Header(_))) {
         *rui.table_state.offset_mut() = offset - 1;
     }
 }
@@ -584,13 +481,8 @@ fn build_item_row<'a>(
     repo_root: &Path,
     prev_source: Option<&str>,
 ) -> Row<'a> {
-    let session_status = item
-        .session_key
-        .as_deref()
-        .and_then(|k| providers.sessions.get(k))
-        .map(|s| &s.status);
-    let (icon, icon_color) =
-        ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
+    let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
+    let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
 
     let source_display = match item.source.as_deref() {
         Some(s) if prev_source == Some(s) => String::new(),
@@ -613,8 +505,7 @@ fn build_item_row<'a>(
 
     let description = ui_helpers::truncate(&item.description, desc_width);
 
-    let wt_indicator =
-        ui_helpers::checkout_indicator(item.is_main_checkout, item.checkout_key().is_some());
+    let wt_indicator = ui_helpers::checkout_indicator(item.is_main_checkout, item.checkout_key().is_some());
 
     let ws_indicator = ui_helpers::workspace_indicator(item.workspace_refs.len());
 
@@ -642,12 +533,7 @@ fn build_item_row<'a>(
         String::new()
     };
 
-    let issues_display = item
-        .issue_keys
-        .iter()
-        .map(|k| format!("#{}", k))
-        .collect::<Vec<_>>()
-        .join(",");
+    let issues_display = item.issue_keys.iter().map(|k| format!("#{}", k)).collect::<Vec<_>>().join(",");
 
     let git_display = if let Some(wt_key) = item.checkout_key() {
         if let Some(co) = providers.checkouts.get(wt_key) {
@@ -660,40 +546,16 @@ fn build_item_row<'a>(
     };
 
     Row::new(vec![
-        Cell::from(Span::styled(
-            format!(" {icon}"),
-            Style::default().fg(icon_color),
-        )),
-        Cell::from(Span::styled(
-            source_display,
-            Style::default().fg(Color::Indexed(67)),
-        )),
-        Cell::from(Span::styled(
-            path_display,
-            Style::default().fg(Color::Indexed(245)),
-        )),
+        Cell::from(Span::styled(format!(" {icon}"), Style::default().fg(icon_color))),
+        Cell::from(Span::styled(source_display, Style::default().fg(Color::Indexed(67)))),
+        Cell::from(Span::styled(path_display, Style::default().fg(Color::Indexed(245)))),
         Cell::from(description),
-        Cell::from(Span::styled(
-            branch_display,
-            Style::default().fg(Color::Cyan),
-        )),
-        Cell::from(Span::styled(
-            wt_indicator.to_string(),
-            Style::default().fg(Color::Green),
-        )),
-        Cell::from(Span::styled(
-            ws_indicator,
-            Style::default().fg(Color::Green),
-        )),
+        Cell::from(Span::styled(branch_display, Style::default().fg(Color::Cyan))),
+        Cell::from(Span::styled(wt_indicator.to_string(), Style::default().fg(Color::Green))),
+        Cell::from(Span::styled(ws_indicator, Style::default().fg(Color::Green))),
         Cell::from(Span::styled(pr_display, Style::default().fg(Color::Blue))),
-        Cell::from(Span::styled(
-            session_display,
-            Style::default().fg(Color::Magenta),
-        )),
-        Cell::from(Span::styled(
-            issues_display,
-            Style::default().fg(Color::Yellow),
-        )),
+        Cell::from(Span::styled(session_display, Style::default().fg(Color::Magenta))),
+        Cell::from(Span::styled(issues_display, Style::default().fg(Color::Yellow))),
         Cell::from(Span::styled(git_display, Style::default().fg(Color::Red))),
     ])
 }
@@ -727,11 +589,7 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
             if let Some(co) = providers.checkouts.get(wt_key) {
                 lines.push(format!("Path: {}", wt_key.path.display()));
                 if let Some(commit) = &co.last_commit {
-                    let sha = if commit.short_sha.is_empty() {
-                        "?"
-                    } else {
-                        &commit.short_sha
-                    };
+                    let sha = if commit.short_sha.is_empty() { "?" } else { &commit.short_sha };
                     lines.push(format!("Commit: {} {}", sha, commit.message));
                 }
                 if let Some(main) = &co.trunk_ahead_behind {
@@ -749,34 +607,19 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
 
         if let Some(ref pr_key) = item.change_request_key {
             if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
-                let provider_prefix = if cr.provider_display_name.is_empty() {
-                    String::new()
-                } else {
-                    format!("{} ", cr.provider_display_name)
-                };
-                lines.push(format!(
-                    "{}{} #{}: {}",
-                    provider_prefix,
-                    model.active_labels().code_review.abbr,
-                    pr_key,
-                    cr.title
-                ));
+                let provider_prefix =
+                    if cr.provider_display_name.is_empty() { String::new() } else { format!("{} ", cr.provider_display_name) };
+                lines.push(format!("{}{} #{}: {}", provider_prefix, model.active_labels().code_review.abbr, pr_key, cr.title));
                 lines.push(format!("State: {:?}", cr.status));
             }
         }
 
         if let Some(ref ses_key) = item.session_key {
             if let Some(ses) = providers.sessions.get(ses_key.as_str()) {
-                let noun = if ses.item_noun.is_empty() {
-                    model.active_labels().cloud_agents.noun_capitalized()
-                } else {
-                    ses.item_noun.clone()
-                };
-                let provider_prefix = if ses.provider_display_name.is_empty() {
-                    noun
-                } else {
-                    format!("{} {}", ses.provider_display_name, noun)
-                };
+                let noun =
+                    if ses.item_noun.is_empty() { model.active_labels().cloud_agents.noun_capitalized() } else { ses.item_noun.clone() };
+                let provider_prefix =
+                    if ses.provider_display_name.is_empty() { noun } else { format!("{} {}", ses.provider_display_name, noun) };
                 lines.push(format!("{}: {}", provider_prefix, ses.title));
                 lines.push(format!("Id: {}", ses_key));
                 lines.push(format!("Status: {:?}", ses.status));
@@ -792,11 +635,7 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
 
         for ws_ref in &item.workspace_refs {
             if let Some(ws) = providers.workspaces.get(ws_ref.as_str()) {
-                let name = if ws.name.is_empty() {
-                    ws_ref.as_str()
-                } else {
-                    &ws.name
-                };
+                let name = if ws.name.is_empty() { ws_ref.as_str() } else { &ws.name };
                 lines.push(format!("Workspace: {}", name));
             }
         }
@@ -804,15 +643,9 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
         for issue_key in &item.issue_keys {
             if let Some(issue) = providers.issues.get(issue_key.as_str()) {
                 let labels = issue.labels.join(", ");
-                let provider_prefix = if issue.provider_display_name.is_empty() {
-                    String::new()
-                } else {
-                    format!("{} ", issue.provider_display_name)
-                };
-                lines.push(format!(
-                    "{}Issue #{}: {} [{}]",
-                    provider_prefix, issue_key, issue.title, labels
-                ));
+                let provider_prefix =
+                    if issue.provider_display_name.is_empty() { String::new() } else { format!("{} ", issue.provider_display_name) };
+                lines.push(format!("{}Issue #{}: {} [{}]", provider_prefix, issue_key, issue.title, labels));
             }
         }
 
@@ -821,9 +654,7 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, frame: &mut Frame, are
         String::new()
     };
 
-    let preview = Paragraph::new(text)
-        .block(Block::bordered().title(" Preview "))
-        .wrap(Wrap { trim: true });
+    let preview = Paragraph::new(text).block(Block::bordered().title(" Preview ")).wrap(Wrap { trim: true });
     frame.render_widget(preview, area);
 }
 
@@ -838,9 +669,7 @@ fn render_debug_panel(model: &TuiModel, ui: &UiState, frame: &mut Frame, area: R
         String::new()
     };
 
-    let panel = Paragraph::new(text)
-        .block(Block::bordered().title(" Debug (D to toggle) "))
-        .wrap(Wrap { trim: true });
+    let panel = Paragraph::new(text).block(Block::bordered().title(" Debug (D to toggle) ")).wrap(Wrap { trim: true });
     frame.render_widget(panel, area);
 }
 
@@ -854,11 +683,8 @@ fn render_action_menu(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
     frame.render_widget(Clear, area);
 
     let labels = model.active_labels();
-    let list_items: Vec<ListItem> = items
-        .iter()
-        .enumerate()
-        .map(|(i, intent)| ListItem::new(format!(" {}: {}", i + 1, intent.label(labels))))
-        .collect();
+    let list_items: Vec<ListItem> =
+        items.iter().enumerate().map(|(i, intent)| ListItem::new(format!(" {}: {}", i + 1, intent.label(labels)))).collect();
 
     let list = List::new(list_items)
         .block(Block::bordered().title(" Actions "))
@@ -871,12 +697,7 @@ fn render_action_menu(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
 }
 
 fn render_input_popup(ui: &UiState, frame: &mut Frame) {
-    let UiMode::BranchInput {
-        ref input,
-        ref kind,
-        ..
-    } = ui.mode
-    else {
+    let UiMode::BranchInput { ref input, ref kind, .. } = ui.mode else {
         return;
     };
 
@@ -888,8 +709,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     frame.render_widget(inner, area);
 
     if *kind == BranchInputKind::Generating {
-        let paragraph =
-            Paragraph::new("  Generating branch name...").style(Style::default().fg(Color::Yellow));
+        let paragraph = Paragraph::new("  Generating branch name...").style(Style::default().fg(Color::Yellow));
         frame.render_widget(paragraph, inner_area);
         return;
     }
@@ -905,10 +725,7 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
 }
 
 fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
-    let UiMode::DeleteConfirm {
-        ref info, loading, ..
-    } = ui.mode
-    else {
+    let UiMode::DeleteConfirm { ref info, loading, .. } = ui.mode else {
         return;
     };
 
@@ -922,15 +739,9 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
     const MAX_COMMITS: usize = 5;
 
     if loading {
-        lines.push(Line::from(Span::styled(
-            "Loading safety info...",
-            Style::default().fg(Color::Yellow),
-        )));
+        lines.push(Line::from(Span::styled("Loading safety info...", Style::default().fg(Color::Yellow))));
     } else if let Some(info) = info {
-        lines.push(Line::from(vec![
-            Span::raw("Branch: "),
-            Span::styled(&info.branch, Style::default().bold()),
-        ]));
+        lines.push(Line::from(vec![Span::raw("Branch: "), Span::styled(&info.branch, Style::default().bold())]));
         lines.push(Line::from(""));
 
         if let Some(pr_status) = &info.change_request_status {
@@ -958,20 +769,14 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
 
         if info.has_uncommitted {
             if info.uncommitted_files.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "⚠ Has uncommitted changes",
-                    Style::default().fg(Color::Red).bold(),
-                )));
+                lines.push(Line::from(Span::styled("⚠ Has uncommitted changes", Style::default().fg(Color::Red).bold())));
             } else {
                 lines.push(Line::from(Span::styled(
                     format!("⚠ {} uncommitted file(s):", info.uncommitted_files.len()),
                     Style::default().fg(Color::Red).bold(),
                 )));
                 for file_line in info.uncommitted_files.iter().take(MAX_FILES) {
-                    lines.push(Line::from(Span::styled(
-                        file_line.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    lines.push(Line::from(Span::styled(file_line.to_string(), Style::default().fg(Color::DarkGray))));
                 }
                 if info.uncommitted_files.len() > MAX_FILES {
                     lines.push(Line::from(Span::styled(
@@ -983,10 +788,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
         }
 
         if let Some(warning) = &info.base_detection_warning {
-            lines.push(Line::from(Span::styled(
-                format!("⚠ {}", warning),
-                Style::default().fg(Color::Yellow),
-            )));
+            lines.push(Line::from(Span::styled(format!("⚠ {}", warning), Style::default().fg(Color::Yellow))));
         } else if !info.unpushed_commits.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("⚠ {} unpushed commit(s):", info.unpushed_commits.len()),
@@ -1003,26 +805,15 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
             && info.change_request_status.as_deref() == Some("MERGED")
         {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "✓ Safe to delete",
-                Style::default().fg(Color::Green).bold(),
-            )));
+            lines.push(Line::from(Span::styled("✓ Safe to delete", Style::default().fg(Color::Green).bold())));
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "y/Enter: confirm    n/Esc: cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled("y/Enter: confirm    n/Esc: cancel", Style::default().fg(Color::DarkGray))));
     }
 
-    let title = format!(
-        " Remove {} ",
-        model.active_labels().checkouts.noun_capitalized()
-    );
-    let paragraph = Paragraph::new(lines)
-        .block(Block::bordered().title(title))
-        .wrap(Wrap { trim: true });
+    let title = format!(" Remove {} ", model.active_labels().checkouts.noun_capitalized());
+    let paragraph = Paragraph::new(lines).block(Block::bordered().title(title)).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
@@ -1036,25 +827,14 @@ fn render_close_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
 
     let noun = &model.active_labels().code_review.noun;
     let lines = vec![
-        Line::from(vec![
-            Span::raw(format!("{} #", noun)),
-            Span::styled(id, Style::default().bold()),
-        ]),
-        Line::from(Span::styled(
-            title.as_str(),
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(vec![Span::raw(format!("{} #", noun)), Span::styled(id, Style::default().bold())]),
+        Line::from(Span::styled(title.as_str(), Style::default().fg(Color::DarkGray))),
         Line::from(""),
-        Line::from(Span::styled(
-            "y/Enter: confirm    n/Esc: cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("y/Enter: confirm    n/Esc: cancel", Style::default().fg(Color::DarkGray))),
     ];
 
     let block_title = format!(" Close {} ", noun);
-    let paragraph = Paragraph::new(lines)
-        .block(Block::bordered().title(block_title))
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(Block::bordered().title(block_title)).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
@@ -1090,25 +870,13 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
         Line::from("  Double-click     Same as Enter"),
         Line::from("  .                Action menu (all available actions)"),
         Line::from("  Right-click      Action menu"),
-        Line::from(format!(
-            "  n                New branch (enter name, creates {})",
-            labels.checkouts.noun
-        )),
-        Line::from(format!(
-            "  d                Remove {} (with safety check)",
-            labels.checkouts.noun
-        )),
-        Line::from(format!(
-            "  p                Show {} in browser",
-            labels.code_review.abbr
-        )),
+        Line::from(format!("  n                New branch (enter name, creates {})", labels.checkouts.noun)),
+        Line::from(format!("  d                Remove {} (with safety check)", labels.checkouts.noun)),
+        Line::from(format!("  p                Show {} in browser", labels.code_review.abbr)),
         Line::from("  l                Cycle layout (auto/zoom/right/below)"),
         Line::from("  r                Refresh data"),
         Line::from(""),
-        Line::from(Span::styled(
-            "Multi-select (issues)",
-            Style::default().bold(),
-        )),
+        Line::from(Span::styled("Multi-select (issues)", Style::default().bold())),
         Line::from("  Space            Toggle selection on current item"),
         Line::from("  Enter            Generate branch name for all selected"),
         Line::from("  Esc              Clear selection"),
@@ -1140,10 +908,7 @@ fn render_help(model: &TuiModel, ui: &mut UiState, frame: &mut Frame) {
         (false, false) => " Help ",
     };
 
-    let paragraph = Paragraph::new(help_text)
-        .block(Block::bordered().title(title))
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(help_text).block(Block::bordered().title(title)).scroll((scroll, 0)).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
@@ -1157,12 +922,7 @@ fn layout_status_text(ui: &UiState) -> &'static str {
 }
 
 fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
-    let UiMode::FilePicker {
-        ref input,
-        ref dir_entries,
-        selected,
-    } = ui.mode
-    else {
+    let UiMode::FilePicker { ref input, ref dir_entries, selected } = ui.mode else {
         return;
     };
 
@@ -1174,10 +934,7 @@ fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
+    let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0)]).split(inner);
 
     ui.layout.file_picker_list_area = chunks[1];
 
@@ -1212,9 +969,7 @@ fn render_file_picker(ui: &mut UiState, frame: &mut Frame) {
         })
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).bold())
-        .highlight_symbol("▸ ");
+    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray).bold()).highlight_symbol("▸ ");
 
     let mut state = ListState::default();
     if !dir_entries.is_empty() {
@@ -1247,9 +1002,7 @@ fn render_config_screen(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
 /// Return the worse of two provider statuses (Error > Ok > None).
 fn worse_status(a: Option<ProviderStatus>, b: Option<ProviderStatus>) -> Option<ProviderStatus> {
     match (a, b) {
-        (Some(ProviderStatus::Error), _) | (_, Some(ProviderStatus::Error)) => {
-            Some(ProviderStatus::Error)
-        }
+        (Some(ProviderStatus::Error), _) | (_, Some(ProviderStatus::Error)) => Some(ProviderStatus::Error),
         (Some(ProviderStatus::Ok), _) | (_, Some(ProviderStatus::Ok)) => Some(ProviderStatus::Ok),
         _ => None,
     }
@@ -1272,18 +1025,12 @@ fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
             if let Some(pnames) = rm.provider_names.get(key) {
                 let entries = by_category.entry(key).or_default();
                 for pname in pnames {
-                    let status = model
-                        .provider_statuses
-                        .get(&(path.clone(), key.to_string(), pname.clone()))
-                        .copied();
+                    let status = model.provider_statuses.get(&(path.clone(), key.to_string(), pname.clone())).copied();
                     if let Some(existing) = entries.iter_mut().find(|e| e.name == *pname) {
                         // Worst-wins: Error beats Ok beats None.
                         existing.status = worse_status(existing.status, status);
                     } else {
-                        entries.push(ProviderEntry {
-                            name: pname.clone(),
-                            status,
-                        });
+                        entries.push(ProviderEntry { name: pname.clone(), status });
                     }
                 }
             }
@@ -1304,9 +1051,7 @@ fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
         }
     }
 
-    let table = Table::new(rows, provider_table_widths())
-        .header(provider_table_header())
-        .block(Block::bordered().title(" Providers "));
+    let table = Table::new(rows, provider_table_widths()).header(provider_table_header()).block(Block::bordered().title(" Providers "));
     frame.render_widget(table, area);
 }
 
@@ -1320,10 +1065,7 @@ fn render_hosts_status(frame: &mut Frame, area: Rect, hosts: &[PeerHostStatus]) 
                 PeerStatus::Connecting => ("\u{25d0}", Style::default().fg(Color::Yellow)),
                 PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(Color::Yellow)),
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{icon} "), style),
-                Span::raw(h.name.as_str()),
-            ]))
+            ListItem::new(Line::from(vec![Span::styled(format!("{icon} "), style), Span::raw(h.name.as_str())]))
         })
         .collect();
 
@@ -1361,14 +1103,8 @@ fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {
                 };
 
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{} ", timestamp),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        format!("{:<5} ", entry.level),
-                        Style::default().fg(level_color),
-                    ),
+                    Span::styled(format!("{} ", timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{:<5} ", entry.level), Style::default().fg(level_color)),
                     Span::raw(&entry.message),
                 ]))
             }
@@ -1386,13 +1122,9 @@ fn render_event_log(ui: &mut UiState, frame: &mut Frame, area: Rect) {
 
     let list = List::new(items)
         .block(
-            Block::bordered().title(" Event Log ").title_top(
-                Line::from(Span::styled(
-                    filter_label,
-                    Style::default().fg(Color::DarkGray),
-                ))
-                .right_aligned(),
-            ),
+            Block::bordered()
+                .title(" Event Log ")
+                .title_top(Line::from(Span::styled(filter_label, Style::default().fg(Color::DarkGray))).right_aligned()),
         )
         .highlight_style(Style::default().bg(Color::Indexed(236)));
 

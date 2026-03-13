@@ -3,34 +3,24 @@
 //! This module is the serialization boundary between the rich in-process
 //! core types and the flat, serde-friendly protocol types.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use flotilla_protocol::{CheckoutRef, HostName, ProviderError, Snapshot, WorkItem};
 
-use crate::data::{CorrelationResult, RefreshError};
-use crate::providers::correlation::{CorrelatedGroup, ItemKind as CorItemKind};
-use crate::refresh::RefreshSnapshot;
+use crate::{
+    data::{CorrelationResult, RefreshError},
+    providers::correlation::{CorrelatedGroup, ItemKind as CorItemKind},
+    refresh::RefreshSnapshot,
+};
 
-pub fn correlation_result_to_work_item(
-    item: &CorrelationResult,
-    groups: &[CorrelatedGroup],
-    host_name: &HostName,
-) -> WorkItem {
+pub fn correlation_result_to_work_item(item: &CorrelationResult, groups: &[CorrelatedGroup], host_name: &HostName) -> WorkItem {
     let kind = item.kind();
     let identity = item.identity();
     let host = item.host(host_name);
 
-    let checkout = item.checkout().map(|co| CheckoutRef {
-        key: co.key.clone(),
-        is_main_checkout: co.is_main_checkout,
-    });
+    let checkout = item.checkout().map(|co| CheckoutRef { key: co.key.clone(), is_main_checkout: co.is_main_checkout });
 
-    let debug_group = item
-        .correlation_group_idx()
-        .and_then(|idx| groups.get(idx))
-        .map(format_debug_group)
-        .unwrap_or_default();
+    let debug_group = item.correlation_group_idx().and_then(|idx| groups.get(idx)).map(format_debug_group).unwrap_or_default();
 
     WorkItem {
         kind,
@@ -61,10 +51,7 @@ fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
             CorItemKind::Workspace => "Workspace",
             CorItemKind::ManagedTerminal => "Terminal",
         };
-        lines.push(format!(
-            "  {}: {} [{:?}]",
-            kind_label, ci.title, ci.source_key
-        ));
+        lines.push(format!("  {}: {} [{:?}]", kind_label, ci.title, ci.source_key));
         for key in &ci.correlation_keys {
             lines.push(format!("    {key:?}"));
         }
@@ -73,32 +60,18 @@ fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
 }
 
 pub fn error_to_proto(error: &RefreshError) -> ProviderError {
-    ProviderError {
-        category: error.category.to_string(),
-        provider: error.provider.clone(),
-        message: error.message.clone(),
-    }
+    ProviderError { category: error.category.to_string(), provider: error.provider.clone(), message: error.message.clone() }
 }
 
-pub fn health_to_proto(
-    health: &HashMap<(&'static str, String), bool>,
-) -> HashMap<String, HashMap<String, bool>> {
+pub fn health_to_proto(health: &HashMap<(&'static str, String), bool>) -> HashMap<String, HashMap<String, bool>> {
     let mut nested: HashMap<String, HashMap<String, bool>> = HashMap::new();
     for ((category, provider), &healthy) in health {
-        nested
-            .entry(category.to_string())
-            .or_default()
-            .insert(provider.clone(), healthy);
+        nested.entry(category.to_string()).or_default().insert(provider.clone(), healthy);
     }
     nested
 }
 
-pub fn snapshot_to_proto(
-    repo: &Path,
-    seq: u64,
-    refresh: &RefreshSnapshot,
-    host_name: &HostName,
-) -> Snapshot {
+pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot, host_name: &HostName) -> Snapshot {
     Snapshot {
         seq,
         repo: repo.to_path_buf(),
@@ -106,9 +79,7 @@ pub fn snapshot_to_proto(
         work_items: refresh
             .work_items
             .iter()
-            .map(|item| {
-                correlation_result_to_work_item(item, &refresh.correlation_groups, host_name)
-            })
+            .map(|item| correlation_result_to_work_item(item, &refresh.correlation_groups, host_name))
             .collect(),
         providers: (*refresh.providers).clone(),
         provider_health: health_to_proto(&refresh.provider_health),
@@ -121,10 +92,12 @@ pub fn snapshot_to_proto(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use flotilla_protocol::{HostName, HostPath, WorkItemIdentity, WorkItemKind};
+
     use super::*;
     use crate::data::{CorrelatedAnchor, CorrelatedWorkItem, StandaloneResult};
-    use flotilla_protocol::{HostName, HostPath, WorkItemIdentity, WorkItemKind};
-    use std::path::PathBuf;
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::new("test-host"), PathBuf::from(path))
@@ -137,10 +110,7 @@ mod tests {
     #[test]
     fn convert_correlated_checkout() {
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
-            anchor: CorrelatedAnchor::Checkout(CheckoutRef {
-                key: hp("/repos/my-project/wt-1"),
-                is_main_checkout: false,
-            }),
+            anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/repos/my-project/wt-1"), is_main_checkout: false }),
             branch: Some("feature-login".to_string()),
             description: "Implement login flow".to_string(),
             linked_change_request: Some("PR#55".to_string()),
@@ -155,10 +125,7 @@ mod tests {
         let proto = correlation_result_to_work_item(&item, &[], &test_host());
 
         assert_eq!(proto.kind, WorkItemKind::Checkout);
-        assert_eq!(
-            proto.identity,
-            WorkItemIdentity::Checkout(hp("/repos/my-project/wt-1"))
-        );
+        assert_eq!(proto.identity, WorkItemIdentity::Checkout(hp("/repos/my-project/wt-1")));
         // Checkout-anchored items derive host from HostPath
         assert_eq!(proto.host, test_host());
         assert_eq!(proto.branch.as_deref(), Some("feature-login"));
@@ -202,10 +169,7 @@ mod tests {
     fn convert_correlated_checkout_has_hostname_source() {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
-            anchor: CorrelatedAnchor::Checkout(CheckoutRef {
-                key: hp("/repos/proj/wt"),
-                is_main_checkout: false,
-            }),
+            anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/repos/proj/wt"), is_main_checkout: false }),
             branch: Some("feat".to_string()),
             description: "Feature".to_string(),
             linked_change_request: None,
@@ -253,9 +217,7 @@ mod tests {
 
     #[test]
     fn convert_standalone_remote_branch_has_git_source() {
-        let item = CorrelationResult::Standalone(StandaloneResult::RemoteBranch {
-            branch: "origin/feat".to_string(),
-        });
+        let item = CorrelationResult::Standalone(StandaloneResult::RemoteBranch { branch: "origin/feat".to_string() });
         let proto = correlation_result_to_work_item(&item, &[], &test_host());
         assert_eq!(proto.source, Some("git".to_string()));
     }

@@ -3,32 +3,36 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use flotilla_protocol::{
+    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError, RepoInfo, Snapshot,
+};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use flotilla_protocol::{
-    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState,
-    ProviderError, RepoInfo, Snapshot,
+use crate::{
+    config::ConfigStore,
+    convert::snapshot_to_proto,
+    daemon::DaemonHandle,
+    delta, executor,
+    issue_cache::IssueCache,
+    model::{provider_names_from_registry, repo_name, RepoModel},
+    providers::{
+        discovery::{discover_providers, DiscoveryResult, EnvironmentBag, FactoryRegistry, ProcessEnvVars, RepoDetector},
+        CommandRunner,
+    },
+    refresh::RefreshSnapshot,
 };
-
-use flotilla_protocol::ProviderData;
-
-use crate::config::ConfigStore;
-use crate::convert::snapshot_to_proto;
-use crate::daemon::DaemonHandle;
-use crate::delta;
-use crate::executor;
-use crate::issue_cache::IssueCache;
-use crate::model::{provider_names_from_registry, repo_name, RepoModel};
-use crate::providers::CommandRunner;
-use crate::refresh::RefreshSnapshot;
 
 fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -57,17 +61,10 @@ fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
 }
 
 /// Clone base providers and replace the issues field with cached issues or search results.
-fn inject_issues(
-    base_providers: &ProviderData,
-    cache: &IssueCache,
-    search_results: &Option<Vec<(String, Issue)>>,
-) -> ProviderData {
+fn inject_issues(base_providers: &ProviderData, cache: &IssueCache, search_results: &Option<Vec<(String, Issue)>>) -> ProviderData {
     let mut providers = base_providers.clone();
     if let Some(ref results) = search_results {
-        providers.issues = results
-            .iter()
-            .map(|(id, i)| (id.clone(), i.clone()))
-            .collect();
+        providers.issues = results.iter().map(|(id, i)| (id.clone(), i.clone())).collect();
     } else if !cache.is_empty() {
         providers.issues = (*cache.to_index_map()).clone();
     } else {
@@ -102,13 +99,8 @@ fn build_repo_snapshot_with_peers(
 
     // Merge peer provider data if any
     let providers = if let Some(peers) = peer_overlay {
-        let peer_refs: Vec<(HostName, &ProviderData)> =
-            peers.iter().map(|(h, d)| (h.clone(), d)).collect();
-        Arc::new(crate::merge::merge_provider_data(
-            &local_providers,
-            host_name,
-            &peer_refs,
-        ))
+        let peer_refs: Vec<(HostName, &ProviderData)> = peers.iter().map(|(h, d)| (h.clone(), d)).collect();
+        Arc::new(crate::merge::merge_provider_data(&local_providers, host_name, &peer_refs))
     } else {
         Arc::new(local_providers)
     };
@@ -159,11 +151,7 @@ fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
 
     match (delta_size, full_size) {
         (Ok(d), Ok(f)) if d < f => {
-            debug!(
-                delta_bytes = d,
-                full_bytes = f,
-                "delta smaller than full, sending delta"
-            );
+            debug!(delta_bytes = d, full_bytes = f, "delta smaller than full, sending delta");
             DaemonEvent::SnapshotDelta(Box::new(snapshot_delta))
         }
         _ => {
@@ -249,12 +237,7 @@ impl RepoState {
         }
 
         let prev_seq = self.seq;
-        let entry = DeltaEntry {
-            seq: self.seq + 1,
-            prev_seq,
-            changes,
-            work_items,
-        };
+        let entry = DeltaEntry { seq: self.seq + 1, prev_seq, changes, work_items };
 
         // Append to bounded log
         self.delta_log.push_back(entry.clone());
@@ -296,11 +279,11 @@ pub struct InProcessDaemon {
     peer_status: RwLock<HashMap<HostName, PeerConnectionState>>,
     /// Host-level environment assertions, computed once at startup and
     /// reused for each repo discovery.
-    host_bag: crate::providers::discovery::EnvironmentBag,
+    host_bag: EnvironmentBag,
     /// Repo-level detectors, computed once at startup.
-    repo_detectors: Vec<Box<dyn crate::providers::discovery::RepoDetector>>,
+    repo_detectors: Vec<Box<dyn RepoDetector>>,
     /// Provider factories, computed once at startup (follower vs full).
-    factories: crate::providers::discovery::FactoryRegistry,
+    factories: FactoryRegistry,
 }
 
 impl InProcessDaemon {
@@ -320,15 +303,8 @@ impl InProcessDaemon {
     /// discovery. The follower daemon only reports local state (VCS,
     /// checkouts, workspace manager, terminal pool). Service-level data
     /// arrives from the leader via PeerData messages.
-    pub async fn new_with_options(
-        repo_paths: Vec<PathBuf>,
-        config: Arc<ConfigStore>,
-        follower: bool,
-        host_name: HostName,
-    ) -> Arc<Self> {
-        use crate::providers::discovery::{
-            self, detectors, DiscoveryResult, FactoryRegistry, ProcessEnvVars,
-        };
+    pub async fn new_with_options(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>, follower: bool, host_name: HostName) -> Arc<Self> {
+        use crate::providers::discovery::{self, detectors, DiscoveryResult, FactoryRegistry, ProcessEnvVars};
 
         let (event_tx, _) = broadcast::channel(256);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
@@ -339,39 +315,18 @@ impl InProcessDaemon {
         // Run host detection once before the repo loop
         let host_detectors = detectors::default_host_detectors();
         let repo_detectors = detectors::default_repo_detectors();
-        let host_bag =
-            discovery::run_host_detectors(&host_detectors, &*runner, &ProcessEnvVars).await;
-        let factories = if follower {
-            FactoryRegistry::for_follower()
-        } else {
-            FactoryRegistry::default_all()
-        };
+        let host_bag = discovery::run_host_detectors(&host_detectors, &*runner, &ProcessEnvVars).await;
+        let factories = if follower { FactoryRegistry::for_follower() } else { FactoryRegistry::default_all() };
 
         for path in repo_paths {
             if repos.contains_key(&path) {
                 continue;
             }
-            let DiscoveryResult {
-                registry,
-                repo_slug,
-                bag,
-                unmet,
-            } = discovery::discover_providers(
-                &host_bag,
-                &path,
-                &repo_detectors,
-                &factories,
-                &config,
-                Arc::clone(&runner),
-                &ProcessEnvVars,
-            )
-            .await;
+            let DiscoveryResult { registry, repo_slug, bag, unmet } =
+                discovery::discover_providers(&host_bag, &path, &repo_detectors, &factories, &config, Arc::clone(&runner), &ProcessEnvVars)
+                    .await;
             if !unmet.is_empty() {
-                debug!(
-                    count = unmet.len(),
-                    ?unmet,
-                    "providers not activated: missing requirements"
-                );
+                debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
 
             // RepoIdentity from the merged bag
@@ -381,22 +336,19 @@ impl InProcessDaemon {
 
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
-            repos.insert(
-                path.clone(),
-                RepoState {
-                    model,
-                    seq: 0,
-                    last_snapshot: Arc::new(RefreshSnapshot::default()),
-                    issue_cache: IssueCache::new(),
-                    search_results: None,
-                    issue_fetch_mutex: Arc::new(Mutex::new(())),
-                    last_broadcast_providers: ProviderData::default(),
-                    last_broadcast_health: HashMap::new(),
-                    last_broadcast_errors: Vec::new(),
-                    delta_log: VecDeque::new(),
-                    local_data_version: 0,
-                },
-            );
+            repos.insert(path.clone(), RepoState {
+                model,
+                seq: 0,
+                last_snapshot: Arc::new(RefreshSnapshot::default()),
+                issue_cache: IssueCache::new(),
+                search_results: None,
+                issue_fetch_mutex: Arc::new(Mutex::new(())),
+                last_broadcast_providers: ProviderData::default(),
+                last_broadcast_health: HashMap::new(),
+                last_broadcast_errors: Vec::new(),
+                delta_log: VecDeque::new(),
+                local_data_version: 0,
+            });
             order.push(path);
         }
 
@@ -446,23 +398,14 @@ impl InProcessDaemon {
     }
 
     /// Find the local repo path that matches a given RepoIdentity, if any.
-    pub async fn find_repo_by_identity(
-        &self,
-        identity: &flotilla_protocol::RepoIdentity,
-    ) -> Option<PathBuf> {
+    pub async fn find_repo_by_identity(&self, identity: &flotilla_protocol::RepoIdentity) -> Option<PathBuf> {
         self.repo_identities.read().await.get(identity).cloned()
     }
 
     /// Reverse lookup: find the RepoIdentity for a given local repo path.
-    pub async fn find_identity_for_path(
-        &self,
-        repo_path: &Path,
-    ) -> Option<flotilla_protocol::RepoIdentity> {
+    pub async fn find_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
         let identities = self.repo_identities.read().await;
-        identities
-            .iter()
-            .find(|(_, path)| path.as_path() == repo_path)
-            .map(|(id, _)| id.clone())
+        identities.iter().find(|(_, path)| path.as_path() == repo_path).map(|(id, _)| id.clone())
     }
 
     /// Get the local-only provider data for a repo (without peer overlay).
@@ -472,11 +415,7 @@ impl InProcessDaemon {
     pub async fn get_local_providers(&self, repo: &Path) -> Option<(ProviderData, u64)> {
         let repos = self.repos.read().await;
         let state = repos.get(repo)?;
-        let providers = inject_issues(
-            &state.last_snapshot.providers,
-            &state.issue_cache,
-            &state.search_results,
-        );
+        let providers = inject_issues(&state.last_snapshot.providers, &state.issue_cache, &state.search_results);
         Some((providers, state.local_data_version))
     }
 
@@ -512,11 +451,7 @@ impl InProcessDaemon {
                         return None;
                     }
                     let snapshot = handle.snapshot_rx.borrow_and_update().clone();
-                    let providers = inject_issues(
-                        &snapshot.providers,
-                        &state.issue_cache,
-                        &state.search_results,
-                    );
+                    let providers = inject_issues(&snapshot.providers, &state.issue_cache, &state.search_results);
 
                     Some((
                         path.clone(),
@@ -543,13 +478,8 @@ impl InProcessDaemon {
         for (path, snapshot, providers, issue_total, issue_has_more, search_results) in changed {
             // Merge peer provider data if any
             let providers = if let Some(peers) = peer_overlay.get(&path) {
-                let peer_refs: Vec<(HostName, &ProviderData)> =
-                    peers.iter().map(|(h, d)| (h.clone(), d)).collect();
-                Arc::new(crate::merge::merge_provider_data(
-                    &providers,
-                    &self.host_name,
-                    &peer_refs,
-                ))
+                let peer_refs: Vec<(HostName, &ProviderData)> = peers.iter().map(|(h, d)| (h.clone(), d)).collect();
+                Arc::new(crate::merge::merge_provider_data(&providers, &self.host_name, &peer_refs))
             } else {
                 Arc::new(providers)
             };
@@ -562,14 +492,7 @@ impl InProcessDaemon {
                 errors: snapshot.errors.clone(),
                 provider_health: snapshot.provider_health.clone(),
             };
-            updates.push((
-                path,
-                snapshot,
-                re_snapshot,
-                issue_total,
-                issue_has_more,
-                search_results,
-            ));
+            updates.push((path, snapshot, re_snapshot, issue_total, issue_has_more, search_results));
         }
 
         // Apply updates under write lock and broadcast
@@ -584,10 +507,8 @@ impl InProcessDaemon {
             state.model.data.provider_health = snapshot.provider_health.clone();
             state.model.data.loading = false;
 
-            let mut proto_snapshot =
-                snapshot_to_proto(&path, state.seq + 1, &re_snapshot, &self.host_name);
-            proto_snapshot.provider_health =
-                crate::convert::health_to_proto(&state.model.data.provider_health);
+            let mut proto_snapshot = snapshot_to_proto(&path, state.seq + 1, &re_snapshot, &self.host_name);
+            proto_snapshot.provider_health = crate::convert::health_to_proto(&state.model.data.provider_health);
             proto_snapshot.issue_total = issue_total;
             proto_snapshot.issue_has_more = issue_has_more;
             proto_snapshot.issue_search_results = search_results;
@@ -656,10 +577,7 @@ impl InProcessDaemon {
                     }
                     break;
                 }
-                (
-                    state.issue_cache.next_page,
-                    Arc::clone(&state.model.registry),
-                )
+                (state.issue_cache.next_page, Arc::clone(&state.model.registry))
             };
 
             // Fetch the next page outside any lock
@@ -734,12 +652,7 @@ impl InProcessDaemon {
                     if missing.is_empty() {
                         return None;
                     }
-                    Some((
-                        path.clone(),
-                        missing,
-                        Arc::clone(&state.model.registry),
-                        Arc::clone(&state.issue_fetch_mutex),
-                    ))
+                    Some((path.clone(), missing, Arc::clone(&state.model.registry), Arc::clone(&state.issue_fetch_mutex)))
                 })
                 .collect()
         };
@@ -782,11 +695,7 @@ impl InProcessDaemon {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "failed to fetch linked issues for {}: {}",
-                        path.display(),
-                        e
-                    );
+                    tracing::warn!("failed to fetch linked issues for {}: {}", path.display(), e);
                 }
             }
         }
@@ -837,13 +746,7 @@ impl InProcessDaemon {
             // that land on GitHub during the request.
             let refresh_ts = now_iso8601();
 
-            debug!(
-                "issue incremental: repo={} since={} refresh_ts={} cache_len={}",
-                path.display(),
-                since,
-                refresh_ts,
-                prev_count,
-            );
+            debug!("issue incremental: repo={} since={} refresh_ts={} cache_len={}", path.display(), since, refresh_ts, prev_count,);
 
             match tracker.list_issues_changed_since(&path, &since, 50).await {
                 Ok(changeset) => {
@@ -852,11 +755,7 @@ impl InProcessDaemon {
                     let has_more = changeset.has_more;
 
                     if n_updated > 0 || n_closed > 0 || has_more {
-                        let updated_ids: Vec<&str> = changeset
-                            .updated
-                            .iter()
-                            .map(|(id, _)| id.as_str())
-                            .collect();
+                        let updated_ids: Vec<&str> = changeset.updated.iter().map(|(id, _)| id.as_str()).collect();
                         info!(
                             "issue incremental: repo={} updated={:?} closed={:?} has_more={}",
                             path.display(),
@@ -870,10 +769,7 @@ impl InProcessDaemon {
                         // Too many changes — skip incremental, do a full re-fetch.
                         // Don't reset until we have data to replace it with,
                         // so transient API failures don't wipe the UI.
-                        info!(
-                            "issue incremental: escalating to full re-fetch for {}",
-                            path.display(),
-                        );
+                        info!("issue incremental: escalating to full re-fetch for {}", path.display(),);
                         drop(_guard);
                         let first_page = {
                             let reg = {
@@ -914,10 +810,7 @@ impl InProcessDaemon {
                             // Fetch failed — keep existing cache and do NOT advance
                             // the timestamp, so the next incremental call retries
                             // from the same `since` window.
-                            warn!(
-                                "issue incremental: escalation fetch failed for {}, keeping cache",
-                                path.display(),
-                            );
+                            warn!("issue incremental: escalation fetch failed for {}, keeping cache", path.display(),);
                         }
                     } else {
                         let has_changes = n_updated > 0 || n_closed > 0;
@@ -934,11 +827,7 @@ impl InProcessDaemon {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "incremental issue refresh failed for {}: {}",
-                        path.display(),
-                        e
-                    );
+                    warn!("incremental issue refresh failed for {}: {}", path.display(), e);
                 }
             }
         }
@@ -955,11 +844,7 @@ impl InProcessDaemon {
     /// initial merged data from peer snapshots.
     ///
     /// Emits `DaemonEvent::RepoAdded` so the TUI creates a tab.
-    pub async fn add_virtual_repo(
-        &self,
-        synthetic_path: PathBuf,
-        provider_data: ProviderData,
-    ) -> Result<(), String> {
+    pub async fn add_virtual_repo(&self, synthetic_path: PathBuf, provider_data: ProviderData) -> Result<(), String> {
         // Check if already tracked
         {
             let repos = self.repos.read().await;
@@ -988,22 +873,19 @@ impl InProcessDaemon {
             if repos.contains_key(&synthetic_path) {
                 return Ok(());
             }
-            repos.insert(
-                synthetic_path.clone(),
-                RepoState {
-                    model,
-                    seq: 0,
-                    last_snapshot: Arc::new(RefreshSnapshot::default()),
-                    issue_cache: IssueCache::new(),
-                    search_results: None,
-                    issue_fetch_mutex: Arc::new(Mutex::new(())),
-                    last_broadcast_providers: ProviderData::default(),
-                    last_broadcast_health: HashMap::new(),
-                    last_broadcast_errors: Vec::new(),
-                    delta_log: VecDeque::new(),
-                    local_data_version: 0,
-                },
-            );
+            repos.insert(synthetic_path.clone(), RepoState {
+                model,
+                seq: 0,
+                last_snapshot: Arc::new(RefreshSnapshot::default()),
+                issue_cache: IssueCache::new(),
+                search_results: None,
+                issue_fetch_mutex: Arc::new(Mutex::new(())),
+                last_broadcast_providers: ProviderData::default(),
+                last_broadcast_health: HashMap::new(),
+                last_broadcast_errors: Vec::new(),
+                delta_log: VecDeque::new(),
+                local_data_version: 0,
+            });
             order.push(synthetic_path.clone());
         }
 
@@ -1011,9 +893,7 @@ impl InProcessDaemon {
         // with peer connections.
 
         info!(repo = %synthetic_path.display(), "added virtual repo");
-        let _ = self
-            .event_tx
-            .send(DaemonEvent::RepoAdded(Box::new(repo_info)));
+        let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
 
         Ok(())
     }
@@ -1069,11 +949,7 @@ impl InProcessDaemon {
     /// If the event is a `PeerStatusChanged`, also records the status so
     /// `replay_since` can include it for late-subscribing clients.
     pub fn send_event(&self, event: DaemonEvent) {
-        if let DaemonEvent::PeerStatusChanged {
-            ref host,
-            ref status,
-        } = event
-        {
+        if let DaemonEvent::PeerStatusChanged { ref host, ref status } = event {
             // Use try_write to avoid blocking; if contended, the replay
             // will use a slightly stale value — acceptable for display.
             if let Ok(mut map) = self.peer_status.try_write() {
@@ -1096,9 +972,7 @@ impl DaemonHandle for InProcessDaemon {
             pp.get(repo).cloned()
         };
         let repos = self.repos.read().await;
-        let state = repos
-            .get(repo)
-            .ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+        let state = repos.get(repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
 
         Ok(build_repo_snapshot_with_peers(
             repo,
@@ -1122,9 +996,7 @@ impl DaemonHandle for InProcessDaemon {
                     name: repo_name(path),
                     labels: state.model.labels.clone(),
                     provider_names: provider_names_from_registry(&state.model.registry),
-                    provider_health: crate::convert::health_to_proto(
-                        &state.model.data.provider_health,
-                    ),
+                    provider_health: crate::convert::health_to_proto(&state.model.data.provider_health),
                     loading: state.model.data.loading,
                 });
             }
@@ -1170,9 +1042,7 @@ impl DaemonHandle for InProcessDaemon {
         let event_tx = self.event_tx.clone();
         let (registry, providers_data, refresh_trigger) = {
             let repos = self.repos.read().await;
-            let state = repos
-                .get(repo)
-                .ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+            let state = repos.get(repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             (
                 Arc::clone(&state.model.registry),
                 Arc::clone(&state.model.data.providers),
@@ -1184,31 +1054,15 @@ impl DaemonHandle for InProcessDaemon {
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
         let config_base = self.config.base_path().to_path_buf();
-        let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-            command_id: id,
-            repo: repo_path.clone(),
-            description,
-        });
+        let _ = self.event_tx.send(DaemonEvent::CommandStarted { command_id: id, repo: repo_path.clone(), description });
 
         tokio::spawn(async move {
-            let result = executor::execute(
-                command,
-                &repo_path,
-                &registry,
-                &providers_data,
-                &*runner,
-                &config_base,
-            )
-            .await;
+            let result = executor::execute(command, &repo_path, &registry, &providers_data, &*runner, &config_base).await;
 
             // Trigger a refresh after command execution
             refresh_trigger.notify_one();
 
-            let _ = event_tx.send(DaemonEvent::CommandFinished {
-                command_id: id,
-                repo: repo_path,
-                result,
-            });
+            let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
         });
 
         Ok(id)
@@ -1217,20 +1071,15 @@ impl DaemonHandle for InProcessDaemon {
     async fn refresh(&self, repo: &Path) -> Result<(), String> {
         let (prev_count, registry) = {
             let repos = self.repos.read().await;
-            let state = repos
-                .get(repo)
-                .ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+            let state = repos.get(repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             state.model.refresh_handle.trigger_refresh();
             (state.issue_cache.len(), Arc::clone(&state.model.registry))
         };
 
         if prev_count > 0 {
             // Fetch page 1 before resetting, so failures don't wipe the UI.
-            let first_page = if let Some((_, t)) = registry.issue_trackers.values().next() {
-                t.list_issues_page(repo, 1, 50).await.ok()
-            } else {
-                None
-            };
+            let first_page =
+                if let Some((_, t)) = registry.issue_trackers.values().next() { t.list_issues_page(repo, 1, 50).await.ok() } else { None };
 
             if first_page.is_some() {
                 {
@@ -1268,27 +1117,18 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let crate::providers::discovery::DiscoveryResult {
-            registry,
-            repo_slug,
-            bag,
-            unmet,
-        } = crate::providers::discovery::discover_providers(
+        let DiscoveryResult { registry, repo_slug, bag, unmet } = discover_providers(
             &self.host_bag,
             &path,
             &self.repo_detectors,
             &self.factories,
             &self.config,
             Arc::clone(&self.runner),
-            &crate::providers::discovery::ProcessEnvVars,
+            &ProcessEnvVars,
         )
         .await;
         if !unmet.is_empty() {
-            debug!(
-                count = unmet.len(),
-                ?unmet,
-                "providers not activated: missing requirements"
-            );
+            debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
         model.data.loading = true;
@@ -1309,31 +1149,25 @@ impl DaemonHandle for InProcessDaemon {
             if repos.contains_key(&path) {
                 return Ok(());
             }
-            repos.insert(
-                path.clone(),
-                RepoState {
-                    model,
-                    seq: 0,
-                    last_snapshot: Arc::new(RefreshSnapshot::default()),
-                    issue_cache: IssueCache::new(),
-                    search_results: None,
-                    issue_fetch_mutex: Arc::new(Mutex::new(())),
-                    last_broadcast_providers: ProviderData::default(),
-                    last_broadcast_health: HashMap::new(),
-                    last_broadcast_errors: Vec::new(),
-                    delta_log: VecDeque::new(),
-                    local_data_version: 0,
-                },
-            );
+            repos.insert(path.clone(), RepoState {
+                model,
+                seq: 0,
+                last_snapshot: Arc::new(RefreshSnapshot::default()),
+                issue_cache: IssueCache::new(),
+                search_results: None,
+                issue_fetch_mutex: Arc::new(Mutex::new(())),
+                last_broadcast_providers: ProviderData::default(),
+                last_broadcast_health: HashMap::new(),
+                last_broadcast_errors: Vec::new(),
+                delta_log: VecDeque::new(),
+                local_data_version: 0,
+            });
             order.push(path.clone());
         }
 
         // Register RepoIdentity for peer routing
         if let Some(identity) = bag.repo_identity() {
-            self.repo_identities
-                .write()
-                .await
-                .insert(identity, path.clone());
+            self.repo_identities.write().await.insert(identity, path.clone());
         }
 
         // Persist to config
@@ -1342,17 +1176,12 @@ impl DaemonHandle for InProcessDaemon {
         self.config.save_tab_order(&order);
 
         info!(repo = %path.display(), "added repo");
-        let _ = self
-            .event_tx
-            .send(DaemonEvent::RepoAdded(Box::new(repo_info)));
+        let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
 
         Ok(())
     }
 
-    async fn replay_since(
-        &self,
-        last_seen: &HashMap<PathBuf, u64>,
-    ) -> Result<Vec<DaemonEvent>, String> {
+    async fn replay_since(&self, last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String> {
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
         let mut events = Vec::new();
@@ -1366,44 +1195,29 @@ impl DaemonHandle for InProcessDaemon {
             if state.seq == 0 {
                 continue;
             }
-            let snapshot = || {
-                build_repo_snapshot(
-                    path,
-                    state.seq,
-                    &state.last_snapshot,
-                    &state.issue_cache,
-                    &state.search_results,
-                    &self.host_name,
-                )
-            };
+            let snapshot =
+                || build_repo_snapshot(path, state.seq, &state.last_snapshot, &state.issue_cache, &state.search_results, &self.host_name);
 
             match last_seen.get(path) {
                 Some(&client_seq) => {
                     // Try to find the client's seq in the delta log and replay from there
-                    let replay_start = state
-                        .delta_log
-                        .iter()
-                        .position(|entry| entry.prev_seq == client_seq);
+                    let replay_start = state.delta_log.iter().position(|entry| entry.prev_seq == client_seq);
 
                     if let Some(start_idx) = replay_start {
                         // Capture issue metadata once — it doesn't change per-entry
                         let issue_snapshot = snapshot();
                         // Replay delta entries (each carries pre-correlated work_items)
                         for entry in state.delta_log.iter().skip(start_idx) {
-                            events.push(DaemonEvent::SnapshotDelta(Box::new(
-                                flotilla_protocol::SnapshotDelta {
-                                    seq: entry.seq,
-                                    prev_seq: entry.prev_seq,
-                                    repo: path.clone(),
-                                    changes: entry.changes.clone(),
-                                    work_items: entry.work_items.clone(),
-                                    issue_total: issue_snapshot.issue_total,
-                                    issue_has_more: issue_snapshot.issue_has_more,
-                                    issue_search_results: issue_snapshot
-                                        .issue_search_results
-                                        .clone(),
-                                },
-                            )));
+                            events.push(DaemonEvent::SnapshotDelta(Box::new(flotilla_protocol::SnapshotDelta {
+                                seq: entry.seq,
+                                prev_seq: entry.prev_seq,
+                                repo: path.clone(),
+                                changes: entry.changes.clone(),
+                                work_items: entry.work_items.clone(),
+                                issue_total: issue_snapshot.issue_total,
+                                issue_has_more: issue_snapshot.issue_has_more,
+                                issue_search_results: issue_snapshot.issue_search_results.clone(),
+                            })));
                         }
                     } else if client_seq == state.seq {
                         // Client is up to date — no replay needed
@@ -1422,10 +1236,7 @@ impl DaemonHandle for InProcessDaemon {
         // Include current peer status so late-subscribing clients see it
         let peer_status = self.peer_status.read().await;
         for (host, status) in peer_status.iter() {
-            events.push(DaemonEvent::PeerStatusChanged {
-                host: host.clone(),
-                status: *status,
-            });
+            events.push(DaemonEvent::PeerStatusChanged { host: host.clone(), status: *status });
         }
 
         Ok(events)
@@ -1467,8 +1278,9 @@ impl DaemonHandle for InProcessDaemon {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout};
+
+    use super::*;
 
     fn checkout_with_issue(issue_id: &str) -> Checkout {
         Checkout {
@@ -1500,18 +1312,11 @@ mod tests {
     fn collect_linked_issue_ids_deduplicates_across_sources() {
         let mut providers = ProviderData::default();
         providers.checkouts.insert(
-            flotilla_protocol::HostPath::new(
-                flotilla_protocol::HostName::new("test-host"),
-                PathBuf::from("/tmp/repo"),
-            ),
+            flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from("/tmp/repo")),
             checkout_with_issue("123"),
         );
-        providers
-            .change_requests
-            .insert("1".into(), cr_with_issue("123"));
-        providers
-            .change_requests
-            .insert("2".into(), cr_with_issue("456"));
+        providers.change_requests.insert("1".into(), cr_with_issue("123"));
+        providers.change_requests.insert("2".into(), cr_with_issue("456"));
 
         let mut ids = collect_linked_issue_ids(&providers);
         ids.sort();
@@ -1523,27 +1328,21 @@ mod tests {
         let base = ProviderData::default();
 
         let mut cache = IssueCache::new();
-        cache.add_pinned(vec![(
-            "1".into(),
-            Issue {
-                title: "cached".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )]);
+        cache.add_pinned(vec![("1".into(), Issue {
+            title: "cached".into(),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })]);
 
-        let search_results = Some(vec![(
-            "2".into(),
-            Issue {
-                title: "search".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )]);
+        let search_results = Some(vec![("2".into(), Issue {
+            title: "search".into(),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })]);
 
         let from_search = inject_issues(&base, &cache, &search_results);
         assert_eq!(from_search.issues.len(), 1);
@@ -1573,30 +1372,16 @@ mod tests {
             issue_search_results: None,
         };
 
-        let initial = DeltaEntry {
-            seq: 1,
-            prev_seq: 0,
-            changes: vec![],
-            work_items: vec![],
-        };
-        assert!(matches!(
-            choose_event(snapshot.clone(), initial),
-            DaemonEvent::SnapshotFull(_)
-        ));
+        let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![], work_items: vec![] };
+        assert!(matches!(choose_event(snapshot.clone(), initial), DaemonEvent::SnapshotFull(_)));
 
         let non_empty = DeltaEntry {
             seq: 2,
             prev_seq: 1,
-            changes: vec![flotilla_protocol::Change::Branch {
-                key: "feature/x".into(),
-                op: flotilla_protocol::EntryOp::Removed,
-            }],
+            changes: vec![flotilla_protocol::Change::Branch { key: "feature/x".into(), op: flotilla_protocol::EntryOp::Removed }],
             work_items: vec![],
         };
-        assert!(matches!(
-            choose_event(snapshot, non_empty),
-            DaemonEvent::SnapshotDelta(_)
-        ));
+        assert!(matches!(choose_event(snapshot, non_empty), DaemonEvent::SnapshotDelta(_)));
     }
 
     #[test]
@@ -1617,17 +1402,11 @@ mod tests {
         let delta = DeltaEntry {
             seq: 3,
             prev_seq: 2,
-            changes: vec![flotilla_protocol::Change::Branch {
-                key: "feature/".repeat(128),
-                op: flotilla_protocol::EntryOp::Removed,
-            }],
+            changes: vec![flotilla_protocol::Change::Branch { key: "feature/".repeat(128), op: flotilla_protocol::EntryOp::Removed }],
             work_items: vec![],
         };
 
-        assert!(matches!(
-            choose_event(snapshot, delta),
-            DaemonEvent::SnapshotFull(_)
-        ));
+        assert!(matches!(choose_event(snapshot, delta), DaemonEvent::SnapshotFull(_)));
     }
 
     #[test]
@@ -1635,25 +1414,15 @@ mod tests {
         let mut cache = IssueCache::new();
         cache.total_count = Some(5);
         cache.has_more = true;
-        cache.add_pinned(vec![(
-            "9".into(),
-            Issue {
-                title: "cached issue".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )]);
+        cache.add_pinned(vec![("9".into(), Issue {
+            title: "cached issue".into(),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })]);
 
-        let snap = build_repo_snapshot(
-            Path::new("/tmp/repo"),
-            7,
-            &RefreshSnapshot::default(),
-            &cache,
-            &None,
-            &HostName::local(),
-        );
+        let snap = build_repo_snapshot(Path::new("/tmp/repo"), 7, &RefreshSnapshot::default(), &cache, &None, &HostName::local());
         assert_eq!(snap.seq, 7);
         assert_eq!(snap.issue_total, Some(5));
         assert!(snap.issue_has_more);

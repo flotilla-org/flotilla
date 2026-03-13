@@ -3,12 +3,9 @@
 //! Used by both unit tests (via test_support) and integration tests (via tests/support).
 //! Always compiled so integration tests can access these through the public API.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
-use flotilla_protocol::{
-    CheckoutRef, HostName, HostPath, RepoInfo, RepoLabels, WorkItem, WorkItemIdentity, WorkItemKind,
-};
+use flotilla_protocol::{CheckoutRef, HostName, HostPath, RepoInfo, RepoLabels, WorkItem, WorkItemIdentity, WorkItemKind};
 
 pub fn bare_item() -> WorkItem {
     WorkItem {
@@ -57,10 +54,7 @@ pub fn checkout_item(branch: &str, path: &str, is_main: bool) -> WorkItem {
         host: HostName::local(),
         branch: Some(branch.into()),
         description: format!("checkout {branch}"),
-        checkout: Some(CheckoutRef {
-            key: host_path,
-            is_main_checkout: is_main,
-        }),
+        checkout: Some(CheckoutRef { key: host_path, is_main_checkout: is_main }),
         change_request_key: None,
         session_key: None,
         issue_keys: Vec::new(),
@@ -129,11 +123,7 @@ pub fn remote_branch_item(branch: &str) -> WorkItem {
     }
 }
 
-pub fn repo_info(
-    path: impl Into<PathBuf>,
-    name: impl Into<String>,
-    labels: RepoLabels,
-) -> RepoInfo {
+pub fn repo_info(path: impl Into<PathBuf>, name: impl Into<String>, labels: RepoLabels) -> RepoInfo {
     RepoInfo {
         path: path.into(),
         name: name.into(),

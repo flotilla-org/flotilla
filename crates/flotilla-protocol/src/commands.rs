@@ -106,17 +106,10 @@ impl Command {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandResult {
     Ok,
-    CheckoutCreated {
-        branch: String,
-    },
-    BranchNameGenerated {
-        name: String,
-        issue_ids: Vec<(String, String)>,
-    },
+    CheckoutCreated { branch: String },
+    BranchNameGenerated { name: String, issue_ids: Vec<(String, String)> },
     CheckoutStatus(CheckoutStatus),
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -139,65 +132,31 @@ mod tests {
     #[test]
     fn command_roundtrip_covers_all_variants() {
         let cases = vec![
-            Command::CreateWorkspaceForCheckout {
-                checkout_path: PathBuf::from("/repos/project/wt-1"),
-            },
-            Command::SelectWorkspace {
-                ws_ref: "cmux-session-1".into(),
-            },
-            Command::CreateCheckout {
-                branch: "feat-new".into(),
-                create_branch: true,
-                issue_ids: vec![("github".into(), "42".into())],
-            },
-            Command::CreateCheckout {
-                branch: "fix/bug".into(),
-                create_branch: false,
-                issue_ids: vec![],
-            },
-            Command::RemoveCheckout {
-                branch: "old-branch".into(),
-                terminal_keys: vec![],
-            },
+            Command::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repos/project/wt-1") },
+            Command::SelectWorkspace { ws_ref: "cmux-session-1".into() },
+            Command::CreateCheckout { branch: "feat-new".into(), create_branch: true, issue_ids: vec![("github".into(), "42".into())] },
+            Command::CreateCheckout { branch: "fix/bug".into(), create_branch: false, issue_ids: vec![] },
+            Command::RemoveCheckout { branch: "old-branch".into(), terminal_keys: vec![] },
             Command::FetchCheckoutStatus {
                 branch: "feat-done".into(),
                 checkout_path: Some(PathBuf::from("/repos/proj/wt")),
                 change_request_id: Some("123".into()),
             },
-            Command::FetchCheckoutStatus {
-                branch: "x".into(),
-                checkout_path: None,
-                change_request_id: None,
-            },
+            Command::FetchCheckoutStatus { branch: "x".into(), checkout_path: None, change_request_id: None },
             Command::OpenChangeRequest { id: "55".into() },
             Command::CloseChangeRequest { id: "77".into() },
             Command::OpenIssue { id: "GH-10".into() },
-            Command::LinkIssuesToChangeRequest {
-                change_request_id: "PR-7".into(),
-                issue_ids: vec!["I-1".into(), "I-2".into()],
-            },
-            Command::ArchiveSession {
-                session_id: "sess-abc".into(),
-            },
-            Command::GenerateBranchName {
-                issue_keys: vec!["GH-1".into(), "LIN-5".into()],
-            },
+            Command::LinkIssuesToChangeRequest { change_request_id: "PR-7".into(), issue_ids: vec!["I-1".into(), "I-2".into()] },
+            Command::ArchiveSession { session_id: "sess-abc".into() },
+            Command::GenerateBranchName { issue_keys: vec!["GH-1".into(), "LIN-5".into()] },
             Command::TeleportSession {
                 session_id: "sess-1".into(),
                 branch: Some("feat-x".into()),
                 checkout_key: Some(PathBuf::from("/repos/wt")),
             },
-            Command::TeleportSession {
-                session_id: "sess-2".into(),
-                branch: None,
-                checkout_key: None,
-            },
-            Command::AddRepo {
-                path: PathBuf::from("/new/repo"),
-            },
-            Command::RemoveRepo {
-                path: PathBuf::from("/old/repo"),
-            },
+            Command::TeleportSession { session_id: "sess-2".into(), branch: None, checkout_key: None },
+            Command::AddRepo { path: PathBuf::from("/new/repo") },
+            Command::RemoveRepo { path: PathBuf::from("/old/repo") },
             Command::Refresh,
         ];
 
@@ -210,23 +169,15 @@ mod tests {
     fn command_uses_snake_case_tag() {
         let cmd = Command::SelectWorkspace { ws_ref: "x".into() };
         let json = serde_json::to_value(&cmd).expect("serialize");
-        assert_eq!(
-            json.get("command").and_then(|v| v.as_str()),
-            Some("select_workspace")
-        );
+        assert_eq!(json.get("command").and_then(|v| v.as_str()), Some("select_workspace"));
     }
 
     #[test]
     fn command_result_roundtrip_covers_all_variants() {
         let cases = vec![
             CommandResult::Ok,
-            CommandResult::CheckoutCreated {
-                branch: "feat-new".into(),
-            },
-            CommandResult::BranchNameGenerated {
-                name: "feat/cool-thing".into(),
-                issue_ids: vec![("gh".into(), "1".into())],
-            },
+            CommandResult::CheckoutCreated { branch: "feat-new".into() },
+            CommandResult::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
             CommandResult::CheckoutStatus(CheckoutStatus {
                 branch: "old".into(),
                 change_request_status: Some("merged".into()),
@@ -236,9 +187,7 @@ mod tests {
                 uncommitted_files: vec!["M  src/main.rs".into(), "?? TODO.txt".into()],
                 base_detection_warning: Some("warning text".into()),
             }),
-            CommandResult::Error {
-                message: "something failed".into(),
-            },
+            CommandResult::Error { message: "something failed".into() },
         ];
 
         for result in cases {
@@ -250,10 +199,7 @@ mod tests {
     fn command_result_uses_snake_case_tag() {
         let result = CommandResult::CheckoutCreated { branch: "x".into() };
         let json = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(
-            json.get("status").and_then(|v| v.as_str()),
-            Some("checkout_created")
-        );
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("checkout_created"));
     }
 
     #[test]
@@ -285,62 +231,25 @@ mod tests {
     #[test]
     fn command_description_covers_all_variants() {
         let cases: Vec<Command> = vec![
-            Command::CreateWorkspaceForCheckout {
-                checkout_path: PathBuf::from("/tmp"),
-            },
+            Command::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/tmp") },
             Command::SelectWorkspace { ws_ref: "x".into() },
-            Command::CreateCheckout {
-                branch: "b".into(),
-                create_branch: true,
-                issue_ids: vec![],
-            },
-            Command::RemoveCheckout {
-                branch: "b".into(),
-                terminal_keys: vec![],
-            },
-            Command::FetchCheckoutStatus {
-                branch: "b".into(),
-                checkout_path: None,
-                change_request_id: None,
-            },
+            Command::CreateCheckout { branch: "b".into(), create_branch: true, issue_ids: vec![] },
+            Command::RemoveCheckout { branch: "b".into(), terminal_keys: vec![] },
+            Command::FetchCheckoutStatus { branch: "b".into(), checkout_path: None, change_request_id: None },
             Command::OpenChangeRequest { id: "1".into() },
             Command::CloseChangeRequest { id: "1".into() },
             Command::OpenIssue { id: "1".into() },
-            Command::LinkIssuesToChangeRequest {
-                change_request_id: "1".into(),
-                issue_ids: vec![],
-            },
-            Command::ArchiveSession {
-                session_id: "s".into(),
-            },
+            Command::LinkIssuesToChangeRequest { change_request_id: "1".into(), issue_ids: vec![] },
+            Command::ArchiveSession { session_id: "s".into() },
             Command::GenerateBranchName { issue_keys: vec![] },
-            Command::TeleportSession {
-                session_id: "s".into(),
-                branch: None,
-                checkout_key: None,
-            },
-            Command::AddRepo {
-                path: PathBuf::from("/tmp"),
-            },
-            Command::RemoveRepo {
-                path: PathBuf::from("/tmp"),
-            },
+            Command::TeleportSession { session_id: "s".into(), branch: None, checkout_key: None },
+            Command::AddRepo { path: PathBuf::from("/tmp") },
+            Command::RemoveRepo { path: PathBuf::from("/tmp") },
             Command::Refresh,
-            Command::SetIssueViewport {
-                repo: PathBuf::from("/tmp"),
-                visible_count: 10,
-            },
-            Command::FetchMoreIssues {
-                repo: PathBuf::from("/tmp"),
-                desired_count: 10,
-            },
-            Command::SearchIssues {
-                repo: PathBuf::from("/tmp"),
-                query: "q".into(),
-            },
-            Command::ClearIssueSearch {
-                repo: PathBuf::from("/tmp"),
-            },
+            Command::SetIssueViewport { repo: PathBuf::from("/tmp"), visible_count: 10 },
+            Command::FetchMoreIssues { repo: PathBuf::from("/tmp"), desired_count: 10 },
+            Command::SearchIssues { repo: PathBuf::from("/tmp"), query: "q".into() },
+            Command::ClearIssueSearch { repo: PathBuf::from("/tmp") },
         ];
         for cmd in cases {
             let desc = cmd.description();

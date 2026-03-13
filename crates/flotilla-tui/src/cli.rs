@@ -5,9 +5,7 @@ use flotilla_core::daemon::DaemonHandle;
 use crate::socket::SocketDaemon;
 
 pub async fn run_status(socket_path: &Path) -> Result<(), String> {
-    let daemon = SocketDaemon::connect(socket_path)
-        .await
-        .map_err(|e| format!("cannot connect to daemon: {e}"))?;
+    let daemon = SocketDaemon::connect(socket_path).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
 
     let repos = daemon.list_repos().await.map_err(|e| e.to_string())?;
 
@@ -23,9 +21,7 @@ pub async fn run_status(socket_path: &Path) -> Result<(), String> {
             .provider_health
             .iter()
             .flat_map(|(category, providers)| {
-                providers.iter().map(move |(name, v)| {
-                    format!("{category}/{name}: {}", if *v { "ok" } else { "error" })
-                })
+                providers.iter().map(move |(name, v)| format!("{category}/{name}: {}", if *v { "ok" } else { "error" }))
             })
             .collect();
         let loading = if repo.loading { " (loading)" } else { "" };
@@ -39,9 +35,7 @@ pub async fn run_status(socket_path: &Path) -> Result<(), String> {
 }
 
 pub async fn run_watch(socket_path: &Path) -> Result<(), String> {
-    let daemon = SocketDaemon::connect(socket_path)
-        .await
-        .map_err(|e| format!("cannot connect to daemon: {e}"))?;
+    let daemon = SocketDaemon::connect(socket_path).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
 
     let mut rx = daemon.subscribe();
     println!("watching events (Ctrl-C to stop)...");
@@ -49,8 +43,7 @@ pub async fn run_watch(socket_path: &Path) -> Result<(), String> {
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let json =
-                    serde_json::to_string_pretty(&event).unwrap_or_else(|_| format!("{event:?}"));
+                let json = serde_json::to_string_pretty(&event).unwrap_or_else(|_| format!("{event:?}"));
                 println!("{json}");
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

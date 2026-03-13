@@ -1,8 +1,7 @@
+use flotilla_protocol::{Command, CommandResult};
 use tracing::info;
 
-use super::ui_state::UiMode;
-use super::App;
-use flotilla_protocol::{Command, CommandResult};
+use super::{ui_state::UiMode, App};
 
 /// Dispatch a single Command by routing through the daemon handle.
 ///
@@ -83,11 +82,7 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
                 UiMode::DeleteConfirm { terminal_keys, .. } => terminal_keys.clone(),
                 _ => vec![],
             };
-            app.ui.mode = UiMode::DeleteConfirm {
-                info: Some(info),
-                loading: false,
-                terminal_keys,
-            };
+            app.ui.mode = UiMode::DeleteConfirm { info: Some(info), loading: false, terminal_keys };
         }
         CommandResult::Error { message } => {
             app.model.status_message = Some(message);

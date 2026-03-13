@@ -1,15 +1,15 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
-use std::time::Instant;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 
-use ratatui::layout::Rect;
-use ratatui::widgets::TableState;
+use flotilla_core::data::{GroupEntry, GroupedWorkItems};
+use flotilla_protocol::{CheckoutStatus, WorkItemIdentity};
+use ratatui::{layout::Rect, widgets::TableState};
 use tui_input::Input;
 
 use super::intent::Intent;
-use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-use flotilla_protocol::CheckoutStatus;
-use flotilla_protocol::WorkItemIdentity;
 
 #[derive(Clone)]
 pub struct DirEntry {
@@ -93,12 +93,12 @@ pub struct RepoUiState {
 impl RepoUiState {
     /// Replace the table view and restore selection by work item identity.
     pub fn update_table_view(&mut self, table_view: GroupedWorkItems) {
-        let prev_identity = self
-            .selected_selectable_idx
-            .and_then(|si| self.table_view.selectable_indices.get(si).copied())
-            .and_then(|ti| match self.table_view.table_entries.get(ti) {
-                Some(GroupEntry::Item(item)) => Some(item.identity.clone()),
-                _ => None,
+        let prev_identity =
+            self.selected_selectable_idx.and_then(|si| self.table_view.selectable_indices.get(si).copied()).and_then(|ti| {
+                match self.table_view.table_entries.get(ti) {
+                    Some(GroupEntry::Item(item)) => Some(item.identity.clone()),
+                    _ => None,
+                }
             });
 
         self.table_view = table_view;
@@ -107,29 +107,22 @@ impl RepoUiState {
             self.selected_selectable_idx = None;
             self.table_state.select(None);
         } else if let Some(ref identity) = prev_identity {
-            let found = self
-                .table_view
-                .selectable_indices
-                .iter()
-                .enumerate()
-                .find(|(_, &ti)| {
-                    matches!(
-                        self.table_view.table_entries.get(ti),
-                        Some(GroupEntry::Item(item)) if item.identity == *identity
-                    )
-                });
+            let found = self.table_view.selectable_indices.iter().enumerate().find(|(_, &ti)| {
+                matches!(
+                    self.table_view.table_entries.get(ti),
+                    Some(GroupEntry::Item(item)) if item.identity == *identity
+                )
+            });
             if let Some((si, &ti)) = found {
                 self.selected_selectable_idx = Some(si);
                 self.table_state.select(Some(ti));
             } else {
                 self.selected_selectable_idx = Some(0);
-                self.table_state
-                    .select(Some(self.table_view.selectable_indices[0]));
+                self.table_state.select(Some(self.table_view.selectable_indices[0]));
             }
         } else {
             self.selected_selectable_idx = Some(0);
-            self.table_state
-                .select(Some(self.table_view.selectable_indices[0]));
+            self.table_state.select(Some(self.table_view.selectable_indices[0]));
         }
 
         // Clean up stale multi-select identities
@@ -142,8 +135,7 @@ impl RepoUiState {
                 _ => None,
             })
             .collect();
-        self.multi_selected
-            .retain(|id| current_identities.contains(id));
+        self.multi_selected.retain(|id| current_identities.contains(id));
     }
 }
 
@@ -198,11 +190,7 @@ pub struct EventLogUiState {
 
 impl Default for EventLogUiState {
     fn default() -> Self {
-        Self {
-            selected: None,
-            count: 0,
-            filter: tracing::Level::INFO,
-        }
+        Self { selected: None, count: 0, filter: tracing::Level::INFO }
     }
 }
 
@@ -220,10 +208,7 @@ pub struct UiState {
 
 impl UiState {
     pub fn new(repo_paths: &[PathBuf]) -> Self {
-        let repo_ui = repo_paths
-            .iter()
-            .map(|p| (p.clone(), RepoUiState::default()))
-            .collect();
+        let repo_ui = repo_paths.iter().map(|p| (p.clone(), RepoUiState::default())).collect();
         Self {
             mode: UiMode::default(),
             repo_ui,
@@ -263,50 +248,12 @@ mod tests {
             (UiMode::Normal, false),
             (UiMode::Help, false),
             (UiMode::Config, true),
-            (
-                UiMode::ActionMenu {
-                    items: vec![],
-                    index: 0,
-                },
-                false,
-            ),
-            (
-                UiMode::BranchInput {
-                    input: Input::default(),
-                    kind: BranchInputKind::Manual,
-                    pending_issue_ids: vec![],
-                },
-                false,
-            ),
-            (
-                UiMode::FilePicker {
-                    input: Input::default(),
-                    dir_entries: vec![],
-                    selected: 0,
-                },
-                false,
-            ),
-            (
-                UiMode::DeleteConfirm {
-                    info: None,
-                    loading: false,
-                    terminal_keys: vec![],
-                },
-                false,
-            ),
-            (
-                UiMode::CloseConfirm {
-                    id: "42".into(),
-                    title: "test".into(),
-                },
-                false,
-            ),
-            (
-                UiMode::IssueSearch {
-                    input: Input::default(),
-                },
-                false,
-            ),
+            (UiMode::ActionMenu { items: vec![], index: 0 }, false),
+            (UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] }, false),
+            (UiMode::FilePicker { input: Input::default(), dir_entries: vec![], selected: 0 }, false),
+            (UiMode::DeleteConfirm { info: None, loading: false, terminal_keys: vec![] }, false),
+            (UiMode::CloseConfirm { id: "42".into(), title: "test".into() }, false),
+            (UiMode::IssueSearch { input: Input::default() }, false),
         ];
         for (mode, expected) in &cases {
             assert_eq!(mode.is_config(), *expected, "failed for mode variant");
@@ -339,11 +286,7 @@ mod tests {
 
     #[test]
     fn new_with_multiple_paths_creates_correct_count() {
-        let paths = vec![
-            PathBuf::from("/repo/a"),
-            PathBuf::from("/repo/b"),
-            PathBuf::from("/repo/c"),
-        ];
+        let paths = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b"), PathBuf::from("/repo/c")];
         let state = UiState::new(&paths);
         assert_eq!(state.repo_ui.len(), 3);
         for p in &paths {

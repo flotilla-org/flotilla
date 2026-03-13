@@ -4,14 +4,15 @@
 //! responses keyed by `(cmd, args)` and tracks which `cwd` paths and
 //! `exists` calls were made.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use async_trait::async_trait;
 
-use crate::providers::discovery::EnvVars;
-use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::{discovery::EnvVars, ChannelLabel, CommandOutput, CommandRunner};
 
 type ResponseMap = HashMap<(String, String), Vec<Result<String, String>>>;
 
@@ -34,39 +35,22 @@ pub(crate) struct TestEnvVars {
 
 impl DiscoveryMockRunner {
     pub(crate) fn builder() -> DiscoveryMockRunnerBuilder {
-        DiscoveryMockRunnerBuilder {
-            responses: HashMap::new(),
-            tool_exists: HashMap::new(),
-        }
+        DiscoveryMockRunnerBuilder { responses: HashMap::new(), tool_exists: HashMap::new() }
     }
 
     #[allow(dead_code)]
     pub(crate) fn saw_cwd(&self, cwd: &Path) -> bool {
-        self.seen_cwds
-            .lock()
-            .expect("lock poisoned")
-            .iter()
-            .any(|p| p == cwd)
+        self.seen_cwds.lock().expect("lock poisoned").iter().any(|p| p == cwd)
     }
 
     #[allow(dead_code)]
     pub(crate) fn exists_call_count(&self, cmd: &str) -> usize {
-        self.exists_calls
-            .lock()
-            .expect("lock poisoned")
-            .iter()
-            .filter(|(called, _)| called == cmd)
-            .count()
+        self.exists_calls.lock().expect("lock poisoned").iter().filter(|(called, _)| called == cmd).count()
     }
 }
 
 impl DiscoveryMockRunnerBuilder {
-    pub(crate) fn on_run(
-        mut self,
-        cmd: &str,
-        args: &[&str],
-        response: Result<String, String>,
-    ) -> Self {
+    pub(crate) fn on_run(mut self, cmd: &str, args: &[&str], response: Result<String, String>) -> Self {
         let key = (cmd.to_string(), args.join(" "));
         self.responses.entry(key).or_default().push(response);
         self
@@ -94,12 +78,7 @@ impl TestEnvVars {
         V: Into<String>,
         I: IntoIterator<Item = (K, V)>,
     {
-        Self {
-            vars: vars
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
-        }
+        Self { vars: vars.into_iter().map(|(key, value)| (key.into(), value.into())).collect() }
     }
 }
 
@@ -111,17 +90,8 @@ impl EnvVars for TestEnvVars {
 
 #[async_trait]
 impl CommandRunner for DiscoveryMockRunner {
-    async fn run(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        _label: &ChannelLabel,
-    ) -> Result<String, String> {
-        self.seen_cwds
-            .lock()
-            .expect("lock poisoned")
-            .push(cwd.to_path_buf());
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        self.seen_cwds.lock().expect("lock poisoned").push(cwd.to_path_buf());
         let key = (cmd.to_string(), args.join(" "));
         let mut map = self.responses.lock().expect("lock poisoned");
         if let Some(queue) = map.get_mut(&key) {
@@ -129,38 +99,18 @@ impl CommandRunner for DiscoveryMockRunner {
                 return queue.remove(0);
             }
         }
-        Err(format!(
-            "DiscoveryMockRunner: no response for {cmd} {}",
-            args.join(" ")
-        ))
+        Err(format!("DiscoveryMockRunner: no response for {cmd} {}", args.join(" ")))
     }
 
-    async fn run_output(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<CommandOutput, String> {
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
-            Ok(stdout) => Ok(CommandOutput {
-                stdout,
-                stderr: String::new(),
-                success: true,
-            }),
-            Err(stderr) => Ok(CommandOutput {
-                stdout: String::new(),
-                stderr,
-                success: false,
-            }),
+            Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
+            Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
         }
     }
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-        self.exists_calls
-            .lock()
-            .expect("lock poisoned")
-            .push((cmd.to_string(), args.join(" ")));
+        self.exists_calls.lock().expect("lock poisoned").push((cmd.to_string(), args.join(" ")));
         self.tool_exists.get(cmd).copied().unwrap_or(false)
     }
 }

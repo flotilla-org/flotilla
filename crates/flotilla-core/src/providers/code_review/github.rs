@@ -1,9 +1,14 @@
-use crate::providers::github_api::{clamp_per_page, GhApi};
-use crate::providers::types::*;
-use crate::providers::{gh_api_get, run, CommandRunner};
+use std::{path::Path, sync::Arc};
+
 use async_trait::async_trait;
-use std::path::Path;
-use std::sync::Arc;
+
+use crate::providers::{
+    gh_api_get,
+    github_api::{clamp_per_page, GhApi},
+    run,
+    types::*,
+    CommandRunner,
+};
 
 pub struct GitHubCodeReview {
     provider_name: String,
@@ -23,18 +28,8 @@ struct GhPr {
 }
 
 impl GitHubCodeReview {
-    pub fn new(
-        provider_name: String,
-        repo_slug: String,
-        api: Arc<dyn GhApi>,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Self {
-        Self {
-            provider_name,
-            repo_slug,
-            api,
-            runner,
-        }
+    pub fn new(provider_name: String, repo_slug: String, api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>) -> Self {
+        Self { provider_name, repo_slug, api, runner }
     }
 
     fn parse_state(state: &str) -> ChangeRequestStatus {
@@ -89,43 +84,29 @@ impl GitHubCodeReview {
             }
         }
 
-        let status = if pr.state.to_uppercase() == "OPEN" && pr.is_draft {
-            ChangeRequestStatus::Draft
-        } else {
-            Self::parse_state(&pr.state)
-        };
+        let status =
+            if pr.state.to_uppercase() == "OPEN" && pr.is_draft { ChangeRequestStatus::Draft } else { Self::parse_state(&pr.state) };
 
-        (
-            id,
-            ChangeRequest {
-                title: pr.title.clone(),
-                branch: pr.head_ref_name.clone(),
-                status,
-                body: pr.body.clone(),
-                correlation_keys,
-                association_keys,
-                provider_name: self.provider_name.clone(),
-                provider_display_name: "GitHub".into(),
-            },
-        )
+        (id, ChangeRequest {
+            title: pr.title.clone(),
+            branch: pr.head_ref_name.clone(),
+            status,
+            body: pr.body.clone(),
+            correlation_keys,
+            association_keys,
+            provider_name: self.provider_name.clone(),
+            provider_display_name: "GitHub".into(),
+        })
     }
 }
 
 #[async_trait]
 impl super::CodeReview for GitHubCodeReview {
-    async fn list_change_requests(
-        &self,
-        repo_root: &Path,
-        limit: usize,
-    ) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         let per_page = clamp_per_page(limit);
-        let endpoint = format!(
-            "repos/{}/pulls?state=open&per_page={}",
-            self.repo_slug, per_page
-        );
+        let endpoint = format!("repos/{}/pulls?state=open&per_page={}", self.repo_slug, per_page);
         let body = gh_api_get!(self.api, &endpoint, repo_root)?;
-        let items: Vec<serde_json::Value> =
-            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         Ok(items
             .iter()
@@ -137,46 +118,25 @@ impl super::CodeReview for GitHubCodeReview {
                 let body_text = v["body"].as_str().map(|s| s.to_string());
                 let is_draft = v["draft"].as_bool().unwrap_or(false);
 
-                let pr = GhPr {
-                    number,
-                    title,
-                    head_ref_name: head_ref,
-                    state,
-                    body: body_text,
-                    is_draft,
-                };
+                let pr = GhPr { number, title, head_ref_name: head_ref, state, body: body_text, is_draft };
                 Some(self.gh_pr_to_change_request(&pr))
             })
             .collect())
     }
 
-    async fn get_change_request(
-        &self,
-        repo_root: &Path,
-        id: &str,
-    ) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
         let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         let number = v["number"].as_i64().ok_or("missing number")?;
         let title = v["title"].as_str().ok_or("missing title")?.to_string();
-        let head_ref = v["head"]["ref"]
-            .as_str()
-            .ok_or("missing head ref")?
-            .to_string();
+        let head_ref = v["head"]["ref"].as_str().ok_or("missing head ref")?.to_string();
         let state = v["state"].as_str().unwrap_or("open").to_string();
         let body_text = v["body"].as_str().map(|s| s.to_string());
         let is_draft = v["draft"].as_bool().unwrap_or(false);
 
-        let pr = GhPr {
-            number,
-            title,
-            head_ref_name: head_ref,
-            state,
-            body: body_text,
-            is_draft,
-        };
+        let pr = GhPr { number, title, head_ref_name: head_ref, state, body: body_text, is_draft };
         Ok(self.gh_pr_to_change_request(&pr))
     }
 
@@ -190,19 +150,11 @@ impl super::CodeReview for GitHubCodeReview {
         Ok(())
     }
 
-    async fn list_merged_branch_names(
-        &self,
-        repo_root: &Path,
-        limit: usize,
-    ) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, repo_root: &Path, limit: usize) -> Result<Vec<String>, String> {
         let per_page = clamp_per_page(limit);
-        let endpoint = format!(
-            "repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}",
-            self.repo_slug, per_page
-        );
+        let endpoint = format!("repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}", self.repo_slug, per_page);
         let body = gh_api_get!(self.api, &endpoint, repo_root)?;
-        let items: Vec<serde_json::Value> =
-            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         Ok(items
             .iter()
@@ -214,35 +166,27 @@ impl super::CodeReview for GitHubCodeReview {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
     use super::*;
-    use crate::providers::code_review::CodeReview;
-    use crate::providers::replay::{self, Masks};
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    use crate::providers::{
+        code_review::CodeReview,
+        github_api::GhApi,
+        replay::{
+            Masks, {self},
+        },
+        CommandRunner,
+    };
 
     fn fixture(name: &str) -> String {
-        format!(
-            "{}/src/providers/code_review/fixtures/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            name
-        )
+        format!("{}/src/providers/code_review/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
     }
 
     fn repo_root_for_recording() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
     }
 
-    fn build_api_and_runner(
-        session: &replay::Session,
-    ) -> (
-        Arc<dyn crate::providers::github_api::GhApi>,
-        Arc<dyn crate::providers::CommandRunner>,
-    ) {
+    fn build_api_and_runner(session: &replay::Session) -> (Arc<dyn GhApi>, Arc<dyn CommandRunner>) {
         let runner = replay::test_runner(session);
         let api = replay::test_gh_api(session);
         (api, runner)
@@ -253,18 +197,11 @@ mod tests {
         let repo_slug = "rjwittams/flotilla".to_string();
 
         let session = replay::test_session(&fixture("github_prs.yaml"), Masks::new());
-        let repo_root = if session.is_recording() {
-            repo_root_for_recording()
-        } else {
-            PathBuf::from("/test/repo")
-        };
+        let repo_root = if session.is_recording() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
         let (api, runner) = build_api_and_runner(&session);
 
         let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
-        let prs = provider
-            .list_change_requests(&repo_root, 100)
-            .await
-            .unwrap();
+        let prs = provider.list_change_requests(&repo_root, 100).await.unwrap();
 
         // Currently 0 open PRs, so list may be empty — validate structure
         for (id, cr) in &prs {
@@ -281,18 +218,11 @@ mod tests {
         let repo_slug = "rjwittams/flotilla".to_string();
 
         let session = replay::test_session(&fixture("github_merged.yaml"), Masks::new());
-        let repo_root = if session.is_recording() {
-            repo_root_for_recording()
-        } else {
-            PathBuf::from("/test/repo")
-        };
+        let repo_root = if session.is_recording() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
         let (api, runner) = build_api_and_runner(&session);
 
         let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
-        let branches = provider
-            .list_merged_branch_names(&repo_root, 5)
-            .await
-            .unwrap();
+        let branches = provider.list_merged_branch_names(&repo_root, 5).await.unwrap();
 
         // The repo has closed/merged PRs, so we expect some results
         for name in &branches {
@@ -364,18 +294,11 @@ mod tests {
             ("Just a description", vec![]),
             ("", vec![]),
             ("Fixes 7", vec![]),
-            (
-                "This PR fixes #12 by updating the parser.\nAlso closes #34.",
-                vec!["12", "34"],
-            ),
+            ("This PR fixes #12 by updating the parser.\nAlso closes #34.", vec!["12", "34"]),
         ];
         for (input, expected) in cases {
             let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
-            assert_eq!(
-                GitHubCodeReview::parse_linked_issues(input),
-                expected,
-                "{input}"
-            );
+            assert_eq!(GitHubCodeReview::parse_linked_issues(input), expected, "{input}");
         }
     }
 
@@ -413,18 +336,9 @@ mod tests {
         assert_eq!(cr.title, "Add feature");
         assert_eq!(cr.branch, "feat/add-feature");
         assert_eq!(cr.status, ChangeRequestStatus::Open);
-        assert!(cr
-            .correlation_keys
-            .contains(&CorrelationKey::Branch("feat/add-feature".into())));
-        assert!(cr
-            .correlation_keys
-            .contains(&CorrelationKey::ChangeRequestRef(
-                "github".into(),
-                "42".into()
-            )));
-        assert!(cr
-            .association_keys
-            .contains(&AssociationKey::IssueRef("github".into(), "7".into())));
+        assert!(cr.correlation_keys.contains(&CorrelationKey::Branch("feat/add-feature".into())));
+        assert!(cr.correlation_keys.contains(&CorrelationKey::ChangeRequestRef("github".into(), "42".into())));
+        assert!(cr.association_keys.contains(&AssociationKey::IssueRef("github".into(), "7".into())));
     }
 
     #[test]
@@ -459,12 +373,8 @@ mod tests {
         pr.head_ref_name = "fix".into();
         pr.body = Some("Also closes #2".into());
         let (_, cr) = provider.gh_pr_to_change_request(&pr);
-        assert!(cr
-            .association_keys
-            .contains(&AssociationKey::IssueRef("github".into(), "1".into())));
-        assert!(cr
-            .association_keys
-            .contains(&AssociationKey::IssueRef("github".into(), "2".into())));
+        assert!(cr.association_keys.contains(&AssociationKey::IssueRef("github".into(), "1".into())));
+        assert!(cr.association_keys.contains(&AssociationKey::IssueRef("github".into(), "2".into())));
     }
 
     #[test]
@@ -475,15 +385,7 @@ mod tests {
         pr.head_ref_name = "fix".into();
         pr.body = Some("Closes #5".into());
         let (_, cr) = provider.gh_pr_to_change_request(&pr);
-        let issue_refs: Vec<_> = cr
-            .association_keys
-            .iter()
-            .filter(|k| matches!(k, AssociationKey::IssueRef(_, _)))
-            .collect();
-        assert_eq!(
-            issue_refs.len(),
-            1,
-            "same issue from title and body should deduplicate"
-        );
+        let issue_refs: Vec<_> = cr.association_keys.iter().filter(|k| matches!(k, AssociationKey::IssueRef(_, _))).collect();
+        assert_eq!(issue_refs.len(), 1, "same issue from title and body should deduplicate");
     }
 }

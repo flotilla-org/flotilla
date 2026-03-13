@@ -1,12 +1,10 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 // Re-export provider data types from the protocol crate.
 // These are the canonical definitions; core uses them via this re-export.
 pub use flotilla_protocol::{
-    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession,
-    CommitInfo, CorrelationKey, Issue, IssueChangeset, IssuePage, SessionStatus, WorkingTreeStatus,
-    Workspace,
+    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
+    IssueChangeset, IssuePage, SessionStatus, WorkingTreeStatus, Workspace,
 };
 
 /// Criteria passed to coding agents so they can filter results to a specific repo.

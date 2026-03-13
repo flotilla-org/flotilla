@@ -4,10 +4,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::providers::discovery::{
-    EnvVars, EnvironmentAssertion, HostPlatform, RepoDetector, VcsKind,
+use crate::providers::{
+    discovery::{EnvVars, EnvironmentAssertion, HostPlatform, RepoDetector, VcsKind},
+    run, CommandRunner,
 };
-use crate::providers::{run, CommandRunner};
 
 // ---------------------------------------------------------------------------
 // VcsRepoDetector (RepoDetector)
@@ -18,26 +18,13 @@ pub struct VcsRepoDetector;
 
 #[async_trait]
 impl RepoDetector for VcsRepoDetector {
-    async fn detect(
-        &self,
-        repo_root: &Path,
-        _runner: &dyn CommandRunner,
-        _env: &dyn EnvVars,
-    ) -> Vec<EnvironmentAssertion> {
+    async fn detect(&self, repo_root: &Path, _runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
         let git_path = repo_root.join(".git");
         if git_path.is_dir() {
-            vec![EnvironmentAssertion::vcs_checkout(
-                repo_root,
-                VcsKind::Git,
-                true,
-            )]
+            vec![EnvironmentAssertion::vcs_checkout(repo_root, VcsKind::Git, true)]
         } else if git_path.is_file() {
             // .git file indicates a worktree
-            vec![EnvironmentAssertion::vcs_checkout(
-                repo_root,
-                VcsKind::Git,
-                false,
-            )]
+            vec![EnvironmentAssertion::vcs_checkout(repo_root, VcsKind::Git, false)]
         } else {
             vec![]
         }
@@ -57,46 +44,22 @@ impl RepoDetector for VcsRepoDetector {
 pub struct RemoteHostDetector;
 
 /// Get the URL of the remote for the current tracking branch.
-async fn tracking_remote_url(
-    repo_root: &Path,
-    runner: &dyn CommandRunner,
-) -> Option<(String, String)> {
-    let upstream = run!(
-        runner,
-        "git",
-        &["rev-parse", "--abbrev-ref", "@{upstream}"],
-        repo_root,
-    )
-    .ok()?;
+async fn tracking_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Option<(String, String)> {
+    let upstream = run!(runner, "git", &["rev-parse", "--abbrev-ref", "@{upstream}"], repo_root,).ok()?;
     let upstream = upstream.trim();
     let remotes_output = run!(runner, "git", &["remote"], repo_root).ok()?;
-    let remotes: Vec<&str> = remotes_output
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect();
+    let remotes: Vec<&str> = remotes_output.lines().map(|line| line.trim()).filter(|line| !line.is_empty()).collect();
     // upstream looks like "origin/main" or "team/origin/main". Match it against
     // configured remotes and prefer the longest prefix to handle remotes containing '/'.
     let remote_name = remotes
         .into_iter()
-        .filter(|remote| {
-            upstream == *remote
-                || upstream
-                    .strip_prefix(remote)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
+        .filter(|remote| upstream == *remote || upstream.strip_prefix(remote).is_some_and(|suffix| suffix.starts_with('/')))
         .max_by_key(|remote| remote.len())
         .or_else(|| upstream.split('/').next())?;
     if remote_name.is_empty() {
         return None;
     }
-    let url = run!(
-        runner,
-        "git",
-        &["remote", "get-url", remote_name],
-        repo_root
-    )
-    .ok()?;
+    let url = run!(runner, "git", &["remote", "get-url", remote_name], repo_root).ok()?;
     let url = url.trim().to_string();
     if url.is_empty() {
         return None;
@@ -105,10 +68,7 @@ async fn tracking_remote_url(
 }
 
 /// Find the preferred remote URL and its name.
-async fn preferred_remote(
-    repo_root: &Path,
-    runner: &dyn CommandRunner,
-) -> Option<(String, String)> {
+async fn preferred_remote(repo_root: &Path, runner: &dyn CommandRunner) -> Option<(String, String)> {
     // 1. Try the tracking remote for the current branch
     if let Some(result) = tracking_remote_url(repo_root, runner).await {
         return Some(result);
@@ -116,11 +76,7 @@ async fn preferred_remote(
 
     // Get the list of remotes for steps 2 and 3
     let remotes_output = run!(runner, "git", &["remote"], repo_root).ok()?;
-    let remotes: Vec<&str> = remotes_output
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let remotes: Vec<&str> = remotes_output.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
 
     // 2. Prefer "origin" if it exists
     if remotes.contains(&"origin") {
@@ -166,9 +122,7 @@ fn extract_owner_repo(url: &str) -> Option<(String, String)> {
         rest.split_once(':').map(|(_, p)| p)
     } else {
         // https://github.com/owner/repo.git or similar
-        url.strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .and_then(|u| u.split_once('/').map(|(_, p)| p))
+        url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).and_then(|u| u.split_once('/').map(|(_, p)| p))
     }?;
     let slug = path.trim_end_matches(".git").trim_matches('/');
     let (owner, repo) = slug.split_once('/')?;
@@ -182,12 +136,7 @@ fn extract_owner_repo(url: &str) -> Option<(String, String)> {
 
 #[async_trait]
 impl RepoDetector for RemoteHostDetector {
-    async fn detect(
-        &self,
-        repo_root: &Path,
-        runner: &dyn CommandRunner,
-        _env: &dyn EnvVars,
-    ) -> Vec<EnvironmentAssertion> {
+    async fn detect(&self, repo_root: &Path, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
         let (remote_name, url) = match preferred_remote(repo_root, runner).await {
             Some(r) => r,
             None => return vec![],
@@ -200,12 +149,7 @@ impl RepoDetector for RemoteHostDetector {
             Some(r) => r,
             None => return vec![],
         };
-        vec![EnvironmentAssertion::remote_host(
-            platform,
-            owner,
-            repo,
-            remote_name,
-        )]
+        vec![EnvironmentAssertion::remote_host(platform, owner, repo, remote_name)]
     }
 }
 
@@ -216,7 +160,7 @@ impl RepoDetector for RemoteHostDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::discovery::test_support::DiscoveryMockRunner;
+    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
 
     // -- VcsRepoDetector --
 
@@ -225,20 +169,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector
-            .detect(
-                dir.path(),
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = VcsRepoDetector.detect(dir.path(), &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::VcsCheckoutDetected {
-                root,
-                kind,
-                is_main_checkout,
-            } => {
+            EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
                 assert_eq!(root, dir.path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(*is_main_checkout);
@@ -252,20 +186,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(dir.path().join(".git"), "gitdir: /some/path\n").expect("write .git file");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector
-            .detect(
-                dir.path(),
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = VcsRepoDetector.detect(dir.path(), &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::VcsCheckoutDetected {
-                root,
-                kind,
-                is_main_checkout,
-            } => {
+            EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
                 assert_eq!(root, dir.path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(!*is_main_checkout);
@@ -278,13 +202,7 @@ mod tests {
     async fn vcs_repo_detector_no_git() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector
-            .detect(
-                dir.path(),
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = VcsRepoDetector.detect(dir.path(), &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
     }
 
@@ -294,33 +212,14 @@ mod tests {
     async fn remote_host_detector_github_ssh() {
         let repo_root = Path::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
-            .on_run(
-                "git",
-                &["rev-parse", "--abbrev-ref", "@{upstream}"],
-                Err("fatal: no upstream".into()),
-            )
+            .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run(
-                "git",
-                &["remote", "get-url", "origin"],
-                Ok("git@github.com:owner/repo.git\n".into()),
-            )
+            .on_run("git", &["remote", "get-url", "origin"], Ok("git@github.com:owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector
-            .detect(
-                repo_root,
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost {
-                platform,
-                owner,
-                repo,
-                remote_name,
-            } => {
+            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
                 assert_eq!(*platform, HostPlatform::GitHub);
                 assert_eq!(owner, "owner");
                 assert_eq!(repo, "repo");
@@ -334,33 +233,14 @@ mod tests {
     async fn remote_host_detector_prefers_tracking_remote() {
         let repo_root = Path::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
-            .on_run(
-                "git",
-                &["rev-parse", "--abbrev-ref", "@{upstream}"],
-                Ok("upstream/main\n".into()),
-            )
+            .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("upstream/main\n".into()))
             .on_run("git", &["remote"], Ok("origin\nupstream\n".into()))
-            .on_run(
-                "git",
-                &["remote", "get-url", "upstream"],
-                Ok("https://github.com/upstream-owner/repo.git\n".into()),
-            )
+            .on_run("git", &["remote", "get-url", "upstream"], Ok("https://github.com/upstream-owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector
-            .detect(
-                repo_root,
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost {
-                platform,
-                owner,
-                repo,
-                remote_name,
-            } => {
+            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
                 assert_eq!(*platform, HostPlatform::GitHub);
                 assert_eq!(owner, "upstream-owner");
                 assert_eq!(repo, "repo");
@@ -374,33 +254,14 @@ mod tests {
     async fn remote_host_detector_https_url() {
         let repo_root = Path::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
-            .on_run(
-                "git",
-                &["rev-parse", "--abbrev-ref", "@{upstream}"],
-                Err("fatal: no upstream".into()),
-            )
+            .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run(
-                "git",
-                &["remote", "get-url", "origin"],
-                Ok("https://github.com/owner/repo.git\n".into()),
-            )
+            .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector
-            .detect(
-                repo_root,
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost {
-                platform,
-                owner,
-                repo,
-                remote_name,
-            } => {
+            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
                 assert_eq!(*platform, HostPlatform::GitHub);
                 assert_eq!(owner, "owner");
                 assert_eq!(repo, "repo");
@@ -414,20 +275,10 @@ mod tests {
     async fn remote_host_detector_no_remotes() {
         let repo_root = Path::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
-            .on_run(
-                "git",
-                &["rev-parse", "--abbrev-ref", "@{upstream}"],
-                Err("fatal: no upstream".into()),
-            )
+            .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok(String::new()))
             .build();
-        let assertions = RemoteHostDetector
-            .detect(
-                repo_root,
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
     }
 
@@ -435,33 +286,14 @@ mod tests {
     async fn remote_host_detector_gitlab() {
         let repo_root = Path::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
-            .on_run(
-                "git",
-                &["rev-parse", "--abbrev-ref", "@{upstream}"],
-                Err("fatal: no upstream".into()),
-            )
+            .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run(
-                "git",
-                &["remote", "get-url", "origin"],
-                Ok("https://gitlab.example.com/org/project.git\n".into()),
-            )
+            .on_run("git", &["remote", "get-url", "origin"], Ok("https://gitlab.example.com/org/project.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector
-            .detect(
-                repo_root,
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost {
-                platform,
-                owner,
-                repo,
-                remote_name,
-            } => {
+            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
                 assert_eq!(*platform, HostPlatform::GitLab);
                 assert_eq!(owner, "org");
                 assert_eq!(repo, "project");
@@ -475,25 +307,11 @@ mod tests {
     async fn remote_host_detector_unknown_host_returns_empty() {
         let repo_root = Path::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
-            .on_run(
-                "git",
-                &["rev-parse", "--abbrev-ref", "@{upstream}"],
-                Err("fatal: no upstream".into()),
-            )
+            .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run(
-                "git",
-                &["remote", "get-url", "origin"],
-                Ok("https://bitbucket.org/owner/repo.git\n".into()),
-            )
+            .on_run("git", &["remote", "get-url", "origin"], Ok("https://bitbucket.org/owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector
-            .detect(
-                repo_root,
-                &runner,
-                &crate::providers::discovery::test_support::TestEnvVars::default(),
-            )
-            .await;
+        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
     }
 
@@ -501,63 +319,39 @@ mod tests {
 
     #[test]
     fn detect_host_from_url_github() {
-        assert_eq!(
-            detect_host_from_url("git@github.com:owner/repo.git"),
-            Some(HostPlatform::GitHub)
-        );
-        assert_eq!(
-            detect_host_from_url("https://GitHub.com/owner/repo"),
-            Some(HostPlatform::GitHub)
-        );
+        assert_eq!(detect_host_from_url("git@github.com:owner/repo.git"), Some(HostPlatform::GitHub));
+        assert_eq!(detect_host_from_url("https://GitHub.com/owner/repo"), Some(HostPlatform::GitHub));
     }
 
     #[test]
     fn detect_host_from_url_gitlab() {
-        assert_eq!(
-            detect_host_from_url("https://gitlab.mycompany.com/org/project"),
-            Some(HostPlatform::GitLab)
-        );
+        assert_eq!(detect_host_from_url("https://gitlab.mycompany.com/org/project"), Some(HostPlatform::GitLab));
     }
 
     #[test]
     fn detect_host_from_url_unknown() {
-        assert_eq!(
-            detect_host_from_url("https://bitbucket.org/owner/repo"),
-            None
-        );
+        assert_eq!(detect_host_from_url("https://bitbucket.org/owner/repo"), None);
         assert_eq!(detect_host_from_url(""), None);
     }
 
     #[test]
     fn extract_owner_repo_ssh() {
-        assert_eq!(
-            extract_owner_repo("git@github.com:owner/repo.git"),
-            Some(("owner".into(), "repo".into()))
-        );
+        assert_eq!(extract_owner_repo("git@github.com:owner/repo.git"), Some(("owner".into(), "repo".into())));
     }
 
     #[test]
     fn extract_owner_repo_https() {
-        assert_eq!(
-            extract_owner_repo("https://github.com/owner/repo.git"),
-            Some(("owner".into(), "repo".into()))
-        );
+        assert_eq!(extract_owner_repo("https://github.com/owner/repo.git"), Some(("owner".into(), "repo".into())));
     }
 
     #[test]
     fn extract_owner_repo_no_git_suffix() {
-        assert_eq!(
-            extract_owner_repo("git@github.com:owner/repo"),
-            Some(("owner".into(), "repo".into()))
-        );
+        assert_eq!(extract_owner_repo("git@github.com:owner/repo"), Some(("owner".into(), "repo".into())));
     }
 
     #[test]
     fn extract_owner_repo_trailing_slash() {
-        assert_eq!(
-            extract_owner_repo("https://github.com/owner/repo/"),
-            Some(("owner".into(), "repo".into()))
-        );
+        assert_eq!(extract_owner_repo("https://github.com/owner/repo/"), Some(("owner".into(), "repo".into())));
     }
 
     #[test]
@@ -569,9 +363,6 @@ mod tests {
     #[test]
     fn extract_owner_repo_deep_path() {
         // For deep paths like org/sub/repo, we take owner=org, repo=sub
-        assert_eq!(
-            extract_owner_repo("https://github.com/org/sub/repo.git"),
-            Some(("org".into(), "sub".into()))
-        );
+        assert_eq!(extract_owner_repo("https://github.com/org/sub/repo.git"), Some(("org".into(), "sub".into())));
     }
 }

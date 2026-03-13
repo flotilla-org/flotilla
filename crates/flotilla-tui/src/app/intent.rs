@@ -1,5 +1,6 @@
-use super::App;
 use flotilla_protocol::{Command, HostName, RepoLabels, WorkItem, WorkItemKind};
+
+use super::App;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
@@ -40,20 +41,14 @@ impl Intent {
     pub fn is_available(&self, item: &WorkItem) -> bool {
         match self {
             Intent::SwitchToWorkspace => !item.workspace_refs.is_empty(),
-            Intent::CreateWorkspace => {
-                item.checkout_key().is_some() && item.workspace_refs.is_empty()
-            }
+            Intent::CreateWorkspace => item.checkout_key().is_some() && item.workspace_refs.is_empty(),
             Intent::RemoveCheckout => item.checkout_key().is_some() && !item.is_main_checkout,
-            Intent::CreateCheckoutAndWorkspace => {
-                item.checkout_key().is_none() && item.branch.is_some()
-            }
+            Intent::CreateCheckoutAndWorkspace => item.checkout_key().is_none() && item.branch.is_some(),
             Intent::GenerateBranchName => item.branch.is_none() && !item.issue_keys.is_empty(),
             Intent::OpenChangeRequest => item.change_request_key.is_some(),
             Intent::OpenIssue => !item.issue_keys.is_empty(),
             Intent::LinkIssuesToChangeRequest => {
-                item.change_request_key.is_some()
-                    && item.checkout_key().is_some()
-                    && !item.issue_keys.is_empty()
+                item.change_request_key.is_some() && item.checkout_key().is_some() && !item.issue_keys.is_empty()
             }
             Intent::TeleportSession => item.session_key.is_some(),
             Intent::ArchiveSession => item.session_key.is_some(),
@@ -110,19 +105,8 @@ impl Intent {
     /// Returns None if the intent can't be resolved (missing data).
     pub fn resolve(&self, item: &WorkItem, app: &App) -> Option<Command> {
         match self {
-            Intent::SwitchToWorkspace => {
-                item.workspace_refs
-                    .first()
-                    .map(|ws_ref| Command::SelectWorkspace {
-                        ws_ref: ws_ref.clone(),
-                    })
-            }
-            Intent::CreateWorkspace => {
-                item.checkout_key()
-                    .map(|p| Command::CreateWorkspaceForCheckout {
-                        checkout_path: p.path.clone(),
-                    })
-            }
+            Intent::SwitchToWorkspace => item.workspace_refs.first().map(|ws_ref| Command::SelectWorkspace { ws_ref: ws_ref.clone() }),
+            Intent::CreateWorkspace => item.checkout_key().map(|p| Command::CreateWorkspaceForCheckout { checkout_path: p.path.clone() }),
             Intent::RemoveCheckout => {
                 if item.kind != WorkItemKind::Checkout || item.is_main_checkout {
                     return None;
@@ -130,37 +114,22 @@ impl Intent {
                 let branch = item.branch.as_ref()?.to_string();
                 let checkout_path = item.checkout_key().map(|p| p.path.clone());
                 let change_request_id = item.change_request_key.clone();
-                Some(Command::FetchCheckoutStatus {
-                    branch,
-                    checkout_path,
-                    change_request_id,
-                })
+                Some(Command::FetchCheckoutStatus { branch, checkout_path, change_request_id })
             }
-            Intent::CreateCheckoutAndWorkspace => {
-                item.branch.as_ref().map(|branch| Command::CreateCheckout {
-                    branch: branch.to_string(),
-                    create_branch: item.kind != WorkItemKind::RemoteBranch
-                        && item.kind != WorkItemKind::ChangeRequest,
-                    issue_ids: Vec::new(),
-                })
-            }
+            Intent::CreateCheckoutAndWorkspace => item.branch.as_ref().map(|branch| Command::CreateCheckout {
+                branch: branch.to_string(),
+                create_branch: item.kind != WorkItemKind::RemoteBranch && item.kind != WorkItemKind::ChangeRequest,
+                issue_ids: Vec::new(),
+            }),
             Intent::GenerateBranchName => {
                 if !item.issue_keys.is_empty() {
-                    Some(Command::GenerateBranchName {
-                        issue_keys: item.issue_keys.clone(),
-                    })
+                    Some(Command::GenerateBranchName { issue_keys: item.issue_keys.clone() })
                 } else {
                     None
                 }
             }
-            Intent::OpenChangeRequest => item
-                .change_request_key
-                .as_ref()
-                .map(|k| Command::OpenChangeRequest { id: k.clone() }),
-            Intent::OpenIssue => item
-                .issue_keys
-                .first()
-                .map(|k| Command::OpenIssue { id: k.clone() }),
+            Intent::OpenChangeRequest => item.change_request_key.as_ref().map(|k| Command::OpenChangeRequest { id: k.clone() }),
+            Intent::OpenIssue => item.issue_keys.first().map(|k| Command::OpenIssue { id: k.clone() }),
             Intent::LinkIssuesToChangeRequest => {
                 let change_request_key = item.change_request_key.as_ref()?;
                 let co_key = item.checkout_key()?;
@@ -193,21 +162,14 @@ impl Intent {
                 if missing.is_empty() {
                     return None;
                 }
-                Some(Command::LinkIssuesToChangeRequest {
-                    change_request_id: change_request_key.clone(),
-                    issue_ids: missing,
-                })
+                Some(Command::LinkIssuesToChangeRequest { change_request_id: change_request_key.clone(), issue_ids: missing })
             }
-            Intent::TeleportSession => {
-                item.session_key.as_ref().map(|k| Command::TeleportSession {
-                    session_id: k.clone(),
-                    branch: item.branch.clone(),
-                    checkout_key: item.checkout_key().map(|p| p.path.clone()),
-                })
-            }
-            Intent::ArchiveSession => item.session_key.as_ref().map(|k| Command::ArchiveSession {
+            Intent::TeleportSession => item.session_key.as_ref().map(|k| Command::TeleportSession {
                 session_id: k.clone(),
+                branch: item.branch.clone(),
+                checkout_key: item.checkout_key().map(|p| p.path.clone()),
             }),
+            Intent::ArchiveSession => item.session_key.as_ref().map(|k| Command::ArchiveSession { session_id: k.clone() }),
             Intent::CloseChangeRequest => {
                 let cr_key = item.change_request_key.as_ref()?;
                 let providers = &app.model.active().providers;
@@ -249,12 +211,12 @@ impl Intent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::test_support::{
-        bare_item, checkout_item, pr_item, remote_branch_item, session_item, stub_app,
-    };
-    use flotilla_protocol::{CategoryLabels, CheckoutRef, HostName, HostPath, RepoLabels};
     use std::path::PathBuf;
+
+    use flotilla_protocol::{CategoryLabels, CheckoutRef, HostName, HostPath, RepoLabels};
+
+    use super::*;
+    use crate::app::test_support::{bare_item, checkout_item, pr_item, remote_branch_item, session_item, stub_app};
 
     // ── Helpers ──
 
@@ -264,26 +226,10 @@ mod tests {
 
     fn custom_labels() -> RepoLabels {
         RepoLabels {
-            checkouts: CategoryLabels {
-                section: "Worktrees".into(),
-                noun: "worktree".into(),
-                abbr: "wt".into(),
-            },
-            code_review: CategoryLabels {
-                section: "Pull Requests".into(),
-                noun: "PR".into(),
-                abbr: "pr".into(),
-            },
-            issues: CategoryLabels {
-                section: "Issues".into(),
-                noun: "issue".into(),
-                abbr: "iss".into(),
-            },
-            cloud_agents: CategoryLabels {
-                section: "Sessions".into(),
-                noun: "session".into(),
-                abbr: "sess".into(),
-            },
+            checkouts: CategoryLabels { section: "Worktrees".into(), noun: "worktree".into(), abbr: "wt".into() },
+            code_review: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "pr".into() },
+            issues: CategoryLabels { section: "Issues".into(), noun: "issue".into(), abbr: "iss".into() },
+            cloud_agents: CategoryLabels { section: "Sessions".into(), noun: "session".into(), abbr: "sess".into() },
         }
     }
 
@@ -443,29 +389,14 @@ mod tests {
     #[test]
     fn label_with_default_labels() {
         let labels = default_labels();
-        assert_eq!(
-            Intent::SwitchToWorkspace.label(&labels),
-            "Switch to workspace"
-        );
+        assert_eq!(Intent::SwitchToWorkspace.label(&labels), "Switch to workspace");
         assert_eq!(Intent::CreateWorkspace.label(&labels), "Create workspace");
         assert_eq!(Intent::RemoveCheckout.label(&labels), "Remove item");
-        assert_eq!(
-            Intent::CreateCheckoutAndWorkspace.label(&labels),
-            "Create item + workspace"
-        );
-        assert_eq!(
-            Intent::GenerateBranchName.label(&labels),
-            "Generate branch name"
-        );
-        assert_eq!(
-            Intent::OpenChangeRequest.label(&labels),
-            "Open item in browser"
-        );
+        assert_eq!(Intent::CreateCheckoutAndWorkspace.label(&labels), "Create item + workspace");
+        assert_eq!(Intent::GenerateBranchName.label(&labels), "Generate branch name");
+        assert_eq!(Intent::OpenChangeRequest.label(&labels), "Open item in browser");
         assert_eq!(Intent::OpenIssue.label(&labels), "Open issue in browser");
-        assert_eq!(
-            Intent::LinkIssuesToChangeRequest.label(&labels),
-            "Link issues to item"
-        );
+        assert_eq!(Intent::LinkIssuesToChangeRequest.label(&labels), "Link issues to item");
         assert_eq!(Intent::TeleportSession.label(&labels), "Teleport session");
         assert_eq!(Intent::ArchiveSession.label(&labels), "Archive session");
         assert_eq!(Intent::CloseChangeRequest.label(&labels), "Close item");
@@ -475,33 +406,18 @@ mod tests {
     fn label_with_custom_labels() {
         let labels = custom_labels();
         assert_eq!(Intent::RemoveCheckout.label(&labels), "Remove worktree");
-        assert_eq!(
-            Intent::CreateCheckoutAndWorkspace.label(&labels),
-            "Create worktree + workspace"
-        );
-        assert_eq!(
-            Intent::OpenChangeRequest.label(&labels),
-            "Open PR in browser"
-        );
-        assert_eq!(
-            Intent::LinkIssuesToChangeRequest.label(&labels),
-            "Link issues to PR"
-        );
+        assert_eq!(Intent::CreateCheckoutAndWorkspace.label(&labels), "Create worktree + workspace");
+        assert_eq!(Intent::OpenChangeRequest.label(&labels), "Open PR in browser");
+        assert_eq!(Intent::LinkIssuesToChangeRequest.label(&labels), "Link issues to PR");
         assert_eq!(Intent::CloseChangeRequest.label(&labels), "Close PR");
     }
 
     #[test]
     fn label_static_strings_unaffected_by_labels() {
         let labels = custom_labels();
-        assert_eq!(
-            Intent::SwitchToWorkspace.label(&labels),
-            "Switch to workspace"
-        );
+        assert_eq!(Intent::SwitchToWorkspace.label(&labels), "Switch to workspace");
         assert_eq!(Intent::CreateWorkspace.label(&labels), "Create workspace");
-        assert_eq!(
-            Intent::GenerateBranchName.label(&labels),
-            "Generate branch name"
-        );
+        assert_eq!(Intent::GenerateBranchName.label(&labels), "Generate branch name");
         assert_eq!(Intent::OpenIssue.label(&labels), "Open issue in browser");
         assert_eq!(Intent::TeleportSession.label(&labels), "Teleport session");
         assert_eq!(Intent::ArchiveSession.label(&labels), "Archive session");
@@ -512,32 +428,20 @@ mod tests {
     #[test]
     fn shortcut_hint_remove_worktree() {
         let labels = default_labels();
-        assert_eq!(
-            Intent::RemoveCheckout.shortcut_hint(&labels),
-            Some("d:remove item".into())
-        );
+        assert_eq!(Intent::RemoveCheckout.shortcut_hint(&labels), Some("d:remove item".into()));
     }
 
     #[test]
     fn shortcut_hint_open_pr() {
         let labels = default_labels();
-        assert_eq!(
-            Intent::OpenChangeRequest.shortcut_hint(&labels),
-            Some("p:show".into())
-        );
+        assert_eq!(Intent::OpenChangeRequest.shortcut_hint(&labels), Some("p:show".into()));
     }
 
     #[test]
     fn shortcut_hint_with_custom_labels() {
         let labels = custom_labels();
-        assert_eq!(
-            Intent::RemoveCheckout.shortcut_hint(&labels),
-            Some("d:remove worktree".into())
-        );
-        assert_eq!(
-            Intent::OpenChangeRequest.shortcut_hint(&labels),
-            Some("p:show pr".into())
-        );
+        assert_eq!(Intent::RemoveCheckout.shortcut_hint(&labels), Some("d:remove worktree".into()));
+        assert_eq!(Intent::OpenChangeRequest.shortcut_hint(&labels), Some("p:show pr".into()));
     }
 
     #[test]
@@ -545,14 +449,10 @@ mod tests {
         let labels = default_labels();
         assert!(Intent::SwitchToWorkspace.shortcut_hint(&labels).is_none());
         assert!(Intent::CreateWorkspace.shortcut_hint(&labels).is_none());
-        assert!(Intent::CreateCheckoutAndWorkspace
-            .shortcut_hint(&labels)
-            .is_none());
+        assert!(Intent::CreateCheckoutAndWorkspace.shortcut_hint(&labels).is_none());
         assert!(Intent::GenerateBranchName.shortcut_hint(&labels).is_none());
         assert!(Intent::OpenIssue.shortcut_hint(&labels).is_none());
-        assert!(Intent::LinkIssuesToChangeRequest
-            .shortcut_hint(&labels)
-            .is_none());
+        assert!(Intent::LinkIssuesToChangeRequest.shortcut_hint(&labels).is_none());
         assert!(Intent::TeleportSession.shortcut_hint(&labels).is_none());
         assert!(Intent::ArchiveSession.shortcut_hint(&labels).is_none());
         assert!(Intent::CloseChangeRequest.shortcut_hint(&labels).is_none());
@@ -600,10 +500,7 @@ mod tests {
         let all_variants = all_intent_variants();
         let menu = Intent::all_in_menu_order();
         for variant in &all_variants {
-            assert!(
-                menu.contains(variant),
-                "{variant:?} missing from all_in_menu_order()"
-            );
+            assert!(menu.contains(variant), "{variant:?} missing from all_in_menu_order()");
         }
         assert_eq!(menu.len(), all_variants.len());
     }
@@ -628,8 +525,9 @@ mod tests {
     // ── resolve tests ──
     //
     // resolve() requires &App so we use the shared TUI test harness.
-    use flotilla_protocol::ProviderData;
     use std::sync::Arc;
+
+    use flotilla_protocol::ProviderData;
 
     #[test]
     fn resolve_switch_to_workspace() {
@@ -691,11 +589,7 @@ mod tests {
         let cmd = Intent::RemoveCheckout.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::FetchCheckoutStatus {
-                branch,
-                checkout_path,
-                change_request_id,
-            } => {
+            Command::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
                 assert_eq!(branch, "feat/x");
                 assert_eq!(checkout_path, Some(PathBuf::from("/tmp/feat-x")));
                 assert_eq!(change_request_id, Some("99".into()));
@@ -716,10 +610,8 @@ mod tests {
         let app = stub_app();
         let mut item = pr_item("42");
         // Even with a checkout path, the kind check prevents resolve
-        item.checkout = Some(CheckoutRef {
-            key: HostPath::new(HostName::new("test-host"), PathBuf::from("/tmp/pr-co")),
-            is_main_checkout: false,
-        });
+        item.checkout =
+            Some(CheckoutRef { key: HostPath::new(HostName::new("test-host"), PathBuf::from("/tmp/pr-co")), is_main_checkout: false });
         assert!(Intent::RemoveCheckout.resolve(&item, &app).is_none());
     }
 
@@ -737,9 +629,7 @@ mod tests {
         let item = checkout_item("feat/x", "/tmp/feat-x", false);
         let cmd = Intent::RemoveCheckout.resolve(&item, &app).unwrap();
         match cmd {
-            Command::FetchCheckoutStatus {
-                change_request_id, ..
-            } => {
+            Command::FetchCheckoutStatus { change_request_id, .. } => {
                 assert_eq!(change_request_id, None);
             }
             other => panic!("expected FetchCheckoutStatus, got {other:?}"),
@@ -753,11 +643,7 @@ mod tests {
         let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateCheckout {
-                branch,
-                create_branch,
-                issue_ids,
-            } => {
+            Command::CreateCheckout { branch, create_branch, issue_ids } => {
                 assert_eq!(branch, "feat/remote");
                 // RemoteBranch kind -> create_branch = false
                 assert!(!create_branch);
@@ -774,11 +660,7 @@ mod tests {
         let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateCheckout {
-                branch,
-                create_branch,
-                ..
-            } => {
+            Command::CreateCheckout { branch, create_branch, .. } => {
                 assert_eq!(branch, "feat/pr-branch");
                 // Pr kind -> create_branch = false
                 assert!(!create_branch);
@@ -794,11 +676,7 @@ mod tests {
         let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateCheckout {
-                branch,
-                create_branch,
-                ..
-            } => {
+            Command::CreateCheckout { branch, create_branch, .. } => {
                 assert_eq!(branch, "feat/session-branch");
                 // Session kind -> create_branch = true (not RemoteBranch or Pr)
                 assert!(create_branch);
@@ -811,9 +689,7 @@ mod tests {
     fn resolve_create_worktree_and_workspace_none_without_branch() {
         let app = stub_app();
         let item = bare_item(); // no branch
-        assert!(Intent::CreateCheckoutAndWorkspace
-            .resolve(&item, &app)
-            .is_none());
+        assert!(Intent::CreateCheckoutAndWorkspace.resolve(&item, &app).is_none());
     }
 
     #[test]
@@ -884,18 +760,12 @@ mod tests {
     fn resolve_teleport_session() {
         let app = stub_app();
         let mut item = session_item("sess-42");
-        item.checkout = Some(CheckoutRef {
-            key: HostPath::new(HostName::new("test-host"), PathBuf::from("/tmp/co")),
-            is_main_checkout: false,
-        });
+        item.checkout =
+            Some(CheckoutRef { key: HostPath::new(HostName::new("test-host"), PathBuf::from("/tmp/co")), is_main_checkout: false });
         let cmd = Intent::TeleportSession.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::TeleportSession {
-                session_id,
-                branch,
-                checkout_key,
-            } => {
+            Command::TeleportSession { session_id, branch, checkout_key } => {
                 assert_eq!(session_id, "sess-42");
                 assert_eq!(branch, Some("feat/session-branch".into()));
                 assert_eq!(checkout_key, Some(PathBuf::from("/tmp/co")));
@@ -909,11 +779,7 @@ mod tests {
         let app = stub_app();
         let item = session_item("sess-42");
         match Intent::TeleportSession.resolve(&item, &app).unwrap() {
-            Command::TeleportSession {
-                checkout_key,
-                branch,
-                ..
-            } => {
+            Command::TeleportSession { checkout_key, branch, .. } => {
                 assert!(checkout_key.is_none());
                 assert_eq!(branch, Some("feat/session-branch".into()));
             }
@@ -953,50 +819,35 @@ mod tests {
     /// linked) and a checkout at `/tmp/feat-x` whose association keys reference
     /// the given `checkout_issue_ids`.
     fn app_with_pr_and_issues(checkout_issue_ids: &[&str]) -> App {
-        use flotilla_protocol::{
-            AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey,
-        };
+        use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey};
 
         let mut app = stub_app();
 
         let mut providers = ProviderData::default();
-        providers.change_requests.insert(
-            "42".into(),
-            ChangeRequest {
-                title: "Fix bug".into(),
-                branch: "feat/x".into(),
-                status: ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                // PR already has issue "10" linked
-                association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
+        providers.change_requests.insert("42".into(), ChangeRequest {
+            title: "Fix bug".into(),
+            branch: "feat/x".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            // PR already has issue "10" linked
+            association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
         let co_path = HostPath::new(HostName::local(), PathBuf::from("/tmp/feat-x"));
-        providers.checkouts.insert(
-            co_path.clone(),
-            Checkout {
-                branch: "feat/x".into(),
-                is_main: false,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone())],
-                association_keys: checkout_issue_ids
-                    .iter()
-                    .map(|id| AssociationKey::IssueRef("gh".into(), (*id).into()))
-                    .collect(),
-            },
-        );
+        providers.checkouts.insert(co_path.clone(), Checkout {
+            branch: "feat/x".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone())],
+            association_keys: checkout_issue_ids.iter().map(|id| AssociationKey::IssueRef("gh".into(), (*id).into())).collect(),
+        });
 
-        app.model
-            .repos
-            .get_mut(&PathBuf::from("/tmp/test-repo"))
-            .unwrap()
-            .providers = Arc::new(providers);
+        app.model.repos.get_mut(&PathBuf::from("/tmp/test-repo")).unwrap().providers = Arc::new(providers);
 
         app
     }
@@ -1025,10 +876,7 @@ mod tests {
         let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::LinkIssuesToChangeRequest {
-                change_request_id,
-                issue_ids,
-            } => {
+            Command::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
                 assert_eq!(change_request_id, "42");
                 // Only issue "20" should be linked ("10" is already on the PR)
                 assert_eq!(issue_ids, vec!["20".to_string()]);
@@ -1062,10 +910,7 @@ mod tests {
         item.issue_keys = vec!["7".into()];
         item.workspace_refs = vec!["ws-1".into()];
 
-        let available: Vec<_> = Intent::all_in_menu_order()
-            .iter()
-            .filter(|i| i.is_available(&item))
-            .collect();
+        let available: Vec<_> = Intent::all_in_menu_order().iter().filter(|i| i.is_available(&item)).collect();
 
         assert!(available.contains(&&Intent::SwitchToWorkspace));
         assert!(available.contains(&&Intent::OpenChangeRequest));
@@ -1084,14 +929,8 @@ mod tests {
     #[test]
     fn bare_item_has_no_intents_available() {
         let item = bare_item();
-        let available: Vec<_> = Intent::all_in_menu_order()
-            .iter()
-            .filter(|i| i.is_available(&item))
-            .collect();
-        assert!(
-            available.is_empty(),
-            "bare item should have no intents, got {available:?}"
-        );
+        let available: Vec<_> = Intent::all_in_menu_order().iter().filter(|i| i.is_available(&item)).collect();
+        assert!(available.is_empty(), "bare item should have no intents, got {available:?}");
     }
 
     // ── requires_local_host tests ──
@@ -1123,10 +962,7 @@ mod tests {
         let my_host = Some(HostName::local());
         // Local item, local host -> all intents allowed
         for intent in Intent::all_in_menu_order() {
-            assert!(
-                intent.is_allowed_for_host(&item, &my_host),
-                "{intent:?} should be allowed for local item"
-            );
+            assert!(intent.is_allowed_for_host(&item, &my_host), "{intent:?} should be allowed for local item");
         }
     }
 
@@ -1160,10 +996,7 @@ mod tests {
 
         // When my_host is unknown, treat everything as local
         for intent in Intent::all_in_menu_order() {
-            assert!(
-                intent.is_allowed_for_host(&item, &my_host),
-                "{intent:?} should be allowed when my_host is unknown"
-            );
+            assert!(intent.is_allowed_for_host(&item, &my_host), "{intent:?} should be allowed when my_host is unknown");
         }
     }
 
@@ -1179,10 +1012,8 @@ mod tests {
 
         let my_host = Some(HostName::local());
 
-        let available: Vec<_> = Intent::all_in_menu_order()
-            .iter()
-            .filter(|i| i.is_available(&item) && i.is_allowed_for_host(&item, &my_host))
-            .collect();
+        let available: Vec<_> =
+            Intent::all_in_menu_order().iter().filter(|i| i.is_available(&item) && i.is_allowed_for_host(&item, &my_host)).collect();
 
         // Filesystem intents should be excluded
         assert!(!available.contains(&&Intent::SwitchToWorkspace));
@@ -1207,19 +1038,16 @@ mod tests {
         let repo = app.model.repo_order[0].clone();
         let rm = app.model.repos.get_mut(&repo).unwrap();
         let mut providers = ProviderData::default();
-        providers.change_requests.insert(
-            "55".to_string(),
-            flotilla_protocol::ChangeRequest {
-                title: "My PR".into(),
-                branch: "feat/x".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            },
-        );
+        providers.change_requests.insert("55".to_string(), flotilla_protocol::ChangeRequest {
+            title: "My PR".into(),
+            branch: "feat/x".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        });
         rm.providers = Arc::new(providers);
 
         let item = pr_item("55");
@@ -1237,19 +1065,16 @@ mod tests {
         let repo = app.model.repo_order[0].clone();
         let rm = app.model.repos.get_mut(&repo).unwrap();
         let mut providers = ProviderData::default();
-        providers.change_requests.insert(
-            "56".to_string(),
-            flotilla_protocol::ChangeRequest {
-                title: "Done PR".into(),
-                branch: "feat/done".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Merged,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            },
-        );
+        providers.change_requests.insert("56".to_string(), flotilla_protocol::ChangeRequest {
+            title: "Done PR".into(),
+            branch: "feat/done".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Merged,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        });
         rm.providers = Arc::new(providers);
 
         let item = pr_item("56");

@@ -75,10 +75,7 @@ struct UnionFind {
 
 impl UnionFind {
     fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n).collect(),
-            rank: vec![0; n],
-        }
+        Self { parent: (0..n).collect(), rank: vec![0; n] }
     }
 
     fn find(&mut self, x: usize) -> usize {
@@ -134,10 +131,7 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
     let mut group_singletons: HashMap<usize, Vec<ItemKind>> = HashMap::new();
     for (idx, item) in items.iter().enumerate() {
         if is_singleton_kind(&item.kind) {
-            group_singletons
-                .entry(idx)
-                .or_default()
-                .push(item.kind.clone());
+            group_singletons.entry(idx).or_default().push(item.kind.clone());
         }
     }
 
@@ -156,12 +150,8 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
                     // Check if merging would combine two singleton kinds
                     let singletons_a = group_singletons.get(&root_a);
                     let singletons_b = group_singletons.get(&root_b);
-                    let would_conflict = if let (Some(sa), Some(sb)) = (singletons_a, singletons_b)
-                    {
-                        sa.iter().any(|k| sb.contains(k))
-                    } else {
-                        false
-                    };
+                    let would_conflict =
+                        if let (Some(sa), Some(sb)) = (singletons_a, singletons_b) { sa.iter().any(|k| sb.contains(k)) } else { false };
                     if would_conflict {
                         continue; // refuse the union
                     }
@@ -191,12 +181,7 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
     let mut roots: Vec<usize> = groups.keys().copied().collect();
     roots.sort_unstable();
 
-    roots
-        .into_iter()
-        .map(|root| CorrelatedGroup {
-            items: groups.remove(&root).unwrap(),
-        })
-        .collect()
+    roots.into_iter().map(|root| CorrelatedGroup { items: groups.remove(&root).unwrap() }).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -205,30 +190,16 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
 
+    use super::*;
+
     fn hp(path: &str) -> HostPath {
-        HostPath::new(
-            flotilla_protocol::HostName::new("test-host"),
-            PathBuf::from(path),
-        )
+        HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path))
     }
 
-    fn item(
-        provider: &str,
-        kind: ItemKind,
-        title: &str,
-        keys: Vec<CorrelationKey>,
-        source_key: ProviderItemKey,
-    ) -> CorrelatedItem {
-        CorrelatedItem {
-            provider_name: provider.to_string(),
-            kind,
-            title: title.to_string(),
-            correlation_keys: keys,
-            source_key,
-        }
+    fn item(provider: &str, kind: ItemKind, title: &str, keys: Vec<CorrelationKey>, source_key: ProviderItemKey) -> CorrelatedItem {
+        CorrelatedItem { provider_name: provider.to_string(), kind, title: title.to_string(), correlation_keys: keys, source_key }
     }
 
     #[test]
@@ -287,10 +258,7 @@ mod tests {
                 "git",
                 ItemKind::Checkout,
                 "feat-x checkout",
-                vec![
-                    CorrelationKey::Branch("feat-x".into()),
-                    CorrelationKey::CheckoutPath(hp("/code/feat-x")),
-                ],
+                vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(hp("/code/feat-x"))],
                 ProviderItemKey::Checkout(hp("/code/feat-x")),
             ),
             item(
@@ -350,27 +318,9 @@ mod tests {
     #[test]
     fn no_correlation_keys_each_item_separate() {
         let items = vec![
-            item(
-                "git",
-                ItemKind::Checkout,
-                "orphan-a",
-                vec![],
-                ProviderItemKey::Checkout(hp("/code/orphan-a")),
-            ),
-            item(
-                "github",
-                ItemKind::ChangeRequest,
-                "orphan-b",
-                vec![],
-                ProviderItemKey::ChangeRequest("orphan-b".into()),
-            ),
-            item(
-                "claude",
-                ItemKind::CloudSession,
-                "orphan-c",
-                vec![],
-                ProviderItemKey::Session("orphan-c".into()),
-            ),
+            item("git", ItemKind::Checkout, "orphan-a", vec![], ProviderItemKey::Checkout(hp("/code/orphan-a"))),
+            item("github", ItemKind::ChangeRequest, "orphan-b", vec![], ProviderItemKey::ChangeRequest("orphan-b".into())),
+            item("claude", ItemKind::CloudSession, "orphan-c", vec![], ProviderItemKey::Session("orphan-c".into())),
         ];
 
         let groups = correlate(items);
@@ -415,20 +365,14 @@ mod tests {
                 "git",
                 ItemKind::Checkout,
                 "main",
-                vec![
-                    CorrelationKey::Branch("main".into()),
-                    CorrelationKey::CheckoutPath(main_path.clone()),
-                ],
+                vec![CorrelationKey::Branch("main".into()), CorrelationKey::CheckoutPath(main_path.clone())],
                 ProviderItemKey::Checkout(main_path.clone()),
             ),
             item(
                 "git",
                 ItemKind::Checkout,
                 "feat-x",
-                vec![
-                    CorrelationKey::Branch("feat-x".into()),
-                    CorrelationKey::CheckoutPath(feat_path.clone()),
-                ],
+                vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(feat_path.clone())],
                 ProviderItemKey::Checkout(feat_path.clone()),
             ),
             item(
@@ -436,21 +380,14 @@ mod tests {
                 ItemKind::Workspace,
                 "buggy-workspace",
                 // Workspace reports both paths (buggy multiplexer)
-                vec![
-                    CorrelationKey::CheckoutPath(feat_path),
-                    CorrelationKey::CheckoutPath(main_path),
-                ],
+                vec![CorrelationKey::CheckoutPath(feat_path), CorrelationKey::CheckoutPath(main_path)],
                 ProviderItemKey::Workspace("cmux:buggy-workspace".into()),
             ),
         ];
 
         let groups = correlate(items);
         // The workspace should attach to one checkout, not bridge them
-        assert_eq!(
-            groups.len(),
-            2,
-            "two checkouts must stay in separate groups"
-        );
+        assert_eq!(groups.len(), 2, "two checkouts must stay in separate groups");
         // One group has 2 items (checkout + workspace), the other has 1 (checkout alone)
         let mut sizes: Vec<usize> = groups.iter().map(|g| g.items.len()).collect();
         sizes.sort();
@@ -519,10 +456,7 @@ mod tests {
                 "git",
                 ItemKind::Checkout,
                 "feat-x",
-                vec![
-                    CorrelationKey::Branch("feat-x".into()),
-                    CorrelationKey::CheckoutPath(path.clone()),
-                ],
+                vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(path.clone())],
                 ProviderItemKey::Checkout(path),
             ),
             item(

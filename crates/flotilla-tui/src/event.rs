@@ -1,7 +1,8 @@
+use std::time::Duration;
+
 use crossterm::event::{EventStream, KeyEventKind};
 use flotilla_protocol::DaemonEvent;
 use futures::{FutureExt, StreamExt};
-use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug)]

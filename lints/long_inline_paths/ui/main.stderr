@@ -1,0 +1,22 @@
+warning: long inline path `crate::inner::deep::deeper::hello` (5 segments, max 3); prefer a `use` import
+  --> $DIR/main.rs:15:5
+   |
+LL |     crate::inner::deep::deeper::hello();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(long_inline_paths)]` on by default
+
+warning: long inline path `crate::inner::deep::deeper::Thing` (5 segments, max 3); prefer a `use` import
+  --> $DIR/main.rs:19:18
+   |
+LL | fn bad_type() -> crate::inner::deep::deeper::Thing {
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: long inline path `crate::inner::deep::deeper::Thing` (5 segments, max 3); prefer a `use` import
+  --> $DIR/main.rs:20:5
+   |
+LL |     crate::inner::deep::deeper::Thing
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 3 warnings emitted
+

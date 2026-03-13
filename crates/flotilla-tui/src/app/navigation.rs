@@ -45,11 +45,7 @@ impl App {
             self.ui.mode = UiMode::Normal;
             self.model.active_repo = idx;
             let key = &self.model.repo_order[idx];
-            self.ui
-                .repo_ui
-                .get_mut(key)
-                .expect("active repo must have UI state")
-                .has_unseen_changes = false;
+            self.ui.repo_ui.get_mut(key).expect("active repo must have UI state").has_unseen_changes = false;
         }
     }
 
@@ -94,20 +90,14 @@ impl App {
 
         // Infinite scroll: fetch more issues when near the bottom
         let total = self.active_ui().table_view.selectable_indices.len();
-        if next + 5 >= total
-            && self.model.active().issue_has_more
-            && !self.model.active().issue_fetch_pending
-        {
+        if next + 5 >= total && self.model.active().issue_has_more && !self.model.active().issue_fetch_pending {
             let repo = self.model.active_repo_root().clone();
             let issue_count = self.model.active().providers.issues.len();
             let desired = issue_count + 50;
             if let Some(rm) = self.model.repos.get_mut(&repo) {
                 rm.issue_fetch_pending = true;
             }
-            self.proto_commands.push(Command::FetchMoreIssues {
-                repo,
-                desired_count: desired,
-            });
+            self.proto_commands.push(Command::FetchMoreIssues { repo, desired_count: desired });
         }
     }
 
@@ -137,11 +127,7 @@ impl App {
             let data_row = row_in_table - 2;
             let offset = self.active_ui().table_state.offset();
             let actual_row = data_row + offset;
-            self.active_ui()
-                .table_view
-                .selectable_indices
-                .iter()
-                .position(|&idx| idx == actual_row)
+            self.active_ui().table_view.selectable_indices.iter().position(|&idx| idx == actual_row)
         } else {
             None
         }
@@ -150,9 +136,7 @@ impl App {
     pub(super) fn toggle_multi_select(&mut self) {
         if let Some(si) = self.active_ui().selected_selectable_idx {
             if let Some(&table_idx) = self.active_ui().table_view.selectable_indices.get(si) {
-                if let Some(GroupEntry::Item(item)) =
-                    self.active_ui().table_view.table_entries.get(table_idx)
-                {
+                if let Some(GroupEntry::Item(item)) = self.active_ui().table_view.table_entries.get(table_idx) {
                     let identity = item.identity.clone();
                     let rui = self.active_ui_mut();
                     if !rui.multi_selected.remove(&identity) {
@@ -166,13 +150,12 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::test_support::{
-        issue_item, issue_table_entries, set_active_table_view, stub_app_with_repos,
-    };
     use flotilla_core::data::{GroupEntry, GroupedWorkItems};
     use flotilla_protocol::{Command, WorkItemIdentity};
     use ratatui::layout::Rect;
+
+    use super::*;
+    use crate::app::test_support::{issue_item, issue_table_entries, set_active_table_view, stub_app_with_repos};
 
     // ── switch_tab tests ─────────────────────────────────────────────
 
@@ -387,10 +370,7 @@ mod tests {
         let cmd = app.proto_commands.take_next();
         assert!(cmd.is_some(), "expected FetchMoreIssues command");
         match cmd.unwrap() {
-            Command::FetchMoreIssues {
-                repo: cmd_repo,
-                desired_count,
-            } => {
+            Command::FetchMoreIssues { repo: cmd_repo, desired_count } => {
                 assert_eq!(cmd_repo, repo);
                 // providers.issues is empty (default), so desired = 0 + 50
                 assert_eq!(desired_count, 50);
@@ -516,10 +496,7 @@ mod tests {
         app.select_next(); // None -> 0
         assert!(app.active_ui().multi_selected.is_empty());
         app.toggle_multi_select();
-        assert!(app
-            .active_ui()
-            .multi_selected
-            .contains(&WorkItemIdentity::Issue("0".into())));
+        assert!(app.active_ui().multi_selected.contains(&WorkItemIdentity::Issue("0".into())));
     }
 
     #[test]
@@ -529,16 +506,10 @@ mod tests {
         app.select_next(); // None -> 0
                            // Toggle on
         app.toggle_multi_select();
-        assert!(app
-            .active_ui()
-            .multi_selected
-            .contains(&WorkItemIdentity::Issue("0".into())));
+        assert!(app.active_ui().multi_selected.contains(&WorkItemIdentity::Issue("0".into())));
         // Toggle off
         app.toggle_multi_select();
-        assert!(!app
-            .active_ui()
-            .multi_selected
-            .contains(&WorkItemIdentity::Issue("0".into())));
+        assert!(!app.active_ui().multi_selected.contains(&WorkItemIdentity::Issue("0".into())));
         assert!(app.active_ui().multi_selected.is_empty());
     }
 

@@ -5,9 +5,8 @@ pub mod test_support;
 pub mod transport;
 
 pub use manager::{
-    synthetic_repo_path, ActivationResult, ConnectionDirection, ConnectionMeta, DisconnectPlan,
-    HandleResult, InboundPeerEnvelope, PeerManager, PendingResyncRequest, PerRepoPeerState,
-    ReversePathHop, ReversePathKey, RouteHop, RouteState,
+    synthetic_repo_path, ActivationResult, ConnectionDirection, ConnectionMeta, DisconnectPlan, HandleResult, InboundPeerEnvelope,
+    PeerManager, PendingResyncRequest, PerRepoPeerState, ReversePathHop, ReversePathKey, RouteHop, RouteState,
 };
 pub use merge::merge_provider_data;
 pub use ssh_transport::SshTransport;

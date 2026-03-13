@@ -1,17 +1,22 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::UnixStream;
-use tokio::sync::{broadcast, oneshot, Mutex};
-use tracing::{debug, error, warn};
-
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{Command, DaemonEvent, Message, RawResponse, RepoInfo, Snapshot};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    net::UnixStream,
+    sync::{broadcast, oneshot, Mutex},
+};
+use tracing::{debug, error, warn};
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
 /// operations (no async work while holding the lock), and using a sync lock
@@ -35,19 +40,15 @@ impl SocketDaemon {
     /// Splits the socket into reader/writer halves, spawns a background task
     /// to read incoming messages, and returns `Arc<Self>`.
     pub async fn connect(socket_path: &Path) -> Result<Arc<Self>, String> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| format!("failed to connect to {}: {e}", socket_path.display()))?;
+        let stream = UnixStream::connect(socket_path).await.map_err(|e| format!("failed to connect to {}: {e}", socket_path.display()))?;
 
         let (read_half, write_half) = stream.into_split();
 
         let (event_tx, _) = broadcast::channel(256);
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
 
@@ -82,12 +83,7 @@ impl SocketDaemon {
                         };
 
                         match msg {
-                            Message::Response {
-                                id,
-                                ok,
-                                data,
-                                error,
-                            } => {
+                            Message::Response { id, ok, data, error } => {
                                 let raw = RawResponse { ok, data, error };
                                 let mut map = reader_pending.lock().await;
                                 if let Some(tx) = map.remove(&id) {
@@ -124,11 +120,7 @@ impl SocketDaemon {
                         error!("daemon connection closed (EOF)");
                         let mut map = reader_pending.lock().await;
                         for (_, tx) in map.drain() {
-                            let _ = tx.send(RawResponse {
-                                ok: false,
-                                data: None,
-                                error: Some("daemon connection closed".into()),
-                            });
+                            let _ = tx.send(RawResponse { ok: false, data: None, error: Some("daemon connection closed".into()) });
                         }
                         break;
                     }
@@ -136,11 +128,7 @@ impl SocketDaemon {
                         error!(err = %e, "error reading from daemon socket");
                         let mut map = reader_pending.lock().await;
                         for (_, tx) in map.drain() {
-                            let _ = tx.send(RawResponse {
-                                ok: false,
-                                data: None,
-                                error: Some(format!("daemon read error: {e}")),
-                            });
+                            let _ = tx.send(RawResponse { ok: false, data: None, error: Some(format!("daemon read error: {e}")) });
                         }
                         break;
                     }
@@ -152,11 +140,7 @@ impl SocketDaemon {
     }
 
     /// Send a request to the daemon and wait for the matching response.
-    async fn request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<RawResponse, String> {
+    async fn request(&self, method: &str, params: serde_json::Value) -> Result<RawResponse, String> {
         send_request(&self.writer, &self.pending, &self.next_id, method, params).await
     }
 }
@@ -175,12 +159,8 @@ fn acquire_spawn_lock(lock_path: &std::path::Path) -> Result<Option<std::fs::Fil
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-        .map_err(|e| format!("lock open: {e}"))?;
+    let file =
+        std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(lock_path).map_err(|e| format!("lock open: {e}"))?;
 
     // Non-blocking try: are we the first?
     let fd = file.as_raw_fd();
@@ -208,11 +188,7 @@ fn acquire_spawn_lock(lock_path: &std::path::Path) -> Result<Option<std::fs::Fil
     Ok(None)
 }
 
-fn spawn_daemon(
-    config_dir: &Path,
-    config_dir_override: Option<&Path>,
-    socket_override: Option<&Path>,
-) -> Result<(), String> {
+fn spawn_daemon(config_dir: &Path, config_dir_override: Option<&Path>, socket_override: Option<&Path>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("can't find self: {e}"))?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("daemon");
@@ -235,12 +211,9 @@ fn spawn_daemon(
     cmd.stdout(std::process::Stdio::null());
     let log_file = config_dir.join("daemon.log");
     let _ = std::fs::create_dir_all(config_dir);
-    let stderr = std::fs::File::create(&log_file)
-        .map(std::process::Stdio::from)
-        .unwrap_or_else(|_| std::process::Stdio::null());
+    let stderr = std::fs::File::create(&log_file).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
     cmd.stderr(stderr);
-    cmd.spawn()
-        .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+    cmd.spawn().map_err(|e| format!("failed to spawn daemon: {e}"))?;
     Ok(())
 }
 
@@ -264,9 +237,8 @@ pub async fn connect_or_spawn(
     let mut lock_file = None;
     for attempt in 0..MAX_LOCK_RETRIES {
         let lock_path_clone = lock_path.clone();
-        let lock_result = tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
-            .await
-            .map_err(|e| format!("spawn_blocking: {e}"))?;
+        let lock_result =
+            tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone)).await.map_err(|e| format!("spawn_blocking: {e}"))?;
         match lock_result {
             Ok(Some(file)) => {
                 lock_file = Some(file);
@@ -280,23 +252,16 @@ pub async fn connect_or_spawn(
                 // Their daemon didn't come up — retry lock acquisition rather than
                 // falling through to spawn without mutual exclusion.
                 if attempt + 1 < MAX_LOCK_RETRIES {
-                    warn!(
-                        attempt = attempt + 1,
-                        "connect after lock wait failed, retrying lock"
-                    );
+                    warn!(attempt = attempt + 1, "connect after lock wait failed, retrying lock");
                     continue;
                 }
                 // Exhausted retries — acquire lock ourselves before spawning
                 // so we never spawn without mutual exclusion.
-                warn!(
-                    attempts = MAX_LOCK_RETRIES,
-                    "connect after lock wait failed, acquiring lock to spawn"
-                );
+                warn!(attempts = MAX_LOCK_RETRIES, "connect after lock wait failed, acquiring lock to spawn");
                 let lock_path_clone = lock_path.clone();
-                let final_lock =
-                    tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
-                        .await
-                        .map_err(|e| format!("spawn_blocking: {e}"))?;
+                let final_lock = tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone))
+                    .await
+                    .map_err(|e| format!("spawn_blocking: {e}"))?;
                 match final_lock {
                     Ok(Some(file)) => {
                         lock_file = Some(file);
@@ -377,11 +342,7 @@ async fn send_request(
         map.insert(id, tx);
     }
 
-    let msg = Message::Request {
-        id,
-        method: method.to_string(),
-        params,
-    };
+    let msg = Message::Request { id, method: method.to_string(), params };
 
     let line = match serde_json::to_string(&msg) {
         Ok(line) => line,
@@ -393,15 +354,9 @@ async fn send_request(
 
     let write_result = async {
         let mut w = writer.lock().await;
-        w.write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("failed to write to daemon socket: {e}"))?;
-        w.write_all(b"\n")
-            .await
-            .map_err(|e| format!("failed to write newline to daemon socket: {e}"))?;
-        w.flush()
-            .await
-            .map_err(|e| format!("failed to flush daemon socket: {e}"))?;
+        w.write_all(line.as_bytes()).await.map_err(|e| format!("failed to write to daemon socket: {e}"))?;
+        w.write_all(b"\n").await.map_err(|e| format!("failed to write newline to daemon socket: {e}"))?;
+        w.flush().await.map_err(|e| format!("failed to flush daemon socket: {e}"))?;
         Ok::<(), String>(())
     }
     .await;
@@ -448,10 +403,7 @@ fn handle_event(
             );
             // Sync lock: update seq before dispatching event so a
             // quickly-following delta sees the correct local seq.
-            local_seqs
-                .write()
-                .unwrap()
-                .insert(snap.repo.clone(), snap.seq);
+            local_seqs.write().unwrap().insert(snap.repo.clone(), snap.seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::SnapshotDelta(delta) => {
@@ -522,24 +474,14 @@ fn handle_event(
                         let recovered_seq = local_seqs.read().unwrap().get(&repo).copied();
                         for buffered_event in buffered {
                             let dominated = match &buffered_event {
-                                DaemonEvent::SnapshotDelta(d) => {
-                                    recovered_seq.is_some_and(|rs| d.seq <= rs)
-                                }
+                                DaemonEvent::SnapshotDelta(d) => recovered_seq.is_some_and(|rs| d.seq <= rs),
                                 _ => false,
                             };
                             if dominated {
                                 debug!("discarding buffered delta already covered by recovery");
                                 continue;
                             }
-                            handle_event(
-                                buffered_event,
-                                &local_seqs,
-                                &recovering,
-                                &event_tx,
-                                &writer,
-                                &pending,
-                                &next_id,
-                            );
+                            handle_event(buffered_event, &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
                         }
                     });
                 }
@@ -570,27 +512,15 @@ async fn recover_from_gap(
 ) {
     let last_seen = {
         let seqs = local_seqs.read().unwrap();
-        seqs.iter()
-            .map(|(path, &seq)| (path.clone(), seq))
-            .collect::<HashMap<_, _>>()
+        seqs.iter().map(|(path, &seq)| (path.clone(), seq)).collect::<HashMap<_, _>>()
     };
 
-    let resp = send_request(
-        writer,
-        pending,
-        next_id,
-        "replay_since",
-        serde_json::json!({ "last_seen": last_seen }),
-    )
-    .await;
+    let resp = send_request(writer, pending, next_id, "replay_since", serde_json::json!({ "last_seen": last_seen })).await;
 
     match resp {
         Ok(raw) => match raw.parse::<Vec<DaemonEvent>>() {
             Ok(events) => {
-                debug!(
-                    event_count = events.len(),
-                    "gap recovery: got replay events"
-                );
+                debug!(event_count = events.len(), "gap recovery: got replay events");
                 // Update seqs monotonically — a live event may have advanced
                 // a repo's seq while this replay was in flight.
                 {
@@ -636,9 +566,7 @@ impl DaemonHandle for SocketDaemon {
     async fn get_state(&self, repo: &Path) -> Result<Snapshot, String> {
         // Always RPC to server — local state only tracks seqs for gap detection,
         // not full snapshots (work_items can't be materialized client-side).
-        let resp = self
-            .request("get_state", serde_json::json!({ "repo": repo }))
-            .await?;
+        let resp = self.request("get_state", serde_json::json!({ "repo": repo })).await?;
         resp.parse()
     }
 
@@ -648,46 +576,27 @@ impl DaemonHandle for SocketDaemon {
     }
 
     async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
-        let resp = self
-            .request(
-                "execute",
-                serde_json::json!({ "repo": repo, "command": command }),
-            )
-            .await?;
+        let resp = self.request("execute", serde_json::json!({ "repo": repo, "command": command })).await?;
         resp.parse::<u64>()
     }
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {
-        let resp = self
-            .request("refresh", serde_json::json!({ "repo": repo }))
-            .await?;
+        let resp = self.request("refresh", serde_json::json!({ "repo": repo })).await?;
         resp.parse_empty()
     }
 
     async fn add_repo(&self, path: &Path) -> Result<(), String> {
-        let resp = self
-            .request("add_repo", serde_json::json!({ "path": path }))
-            .await?;
+        let resp = self.request("add_repo", serde_json::json!({ "path": path })).await?;
         resp.parse_empty()
     }
 
     async fn remove_repo(&self, path: &Path) -> Result<(), String> {
-        let resp = self
-            .request("remove_repo", serde_json::json!({ "path": path }))
-            .await?;
+        let resp = self.request("remove_repo", serde_json::json!({ "path": path })).await?;
         resp.parse_empty()
     }
 
-    async fn replay_since(
-        &self,
-        last_seen: &HashMap<PathBuf, u64>,
-    ) -> Result<Vec<DaemonEvent>, String> {
-        let resp = self
-            .request(
-                "replay_since",
-                serde_json::json!({ "last_seen": last_seen }),
-            )
-            .await?;
+    async fn replay_since(&self, last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String> {
+        let resp = self.request("replay_since", serde_json::json!({ "last_seen": last_seen })).await?;
         let events: Vec<DaemonEvent> = resp.parse()?;
 
         // Seed local_seqs from replay events so the background reader
@@ -713,10 +622,10 @@ impl DaemonHandle for SocketDaemon {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use flotilla_protocol::{Snapshot, SnapshotDelta};
-    use tokio::net::unix::OwnedReadHalf;
-    use tokio::net::UnixStream;
+    use tokio::net::{unix::OwnedReadHalf, UnixStream};
+
+    use super::*;
 
     type SharedWriter = Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>;
     type SharedPending = Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>>;
@@ -772,11 +681,7 @@ mod tests {
         let (client, server) = UnixStream::pair().expect("pair");
         drop(server);
         let (_read_half, write_half) = client.into_split();
-        (
-            Arc::new(Mutex::new(BufWriter::new(write_half))),
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(AtomicU64::new(1)),
-        )
+        (Arc::new(Mutex::new(BufWriter::new(write_half))), Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicU64::new(1)))
     }
 
     /// Returns a writer/pending/next_id triple for tests that call `handle_event`.
@@ -786,20 +691,11 @@ mod tests {
         let (client, server) = UnixStream::pair().expect("pair");
         let (server_read, _server_write) = server.into_split();
         let (_read_half, write_half) = client.into_split();
-        (
-            Arc::new(Mutex::new(BufWriter::new(write_half))),
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(AtomicU64::new(1)),
-            server_read,
-        )
+        (Arc::new(Mutex::new(BufWriter::new(write_half))), Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicU64::new(1)), server_read)
     }
 
     async fn read_request(lines: &mut RequestLines) -> (u64, String, serde_json::Value) {
-        let line = lines
-            .next_line()
-            .await
-            .expect("read request line")
-            .expect("line missing");
+        let line = lines.next_line().await.expect("read request line").expect("line missing");
         match serde_json::from_str::<Message>(&line).expect("parse request") {
             Message::Request { id, method, params } => (id, method, params),
             other => panic!("expected request, got {other:?}"),
@@ -814,32 +710,15 @@ mod tests {
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
         let request_task = tokio::spawn(async move {
-            send_request(
-                &request_writer,
-                &request_pending,
-                &request_next_id,
-                "list_repos",
-                serde_json::json!({"x": 1}),
-            )
-            .await
+            send_request(&request_writer, &request_pending, &request_next_id, "list_repos", serde_json::json!({"x": 1})).await
         });
 
         let (id, method, params) = read_request(&mut harness.lines).await;
         assert_eq!(method, "list_repos");
         assert_eq!(params["x"], 1);
 
-        let tx = harness
-            .pending
-            .lock()
-            .await
-            .remove(&id)
-            .expect("pending sender should exist");
-        tx.send(RawResponse {
-            ok: true,
-            data: Some(serde_json::json!({"ok": true})),
-            error: None,
-        })
-        .expect("send response");
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender should exist");
+        tx.send(RawResponse { ok: true, data: Some(serde_json::json!({"ok": true})), error: None }).expect("send response");
 
         let raw = request_task.await.expect("join").expect("send_request");
         assert!(raw.ok);
@@ -854,24 +733,14 @@ mod tests {
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
         let task = tokio::spawn(async move {
-            send_request(
-                &request_writer,
-                &request_pending,
-                &request_next_id,
-                "never_replied",
-                serde_json::json!({}),
-            )
-            .await
+            send_request(&request_writer, &request_pending, &request_next_id, "never_replied", serde_json::json!({})).await
         });
 
         let (id, method, _) = read_request(&mut harness.lines).await;
         assert_eq!(method, "never_replied");
 
         harness.pending.lock().await.remove(&id);
-        let err = task
-            .await
-            .expect("join")
-            .expect_err("dropping sender should cancel request");
+        let err = task.await.expect("join").expect_err("dropping sender should cancel request");
         assert!(err.contains("cancelled"));
     }
 
@@ -879,15 +748,9 @@ mod tests {
     async fn send_request_cleans_pending_on_write_error() {
         let (writer, pending, next_id) = broken_request_harness();
 
-        let err = send_request(
-            &writer,
-            &pending,
-            &next_id,
-            "broken_pipe",
-            serde_json::json!({}),
-        )
-        .await
-        .expect_err("closed peer should fail writes");
+        let err = send_request(&writer, &pending, &next_id, "broken_pipe", serde_json::json!({}))
+            .await
+            .expect_err("closed peer should fail writes");
 
         assert!(err.contains("failed to"));
         assert!(pending.lock().await.is_empty());
@@ -901,14 +764,7 @@ mod tests {
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
         let task = tokio::spawn(async move {
-            send_request(
-                &request_writer,
-                &request_pending,
-                &request_next_id,
-                "cancelled",
-                serde_json::json!({}),
-            )
-            .await
+            send_request(&request_writer, &request_pending, &request_next_id, "cancelled", serde_json::json!({})).await
         });
 
         let (id, method, _) = read_request(&mut harness.lines).await;
@@ -916,10 +772,7 @@ mod tests {
 
         harness.pending.lock().await.remove(&id);
 
-        let err = task
-            .await
-            .expect("join")
-            .expect_err("dropping sender should cancel request");
+        let err = task.await.expect("join").expect_err("dropping sender should cancel request");
         assert!(err.contains("cancelled"));
         assert!(harness.pending.lock().await.is_empty());
     }
@@ -932,14 +785,7 @@ mod tests {
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
         let task = tokio::spawn(async move {
-            send_request(
-                &request_writer,
-                &request_pending,
-                &request_next_id,
-                "timeout",
-                serde_json::json!({}),
-            )
-            .await
+            send_request(&request_writer, &request_pending, &request_next_id, "timeout", serde_json::json!({})).await
         });
 
         let (id, method, _) = read_request(&mut harness.lines).await;
@@ -949,10 +795,7 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
 
-        let err = task
-            .await
-            .expect("join")
-            .expect_err("missing response should time out");
+        let err = task.await.expect("join").expect_err("missing response should time out");
         assert!(err.contains("timed out"));
         assert!(harness.pending.lock().await.is_empty());
     }
@@ -961,8 +804,7 @@ mod tests {
     async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -997,8 +839,7 @@ mod tests {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         local_seqs.write().unwrap().insert(repo.clone(), 1);
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         recovering.lock().unwrap().insert(repo.clone(), vec![]);
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
@@ -1013,17 +854,9 @@ mod tests {
             &next_id,
         );
 
-        let buffered = recovering
-            .lock()
-            .unwrap()
-            .get(&repo)
-            .cloned()
-            .expect("buffer exists");
+        let buffered = recovering.lock().unwrap().get(&repo).cloned().expect("buffer exists");
         assert_eq!(buffered.len(), 1);
-        assert!(
-            event_rx.try_recv().is_err(),
-            "buffered delta should not dispatch"
-        );
+        assert!(event_rx.try_recv().is_err(), "buffered delta should not dispatch");
     }
 
     #[tokio::test]
@@ -1041,34 +874,16 @@ mod tests {
         let recover_pending = Arc::clone(&harness.pending);
         let recover_next_id = Arc::clone(&harness.next_id);
         let recover_task = tokio::spawn(async move {
-            recover_from_gap(
-                &recover_local_seqs,
-                &recover_event_tx,
-                &recover_writer,
-                &recover_pending,
-                &recover_next_id,
-            )
-            .await;
+            recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
         let (id, method, _) = read_request(&mut harness.lines).await;
         assert_eq!(method, "replay_since");
 
-        let replay_events = vec![DaemonEvent::SnapshotDelta(Box::new(make_delta(
-            &repo, 3, 4,
-        )))];
-        let tx = harness
-            .pending
-            .lock()
-            .await
-            .remove(&id)
-            .expect("pending sender for replay");
-        tx.send(RawResponse {
-            ok: true,
-            data: Some(serde_json::to_value(replay_events).expect("serialize replay events")),
-            error: None,
-        })
-        .expect("send replay response");
+        let replay_events = vec![DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 3, 4)))];
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender for replay");
+        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize replay events")), error: None })
+            .expect("send replay response");
         recover_task.await.expect("join recover");
 
         let event = event_rx.recv().await.expect("forwarded replay event");
@@ -1081,15 +896,10 @@ mod tests {
         let unique = format!(
             "flotilla-client-lock-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos()
         );
         let lock_path = std::env::temp_dir().join(unique).join("daemon.sock.lock");
-        let holder = acquire_spawn_lock(&lock_path)
-            .expect("acquire first lock")
-            .expect("first call should become spawner");
+        let holder = acquire_spawn_lock(&lock_path).expect("acquire first lock").expect("first call should become spawner");
 
         // Use a barrier so we know the waiter thread has started before
         // checking is_finished(). Without this, a short sleep could pass
@@ -1104,17 +914,11 @@ mod tests {
         barrier.wait();
         // Waiter has started; give it time to enter flock() (a single syscall).
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(
-            !waiter.is_finished(),
-            "waiter should block while lock is held"
-        );
+        assert!(!waiter.is_finished(), "waiter should block while lock is held");
 
         drop(holder);
         let waiter_result = waiter.join().expect("join waiter");
-        assert!(
-            waiter_result.is_none(),
-            "waiter should return None after spawner releases lock"
-        );
+        assert!(waiter_result.is_none(), "waiter should return None after spawner releases lock");
         let _ = std::fs::remove_file(&lock_path);
     }
 }

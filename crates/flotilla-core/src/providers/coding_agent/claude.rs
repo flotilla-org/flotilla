@@ -1,14 +1,18 @@
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex,
+    },
+    time::Instant,
+};
+
 use async_trait::async_trait;
 use reqwest;
 use serde::Deserialize;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
-
-use crate::providers::types::*;
-use crate::providers::{http_execute, run, CommandRunner, HttpClient};
 use tracing::{debug, info, warn};
+
+use crate::providers::{http_execute, run, types::*, CommandRunner, HttpClient};
 
 pub struct ClaudeCodingAgent {
     provider_name: String,
@@ -19,11 +23,7 @@ pub struct ClaudeCodingAgent {
 }
 
 impl ClaudeCodingAgent {
-    pub fn new(
-        provider_name: String,
-        runner: Arc<dyn CommandRunner>,
-        http: Arc<dyn HttpClient>,
-    ) -> Self {
+    pub fn new(provider_name: String, runner: Arc<dyn CommandRunner>, http: Arc<dyn HttpClient>) -> Self {
         Self {
             provider_name,
             runner,
@@ -58,8 +58,7 @@ struct AuthCache {
     token: Option<OAuthToken>,
 }
 
-static AUTH_CACHE: LazyLock<Mutex<AuthCache>> =
-    LazyLock::new(|| Mutex::new(AuthCache { token: None }));
+static AUTH_CACHE: LazyLock<Mutex<AuthCache>> = LazyLock::new(|| Mutex::new(AuthCache { token: None }));
 
 // ---------- API deserialization types ----------
 
@@ -107,20 +106,11 @@ struct SessionGitInfo {
 
 impl WebSession {
     fn branch(&self) -> Option<&str> {
-        self.session_context
-            .outcomes
-            .first()
-            .and_then(|o| o.git_info.as_ref())
-            .and_then(|gi| gi.branches.first())
-            .map(|s| s.as_str())
+        self.session_context.outcomes.first().and_then(|o| o.git_info.as_ref()).and_then(|gi| gi.branches.first()).map(|s| s.as_str())
     }
 
     fn repo_slug(&self) -> Option<&str> {
-        self.session_context
-            .outcomes
-            .first()
-            .and_then(|o| o.git_info.as_ref())
-            .and_then(|gi| gi.repo.as_deref())
+        self.session_context.outcomes.first().and_then(|o| o.git_info.as_ref()).and_then(|gi| gi.repo.as_deref())
     }
 }
 
@@ -140,27 +130,14 @@ fn sessions_url_for(base_url: &str) -> String {
 }
 
 fn session_url_for(base_url: &str, session_id: &str) -> String {
-    format!(
-        "{}/v1/sessions/{session_id}",
-        base_url.trim_end_matches('/')
-    )
+    format!("{}/v1/sessions/{session_id}", base_url.trim_end_matches('/'))
 }
 
 // ---------- auth helpers ----------
 
 async fn read_oauth_token_from_keychain(runner: &dyn CommandRunner) -> Result<OAuthToken, String> {
-    let output = run!(
-        runner,
-        "security",
-        &[
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ],
-        Path::new("."),
-    )
-    .map_err(|_| "No Claude Code credentials in keychain".to_string())?;
+    let output = run!(runner, "security", &["find-generic-password", "-s", "Claude Code-credentials", "-w",], Path::new("."),)
+        .map_err(|_| "No Claude Code credentials in keychain".to_string())?;
     let json = output.trim();
     let creds: OAuthCredentials = serde_json::from_str(json).map_err(|e| e.to_string())?;
     Ok(creds.claude_ai_oauth)
@@ -170,10 +147,7 @@ async fn get_oauth_token(runner: &dyn CommandRunner) -> Result<OAuthToken, Strin
     {
         let cache = AUTH_CACHE.lock().unwrap();
         if let Some(ref token) = cache.token {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
             if token.expires_at > now + 60 {
                 return Ok(token.clone());
             }
@@ -198,8 +172,7 @@ impl ClaudeCodingAgent {
         access_token: &str,
         json_body: Option<serde_json::Value>,
     ) -> Result<reqwest::Request, String> {
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|e| format!("invalid HTTP method: {e}"))?;
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| format!("invalid HTTP method: {e}"))?;
         let mut builder = super::REQUEST_FACTORY
             .request(method, url)
             .header("authorization", format!("Bearer {access_token}"))
@@ -221,10 +194,7 @@ impl ClaudeCodingAgent {
                     Ok(sessions) => Ok(sessions),
                     Err(e) if e.contains("authentication") => {
                         if !self.auth_warned.swap(true, Ordering::Relaxed) {
-                            warn!(
-                                provider = "claude",
-                                "Claude sessions unavailable: insufficient OAuth scopes"
-                            );
+                            warn!(provider = "claude", "Claude sessions unavailable: insufficient OAuth scopes");
                         }
                         debug!(provider = "claude", err = %e, "Claude auth error detail");
                         Ok(vec![])
@@ -254,14 +224,9 @@ impl ClaudeCodingAgent {
             return Err(format!("session fetch failed (HTTP {status}): {body}"));
         }
 
-        let parsed: SessionsResponse =
-            serde_json::from_str(body).map_err(|e| format!("session parse error: {e}"))?;
+        let parsed: SessionsResponse = serde_json::from_str(body).map_err(|e| format!("session parse error: {e}"))?;
 
-        let mut sessions: Vec<WebSession> = parsed
-            .data
-            .into_iter()
-            .filter(|s| s.session_status != "archived")
-            .collect();
+        let mut sessions: Vec<WebSession> = parsed.data.into_iter().filter(|s| s.session_status != "archived").collect();
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(sessions)
     }
@@ -270,12 +235,7 @@ impl ClaudeCodingAgent {
         info!(provider = "claude", %session_id, "archiving session");
         let token = get_oauth_token(&*self.runner).await?;
         let url = session_url_for(base_url, session_id);
-        let request = Self::build_request(
-            "PATCH",
-            &url,
-            &token.access_token,
-            Some(serde_json::json!({"session_status": "archived"})),
-        )?;
+        let request = Self::build_request("PATCH", &url, &token.access_token, Some(serde_json::json!({"session_status": "archived"})))?;
         let resp = http_execute!(self.http, request)?;
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
@@ -291,10 +251,7 @@ impl ClaudeCodingAgent {
 
 #[async_trait]
 impl super::CloudAgentService for ClaudeCodingAgent {
-    async fn list_sessions(
-        &self,
-        criteria: &RepoCriteria,
-    ) -> Result<Vec<(String, CloudAgentSession)>, String> {
+    async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
         // Check instance cache
         let cached = {
             let cache = self.sessions_cache.lock().unwrap();
@@ -314,16 +271,11 @@ impl super::CloudAgentService for ClaudeCodingAgent {
             sessions
         } else {
             let fetched = self.fetch_sessions(CLAUDE_API_BASE_URL).await?;
-            debug!(
-                provider = "claude",
-                count = fetched.len(),
-                "Claude sessions: fetched from API"
-            );
+            debug!(provider = "claude", count = fetched.len(), "Claude sessions: fetched from API");
 
             // Diff against known IDs and log additions/removals at INFO
             let mut cache = self.sessions_cache.lock().unwrap();
-            let new_ids: std::collections::HashSet<String> =
-                fetched.iter().map(|s| s.id.clone()).collect();
+            let new_ids: std::collections::HashSet<String> = fetched.iter().map(|s| s.id.clone()).collect();
             if !cache.known_ids.is_empty() {
                 for s in &fetched {
                     if !cache.known_ids.contains(&s.id) {
@@ -348,10 +300,7 @@ impl super::CloudAgentService for ClaudeCodingAgent {
         };
 
         // Sessions with no repo info still match (backward compat with older sessions)
-        let filtered: Vec<WebSession> = sessions
-            .into_iter()
-            .filter(|s| s.repo_slug().is_none_or(|r| r == slug))
-            .collect();
+        let filtered: Vec<WebSession> = sessions.into_iter().filter(|s| s.repo_slug().is_none_or(|r| r == slug)).collect();
 
         let provider_name = &self.provider_name;
         Ok(filtered
@@ -363,47 +312,33 @@ impl super::CloudAgentService for ClaudeCodingAgent {
                     _ => SessionStatus::Idle,
                 };
 
-                let model = if s.session_context.model.is_empty() {
-                    None
-                } else {
-                    Some(s.session_context.model.clone())
-                };
+                let model = if s.session_context.model.is_empty() { None } else { Some(s.session_context.model.clone()) };
 
                 let id = s.id.clone();
-                let mut correlation_keys = vec![CorrelationKey::SessionRef(
-                    provider_name.clone(),
-                    id.clone(),
-                )];
+                let mut correlation_keys = vec![CorrelationKey::SessionRef(provider_name.clone(), id.clone())];
 
                 // Add branch correlation key if available
                 if let Some(branch) = s.branch() {
-                    let clean = branch
-                        .strip_prefix("refs/heads/")
-                        .unwrap_or(branch)
-                        .to_string();
+                    let clean = branch.strip_prefix("refs/heads/").unwrap_or(branch).to_string();
                     correlation_keys.push(CorrelationKey::Branch(clean));
                 }
 
-                (
-                    id,
-                    CloudAgentSession {
-                        title: s.title,
-                        status,
-                        model,
-                        updated_at: Some(s.updated_at.clone()),
-                        correlation_keys,
-                        provider_name: provider_name.clone(),
-                        provider_display_name: "Claude".into(),
-                        item_noun: "Agent".into(),
-                    },
-                )
+                (id, CloudAgentSession {
+                    title: s.title,
+                    status,
+                    model,
+                    updated_at: Some(s.updated_at.clone()),
+                    correlation_keys,
+                    provider_name: provider_name.clone(),
+                    provider_display_name: "Claude".into(),
+                    item_noun: "Agent".into(),
+                })
             })
             .collect())
     }
 
     async fn archive_session(&self, session_id: &str) -> Result<(), String> {
-        self.archive_session_inner(session_id, CLAUDE_API_BASE_URL)
-            .await
+        self.archive_session_inner(session_id, CLAUDE_API_BASE_URL).await
     }
 
     async fn attach_command(&self, session_id: &str) -> Result<String, String> {
@@ -413,27 +348,21 @@ impl super::CloudAgentService for ClaudeCodingAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::providers::coding_agent::CloudAgentService;
-    use crate::providers::replay;
     use std::sync::Arc;
+
     use tokio::sync::Mutex as AsyncMutex;
+
+    use super::*;
+    use crate::providers::{coding_agent::CloudAgentService, replay, testing::MockRunner};
 
     static TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
     fn fixture(name: &str) -> String {
-        format!(
-            "{}/src/providers/coding_agent/fixtures/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            name
-        )
+        format!("{}/src/providers/coding_agent/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
     }
 
     fn now_epoch_secs() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
     }
 
     fn token_json(access_token: &str, expires_at: i64) -> String {
@@ -451,13 +380,10 @@ mod tests {
     }
 
     fn mock_runner(responses: Vec<Result<String, String>>) -> Arc<dyn CommandRunner> {
-        Arc::new(crate::providers::testing::MockRunner::new(responses))
+        Arc::new(MockRunner::new(responses))
     }
 
-    fn make_agent(
-        runner: Arc<dyn CommandRunner>,
-        http: Arc<dyn crate::providers::HttpClient>,
-    ) -> ClaudeCodingAgent {
+    fn make_agent(runner: Arc<dyn CommandRunner>, http: Arc<dyn crate::providers::HttpClient>) -> ClaudeCodingAgent {
         ClaudeCodingAgent::new("claude".into(), runner, http)
     }
 
@@ -465,10 +391,7 @@ mod tests {
     async fn oauth_token_is_cached_until_near_expiry() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
-        let runner = crate::providers::testing::MockRunner::new(vec![Ok(token_json(
-            "token-1",
-            now_epoch_secs() + 3600,
-        ))]);
+        let runner = MockRunner::new(vec![Ok(token_json("token-1", now_epoch_secs() + 3600))]);
         let token1 = get_oauth_token(&runner).await.expect("first token");
         let token2 = get_oauth_token(&runner).await.expect("cached token");
         assert_eq!(token1.access_token, "token-1");
@@ -479,10 +402,8 @@ mod tests {
     async fn oauth_token_refreshes_when_expiring_soon() {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
-        let runner = crate::providers::testing::MockRunner::new(vec![
-            Ok(token_json("old-token", now_epoch_secs() + 10)),
-            Ok(token_json("new-token", now_epoch_secs() + 3600)),
-        ]);
+        let runner =
+            MockRunner::new(vec![Ok(token_json("old-token", now_epoch_secs() + 10)), Ok(token_json("new-token", now_epoch_secs() + 3600))]);
         let first = get_oauth_token(&runner).await.expect("first token");
         let second = get_oauth_token(&runner).await.expect("refreshed token");
         assert_eq!(first.access_token, "old-token");
@@ -499,10 +420,7 @@ mod tests {
         let http = replay::test_http_client(&session);
         let agent = make_agent(runner, http);
 
-        let sessions = agent
-            .fetch_sessions_inner("https://api.test")
-            .await
-            .expect("fetch sessions");
+        let sessions = agent.fetch_sessions_inner("https://api.test").await.expect("fetch sessions");
         session.finish();
 
         assert_eq!(sessions.len(), 2, "archived sessions should be filtered");
@@ -515,19 +433,13 @@ mod tests {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
 
-        let runner = mock_runner(vec![
-            Ok(token_json("expired", now_epoch_secs() + 3600)),
-            Ok(token_json("fresh", now_epoch_secs() + 3600)),
-        ]);
-        let session =
-            replay::test_session(&fixture("claude_auth_retry.yaml"), replay::Masks::new());
+        let runner =
+            mock_runner(vec![Ok(token_json("expired", now_epoch_secs() + 3600)), Ok(token_json("fresh", now_epoch_secs() + 3600))]);
+        let session = replay::test_session(&fixture("claude_auth_retry.yaml"), replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = make_agent(runner, http);
 
-        let sessions = agent
-            .fetch_sessions("https://api.test")
-            .await
-            .expect("retry should succeed");
+        let sessions = agent.fetch_sessions("https://api.test").await.expect("retry should succeed");
         session.finish();
 
         assert_eq!(sessions.len(), 1);
@@ -539,19 +451,12 @@ mod tests {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
 
-        let runner = mock_runner(vec![
-            Ok(token_json("bad-1", now_epoch_secs() + 3600)),
-            Ok(token_json("bad-2", now_epoch_secs() + 3600)),
-        ]);
-        let session =
-            replay::test_session(&fixture("claude_auth_failure.yaml"), replay::Masks::new());
+        let runner = mock_runner(vec![Ok(token_json("bad-1", now_epoch_secs() + 3600)), Ok(token_json("bad-2", now_epoch_secs() + 3600))]);
+        let session = replay::test_session(&fixture("claude_auth_failure.yaml"), replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = make_agent(runner, http);
 
-        let sessions = agent
-            .fetch_sessions("https://api.test")
-            .await
-            .expect("auth failures should degrade gracefully");
+        let sessions = agent.fetch_sessions("https://api.test").await.expect("auth failures should degrade gracefully");
         session.finish();
 
         assert!(sessions.is_empty());
@@ -583,10 +488,7 @@ mod tests {
                     session_context: SessionContext {
                         model: "sonnet".into(),
                         outcomes: vec![SessionOutcome {
-                            git_info: Some(SessionGitInfo {
-                                branches: vec!["refs/heads/feat-a".into()],
-                                repo: Some("owner/repo".into()),
-                            }),
+                            git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-a".into()], repo: Some("owner/repo".into()) }),
                         }],
                     },
                 },
@@ -596,10 +498,7 @@ mod tests {
                     session_status: "something-else".into(),
                     created_at: String::new(),
                     updated_at: "2026-03-04T00:00:00Z".into(),
-                    session_context: SessionContext {
-                        model: String::new(),
-                        outcomes: vec![SessionOutcome { git_info: None }],
-                    },
+                    session_context: SessionContext { model: String::new(), outcomes: vec![SessionOutcome { git_info: None }] },
                 },
                 WebSession {
                     id: "skip".into(),
@@ -610,10 +509,7 @@ mod tests {
                     session_context: SessionContext {
                         model: "opus".into(),
                         outcomes: vec![SessionOutcome {
-                            git_info: Some(SessionGitInfo {
-                                branches: vec!["refs/heads/feat-b".into()],
-                                repo: Some("other/repo".into()),
-                            }),
+                            git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-b".into()], repo: Some("other/repo".into()) }),
                         }],
                     },
                 },
@@ -621,29 +517,15 @@ mod tests {
             cache.fetched_at = Some(Instant::now());
         }
 
-        let sessions = agent
-            .list_sessions(&RepoCriteria {
-                repo_slug: Some("owner/repo".into()),
-            })
-            .await
-            .expect("list sessions");
+        let sessions = agent.list_sessions(&RepoCriteria { repo_slug: Some("owner/repo".into()) }).await.expect("list sessions");
 
         assert_eq!(sessions.len(), 2);
-        let one = sessions
-            .iter()
-            .find(|(id, _)| id == "one")
-            .expect("one session");
+        let one = sessions.iter().find(|(id, _)| id == "one").expect("one session");
         assert_eq!(one.1.status, SessionStatus::Running);
         assert_eq!(one.1.model.as_deref(), Some("sonnet"));
-        assert!(one
-            .1
-            .correlation_keys
-            .contains(&CorrelationKey::Branch("feat-a".into())));
+        assert!(one.1.correlation_keys.contains(&CorrelationKey::Branch("feat-a".into())));
 
-        let two = sessions
-            .iter()
-            .find(|(id, _)| id == "two")
-            .expect("two session");
+        let two = sessions.iter().find(|(id, _)| id == "two").expect("two session");
         assert_eq!(two.1.status, SessionStatus::Idle);
         assert!(two.1.model.is_none());
     }
@@ -653,19 +535,12 @@ mod tests {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
 
-        let runner = mock_runner(vec![Ok(token_json(
-            "archive-token",
-            now_epoch_secs() + 3600,
-        ))]);
-        let session =
-            replay::test_session(&fixture("claude_archive_ok.yaml"), replay::Masks::new());
+        let runner = mock_runner(vec![Ok(token_json("archive-token", now_epoch_secs() + 3600))]);
+        let session = replay::test_session(&fixture("claude_archive_ok.yaml"), replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = make_agent(runner, http);
 
-        agent
-            .archive_session_inner("s-ok", "https://api.test")
-            .await
-            .expect("archive should succeed");
+        agent.archive_session_inner("s-ok", "https://api.test").await.expect("archive should succeed");
         session.finish();
     }
 
@@ -674,19 +549,12 @@ mod tests {
         let _test_lock = TEST_LOCK.lock().await;
         reset_auth_state();
 
-        let runner = mock_runner(vec![Ok(token_json(
-            "archive-token",
-            now_epoch_secs() + 3600,
-        ))]);
-        let session =
-            replay::test_session(&fixture("claude_archive_fail.yaml"), replay::Masks::new());
+        let runner = mock_runner(vec![Ok(token_json("archive-token", now_epoch_secs() + 3600))]);
+        let session = replay::test_session(&fixture("claude_archive_fail.yaml"), replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = make_agent(runner, http);
 
-        let err = agent
-            .archive_session_inner("s-fail", "https://api.test")
-            .await
-            .expect_err("archive should fail");
+        let err = agent.archive_session_inner("s-fail", "https://api.test").await.expect_err("archive should fail");
         session.finish();
 
         assert!(err.contains("HTTP 500"));
@@ -704,10 +572,7 @@ mod tests {
         let session = replay::test_session(empty_fixture.to_str().unwrap(), replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = make_agent(runner, http);
-        let cmd = agent
-            .attach_command("abc123")
-            .await
-            .expect("attach command");
+        let cmd = agent.attach_command("abc123").await.expect("attach command");
         assert_eq!(cmd, "claude --teleport abc123");
     }
 }

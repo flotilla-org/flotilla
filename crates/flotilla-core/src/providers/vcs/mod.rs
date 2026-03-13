@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use crate::providers::types::*;
-use crate::providers::{run, CommandRunner};
+use crate::providers::{run, types::*, CommandRunner};
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
@@ -19,34 +18,15 @@ pub trait Vcs: Send + Sync {
     fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf>;
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String>;
     async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String>;
-    async fn commit_log(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-        limit: usize,
-    ) -> Result<Vec<CommitInfo>, String>;
-    async fn ahead_behind(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-        reference: &str,
-    ) -> Result<AheadBehind, String>;
-    async fn working_tree_status(
-        &self,
-        repo_root: &Path,
-        checkout_path: &Path,
-    ) -> Result<WorkingTreeStatus, String>;
+    async fn commit_log(&self, repo_root: &Path, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String>;
+    async fn ahead_behind(&self, repo_root: &Path, branch: &str, reference: &str) -> Result<AheadBehind, String>;
+    async fn working_tree_status(&self, repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String>;
 }
 
 #[async_trait]
 pub trait CheckoutManager: Send + Sync {
     async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String>;
-    async fn create_checkout(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-        create_branch: bool,
-    ) -> Result<(PathBuf, Checkout), String>;
+    async fn create_checkout(&self, repo_root: &Path, branch: &str, create_branch: bool) -> Result<(PathBuf, Checkout), String>;
     async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String>;
 }
 
@@ -84,11 +64,7 @@ pub(crate) fn parse_porcelain_status(output: &str) -> WorkingTreeStatus {
             }
         }
     }
-    WorkingTreeStatus {
-        staged,
-        modified,
-        untracked,
-    }
+    WorkingTreeStatus { staged, modified, untracked }
 }
 
 /// Parse the output of `git config --get-regexp 'branch\.<branch>\.flotilla\.issues\.'`
@@ -110,10 +86,7 @@ pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
         for id in value.split(',') {
             let id = id.trim();
             if !id.is_empty() {
-                keys.push(AssociationKey::IssueRef(
-                    provider.to_string(),
-                    id.to_string(),
-                ));
+                keys.push(AssociationKey::IssueRef(provider.to_string(), id.to_string()));
             }
         }
     }
@@ -122,21 +95,9 @@ pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
 
 /// Read issue links from git config for a specific branch.
 /// Returns empty vec if no links or on error (non-fatal).
-pub async fn read_branch_issue_links(
-    repo_root: &Path,
-    branch: &str,
-    runner: &dyn CommandRunner,
-) -> Vec<AssociationKey> {
-    let pattern = format!(
-        "branch\\.{}\\.flotilla\\.issues\\.",
-        regex_escape_branch(branch)
-    );
-    let result = run!(
-        runner,
-        "git",
-        &["config", "--get-regexp", &pattern],
-        repo_root
-    );
+pub async fn read_branch_issue_links(repo_root: &Path, branch: &str, runner: &dyn CommandRunner) -> Vec<AssociationKey> {
+    let pattern = format!("branch\\.{}\\.flotilla\\.issues\\.", regex_escape_branch(branch));
+    let result = run!(runner, "git", &["config", "--get-regexp", &pattern], repo_root);
     match result {
         Ok(output) => parse_issue_config_output(&output),
         Err(_) => Vec::new(),
@@ -166,26 +127,20 @@ mod tests {
     fn parse_issue_links_single_provider() {
         let git_output = "branch.feat-x.flotilla.issues.github 123,456\n";
         let keys = parse_issue_config_output(git_output);
-        assert_eq!(
-            keys,
-            vec![
-                AssociationKey::IssueRef("github".into(), "123".into()),
-                AssociationKey::IssueRef("github".into(), "456".into()),
-            ]
-        );
+        assert_eq!(keys, vec![
+            AssociationKey::IssueRef("github".into(), "123".into()),
+            AssociationKey::IssueRef("github".into(), "456".into()),
+        ]);
     }
 
     #[test]
     fn parse_issue_links_multiple_providers() {
         let git_output = "branch.feat-x.flotilla.issues.github 42\nbranch.feat-x.flotilla.issues.linear ABC-123\n";
         let keys = parse_issue_config_output(git_output);
-        assert_eq!(
-            keys,
-            vec![
-                AssociationKey::IssueRef("github".into(), "42".into()),
-                AssociationKey::IssueRef("linear".into(), "ABC-123".into()),
-            ]
-        );
+        assert_eq!(keys, vec![
+            AssociationKey::IssueRef("github".into(), "42".into()),
+            AssociationKey::IssueRef("linear".into(), "ABC-123".into()),
+        ]);
     }
 
     #[test]
@@ -204,11 +159,12 @@ mod tests {
 /// Shared test utilities for checkout manager implementations.
 #[cfg(test)]
 pub(crate) mod checkout_test_support {
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
-    use crate::providers::vcs::CheckoutManager;
-    use crate::providers::{ChannelLabel, CommandRunner};
+    use crate::providers::{vcs::CheckoutManager, ChannelLabel, CommandRunner};
 
     /// Run a git command, panicking on failure.
     pub fn git(cwd: &Path, args: &[&str]) {
@@ -218,37 +174,19 @@ pub(crate) mod checkout_test_support {
             .stdin(std::process::Stdio::null())
             .output()
             .expect("failed to spawn git");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     }
 
     /// Create a repo where `feature/remote-only` exists on the remote but not locally.
     /// The remote branch has a commit "remote-only work" ahead of main.
     pub fn setup_remote_only_branch() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let base = dir
-            .path()
-            .canonicalize()
-            .expect("failed to canonicalize tempdir");
+        let base = dir.path().canonicalize().expect("failed to canonicalize tempdir");
         let remote = base.join("remote.git");
         let repo = base.join("repo");
 
-        git(
-            &base,
-            &["init", "--bare", remote.to_str().expect("non-UTF-8 path")],
-        );
-        git(
-            &base,
-            &[
-                "clone",
-                remote.to_str().expect("non-UTF-8 path"),
-                repo.to_str().expect("non-UTF-8 path"),
-            ],
-        );
+        git(&base, &["init", "--bare", remote.to_str().expect("non-UTF-8 path")]);
+        git(&base, &["clone", remote.to_str().expect("non-UTF-8 path"), repo.to_str().expect("non-UTF-8 path")]);
         git(&repo, &["config", "user.email", "test@test.com"]);
         git(&repo, &["config", "user.name", "Test"]);
 
@@ -276,38 +214,19 @@ pub(crate) mod checkout_test_support {
     ///
     /// The worktree should end up on the remote branch's commit ("remote-only work"),
     /// not on main's HEAD ("Initial commit").
-    pub async fn assert_checkout_tracks_remote_branch(
-        mgr: &dyn CheckoutManager,
-        runner: &Arc<dyn CommandRunner>,
-        repo_path: &Path,
-    ) {
-        let (wt_path, checkout) = mgr
-            .create_checkout(repo_path, "feature/remote-only", true)
-            .await
-            .expect("create_checkout should succeed");
+    pub async fn assert_checkout_tracks_remote_branch(mgr: &dyn CheckoutManager, runner: &Arc<dyn CommandRunner>, repo_path: &Path) {
+        let (wt_path, checkout) =
+            mgr.create_checkout(repo_path, "feature/remote-only", true).await.expect("create_checkout should succeed");
 
         assert_eq!(checkout.branch, "feature/remote-only");
         assert!(!checkout.is_main);
 
-        let commit = checkout
-            .last_commit
-            .as_ref()
-            .expect("should have commit info");
-        assert_eq!(
-            commit.message, "remote-only work",
-            "checkout should be on the remote branch's commit, not main"
-        );
+        let commit = checkout.last_commit.as_ref().expect("should have commit info");
+        assert_eq!(commit.message, "remote-only work", "checkout should be on the remote branch's commit, not main");
 
         // Verify via direct git command through the runner
         let label = ChannelLabel::Command("verify-commit".into());
-        let log_output = runner
-            .run("git", &["log", "-1", "--format=%s"], &wt_path, &label)
-            .await
-            .expect("git log should succeed");
-        assert_eq!(
-            log_output.trim(),
-            "remote-only work",
-            "worktree HEAD should be the remote branch's tip"
-        );
+        let log_output = runner.run("git", &["log", "-1", "--format=%s"], &wt_path, &label).await.expect("git log should succeed");
+        assert_eq!(log_output.trim(), "remote-only work", "worktree HEAD should be the remote branch's tip");
     }
 }
