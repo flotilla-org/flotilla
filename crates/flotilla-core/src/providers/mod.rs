@@ -352,7 +352,7 @@ pub async fn resolve_claude_path(runner: &dyn CommandRunner) -> Option<String> {
 pub mod replay;
 
 #[cfg(test)]
-pub mod testing {
+pub(crate) mod testing {
     use std::collections::VecDeque;
 
     use async_trait::async_trait;
@@ -404,7 +404,12 @@ pub(crate) mod github_test_support {
     use crate::providers::{github_api::GhApi, replay, CommandRunner};
 
     pub fn repo_root_for_recording() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CARGO_MANIFEST_DIR should have a parent")
+            .parent()
+            .expect("CARGO_MANIFEST_DIR should have a grandparent")
+            .to_path_buf()
     }
 
     pub fn build_api_and_runner(session: &replay::Session) -> (Arc<dyn GhApi>, Arc<dyn CommandRunner>) {
