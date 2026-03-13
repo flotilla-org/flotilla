@@ -2,12 +2,12 @@
 //!
 //! Checks for the `CURSOR_API_KEY` environment variable and the `agent` binary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
 use crate::providers::discovery::{EnvironmentAssertion, HostDetector};
-use crate::providers::CommandRunner;
+use crate::providers::{run, CommandRunner};
 
 /// Detects Cursor IDE availability via env var and binary.
 pub struct CursorDetector;
@@ -29,12 +29,20 @@ impl HostDetector for CursorDetector {
             });
         }
 
-        // Check `agent` binary
-        if runner.exists("agent", &["--version"]).await {
+        // Check `agent` binary — single call proves existence and captures version
+        if let Ok(output) = run!(runner, "agent", &["--version"], Path::new(".")) {
+            let version = {
+                let trimmed = output.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            };
             assertions.push(EnvironmentAssertion::BinaryAvailable {
                 name: "agent".into(),
                 path: PathBuf::from("agent"),
-                version: None,
+                version,
             });
         }
 
@@ -50,7 +58,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_detector_binary_found() {
         let runner = DiscoveryMockRunner::builder()
-            .tool_exists("agent", true)
+            .on_run("agent", &["--version"], Ok("0.1.0\n".into()))
             .build();
         let assertions = CursorDetector.detect(&runner).await;
         // Should at least have the binary assertion (env var depends on process state)
@@ -65,9 +73,8 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_detector_binary_not_found() {
-        let runner = DiscoveryMockRunner::builder()
-            .tool_exists("agent", false)
-            .build();
+        // No on_run configured → run! returns Err → no binary assertion
+        let runner = DiscoveryMockRunner::builder().build();
         let assertions = CursorDetector.detect(&runner).await;
         let has_binary = assertions.iter().any(|a| {
             matches!(

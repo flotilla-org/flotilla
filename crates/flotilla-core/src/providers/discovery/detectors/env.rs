@@ -29,18 +29,13 @@ impl HostDetector for ZellijDetector {
             });
         }
 
-        // Check binary and extract version for compatibility checking
-        if runner.exists("zellij", &["--version"]).await {
-            let version = run!(runner, "zellij", &["--version"], Path::new("."))
-                .ok()
-                .and_then(|output| {
-                    // Output format: "zellij 0.40.1" or similar
-                    let trimmed = output.trim();
-                    trimmed
-                        .strip_prefix("zellij ")
-                        .map(|v| v.to_string())
-                        .or_else(|| Some(trimmed.to_string()))
-                });
+        // Single call: proves binary exists and captures version
+        if let Ok(output) = run!(runner, "zellij", &["--version"], Path::new(".")) {
+            let trimmed = output.trim();
+            let version = trimmed
+                .strip_prefix("zellij ")
+                .map(|v| v.to_string())
+                .or_else(|| Some(trimmed.to_string()));
             assertions.push(EnvironmentAssertion::BinaryAvailable {
                 name: "zellij".into(),
                 path: PathBuf::from("zellij"),
@@ -70,7 +65,6 @@ mod tests {
         }
 
         let runner = DiscoveryMockRunner::builder()
-            .tool_exists("zellij", true)
             .on_run("zellij", &["--version"], Ok("zellij 0.40.1\n".into()))
             .build();
         let assertions = ZellijDetector.detect(&runner).await;
@@ -102,7 +96,6 @@ mod tests {
         }
 
         let runner = DiscoveryMockRunner::builder()
-            .tool_exists("zellij", true)
             .on_run("zellij", &["--version"], Ok("zellij 0.40.1\n".into()))
             .build();
         let assertions = ZellijDetector.detect(&runner).await;
@@ -124,9 +117,8 @@ mod tests {
             std::env::remove_var("ZELLIJ");
         }
 
-        let runner = DiscoveryMockRunner::builder()
-            .tool_exists("zellij", false)
-            .build();
+        // No on_run configured → run! returns Err → no binary assertion
+        let runner = DiscoveryMockRunner::builder().build();
         let assertions = ZellijDetector.detect(&runner).await;
 
         assert!(assertions.is_empty());

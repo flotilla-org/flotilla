@@ -70,12 +70,15 @@ mod tests {
     use super::*;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
 
+    // Tests that manipulate the CMUX_SOCKET_PATH env var must not run concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn cmux_detector_with_socket_and_binary() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
         // Env var set + binary on PATH → EnvVarSet + SocketAvailable + BinaryAvailable
         let socket_path = "/tmp/cmux-test.sock";
-        // SAFETY: process-global env var mutation; tests in this module run serially
-        // via cargo test's default threading model for each test binary.
         unsafe {
             std::env::set_var("CMUX_SOCKET_PATH", socket_path);
         }
@@ -111,6 +114,8 @@ mod tests {
 
     #[tokio::test]
     async fn cmux_detector_binary_only() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
         // No env var, binary on PATH → BinaryAvailable only
         unsafe {
             std::env::remove_var("CMUX_SOCKET_PATH");
@@ -131,6 +136,8 @@ mod tests {
 
     #[tokio::test]
     async fn cmux_detector_nothing() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
         // No env var, no binary on PATH, and the app-bundle path likely doesn't
         // exist in CI — assert empty (or just BinaryAvailable if the app is
         // installed on this machine).

@@ -823,8 +823,6 @@ mod orchestrator_tests {
     fn runner_with_git_repo(repo_root: &std::path::Path) -> Arc<DiscoveryMockRunner> {
         Arc::new(
             DiscoveryMockRunner::builder()
-                .tool_exists("git", true)
-                .tool_exists("wt", true)
                 .on_run("git", &["--version"], Ok("git version 2.40.0".into()))
                 .on_run(
                     "git",
@@ -1039,7 +1037,6 @@ mod orchestrator_tests {
     async fn run_host_detectors_collects_assertions() {
         let runner = Arc::new(
             DiscoveryMockRunner::builder()
-                .tool_exists("git", true)
                 .on_run("git", &["--version"], Ok("git version 2.40.0".into()))
                 .build(),
         );

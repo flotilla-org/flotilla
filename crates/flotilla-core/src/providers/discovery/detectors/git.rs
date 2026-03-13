@@ -23,18 +23,14 @@ impl HostDetector for GitBinaryDetector {
     }
 
     async fn detect(&self, runner: &dyn CommandRunner) -> Vec<EnvironmentAssertion> {
-        if !runner.exists("git", &["--version"]).await {
+        // Single call: proves binary exists and captures version
+        let Ok(output) = run!(runner, "git", &["--version"], Path::new(".")) else {
             return vec![];
-        }
-        // Parse version from "git version 2.43.0\n"
-        let version = run!(runner, "git", &["--version"], Path::new("."))
-            .ok()
-            .and_then(|output| {
-                output
-                    .trim()
-                    .strip_prefix("git version ")
-                    .map(|v| v.to_string())
-            });
+        };
+        let version = output
+            .trim()
+            .strip_prefix("git version ")
+            .map(|v| v.to_string());
         vec![EnvironmentAssertion::BinaryAvailable {
             name: "git".into(),
             path: PathBuf::from("git"),
@@ -263,7 +259,6 @@ mod tests {
     #[tokio::test]
     async fn git_binary_detector_found() {
         let runner = DiscoveryMockRunner::builder()
-            .tool_exists("git", true)
             .on_run("git", &["--version"], Ok("git version 2.43.0\n".into()))
             .build();
         let assertions = GitBinaryDetector.detect(&runner).await;
@@ -284,9 +279,8 @@ mod tests {
 
     #[tokio::test]
     async fn git_binary_detector_not_found() {
-        let runner = DiscoveryMockRunner::builder()
-            .tool_exists("git", false)
-            .build();
+        // No on_run configured → run! returns Err → empty assertions
+        let runner = DiscoveryMockRunner::builder().build();
         let assertions = GitBinaryDetector.detect(&runner).await;
         assert!(assertions.is_empty());
     }

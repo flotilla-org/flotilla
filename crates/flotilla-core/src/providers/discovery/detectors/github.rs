@@ -17,21 +17,17 @@ impl HostDetector for GhCliDetector {
     }
 
     async fn detect(&self, runner: &dyn CommandRunner) -> Vec<EnvironmentAssertion> {
-        if !runner.exists("gh", &["--version"]).await {
+        // Single call: proves binary exists and captures version
+        let Ok(output) = run!(runner, "gh", &["--version"], Path::new(".")) else {
             return vec![];
-        }
-        // Parse version from "gh version 2.49.0 (2024-05-13)\n..."
-        let version = run!(runner, "gh", &["--version"], Path::new("."))
-            .ok()
-            .and_then(|output| {
-                output
-                    .lines()
-                    .next()
-                    .and_then(|line| line.strip_prefix("gh version "))
-                    .map(|rest| {
-                        // Take only the version number, strip build date etc.
-                        rest.split_whitespace().next().unwrap_or(rest).to_string()
-                    })
+        };
+        let version = output
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("gh version "))
+            .map(|rest| {
+                // Take only the version number, strip build date etc.
+                rest.split_whitespace().next().unwrap_or(rest).to_string()
             });
         vec![EnvironmentAssertion::BinaryAvailable {
             name: "gh".into(),
@@ -49,7 +45,6 @@ mod tests {
     #[tokio::test]
     async fn gh_cli_detector_found() {
         let runner = DiscoveryMockRunner::builder()
-            .tool_exists("gh", true)
             .on_run(
                 "gh",
                 &["--version"],
@@ -74,27 +69,18 @@ mod tests {
 
     #[tokio::test]
     async fn gh_cli_detector_not_found() {
-        let runner = DiscoveryMockRunner::builder()
-            .tool_exists("gh", false)
-            .build();
+        // No on_run configured → run! returns Err → empty assertions
+        let runner = DiscoveryMockRunner::builder().build();
         let assertions = GhCliDetector.detect(&runner).await;
         assert!(assertions.is_empty());
     }
 
     #[tokio::test]
-    async fn gh_cli_detector_version_parse_failure_still_returns_binary() {
+    async fn gh_cli_detector_command_error_returns_empty() {
         let runner = DiscoveryMockRunner::builder()
-            .tool_exists("gh", true)
             .on_run("gh", &["--version"], Err("failed".into()))
             .build();
         let assertions = GhCliDetector.detect(&runner).await;
-        assert_eq!(assertions.len(), 1);
-        match &assertions[0] {
-            EnvironmentAssertion::BinaryAvailable { name, version, .. } => {
-                assert_eq!(name, "gh");
-                assert!(version.is_none());
-            }
-            other => panic!("expected BinaryAvailable, got {other:?}"),
-        }
+        assert!(assertions.is_empty());
     }
 }
