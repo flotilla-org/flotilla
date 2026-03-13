@@ -776,6 +776,17 @@ async fn disconnect_peer_and_rebuild(
     // Apply pre-computed overlay updates outside the PeerManager lock.
     // Identity → path is resolved here at apply time (not at computation time)
     // to avoid TOCTOU with concurrent add_repo/remove_repo.
+    //
+    // Note: a residual apply-ordering race exists here. Between releasing
+    // the PM lock above and calling set_peer_providers below, the central
+    // processor can accept fresh inbound data and call set_peer_providers
+    // via the HandleResult::Updated path. Because set_peer_providers is a
+    // blind replace, this apply could overwrite that newer data. This is
+    // the same read-then-apply pattern shared by ALL overlay write paths
+    // (including the central processor itself). The effect is transient:
+    // the next inbound message for the affected repo will re-apply the
+    // correct state. Fully fixing this requires versioned/conditional
+    // set_peer_providers, which is a broader change tracked separately.
     for update in &plan.overlay_updates {
         match update {
             crate::peer::OverlayUpdate::SetProviders { identity, peers } => {
