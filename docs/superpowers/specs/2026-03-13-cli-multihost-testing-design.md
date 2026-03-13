@@ -24,6 +24,8 @@ All commands support two output modes:
 
 A shared output layer renders the same data in both formats, established as a pattern for all commands.
 
+The existing `watch` command already serializes `DaemonEvent` via serde — `--json` for streaming commands uses this same serialization, one JSON object per line (JSONL).
+
 ### Command Grammar
 
 Commands follow a `<noun> [scope] <verb>` grammar. Scoping narrows context:
@@ -34,10 +36,14 @@ flotilla repo <path_or_slug> work          # work for one repo
 flotilla host <host> work                  # work from one host
 ```
 
-The `host <host>` prefix routes commands to a remote host's daemon via the peer protocol. Any command can be remote-targeted this way:
+The `host <host>` prefix targets commands at a remote host. Two mechanisms:
+
+- **Query commands** (`status`, `providers`, `work`): answered from locally-replicated peer data — no remote round-trip needed since the daemon already holds peer snapshots.
+- **Control commands** (`repo add`, `refresh`, `checkout`): require remote command forwarding. This extends the peer protocol beyond data replication — the local daemon sends a `Command` to the remote peer and proxies the `CommandResult` back. This is a new capability requiring additions to `PeerDataMessage` (or a parallel request/response channel over the SSH transport).
 
 ```
-flotilla host feta repo add /path/to/repo
+flotilla host feta repo add /path/to/repo   # remote command forwarding
+flotilla host feta providers                 # answered from local replica
 ```
 
 `path_or_slug` matching: full path, repo name, or unique substring.
@@ -60,7 +66,7 @@ flotilla host feta repo add /path/to/repo
 | `flotilla repo add <path>` | Track a new repo |
 | `flotilla repo remove <path_or_slug>` | Stop tracking a repo |
 | `flotilla repo <path_or_slug> checkout <branch> [path]` | Create checkout (path optional) |
-| `flotilla checkout <path> remove` | Remove a checkout |
+| `flotilla checkout <path_or_branch> remove` | Remove a checkout (by worktree path or branch name) |
 
 Control commands send `Command` variants through `execute()`, block until `CommandFinished`, and exit with appropriate exit codes.
 
@@ -84,6 +90,37 @@ Control commands send `Command` variants through `execute()`, block until `Comma
 
 `watch` uses the existing `DaemonEvent` subscription. The scope prefix applies a filter — same stream, narrower view.
 
+## Protocol and API Additions
+
+The CLI requires new capabilities in the daemon API and wire protocol:
+
+### New `DaemonHandle` methods
+
+The existing trait has `get_state`, `list_repos`, `execute`, `refresh`, `add_repo`, `remove_repo`, `replay_since`. New methods needed:
+
+- `list_hosts()` — returns configured hosts with connection status
+- `get_host_providers(host)` — provider discovery results for a host (from local replica for remote hosts)
+- `get_topology()` — peer connection graph with sync state
+- `get_local_providers()` — host-level discovery results (assertions, detected binaries/sockets/auth)
+
+These map to new request types in the wire protocol (`dispatch_request` in `server.rs`).
+
+### Discovery data serialization
+
+`EnvironmentBag` and `EnvironmentAssertion` need `Serialize`/`Deserialize` derives (or a new summary type in `flotilla-protocol`) to surface host-level discovery data via the CLI. The provider registry should retain a summary of what was discovered, not just the constructed provider instances.
+
+### Remote command forwarding
+
+Control commands targeted at remote hosts (`host <host> repo add`) require extending the peer transport to carry request/response messages, not just `PeerDataMessage` replication data. This could be:
+- New variants on `PeerDataMessage` (`CommandRequest`, `CommandResponse`)
+- Or a parallel request/response channel over the same SSH connection
+
+This is scoped to Issue 3 (control commands) and is the most significant protocol addition.
+
+### Refresh scoping
+
+`Command::Refresh` needs an optional repo parameter to support `flotilla refresh <repo>` vs `flotilla refresh` (all repos).
+
 ## Docker Infrastructure
 
 ### Image Strategy
@@ -99,9 +136,11 @@ Control commands send `Command` variants through `execute()`, block until `Comma
 | Role | Providers | Coding Agent | Session Manager | Notes |
 |------|-----------|-------------|-----------------|-------|
 | `workstation` | Full (`gh`, all providers) | claude | tmux + zellij, shpool | Leader, workspace transfer testing |
-| `follower-codex` | Local only (VCS, workspace) | codex | shpool | Persistent sessions |
-| `follower-gemini` | Local only (VCS, workspace) | gemini | No shpool | Direct SSH spawn |
+| `follower-codex` | Local only (VCS, workspace) | codex (stub) | shpool | Persistent sessions |
+| `follower-gemini` | Local only (VCS, workspace) | gemini (stub) | No shpool | Direct SSH spawn |
 | `jumpbox` | Minimal (SSH only) | None | None | Follower mode, relay only |
+
+Coding agents in test containers are stubs — enough to be detected by provider discovery (binary present, auth file exists) but not calling real APIs. The tests validate that flotilla discovers and reports the right providers per host, not that the agents function.
 
 ### Topologies
 
@@ -171,27 +210,27 @@ def test_peer_connectivity(minimal_topology):
 
 ### Issue 1: CLI output formatting infrastructure
 
-Add `--json` flag and shared output layer. Retrofit existing `status` and `watch` subcommands. Establish pattern for all future commands.
+Add `--json` flag and shared output layer. Retrofit existing `status` and `watch` subcommands. Establish pattern for all future commands. Includes `--json` for `watch` (JSONL, one event per line).
 
 **Labels**: `enhancement`, `infrastructure`
 
 ### Issue 2: CLI query commands
 
-`status`, `host providers`, `repo [path_or_slug] providers`, `repo [path_or_slug]`, `work`. All one-shot, all support `--json`.
+`status`, `host providers`, `repo [path_or_slug] providers`, `repo [path_or_slug]`, `work`. All one-shot, all support `--json`. Includes new `DaemonHandle` methods (`list_hosts`, `get_local_providers`, `get_host_providers`) and making discovery data serializable.
 
 **Labels**: `enhancement`
 **Blocked by**: Issue 1
 
 ### Issue 3: CLI control commands
 
-`refresh`, `repo add/remove`, `repo checkout`, `checkout remove`. Remote targeting via `host <host>` prefix. `path_or_slug` matching.
+`refresh`, `repo add/remove`, `repo checkout`, `checkout remove`. `path_or_slug` matching. Remote targeting via `host <host>` prefix — requires extending peer protocol with command forwarding (`CommandRequest`/`CommandResponse`). Also includes `Refresh` scoping (optional repo parameter).
 
 **Labels**: `enhancement`
 **Blocked by**: Issue 1
 
 ### Issue 4: CLI multi-host commands
 
-`host list`, `host <host> status`, `host <host> providers`, `topology` (with `--dot`), `watch` scoping.
+`host list`, `host <host> status`, `host <host> providers`, `topology` (with `--dot`), `watch` scoping. Includes `get_topology()` daemon method. Query commands against remote hosts answered from local replica (no remote forwarding needed).
 
 **Labels**: `enhancement`
 **Blocked by**: Issue 1
@@ -204,10 +243,10 @@ Add `--json` flag and shared output layer. Retrofit existing `status` and `watch
 
 ### Issue 6: Minimal topology — 2-node direct SSH + pytest harness
 
-First end-to-end validation. Pytest skeleton with compose fixtures, SSH helpers, JSON assertion utils.
+First end-to-end validation. Pytest skeleton with compose fixtures, SSH helpers, JSON assertion utils. Can start with just `status --json` and `watch --json` (from Issue 1), expanding test coverage as Issues 2–4 land.
 
 **Labels**: `testing`, `infrastructure`
-**Blocked by**: Issues 1–4, 5
+**Blocked by**: Issues 1, 5
 
 ### Issue 7: Hub-spoke topology — 1 workstation + 2 followers
 
