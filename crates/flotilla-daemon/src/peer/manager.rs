@@ -109,11 +109,23 @@ pub struct PendingResyncRequest {
     pub deadline_at: Instant,
 }
 
+/// Pre-computed overlay update to apply to InProcessDaemon after releasing the PeerManager lock.
+#[derive(Debug, Clone)]
+pub enum OverlayUpdate {
+    /// Update peer_providers for a repo with remaining peer data.
+    SetProviders { path: PathBuf, peers: Vec<(HostName, ProviderData)> },
+    /// Remove a virtual repo — no peers remain.
+    RemoveRepo { identity: RepoIdentity, path: PathBuf },
+}
+
 #[derive(Debug, Clone)]
 pub struct DisconnectPlan {
     pub was_active: bool,
     pub affected_repos: Vec<RepoIdentity>,
     pub resync_requests: Vec<RoutedPeerMessage>,
+    /// Pre-computed overlay state for each affected repo, captured atomically
+    /// with the disconnect under the same lock.
+    pub overlay_updates: Vec<OverlayUpdate>,
 }
 
 /// Per-repo state received from a single peer host.
@@ -866,7 +878,12 @@ impl PeerManager {
 
     pub fn disconnect_peer(&mut self, name: &HostName, generation: u64) -> DisconnectPlan {
         if !self.generation_is_current(name, generation) {
-            return DisconnectPlan { was_active: false, affected_repos: Vec::new(), resync_requests: Vec::new() };
+            return DisconnectPlan {
+                was_active: false,
+                affected_repos: Vec::new(),
+                resync_requests: Vec::new(),
+                overlay_updates: Vec::new(),
+            };
         }
 
         self.senders.remove(name);
@@ -952,7 +969,7 @@ impl PeerManager {
 
         self.last_seen_clocks.retain(|(host, _), _| host != name);
 
-        DisconnectPlan { was_active: true, affected_repos, resync_requests }
+        DisconnectPlan { was_active: true, affected_repos, resync_requests, overlay_updates: Vec::new() }
     }
 }
 
