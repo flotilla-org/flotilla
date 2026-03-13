@@ -54,6 +54,10 @@ impl DaemonHandle for StubDaemon {
         Ok(1)
     }
 
+    async fn cancel(&self, _command_id: u64) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn refresh(&self, _repo: &Path) -> Result<(), String> {
         Ok(())
     }

@@ -581,6 +581,11 @@ impl DaemonHandle for SocketDaemon {
         resp.parse::<u64>()
     }
 
+    async fn cancel(&self, command_id: u64) -> Result<(), String> {
+        let resp = self.request("cancel", serde_json::json!({ "command_id": command_id })).await?;
+        resp.parse_empty()
+    }
+
     async fn refresh(&self, repo: &Path) -> Result<(), String> {
         let resp = self.request("refresh", serde_json::json!({ "repo": repo })).await?;
         resp.parse_empty()

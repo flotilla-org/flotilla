@@ -102,7 +102,7 @@ impl Command {
 }
 
 /// Result returned from command execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandResult {
     Ok,
@@ -123,7 +123,7 @@ pub enum StepStatus {
     Failed { message: String },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CheckoutStatus {
     pub branch: String,
     pub change_request_status: Option<String>,

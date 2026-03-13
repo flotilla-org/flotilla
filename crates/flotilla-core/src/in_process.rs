@@ -1068,6 +1068,11 @@ impl DaemonHandle for InProcessDaemon {
         Ok(id)
     }
 
+    async fn cancel(&self, _command_id: u64) -> Result<(), String> {
+        // TODO: implement cancellation with CancellationToken tracking
+        Err("cancel not yet implemented".into())
+    }
+
     async fn refresh(&self, repo: &Path) -> Result<(), String> {
         let (prev_count, registry) = {
             let repos = self.repos.read().await;
