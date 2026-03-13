@@ -598,37 +598,53 @@ impl DaemonServer {
             let mut event_rx = outbound_daemon.subscribe();
             let mut outbound_clock = flotilla_protocol::VectorClock::default();
             let host_name = outbound_daemon.host_name().clone();
+            let mut last_sent_versions: std::collections::HashMap<std::path::PathBuf, u64> =
+                std::collections::HashMap::new();
 
             loop {
-                match event_rx.recv().await {
-                    Ok(DaemonEvent::SnapshotFull(snapshot)) => {
-                        send_local_to_peers(
-                            &outbound_daemon,
-                            &outbound_peer_manager,
-                            &host_name,
-                            &mut outbound_clock,
-                            &snapshot.repo,
-                        )
-                        .await;
-                    }
-                    Ok(DaemonEvent::SnapshotDelta(delta)) => {
-                        // Deltas also indicate local data changed — send full
-                        // local providers to peers (we don't replicate deltas).
-                        send_local_to_peers(
-                            &outbound_daemon,
-                            &outbound_peer_manager,
-                            &host_name,
-                            &mut outbound_clock,
-                            &delta.repo,
-                        )
-                        .await;
-                    }
-                    Ok(_) => {} // Ignore non-data events
+                let repo_path = match event_rx.recv().await {
+                    Ok(DaemonEvent::SnapshotFull(snapshot)) => Some(snapshot.repo.clone()),
+                    Ok(DaemonEvent::SnapshotDelta(delta)) => Some(delta.repo.clone()),
+                    Ok(_) => None,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "outbound peer event subscriber lagged");
+                        None
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
+                    }
+                };
+                if let Some(repo_path) = repo_path {
+                    // Only send to peers when local data has actually changed.
+                    // get_local_providers returns a local_data_version that only
+                    // increments on local changes (provider refreshes, issue
+                    // updates, searches), not peer data merges. This prevents a
+                    // feedback loop where peer data triggers re-sending unchanged
+                    // local data back to peers endlessly.
+                    let Some((local_providers, version)) =
+                        outbound_daemon.get_local_providers(&repo_path).await
+                    else {
+                        continue;
+                    };
+                    let last = last_sent_versions.get(&repo_path).copied().unwrap_or(0);
+                    if version <= last {
+                        continue;
+                    }
+                    let sent = send_local_to_peers(
+                        &outbound_daemon,
+                        &outbound_peer_manager,
+                        &host_name,
+                        &mut outbound_clock,
+                        &repo_path,
+                        local_providers,
+                        version,
+                    )
+                    .await;
+                    // Only record the version as sent if at least one peer
+                    // received it. Otherwise a version produced while no peers
+                    // are connected would be suppressed forever on reconnect.
+                    if sent {
+                        last_sent_versions.insert(repo_path, version);
                     }
                 }
             }
@@ -811,18 +827,19 @@ async fn disconnect_peer_and_rebuild(
 ///
 /// Sends to both configured SSH transports (outbound peers we connected to)
 /// and inbound peer clients (peers that connected to our socket).
+/// Send local provider data to all connected peers.
+/// Returns `true` if at least one peer was successfully sent to.
 async fn send_local_to_peers(
     daemon: &Arc<InProcessDaemon>,
     peer_manager: &Arc<Mutex<PeerManager>>,
     host_name: &HostName,
     clock: &mut flotilla_protocol::VectorClock,
     repo_path: &std::path::Path,
-) {
+    local_providers: flotilla_protocol::ProviderData,
+    local_data_version: u64,
+) -> bool {
     let Some(identity) = daemon.find_identity_for_path(repo_path).await else {
-        return;
-    };
-    let Some((local_providers, seq)) = daemon.get_local_providers(repo_path).await else {
-        return;
+        return false;
     };
 
     clock.tick(host_name);
@@ -833,7 +850,7 @@ async fn send_local_to_peers(
         clock: clock.clone(),
         kind: flotilla_protocol::PeerDataKind::Snapshot {
             data: Box::new(local_providers),
-            seq,
+            seq: local_data_version,
         },
     };
 
@@ -842,11 +859,15 @@ async fn send_local_to_peers(
         let pm = peer_manager.lock().await;
         pm.active_peer_senders()
     };
+    let mut any_sent = false;
     for (peer_name, sender) in peer_senders {
         if let Err(e) = sender.send(PeerWireMessage::Data(msg.clone())).await {
             debug!(peer = %peer_name, err = %e, "failed to send snapshot to peer");
+        } else {
+            any_sent = true;
         }
     }
+    any_sent
 }
 
 /// Forward messages from an inbound receiver to the shared peer_data channel.

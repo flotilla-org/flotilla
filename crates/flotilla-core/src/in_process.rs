@@ -192,6 +192,9 @@ struct RepoState {
     last_broadcast_errors: Vec<ProviderError>,
     /// Bounded delta log for replay on client reconnect.
     delta_log: VecDeque<DeltaEntry>,
+    /// Incremented only when local provider data changes (not peer data merges).
+    /// Used by the outbound peer task to avoid re-sending unchanged local data.
+    local_data_version: u64,
 }
 
 impl RepoState {
@@ -391,6 +394,7 @@ impl InProcessDaemon {
                     last_broadcast_health: HashMap::new(),
                     last_broadcast_errors: Vec::new(),
                     delta_log: VecDeque::new(),
+                    local_data_version: 0,
                 },
             );
             order.push(path);
@@ -473,7 +477,7 @@ impl InProcessDaemon {
             &state.issue_cache,
             &state.search_results,
         );
-        Some((providers, state.seq))
+        Some((providers, state.local_data_version))
     }
 
     /// Update the peer provider data overlay for a repo and trigger re-broadcast.
@@ -485,7 +489,7 @@ impl InProcessDaemon {
             let mut pp = self.peer_providers.write().await;
             pp.insert(repo_path.to_path_buf(), peers);
         }
-        self.broadcast_snapshot(repo_path).await;
+        self.broadcast_snapshot_inner(repo_path, false).await;
     }
 
     /// Poll all repos for new refresh snapshots.
@@ -604,6 +608,7 @@ impl InProcessDaemon {
             );
 
             state.seq += 1;
+            state.local_data_version += 1;
             state.last_snapshot = snapshot;
 
             let event = choose_event(proto_snapshot, delta_entry);
@@ -996,6 +1001,7 @@ impl InProcessDaemon {
                     last_broadcast_health: HashMap::new(),
                     last_broadcast_errors: Vec::new(),
                     delta_log: VecDeque::new(),
+                    local_data_version: 0,
                 },
             );
             order.push(synthetic_path.clone());
@@ -1017,6 +1023,10 @@ impl InProcessDaemon {
     /// If peer provider data has been set for this repo via [`set_peer_providers`],
     /// it is merged into the snapshot before correlation and broadcasting.
     async fn broadcast_snapshot(&self, repo: &Path) {
+        self.broadcast_snapshot_inner(repo, true).await;
+    }
+
+    async fn broadcast_snapshot_inner(&self, repo: &Path, is_local_change: bool) {
         // Read peer overlay (brief read lock)
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
@@ -1046,6 +1056,9 @@ impl InProcessDaemon {
             proto_snapshot.work_items.clone(),
         );
         state.seq += 1;
+        if is_local_change {
+            state.local_data_version += 1;
+        }
 
         let event = choose_event(proto_snapshot, delta_entry);
         let _ = self.event_tx.send(event);
@@ -1309,6 +1322,7 @@ impl DaemonHandle for InProcessDaemon {
                     last_broadcast_health: HashMap::new(),
                     last_broadcast_errors: Vec::new(),
                     delta_log: VecDeque::new(),
+                    local_data_version: 0,
                 },
             );
             order.push(path.clone());
