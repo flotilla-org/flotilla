@@ -1082,6 +1082,22 @@ impl DaemonHandle for InProcessDaemon {
                     let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
                 }
                 ExecutionPlan::Steps(step_plan) => {
+                    // Reject if another step command is already running.
+                    // Single-slot design: one step command at a time (global).
+                    {
+                        let guard = active_ref.lock().await;
+                        if let Some(active) = &*guard {
+                            let _ = event_tx.send(DaemonEvent::CommandFinished {
+                                command_id: id,
+                                repo: repo_path,
+                                result: flotilla_protocol::CommandResult::Error {
+                                    message: format!("another command is already running (id {})", active.command_id),
+                                },
+                            });
+                            return;
+                        }
+                    }
+
                     let token = CancellationToken::new();
                     *active_ref.lock().await = Some(ActiveCommand { command_id: id, token: token.clone() });
 
