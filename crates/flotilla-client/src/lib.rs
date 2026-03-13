@@ -27,20 +27,26 @@ type SeqMap = std::sync::RwLock<HashMap<PathBuf, u64>>;
 /// RAII guard that removes a lock file when dropped.
 ///
 /// Holds the open file handle (which keeps the OS flock) and removes the
-/// lock file on drop.
+/// lock file on drop.  The flock is released *before* the path is unlinked
+/// so that concurrent clients racing on the same path always contend on the
+/// same inode — unlinking first would let them create a new file and flock
+/// a different inode, breaking mutual exclusion.
 struct SpawnLockGuard {
-    _file: std::fs::File,
+    file: Option<std::fs::File>,
     path: PathBuf,
 }
 
 impl SpawnLockGuard {
     fn new(file: std::fs::File, path: PathBuf) -> Self {
-        Self { _file: file, path }
+        Self { file: Some(file), path }
     }
 }
 
 impl Drop for SpawnLockGuard {
     fn drop(&mut self) {
+        // Release the flock before unlinking, preserving the
+        // mutual-exclusion contract during the handoff window.
+        drop(self.file.take());
         let _ = std::fs::remove_file(&self.path);
     }
 }
