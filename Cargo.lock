@@ -1078,6 +1078,7 @@ dependencies = [
  "toml",
  "tracing",
  "urlencoding",
+ "uuid",
 ]
 
 [[package]]
@@ -1095,6 +1096,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1108,6 +1110,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4063,6 +4066,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

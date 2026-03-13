@@ -22,7 +22,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_message_line_produces_valid_json_line() {
-        let msg = Message::Hello { protocol_version: 1, host_name: HostName::new("test") };
+        let msg = Message::Hello { protocol_version: 1, host_name: HostName::new("test"), session_id: uuid::Uuid::nil() };
         let mut buf = Vec::new();
         write_message_line(&mut buf, &msg).await.expect("write should succeed");
 
@@ -31,7 +31,7 @@ mod tests {
         let trimmed = output.trim_end();
         let parsed: Message = serde_json::from_str(trimmed).expect("should be valid JSON");
         match parsed {
-            Message::Hello { protocol_version, host_name } => {
+            Message::Hello { protocol_version, host_name, .. } => {
                 assert_eq!(protocol_version, 1);
                 assert_eq!(host_name, HostName::new("test"));
             }

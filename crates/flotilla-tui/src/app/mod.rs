@@ -42,6 +42,7 @@ pub enum PeerStatus {
     Disconnected,
     Connecting,
     Reconnecting,
+    Rejected,
 }
 
 impl From<PeerConnectionState> for PeerStatus {
@@ -51,6 +52,7 @@ impl From<PeerConnectionState> for PeerStatus {
             PeerConnectionState::Disconnected => PeerStatus::Disconnected,
             PeerConnectionState::Connecting => PeerStatus::Connecting,
             PeerConnectionState::Reconnecting => PeerStatus::Reconnecting,
+            PeerConnectionState::Rejected { .. } => PeerStatus::Rejected,
         }
     }
 }

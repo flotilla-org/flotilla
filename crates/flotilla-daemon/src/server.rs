@@ -352,7 +352,7 @@ async fn handle_client(
             info!(%count, "client disconnected");
             client_notify.notify_one();
         }
-        Message::Hello { protocol_version, host_name } => {
+        Message::Hello { protocol_version, host_name, session_id } => {
             if protocol_version != PROTOCOL_VERSION {
                 warn!(
                     peer = %host_name,
@@ -360,15 +360,27 @@ async fn handle_client(
                     got = protocol_version,
                     "peer protocol version mismatch"
                 );
+                daemon.send_event(DaemonEvent::PeerStatusChanged {
+                    host: host_name,
+                    status: PeerConnectionState::Rejected {
+                        reason: format!("protocol mismatch (local={}, remote={})", PROTOCOL_VERSION, protocol_version),
+                    },
+                });
                 return;
             }
 
-            if write_message(&writer, &Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: daemon.host_name().clone() })
-                .await
-                .is_err()
+            if write_message(&writer, &Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                host_name: daemon.host_name().clone(),
+                session_id: daemon.session_id(),
+            })
+            .await
+            .is_err()
             {
                 return;
             }
+
+            let remote_session_id = Some(session_id);
 
             let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(64);
             let relay_writer = Arc::clone(&writer);
@@ -391,6 +403,7 @@ async fn handle_client(
                         expected_peer: None,
                         config_backed: false,
                     },
+                    remote_session_id,
                 ) {
                     ActivationResult::Accepted { generation, displaced } => (generation, displaced),
                     ActivationResult::Rejected { reason } => {
@@ -809,13 +822,14 @@ mod tests {
         let mut reader = BufReader::new(read_half).lines();
         let mut writer = BufWriter::new(write_half);
 
-        let hello = Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("remote-host") };
+        let hello =
+            Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("remote-host"), session_id: uuid::Uuid::nil() };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
         let line = reader.next_line().await.expect("read hello response").expect("hello line");
         let hello_back: Message = serde_json::from_str(&line).expect("parse hello");
         match hello_back {
-            Message::Hello { protocol_version, host_name } => {
+            Message::Hello { protocol_version, host_name, .. } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(host_name, expected_local_host);
             }
@@ -959,7 +973,8 @@ mod tests {
         let mut reader = BufReader::new(read_half).lines();
         let mut writer = BufWriter::new(write_half);
 
-        let hello = Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("relay-target") };
+        let hello =
+            Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("relay-target"), session_id: uuid::Uuid::nil() };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
         let _ = reader.next_line().await.expect("read hello").expect("line");
 
@@ -1038,7 +1053,8 @@ mod tests {
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half).lines();
             let mut writer = BufWriter::new(write_half);
-            let hello = Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("peer") };
+            let hello =
+                Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("peer"), session_id: uuid::Uuid::nil() };
             flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
             let line = reader.next_line().await.expect("read hello response").expect("hello response line");
