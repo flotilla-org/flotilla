@@ -291,6 +291,13 @@ pub struct InProcessDaemon {
     /// Current peer connection status, updated via `set_peer_status()` and
     /// replayed to late-subscribing clients via `replay_since()`.
     peer_status: RwLock<HashMap<HostName, PeerConnectionState>>,
+    /// Host-level environment assertions, computed once at startup and
+    /// reused for each repo discovery.
+    host_bag: crate::providers::discovery::EnvironmentBag,
+    /// Repo-level detectors, computed once at startup.
+    repo_detectors: Vec<Box<dyn crate::providers::discovery::RepoDetector>>,
+    /// Provider factories, computed once at startup (follower vs full).
+    factories: crate::providers::discovery::FactoryRegistry,
 }
 
 impl InProcessDaemon {
@@ -316,33 +323,46 @@ impl InProcessDaemon {
         follower: bool,
         host_name: HostName,
     ) -> Arc<Self> {
+        use crate::providers::discovery::{self, detectors, DiscoveryResult, FactoryRegistry};
+
         let (event_tx, _) = broadcast::channel(256);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let mut repos = HashMap::new();
         let mut order = Vec::new();
         let mut identities = HashMap::new();
 
+        // Run host detection once before the repo loop
+        let host_detectors = detectors::default_host_detectors();
+        let repo_detectors = detectors::default_repo_detectors();
+        let host_bag = discovery::run_host_detectors(&host_detectors, &*runner).await;
+        let factories = if follower {
+            FactoryRegistry::for_follower()
+        } else {
+            FactoryRegistry::default_all()
+        };
+
         for path in repo_paths {
             if repos.contains_key(&path) {
                 continue;
             }
-            let (registry, repo_slug) = crate::providers::discovery_legacy::detect_providers(
+            let DiscoveryResult {
+                registry,
+                repo_slug,
+                bag,
+                unmet: _,
+            } = discovery::discover_providers(
+                &host_bag,
                 &path,
+                &repo_detectors,
+                &factories,
                 &config,
                 Arc::clone(&runner),
-                follower,
             )
             .await;
 
-            // Extract RepoIdentity from git remote URL for peer data routing
-            if let Some(url) =
-                crate::providers::discovery_legacy::first_remote_url(&path, &*runner).await
-            {
-                if let Some(identity) =
-                    crate::providers::discovery_legacy::extract_repo_identity(&url)
-                {
-                    identities.insert(identity, path.clone());
-                }
+            // RepoIdentity from the merged bag
+            if let Some(identity) = bag.repo_identity() {
+                identities.insert(identity, path.clone());
             }
 
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
@@ -377,6 +397,9 @@ impl InProcessDaemon {
             peer_providers: RwLock::new(HashMap::new()),
             repo_identities: RwLock::new(identities),
             peer_status: RwLock::new(HashMap::new()),
+            host_bag,
+            repo_detectors,
+            factories,
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -1221,11 +1244,18 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let (registry, repo_slug) = crate::providers::discovery_legacy::detect_providers(
+        let crate::providers::discovery::DiscoveryResult {
+            registry,
+            repo_slug,
+            bag,
+            unmet: _,
+        } = crate::providers::discovery::discover_providers(
+            &self.host_bag,
             &path,
+            &self.repo_detectors,
+            &self.factories,
             &self.config,
             Arc::clone(&self.runner),
-            self.follower,
         )
         .await;
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
@@ -1266,16 +1296,11 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Register RepoIdentity for peer routing
-        if let Some(url) =
-            crate::providers::discovery_legacy::first_remote_url(&path, &*self.runner).await
-        {
-            if let Some(identity) = crate::providers::discovery_legacy::extract_repo_identity(&url)
-            {
-                self.repo_identities
-                    .write()
-                    .await
-                    .insert(identity, path.clone());
-            }
+        if let Some(identity) = bag.repo_identity() {
+            self.repo_identities
+                .write()
+                .await
+                .insert(identity, path.clone());
         }
 
         // Persist to config

@@ -5,7 +5,7 @@
 use flotilla_core::config::ConfigStore;
 use flotilla_core::convert::correlation_result_to_work_item;
 use flotilla_core::data;
-use flotilla_core::providers::discovery_legacy::detect_providers;
+use flotilla_core::providers::discovery::{self, detectors, FactoryRegistry};
 use flotilla_core::providers::types::RepoCriteria;
 use flotilla_core::providers::{CommandRunner, ProcessCommandRunner};
 use flotilla_core::refresh::RepoRefreshHandle;
@@ -27,7 +27,23 @@ async fn main() {
     println!("\n=== Step 1: Build ProviderRegistry ===");
     let config = ConfigStore::new();
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
-    let (registry, repo_slug) = detect_providers(&repo_root, &config, runner, false).await;
+
+    let host_dets = detectors::default_host_detectors();
+    let repo_dets = detectors::default_repo_detectors();
+    let host_bag = discovery::run_host_detectors(&host_dets, &*runner).await;
+    let factories = FactoryRegistry::default_all();
+
+    let result = discovery::discover_providers(
+        &host_bag,
+        &repo_root,
+        &repo_dets,
+        &factories,
+        &config,
+        Arc::clone(&runner),
+    )
+    .await;
+    let registry = result.registry;
+    let repo_slug = result.repo_slug;
     println!("  checkout_managers: {}", registry.checkout_managers.len());
     println!("  code_review: {}", registry.code_review.len());
     println!("  issue_trackers: {}", registry.issue_trackers.len());
