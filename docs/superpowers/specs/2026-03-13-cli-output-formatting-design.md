@@ -54,7 +54,7 @@ Handlers receive `format: OutputFormat`.
 
 ### Human mode (default)
 
-Table-like output — one block per repo:
+Table-like output — one block per repo. This is a new format replacing the existing ad-hoc output:
 
 ```
 my-repo  /path/to/repo
@@ -64,15 +64,27 @@ other-repo  /path/to/other  (loading)
   vcs/Git: ok  issue_tracker/GitHub: error
 ```
 
+If no repos are tracked, print `No repos tracked.` and exit 0.
+
 ### JSON mode
 
-Pretty-printed JSON array of `RepoInfo` objects via `json_pretty`.
+Pretty-printed JSON wrapper object via `json_pretty`:
+
+```json
+{
+  "repos": [ ... RepoInfo objects ... ]
+}
+```
+
+The wrapper object allows adding top-level fields (e.g., daemon version) without breaking consumers.
 
 ## `watch` Command
 
+**Breaking change:** The existing `watch` command outputs pretty-printed JSON by default. This changes the default to human-readable summaries. Use `--json` for machine-readable output.
+
 ### Human mode (default)
 
-One-line event summaries:
+One-line event summaries. Repo names are derived from the last component of the `repo: PathBuf` field:
 
 ```
 [snapshot] my-repo: full snapshot (seq 42, 5 work items)
@@ -82,11 +94,24 @@ One-line event summaries:
 [command]  my-repo: started "refresh"
 [command]  my-repo: finished "refresh" → ok
 [peer]     host-2: connected
+[peer]     host-2: disconnected
+[peer]     host-2: connecting
+[peer]     host-2: reconnecting
 ```
+
+All four `PeerConnectionState` variants (`Connected`, `Disconnected`, `Connecting`, `Reconnecting`) are rendered lowercase.
+
+On daemon disconnect, print `daemon disconnected` to stderr and exit 0.
 
 ### JSON mode
 
 Compact JSONL — one `DaemonEvent` per line via `json_line`. Not pretty-printed.
+
+On daemon disconnect, stop writing and exit 0.
+
+### Both modes
+
+On broken pipe, exit silently (exit 0) — standard behavior for piped CLI tools (`watch | head`). If the daemon is not running or the connection fails, print the error to stderr and exit non-zero (the default `color_eyre` behavior).
 
 ## File Changes
 
