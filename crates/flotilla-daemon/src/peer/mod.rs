@@ -1,9 +1,11 @@
+pub mod channel_transport;
 pub mod manager;
 pub mod merge;
 pub mod ssh_transport;
 pub mod test_support;
 pub mod transport;
 
+pub use channel_transport::{channel_transport_pair, ChannelTransport};
 pub use manager::{
     synthetic_repo_path, ActivationResult, ConnectionDirection, ConnectionMeta, DisconnectPlan, HandleResult, InboundPeerEnvelope,
     PeerManager, PendingResyncRequest, PerRepoPeerState, ReversePathHop, ReversePathKey, RouteHop, RouteState,
