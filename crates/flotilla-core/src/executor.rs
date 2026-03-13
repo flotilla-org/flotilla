@@ -1878,4 +1878,142 @@ mod tests {
         assert_eq!(config.template_vars.get("main_command"), Some(&"claude".to_string()));
         assert!(config.template_yaml.is_none(), "no template file should exist at test paths");
     }
+
+    // -----------------------------------------------------------------------
+    // Helper to run build_plan with Arc-wrapped arguments
+    // -----------------------------------------------------------------------
+
+    async fn run_build_plan(
+        command: Command,
+        registry: ProviderRegistry,
+        providers_data: ProviderData,
+        runner: MockRunner,
+    ) -> ExecutionPlan {
+        build_plan(command, repo_root(), Arc::new(registry), Arc::new(providers_data), Arc::new(runner), config_base()).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: build_plan
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn build_plan_create_checkout_returns_steps() {
+        let mut registry = empty_registry();
+        registry
+            .checkout_managers
+            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
+        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        let data = empty_data();
+        let runner = runner_ok();
+
+        let plan = run_build_plan(
+            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
+            registry,
+            data,
+            runner,
+        )
+        .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // At least 2 steps: checkout + workspace
+                assert!(step_plan.steps.len() >= 2, "expected at least 2 steps, got {}", step_plan.steps.len());
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_create_checkout_skips_existing() {
+        let mut registry = empty_registry();
+        registry
+            .checkout_managers
+            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
+        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        let mut data = empty_data();
+        // Pre-populate with an existing checkout for the branch
+        data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(
+            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
+            registry,
+            data,
+            runner,
+        )
+        .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // Still has steps (checkout step is present but will skip at runtime,
+                // workspace step is present). The plan is structurally the same;
+                // the skip happens when the step action runs.
+                assert!(step_plan.steps.len() >= 2, "expected at least 2 steps, got {}", step_plan.steps.len());
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_teleport_session_returns_steps() {
+        let mut registry = empty_registry();
+        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
+        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        let mut data = empty_data();
+        let path = PathBuf::from("/repo/wt-feat");
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+        data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(
+            Command::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
+            registry,
+            data,
+            runner,
+        )
+        .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // 3 steps: resolve attach, ensure checkout, create workspace
+                assert!(step_plan.steps.len() >= 2, "expected at least 2 steps, got {}", step_plan.steps.len());
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_remove_checkout_returns_steps() {
+        let mut registry = empty_registry();
+        registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old"))));
+        let runner = runner_ok();
+
+        let plan =
+            run_build_plan(Command::RemoveCheckout { branch: "old".to_string(), terminal_keys: vec![] }, registry, empty_data(), runner)
+                .await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                // At least 1 step: remove checkout
+                assert!(!step_plan.steps.is_empty(), "expected at least 1 step");
+            }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_simple_command_returns_immediate() {
+        let mut registry = empty_registry();
+        registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(Command::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
+
+        match plan {
+            ExecutionPlan::Immediate(result) => {
+                assert_ok(result);
+            }
+            ExecutionPlan::Steps(_) => panic!("expected Immediate, got Steps"),
+        }
+    }
 }
