@@ -896,6 +896,12 @@ async fn send_local_to_peer(
         let Some((local_providers, version)) = daemon.get_local_providers(&repo_path).await else {
             continue;
         };
+        // Skip uninitialized repos (version 0 = not yet refreshed). Sending
+        // empty data with a fresh vector clock would overwrite the peer's
+        // existing state. The peer will receive data on first local refresh.
+        if version == 0 {
+            continue;
+        }
         let Some(identity) = daemon.find_identity_for_path(&repo_path).await else {
             continue;
         };
