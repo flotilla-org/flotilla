@@ -13,9 +13,7 @@ use flotilla_protocol::{
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::peer::{
-    merge_provider_data, synthetic_repo_path, HandleResult, InboundPeerEnvelope, OverlayUpdate, PeerManager, SshTransport,
-};
+use crate::peer::{merge_provider_data, synthetic_repo_path, HandleResult, InboundPeerEnvelope, OverlayUpdate, PeerManager, SshTransport};
 
 /// Notification sent from connection sites to the outbound task when a
 /// peer connects or reconnects. The outbound task responds by sending
@@ -45,6 +43,7 @@ impl PeerNetworkingTask {
     /// Loads `hosts.toml` from config, creates a `PeerManager`, and registers
     /// SSH transports for each configured peer. Returns the task plus shared
     /// handles that `DaemonServer` needs for socket-peer integration.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         daemon: Arc<InProcessDaemon>,
         config: &ConfigStore,
@@ -83,12 +82,7 @@ impl PeerNetworkingTask {
         let peer_manager = Arc::new(Mutex::new(peer_manager));
 
         Ok((
-            Self {
-                daemon,
-                peer_manager: Arc::clone(&peer_manager),
-                peer_data_tx: peer_data_tx.clone(),
-                peer_data_rx: Some(peer_data_rx),
-            },
+            Self { daemon, peer_manager: Arc::clone(&peer_manager), peer_data_tx: peer_data_tx.clone(), peer_data_rx: Some(peer_data_rx) },
             peer_manager,
             peer_data_tx,
         ))
@@ -249,197 +243,196 @@ impl PeerNetworkingTask {
 
             loop {
                 tokio::select! {
-                    maybe_env = rx.recv() => {
-                        let Some(env) = maybe_env else {
-                            break;
-                        };
-                    let (origin, repo_path) = match &env.msg {
-                        PeerWireMessage::Data(msg) => {
-                            (msg.origin_host.clone(), msg.repo_path.clone())
-                        }
-                        PeerWireMessage::Routed(
-                            flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
-                                responder_host,
-                                repo_path,
-                                ..
-                            },
-                        ) => (responder_host.clone(), repo_path.clone()),
-                        PeerWireMessage::Routed(_) => (env.connection_peer.clone(), PathBuf::new()),
-                        PeerWireMessage::Goodbye { .. } => {
-                            (env.connection_peer.clone(), PathBuf::new())
-                        }
+                maybe_env = rx.recv() => {
+                    let Some(env) = maybe_env else {
+                        break;
                     };
-
-                    let mut pm = peer_manager_task.lock().await;
-
-                    if let PeerWireMessage::Data(msg) = &env.msg {
-                        pm.relay(&origin, msg).await;
+                let (origin, repo_path) = match &env.msg {
+                    PeerWireMessage::Data(msg) => {
+                        (msg.origin_host.clone(), msg.repo_path.clone())
                     }
+                    PeerWireMessage::Routed(
+                        flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
+                            responder_host,
+                            repo_path,
+                            ..
+                        },
+                    ) => (responder_host.clone(), repo_path.clone()),
+                    PeerWireMessage::Routed(_) => (env.connection_peer.clone(), PathBuf::new()),
+                    PeerWireMessage::Goodbye { .. } => {
+                        (env.connection_peer.clone(), PathBuf::new())
+                    }
+                };
 
-                    // Then handle locally
-                    let result = pm.handle_inbound(env).await;
-                    match result {
-                        HandleResult::Updated(ref updated_repo_id) => {
-                            // Collect all peer data for this repo identity
-                            let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
-                                .get_peer_data()
-                                .iter()
-                                .filter_map(|(host, repos)| {
-                                    repos
-                                        .get(updated_repo_id)
-                                        .map(|state| (host.clone(), state.provider_data.clone()))
-                                })
-                                .collect();
+                let mut pm = peer_manager_task.lock().await;
 
-                            // Drop the lock before async daemon calls
-                            drop(pm);
+                if let PeerWireMessage::Data(msg) = &env.msg {
+                    pm.relay(&origin, msg).await;
+                }
 
-                            // Find local repo or create virtual repo
-                            if let Some(local_path) =
-                                peer_daemon.find_repo_by_identity(updated_repo_id).await
-                            {
-                                debug!(
-                                    repo = %updated_repo_id,
-                                    path = %local_path.display(),
-                                    peer_count = peers.len(),
-                                    "updating local repo with peer data"
-                                );
-                                peer_daemon.set_peer_providers(&local_path, peers).await;
-                            } else {
-                                // Remote-only repo — create or update virtual repo
-                                let synthetic =
-                                    synthetic_repo_path(&origin, &repo_path);
-                                debug!(
-                                    repo = %updated_repo_id,
-                                    path = %synthetic.display(),
-                                    "creating/updating virtual repo for remote-only peer"
-                                );
+                // Then handle locally
+                let result = pm.handle_inbound(env).await;
+                match result {
+                    HandleResult::Updated(ref updated_repo_id) => {
+                        // Collect all peer data for this repo identity
+                        let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
+                            .get_peer_data()
+                            .iter()
+                            .filter_map(|(host, repos)| {
+                                repos
+                                    .get(updated_repo_id)
+                                    .map(|state| (host.clone(), state.provider_data.clone()))
+                            })
+                            .collect();
 
-                                // Build merged provider data for virtual repo
-                                let merged = merge_provider_data(
-                                    &flotilla_protocol::ProviderData::default(),
-                                    peer_daemon.host_name(),
-                                    &peers
-                                        .iter()
-                                        .map(|(h, d)| (h.clone(), d))
-                                        .collect::<Vec<_>>(),
-                                );
+                        // Drop the lock before async daemon calls
+                        drop(pm);
 
-                                if let Err(e) = peer_daemon
-                                    .add_virtual_repo(synthetic.clone(), merged)
-                                    .await
-                                {
-                                    warn!(
-                                        repo = %updated_repo_id,
-                                        err = %e,
-                                        "failed to add virtual repo"
-                                    );
-                                } else {
-                                    // Also set peer providers on the virtual repo
-                                    // so future merges work correctly
-                                    peer_daemon.set_peer_providers(&synthetic, peers).await;
+                        // Find local repo or create virtual repo
+                        if let Some(local_path) =
+                            peer_daemon.find_repo_by_identity(updated_repo_id).await
+                        {
+                            debug!(
+                                repo = %updated_repo_id,
+                                path = %local_path.display(),
+                                peer_count = peers.len(),
+                                "updating local repo with peer data"
+                            );
+                            peer_daemon.set_peer_providers(&local_path, peers).await;
+                        } else {
+                            // Remote-only repo — create or update virtual repo
+                            let synthetic =
+                                synthetic_repo_path(&origin, &repo_path);
+                            debug!(
+                                repo = %updated_repo_id,
+                                path = %synthetic.display(),
+                                "creating/updating virtual repo for remote-only peer"
+                            );
 
-                                    // Register in PeerManager
-                                    let mut pm2 = peer_manager_task.lock().await;
-                                    pm2.register_remote_repo(updated_repo_id.clone(), synthetic);
-                                }
-                            }
-                        }
-                        HandleResult::ResyncRequested {
-                            request_id,
-                            requester_host,
-                            reply_via,
-                            repo,
-                            since_seq: _, // Phase 1: always send full snapshot
-                        } => {
-                            let local_host = pm.local_host().clone();
+                            // Build merged provider data for virtual repo
+                            let merged = merge_provider_data(
+                                &flotilla_protocol::ProviderData::default(),
+                                peer_daemon.host_name(),
+                                &peers
+                                    .iter()
+                                    .map(|(h, d)| (h.clone(), d))
+                                    .collect::<Vec<_>>(),
+                            );
 
-                            // Send local-only providers (not merged) back to requesting peer
-                            if let Some(local_path) = peer_daemon.find_repo_by_identity(&repo).await
-                            {
-                                if let Some((local_providers, seq)) =
-                                    peer_daemon.get_local_providers(&local_path).await
-                                {
-                                    reply_clock.tick(&local_host);
-                                    let response_clock = reply_clock.clone();
-                                    let response_repo = repo.clone();
-                                    let response_repo_path = local_path.clone();
-                                    let response_host = local_host.clone();
-                                    let response_data = local_providers.clone();
-                                    if let Err(e) = pm
-                                        .send_to(
-                                            &reply_via,
-                                            PeerWireMessage::Routed(
-                                                flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
-                                                    request_id,
-                                                    requester_host: requester_host.clone(),
-                                                    responder_host: response_host,
-                                                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                                                    repo_identity: response_repo,
-                                                    repo_path: response_repo_path,
-                                                    clock: response_clock,
-                                                    seq,
-                                                    data: Box::new(response_data),
-                                                },
-                                            ),
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            peer = %reply_via,
-                                            err = %e,
-                                            "failed to send resync response"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        HandleResult::NeedsResync { from, repo } => {
-                            let local_host = pm.local_host().clone();
-                            let request_id =
-                                pm.note_pending_resync_request(from.clone(), repo.clone());
-                            if let Err(e) = pm
-                                .send_to(
-                                    &from,
-                                    PeerWireMessage::Routed(
-                                        flotilla_protocol::RoutedPeerMessage::RequestResync {
-                                            request_id,
-                                            requester_host: local_host,
-                                            target_host: from.clone(),
-                                            remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                                            repo_identity: repo,
-                                            since_seq: 0,
-                                        },
-                                    ),
-                                )
+                            if let Err(e) = peer_daemon
+                                .add_virtual_repo(synthetic.clone(), merged)
                                 .await
                             {
                                 warn!(
-                                    peer = %from,
+                                    repo = %updated_repo_id,
                                     err = %e,
-                                    "failed to send resync request"
+                                    "failed to add virtual repo"
                                 );
+                            } else {
+                                // Also set peer providers on the virtual repo
+                                // so future merges work correctly
+                                peer_daemon.set_peer_providers(&synthetic, peers).await;
+
+                                // Register in PeerManager
+                                let mut pm2 = peer_manager_task.lock().await;
+                                pm2.register_remote_repo(updated_repo_id.clone(), synthetic);
                             }
                         }
-                        HandleResult::ReconnectSuppressed { peer } => {
-                            info!(peer = %peer, "peer requested reconnect suppression");
-                        }
-                        HandleResult::Ignored => {}
                     }
-                        }
-                        _ = resync_sweep.tick() => {
-                            let expired_repos = {
-                                let mut pm = peer_manager_task.lock().await;
-                                pm.sweep_expired_resyncs(Instant::now())
-                            };
-                            if !expired_repos.is_empty() {
-                                rebuild_peer_overlays(&peer_manager_task, &peer_daemon, expired_repos).await;
+                    HandleResult::ResyncRequested {
+                        request_id,
+                        requester_host,
+                        reply_via,
+                        repo,
+                        since_seq: _, // Phase 1: always send full snapshot
+                    } => {
+                        let local_host = pm.local_host().clone();
+
+                        // Send local-only providers (not merged) back to requesting peer
+                        if let Some(local_path) = peer_daemon.find_repo_by_identity(&repo).await
+                        {
+                            if let Some((local_providers, seq)) =
+                                peer_daemon.get_local_providers(&local_path).await
+                            {
+                                reply_clock.tick(&local_host);
+                                let response_clock = reply_clock.clone();
+                                let response_repo = repo.clone();
+                                let response_repo_path = local_path.clone();
+                                let response_host = local_host.clone();
+                                let response_data = local_providers.clone();
+                                if let Err(e) = pm
+                                    .send_to(
+                                        &reply_via,
+                                        PeerWireMessage::Routed(
+                                            flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
+                                                request_id,
+                                                requester_host: requester_host.clone(),
+                                                responder_host: response_host,
+                                                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                                                repo_identity: response_repo,
+                                                repo_path: response_repo_path,
+                                                clock: response_clock,
+                                                seq,
+                                                data: Box::new(response_data),
+                                            },
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        peer = %reply_via,
+                                        err = %e,
+                                        "failed to send resync response"
+                                    );
+                                }
                             }
+                        }
+                    }
+                    HandleResult::NeedsResync { from, repo } => {
+                        let local_host = pm.local_host().clone();
+                        let request_id =
+                            pm.note_pending_resync_request(from.clone(), repo.clone());
+                        if let Err(e) = pm
+                            .send_to(
+                                &from,
+                                PeerWireMessage::Routed(
+                                    flotilla_protocol::RoutedPeerMessage::RequestResync {
+                                        request_id,
+                                        requester_host: local_host,
+                                        target_host: from.clone(),
+                                        remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                                        repo_identity: repo,
+                                        since_seq: 0,
+                                    },
+                                ),
+                            )
+                            .await
+                        {
+                            warn!(
+                                peer = %from,
+                                err = %e,
+                                "failed to send resync request"
+                            );
+                        }
+                    }
+                    HandleResult::ReconnectSuppressed { peer } => {
+                        info!(peer = %peer, "peer requested reconnect suppression");
+                    }
+                    HandleResult::Ignored => {}
+                }
+                    }
+                    _ = resync_sweep.tick() => {
+                        let expired_repos = {
+                            let mut pm = peer_manager_task.lock().await;
+                            pm.sweep_expired_resyncs(Instant::now())
+                        };
+                        if !expired_repos.is_empty() {
+                            rebuild_peer_overlays(&peer_manager_task, &peer_daemon, expired_repos).await;
                         }
                     }
                 }
             }
-        );
+        });
 
         // Task group 3: Outbound snapshot broadcaster
         let outbound_daemon = Arc::clone(&daemon);

@@ -17,8 +17,10 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-use crate::peer::{ActivationResult, ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, PeerSender};
-use crate::peer_networking::{disconnect_peer_and_rebuild, PeerConnectedNotice};
+use crate::{
+    peer::{ActivationResult, ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, PeerSender},
+    peer_networking::{disconnect_peer_and_rebuild, PeerConnectedNotice},
+};
 
 struct SocketPeerSender {
     tx: tokio::sync::Mutex<Option<mpsc::Sender<Message>>>,
@@ -78,8 +80,7 @@ impl DaemonServer {
 
         let daemon = InProcessDaemon::new_with_options(repo_paths, config.clone(), daemon_config.follower, host_name).await;
 
-        let (peer_networking, peer_manager, peer_data_tx) =
-            crate::peer_networking::PeerNetworkingTask::new(Arc::clone(&daemon), &config)?;
+        let (peer_networking, peer_manager, peer_data_tx) = crate::peer_networking::PeerNetworkingTask::new(Arc::clone(&daemon), &config)?;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
