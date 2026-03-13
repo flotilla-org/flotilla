@@ -51,7 +51,7 @@ pub fn resolve_repo<'a>(query: &str, repos: impl Iterator<Item = (&'a Path, Opti
     let mut matches: Vec<PathBuf> = Vec::new();
     for &(path, slug) in &entries {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.contains(query) || slug.map_or(false, |s| s.contains(query)) {
+        if name.contains(query) || slug.is_some_and(|s| s.contains(query)) {
             matches.push(path.to_path_buf());
         }
     }

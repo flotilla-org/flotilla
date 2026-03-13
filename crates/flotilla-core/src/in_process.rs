@@ -15,8 +15,8 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError,
-    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse,
+    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSummary, RepoWorkResponse, Snapshot, StatusResponse, UnmetRequirementInfo,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -981,6 +981,13 @@ impl InProcessDaemon {
         }
         let _ = self.event_tx.send(event);
     }
+
+    /// Resolve a slug (directory name, explicit slug, or full path) to a repo PathBuf.
+    async fn resolve_slug(&self, slug: &str) -> Result<PathBuf, String> {
+        let repos = self.repos.read().await;
+        let entries: Vec<_> = repos.iter().map(|(path, state)| (path.as_path(), state.slug.as_deref())).collect();
+        crate::resolve::resolve_repo(slug, entries.into_iter()).map_err(|e| e.to_string())
+    }
 }
 
 #[async_trait]
@@ -1349,19 +1356,126 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {
-        todo!("Task 8")
+        let peer_providers = self.peer_providers.read().await;
+        let repos = self.repos.read().await;
+        let repo_order = self.repo_order.read().await;
+        let mut summaries = Vec::new();
+
+        for path in repo_order.iter() {
+            let Some(state) = repos.get(path) else { continue };
+            let peer_overlay = peer_providers.get(path).cloned();
+            let snapshot = build_repo_snapshot_with_peers(
+                path,
+                state.seq,
+                &state.last_snapshot,
+                &state.issue_cache,
+                &state.search_results,
+                &self.host_name,
+                peer_overlay.as_deref(),
+            );
+            summaries.push(RepoSummary {
+                path: path.clone(),
+                slug: state.slug.clone(),
+                provider_health: snapshot.provider_health,
+                work_item_count: snapshot.work_items.len(),
+                error_count: snapshot.errors.len(),
+            });
+        }
+        Ok(StatusResponse { repos: summaries })
     }
 
-    async fn get_repo_detail(&self, _slug: &str) -> Result<RepoDetailResponse, String> {
-        todo!("Task 8")
+    async fn get_repo_detail(&self, slug: &str) -> Result<RepoDetailResponse, String> {
+        let path = self.resolve_slug(slug).await?;
+        let peer_overlay = {
+            let pp = self.peer_providers.read().await;
+            pp.get(&path).cloned()
+        };
+        let repos = self.repos.read().await;
+        let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
+        let snapshot = build_repo_snapshot_with_peers(
+            &path,
+            state.seq,
+            &state.last_snapshot,
+            &state.issue_cache,
+            &state.search_results,
+            &self.host_name,
+            peer_overlay.as_deref(),
+        );
+        Ok(RepoDetailResponse {
+            path,
+            slug: state.slug.clone(),
+            provider_health: snapshot.provider_health,
+            work_items: snapshot.work_items,
+            errors: snapshot.errors,
+        })
     }
 
-    async fn get_repo_providers(&self, _slug: &str) -> Result<RepoProvidersResponse, String> {
-        todo!("Task 8")
+    async fn get_repo_providers(&self, slug: &str) -> Result<RepoProvidersResponse, String> {
+        let path = self.resolve_slug(slug).await?;
+        let peer_overlay = {
+            let pp = self.peer_providers.read().await;
+            pp.get(&path).cloned()
+        };
+        let repos = self.repos.read().await;
+        let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
+        let snapshot = build_repo_snapshot_with_peers(
+            &path,
+            state.seq,
+            &state.last_snapshot,
+            &state.issue_cache,
+            &state.search_results,
+            &self.host_name,
+            peer_overlay.as_deref(),
+        );
+
+        let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+        let repo_discovery = state.repo_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+
+        let provider_infos = state
+            .model
+            .registry
+            .provider_infos()
+            .into_iter()
+            .map(|(category, name)| {
+                let healthy = snapshot.provider_health.get(&category).and_then(|providers| providers.get(&name)).copied().unwrap_or(true);
+                ProviderInfo { category, name, healthy }
+            })
+            .collect();
+
+        let unmet_requirements = state
+            .unmet
+            .iter()
+            .map(|(factory, req)| UnmetRequirementInfo { factory: factory.clone(), requirement: format!("{req:?}") })
+            .collect();
+
+        Ok(RepoProvidersResponse {
+            path,
+            slug: state.slug.clone(),
+            host_discovery,
+            repo_discovery,
+            providers: provider_infos,
+            unmet_requirements,
+        })
     }
 
-    async fn get_repo_work(&self, _slug: &str) -> Result<RepoWorkResponse, String> {
-        todo!("Task 8")
+    async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String> {
+        let path = self.resolve_slug(slug).await?;
+        let peer_overlay = {
+            let pp = self.peer_providers.read().await;
+            pp.get(&path).cloned()
+        };
+        let repos = self.repos.read().await;
+        let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
+        let snapshot = build_repo_snapshot_with_peers(
+            &path,
+            state.seq,
+            &state.last_snapshot,
+            &state.issue_cache,
+            &state.search_results,
+            &self.host_name,
+            peer_overlay.as_deref(),
+        );
+        Ok(RepoWorkResponse { path, slug: state.slug.clone(), work_items: snapshot.work_items })
     }
 }
 

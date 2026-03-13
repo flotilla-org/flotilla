@@ -332,3 +332,27 @@ async fn add_virtual_repo_is_idempotent() {
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1, "should still have exactly one repo");
 }
+
+#[tokio::test]
+async fn get_status_returns_repo_summaries() {
+    let (_repo, daemon) = daemon_for_cwd().await;
+    let mut rx = daemon.subscribe();
+    recv_event(&mut rx).await;
+
+    let status = daemon.get_status().await.expect("get_status failed");
+    assert!(!status.repos.is_empty());
+    let summary = &status.repos[0];
+    assert!(summary.path.exists());
+}
+
+#[tokio::test]
+async fn get_repo_work_returns_work_items() {
+    let (repo, daemon) = daemon_for_cwd().await;
+    let mut rx = daemon.subscribe();
+    recv_event(&mut rx).await;
+
+    let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
+    let work = daemon.get_repo_work(repo_name).await.expect("get_repo_work failed");
+    assert_eq!(work.path, repo);
+    // Work items may or may not be present depending on repo state, but the call should succeed
+}
