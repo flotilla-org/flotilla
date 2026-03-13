@@ -278,6 +278,7 @@ impl App {
                         status: peer_status,
                     });
                 }
+                self.model.peer_hosts.sort_by(|a, b| a.name.cmp(&b.name));
             }
         }
     }

@@ -1327,7 +1327,7 @@ fn render_hosts_status(frame: &mut Frame, area: Rect, hosts: &[PeerHostStatus]) 
         })
         .collect();
 
-    let list = List::new(items).block(Block::bordered().title(" Connected Hosts "));
+    let list = List::new(items).block(Block::bordered().title(" Hosts "));
     frame.render_widget(list, area);
 }
 

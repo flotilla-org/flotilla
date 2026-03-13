@@ -36,7 +36,8 @@ async fn socket_roundtrip() {
         socket_path.clone(),
         Duration::from_secs(300),
     )
-    .await;
+    .await
+    .expect("server config should be valid");
 
     let server_handle = tokio::spawn(async move { server.run().await });
 

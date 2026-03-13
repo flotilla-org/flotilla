@@ -6,7 +6,9 @@ pub mod provider_data;
 pub mod snapshot;
 
 pub use host::{HostName, HostPath, RepoIdentity};
-pub use peer::{PeerDataKind, PeerDataMessage, VectorClock};
+pub use peer::{
+    GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock,
+};
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
@@ -45,6 +47,11 @@ pub use snapshot::{
     WorkItemIdentity, WorkItemKind,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConfigLabel(pub String);
+
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Top-level message envelope for the JSON protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -67,8 +74,13 @@ pub enum Message {
     },
     #[serde(rename = "event")]
     Event { event: Box<DaemonEvent> },
-    #[serde(rename = "peer_data")]
-    PeerData(Box<PeerDataMessage>),
+    #[serde(rename = "hello")]
+    Hello {
+        protocol_version: u32,
+        host_name: HostName,
+    },
+    #[serde(rename = "peer")]
+    Peer(Box<PeerWireMessage>),
 }
 
 /// Parsed response from the wire — before type-specific deserialization.
@@ -497,5 +509,84 @@ mod tests {
             }
             other => panic!("expected CommandFinished, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn message_hello_roundtrip() {
+        let msg = Message::Hello {
+            protocol_version: 1,
+            host_name: HostName::new("desktop"),
+        };
+
+        test_helpers::assert_json_roundtrip(&msg);
+    }
+
+    #[test]
+    fn message_peer_data_roundtrip() {
+        let msg = Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
+            origin_host: HostName::new("desktop"),
+            repo_identity: RepoIdentity {
+                authority: "github.com".into(),
+                path: "owner/repo".into(),
+            },
+            repo_path: PathBuf::from("/tmp/repo"),
+            clock: VectorClock::default(),
+            kind: PeerDataKind::Snapshot {
+                data: Box::new(ProviderData::default()),
+                seq: 7,
+            },
+        })));
+
+        test_helpers::assert_json_roundtrip(&msg);
+    }
+
+    #[test]
+    fn message_peer_routed_request_resync_roundtrip() {
+        let msg = Message::Peer(Box::new(PeerWireMessage::Routed(
+            RoutedPeerMessage::RequestResync {
+                request_id: 5,
+                requester_host: HostName::new("laptop"),
+                target_host: HostName::new("desktop"),
+                remaining_hops: 4,
+                repo_identity: RepoIdentity {
+                    authority: "github.com".into(),
+                    path: "owner/repo".into(),
+                },
+                since_seq: 12,
+            },
+        )));
+
+        test_helpers::assert_json_roundtrip(&msg);
+    }
+
+    #[test]
+    fn message_peer_routed_resync_snapshot_roundtrip() {
+        let msg = Message::Peer(Box::new(PeerWireMessage::Routed(
+            RoutedPeerMessage::ResyncSnapshot {
+                request_id: 6,
+                requester_host: HostName::new("laptop"),
+                responder_host: HostName::new("desktop"),
+                remaining_hops: 4,
+                repo_identity: RepoIdentity {
+                    authority: "github.com".into(),
+                    path: "owner/repo".into(),
+                },
+                repo_path: PathBuf::from("/tmp/repo"),
+                clock: VectorClock::default(),
+                seq: 13,
+                data: Box::new(ProviderData::default()),
+            },
+        )));
+
+        test_helpers::assert_json_roundtrip(&msg);
+    }
+
+    #[test]
+    fn message_peer_goodbye_roundtrip() {
+        let msg = Message::Peer(Box::new(PeerWireMessage::Goodbye {
+            reason: GoodbyeReason::Superseded,
+        }));
+
+        test_helpers::assert_json_roundtrip(&msg);
     }
 }

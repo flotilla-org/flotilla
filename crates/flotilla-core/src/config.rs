@@ -103,9 +103,8 @@ pub struct RepoCheckoutsOverride {
 
 /// Remote host configuration for multi-host mode.
 /// Loaded from `~/.config/flotilla/hosts.toml`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct HostsConfig {
-    #[serde(default)]
     pub hosts: HashMap<String, RemoteHostConfig>,
 }
 
@@ -113,8 +112,49 @@ pub struct HostsConfig {
 #[derive(Debug, Deserialize)]
 pub struct RemoteHostConfig {
     pub hostname: String,
+    pub expected_host_name: String,
     pub user: Option<String>,
     pub daemon_socket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawHostsConfig {
+    #[serde(default)]
+    hosts: HashMap<String, RawRemoteHostConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRemoteHostConfig {
+    hostname: String,
+    expected_host_name: Option<String>,
+    user: Option<String>,
+    daemon_socket: String,
+}
+
+impl<'de> Deserialize<'de> for HostsConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawHostsConfig::deserialize(deserializer)?;
+        let hosts = raw
+            .hosts
+            .into_iter()
+            .map(|(label, host)| {
+                let expected_host_name = host.expected_host_name.unwrap_or_else(|| label.clone());
+                (
+                    label,
+                    RemoteHostConfig {
+                        hostname: host.hostname,
+                        expected_host_name,
+                        user: host.user,
+                        daemon_socket: host.daemon_socket,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self { hosts })
+    }
 }
 
 /// Daemon-level configuration.
@@ -320,13 +360,15 @@ impl ConfigStore {
     }
 
     /// Load remote hosts config from `~/.config/flotilla/hosts.toml`.
-    pub fn load_hosts(&self) -> HostsConfig {
+    pub fn load_hosts(&self) -> Result<HostsConfig, String> {
         let path = self.base_path().join("hosts.toml");
         if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            toml::from_str(&content).unwrap_or_default()
+            let content = std::fs::read_to_string(&path)
+                .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+            toml::from_str(&content)
+                .map_err(|err| format!("failed to parse {}: {err}", path.display()))
         } else {
-            HostsConfig::default()
+            Ok(HostsConfig::default())
         }
     }
 
@@ -755,18 +797,35 @@ mod tests {
         let toml = r#"
 [hosts.desktop]
 hostname = "desktop.local"
+expected_host_name = "desktop"
 user = "robert"
 daemon_socket = "/run/user/1000/flotilla/daemon.sock"
 
 [hosts.cloud]
 hostname = "10.0.1.50"
+expected_host_name = "cloud"
 daemon_socket = "/home/robert/.config/flotilla/daemon.sock"
 "#;
         let config: HostsConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.hosts.len(), 2);
         assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
+        assert_eq!(config.hosts["desktop"].expected_host_name, "desktop");
         assert_eq!(config.hosts["desktop"].user, Some("robert".into()));
+        assert_eq!(config.hosts["cloud"].expected_host_name, "cloud");
         assert_eq!(config.hosts["cloud"].user, None);
+    }
+
+    #[test]
+    fn parse_hosts_config_defaults_expected_host_name_to_table_key() {
+        let toml = r#"
+[hosts.desktop]
+hostname = "desktop.local"
+daemon_socket = "/run/user/1000/flotilla/daemon.sock"
+"#;
+        let config: HostsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.hosts.len(), 1);
+        assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
+        assert_eq!(config.hosts["desktop"].expected_host_name, "desktop");
     }
 
     #[test]
@@ -791,7 +850,7 @@ host_name = "my-desktop"
     fn load_hosts_missing_file_returns_default() {
         let dir = tempdir().unwrap();
         let store = ConfigStore::with_base(dir.path());
-        let config = store.load_hosts();
+        let config = store.load_hosts().unwrap();
         assert!(config.hosts.is_empty());
     }
 
@@ -801,13 +860,30 @@ host_name = "my-desktop"
         let base = dir.path();
         std::fs::write(
             base.join("hosts.toml"),
-            "[hosts.desktop]\nhostname = \"desktop.local\"\ndaemon_socket = \"/tmp/d.sock\"\n",
+            "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/d.sock\"\n",
         )
         .unwrap();
         let store = ConfigStore::with_base(base);
-        let config = store.load_hosts();
+        let config = store.load_hosts().unwrap();
         assert_eq!(config.hosts.len(), 1);
         assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
+        assert_eq!(config.hosts["desktop"].expected_host_name, "desktop");
+    }
+
+    #[test]
+    fn load_hosts_invalid_file_returns_error() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("hosts.toml"),
+            "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = [\ndaemon_socket = \"/tmp/d.sock\"\n",
+        )
+        .unwrap();
+        let store = ConfigStore::with_base(base);
+        let err = store
+            .load_hosts()
+            .expect_err("invalid hosts config should error");
+        assert!(err.contains("failed to parse"));
     }
 
     #[test]

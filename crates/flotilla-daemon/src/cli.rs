@@ -35,7 +35,7 @@ pub async fn run(socket_path: &Path, timeout_secs: u64) -> Result<(), String> {
 
     let server =
         crate::server::DaemonServer::new(repo_roots, config, socket_path.to_path_buf(), timeout)
-            .await;
+            .await?;
 
     server.run().await
 }
