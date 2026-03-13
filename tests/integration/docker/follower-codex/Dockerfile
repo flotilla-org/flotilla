@@ -13,7 +13,7 @@ FROM flotilla-base
 # codex CLI from npm-installer stage
 COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=npm-installer /usr/local/bin/node /usr/local/bin/node
-RUN ln -s /usr/local/lib/node_modules/.bin/codex /usr/local/bin/codex
+RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
 
 # Placeholder codex auth file for CodexAuthDetector
 RUN mkdir -p /home/flotilla/.codex \

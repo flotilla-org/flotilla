@@ -29,7 +29,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # claude CLI from npm-installer stage
 COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=npm-installer /usr/local/bin/node /usr/local/bin/node
-RUN ln -s /usr/local/lib/node_modules/.bin/claude /usr/local/bin/claude
+RUN ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js /usr/local/bin/claude
 
 # zellij + shpool from cargo-installer stage
 COPY --from=cargo-installer /usr/local/cargo/bin/zellij /usr/local/bin/zellij
