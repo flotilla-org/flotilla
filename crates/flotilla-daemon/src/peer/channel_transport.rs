@@ -482,4 +482,123 @@ mod tests {
         assert!(msg.is_none(), "B's receiver should close after A disconnects");
     }
 
+    // --- Reconnection tests ---
+
+    #[tokio::test]
+    async fn reconnect_sends_and_receives() {
+        let (mut a, mut b) = channel_transport_pair(HostName::new("alpha"), HostName::new("beta"));
+
+        // First session
+        a.connect().await.expect("connect A");
+        b.connect().await.expect("connect B");
+        let sender_a1 = a.sender().expect("sender A");
+        let mut rx_b1 = b.subscribe().await.expect("subscribe B");
+        sender_a1.send(test_snapshot_msg("alpha", 1)).await.expect("send");
+        let msg = rx_b1.recv().await.expect("recv");
+        assert!(matches!(msg, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 1, .. }, .. })));
+
+        // Disconnect both sides
+        a.disconnect().await.expect("disconnect A");
+        b.disconnect().await.expect("disconnect B");
+
+        // Second session — reconnect and verify messaging works
+        a.connect().await.expect("reconnect A");
+        b.connect().await.expect("reconnect B");
+        let sender_a2 = a.sender().expect("sender A after reconnect");
+        let mut rx_b2 = b.subscribe().await.expect("subscribe B after reconnect");
+        sender_a2.send(test_snapshot_msg("alpha", 2)).await.expect("send after reconnect");
+        let msg = rx_b2.recv().await.expect("recv after reconnect");
+        assert!(matches!(msg, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 2, .. }, .. })));
+    }
+
+    #[tokio::test]
+    async fn remote_disconnect_closes_local_receiver() {
+        let (mut a, mut b) = channel_transport_pair(HostName::new("alpha"), HostName::new("beta"));
+        a.connect().await.expect("connect A");
+        b.connect().await.expect("connect B");
+
+        let _rx_a = a.subscribe().await.expect("subscribe A");
+        let mut rx_b = b.subscribe().await.expect("subscribe B");
+
+        // A disconnects — B's forwarding task should see Disconnected and close the session
+        a.disconnect().await.expect("disconnect A");
+
+        // B's receiver should yield None
+        let msg = rx_b.recv().await;
+        assert!(msg.is_none(), "B's receiver should close after A disconnects");
+    }
+
+    #[tokio::test]
+    async fn remote_disconnect_transitions_status() {
+        let (mut a, mut b) = channel_transport_pair(HostName::new("alpha"), HostName::new("beta"));
+        a.connect().await.expect("connect A");
+        b.connect().await.expect("connect B");
+
+        let _rx_a = a.subscribe().await.expect("subscribe A");
+        let mut rx_b = b.subscribe().await.expect("subscribe B");
+
+        // A disconnects
+        a.disconnect().await.expect("disconnect A");
+
+        // Drain B's receiver to ensure the forwarding task has processed the Disconnected envelope
+        let _ = rx_b.recv().await;
+
+        // B's status should now be Disconnected
+        assert_eq!(b.status(), PeerConnectionStatus::Disconnected, "B should transition to Disconnected after A disconnects");
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_remote_disconnect() {
+        let (mut a, mut b) = channel_transport_pair(HostName::new("alpha"), HostName::new("beta"));
+        a.connect().await.expect("connect A");
+        b.connect().await.expect("connect B");
+
+        let _rx_a = a.subscribe().await.expect("subscribe A");
+        let mut rx_b = b.subscribe().await.expect("subscribe B");
+
+        // A disconnects — B detects
+        a.disconnect().await.expect("disconnect A");
+        let _ = rx_b.recv().await; // drain to trigger status transition
+        assert_eq!(b.status(), PeerConnectionStatus::Disconnected);
+
+        // Both sides reconnect
+        a.connect().await.expect("reconnect A");
+        b.connect().await.expect("reconnect B");
+
+        // Bidirectional messaging works in the new session
+        let sender_a = a.sender().expect("sender A");
+        let sender_b = b.sender().expect("sender B");
+        let mut rx_a = a.subscribe().await.expect("subscribe A");
+        let mut rx_b = b.subscribe().await.expect("subscribe B");
+
+        sender_a.send(test_snapshot_msg("alpha", 10)).await.expect("send A→B");
+        sender_b.send(test_snapshot_msg("beta", 20)).await.expect("send B→A");
+
+        let msg_at_b = rx_b.recv().await.expect("B recv");
+        assert!(matches!(msg_at_b, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 10, .. }, .. })));
+
+        let msg_at_a = rx_a.recv().await.expect("A recv");
+        assert!(matches!(msg_at_a, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 20, .. }, .. })));
+    }
+
+    #[tokio::test]
+    async fn multiple_reconnect_cycles() {
+        let (mut a, mut b) = channel_transport_pair(HostName::new("alpha"), HostName::new("beta"));
+
+        for cycle in 0..3u64 {
+            a.connect().await.unwrap_or_else(|e| panic!("connect A cycle {cycle}: {e}"));
+            b.connect().await.unwrap_or_else(|e| panic!("connect B cycle {cycle}: {e}"));
+
+            let sender = a.sender().expect("sender A");
+            let mut rx = b.subscribe().await.expect("subscribe B");
+
+            let seq = cycle * 10 + 1;
+            sender.send(test_snapshot_msg("alpha", seq)).await.expect("send");
+            let msg = rx.recv().await.expect("recv");
+            assert!(matches!(msg, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: s, .. }, .. }) if s == seq));
+
+            a.disconnect().await.unwrap_or_else(|e| panic!("disconnect A cycle {cycle}: {e}"));
+            b.disconnect().await.unwrap_or_else(|e| panic!("disconnect B cycle {cycle}: {e}"));
+        }
+    }
 }
