@@ -110,7 +110,7 @@ impl GitCheckoutManager {
                 if !is_main {
                     run!(self.runner, "git", &["rev-list", "--left-right", "--count", &trunk_ref], path, TaskId("trunk-ab"))
                         .ok()
-                        .and_then(|out| parse_ahead_behind(&out))
+                        .and_then(|out| super::parse_ahead_behind(&out))
                 } else {
                     None
                 }
@@ -118,7 +118,7 @@ impl GitCheckoutManager {
             async {
                 run!(self.runner, "git", &["rev-list", "--left-right", "--count", &remote_ref], path, TaskId("remote-ab"))
                     .ok()
-                    .and_then(|out| parse_ahead_behind(&out))
+                    .and_then(|out| super::parse_ahead_behind(&out))
             },
             async { run!(self.runner, "git", &["status", "--porcelain"], path).ok().map(|out| super::parse_porcelain_status(&out)) },
             async {
@@ -142,14 +142,6 @@ impl GitCheckoutManager {
             association_keys: issue_links,
         })
     }
-}
-
-fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
-    let trimmed = output.trim();
-    let mut parts = trimmed.split('\t');
-    let ahead: i64 = parts.next()?.parse().ok()?;
-    let behind: i64 = parts.next()?.parse().ok()?;
-    Some(AheadBehind { ahead, behind })
 }
 
 #[async_trait]
@@ -307,20 +299,6 @@ branch refs/heads/feature
         let entries = GitCheckoutManager::parse_porcelain(output);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "feature");
-    }
-
-    #[test]
-    fn parse_ahead_behind_valid() {
-        assert!(parse_ahead_behind("3\t5\n").is_some());
-        let ab = parse_ahead_behind("3\t5\n").unwrap();
-        assert_eq!(ab.ahead, 3);
-        assert_eq!(ab.behind, 5);
-    }
-
-    #[test]
-    fn parse_ahead_behind_empty() {
-        assert!(parse_ahead_behind("").is_none());
-        assert!(parse_ahead_behind("just-one").is_none());
     }
 
     #[test]

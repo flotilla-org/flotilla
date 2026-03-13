@@ -106,11 +106,7 @@ impl super::Vcs for GitVcs {
     async fn ahead_behind(&self, repo_root: &Path, branch: &str, reference: &str) -> Result<AheadBehind, String> {
         let range = format!("{}...{}", branch, reference);
         let output = run!(self.runner, "git", &["rev-list", "--count", "--left-right", &range], repo_root)?;
-        let trimmed = output.trim();
-        let mut parts = trimmed.split('\t');
-        let ahead: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let behind: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        Ok(AheadBehind { ahead, behind })
+        super::parse_ahead_behind(&output).ok_or_else(|| format!("failed to parse ahead/behind from: {output:?}"))
     }
 
     async fn working_tree_status(&self, _repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String> {

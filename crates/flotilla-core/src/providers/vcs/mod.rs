@@ -67,6 +67,17 @@ pub(crate) fn parse_porcelain_status(output: &str) -> WorkingTreeStatus {
     WorkingTreeStatus { staged, modified, untracked }
 }
 
+/// Parse the output of `git rev-list --count --left-right` into an `AheadBehind`.
+///
+/// Output format is `<ahead>\t<behind>\n`.
+pub(crate) fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
+    let trimmed = output.trim();
+    let mut parts = trimmed.split('\t');
+    let ahead: i64 = parts.next()?.parse().ok()?;
+    let behind: i64 = parts.next()?.parse().ok()?;
+    Some(AheadBehind { ahead, behind })
+}
+
 /// Parse the output of `git config --get-regexp 'branch\.<branch>\.flotilla\.issues\.'`
 /// into association keys. Each line has the format:
 /// `branch.<name>.flotilla.issues.<provider> id1,id2,...`
@@ -153,6 +164,30 @@ mod tests {
     fn regex_escape_branch_with_dots() {
         assert_eq!(regex_escape_branch("feat.x"), "feat\\.x");
         assert_eq!(regex_escape_branch("simple"), "simple");
+    }
+
+    #[test]
+    fn parse_ahead_behind_normal() {
+        let ab = parse_ahead_behind("3\t5\n").expect("should parse");
+        assert_eq!(ab.ahead, 3);
+        assert_eq!(ab.behind, 5);
+    }
+
+    #[test]
+    fn parse_ahead_behind_zeros() {
+        let ab = parse_ahead_behind("0\t0\n").expect("should parse");
+        assert_eq!(ab.ahead, 0);
+        assert_eq!(ab.behind, 0);
+    }
+
+    #[test]
+    fn parse_ahead_behind_empty() {
+        assert!(parse_ahead_behind("").is_none());
+    }
+
+    #[test]
+    fn parse_ahead_behind_malformed() {
+        assert!(parse_ahead_behind("notanumber\t5").is_none());
     }
 }
 
