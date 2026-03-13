@@ -1976,7 +1976,7 @@ mod tests {
         match plan {
             ExecutionPlan::Steps(step_plan) => {
                 // 3 steps: resolve attach, ensure checkout, create workspace
-                assert!(step_plan.steps.len() >= 2, "expected at least 2 steps, got {}", step_plan.steps.len());
+                assert_eq!(step_plan.steps.len(), 3, "expected 3 steps, got {}", step_plan.steps.len());
             }
             ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
         }

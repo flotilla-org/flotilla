@@ -115,7 +115,7 @@ pub enum CommandResult {
 
 /// Status of an individual step within a multi-step command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "status")]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum StepStatus {
     Skipped,
     Started,

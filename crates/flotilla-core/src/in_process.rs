@@ -1083,7 +1083,10 @@ impl DaemonHandle for InProcessDaemon {
                 tokio::spawn(async move {
                     let result = run_step_plan(step_plan, id, repo_path.clone(), token, event_tx.clone()).await;
                     refresh_trigger.notify_one();
-                    *active_ref.lock().await = None;
+                    let mut guard = active_ref.lock().await;
+                    if guard.as_ref().map(|a| a.command_id) == Some(id) {
+                        *guard = None;
+                    }
                     let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
                 });
             }
