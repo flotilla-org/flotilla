@@ -4,6 +4,7 @@ RUN npm install -g @google/gemini-cli
 
 # --- Runtime: layer on flotilla-base ---
 FROM flotilla-base
+# Copy node, modules, and npm-generated wrapper
 COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=npm-installer /usr/local/bin/node /usr/local/bin/node
-RUN ln -s /usr/local/lib/node_modules/@google/gemini-cli/dist/index.js /usr/local/bin/gemini
+COPY --from=npm-installer /usr/local/bin/gemini /usr/local/bin/gemini

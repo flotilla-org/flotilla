@@ -10,10 +10,10 @@ RUN npm install -g @openai/codex
 # --- Runtime: layer on flotilla-base ---
 FROM flotilla-base
 
-# codex CLI from npm-installer stage
+# codex CLI from npm-installer stage (copy node, modules, and npm-generated wrapper)
 COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=npm-installer /usr/local/bin/node /usr/local/bin/node
-RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
+COPY --from=npm-installer /usr/local/bin/codex /usr/local/bin/codex
 
 # Placeholder codex auth file for CodexAuthDetector
 RUN mkdir -p /home/flotilla/.codex \

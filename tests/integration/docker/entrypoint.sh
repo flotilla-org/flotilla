@@ -25,8 +25,12 @@ refresh_authorized_keys() {
     if [ -d "${SHARED_KEYS_DIR}" ]; then
         cat "${SHARED_KEYS_DIR}"/*.pub > "${SSH_DIR}/authorized_keys" 2>/dev/null || true
         chmod 600 "${SSH_DIR}/authorized_keys"
+        chown "${FLOTILLA_USER}:${FLOTILLA_USER}" "${SSH_DIR}/authorized_keys"
     fi
 }
+
+# --- Fix ownership (before first refresh so the file is created with correct parent) ---
+chown -R "${FLOTILLA_USER}:${FLOTILLA_USER}" "${SSH_DIR}"
 
 refresh_authorized_keys
 
@@ -37,9 +41,6 @@ refresh_authorized_keys
         refresh_authorized_keys
     done
 ) &
-
-# --- Fix ownership ---
-chown -R "${FLOTILLA_USER}:${FLOTILLA_USER}" "${SSH_DIR}"
 
 # --- Start sshd ---
 /usr/sbin/sshd

@@ -27,9 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN mkdir /run/sshd
 
-# Permit pubkey auth, disable password auth
-RUN sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
-    && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+# Disable password auth (pubkey is already the default)
+RUN mkdir -p /etc/ssh/sshd_config.d \
+    && echo "PasswordAuthentication no" > /etc/ssh/sshd_config.d/flotilla.conf
 
 RUN useradd -m -s /bin/bash flotilla \
     && mkdir -p /home/flotilla/.ssh \
