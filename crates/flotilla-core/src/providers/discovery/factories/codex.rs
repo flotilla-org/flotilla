@@ -8,9 +8,7 @@ use async_trait::async_trait;
 use crate::config::ConfigStore;
 use crate::providers::coding_agent::codex::CodexCodingAgent;
 use crate::providers::coding_agent::CloudAgentService;
-use crate::providers::discovery::{
-    CloudAgentFactory, EnvironmentBag, ProviderDescriptor, UnmetRequirement,
-};
+use crate::providers::discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
 use crate::providers::{CommandRunner, ReqwestHttpClient};
 
 // ---------------------------------------------------------------------------
@@ -20,7 +18,9 @@ use crate::providers::{CommandRunner, ReqwestHttpClient};
 pub struct CodexCodingAgentFactory;
 
 #[async_trait]
-impl CloudAgentFactory for CodexCodingAgentFactory {
+impl Factory for CodexCodingAgentFactory {
+    type Output = dyn CloudAgentService;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("codex", "Codex", "S", "Sessions", "session")
     }
@@ -53,7 +53,7 @@ mod tests {
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use crate::providers::discovery::{
-        CloudAgentFactory, EnvironmentAssertion, EnvironmentBag, UnmetRequirement,
+        EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
     };
 
     use super::CodexCodingAgentFactory;

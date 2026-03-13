@@ -11,7 +11,7 @@ pub mod zellij;
 
 use super::FactoryRegistry;
 
-fn workspace_factories() -> Vec<Box<dyn super::WorkspaceManagerFactory>> {
+fn workspace_factories() -> Vec<Box<super::WorkspaceManagerFactory>> {
     vec![
         Box::new(cmux::CmuxInsideFactory),
         Box::new(zellij::ZellijWorkspaceManagerFactory),
@@ -20,14 +20,14 @@ fn workspace_factories() -> Vec<Box<dyn super::WorkspaceManagerFactory>> {
     ]
 }
 
-fn terminal_pool_factories() -> Vec<Box<dyn super::TerminalPoolFactory>> {
+fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
     vec![
         Box::new(shpool::ShpoolTerminalPoolFactory),
         Box::new(passthrough::PassthroughTerminalPoolFactory),
     ]
 }
 
-fn checkout_manager_factories() -> Vec<Box<dyn super::CheckoutManagerFactory>> {
+fn checkout_manager_factories() -> Vec<Box<super::CheckoutManagerFactory>> {
     vec![
         Box::new(git::WtCheckoutManagerFactory),
         Box::new(git::GitCheckoutManagerFactory),

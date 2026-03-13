@@ -9,8 +9,7 @@ use crate::config::ConfigStore;
 use crate::providers::code_review::github::GitHubCodeReview;
 use crate::providers::code_review::CodeReview;
 use crate::providers::discovery::{
-    CodeReviewFactory, EnvironmentBag, HostPlatform, IssueTrackerFactory, ProviderDescriptor,
-    UnmetRequirement,
+    EnvironmentBag, Factory, HostPlatform, ProviderDescriptor, UnmetRequirement,
 };
 use crate::providers::github_api::GhApiClient;
 use crate::providers::issue_tracker::github::GitHubIssueTracker;
@@ -40,7 +39,9 @@ fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement
 pub struct GitHubCodeReviewFactory;
 
 #[async_trait]
-impl CodeReviewFactory for GitHubCodeReviewFactory {
+impl Factory for GitHubCodeReviewFactory {
+    type Output = dyn CodeReview;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled(
             "github",
@@ -76,7 +77,9 @@ impl CodeReviewFactory for GitHubCodeReviewFactory {
 pub struct GitHubIssueTrackerFactory;
 
 #[async_trait]
-impl IssueTrackerFactory for GitHubIssueTrackerFactory {
+impl Factory for GitHubIssueTrackerFactory {
+    type Output = dyn IssueTracker;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("github", "GitHub Issues", "#", "Issues", "issue")
     }
@@ -111,8 +114,7 @@ mod tests {
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use crate::providers::discovery::{
-        CodeReviewFactory, EnvironmentAssertion, EnvironmentBag, HostPlatform, IssueTrackerFactory,
-        UnmetRequirement,
+        EnvironmentAssertion, EnvironmentBag, Factory, HostPlatform, UnmetRequirement,
     };
 
     use super::{GitHubCodeReviewFactory, GitHubIssueTrackerFactory};

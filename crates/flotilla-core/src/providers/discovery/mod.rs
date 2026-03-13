@@ -362,118 +362,46 @@ pub trait RepoDetector: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Factory traits — one per provider category
+// Factory trait and category aliases
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-pub trait VcsFactory: Send + Sync {
+pub trait Factory: Send + Sync {
+    type Output: ?Sized + Send + Sync;
+
     fn descriptor(&self) -> ProviderDescriptor;
+
     async fn probe(
         &self,
         env: &EnvironmentBag,
         config: &ConfigStore,
         repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>>;
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>>;
 }
 
-#[async_trait]
-pub trait CheckoutManagerFactory: Send + Sync {
-    fn descriptor(&self) -> ProviderDescriptor;
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &ConfigStore,
-        repo_root: &Path,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>>;
-}
-
-#[async_trait]
-pub trait CodeReviewFactory: Send + Sync {
-    fn descriptor(&self) -> ProviderDescriptor;
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &ConfigStore,
-        repo_root: &Path,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn CodeReview>, Vec<UnmetRequirement>>;
-}
-
-#[async_trait]
-pub trait IssueTrackerFactory: Send + Sync {
-    fn descriptor(&self) -> ProviderDescriptor;
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &ConfigStore,
-        repo_root: &Path,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>>;
-}
-
-#[async_trait]
-pub trait CloudAgentFactory: Send + Sync {
-    fn descriptor(&self) -> ProviderDescriptor;
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &ConfigStore,
-        repo_root: &Path,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>>;
-}
-
-#[async_trait]
-pub trait AiUtilityFactory: Send + Sync {
-    fn descriptor(&self) -> ProviderDescriptor;
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &ConfigStore,
-        repo_root: &Path,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>>;
-}
-
-#[async_trait]
-pub trait WorkspaceManagerFactory: Send + Sync {
-    fn descriptor(&self) -> ProviderDescriptor;
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &ConfigStore,
-        repo_root: &Path,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>>;
-}
-
-#[async_trait]
-pub trait TerminalPoolFactory: Send + Sync {
-    fn descriptor(&self) -> ProviderDescriptor;
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &ConfigStore,
-        repo_root: &Path,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>>;
-}
+pub type VcsFactory = dyn Factory<Output = dyn Vcs>;
+pub type CheckoutManagerFactory = dyn Factory<Output = dyn CheckoutManager>;
+pub type CodeReviewFactory = dyn Factory<Output = dyn CodeReview>;
+pub type IssueTrackerFactory = dyn Factory<Output = dyn IssueTracker>;
+pub type CloudAgentFactory = dyn Factory<Output = dyn CloudAgentService>;
+pub type AiUtilityFactory = dyn Factory<Output = dyn AiUtility>;
+pub type WorkspaceManagerFactory = dyn Factory<Output = dyn WorkspaceManager>;
+pub type TerminalPoolFactory = dyn Factory<Output = dyn TerminalPool>;
 
 // ---------------------------------------------------------------------------
 // Factory registry
 // ---------------------------------------------------------------------------
 
 pub struct FactoryRegistry {
-    pub vcs: Vec<Box<dyn VcsFactory>>,
-    pub checkout_managers: Vec<Box<dyn CheckoutManagerFactory>>,
-    pub code_review: Vec<Box<dyn CodeReviewFactory>>,
-    pub issue_trackers: Vec<Box<dyn IssueTrackerFactory>>,
-    pub cloud_agents: Vec<Box<dyn CloudAgentFactory>>,
-    pub ai_utilities: Vec<Box<dyn AiUtilityFactory>>,
-    pub workspace_managers: Vec<Box<dyn WorkspaceManagerFactory>>,
-    pub terminal_pools: Vec<Box<dyn TerminalPoolFactory>>,
+    pub vcs: Vec<Box<VcsFactory>>,
+    pub checkout_managers: Vec<Box<CheckoutManagerFactory>>,
+    pub code_review: Vec<Box<CodeReviewFactory>>,
+    pub issue_trackers: Vec<Box<IssueTrackerFactory>>,
+    pub cloud_agents: Vec<Box<CloudAgentFactory>>,
+    pub ai_utilities: Vec<Box<AiUtilityFactory>>,
+    pub workspace_managers: Vec<Box<WorkspaceManagerFactory>>,
+    pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -521,67 +449,142 @@ pub async fn discover_providers(
     let mut registry = ProviderRegistry::new();
     let mut unmet = Vec::new();
 
-    macro_rules! probe_all_map {
-        ($factory_list:expr, $target:expr) => {
-            for factory in $factory_list {
-                match factory
-                    .probe(&combined, config, repo_root, runner.clone())
-                    .await
-                {
-                    Ok(provider) => {
-                        let desc = factory.descriptor();
-                        $target.insert(desc.name.clone(), (desc, provider));
-                    }
-                    Err(reqs) => unmet.extend(reqs),
-                }
+    async fn probe_all<T: ?Sized + Send + Sync + 'static, F>(
+        factories: &[Box<dyn Factory<Output = T>>],
+        env: &EnvironmentBag,
+        config: &ConfigStore,
+        repo_root: &Path,
+        runner: &Arc<dyn CommandRunner>,
+        unmet: &mut Vec<UnmetRequirement>,
+        mut insert: F,
+    ) where
+        F: FnMut(ProviderDescriptor, Arc<T>),
+    {
+        for factory in factories {
+            match factory.probe(env, config, repo_root, runner.clone()).await {
+                Ok(provider) => insert(factory.descriptor(), provider),
+                Err(reqs) => unmet.extend(reqs),
             }
-        };
+        }
     }
 
-    macro_rules! probe_first_map {
-        ($factory_list:expr, $target:expr) => {
-            for factory in $factory_list {
-                match factory
-                    .probe(&combined, config, repo_root, runner.clone())
-                    .await
-                {
-                    Ok(provider) => {
-                        let desc = factory.descriptor();
-                        $target.insert(desc.name.clone(), (desc, provider));
-                        break;
-                    }
-                    Err(reqs) => unmet.extend(reqs),
-                }
+    async fn probe_first<T: ?Sized + Send + Sync + 'static>(
+        factories: &[Box<dyn Factory<Output = T>>],
+        env: &EnvironmentBag,
+        config: &ConfigStore,
+        repo_root: &Path,
+        runner: &Arc<dyn CommandRunner>,
+        unmet: &mut Vec<UnmetRequirement>,
+    ) -> Option<(ProviderDescriptor, Arc<T>)> {
+        for factory in factories {
+            match factory.probe(env, config, repo_root, runner.clone()).await {
+                Ok(provider) => return Some((factory.descriptor(), provider)),
+                Err(reqs) => unmet.extend(reqs),
             }
-        };
+        }
+        None
     }
 
-    macro_rules! probe_first_option {
-        ($factory_list:expr, $target:expr) => {
-            for factory in $factory_list {
-                match factory
-                    .probe(&combined, config, repo_root, runner.clone())
-                    .await
-                {
-                    Ok(provider) => {
-                        let desc = factory.descriptor();
-                        $target = Some((desc, provider));
-                        break;
-                    }
-                    Err(reqs) => unmet.extend(reqs),
-                }
-            }
-        };
+    probe_all(
+        &factories.vcs,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+        |desc, provider| {
+            registry.vcs.insert(desc.name.clone(), (desc, provider));
+        },
+    )
+    .await;
+    if let Some((desc, provider)) = probe_first(
+        &factories.checkout_managers,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+    )
+    .await
+    {
+        registry
+            .checkout_managers
+            .insert(desc.name.clone(), (desc, provider));
     }
-
-    probe_all_map!(&factories.vcs, registry.vcs);
-    probe_first_map!(&factories.checkout_managers, registry.checkout_managers);
-    probe_all_map!(&factories.code_review, registry.code_review);
-    probe_all_map!(&factories.issue_trackers, registry.issue_trackers);
-    probe_all_map!(&factories.cloud_agents, registry.cloud_agents);
-    probe_all_map!(&factories.ai_utilities, registry.ai_utilities);
-    probe_first_option!(&factories.workspace_managers, registry.workspace_manager);
-    probe_first_option!(&factories.terminal_pools, registry.terminal_pool);
+    probe_all(
+        &factories.code_review,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+        |desc, provider| {
+            registry
+                .code_review
+                .insert(desc.name.clone(), (desc, provider));
+        },
+    )
+    .await;
+    probe_all(
+        &factories.issue_trackers,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+        |desc, provider| {
+            registry
+                .issue_trackers
+                .insert(desc.name.clone(), (desc, provider));
+        },
+    )
+    .await;
+    probe_all(
+        &factories.cloud_agents,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+        |desc, provider| {
+            registry
+                .cloud_agents
+                .insert(desc.name.clone(), (desc, provider));
+        },
+    )
+    .await;
+    probe_all(
+        &factories.ai_utilities,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+        |desc, provider| {
+            registry
+                .ai_utilities
+                .insert(desc.name.clone(), (desc, provider));
+        },
+    )
+    .await;
+    registry.workspace_manager = probe_first(
+        &factories.workspace_managers,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+    )
+    .await;
+    registry.terminal_pool = probe_first(
+        &factories.terminal_pools,
+        &combined,
+        config,
+        repo_root,
+        &runner,
+        &mut unmet,
+    )
+    .await;
 
     let repo_slug = combined.repo_slug();
 

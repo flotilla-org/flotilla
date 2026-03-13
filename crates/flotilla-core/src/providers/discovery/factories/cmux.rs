@@ -12,9 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::config::ConfigStore;
-use crate::providers::discovery::{
-    EnvironmentBag, ProviderDescriptor, UnmetRequirement, WorkspaceManagerFactory,
-};
+use crate::providers::discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
 use crate::providers::workspace::cmux::CmuxWorkspaceManager;
 use crate::providers::workspace::WorkspaceManager;
 use crate::providers::CommandRunner;
@@ -27,7 +25,9 @@ fn cmux_descriptor() -> ProviderDescriptor {
 pub struct CmuxInsideFactory;
 
 #[async_trait]
-impl WorkspaceManagerFactory for CmuxInsideFactory {
+impl Factory for CmuxInsideFactory {
+    type Output = dyn WorkspaceManager;
+
     fn descriptor(&self) -> ProviderDescriptor {
         cmux_descriptor()
     }
@@ -54,7 +54,9 @@ impl WorkspaceManagerFactory for CmuxInsideFactory {
 pub struct CmuxBinaryFallbackFactory;
 
 #[async_trait]
-impl WorkspaceManagerFactory for CmuxBinaryFallbackFactory {
+impl Factory for CmuxBinaryFallbackFactory {
+    type Output = dyn WorkspaceManager;
+
     fn descriptor(&self) -> ProviderDescriptor {
         cmux_descriptor()
     }
@@ -82,7 +84,7 @@ mod tests {
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use crate::providers::discovery::{
-        EnvironmentAssertion, EnvironmentBag, UnmetRequirement, WorkspaceManagerFactory,
+        EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
     };
 
     use super::{CmuxBinaryFallbackFactory, CmuxInsideFactory};

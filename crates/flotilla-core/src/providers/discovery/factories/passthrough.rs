@@ -6,9 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::config::ConfigStore;
-use crate::providers::discovery::{
-    EnvironmentBag, ProviderDescriptor, TerminalPoolFactory, UnmetRequirement,
-};
+use crate::providers::discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
 use crate::providers::terminal::passthrough::PassthroughTerminalPool;
 use crate::providers::terminal::TerminalPool;
 use crate::providers::CommandRunner;
@@ -16,7 +14,9 @@ use crate::providers::CommandRunner;
 pub struct PassthroughTerminalPoolFactory;
 
 #[async_trait]
-impl TerminalPoolFactory for PassthroughTerminalPoolFactory {
+impl Factory for PassthroughTerminalPoolFactory {
+    type Output = dyn TerminalPool;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::named("passthrough")
     }
@@ -39,7 +39,7 @@ mod tests {
 
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
-    use crate::providers::discovery::{EnvironmentBag, TerminalPoolFactory};
+    use crate::providers::discovery::{EnvironmentBag, Factory};
 
     use super::PassthroughTerminalPoolFactory;
 

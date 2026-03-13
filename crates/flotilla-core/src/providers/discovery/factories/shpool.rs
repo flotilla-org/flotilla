@@ -6,9 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::config::{flotilla_config_dir, ConfigStore};
-use crate::providers::discovery::{
-    EnvironmentBag, ProviderDescriptor, TerminalPoolFactory, UnmetRequirement,
-};
+use crate::providers::discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
 use crate::providers::terminal::shpool::ShpoolTerminalPool;
 use crate::providers::terminal::TerminalPool;
 use crate::providers::CommandRunner;
@@ -16,7 +14,9 @@ use crate::providers::CommandRunner;
 pub struct ShpoolTerminalPoolFactory;
 
 #[async_trait]
-impl TerminalPoolFactory for ShpoolTerminalPoolFactory {
+impl Factory for ShpoolTerminalPoolFactory {
+    type Output = dyn TerminalPool;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::named("shpool")
     }
@@ -46,7 +46,7 @@ mod tests {
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use crate::providers::discovery::{
-        EnvironmentAssertion, EnvironmentBag, TerminalPoolFactory, UnmetRequirement,
+        EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
     };
 
     use super::ShpoolTerminalPoolFactory;

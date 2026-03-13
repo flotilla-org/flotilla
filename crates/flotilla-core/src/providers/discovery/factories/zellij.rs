@@ -6,9 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::config::ConfigStore;
-use crate::providers::discovery::{
-    EnvironmentBag, ProviderDescriptor, UnmetRequirement, WorkspaceManagerFactory,
-};
+use crate::providers::discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
 use crate::providers::workspace::zellij::ZellijWorkspaceManager;
 use crate::providers::workspace::WorkspaceManager;
 use crate::providers::CommandRunner;
@@ -16,7 +14,9 @@ use crate::providers::CommandRunner;
 pub struct ZellijWorkspaceManagerFactory;
 
 #[async_trait]
-impl WorkspaceManagerFactory for ZellijWorkspaceManagerFactory {
+impl Factory for ZellijWorkspaceManagerFactory {
+    type Output = dyn WorkspaceManager;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("zellij", "zellij Workspaces", "", "", "")
     }
@@ -48,7 +48,7 @@ mod tests {
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use crate::providers::discovery::{
-        EnvironmentAssertion, EnvironmentBag, UnmetRequirement, WorkspaceManagerFactory,
+        EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
     };
 
     use super::ZellijWorkspaceManagerFactory;

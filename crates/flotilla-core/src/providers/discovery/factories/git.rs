@@ -7,8 +7,7 @@ use async_trait::async_trait;
 
 use crate::config::ConfigStore;
 use crate::providers::discovery::{
-    CheckoutManagerFactory, EnvironmentBag, ProviderDescriptor, UnmetRequirement, VcsFactory,
-    VcsKind,
+    EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement, VcsKind,
 };
 use crate::providers::vcs::git::GitVcs;
 use crate::providers::vcs::git_worktree::GitCheckoutManager;
@@ -23,7 +22,9 @@ use crate::providers::CommandRunner;
 pub struct GitVcsFactory;
 
 #[async_trait]
-impl VcsFactory for GitVcsFactory {
+impl Factory for GitVcsFactory {
+    type Output = dyn Vcs;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("git", "Git", "", "", "")
     }
@@ -50,7 +51,9 @@ impl VcsFactory for GitVcsFactory {
 pub struct WtCheckoutManagerFactory;
 
 #[async_trait]
-impl CheckoutManagerFactory for WtCheckoutManagerFactory {
+impl Factory for WtCheckoutManagerFactory {
+    type Output = dyn CheckoutManager;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("wt", "wt", "CO", "Checkouts", "checkout")
     }
@@ -85,7 +88,9 @@ impl CheckoutManagerFactory for WtCheckoutManagerFactory {
 pub struct GitCheckoutManagerFactory;
 
 #[async_trait]
-impl CheckoutManagerFactory for GitCheckoutManagerFactory {
+impl Factory for GitCheckoutManagerFactory {
+    type Output = dyn CheckoutManager;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("git", "git worktrees", "WT", "Checkouts", "worktree")
     }
@@ -125,8 +130,7 @@ mod tests {
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use crate::providers::discovery::{
-        CheckoutManagerFactory, EnvironmentAssertion, EnvironmentBag, UnmetRequirement, VcsFactory,
-        VcsKind,
+        EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement, VcsKind,
     };
 
     use super::{GitCheckoutManagerFactory, GitVcsFactory, WtCheckoutManagerFactory};

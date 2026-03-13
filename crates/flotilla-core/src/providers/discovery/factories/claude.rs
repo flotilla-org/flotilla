@@ -10,9 +10,7 @@ use crate::providers::ai_utility::claude::ClaudeAiUtility;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
 use crate::providers::coding_agent::CloudAgentService;
-use crate::providers::discovery::{
-    AiUtilityFactory, CloudAgentFactory, EnvironmentBag, ProviderDescriptor, UnmetRequirement,
-};
+use crate::providers::discovery::{EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
 use crate::providers::{CommandRunner, ReqwestHttpClient};
 
 // ---------------------------------------------------------------------------
@@ -22,7 +20,9 @@ use crate::providers::{CommandRunner, ReqwestHttpClient};
 pub struct ClaudeCodingAgentFactory;
 
 #[async_trait]
-impl CloudAgentFactory for ClaudeCodingAgentFactory {
+impl Factory for ClaudeCodingAgentFactory {
+    type Output = dyn CloudAgentService;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("claude", "Claude", "S", "Sessions", "session")
     }
@@ -54,7 +54,9 @@ impl CloudAgentFactory for ClaudeCodingAgentFactory {
 pub struct ClaudeAiUtilityFactory;
 
 #[async_trait]
-impl AiUtilityFactory for ClaudeAiUtilityFactory {
+impl Factory for ClaudeAiUtilityFactory {
+    type Output = dyn AiUtility;
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("claude", "Claude", "", "", "")
     }
@@ -87,7 +89,7 @@ mod tests {
     use crate::config::ConfigStore;
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
     use crate::providers::discovery::{
-        AiUtilityFactory, CloudAgentFactory, EnvironmentAssertion, EnvironmentBag, UnmetRequirement,
+        EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
     };
 
     use super::{ClaudeAiUtilityFactory, ClaudeCodingAgentFactory};
