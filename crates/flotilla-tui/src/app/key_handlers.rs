@@ -87,6 +87,56 @@ impl App {
 
     fn dispatch_action(&mut self, action: Action) {
         match action {
+            Action::SelectNext => match self.ui.mode.focus_target() {
+                super::ui_state::FocusTarget::WorkItemTable => self.select_next(),
+                super::ui_state::FocusTarget::EventLog => {
+                    if let Some(sel) = self.ui.event_log.selected {
+                        if sel + 1 < self.ui.event_log.count {
+                            self.ui.event_log.selected = Some(sel + 1);
+                        }
+                    } else if self.ui.event_log.count > 0 {
+                        self.ui.event_log.selected = Some(self.ui.event_log.count - 1);
+                    }
+                }
+                super::ui_state::FocusTarget::HelpText => {
+                    self.ui.help_scroll = self.ui.help_scroll.saturating_add(1);
+                }
+                super::ui_state::FocusTarget::ActionMenu => {
+                    if let UiMode::ActionMenu { ref items, ref mut index } = self.ui.mode {
+                        if *index < items.len().saturating_sub(1) {
+                            *index += 1;
+                        }
+                    }
+                }
+                super::ui_state::FocusTarget::FilePickerList => self.file_picker_select_next(),
+                super::ui_state::FocusTarget::BranchInput
+                | super::ui_state::FocusTarget::IssueSearchInput
+                | super::ui_state::FocusTarget::DeleteConfirmDialog
+                | super::ui_state::FocusTarget::CloseConfirmDialog => {}
+            },
+            Action::SelectPrev => match self.ui.mode.focus_target() {
+                super::ui_state::FocusTarget::WorkItemTable => self.select_prev(),
+                super::ui_state::FocusTarget::EventLog => {
+                    if let Some(sel) = self.ui.event_log.selected {
+                        if sel > 0 {
+                            self.ui.event_log.selected = Some(sel - 1);
+                        }
+                    }
+                }
+                super::ui_state::FocusTarget::HelpText => {
+                    self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1);
+                }
+                super::ui_state::FocusTarget::ActionMenu => {
+                    if let UiMode::ActionMenu { ref mut index, .. } = self.ui.mode {
+                        *index = index.saturating_sub(1);
+                    }
+                }
+                super::ui_state::FocusTarget::FilePickerList => self.file_picker_select_prev(),
+                super::ui_state::FocusTarget::BranchInput
+                | super::ui_state::FocusTarget::IssueSearchInput
+                | super::ui_state::FocusTarget::DeleteConfirmDialog
+                | super::ui_state::FocusTarget::CloseConfirmDialog => {}
+            },
             Action::ToggleHelp => match self.ui.mode {
                 UiMode::Normal => self.ui.mode = UiMode::Help,
                 UiMode::Help => {
@@ -677,7 +727,7 @@ mod tests {
     use super::{super::RepoViewLayout, *};
     use crate::{
         app::{
-            test_support::{checkout_item, key, setup_selectable_table as setup_table, stub_app},
+            test_support::{checkout_item, dir_entry, enter_file_picker, key, setup_selectable_table as setup_table, stub_app},
             PeerHostStatus, PeerStatus,
         },
         status_bar::{StatusBarAction, StatusBarTarget},
@@ -714,6 +764,64 @@ mod tests {
     }
 
     // ── handle_key — top-level dispatch ──────────────────────────────
+
+    #[test]
+    fn dispatch_action_select_next_moves_work_item_selection() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
+
+        app.dispatch_action(Action::SelectNext);
+
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
+    }
+
+    #[test]
+    fn dispatch_action_select_next_moves_config_event_log_selection() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Config;
+        app.ui.event_log.count = 3;
+        app.ui.event_log.selected = Some(0);
+
+        app.dispatch_action(Action::SelectNext);
+
+        assert_eq!(app.ui.event_log.selected, Some(1));
+    }
+
+    #[test]
+    fn dispatch_action_select_next_scrolls_help() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Help;
+
+        app.dispatch_action(Action::SelectNext);
+
+        assert_eq!(app.ui.help_scroll, 1);
+    }
+
+    #[test]
+    fn dispatch_action_select_next_advances_menu_index() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
+
+        app.dispatch_action(Action::SelectNext);
+
+        match app.ui.mode {
+            UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
+            _ => panic!("expected ActionMenu"),
+        }
+    }
+
+    #[test]
+    fn dispatch_action_select_next_advances_file_picker_selection() {
+        let mut app = stub_app();
+        enter_file_picker(&mut app, "/tmp/", vec![dir_entry("alpha", false, false), dir_entry("beta", false, false)]);
+
+        app.dispatch_action(Action::SelectNext);
+
+        match app.ui.mode {
+            UiMode::FilePicker { selected, .. } => assert_eq!(selected, 1),
+            _ => panic!("expected FilePicker"),
+        }
+    }
 
     #[test]
     fn resolve_action_maps_shared_navigation_keys() {

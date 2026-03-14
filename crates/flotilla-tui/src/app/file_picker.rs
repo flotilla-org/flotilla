@@ -7,6 +7,20 @@ use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 use super::{App, DirEntry, UiMode};
 
 impl App {
+    pub(super) fn file_picker_select_next(&mut self) {
+        if let UiMode::FilePicker { ref dir_entries, ref mut selected, .. } = self.ui.mode {
+            if !dir_entries.is_empty() {
+                *selected = (*selected + 1).min(dir_entries.len() - 1);
+            }
+        }
+    }
+
+    pub(super) fn file_picker_select_prev(&mut self) {
+        if let UiMode::FilePicker { ref mut selected, .. } = self.ui.mode {
+            *selected = selected.saturating_sub(1);
+        }
+    }
+
     pub(super) fn handle_file_picker_key(&mut self, key: KeyEvent) {
         // Keys that change mode
         if key.code == KeyCode::Esc {
