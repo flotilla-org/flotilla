@@ -7,14 +7,14 @@ use std::{collections::HashMap, path::Path};
 
 use flotilla_protocol::{
     CheckoutRef, DiscoveryEntry, DiscoveryFact, HostName, HostProviderStatus, ProviderError, RepoIdentity, Snapshot, ToolInventory,
-    WorkItem,
+    UnmetRequirementInfo, WorkItem,
 };
 
 use crate::{
     data::{CorrelationResult, RefreshError},
     providers::{
         correlation::{CorrelatedGroup, ItemKind as CorItemKind},
-        discovery::{EnvironmentAssertion, EnvironmentBag},
+        discovery::{EnvironmentAssertion, EnvironmentBag, HostPlatform, UnmetRequirement},
     },
     refresh::RefreshSnapshot,
 };
@@ -156,6 +156,25 @@ pub fn inventory_from_bag(bag: &EnvironmentBag) -> ToolInventory {
     inventory
 }
 
+pub fn unmet_requirement_to_proto(factory: &str, requirement: &UnmetRequirement) -> UnmetRequirementInfo {
+    let (kind, value) = match requirement {
+        UnmetRequirement::MissingBinary(binary) => ("missing_binary", Some(binary.clone())),
+        UnmetRequirement::MissingEnvVar(key) => ("missing_env_var", Some(key.clone())),
+        UnmetRequirement::MissingAuth(provider) => ("missing_auth", Some(provider.clone())),
+        UnmetRequirement::MissingRemoteHost(platform) => ("missing_remote_host", Some(host_platform_name(*platform).to_string())),
+        UnmetRequirement::NoVcsCheckout => ("no_vcs_checkout", None),
+    };
+
+    UnmetRequirementInfo { factory: factory.to_string(), kind: kind.to_string(), value }
+}
+
+fn host_platform_name(platform: HostPlatform) -> &'static str {
+    match platform {
+        HostPlatform::GitHub => "github",
+        HostPlatform::GitLab => "gitlab",
+    }
+}
+
 pub fn provider_health_to_host_statuses(health: &HashMap<(&'static str, String), bool>) -> Vec<HostProviderStatus> {
     let mut statuses: Vec<HostProviderStatus> = health
         .iter()
@@ -215,6 +234,22 @@ mod tests {
         let entry = assertion_to_discovery_entry(&assertion);
         assert_eq!(entry.kind, "auth_file_exists");
         assert_eq!(entry.detail["provider"], "github");
+    }
+
+    #[test]
+    fn convert_unmet_requirement_with_value() {
+        let entry = unmet_requirement_to_proto("github", &crate::providers::discovery::UnmetRequirement::MissingBinary("gh".into()));
+        assert_eq!(entry.factory, "github");
+        assert_eq!(entry.kind, "missing_binary");
+        assert_eq!(entry.value.as_deref(), Some("gh"));
+    }
+
+    #[test]
+    fn convert_unmet_requirement_without_value() {
+        let entry = unmet_requirement_to_proto("git", &crate::providers::discovery::UnmetRequirement::NoVcsCheckout);
+        assert_eq!(entry.factory, "git");
+        assert_eq!(entry.kind, "no_vcs_checkout");
+        assert_eq!(entry.value, None);
     }
 
     #[test]
