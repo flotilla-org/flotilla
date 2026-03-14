@@ -15,8 +15,9 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo,
-    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSummary, RepoWorkResponse, Snapshot, StatusResponse, UnmetRequirementInfo,
+    AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError,
+    ProviderInfo, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSummary, RepoWorkResponse, Snapshot, StatusResponse,
+    UnmetRequirementInfo,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -297,6 +298,8 @@ pub struct InProcessDaemon {
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
+    /// Static local host summary published to peers.
+    local_host_summary: HostSummary,
 }
 
 impl InProcessDaemon {
@@ -362,6 +365,13 @@ impl InProcessDaemon {
             order.push(path);
         }
 
+        let local_host_summary = crate::host_summary::build_local_host_summary(
+            &host_name,
+            &host_bag,
+            crate::host_summary::provider_statuses_from_registries(repos.values().map(|state| state.model.registry.as_ref())),
+            &*discovery.env,
+        );
+
         let daemon = Arc::new(Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
@@ -377,6 +387,7 @@ impl InProcessDaemon {
             discovery,
             active_command: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4(),
+            local_host_summary,
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -408,6 +419,10 @@ impl InProcessDaemon {
     /// handshake so peers can detect daemon restarts.
     pub fn session_id(&self) -> uuid::Uuid {
         self.session_id
+    }
+
+    pub fn local_host_summary(&self) -> &HostSummary {
+        &self.local_host_summary
     }
 
     /// Returns whether this daemon is running in follower mode.

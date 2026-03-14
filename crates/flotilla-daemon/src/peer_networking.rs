@@ -325,6 +325,8 @@ impl PeerNetworkingTask {
                         PeerWireMessage::Data(msg) => {
                             (msg.origin_host.clone(), msg.repo_path.clone())
                         }
+                        // repo_path is unused for host summaries; handle_inbound always returns Ignored.
+                        PeerWireMessage::HostSummary(_) => (env.connection_peer.clone(), PathBuf::new()),
                         PeerWireMessage::Routed(
                             flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
                                 responder_host,
@@ -836,7 +838,6 @@ pub(crate) async fn send_local_to_peer(
     generation: u64,
 ) -> bool {
     let repo_paths = daemon.tracked_repo_paths().await;
-    let mut any_sent = false;
 
     // Resolve the sender once before iterating repos. If the connection
     // has already been superseded, skip the entire loop.
@@ -848,6 +849,13 @@ pub(crate) async fn send_local_to_peer(
         debug!(peer = %peer, "peer connection superseded, skipping local state send");
         return false;
     };
+
+    let mut any_sent = false;
+    if let Err(e) = sender.send(PeerWireMessage::HostSummary(daemon.local_host_summary().clone())).await {
+        debug!(peer = %peer, err = %e, "failed to send host summary to peer");
+    } else {
+        any_sent = true;
+    }
 
     for repo_path in repo_paths {
         let Some((local_providers, version)) = daemon.get_local_providers(&repo_path).await else {

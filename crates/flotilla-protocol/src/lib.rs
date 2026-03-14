@@ -2,6 +2,7 @@ pub mod commands;
 pub mod delta;
 pub mod framing;
 mod host;
+mod host_summary;
 pub mod output;
 pub mod peer;
 pub mod provider_data;
@@ -9,6 +10,7 @@ pub mod query;
 pub mod snapshot;
 
 pub use host::{HostName, HostPath, RepoIdentity};
+pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSummary, SystemInfo, ToolInventory};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 
 #[cfg(test)]

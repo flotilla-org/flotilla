@@ -5,13 +5,15 @@
 
 use std::{collections::HashMap, path::Path};
 
-use flotilla_protocol::{CheckoutRef, DiscoveryEntry, HostName, ProviderError, Snapshot, WorkItem};
+use flotilla_protocol::{
+    CheckoutRef, DiscoveryEntry, DiscoveryFact, HostName, HostProviderStatus, ProviderError, Snapshot, ToolInventory, WorkItem,
+};
 
 use crate::{
     data::{CorrelationResult, RefreshError},
     providers::{
         correlation::{CorrelatedGroup, ItemKind as CorItemKind},
-        discovery::EnvironmentAssertion,
+        discovery::{EnvironmentAssertion, EnvironmentBag},
     },
     refresh::RefreshSnapshot,
 };
@@ -117,6 +119,51 @@ pub fn health_to_proto(health: &HashMap<(&'static str, String), bool>) -> HashMa
     nested
 }
 
+pub fn inventory_from_bag(bag: &EnvironmentBag) -> ToolInventory {
+    let mut inventory = ToolInventory::default();
+
+    for assertion in bag.assertions() {
+        match assertion {
+            EnvironmentAssertion::BinaryAvailable { name, path, version } => {
+                let mut detail = vec![("path".into(), path.display().to_string())];
+                if let Some(version) = version {
+                    detail.push(("version".into(), version.clone()));
+                }
+                inventory.binaries.push(DiscoveryFact { name: name.clone(), detail });
+            }
+            EnvironmentAssertion::SocketAvailable { name, path } => {
+                let detail = vec![("path".into(), path.display().to_string())];
+                inventory.sockets.push(DiscoveryFact { name: name.clone(), detail });
+            }
+            EnvironmentAssertion::AuthFileExists { provider, path } => {
+                let detail = vec![("path".into(), path.display().to_string())];
+                inventory.auth.push(DiscoveryFact { name: provider.clone(), detail });
+            }
+            EnvironmentAssertion::EnvVarSet { key, .. } => {
+                let detail = vec![("value".into(), "<set>".into())];
+                inventory.env_vars.push(DiscoveryFact { name: key.clone(), detail });
+            }
+            EnvironmentAssertion::VcsCheckoutDetected { .. } | EnvironmentAssertion::RemoteHost { .. } => {}
+        }
+    }
+
+    inventory.binaries.sort_by(|a, b| a.name.cmp(&b.name));
+    inventory.sockets.sort_by(|a, b| a.name.cmp(&b.name));
+    inventory.auth.sort_by(|a, b| a.name.cmp(&b.name));
+    inventory.env_vars.sort_by(|a, b| a.name.cmp(&b.name));
+
+    inventory
+}
+
+pub fn provider_health_to_host_statuses(health: &HashMap<(&'static str, String), bool>) -> Vec<HostProviderStatus> {
+    let mut statuses: Vec<HostProviderStatus> = health
+        .iter()
+        .map(|((category, name), healthy)| HostProviderStatus { category: category.to_string(), name: name.clone(), healthy: *healthy })
+        .collect();
+    statuses.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
+    statuses
+}
+
 pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot, host_name: &HostName) -> Snapshot {
     Snapshot {
         seq,
@@ -140,7 +187,7 @@ pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot, host_
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{HostName, HostPath, WorkItemIdentity, WorkItemKind};
+    use flotilla_protocol::{HostName, HostPath, HostProviderStatus, WorkItemIdentity, WorkItemKind};
 
     use super::*;
     use crate::{
@@ -174,6 +221,31 @@ mod tests {
         let entry = assertion_to_discovery_entry(&assertion);
         assert_eq!(entry.kind, "socket_available");
         assert_eq!(entry.detail["name"], "shpool");
+    }
+
+    #[test]
+    fn inventory_from_bag_includes_versioned_binary() {
+        let bag = crate::providers::discovery::EnvironmentBag::new().with(EnvironmentAssertion::versioned_binary(
+            "git",
+            "/usr/bin/git",
+            "2.49.0",
+        ));
+
+        let inventory = inventory_from_bag(&bag);
+
+        assert_eq!(inventory.binaries.len(), 1);
+        assert_eq!(inventory.binaries[0].name, "git");
+        assert!(inventory.binaries[0].detail.iter().any(|(k, v)| k == "version" && v == "2.49.0"));
+    }
+
+    #[test]
+    fn provider_health_to_host_statuses_flattens_categories() {
+        let health = HashMap::from([(("vcs", "Git".to_string()), true), (("cloud_agent", "Claude".to_string()), false)]);
+
+        let statuses = provider_health_to_host_statuses(&health);
+
+        assert!(statuses.contains(&HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }));
+        assert!(statuses.contains(&HostProviderStatus { category: "cloud_agent".into(), name: "Claude".into(), healthy: false }));
     }
 
     fn hp(path: &str) -> HostPath {

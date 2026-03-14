@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{delta::Change, provider_data::ProviderData, CommandResult, HostName, RepoIdentity, StepStatus};
+use crate::{delta::Change, provider_data::ProviderData, CommandResult, HostName, HostSummary, RepoIdentity, StepStatus};
 
 /// Logical clock for causal ordering and deduplication of peer messages.
 ///
@@ -66,6 +66,7 @@ pub struct PeerDataMessage {
 #[serde(tag = "peer_type")]
 pub enum PeerWireMessage {
     Data(PeerDataMessage),
+    HostSummary(HostSummary),
     Routed(RoutedPeerMessage),
     Goodbye { reason: GoodbyeReason },
     Ping { timestamp: u64 },
@@ -149,7 +150,25 @@ pub enum PeerDataKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Command, CommandAction, CommandResult, RepoSelector};
+    use crate::{
+        Command, CommandAction, CommandResult, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, SystemInfo, ToolInventory,
+    };
+
+    fn sample_host_summary() -> HostSummary {
+        HostSummary {
+            host_name: HostName::new("desktop"),
+            system: SystemInfo {
+                home_dir: Some(PathBuf::from("/home/dev")),
+                os: Some("linux".into()),
+                arch: Some("aarch64".into()),
+                cpu_count: Some(8),
+                memory_total_mb: None,
+                environment: HostEnvironment::Container,
+            },
+            inventory: ToolInventory::default(),
+            providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+        }
+    }
 
     #[test]
     fn vector_clock_tick_increments() {
@@ -263,6 +282,14 @@ mod tests {
             PeerWireMessage::Pong { timestamp } => assert_eq!(timestamp, 1234567890),
             other => panic!("expected Pong, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn peer_wire_message_host_summary_roundtrip() {
+        let msg = PeerWireMessage::HostSummary(sample_host_summary());
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: PeerWireMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(decoded, PeerWireMessage::HostSummary(_)));
     }
 
     #[test]

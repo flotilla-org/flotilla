@@ -7,12 +7,19 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 
-use crate::providers::{discovery::EnvVars, ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::{
+    discovery::{
+        detectors,
+        detectors::generic::{parse_first_dotted_version, CommandDetector},
+        EnvVars, FactoryRegistry,
+    },
+    ChannelLabel, CommandOutput, CommandRunner,
+};
 
 type ResponseMap = HashMap<(String, String), Vec<Result<String, String>>>;
 
@@ -118,9 +125,31 @@ impl CommandRunner for DiscoveryMockRunner {
 /// Build a `DiscoveryRuntime` that uses no-op env and a minimal fake runner
 /// (only responds to `git --version`). Avoids probing ambient host tools.
 pub fn fake_discovery(follower: bool) -> super::DiscoveryRuntime {
-    let mut runtime = super::DiscoveryRuntime::for_process(follower);
-    runtime.runner =
-        std::sync::Arc::new(DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build());
-    runtime.env = std::sync::Arc::new(TestEnvVars::default());
-    runtime
+    let factories = if follower { FactoryRegistry::for_follower() } else { FactoryRegistry::default_all() };
+
+    super::DiscoveryRuntime {
+        runner: Arc::new(DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build()),
+        env: Arc::new(TestEnvVars::default()),
+        host_detectors: vec![Box::new(CommandDetector::new("git", &["--version"], parse_first_dotted_version))],
+        repo_detectors: detectors::default_repo_detectors(),
+        factories,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::discovery::{run_host_detectors, EnvironmentAssertion};
+
+    #[tokio::test]
+    async fn fake_discovery_uses_only_git_host_detector() {
+        let runtime = fake_discovery(false);
+        let bag = run_host_detectors(&runtime.host_detectors, &*runtime.runner, &*runtime.env).await;
+
+        assert!(matches!(
+            bag.assertions(),
+            [EnvironmentAssertion::BinaryAvailable { name, version, .. }]
+            if name == "git" && version.as_deref() == Some("2.43.0")
+        ));
+    }
 }

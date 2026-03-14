@@ -4,8 +4,10 @@
 
 - Normal environment: `cargo test --workspace --locked`
 - Restricted Codex sandbox (socket bind/listen blocked): `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests`
+- `flotilla-core` package-local `InProcessDaemon` integration test: `cargo test -p flotilla-core --locked --features test-support --test in_process_daemon`
 
 Use the sandbox-safe command when `CODEX_SANDBOX` is set or socket-bind tests are expected to fail with `Operation not permitted`. The repo-local `TMPDIR` avoids native build failures from crates like `aws-lc-sys` under the sandbox.
+The `flotilla-core` integration test above intentionally depends on shared discovery test helpers behind the `test-support` feature.
 
 ## Cursor Cloud specific instructions
 

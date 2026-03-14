@@ -17,8 +17,8 @@ use flotilla_core::{
     config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
 };
 use flotilla_daemon::peer::{
-    merge::merge_provider_data, test_support::handle_test_peer_data, HandleResult, PeerConnectionStatus, PeerManager, PeerSender,
-    PeerTransport,
+    channel_transport_pair, merge::merge_provider_data, test_support::handle_test_peer_data, HandleResult, PeerConnectionStatus,
+    PeerManager, PeerSender, PeerTransport,
 };
 use flotilla_protocol::{
     Checkout, GoodbyeReason, HostName, HostPath, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, VectorClock,
@@ -120,6 +120,11 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(data), seq },
     }
+}
+
+async fn empty_daemon_with_host(temp: &tempfile::TempDir, host: &str) -> Arc<InProcessDaemon> {
+    let config = Arc::new(ConfigStore::with_base(temp.path().join(format!("config-{host}"))));
+    InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +330,55 @@ async fn daemon_snapshot_includes_follower_checkout_overlay() {
 // ---------------------------------------------------------------------------
 // Test 5: Peer data relay excludes origin
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn host_summary_round_trip_between_connected_peers() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let leader_daemon = empty_daemon_with_host(&temp, "leader").await;
+    let follower_daemon = empty_daemon_with_host(&temp, "follower").await;
+
+    let (leader_transport, follower_transport) = channel_transport_pair(HostName::new("leader"), HostName::new("follower"));
+    let mut leader_mgr = PeerManager::new(HostName::new("leader"));
+    let mut follower_mgr = PeerManager::new(HostName::new("follower"));
+    leader_mgr.add_peer(HostName::new("follower"), Box::new(leader_transport));
+    follower_mgr.add_peer(HostName::new("leader"), Box::new(follower_transport));
+
+    let mut leader_receivers = leader_mgr.connect_all().await;
+    let _follower_receivers = follower_mgr.connect_all().await;
+    let (_peer, generation, mut leader_rx) = leader_receivers.pop().expect("leader receiver");
+
+    follower_mgr
+        .send_to(&HostName::new("leader"), PeerWireMessage::HostSummary(follower_daemon.local_host_summary().clone()))
+        .await
+        .expect("send host summary");
+
+    let inbound = tokio::time::timeout(std::time::Duration::from_secs(2), leader_rx.recv())
+        .await
+        .expect("timeout waiting for host summary")
+        .expect("host summary message");
+
+    let result = leader_mgr
+        .handle_inbound(flotilla_daemon::peer::InboundPeerEnvelope {
+            msg: inbound,
+            connection_generation: generation,
+            connection_peer: HostName::new("follower"),
+        })
+        .await;
+
+    assert_eq!(result, HandleResult::Ignored);
+    let stored = leader_mgr.get_peer_host_summaries().get(&HostName::new("follower")).expect("leader stored follower summary");
+    assert_eq!(stored.host_name, HostName::new("follower"));
+    assert_eq!(stored, follower_daemon.local_host_summary());
+
+    let plan = leader_mgr.disconnect_peer(&HostName::new("follower"), generation);
+    assert!(plan.was_active, "disconnect should clear active peer state");
+    assert!(
+        !leader_mgr.get_peer_host_summaries().contains_key(&HostName::new("follower")),
+        "disconnect should clear the stored host summary"
+    );
+
+    let _ = leader_daemon;
+}
 
 #[tokio::test]
 async fn relay_excludes_origin_and_sends_to_other_peers() {

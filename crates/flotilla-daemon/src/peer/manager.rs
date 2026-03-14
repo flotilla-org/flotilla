@@ -6,8 +6,8 @@ use std::{
 };
 
 use flotilla_protocol::{
-    Command, CommandPeerEvent, CommandResult, ConfigLabel, GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage,
-    ProviderData, RepoIdentity, RoutedPeerMessage, VectorClock,
+    Command, CommandPeerEvent, CommandResult, ConfigLabel, GoodbyeReason, HostName, HostSummary, PeerDataKind, PeerDataMessage,
+    PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage, VectorClock,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -182,6 +182,7 @@ pub struct PeerManager {
     route_epoch: u64,
     request_id_counter: u64,
     peer_data: HashMap<HostName, HashMap<RepoIdentity, PerRepoPeerState>>,
+    peer_host_summaries: HashMap<HostName, HostSummary>,
     /// RepoIdentity values that exist only on remote peers — no local repo
     /// matches. Each maps to the synthetic path used for tab identity.
     known_remote_repos: HashMap<RepoIdentity, PathBuf>,
@@ -212,6 +213,7 @@ impl PeerManager {
             route_epoch: 0,
             request_id_counter: 0,
             peer_data: HashMap::new(),
+            peer_host_summaries: HashMap::new(),
             known_remote_repos: HashMap::new(),
             command_reverse_paths: HashMap::new(),
             last_seen_clocks: HashMap::new(),
@@ -527,6 +529,11 @@ impl PeerManager {
                 }
                 self.store_snapshot_from(&env.connection_peer, env.connection_generation, msg)
             }
+            PeerWireMessage::HostSummary(mut summary) => {
+                summary.host_name = env.connection_peer.clone();
+                self.store_host_summary(summary);
+                HandleResult::Ignored
+            }
             PeerWireMessage::Routed(msg) => self.handle_routed(env.connection_peer, env.connection_generation, msg).await,
             PeerWireMessage::Goodbye { reason } => match reason {
                 GoodbyeReason::Superseded => {
@@ -786,6 +793,14 @@ impl PeerManager {
         &self.peer_data
     }
 
+    pub fn store_host_summary(&mut self, summary: HostSummary) {
+        self.peer_host_summaries.insert(summary.host_name.clone(), summary);
+    }
+
+    pub fn get_peer_host_summaries(&self) -> &HashMap<HostName, HostSummary> {
+        &self.peer_host_summaries
+    }
+
     /// Snapshot relay targets without performing any async sends.
     ///
     /// Returns a list of `(target, sender, stamped message)` tuples for peers
@@ -959,6 +974,7 @@ impl PeerManager {
     pub fn remove_peer_data(&mut self, name: &HostName) -> Vec<RepoIdentity> {
         let affected: Vec<RepoIdentity> = self.peer_data.get(name).map(|repos| repos.keys().cloned().collect()).unwrap_or_default();
         self.peer_data.remove(name);
+        self.peer_host_summaries.remove(name);
         self.last_seen_clocks.retain(|(host, _), _| host != name);
         info!(peer = %name, repos = affected.len(), "cleared peer data");
         affected
@@ -1046,9 +1062,12 @@ impl PeerManager {
     /// Unlike `disconnect_peer`, this does NOT tear down the connection.
     pub fn clear_peer_data_for_restart(&mut self, origin: &HostName) -> Vec<RepoIdentity> {
         let Some(repos) = self.peer_data.remove(origin) else {
+            // Restart cleanup still owns host-summary eviction even when no repo snapshots were cached.
+            self.peer_host_summaries.remove(origin);
             return Vec::new();
         };
         let affected: Vec<RepoIdentity> = repos.keys().cloned().collect();
+        self.peer_host_summaries.remove(origin);
         self.last_seen_clocks.retain(|(host, _), _| host != origin);
         info!(peer = %origin, repo_count = affected.len(), "cleared stale peer data after restart");
         affected
@@ -1071,6 +1090,7 @@ impl PeerManager {
         self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
         self.command_reverse_paths.retain(|_, hop| hop.next_hop != *name);
         self.pending_resync_requests.retain(|key, _| key.target_host != *name);
+        self.peer_host_summaries.remove(name);
 
         let mut affected_repos = Vec::new();
         let mut resync_requests = Vec::new();
@@ -1179,7 +1199,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{super::transport::PeerConnectionStatus, *};
-    use crate::peer::test_support::handle_test_peer_data;
+    use crate::peer::test_support::{ensure_test_connection_generation, handle_test_peer_data};
 
     struct MockPeerSender {
         sent: Arc<Mutex<Vec<PeerWireMessage>>>,
@@ -1258,6 +1278,22 @@ mod tests {
             repo_path: PathBuf::from("/home/dev/repo"),
             clock,
             kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq },
+        }
+    }
+
+    fn sample_host_summary_for(name: &str) -> flotilla_protocol::HostSummary {
+        flotilla_protocol::HostSummary {
+            host_name: HostName::new(name),
+            system: flotilla_protocol::SystemInfo {
+                home_dir: Some(PathBuf::from("/home/dev")),
+                os: Some("linux".into()),
+                arch: Some("x86_64".into()),
+                cpu_count: Some(8),
+                memory_total_mb: Some(16384),
+                environment: flotilla_protocol::HostEnvironment::Unknown,
+            },
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
         }
     }
 
@@ -1470,6 +1506,47 @@ mod tests {
         assert_eq!(data.len(), 2);
         assert!(data.contains_key(&HostName::new("desktop")));
         assert!(data.contains_key(&HostName::new("server")));
+    }
+
+    #[tokio::test]
+    async fn host_summary_handle_inbound_stores_for_connection_peer() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        let connection_peer = HostName::new("remote");
+        let generation = ensure_test_connection_generation(&mut mgr, &connection_peer, || {
+            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
+        });
+
+        let result = mgr
+            .handle_inbound(InboundPeerEnvelope {
+                msg: PeerWireMessage::HostSummary(sample_host_summary_for("spoofed-name")),
+                connection_generation: generation,
+                connection_peer: connection_peer.clone(),
+            })
+            .await;
+
+        assert_eq!(result, HandleResult::Ignored);
+        let stored = mgr.get_peer_host_summaries().get(&connection_peer).expect("stored host summary");
+        assert_eq!(stored.host_name, connection_peer);
+    }
+
+    #[test]
+    fn remove_peer_data_clears_host_summary() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        mgr.store_host_summary(sample_host_summary_for("remote"));
+
+        mgr.remove_peer_data(&HostName::new("remote"));
+
+        assert!(mgr.get_peer_host_summaries().is_empty());
+    }
+
+    #[test]
+    fn clear_peer_data_for_restart_clears_host_summary() {
+        let mut mgr = PeerManager::new(HostName::new("local"));
+        mgr.store_host_summary(sample_host_summary_for("remote"));
+
+        mgr.clear_peer_data_for_restart(&HostName::new("remote"));
+
+        assert!(mgr.get_peer_host_summaries().is_empty());
     }
 
     #[tokio::test]

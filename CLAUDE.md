@@ -22,6 +22,12 @@ Before pushing, always run `cargo +nightly fmt`, `cargo clippy --all-targets --l
 
 In the Codex sandbox, prefer `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped.
 
+Package-local `flotilla-core` daemon integration coverage uses shared discovery test helpers behind `test-support`, so run it as:
+
+```bash
+cargo test -p flotilla-core --locked --features test-support --test in_process_daemon
+```
+
 ## Claude Code Web (changedirection/flotilla fork)
 
 This fork exists for Claude Code Web sessions. Two things to be aware of:
