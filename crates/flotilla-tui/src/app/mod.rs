@@ -1141,7 +1141,7 @@ mod tests {
     #[test]
     fn close_confirm_y_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     fn close_confirm_enter_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn close_confirm_esc_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());
@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn close_confirm_n_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into() };
+        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
         app.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());

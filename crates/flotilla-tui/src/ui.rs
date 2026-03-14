@@ -948,7 +948,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
 }
 
 fn render_close_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
-    let UiMode::CloseConfirm { ref id, ref title } = ui.mode else {
+    let UiMode::CloseConfirm { ref id, ref title, .. } = ui.mode else {
         return;
     };
 

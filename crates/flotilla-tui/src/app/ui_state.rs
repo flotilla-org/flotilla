@@ -58,6 +58,7 @@ pub enum UiMode {
     CloseConfirm {
         id: String,
         title: String,
+        identity: WorkItemIdentity,
     },
     IssueSearch {
         input: Input,
@@ -295,7 +296,7 @@ mod tests {
             (UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] }, false),
             (UiMode::FilePicker { input: Input::default(), dir_entries: vec![], selected: 0 }, false),
             (UiMode::DeleteConfirm { info: None, loading: false, terminal_keys: vec![] }, false),
-            (UiMode::CloseConfirm { id: "42".into(), title: "test".into() }, false),
+            (UiMode::CloseConfirm { id: "42".into(), title: "test".into(), identity: WorkItemIdentity::Session("test".into()) }, false),
             (UiMode::IssueSearch { input: Input::default() }, false),
         ];
         for (mode, expected) in &cases {

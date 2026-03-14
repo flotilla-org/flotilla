@@ -5,7 +5,7 @@ use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
-use super::{App, BranchInputKind, ClearDispatch, Intent, UiMode};
+use super::{ui_state::PendingActionContext, App, BranchInputKind, ClearDispatch, Intent, UiMode};
 use crate::status_bar::StatusBarAction;
 
 impl App {
@@ -345,18 +345,23 @@ impl App {
                     self.enter_branch_input(BranchInputKind::Generating);
                 }
                 Intent::CloseChangeRequest => {
+                    // CloseChangeRequest doesn't push now — the confirm handler
+                    // creates its own PendingActionContext when the user confirms.
                     self.ui.mode = UiMode::CloseConfirm {
                         id: match &cmd {
                             Command { action: CommandAction::CloseChangeRequest { id }, .. } => id.clone(),
                             _ => return,
                         },
                         title: item.description.clone(),
+                        identity: item.identity.clone(),
                     };
-                    return; // Don't push command — confirm handler will
+                    return;
                 }
                 _ => {}
             }
-            self.proto_commands.push(cmd);
+            let pending_ctx =
+                PendingActionContext { identity: item.identity.clone(), description: intent.label(self.model.active_labels()) };
+            self.proto_commands.push_with_context(cmd, Some(pending_ctx));
         }
     }
 
@@ -492,8 +497,10 @@ impl App {
     fn handle_close_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                if let UiMode::CloseConfirm { ref id, .. } = self.ui.mode {
-                    self.proto_commands.push(self.repo_command(CommandAction::CloseChangeRequest { id: id.clone() }));
+                if let UiMode::CloseConfirm { ref id, ref identity, .. } = self.ui.mode {
+                    let ctx = PendingActionContext { identity: identity.clone(), description: format!("Close {}", id) };
+                    self.proto_commands
+                        .push_with_context(self.repo_command(CommandAction::CloseChangeRequest { id: id.clone() }), Some(ctx));
                 }
                 self.ui.mode = UiMode::Normal;
             }
@@ -1390,5 +1397,30 @@ mod tests {
         setup_table(&mut app, vec![item]);
         app.handle_key(key(KeyCode::Char('p')));
         assert!(app.proto_commands.take_next().is_none());
+    }
+
+    // ── pending context attachment ─────────────────────────────────────
+
+    #[test]
+    fn resolve_and_push_attaches_pending_context() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        app.resolve_and_push(Intent::CreateWorkspace, &item);
+        let (_, ctx) = app.proto_commands.take_next().expect("should have command");
+        let ctx = ctx.expect("should have pending context");
+        assert_eq!(ctx.identity, item.identity);
+    }
+
+    #[test]
+    fn close_confirm_attaches_pending_context() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        // Set up CloseConfirm mode with the item's identity
+        app.ui.mode = UiMode::CloseConfirm { id: "PR-1".into(), title: "test".into(), identity: item.identity.clone() };
+        // Simulate pressing 'y' to confirm
+        app.handle_key(key(KeyCode::Char('y')));
+        let (_, ctx) = app.proto_commands.take_next().expect("should have command");
+        let ctx = ctx.expect("should have pending context");
+        assert_eq!(ctx.identity, item.identity);
     }
 }
