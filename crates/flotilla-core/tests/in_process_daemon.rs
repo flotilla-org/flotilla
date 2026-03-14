@@ -11,6 +11,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::{
+        ai_utility::AiUtility,
         coding_agent::CloudAgentService,
         discovery::{DiscoveryRuntime, EnvVars, EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement},
         types::{CloudAgentSession, RepoCriteria, SessionStatus},
@@ -36,11 +37,11 @@ impl CommandRunner for QuietRunner {
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-        Ok(CommandOutput {
-            stdout: String::new(),
-            stderr: format!("QuietRunner: unexpected command {cmd} {}", args.join(" ")),
-            success: false,
-        })
+        if cmd == "git" && args == ["--version"] {
+            Ok(CommandOutput { stdout: "git version 2.43.0".into(), stderr: String::new(), success: true })
+        } else {
+            Err(format!("QuietRunner: unexpected command {cmd} {}", args.join(" ")))
+        }
     }
 
     async fn exists(&self, _: &str, _: &[&str]) -> bool {
@@ -98,6 +99,8 @@ impl CloudAgentService for SlowCloudAgent {
     }
 
     async fn archive_session(&self, _: &str) -> Result<(), String> {
+        // The test waits for this notification before cancelling, so this must
+        // fire after the provider future is actively running.
         self.archive_started.notify_waiters();
         self.archive_release.notified().await;
         Ok(())
@@ -134,6 +137,63 @@ impl Factory for SlowCloudAgentFactory {
 fn slow_cloud_agent_discovery(agent: Arc<SlowCloudAgent>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
     runtime.factories.cloud_agents.push(Box::new(SlowCloudAgentFactory { agent }));
+    runtime
+}
+
+struct SlowAiUtility {
+    generation_started: Notify,
+    generation_release: Notify,
+}
+
+impl SlowAiUtility {
+    fn new() -> Self {
+        Self { generation_started: Notify::new(), generation_release: Notify::new() }
+    }
+
+    async fn wait_for_generation_start(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.generation_started.notified()).await.expect("generation should start");
+    }
+
+    fn release_generation(&self) {
+        self.generation_release.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl AiUtility for SlowAiUtility {
+    async fn generate_branch_name(&self, _: &str) -> Result<String, String> {
+        self.generation_started.notify_waiters();
+        self.generation_release.notified().await;
+        Ok("feat/slow-branch".into())
+    }
+}
+
+struct SlowAiUtilityFactory {
+    utility: Arc<SlowAiUtility>,
+}
+
+#[async_trait]
+impl Factory for SlowAiUtilityFactory {
+    type Output = dyn AiUtility;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::named("slow-ai")
+    }
+
+    async fn probe(
+        &self,
+        _: &EnvironmentBag,
+        _: &ConfigStore,
+        _: &Path,
+        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
+    }
+}
+
+fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
+    let mut runtime = fake_discovery(false);
+    runtime.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility }));
     runtime
 }
 
@@ -275,6 +335,56 @@ async fn archive_session_can_be_cancelled_while_provider_call_is_in_flight() {
     agent.wait_for_archive_start().await;
     daemon.cancel(command_id).await.expect("cancel should succeed while archive is in flight");
     agent.release_archive();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for command finish");
+
+    assert_eq!(result, CommandResult::Cancelled);
+}
+
+#[tokio::test]
+async fn generate_branch_name_can_be_cancelled_while_provider_call_is_in_flight() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let utility = Arc::new(SlowAiUtility::new());
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, slow_ai_discovery(Arc::clone(&utility)), HostName::local()).await;
+    let mut rx = daemon.subscribe();
+
+    daemon.refresh(&repo).await.expect("refresh should succeed");
+
+    let command = Command {
+        host: None,
+        context_repo: Some(RepoSelector::Path(repo.clone())),
+        action: CommandAction::GenerateBranchName { issue_keys: vec!["42".into()] },
+    };
+    let command_id = daemon.execute(command).await.expect("execute should return a command id");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandStarted { command_id: id, .. }) if id == command_id => break,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for command start");
+
+    utility.wait_for_generation_start().await;
+    daemon.cancel(command_id).await.expect("cancel should succeed while generation is in flight");
+    utility.release_generation();
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

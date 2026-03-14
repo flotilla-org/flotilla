@@ -43,9 +43,10 @@ enum CheckoutIntent {
 
 /// Build an execution plan for a command.
 ///
-/// Multi-step commands (CreateCheckout, TeleportSession, RemoveCheckout) return
-/// `ExecutionPlan::Steps` with cancellation points between steps. All other
-/// commands delegate to `execute()` and return `ExecutionPlan::Immediate`.
+/// Multi-step commands (CreateCheckout, TeleportSession, RemoveCheckout,
+/// ArchiveSession, GenerateBranchName) return `ExecutionPlan::Steps` with
+/// cancellation points between steps. All other commands delegate to
+/// `execute()` and return `ExecutionPlan::Immediate`.
 pub async fn build_plan(
     cmd: Command,
     repo_root: PathBuf,
@@ -685,7 +686,7 @@ async fn generate_branch_name_result(issue_keys: &[String], registry: &ProviderR
         issues.iter().map(|(id, _title)| (provider.clone(), id.clone())).collect()
     };
 
-    info!("generating branch name");
+    info!(issue_count = issue_keys.len(), "generating branch name");
     let branch_result = if let Some((_, ai)) = registry.ai_utilities.values().next() {
         let context: Vec<String> = issues.iter().map(|(id, title)| format!("{} #{}", title, id)).collect();
         let prompt_text = if context.len() == 1 { context[0].clone() } else { context.join("; ") };
@@ -699,7 +700,14 @@ async fn generate_branch_name_result(issue_keys: &[String], registry: &ProviderR
             info!(%name, "AI suggested");
             CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
         }
-        _ => {
+        Some(Err(error)) => {
+            warn!(%error, "using fallback branch name after AI failure");
+            let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
+            let name = fallback.join("-");
+            CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
+        }
+        None => {
+            warn!("using fallback branch name without AI provider");
             let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
             let name = fallback.join("-");
             CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
@@ -2127,7 +2135,10 @@ mod tests {
         let plan = run_build_plan(CommandAction::ArchiveSession { session_id: "sess-1".to_string() }, registry, data, runner).await;
 
         match plan {
-            ExecutionPlan::Steps(step_plan) => assert_eq!(step_plan.steps.len(), 1, "expected a single archive step"),
+            ExecutionPlan::Steps(step_plan) => {
+                assert_eq!(step_plan.steps.len(), 1, "expected a single archive step");
+                assert_eq!(step_plan.steps[0].description, "Archive session sess-1");
+            }
             ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
         }
     }
@@ -2143,7 +2154,10 @@ mod tests {
         let plan = run_build_plan(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, registry, data, runner).await;
 
         match plan {
-            ExecutionPlan::Steps(step_plan) => assert_eq!(step_plan.steps.len(), 1, "expected a single branch-name step"),
+            ExecutionPlan::Steps(step_plan) => {
+                assert_eq!(step_plan.steps.len(), 1, "expected a single branch-name step");
+                assert_eq!(step_plan.steps[0].description, "Generate branch name");
+            }
             ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
         }
     }

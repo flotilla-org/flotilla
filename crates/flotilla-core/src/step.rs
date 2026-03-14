@@ -62,10 +62,10 @@ pub async fn run_step_plan(
         });
 
         let outcome = (step.action)().await;
-        if cancel.is_cancelled() {
-            if outcome.is_ok() {
-                return CommandResult::Cancelled;
-            }
+        // Cancellation wins over a successful in-flight step, but provider
+        // errors still surface so we don't hide the underlying failure.
+        if cancel.is_cancelled() && outcome.is_ok() {
+            return CommandResult::Cancelled;
         }
 
         match outcome {
