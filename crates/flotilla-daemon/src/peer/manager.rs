@@ -623,48 +623,20 @@ impl PeerManager {
         }
     }
 
-    /// Forward a message to all connected peers except the origin, self,
-    /// and any host already present in the message's vector clock (which
-    /// indicates that host has already seen or relayed the message).
-    pub async fn relay(&self, origin: &HostName, msg: &PeerDataMessage) {
-        // Stamp our own host into the clock before relaying
+    /// Snapshot relay targets without performing any async sends.
+    ///
+    /// Returns a list of (target, sender, stamped message) tuples for peers
+    /// that should receive the relayed message. The caller sends concurrently
+    /// outside the PeerManager lock, eliminating head-of-line blocking.
+    pub fn prepare_relay(&self, origin: &HostName, msg: &PeerDataMessage) -> Vec<(HostName, Arc<dyn PeerSender>, PeerDataMessage)> {
         let mut relayed_msg = msg.clone();
         relayed_msg.clock.tick(&self.local_host);
 
-        for (name, sender) in &self.senders {
-            if name == origin || name == &self.local_host {
-                continue;
-            }
-            // Skip peers that already appear in the clock — they've
-            // already seen or relayed this message.
-            if msg.clock.get(name) > 0 {
-                debug!(
-                    to = %name,
-                    repo = %msg.repo_identity,
-                    "skipping relay to peer already in clock"
-                );
-                continue;
-            }
-
-            match sender.send(PeerWireMessage::Data(relayed_msg.clone())).await {
-                Ok(()) => {
-                    debug!(
-                        from = %origin,
-                        to = %name,
-                        repo = %msg.repo_identity,
-                        "relayed peer data"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        from = %origin,
-                        to = %name,
-                        err = %e,
-                        "failed to relay peer data"
-                    );
-                }
-            }
-        }
+        self.senders
+            .iter()
+            .filter(|(name, _)| *name != origin && *name != &self.local_host && msg.clock.get(name) == 0)
+            .map(|(name, sender)| (name.clone(), Arc::clone(sender), relayed_msg.clone()))
+            .collect()
     }
 
     /// Accessor for the local host name.
@@ -1234,12 +1206,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_sends_to_all_except_origin() {
+    async fn prepare_relay_sends_to_all_except_origin() {
         let mut mgr = PeerManager::new(HostName::new("local"));
 
-        let (transport_a, sent_a) = MockTransport::with_sender();
-        let (transport_b, sent_b) = MockTransport::with_sender();
-        let (transport_c, sent_c) = MockTransport::with_sender();
+        let (transport_a, _sent_a) = MockTransport::with_sender();
+        let (transport_b, _sent_b) = MockTransport::with_sender();
+        let (transport_c, _sent_c) = MockTransport::with_sender();
         let sender_a = transport_a.sender().expect("sender");
         let sender_b = transport_b.sender().expect("sender");
         let sender_c = transport_c.sender().expect("sender");
@@ -1252,40 +1224,42 @@ mod tests {
         mgr.register_sender(HostName::new("peer-c"), sender_c);
 
         let msg = snapshot_msg("peer-a", 1);
-        mgr.relay(&HostName::new("peer-a"), &msg).await;
+        let targets = mgr.prepare_relay(&HostName::new("peer-a"), &msg);
 
-        // peer-a is origin, so it should NOT receive the relay
-        assert!(sent_a.lock().expect("lock").is_empty());
-        // peer-b and peer-c should each get exactly one message
-        assert_eq!(sent_b.lock().expect("lock").len(), 1);
-        assert_eq!(sent_c.lock().expect("lock").len(), 1);
+        // peer-a is origin, so it should NOT be in the targets
+        let target_names: Vec<&HostName> = targets.iter().map(|(name, _, _)| name).collect();
+        assert!(!target_names.contains(&&HostName::new("peer-a")));
+        // peer-b and peer-c should each be in the targets
+        assert_eq!(targets.len(), 2);
+        assert!(target_names.contains(&&HostName::new("peer-b")));
+        assert!(target_names.contains(&&HostName::new("peer-c")));
     }
 
     #[tokio::test]
-    async fn relay_does_not_send_to_self() {
+    async fn prepare_relay_does_not_send_to_self() {
         let mut mgr = PeerManager::new(HostName::new("local"));
 
-        let (transport, sent) = MockTransport::with_sender();
+        let (transport, _sent) = MockTransport::with_sender();
         let sender = transport.sender().expect("sender");
         mgr.add_peer(HostName::new("local"), Box::new(transport));
         mgr.register_sender(HostName::new("local"), sender);
 
         let msg = snapshot_msg("remote", 1);
-        mgr.relay(&HostName::new("remote"), &msg).await;
+        let targets = mgr.prepare_relay(&HostName::new("remote"), &msg);
 
-        // Should not send to self even if registered as a peer
-        assert!(sent.lock().expect("lock").is_empty());
+        // Should not include self even if registered as a peer
+        assert!(targets.is_empty());
     }
 
     #[tokio::test]
-    async fn relay_skips_peers_already_in_clock() {
+    async fn prepare_relay_skips_peers_in_clock_mock_transport() {
         // Star topology: leader has peers [F1, F2].
         // F1 sends a message that leader relays to F2 (stamping leader into clock).
         // If F2 then tried to relay, it should NOT send back to leader
         // because leader is already in the clock.
         let mut mgr = PeerManager::new(HostName::new("F2"));
 
-        let (transport_leader, sent_leader) = MockTransport::with_sender();
+        let (transport_leader, _sent_leader) = MockTransport::with_sender();
         let sender_leader = transport_leader.sender().expect("sender");
         mgr.add_peer(HostName::new("leader"), Box::new(transport_leader));
         mgr.register_sender(HostName::new("leader"), sender_leader);
@@ -1303,10 +1277,10 @@ mod tests {
             kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
         };
 
-        mgr.relay(&HostName::new("F1"), &msg).await;
+        let targets = mgr.prepare_relay(&HostName::new("F1"), &msg);
 
-        // Leader is already in the clock, so relay should skip it
-        assert!(sent_leader.lock().expect("lock").is_empty(), "should not relay back to a peer already in the clock");
+        // Leader is already in the clock, so prepare_relay should skip it
+        assert!(targets.is_empty(), "should not relay back to a peer already in the clock");
     }
 
     #[tokio::test]
@@ -2227,5 +2201,68 @@ mod tests {
         assert!(mgr.get_sender_if_current(&HostName::new("peer"), generation).is_some());
         assert!(mgr.get_sender_if_current(&HostName::new("peer"), generation + 1).is_none());
         assert!(mgr.get_sender_if_current(&HostName::new("unknown"), 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_relay_excludes_origin_and_self_and_already_seen() {
+        use crate::peer::test_support::TestNetwork;
+
+        // Create a 3-peer network: alpha, beta, charlie
+        let mut net = TestNetwork::new();
+        let alpha = net.add_peer("alpha");
+        let beta = net.add_peer("beta");
+        let charlie = net.add_peer("charlie");
+
+        // Connect alpha to both beta and charlie
+        net.connect(alpha, beta);
+        net.connect(alpha, charlie);
+
+        net.start().await;
+
+        // Create a message originating from beta
+        let msg = snapshot_msg("beta", 1);
+
+        // Call prepare_relay on alpha — should return only charlie
+        // (excludes origin=beta and self=alpha)
+        let targets = net.manager(alpha).prepare_relay(&HostName::new("beta"), &msg);
+
+        assert_eq!(targets.len(), 1, "should relay to charlie only");
+        assert_eq!(targets[0].0, HostName::new("charlie"));
+
+        // Verify the relayed message has alpha's stamp in the clock
+        let relayed_msg = &targets[0].2;
+        assert!(relayed_msg.clock.get(&HostName::new("alpha")) > 0, "relayed message should have alpha's clock stamp");
+        // Original beta stamp should also be preserved
+        assert!(relayed_msg.clock.get(&HostName::new("beta")) > 0, "relayed message should preserve beta's clock stamp");
+    }
+
+    #[tokio::test]
+    async fn prepare_relay_skips_peers_already_in_clock() {
+        use crate::peer::test_support::TestNetwork;
+
+        // Star topology: leader connected to F1 and F2
+        let mut net = TestNetwork::new();
+        let f2 = net.add_peer("F2");
+        let leader = net.add_peer("leader");
+
+        net.connect(f2, leader);
+        net.start().await;
+
+        // Simulate a message that was relayed through leader:
+        // origin=F1, clock={F1:1, leader:1}
+        let mut clock = VectorClock::default();
+        clock.tick(&HostName::new("F1"));
+        clock.tick(&HostName::new("leader"));
+        let msg = PeerDataMessage {
+            origin_host: HostName::new("F1"),
+            repo_identity: test_repo(),
+            repo_path: PathBuf::from("/home/dev/repo"),
+            clock,
+            kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
+        };
+
+        // F2 should not relay back to leader since leader is already in the clock
+        let targets = net.manager(f2).prepare_relay(&HostName::new("F1"), &msg);
+        assert!(targets.is_empty(), "should not relay back to a peer already in the clock");
     }
 }

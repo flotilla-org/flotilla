@@ -87,15 +87,20 @@ impl TestNetwork {
     }
 
     /// Inject a local data message into a peer's outbound path.
-    /// Calls relay() to forward to connected peers via their senders.
+    /// Calls prepare_relay() + sends to forward to connected peers via their senders.
     /// The msg.origin_host should match the peer's name.
     pub async fn inject_local_data(&mut self, peer_idx: usize, msg: PeerDataMessage) {
         let peer = &self.peers[peer_idx];
-        peer.manager.relay(&peer.name, &msg).await;
+        let targets = peer.manager.prepare_relay(&peer.name, &msg);
+        for (name, sender, relayed_msg) in targets {
+            if let Err(e) = sender.send(PeerWireMessage::Data(relayed_msg)).await {
+                tracing::warn!(to = %name, err = %e, "test inject_local_data send failed");
+            }
+        }
     }
 
     /// Process all pending inbound messages for a single peer.
-    /// Replicates the relay-then-handle pattern from server.rs.
+    /// Replicates the prepare_relay-then-handle pattern from peer_networking.rs.
     pub async fn process_peer(&mut self, peer_idx: usize) -> usize {
         let mut messages = Vec::new();
         for (connection_peer, gen, receiver) in &mut self.peers[peer_idx].receivers {
@@ -110,8 +115,13 @@ impl TestNetwork {
         for (connection_peer, generation, msg) in messages {
             if let PeerWireMessage::Data(ref data_msg) = msg {
                 // Use origin_host (not connection_peer) to match production
-                // semantics in server.rs — relay skips the original author.
-                peer.manager.relay(&data_msg.origin_host, data_msg).await;
+                // semantics — relay skips the original author.
+                let targets = peer.manager.prepare_relay(&data_msg.origin_host, data_msg);
+                for (name, sender, relayed_msg) in targets {
+                    if let Err(e) = sender.send(PeerWireMessage::Data(relayed_msg)).await {
+                        tracing::warn!(to = %name, err = %e, "test process_peer relay send failed");
+                    }
+                }
             }
 
             let env = InboundPeerEnvelope { msg, connection_generation: generation, connection_peer };

@@ -10,6 +10,7 @@ use flotilla_protocol::{
     ConfigLabel, DaemonEvent, HostName, PeerConnectionState, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity,
     RoutedPeerMessage,
 };
+use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -270,13 +271,34 @@ impl PeerNetworkingTask {
                         }
                     };
 
-                    let mut pm = peer_manager_task.lock().await;
+                    // Snapshot relay targets under lock (synchronous — no .await)
+                    let relay_targets = if let PeerWireMessage::Data(msg) = &env.msg {
+                        let pm = peer_manager_task.lock().await;
+                        pm.prepare_relay(&origin, msg)
+                    } else {
+                        vec![]
+                    };
 
-                    if let PeerWireMessage::Data(msg) = &env.msg {
-                        pm.relay(&origin, msg).await;
+                    // Send concurrently outside lock with per-peer timeout (5s)
+                    if !relay_targets.is_empty() {
+                        let sends = relay_targets.into_iter().map(|(name, sender, msg)| async move {
+                            match tokio::time::timeout(Duration::from_secs(5), sender.send(PeerWireMessage::Data(msg))).await {
+                                Ok(Ok(())) => {
+                                    debug!(to = %name, "relayed peer data");
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(to = %name, err = %e, "relay send failed");
+                                }
+                                Err(_) => {
+                                    warn!(to = %name, "relay send timed out (5s)");
+                                }
+                            }
+                        });
+                        join_all(sends).await;
                     }
 
-                    // Then handle locally
+                    // Re-acquire lock for handle_inbound
+                    let mut pm = peer_manager_task.lock().await;
                     let result = pm.handle_inbound(env).await;
                     match result {
                         HandleResult::Updated(ref updated_repo_id) => {
