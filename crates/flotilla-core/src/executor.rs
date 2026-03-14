@@ -2106,7 +2106,7 @@ mod tests {
 
         let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/repo/wt-feat")), &data, &local_host);
 
-        assert_eq!(result.unwrap(), "feat-branch");
+        assert_eq!(result.expect("path lookup should succeed"), "feat-branch");
     }
 
     #[test]
@@ -2128,7 +2128,7 @@ mod tests {
 
         let result = resolve_checkout_branch(&CheckoutSelector::Query("feat-login".to_string()), &data, &local_host);
 
-        assert_eq!(result.unwrap(), "feat-login");
+        assert_eq!(result.expect("exact query should match"), "feat-login");
     }
 
     #[test]
@@ -2139,7 +2139,7 @@ mod tests {
 
         let result = resolve_checkout_branch(&CheckoutSelector::Query("login".to_string()), &data, &local_host);
 
-        assert_eq!(result.unwrap(), "feat-login-page");
+        assert_eq!(result.expect("substring query should match"), "feat-login-page");
     }
 
     #[test]
@@ -2186,7 +2186,7 @@ mod tests {
 
         // Default template has one "main" terminal entry
         assert!(config.resolved_commands.is_some());
-        let commands = config.resolved_commands.unwrap();
+        let commands = config.resolved_commands.expect("default template should produce resolved commands");
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].0, "main");
     }
