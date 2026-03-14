@@ -73,19 +73,8 @@ pub async fn build_plan(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            build_create_checkout_plan(
-                branch,
-                create_branch,
-                intent,
-                issue_ids,
-                repo.root,
-                registry,
-                providers_data,
-                runner,
-                config_base,
-                local_host,
-            )
-            .await
+            build_create_checkout_plan(branch, create_branch, intent, issue_ids, repo.root, registry, providers_data, runner, local_host)
+                .await
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
@@ -116,7 +105,10 @@ pub async fn build_plan(
 /// Steps:
 /// 1. Create the checkout (skipped if it already exists on the local host)
 /// 2. Link issues to the branch (skipped if no issue_ids)
-/// 3. Create a workspace for the new checkout
+///
+/// Workspace creation is NOT included here because this plan may execute on a
+/// remote host.  The TUI handles workspace creation locally when it receives
+/// `CheckoutCreated` from a local command.
 #[allow(clippy::too_many_arguments)]
 async fn build_create_checkout_plan(
     branch: String,
@@ -127,7 +119,6 @@ async fn build_create_checkout_plan(
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
     runner: Arc<dyn CommandRunner>,
-    config_base: PathBuf,
     local_host: flotilla_protocol::HostName,
 ) -> ExecutionPlan {
     // Shared slot for the checkout path — pre-populated if the checkout already exists.
@@ -188,38 +179,6 @@ async fn build_create_checkout_plan(
             action: Box::new(move || {
                 Box::pin(async move {
                     write_branch_issue_links(&repo_root, &branch, &issue_ids, &*runner).await;
-                    Ok(StepOutcome::Completed)
-                })
-            }),
-        });
-    }
-
-    // Step 3: Create workspace for the checkout
-    {
-        let slot = Arc::clone(&checkout_path_slot);
-        let branch = branch.clone();
-        let repo_root = repo_root.clone();
-        let registry = Arc::clone(&registry);
-        steps.push(Step {
-            description: "Create workspace".to_string(),
-            action: Box::new(move || {
-                Box::pin(async move {
-                    let checkout_path = match slot.lock().await.clone() {
-                        Some(p) => p,
-                        None => return Ok(StepOutcome::Skipped),
-                    };
-                    let ws_mgr = match &registry.workspace_manager {
-                        Some((_, ws)) => Arc::clone(ws),
-                        None => return Ok(StepOutcome::Skipped),
-                    };
-                    if select_existing_workspace(ws_mgr.as_ref(), &checkout_path).await {
-                        return Ok(StepOutcome::Skipped);
-                    }
-                    let mut config = workspace_config(&repo_root, &branch, &checkout_path, "claude", &config_base);
-                    if let Some((_, tp)) = &registry.terminal_pool {
-                        resolve_terminal_pool(&mut config, tp.as_ref()).await;
-                    }
-                    ws_mgr.create_workspace(&config).await?;
                     Ok(StepOutcome::Completed)
                 })
             }),
@@ -2464,9 +2423,8 @@ mod tests {
 
         match plan {
             ExecutionPlan::Steps(step_plan) => {
-                assert_eq!(step_plan.steps.len(), 2, "checkout + workspace creation");
+                assert_eq!(step_plan.steps.len(), 1, "checkout only — workspace creation is handled by the TUI");
                 assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-                assert_eq!(step_plan.steps[1].description, "Create workspace");
             }
             ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
         }
@@ -2488,9 +2446,8 @@ mod tests {
 
         match plan {
             ExecutionPlan::Steps(step_plan) => {
-                assert_eq!(step_plan.steps.len(), 2, "checkout + workspace even when branch already exists");
+                assert_eq!(step_plan.steps.len(), 1, "checkout only — workspace creation is handled by the TUI");
                 assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-                assert_eq!(step_plan.steps[1].description, "Create workspace");
             }
             ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
         }

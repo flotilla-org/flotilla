@@ -376,14 +376,24 @@ impl App {
                 tracing::info!(%command_id, %description, "command started");
                 self.in_flight.insert(command_id, InFlightCommand { repo_identity, repo, description });
             }
-            DaemonEvent::CommandFinished { command_id, result, .. } => {
+            DaemonEvent::CommandFinished { command_id, host, repo, result, .. } => {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
                     tracing::info!(%command_id, "command finished");
                     let error_message = match &result {
                         CommandResult::Error { message } => Some(message.clone()),
                         _ => None,
                     };
+                    // Auto-create workspace for local checkouts. Remote checkouts
+                    // go through the PrepareTerminal → TerminalPrepared flow instead.
+                    let auto_workspace = match (&result, host == HostName::local()) {
+                        (CommandResult::CheckoutCreated { path, .. }, true) => Some(path.clone()),
+                        _ => None,
+                    };
                     executor::handle_result(result, self);
+                    if let Some(checkout_path) = auto_workspace {
+                        self.proto_commands
+                            .push(self.repo_command_for_path(repo, CommandAction::CreateWorkspaceForCheckout { checkout_path }));
+                    }
 
                     // Find which repo+identity has this command_id
                     let found: Option<(PathBuf, WorkItemIdentity)> = self.ui.repo_ui.iter().find_map(|(path, rui)| {
@@ -1453,5 +1463,54 @@ mod tests {
 
         // The pending action with command_id 99 should still be there
         assert!(app.ui.repo_ui[&repo].pending_actions.contains_key(&identity));
+    }
+
+    #[test]
+    fn local_checkout_created_queues_workspace_creation() {
+        let mut app = stub_app();
+        let repo = app.model.repo_order[0].clone();
+        let checkout_path = PathBuf::from("/tmp/repo/wt-feat");
+
+        app.in_flight.insert(42, InFlightCommand {
+            repo_identity: RepoIdentity { authority: "local".into(), path: repo.to_string_lossy().into_owned() },
+            repo: repo.clone(),
+            description: "test".into(),
+        });
+
+        app.handle_daemon_event(DaemonEvent::CommandFinished {
+            command_id: 42,
+            host: HostName::local(),
+            repo_identity: RepoIdentity { authority: "local".into(), path: repo.to_string_lossy().into_owned() },
+            repo,
+            result: CommandResult::CheckoutCreated { branch: "feat".into(), path: checkout_path.clone() },
+        });
+
+        let (cmd, _) = app.proto_commands.take_next().expect("should queue workspace creation");
+        match cmd.action {
+            CommandAction::CreateWorkspaceForCheckout { checkout_path: p } => assert_eq!(p, checkout_path),
+            other => panic!("expected CreateWorkspaceForCheckout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_checkout_created_does_not_queue_workspace() {
+        let mut app = stub_app();
+        let repo = app.model.repo_order[0].clone();
+
+        app.in_flight.insert(42, InFlightCommand {
+            repo_identity: RepoIdentity { authority: "local".into(), path: repo.to_string_lossy().into_owned() },
+            repo: repo.clone(),
+            description: "test".into(),
+        });
+
+        app.handle_daemon_event(DaemonEvent::CommandFinished {
+            command_id: 42,
+            host: HostName::new("remote-a"),
+            repo_identity: RepoIdentity { authority: "local".into(), path: repo.to_string_lossy().into_owned() },
+            repo,
+            result: CommandResult::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/remote/wt-feat") },
+        });
+
+        assert!(app.proto_commands.take_next().is_none(), "remote checkout should not auto-create local workspace");
     }
 }
