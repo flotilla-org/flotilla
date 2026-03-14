@@ -54,6 +54,7 @@ pub enum UiMode {
         info: Option<CheckoutStatus>,
         loading: bool,
         terminal_keys: Vec<flotilla_protocol::ManagedTerminalId>,
+        identity: WorkItemIdentity,
     },
     CloseConfirm {
         id: String,
@@ -296,7 +297,15 @@ mod tests {
             (UiMode::ActionMenu { items: vec![], index: 0 }, false),
             (UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] }, false),
             (UiMode::FilePicker { input: Input::default(), dir_entries: vec![], selected: 0 }, false),
-            (UiMode::DeleteConfirm { info: None, loading: false, terminal_keys: vec![] }, false),
+            (
+                UiMode::DeleteConfirm {
+                    info: None,
+                    loading: false,
+                    terminal_keys: vec![],
+                    identity: WorkItemIdentity::Session("test".into()),
+                },
+                false,
+            ),
             (UiMode::CloseConfirm { id: "42".into(), title: "test".into(), identity: WorkItemIdentity::Session("test".into()) }, false),
             (UiMode::IssueSearch { input: Input::default() }, false),
         ];

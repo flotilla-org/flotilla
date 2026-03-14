@@ -339,7 +339,12 @@ impl App {
         if let Some(cmd) = intent.resolve(item, self) {
             match intent {
                 Intent::RemoveCheckout => {
-                    self.ui.mode = UiMode::DeleteConfirm { info: None, loading: true, terminal_keys: item.terminal_keys.clone() };
+                    self.ui.mode = UiMode::DeleteConfirm {
+                        info: None,
+                        loading: true,
+                        terminal_keys: item.terminal_keys.clone(),
+                        identity: item.identity.clone(),
+                    };
                 }
                 Intent::GenerateBranchName => {
                     self.enter_branch_input(BranchInputKind::Generating);
@@ -481,11 +486,19 @@ impl App {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if !loading {
                     // Extract branch from CheckoutStatus and send RemoveCheckout
-                    if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, .. } = self.ui.mode {
-                        self.proto_commands.push(self.command(CommandAction::RemoveCheckout {
-                            checkout: CheckoutSelector::Query(info.branch.clone()),
-                            terminal_keys: terminal_keys.clone(),
-                        }));
+                    if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, ref identity, .. } = self.ui.mode {
+                        let ctx = PendingActionContext {
+                            identity: identity.clone(),
+                            description: format!("Remove {}", info.branch),
+                            repo_path: self.model.active_repo_root().clone(),
+                        };
+                        self.proto_commands.push_with_context(
+                            self.command(CommandAction::RemoveCheckout {
+                                checkout: CheckoutSelector::Query(info.branch.clone()),
+                                terminal_keys: terminal_keys.clone(),
+                            }),
+                            Some(ctx),
+                        );
                     }
                     self.ui.mode = UiMode::Normal;
                 }
@@ -571,6 +584,7 @@ mod tests {
             }),
             loading: false,
             terminal_keys: vec![],
+            identity: WorkItemIdentity::Session("test".into()),
         }
     }
 
@@ -1049,7 +1063,8 @@ mod tests {
     #[test]
     fn delete_confirm_ignores_while_loading() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm { info: None, loading: true, terminal_keys: vec![] };
+        app.ui.mode =
+            UiMode::DeleteConfirm { info: None, loading: true, terminal_keys: vec![], identity: WorkItemIdentity::Session("test".into()) };
         app.handle_key(key(KeyCode::Char('y')));
         // Should still be in DeleteConfirm mode
         assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
@@ -1320,7 +1335,8 @@ mod tests {
     #[test]
     fn delete_confirm_y_with_no_info_does_not_push_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm { info: None, loading: false, terminal_keys: vec![] };
+        app.ui.mode =
+            UiMode::DeleteConfirm { info: None, loading: false, terminal_keys: vec![], identity: WorkItemIdentity::Session("test".into()) };
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         // No info means no branch to extract, so no command pushed
