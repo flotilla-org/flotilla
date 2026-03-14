@@ -92,6 +92,9 @@ pub fn render(items: &[SegmentItem], style: &dyn BarStyle, area: Rect, buf: &mut
     hits
 }
 
+/// Powerline chevron character (U+E0B0).
+const CHEVRON: &str = "\u{e0b0}";
+
 /// Tab bar style: pipe separators, cyan active, dark gray inactive.
 pub struct TabBarStyle;
 
@@ -115,6 +118,32 @@ impl BarStyle for TabBarStyle {
 
     fn background_fill(&self) -> Option<Style> {
         None
+    }
+}
+
+/// Status bar key ribbon style with chevron-delimited key chips.
+pub struct RibbonStyle;
+
+impl BarStyle for RibbonStyle {
+    fn render_item(&self, item: &SegmentItem) -> RenderedItem {
+        let key = item.key_hint.as_deref().unwrap_or("");
+        RenderedItem::from_spans(vec![
+            Span::styled(CHEVRON, Style::default().fg(Color::Black).bg(Color::DarkGray)),
+            Span::styled(" ", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+            Span::styled("<", Style::default().fg(Color::Black).bg(Color::DarkGray).bold()),
+            Span::styled(key.to_string(), Style::default().fg(Color::Indexed(208)).bg(Color::DarkGray).bold()),
+            Span::styled(">", Style::default().fg(Color::Black).bg(Color::DarkGray).bold()),
+            Span::styled(format!(" {} ", item.label), Style::default().fg(Color::Black).bg(Color::DarkGray).bold()),
+            Span::styled(CHEVRON, Style::default().fg(Color::DarkGray).bg(Color::Black)),
+        ])
+    }
+
+    fn separator(&self) -> RenderedItem {
+        RenderedItem::empty()
+    }
+
+    fn background_fill(&self) -> Option<Style> {
+        Some(Style::default().fg(Color::White).bg(Color::Black))
     }
 }
 
@@ -228,5 +257,27 @@ mod tests {
         // Remaining cells should have black background
         assert_eq!(buf[(5, 0)].bg, Color::Black);
         assert_eq!(buf[(9, 0)].bg, Color::Black);
+    }
+
+    #[test]
+    fn ribbon_style_renders_with_key_hint() {
+        let style = RibbonStyle;
+        let item = SegmentItem { label: "OPEN".into(), key_hint: Some("ENT".into()), active: false, dragging: false, style_override: None };
+        let rendered = style.render_item(&item);
+        assert_eq!(rendered.spans.len(), 7);
+        let text: String = rendered.spans.iter().map(|s| s.content.as_ref().to_string()).collect();
+        assert!(text.contains("ENT"));
+        assert!(text.contains("OPEN"));
+    }
+
+    #[test]
+    fn ribbon_style_separator_is_empty() {
+        let sep = RibbonStyle.separator();
+        assert_eq!(sep.width, 0);
+    }
+
+    #[test]
+    fn ribbon_style_fills_background() {
+        assert!(RibbonStyle.background_fill().is_some());
     }
 }
