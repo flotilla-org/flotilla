@@ -9,7 +9,6 @@
 
 use std::{
     path::PathBuf,
-    process::Command as ProcessCommand,
     sync::{Arc, Mutex},
 };
 
@@ -18,7 +17,7 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    providers::discovery::test_support::{fake_discovery, git_process_discovery},
+    providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo},
 };
 use flotilla_daemon::peer::{
     channel_transport_pair, merge::merge_provider_data, test_support::handle_test_peer_data, HandleResult, PeerConnectionStatus,
@@ -125,36 +124,6 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(data), seq },
     }
-}
-
-fn init_git_repo(path: &std::path::Path) {
-    std::fs::create_dir_all(path).expect("create repo dir");
-    let status = ProcessCommand::new("git").args(["init", "--initial-branch=main"]).arg(path).status().expect("run git init");
-    assert!(status.success(), "git init should succeed");
-
-    let status = ProcessCommand::new("git")
-        .args(["-C", path.to_str().expect("repo path utf8"), "config", "user.name", "Flotilla Tests"])
-        .status()
-        .expect("configure git user.name");
-    assert!(status.success(), "git config user.name should succeed");
-
-    let status = ProcessCommand::new("git")
-        .args(["-C", path.to_str().expect("repo path utf8"), "config", "user.email", "flotilla@example.com"])
-        .status()
-        .expect("configure git user.email");
-    assert!(status.success(), "git config user.email should succeed");
-
-    std::fs::write(path.join("README.md"), "hello\n").expect("write README");
-
-    let status =
-        ProcessCommand::new("git").args(["-C", path.to_str().expect("repo path utf8"), "add", "README.md"]).status().expect("run git add");
-    assert!(status.success(), "git add should succeed");
-
-    let status = ProcessCommand::new("git")
-        .args(["-C", path.to_str().expect("repo path utf8"), "commit", "-m", "init"])
-        .status()
-        .expect("run git commit");
-    assert!(status.success(), "git commit should succeed");
 }
 
 async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandResult {

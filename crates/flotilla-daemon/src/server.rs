@@ -1087,6 +1087,14 @@ async fn complete_remote_command(
         return;
     }
 
+    let fallback_repo_identity = || RepoIdentity {
+        // Routed command completions can arrive without any repo-bearing event.
+        // In that case there is no reliable filesystem path from the responder,
+        // so keep a local sentinel keyed to the last repo path we saw, if any.
+        authority: "local".into(),
+        path: entry.repo.clone().unwrap_or_default().display().to_string(),
+    };
+
     daemon.send_event(DaemonEvent::CommandFinished {
         command_id: entry.command_id,
         host: responder_host,
@@ -1096,10 +1104,7 @@ async fn complete_remote_command(
                 CommandResult::TerminalPrepared { repo_identity, .. } => Some(repo_identity.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| RepoIdentity {
-                authority: "local".into(),
-                path: entry.repo.clone().unwrap_or_default().display().to_string(),
-            }),
+            .unwrap_or_else(fallback_repo_identity),
         repo: entry.repo.unwrap_or_default(),
         result,
     });
@@ -1792,10 +1797,10 @@ fn extract_str_param(params: &serde_json::Value, field: &str) -> Result<String, 
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, process::Command as ProcessCommand, sync::Mutex as StdMutex, time::Duration as StdDuration};
+    use std::{path::Path, sync::Mutex as StdMutex, time::Duration as StdDuration};
 
     use async_trait::async_trait;
-    use flotilla_core::providers::discovery::test_support::{fake_discovery, git_process_discovery};
+    use flotilla_core::providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote};
     use flotilla_protocol::{
         Checkout, CheckoutTarget, Command, CommandAction, CommandPeerEvent, CommandResult, DaemonEvent, HostName, HostPath, PeerDataKind,
         PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoInfo, RepoSelector, RoutedPeerMessage, VectorClock,
@@ -1899,41 +1904,6 @@ mod tests {
                 seq: 1,
             },
         }
-    }
-
-    fn init_git_repo(path: &Path) {
-        std::fs::create_dir_all(path).expect("create repo dir");
-        let status = ProcessCommand::new("git").args(["init", "--initial-branch=main"]).arg(path).status().expect("run git init");
-        assert!(status.success(), "git init should succeed");
-
-        let repo = path.to_str().expect("repo path utf8");
-        let status = ProcessCommand::new("git")
-            .args(["-C", repo, "config", "user.name", "Flotilla Tests"])
-            .status()
-            .expect("configure git user.name");
-        assert!(status.success(), "git config user.name should succeed");
-
-        let status = ProcessCommand::new("git")
-            .args(["-C", repo, "config", "user.email", "tests@example.com"])
-            .status()
-            .expect("configure git user.email");
-        assert!(status.success(), "git config user.email should succeed");
-
-        std::fs::write(path.join("README.md"), "hello\n").expect("write readme");
-        let status = ProcessCommand::new("git").args(["-C", repo, "add", "README.md"]).status().expect("git add");
-        assert!(status.success(), "git add should succeed");
-
-        let status = ProcessCommand::new("git").args(["-C", repo, "commit", "-m", "init"]).status().expect("git commit");
-        assert!(status.success(), "git commit should succeed");
-    }
-
-    fn init_git_repo_with_remote(path: &Path, remote: &str) -> RepoIdentity {
-        init_git_repo(path);
-        let repo = path.to_str().expect("repo path utf8");
-        let status =
-            ProcessCommand::new("git").args(["-C", repo, "remote", "add", "origin", remote]).status().expect("git remote add origin");
-        assert!(status.success(), "git remote add origin should succeed");
-        RepoIdentity::from_remote_url(remote).expect("remote should produce repo identity")
     }
 
     async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandResult {
@@ -2267,49 +2237,57 @@ mod tests {
         )
         .await;
 
-        let sent = sent.lock().expect("lock");
-        assert!(sent.len() >= 3, "expected started event, finished event, and response");
+        {
+            let sent = sent.lock().expect("lock");
+            assert!(sent.len() >= 3, "expected started event, finished event, and response");
 
-        let mut saw_started = false;
-        let mut saw_finished = false;
-        let mut saw_response = false;
+            let mut saw_started = false;
+            let mut saw_finished = false;
+            let mut saw_response = false;
 
-        for msg in sent.iter() {
-            match msg {
-                PeerWireMessage::Routed(RoutedPeerMessage::CommandEvent { request_id, requester_host, responder_host, event, .. }) => {
-                    assert_eq!(*request_id, 7);
-                    assert_eq!(requester_host, &HostName::new("desktop"));
-                    assert_eq!(responder_host, daemon.host_name());
-                    match event.as_ref() {
-                        CommandPeerEvent::Started { repo: event_repo, description, .. } => {
-                            assert_eq!(event_repo, &repo);
-                            assert_eq!(description, "Refreshing...");
-                            saw_started = true;
+            for msg in sent.iter() {
+                match msg {
+                    PeerWireMessage::Routed(RoutedPeerMessage::CommandEvent {
+                        request_id, requester_host, responder_host, event, ..
+                    }) => {
+                        assert_eq!(*request_id, 7);
+                        assert_eq!(requester_host, &HostName::new("desktop"));
+                        assert_eq!(responder_host, daemon.host_name());
+                        match event.as_ref() {
+                            CommandPeerEvent::Started { repo: event_repo, description, .. } => {
+                                assert_eq!(event_repo, &repo);
+                                assert_eq!(description, "Refreshing...");
+                                saw_started = true;
+                            }
+                            CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
+                                assert_eq!(event_repo, &repo);
+                                assert_eq!(result, &CommandResult::Refreshed { repos: vec![repo.clone()] });
+                                saw_finished = true;
+                            }
+                            CommandPeerEvent::StepUpdate { .. } => {}
                         }
-                        CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
-                            assert_eq!(event_repo, &repo);
-                            assert_eq!(result, &CommandResult::Refreshed { repos: vec![repo.clone()] });
-                            saw_finished = true;
-                        }
-                        CommandPeerEvent::StepUpdate { .. } => {}
                     }
+                    PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse {
+                        request_id,
+                        requester_host,
+                        responder_host,
+                        result,
+                        ..
+                    }) => {
+                        assert_eq!(*request_id, 7);
+                        assert_eq!(requester_host, &HostName::new("desktop"));
+                        assert_eq!(responder_host, daemon.host_name());
+                        assert_eq!(result.as_ref(), &CommandResult::Refreshed { repos: vec![repo.clone()] });
+                        saw_response = true;
+                    }
+                    other => panic!("unexpected proxied message: {other:?}"),
                 }
-                PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse {
-                    request_id, requester_host, responder_host, result, ..
-                }) => {
-                    assert_eq!(*request_id, 7);
-                    assert_eq!(requester_host, &HostName::new("desktop"));
-                    assert_eq!(responder_host, daemon.host_name());
-                    assert_eq!(result.as_ref(), &CommandResult::Refreshed { repos: vec![repo.clone()] });
-                    saw_response = true;
-                }
-                other => panic!("unexpected proxied message: {other:?}"),
             }
-        }
 
-        assert!(saw_started);
-        assert!(saw_finished);
-        assert!(saw_response);
+            assert!(saw_started);
+            assert!(saw_finished);
+            assert!(saw_response);
+        }
         assert!(forwarded_commands.lock().await.is_empty(), "forwarded command should be retired after completion");
     }
 

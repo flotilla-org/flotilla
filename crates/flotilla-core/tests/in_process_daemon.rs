@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
     sync::Arc,
     time::Duration,
 };
@@ -15,7 +14,10 @@ use flotilla_core::{
         ai_utility::AiUtility,
         coding_agent::CloudAgentService,
         discovery::{
-            test_support::{fake_discovery, fake_discovery_with_providers, git_process_discovery, FakeCheckoutManager, FakeIssueTracker},
+            test_support::{
+                fake_discovery, fake_discovery_with_providers, git_process_discovery, init_git_repo_with_remote, FakeCheckoutManager,
+                FakeIssueTracker,
+            },
             DiscoveryRuntime, EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement,
         },
         types::{CloudAgentSession, RepoCriteria, SessionStatus},
@@ -26,28 +28,6 @@ use flotilla_protocol::{
     HostName, Issue, ProviderData, RepoIdentity, RepoSelector,
 };
 use tokio::sync::Notify;
-
-fn init_git_repo_with_remote(path: &Path, remote: &str) {
-    std::fs::create_dir_all(path).expect("create repo dir");
-
-    let status = ProcessCommand::new("git").args(["init", "--initial-branch=main"]).arg(path).status().expect("git init");
-    assert!(status.success(), "git init should succeed");
-
-    let path_str = path.to_str().expect("repo path utf8");
-    let status =
-        ProcessCommand::new("git").args(["-C", path_str, "config", "user.name", "Flotilla Tests"]).status().expect("git config name");
-    assert!(status.success(), "git config user.name should succeed");
-
-    let status = ProcessCommand::new("git")
-        .args(["-C", path_str, "config", "user.email", "flotilla@example.com"])
-        .status()
-        .expect("git config email");
-    assert!(status.success(), "git config user.email should succeed");
-
-    let status =
-        ProcessCommand::new("git").args(["-C", path_str, "remote", "add", "origin", remote]).status().expect("git remote add origin");
-    assert!(status.success(), "git remote add origin should succeed");
-}
 
 struct SlowCloudAgent {
     archive_started: Notify,

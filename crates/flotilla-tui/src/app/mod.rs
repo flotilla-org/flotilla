@@ -423,10 +423,15 @@ impl App {
             }
             DaemonEvent::PeerStatusChanged { host, status } => {
                 let peer_status = PeerStatus::from(status);
+                let clear_target =
+                    matches!(peer_status, PeerStatus::Disconnected | PeerStatus::Rejected) && self.ui.target_host.as_ref() == Some(&host);
                 if let Some(existing) = self.model.peer_hosts.iter_mut().find(|p| p.name == host) {
                     existing.status = peer_status;
                 } else {
                     self.model.peer_hosts.push(PeerHostStatus { name: host, status: peer_status });
+                }
+                if clear_target {
+                    self.ui.target_host = None;
                 }
                 self.model.peer_hosts.sort_by(|a, b| a.name.cmp(&b.name));
             }
@@ -1166,6 +1171,18 @@ mod tests {
 
         assert!(app.in_flight.contains_key(&99));
         assert_eq!(app.in_flight[&99].description, "test cmd");
+    }
+
+    #[test]
+    fn peer_disconnect_clears_selected_target_host() {
+        let mut app = stub_app();
+        app.ui.target_host = Some(HostName::new("alpha"));
+        app.model.peer_hosts = vec![PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected }];
+
+        app.handle_daemon_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Disconnected });
+
+        assert_eq!(app.ui.target_host, None);
+        assert_eq!(app.model.peer_hosts[0].status, PeerStatus::Disconnected);
     }
 
     // -- Convenience accessors --

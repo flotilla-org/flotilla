@@ -284,6 +284,12 @@ impl UiState {
         };
     }
 
+    /// Cycle through currently connected peer hosts, then back to local.
+    ///
+    /// If the current target is no longer present in `peer_hosts`, cycling
+    /// restarts from the first available peer. Peer status updates are
+    /// responsible for clearing a stale selection when the chosen host
+    /// disconnects.
     pub fn cycle_target_host(&mut self, peer_hosts: &[HostName]) {
         self.target_host = match self.target_host.as_ref() {
             None => peer_hosts.first().cloned(),

@@ -7,11 +7,12 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage};
+use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, RepoIdentity};
 use tokio::sync::Mutex as TokioMutex;
 
 use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderDescriptor, UnmetRequirement};
@@ -56,6 +57,38 @@ impl DiscoveryMockRunner {
     pub fn exists_call_count(&self, cmd: &str) -> usize {
         self.exists_calls.lock().expect("lock poisoned").iter().filter(|(called, _)| called == cmd).count()
     }
+}
+
+pub fn init_git_repo(path: &Path) {
+    std::fs::create_dir_all(path).expect("create repo dir");
+    let status = ProcessCommand::new("git").args(["init", "--initial-branch=main"]).arg(path).status().expect("run git init");
+    assert!(status.success(), "git init should succeed");
+
+    let repo = path.to_str().expect("repo path utf8");
+    let status =
+        ProcessCommand::new("git").args(["-C", repo, "config", "user.name", "Flotilla Tests"]).status().expect("configure git user.name");
+    assert!(status.success(), "git config user.name should succeed");
+
+    let status = ProcessCommand::new("git")
+        .args(["-C", repo, "config", "user.email", "flotilla@example.com"])
+        .status()
+        .expect("configure git user.email");
+    assert!(status.success(), "git config user.email should succeed");
+
+    std::fs::write(path.join("README.md"), "hello\n").expect("write README");
+    let status = ProcessCommand::new("git").args(["-C", repo, "add", "README.md"]).status().expect("run git add");
+    assert!(status.success(), "git add should succeed");
+
+    let status = ProcessCommand::new("git").args(["-C", repo, "commit", "-m", "init"]).status().expect("run git commit");
+    assert!(status.success(), "git commit should succeed");
+}
+
+pub fn init_git_repo_with_remote(path: &Path, remote: &str) -> RepoIdentity {
+    init_git_repo(path);
+    let repo = path.to_str().expect("repo path utf8");
+    let status = ProcessCommand::new("git").args(["-C", repo, "remote", "add", "origin", remote]).status().expect("git remote add origin");
+    assert!(status.success(), "git remote add origin should succeed");
+    RepoIdentity::from_remote_url(remote).expect("remote should produce repo identity")
 }
 
 impl DiscoveryMockRunnerBuilder {
