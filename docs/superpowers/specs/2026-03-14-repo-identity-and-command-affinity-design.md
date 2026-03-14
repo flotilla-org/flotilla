@@ -10,7 +10,7 @@ PR `#334` exposed three linked problems in the first remote checkout / terminal-
 
 These are not three independent bugs. They come from the same boundary problem: the daemon, protocol, client, and TUI still treat `PathBuf` as the stable repo identifier, even though multi-host routing already uses `RepoIdentity` as the cross-host concept.
 
-This design fixes that boundary honestly by implementing the essence of `#298` now: use `RepoIdentity` as the stable repo key across daemon state, replay bookkeeping, command routing, and TUI tab state, while retaining per-host paths as metadata for display and local execution.
+This design fixes that boundary honestly by implementing the essence of `#298` now: use `RepoIdentity` as the stable repo key across daemon state, replay bookkeeping, command routing, and TUI tab state, while retaining per-host paths as daemon-local metadata for display, execution, and multi-root discovery.
 
 ## Scope
 
@@ -46,8 +46,8 @@ Those are not safe cross-host selectors. `RepoIdentity` already is.
 So the system should work like this:
 
 - `RepoIdentity` identifies a repo across hosts
-- each daemon stores its own local or synthetic path inside per-repo state
-- commands that need local filesystem access resolve from identity to the local path inside the executing daemon
+- each daemon persists and refreshes all tracked local roots for an identity, plus any synthetic remote-only representation it needs for UI continuity
+- commands that need local filesystem access resolve from identity to an explicit local instance inside the executing daemon instead of relying on path-keyed last-writer-wins behavior
 - the TUI tracks tabs and in-flight commands by identity, not by current path
 
 ## Protocol Changes
@@ -107,12 +107,13 @@ to identity-keyed structures:
 - `repo_order: Vec<RepoIdentity>`
 - `peer_providers: HashMap<RepoIdentity, ...>`
 
-`RepoState` should store the daemon-local path:
+`RepoState` should store the daemon-local instances for that identity:
 
-- local tracked repo path for normal repos
-- synthetic path for remote-only tabs
+- all tracked local repo roots that share the identity
+- whichever per-identity local instance is currently preferred when one concrete path is needed for execution-oriented behavior such as creating a new worktree
+- synthetic path data for remote-only tabs where no local root exists
 
-This removes the current identity-to-path bridge awkwardness and makes routed command resolution match peer replication semantics.
+This removes the current identity-to-path bridge awkwardness, preserves multi-clone local discovery, and makes routed command resolution match peer replication semantics.
 
 ### Repo resolution rules
 
@@ -120,7 +121,8 @@ When a command executes on a daemon:
 
 - `RepoSelector::Identity` resolves directly to repo state by identity
 - `RepoSelector::Path` remains valid for local commands and compatibility paths
-- local filesystem execution always uses the path stored inside that daemon’s `RepoState`
+- local filesystem execution uses an explicit preferred local instance from that daemon’s `RepoState`
+- adding multiple local clones with the same identity must remain stable and deterministic rather than collapsing into whichever path was inserted last
 
 This is what fixes the “same repo must exist at the same absolute path on both hosts” bug.
 
@@ -151,7 +153,7 @@ The TUI should move from path-keyed repo maps and tab ordering to identity-keyed
 `TuiRepoModel` should store both:
 
 - stable `RepoIdentity`
-- current display / local path for that tab
+- enough local instance metadata to render the current display path and preserve deterministic tab behavior when multiple local roots share one identity
 
 This preserves the existing tab/UI behavior while making async and multi-host logic stable.
 
@@ -202,6 +204,7 @@ The follow-up local workspace creation command should therefore be queued agains
 - tests that `RepoSelector::Identity` resolves correctly
 - replay tests keyed by identity instead of path
 - `InProcessDaemon` tests for add/remove/get-state/list/replay after the re-key
+- multi-root tests showing two tracked local clones with the same identity both remain discoverable and deterministic
 
 ### Multi-host / server
 
@@ -223,6 +226,7 @@ This is a refactor of the current branch, not a follow-up feature branch.
 So the implementation should:
 
 - update existing remote checkout / terminal-prep code to the new identity model
+- preserve all configured local roots for discovery and refresh, even when they share a `RepoIdentity`
 - keep public behavior aligned with the current feature intent
 - preserve deterministic test-support behavior introduced earlier
 
