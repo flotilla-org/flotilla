@@ -485,15 +485,7 @@ impl InProcessDaemon {
             CommandAction::Checkout { repo, .. } => self.resolve_repo_selector(repo).await,
             CommandAction::RemoveCheckout { checkout, .. } => self.resolve_checkout_selector(checkout).await.map(|(repo, _)| repo),
             CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
-            CommandAction::FetchCheckoutStatus { checkout_path: Some(path), .. } => {
-                let repos = self.repos.read().await;
-                repos
-                    .keys()
-                    .find(|repo_root| path.starts_with(repo_root))
-                    .cloned()
-                    .ok_or_else(|| format!("repo not tracked: {}", path.display()))
-            }
-            CommandAction::FetchCheckoutStatus { checkout_path: None, .. }
+            CommandAction::FetchCheckoutStatus { .. }
             | CommandAction::OpenChangeRequest { .. }
             | CommandAction::CloseChangeRequest { .. }
             | CommandAction::OpenIssue { .. }
