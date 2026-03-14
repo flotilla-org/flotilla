@@ -90,6 +90,10 @@ pub async fn build_plan(
             }
         }
 
+        CommandAction::ArchiveSession { session_id } => build_archive_session_plan(session_id, registry, providers_data),
+
+        CommandAction::GenerateBranchName { issue_keys } => build_generate_branch_name_plan(issue_keys, registry, providers_data),
+
         action => {
             let result = execute(action, &repo_root, &registry, &providers_data, &*runner, &config_base).await;
             ExecutionPlan::Immediate(result)
@@ -386,6 +390,42 @@ fn build_remove_checkout_plan(
     ExecutionPlan::Steps(StepPlan::new(steps))
 }
 
+fn build_archive_session_plan(
+    session_id: String,
+    registry: Arc<ProviderRegistry>,
+    providers_data: Arc<ProviderData>,
+) -> ExecutionPlan {
+    ExecutionPlan::Steps(StepPlan::new(vec![Step {
+        description: format!("Archive session {session_id}"),
+        action: Box::new(move || {
+            Box::pin(async move {
+                match archive_session_result(&session_id, &registry, &providers_data).await {
+                    CommandResult::Error { message } => Err(message),
+                    result => Ok(StepOutcome::CompletedWith(result)),
+                }
+            })
+        }),
+    }]))
+}
+
+fn build_generate_branch_name_plan(
+    issue_keys: Vec<String>,
+    registry: Arc<ProviderRegistry>,
+    providers_data: Arc<ProviderData>,
+) -> ExecutionPlan {
+    ExecutionPlan::Steps(StepPlan::new(vec![Step {
+        description: "Generate branch name".to_string(),
+        action: Box::new(move || {
+            Box::pin(async move {
+                match generate_branch_name_result(&issue_keys, &registry, &providers_data).await {
+                    CommandResult::Error { message } => Err(message),
+                    result => Ok(StepOutcome::CompletedWith(result)),
+                }
+            })
+        }),
+    }]))
+}
+
 /// Execute a `Command` against the given repo context.
 ///
 /// Commands that are handled at the daemon level (AddRepo, RemoveRepo, Refresh)
@@ -565,56 +605,11 @@ pub async fn execute(
         }
 
         CommandAction::ArchiveSession { session_id } => {
-            if let Some(session) = providers_data.sessions.get(session_id.as_str()) {
-                info!(%session_id, "archiving session");
-                if let Some(key) = session_provider_key(session, &session_id) {
-                    if let Some((_, ca)) = registry.cloud_agents.get(key) {
-                        match ca.archive_session(&session_id).await {
-                            Ok(()) => CommandResult::Ok,
-                            Err(e) => CommandResult::Error { message: e },
-                        }
-                    } else {
-                        CommandResult::Error { message: format!("No coding agent provider: {key}") }
-                    }
-                } else {
-                    CommandResult::Error { message: format!("Cannot determine provider for session {session_id}") }
-                }
-            } else {
-                CommandResult::Error { message: format!("session not found: {session_id}") }
-            }
+            archive_session_result(&session_id, registry, providers_data).await
         }
 
         CommandAction::GenerateBranchName { issue_keys } => {
-            let issues: Vec<(String, String)> = issue_keys
-                .iter()
-                .filter_map(|k| providers_data.issues.get(k.as_str()).map(|issue| (k.clone(), issue.title.clone())))
-                .collect();
-
-            // Collect (provider_name, issue_id) pairs for the created branch
-            let issue_id_pairs: Vec<(String, String)> = {
-                let provider = registry.issue_trackers.keys().next().cloned().unwrap_or_else(|| "issues".to_string());
-                issues.iter().map(|(id, _title)| (provider.clone(), id.clone())).collect()
-            };
-
-            info!("generating branch name");
-            let branch_result = if let Some((_, ai)) = registry.ai_utilities.values().next() {
-                let context: Vec<String> = issues.iter().map(|(id, title)| format!("{} #{}", title, id)).collect();
-                let prompt_text = if context.len() == 1 { context[0].clone() } else { context.join("; ") };
-                Some(ai.generate_branch_name(&prompt_text).await)
-            } else {
-                None
-            };
-            match branch_result {
-                Some(Ok(name)) => {
-                    info!(%name, "AI suggested");
-                    CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
-                }
-                _ => {
-                    let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
-                    let name = fallback.join("-");
-                    CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
-                }
-            }
+            generate_branch_name_result(&issue_keys, registry, providers_data).await
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
@@ -665,6 +660,59 @@ pub async fn execute(
         | CommandAction::SearchIssues { .. }
         | CommandAction::ClearIssueSearch { .. } => {
             CommandResult::Error { message: "bug: daemon-level command reached per-repo executor".to_string() }
+        }
+    }
+}
+
+async fn archive_session_result(session_id: &str, registry: &ProviderRegistry, providers_data: &ProviderData) -> CommandResult {
+    if let Some(session) = providers_data.sessions.get(session_id) {
+        info!(%session_id, "archiving session");
+        if let Some(key) = session_provider_key(session, session_id) {
+            if let Some((_, ca)) = registry.cloud_agents.get(key) {
+                match ca.archive_session(session_id).await {
+                    Ok(()) => CommandResult::Ok,
+                    Err(e) => CommandResult::Error { message: e },
+                }
+            } else {
+                CommandResult::Error { message: format!("No coding agent provider: {key}") }
+            }
+        } else {
+            CommandResult::Error { message: format!("Cannot determine provider for session {session_id}") }
+        }
+    } else {
+        CommandResult::Error { message: format!("session not found: {session_id}") }
+    }
+}
+
+async fn generate_branch_name_result(issue_keys: &[String], registry: &ProviderRegistry, providers_data: &ProviderData) -> CommandResult {
+    let issues: Vec<(String, String)> = issue_keys
+        .iter()
+        .filter_map(|k| providers_data.issues.get(k.as_str()).map(|issue| (k.clone(), issue.title.clone())))
+        .collect();
+
+    let issue_id_pairs: Vec<(String, String)> = {
+        let provider = registry.issue_trackers.keys().next().cloned().unwrap_or_else(|| "issues".to_string());
+        issues.iter().map(|(id, _title)| (provider.clone(), id.clone())).collect()
+    };
+
+    info!("generating branch name");
+    let branch_result = if let Some((_, ai)) = registry.ai_utilities.values().next() {
+        let context: Vec<String> = issues.iter().map(|(id, title)| format!("{} #{}", title, id)).collect();
+        let prompt_text = if context.len() == 1 { context[0].clone() } else { context.join("; ") };
+        Some(ai.generate_branch_name(&prompt_text).await)
+    } else {
+        None
+    };
+
+    match branch_result {
+        Some(Ok(name)) => {
+            info!(%name, "AI suggested");
+            CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
+        }
+        _ => {
+            let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
+            let name = fallback.join("-");
+            CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
         }
     }
 }
@@ -2074,6 +2122,38 @@ mod tests {
                 // At least 1 step: remove checkout
                 assert!(!step_plan.steps.is_empty(), "expected at least 1 step");
             }
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_archive_session_returns_steps() {
+        let mut registry = empty_registry();
+        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
+        let mut data = empty_data();
+        data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(CommandAction::ArchiveSession { session_id: "sess-1".to_string() }, registry, data, runner).await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => assert_eq!(step_plan.steps.len(), 1, "expected a single archive step"),
+            ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_plan_generate_branch_name_returns_steps() {
+        let mut registry = empty_registry();
+        registry.ai_utilities.insert("claude".to_string(), (desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login"))));
+        let mut data = empty_data();
+        data.issues.insert("42".to_string(), make_issue("42", "Add login feature"));
+        let runner = runner_ok();
+
+        let plan = run_build_plan(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, registry, data, runner).await;
+
+        match plan {
+            ExecutionPlan::Steps(step_plan) => assert_eq!(step_plan.steps.len(), 1, "expected a single branch-name step"),
             ExecutionPlan::Immediate(_) => panic!("expected Steps, got Immediate"),
         }
     }
