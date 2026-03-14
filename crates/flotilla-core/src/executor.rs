@@ -390,11 +390,7 @@ fn build_remove_checkout_plan(
     ExecutionPlan::Steps(StepPlan::new(steps))
 }
 
-fn build_archive_session_plan(
-    session_id: String,
-    registry: Arc<ProviderRegistry>,
-    providers_data: Arc<ProviderData>,
-) -> ExecutionPlan {
+fn build_archive_session_plan(session_id: String, registry: Arc<ProviderRegistry>, providers_data: Arc<ProviderData>) -> ExecutionPlan {
     ExecutionPlan::Steps(StepPlan::new(vec![Step {
         description: format!("Archive session {session_id}"),
         action: Box::new(move || {
@@ -604,13 +600,9 @@ pub async fn execute(
             }
         }
 
-        CommandAction::ArchiveSession { session_id } => {
-            archive_session_result(&session_id, registry, providers_data).await
-        }
+        CommandAction::ArchiveSession { session_id } => archive_session_result(&session_id, registry, providers_data).await,
 
-        CommandAction::GenerateBranchName { issue_keys } => {
-            generate_branch_name_result(&issue_keys, registry, providers_data).await
-        }
+        CommandAction::GenerateBranchName { issue_keys } => generate_branch_name_result(&issue_keys, registry, providers_data).await,
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
             info!(%session_id, "teleporting to session");
@@ -685,10 +677,8 @@ async fn archive_session_result(session_id: &str, registry: &ProviderRegistry, p
 }
 
 async fn generate_branch_name_result(issue_keys: &[String], registry: &ProviderRegistry, providers_data: &ProviderData) -> CommandResult {
-    let issues: Vec<(String, String)> = issue_keys
-        .iter()
-        .filter_map(|k| providers_data.issues.get(k.as_str()).map(|issue| (k.clone(), issue.title.clone())))
-        .collect();
+    let issues: Vec<(String, String)> =
+        issue_keys.iter().filter_map(|k| providers_data.issues.get(k.as_str()).map(|issue| (k.clone(), issue.title.clone()))).collect();
 
     let issue_id_pairs: Vec<(String, String)> = {
         let provider = registry.issue_trackers.keys().next().cloned().unwrap_or_else(|| "issues".to_string());

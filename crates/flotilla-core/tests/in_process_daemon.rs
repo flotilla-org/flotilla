@@ -11,10 +11,10 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::{
-        ChannelLabel, CommandOutput, CommandRunner,
         coding_agent::CloudAgentService,
         discovery::{DiscoveryRuntime, EnvVars, EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement},
         types::{CloudAgentSession, RepoCriteria, SessionStatus},
+        ChannelLabel, CommandOutput, CommandRunner,
     },
 };
 use flotilla_protocol::{
@@ -74,9 +74,7 @@ impl SlowCloudAgent {
     }
 
     async fn wait_for_archive_start(&self) {
-        tokio::time::timeout(Duration::from_secs(5), self.archive_started.notified())
-            .await
-            .expect("archive should start");
+        tokio::time::timeout(Duration::from_secs(5), self.archive_started.notified()).await.expect("archive should start");
     }
 
     fn release_archive(&self) {
@@ -87,19 +85,16 @@ impl SlowCloudAgent {
 #[async_trait]
 impl CloudAgentService for SlowCloudAgent {
     async fn list_sessions(&self, _: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        Ok(vec![(
-            "sess-1".into(),
-            CloudAgentSession {
-                title: "Slow Session".into(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: None,
-                correlation_keys: vec![CorrelationKey::SessionRef("slow-agent".into(), "sess-1".into())],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        )])
+        Ok(vec![("sess-1".into(), CloudAgentSession {
+            title: "Slow Session".into(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: None,
+            correlation_keys: vec![CorrelationKey::SessionRef("slow-agent".into(), "sess-1".into())],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        })])
     }
 
     async fn archive_session(&self, _: &str) -> Result<(), String> {

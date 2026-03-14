@@ -125,8 +125,9 @@ pub async fn run_step_plan(
 mod tests {
     use std::sync::Arc;
 
-    use super::*;
     use tokio::sync::Notify;
+
+    use super::*;
 
     fn make_step(desc: &str, outcome: Result<StepOutcome, String>) -> Step {
         let outcome = Arc::new(tokio::sync::Mutex::new(Some(outcome)));
