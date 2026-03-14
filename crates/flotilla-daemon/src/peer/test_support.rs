@@ -17,7 +17,7 @@ where
     }
 
     for direction in [ConnectionDirection::Inbound, ConnectionDirection::Outbound] {
-        match mgr.activate_connection(
+        match mgr.activate_connection_with_session(
             origin.clone(),
             make_sender(),
             ConnectionMeta { direction, config_label: None, expected_peer: Some(origin.clone()), config_backed: false },
@@ -87,21 +87,22 @@ impl TestNetwork {
     }
 
     /// Inject a local data message into a peer's outbound path.
-    /// Calls prepare_relay() + sends to forward to connected peers via their senders.
+    /// Calls relay() to forward to connected peers via their senders.
     /// The msg.origin_host should match the peer's name.
     pub async fn inject_local_data(&mut self, peer_idx: usize, msg: PeerDataMessage) {
         let peer = &self.peers[peer_idx];
-        let targets = peer.manager.prepare_relay(&peer.name, &msg);
-        for (name, sender, relayed_msg) in targets {
-            if let Err(e) = sender.send(PeerWireMessage::Data(relayed_msg)).await {
-                tracing::warn!(to = %name, err = %e, "test inject_local_data send failed");
-            }
-        }
+        peer.manager.relay(&peer.name, &msg).await;
     }
 
     /// Process all pending inbound messages for a single peer.
-    /// Replicates the prepare_relay-then-handle pattern from peer_networking.rs.
+    /// Replicates the relay-then-handle pattern from server.rs.
     pub async fn process_peer(&mut self, peer_idx: usize) -> usize {
+        self.process_peer_with_results(peer_idx).await.len()
+    }
+
+    /// Process all pending inbound messages for a single peer and return the
+    /// handle results in arrival order.
+    pub async fn process_peer_with_results(&mut self, peer_idx: usize) -> Vec<HandleResult> {
         let mut messages = Vec::new();
         for (connection_peer, gen, receiver) in &mut self.peers[peer_idx].receivers {
             while let Ok(msg) = receiver.try_recv() {
@@ -109,26 +110,21 @@ impl TestNetwork {
             }
         }
 
-        let count = messages.len();
         let peer = &mut self.peers[peer_idx];
+        let mut results = Vec::new();
 
         for (connection_peer, generation, msg) in messages {
             if let PeerWireMessage::Data(ref data_msg) = msg {
                 // Use origin_host (not connection_peer) to match production
-                // semantics — relay skips the original author.
-                let targets = peer.manager.prepare_relay(&data_msg.origin_host, data_msg);
-                for (name, sender, relayed_msg) in targets {
-                    if let Err(e) = sender.send(PeerWireMessage::Data(relayed_msg)).await {
-                        tracing::warn!(to = %name, err = %e, "test process_peer relay send failed");
-                    }
-                }
+                // semantics in server.rs — relay skips the original author.
+                peer.manager.relay(&data_msg.origin_host, data_msg).await;
             }
 
             let env = InboundPeerEnvelope { msg, connection_generation: generation, connection_peer };
-            peer.manager.handle_inbound(env).await;
+            results.push(peer.manager.handle_inbound(env).await);
         }
 
-        count
+        results
     }
 
     /// Process messages across all peers until quiescent.

@@ -69,7 +69,7 @@ pub struct SshTransport {
     /// Holds JoinHandles for the reader and writer background tasks so we can
     /// abort them on disconnect.
     task_handles: Vec<tokio::task::JoinHandle<()>>,
-    /// Local daemon's session ID, included in outbound Hello messages.
+    /// Local daemon's session ID, included in outbound hello messages.
     local_session_id: uuid::Uuid,
     /// Session ID received from the remote peer during handshake.
     remote_session_id: Option<uuid::Uuid>,
@@ -221,10 +221,8 @@ impl SshTransport {
         let (outbound_tx, outbound_rx) = mpsc::channel::<PeerWireMessage>(CHANNEL_BUFFER);
         self.outbound_tx = Some(outbound_tx);
 
-        // Spawn reader task — handles Ping/Pong at the transport layer
-        // to minimize response latency for keepalive.
+        // Spawn reader task
         let host_name = self.expected_host_name.clone();
-        let pong_tx = self.outbound_tx.as_ref().cloned();
         let reader_handle = tokio::spawn(async move {
             loop {
                 match lines.next_line().await {
@@ -242,28 +240,15 @@ impl SshTransport {
                         };
 
                         match msg {
-                            Message::Peer(peer_msg) => match *peer_msg {
-                                PeerWireMessage::Ping { timestamp } => {
-                                    // Reply with Pong directly via writer channel
-                                    if let Some(ref tx) = pong_tx {
-                                        let _ = tx.send(PeerWireMessage::Pong { timestamp }).await;
-                                    }
+                            Message::Peer(peer_msg) => {
+                                if inbound_tx.send(*peer_msg).await.is_err() {
+                                    debug!(
+                                        host = %host_name,
+                                        "inbound channel closed, stopping reader"
+                                    );
+                                    break;
                                 }
-                                PeerWireMessage::Pong { timestamp } => {
-                                    // Forward to inbound — the forwarding task
-                                    // updates last_message_at on any recv
-                                    if inbound_tx.send(PeerWireMessage::Pong { timestamp }).await.is_err() {
-                                        debug!(host = %host_name, "inbound channel closed, stopping reader");
-                                        break;
-                                    }
-                                }
-                                other => {
-                                    if inbound_tx.send(other).await.is_err() {
-                                        debug!(host = %host_name, "inbound channel closed, stopping reader");
-                                        break;
-                                    }
-                                }
-                            },
+                            }
                             _ => {
                                 // Silently ignore non-peer messages after handshake.
                                 debug!(

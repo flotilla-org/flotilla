@@ -23,7 +23,6 @@ use futures::stream;
 use crate::{
     config::ConfigStore,
     providers::{
-        CommandRunner,
         ai_utility::AiUtility,
         code_review::CodeReview,
         coding_agent::CloudAgentService,
@@ -32,6 +31,7 @@ use crate::{
         terminal::TerminalPool,
         vcs::{CheckoutManager, Vcs},
         workspace::WorkspaceManager,
+        CommandRunner,
     },
 };
 

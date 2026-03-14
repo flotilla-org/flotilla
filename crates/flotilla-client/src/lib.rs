@@ -579,8 +579,8 @@ impl DaemonHandle for SocketDaemon {
         resp.parse::<Vec<RepoInfo>>()
     }
 
-    async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
-        let resp = self.request("execute", serde_json::json!({ "repo": repo, "command": command })).await?;
+    async fn execute(&self, command: Command) -> Result<u64, String> {
+        let resp = self.request("execute", serde_json::json!({ "command": command })).await?;
         resp.parse::<u64>()
     }
 

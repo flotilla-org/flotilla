@@ -515,6 +515,21 @@ impl PeerNetworkingTask {
                         HandleResult::ReconnectSuppressed { peer } => {
                             info!(peer = %peer, "peer requested reconnect suppression");
                         }
+                        HandleResult::CommandRequested { request_id, requester_host, reply_via, command } => {
+                            warn!(
+                                %request_id,
+                                requester = %requester_host,
+                                reply_via = %reply_via,
+                                command = %command.description(),
+                                "ignoring routed peer command in peer_networking task"
+                            );
+                        }
+                        HandleResult::CommandEventReceived { request_id, responder_host, .. } => {
+                            warn!(%request_id, responder = %responder_host, "ignoring routed peer command event in peer_networking task");
+                        }
+                        HandleResult::CommandResponseReceived { request_id, responder_host, .. } => {
+                            warn!(%request_id, responder = %responder_host, "ignoring routed peer command response in peer_networking task");
+                        }
                         HandleResult::Ignored => {}
                     }
                         }
@@ -673,6 +688,9 @@ pub(crate) async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManage
         let target = match &request {
             RoutedPeerMessage::RequestResync { target_host, .. } => target_host.clone(),
             RoutedPeerMessage::ResyncSnapshot { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::CommandRequest { target_host, .. } => target_host.clone(),
+            RoutedPeerMessage::CommandEvent { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::CommandResponse { requester_host, .. } => requester_host.clone(),
         };
         let sender = {
             let pm = peer_manager.lock().await;

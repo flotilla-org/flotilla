@@ -1,4 +1,4 @@
-use flotilla_protocol::{Command, HostName, RepoLabels, WorkItem, WorkItemKind};
+use flotilla_protocol::{CheckoutTarget, Command, CommandAction, HostName, RepoLabels, WorkItem, WorkItemKind};
 
 use super::App;
 
@@ -105,8 +105,12 @@ impl Intent {
     /// Returns None if the intent can't be resolved (missing data).
     pub fn resolve(&self, item: &WorkItem, app: &App) -> Option<Command> {
         match self {
-            Intent::SwitchToWorkspace => item.workspace_refs.first().map(|ws_ref| Command::SelectWorkspace { ws_ref: ws_ref.clone() }),
-            Intent::CreateWorkspace => item.checkout_key().map(|p| Command::CreateWorkspaceForCheckout { checkout_path: p.path.clone() }),
+            Intent::SwitchToWorkspace => {
+                item.workspace_refs.first().map(|ws_ref| app.repo_command(CommandAction::SelectWorkspace { ws_ref: ws_ref.clone() }))
+            }
+            Intent::CreateWorkspace => {
+                item.checkout_key().map(|p| app.repo_command(CommandAction::CreateWorkspaceForCheckout { checkout_path: p.path.clone() }))
+            }
             Intent::RemoveCheckout => {
                 if item.kind != WorkItemKind::Checkout || item.is_main_checkout {
                     return None;
@@ -114,22 +118,31 @@ impl Intent {
                 let branch = item.branch.as_ref()?.to_string();
                 let checkout_path = item.checkout_key().map(|p| p.path.clone());
                 let change_request_id = item.change_request_key.clone();
-                Some(Command::FetchCheckoutStatus { branch, checkout_path, change_request_id })
+                Some(app.repo_command(CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id }))
             }
-            Intent::CreateCheckoutAndWorkspace => item.branch.as_ref().map(|branch| Command::CreateCheckout {
-                branch: branch.to_string(),
-                create_branch: item.kind != WorkItemKind::RemoteBranch && item.kind != WorkItemKind::ChangeRequest,
-                issue_ids: Vec::new(),
+            Intent::CreateCheckoutAndWorkspace => item.branch.as_ref().map(|branch| {
+                let target = if item.kind == WorkItemKind::RemoteBranch || item.kind == WorkItemKind::ChangeRequest {
+                    CheckoutTarget::Branch(branch.to_string())
+                } else {
+                    CheckoutTarget::FreshBranch(branch.to_string())
+                };
+                app.command(CommandAction::Checkout {
+                    repo: flotilla_protocol::RepoSelector::Path(app.model.active_repo_root().clone()),
+                    target,
+                    issue_ids: Vec::new(),
+                })
             }),
             Intent::GenerateBranchName => {
                 if !item.issue_keys.is_empty() {
-                    Some(Command::GenerateBranchName { issue_keys: item.issue_keys.clone() })
+                    Some(app.repo_command(CommandAction::GenerateBranchName { issue_keys: item.issue_keys.clone() }))
                 } else {
                     None
                 }
             }
-            Intent::OpenChangeRequest => item.change_request_key.as_ref().map(|k| Command::OpenChangeRequest { id: k.clone() }),
-            Intent::OpenIssue => item.issue_keys.first().map(|k| Command::OpenIssue { id: k.clone() }),
+            Intent::OpenChangeRequest => {
+                item.change_request_key.as_ref().map(|k| app.repo_command(CommandAction::OpenChangeRequest { id: k.clone() }))
+            }
+            Intent::OpenIssue => item.issue_keys.first().map(|k| app.repo_command(CommandAction::OpenIssue { id: k.clone() })),
             Intent::LinkIssuesToChangeRequest => {
                 let change_request_key = item.change_request_key.as_ref()?;
                 let co_key = item.checkout_key()?;
@@ -162,14 +175,21 @@ impl Intent {
                 if missing.is_empty() {
                     return None;
                 }
-                Some(Command::LinkIssuesToChangeRequest { change_request_id: change_request_key.clone(), issue_ids: missing })
+                Some(app.repo_command(CommandAction::LinkIssuesToChangeRequest {
+                    change_request_id: change_request_key.clone(),
+                    issue_ids: missing,
+                }))
             }
-            Intent::TeleportSession => item.session_key.as_ref().map(|k| Command::TeleportSession {
-                session_id: k.clone(),
-                branch: item.branch.clone(),
-                checkout_key: item.checkout_key().map(|p| p.path.clone()),
+            Intent::TeleportSession => item.session_key.as_ref().map(|k| {
+                app.repo_command(CommandAction::TeleportSession {
+                    session_id: k.clone(),
+                    branch: item.branch.clone(),
+                    checkout_key: item.checkout_key().map(|p| p.path.clone()),
+                })
             }),
-            Intent::ArchiveSession => item.session_key.as_ref().map(|k| Command::ArchiveSession { session_id: k.clone() }),
+            Intent::ArchiveSession => {
+                item.session_key.as_ref().map(|k| app.repo_command(CommandAction::ArchiveSession { session_id: k.clone() }))
+            }
             Intent::CloseChangeRequest => {
                 let cr_key = item.change_request_key.as_ref()?;
                 let providers = &app.model.active().providers;
@@ -177,7 +197,7 @@ impl Intent {
                 if cr.status != flotilla_protocol::ChangeRequestStatus::Open {
                     return None;
                 }
-                Some(Command::CloseChangeRequest { id: cr_key.clone() })
+                Some(app.repo_command(CommandAction::CloseChangeRequest { id: cr_key.clone() }))
             }
         }
     }
@@ -537,7 +557,7 @@ mod tests {
         let cmd = Intent::SwitchToWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws-abc"),
+            Command { action: CommandAction::SelectWorkspace { ws_ref }, .. } => assert_eq!(ws_ref, "ws-abc"),
             other => panic!("expected SelectWorkspace, got {other:?}"),
         }
     }
@@ -555,7 +575,7 @@ mod tests {
         let mut item = bare_item();
         item.workspace_refs = vec!["ws-first".into(), "ws-second".into()];
         match Intent::SwitchToWorkspace.resolve(&item, &app).unwrap() {
-            Command::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws-first"),
+            Command { action: CommandAction::SelectWorkspace { ws_ref }, .. } => assert_eq!(ws_ref, "ws-first"),
             other => panic!("expected SelectWorkspace, got {other:?}"),
         }
     }
@@ -567,7 +587,7 @@ mod tests {
         let cmd = Intent::CreateWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateWorkspaceForCheckout { checkout_path } => {
+            Command { action: CommandAction::CreateWorkspaceForCheckout { checkout_path }, .. } => {
                 assert_eq!(checkout_path, PathBuf::from("/tmp/feat-x"))
             }
             other => panic!("expected CreateWorkspaceForCheckout, got {other:?}"),
@@ -589,7 +609,7 @@ mod tests {
         let cmd = Intent::RemoveCheckout.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
+            Command { action: CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id }, .. } => {
                 assert_eq!(branch, "feat/x");
                 assert_eq!(checkout_path, Some(PathBuf::from("/tmp/feat-x")));
                 assert_eq!(change_request_id, Some("99".into()));
@@ -629,7 +649,7 @@ mod tests {
         let item = checkout_item("feat/x", "/tmp/feat-x", false);
         let cmd = Intent::RemoveCheckout.resolve(&item, &app).unwrap();
         match cmd {
-            Command::FetchCheckoutStatus { change_request_id, .. } => {
+            Command { action: CommandAction::FetchCheckoutStatus { change_request_id, .. }, .. } => {
                 assert_eq!(change_request_id, None);
             }
             other => panic!("expected FetchCheckoutStatus, got {other:?}"),
@@ -643,10 +663,8 @@ mod tests {
         let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateCheckout { branch, create_branch, issue_ids } => {
-                assert_eq!(branch, "feat/remote");
-                // RemoteBranch kind -> create_branch = false
-                assert!(!create_branch);
+            Command { action: CommandAction::Checkout { target, issue_ids, .. }, .. } => {
+                assert_eq!(target, CheckoutTarget::Branch("feat/remote".into()));
                 assert!(issue_ids.is_empty());
             }
             other => panic!("expected CreateCheckout, got {other:?}"),
@@ -660,10 +678,8 @@ mod tests {
         let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateCheckout { branch, create_branch, .. } => {
-                assert_eq!(branch, "feat/pr-branch");
-                // Pr kind -> create_branch = false
-                assert!(!create_branch);
+            Command { action: CommandAction::Checkout { target, .. }, .. } => {
+                assert_eq!(target, CheckoutTarget::Branch("feat/pr-branch".into()));
             }
             other => panic!("expected CreateCheckout, got {other:?}"),
         }
@@ -676,10 +692,8 @@ mod tests {
         let cmd = Intent::CreateCheckoutAndWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CreateCheckout { branch, create_branch, .. } => {
-                assert_eq!(branch, "feat/session-branch");
-                // Session kind -> create_branch = true (not RemoteBranch or Pr)
-                assert!(create_branch);
+            Command { action: CommandAction::Checkout { target, .. }, .. } => {
+                assert_eq!(target, CheckoutTarget::FreshBranch("feat/session-branch".into()));
             }
             other => panic!("expected CreateCheckout, got {other:?}"),
         }
@@ -700,7 +714,7 @@ mod tests {
         let cmd = Intent::GenerateBranchName.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::GenerateBranchName { issue_keys } => {
+            Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
                 assert_eq!(issue_keys, vec!["42".to_string(), "43".to_string()]);
             }
             other => panic!("expected GenerateBranchName, got {other:?}"),
@@ -721,7 +735,7 @@ mod tests {
         let cmd = Intent::OpenChangeRequest.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::OpenChangeRequest { id } => assert_eq!(id, "123"),
+            Command { action: CommandAction::OpenChangeRequest { id }, .. } => assert_eq!(id, "123"),
             other => panic!("expected OpenChangeRequest, got {other:?}"),
         }
     }
@@ -741,7 +755,7 @@ mod tests {
         let cmd = Intent::OpenIssue.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::OpenIssue { id } => {
+            Command { action: CommandAction::OpenIssue { id }, .. } => {
                 // Opens the first issue
                 assert_eq!(id, "7");
             }
@@ -765,7 +779,7 @@ mod tests {
         let cmd = Intent::TeleportSession.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::TeleportSession { session_id, branch, checkout_key } => {
+            Command { action: CommandAction::TeleportSession { session_id, branch, checkout_key }, .. } => {
                 assert_eq!(session_id, "sess-42");
                 assert_eq!(branch, Some("feat/session-branch".into()));
                 assert_eq!(checkout_key, Some(PathBuf::from("/tmp/co")));
@@ -779,7 +793,7 @@ mod tests {
         let app = stub_app();
         let item = session_item("sess-42");
         match Intent::TeleportSession.resolve(&item, &app).unwrap() {
-            Command::TeleportSession { checkout_key, branch, .. } => {
+            Command { action: CommandAction::TeleportSession { checkout_key, branch, .. }, .. } => {
                 assert!(checkout_key.is_none());
                 assert_eq!(branch, Some("feat/session-branch".into()));
             }
@@ -801,7 +815,7 @@ mod tests {
         let cmd = Intent::ArchiveSession.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::ArchiveSession { session_id } => assert_eq!(session_id, "sess-99"),
+            Command { action: CommandAction::ArchiveSession { session_id }, .. } => assert_eq!(session_id, "sess-99"),
             other => panic!("expected ArchiveSession, got {other:?}"),
         }
     }
@@ -876,7 +890,7 @@ mod tests {
         let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
+            Command { action: CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids }, .. } => {
                 assert_eq!(change_request_id, "42");
                 // Only issue "20" should be linked ("10" is already on the PR)
                 assert_eq!(issue_ids, vec!["20".to_string()]);
@@ -1054,7 +1068,7 @@ mod tests {
         let cmd = Intent::CloseChangeRequest.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command::CloseChangeRequest { id } => assert_eq!(id, "55"),
+            Command { action: CommandAction::CloseChangeRequest { id }, .. } => assert_eq!(id, "55"),
             other => panic!("expected CloseChangeRequest, got {other:?}"),
         }
     }

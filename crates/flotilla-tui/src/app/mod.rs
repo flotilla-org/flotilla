@@ -21,8 +21,8 @@ use flotilla_core::{
     data::{self, GroupEntry, SectionLabels},
 };
 use flotilla_protocol::{
-    Command, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot, SnapshotDelta,
-    StepStatus, WorkItem,
+    Command, CommandAction, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo, RepoLabels, RepoSelector,
+    Snapshot, SnapshotDelta, StepStatus, WorkItem,
 };
 pub use intent::Intent;
 use tui_input::Input;
@@ -275,6 +275,14 @@ impl App {
         self.config.save_layout(layout);
     }
 
+    pub fn command(&self, action: CommandAction) -> Command {
+        Command { host: None, context_repo: None, action }
+    }
+
+    pub fn repo_command(&self, action: CommandAction) -> Command {
+        Command { host: None, context_repo: Some(RepoSelector::Path(self.model.active_repo_root().clone())), action }
+    }
+
     pub fn visible_status_items(&self) -> Vec<VisibleStatusItem> {
         collect_visible_status_items(&self.model, &self.ui)
     }
@@ -289,7 +297,6 @@ impl App {
         }
         self.model.status_message = status_message;
     }
-
     // ── Daemon event handling ──
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
@@ -298,7 +305,7 @@ impl App {
             DaemonEvent::SnapshotDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoRemoved { path } => self.handle_repo_removed(&path),
-            DaemonEvent::CommandStarted { command_id, repo, description } => {
+            DaemonEvent::CommandStarted { command_id, repo, description, .. } => {
                 tracing::info!(%command_id, %description, "command started");
                 self.in_flight.insert(command_id, InFlightCommand { repo, description });
             }
@@ -401,7 +408,7 @@ impl App {
         if !rm.issue_initial_requested {
             rm.issue_initial_requested = true;
             let visible = self.ui.layout.table_area.height.saturating_sub(2) as usize;
-            self.proto_commands.push(Command::SetIssueViewport { repo: path, visible_count: visible.max(20) });
+            self.proto_commands.push(self.command(CommandAction::SetIssueViewport { repo: path, visible_count: visible.max(20) }));
         }
     }
 
@@ -571,7 +578,7 @@ impl App {
     pub(super) fn clear_active_issue_search(&mut self, dispatch: ClearDispatch) {
         if dispatch == ClearDispatch::Always || self.active_ui().active_search_query.is_some() {
             let repo = self.model.active_repo_root().clone();
-            self.proto_commands.push(Command::ClearIssueSearch { repo });
+            self.proto_commands.push(self.command(CommandAction::ClearIssueSearch { repo }));
         }
         self.active_ui_mut().active_search_query = None;
     }
@@ -598,10 +605,14 @@ mod tests {
     #[test]
     fn command_queue_push_and_take_fifo() {
         let mut q = CommandQueue::default();
-        q.push(Command::Refresh);
-        q.push(Command::OpenChangeRequest { id: "1".into() });
-        assert!(matches!(q.take_next(), Some(Command::Refresh)));
-        assert!(matches!(q.take_next(), Some(Command::OpenChangeRequest { .. })));
+        q.push(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
+        q.push(Command {
+            host: None,
+            context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+            action: CommandAction::OpenChangeRequest { id: "1".into() },
+        });
+        assert!(matches!(q.take_next(), Some(Command { action: CommandAction::Refresh { .. }, .. })));
+        assert!(matches!(q.take_next(), Some(Command { action: CommandAction::OpenChangeRequest { .. }, .. })));
     }
 
     #[test]
@@ -840,7 +851,7 @@ mod tests {
         app.apply_snapshot(snap);
 
         let cmd = app.proto_commands.take_next();
-        assert!(matches!(cmd, Some(Command::SetIssueViewport { .. })));
+        assert!(matches!(cmd, Some(Command { action: CommandAction::SetIssueViewport { .. }, .. })));
         // Second snapshot should NOT queue another
         let snap2 = snapshot(&repo);
         app.apply_snapshot(snap2);
@@ -1055,7 +1066,12 @@ mod tests {
         let mut app = stub_app();
         let repo = app.model.repo_order[0].clone();
 
-        app.handle_daemon_event(DaemonEvent::CommandStarted { command_id: 99, repo: repo.clone(), description: "test cmd".into() });
+        app.handle_daemon_event(DaemonEvent::CommandStarted {
+            command_id: 99,
+            host: HostName::local(),
+            repo: repo.clone(),
+            description: "test cmd".into(),
+        });
 
         assert!(app.in_flight.contains_key(&99));
         assert_eq!(app.in_flight[&99].description, "test cmd");
@@ -1101,7 +1117,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
-        assert!(matches!(cmd, Some(Command::CloseChangeRequest { id }) if id == "42"));
+        assert!(matches!(cmd, Some(Command { action: CommandAction::CloseChangeRequest { id }, .. }) if id == "42"));
     }
 
     #[test]
@@ -1111,7 +1127,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
-        assert!(matches!(cmd, Some(Command::CloseChangeRequest { id }) if id == "42"));
+        assert!(matches!(cmd, Some(Command { action: CommandAction::CloseChangeRequest { id }, .. }) if id == "42"));
     }
 
     #[test]

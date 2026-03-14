@@ -18,13 +18,13 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::{
-        ChannelLabel, CommandOutput, CommandRunner,
         discovery::{DiscoveryRuntime, EnvVars},
+        ChannelLabel, CommandOutput, CommandRunner,
     },
 };
 use flotilla_daemon::peer::{
-    HandleResult, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport, merge::merge_provider_data,
-    test_support::handle_test_peer_data,
+    merge::merge_provider_data, test_support::handle_test_peer_data, HandleResult, PeerConnectionStatus, PeerManager, PeerSender,
+    PeerTransport,
 };
 use flotilla_protocol::{
     Checkout, GoodbyeReason, HostName, HostPath, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, VectorClock,
@@ -492,8 +492,8 @@ fn merge_preserves_local_service_data_with_peer_checkouts() {
 #[tokio::test]
 async fn delta_message_returns_needs_resync() {
     use flotilla_protocol::{
-        Change,
         delta::{Branch, BranchStatus, EntryOp},
+        Change,
     };
 
     let mut mgr = PeerManager::new(HostName::new("leader"));
