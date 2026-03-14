@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 replay = []
+test-support = []
 
 [dependencies]
 flotilla-protocol = { path = "../flotilla-protocol" }

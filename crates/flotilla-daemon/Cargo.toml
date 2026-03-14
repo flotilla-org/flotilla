@@ -23,4 +23,5 @@ futures = "0.3"
 indexmap = { workspace = true }
 tempfile = "3"
 flotilla-client = { path = "../flotilla-client" }
+flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol" }

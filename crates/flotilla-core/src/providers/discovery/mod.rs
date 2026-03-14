@@ -9,6 +9,7 @@ use futures::StreamExt;
 pub mod detectors;
 pub mod factories;
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 use std::{
