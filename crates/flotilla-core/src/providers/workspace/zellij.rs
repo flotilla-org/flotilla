@@ -320,10 +320,10 @@ mod tests {
     #[test]
     fn state_serialization_format() {
         let mut state = ZellijState::default();
-        state.tabs.insert("feat-branch".to_string(), TabState {
-            working_directory: "/home/user/project".to_string(),
-            created_at: "1000".to_string(),
-        });
+        state.tabs.insert(
+            "feat-branch".to_string(),
+            TabState { working_directory: "/home/user/project".to_string(), created_at: "1000".to_string() },
+        );
         let serialized = toml::to_string(&state).unwrap();
         assert!(serialized.contains("[tabs.feat-branch]"));
         assert!(serialized.contains("working_directory"));

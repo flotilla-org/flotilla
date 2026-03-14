@@ -142,12 +142,10 @@ impl<'de> Deserialize<'de> for HostsConfig {
             .into_iter()
             .map(|(label, host)| {
                 let expected_host_name = host.expected_host_name.unwrap_or_else(|| label.clone());
-                (label, RemoteHostConfig {
-                    hostname: host.hostname,
-                    expected_host_name,
-                    user: host.user,
-                    daemon_socket: host.daemon_socket,
-                })
+                (
+                    label,
+                    RemoteHostConfig { hostname: host.hostname, expected_host_name, user: host.user, daemon_socket: host.daemon_socket },
+                )
             })
             .collect();
         Ok(Self { hosts })

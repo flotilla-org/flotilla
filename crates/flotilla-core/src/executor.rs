@@ -709,7 +709,8 @@ async fn validate_checkout_target(
     runner: &dyn CommandRunner,
 ) -> Result<(), String> {
     let local_exists = run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")], repo_root).is_ok();
-    let remote_exists = run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")], repo_root).is_ok();
+    let remote_exists =
+        run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")], repo_root).is_ok();
     match intent {
         CheckoutIntent::ExistingBranch if local_exists || remote_exists => Ok(()),
         CheckoutIntent::ExistingBranch => Err(format!("branch not found: {branch}")),
@@ -835,7 +836,7 @@ mod tests {
         ProviderDescriptor::named(name)
     }
     use async_trait::async_trait;
-    use flotilla_protocol::{HostName, HostPath};
+    use flotilla_protocol::{HostName, HostPath, RepoSelector};
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::local(), PathBuf::from(path))
@@ -854,16 +855,19 @@ mod tests {
     impl MockCheckoutManager {
         fn succeeding(branch: &str, path: &str) -> Self {
             Self {
-                create_result: tokio::sync::Mutex::new(Some(Ok((PathBuf::from(path), Checkout {
-                    branch: branch.to_string(),
-                    is_main: false,
-                    trunk_ahead_behind: None,
-                    remote_ahead_behind: None,
-                    working_tree: None,
-                    last_commit: None,
-                    correlation_keys: vec![],
-                    association_keys: vec![],
-                })))),
+                create_result: tokio::sync::Mutex::new(Some(Ok((
+                    PathBuf::from(path),
+                    Checkout {
+                        branch: branch.to_string(),
+                        is_main: false,
+                        trunk_ahead_behind: None,
+                        remote_ahead_behind: None,
+                        working_tree: None,
+                        last_commit: None,
+                        correlation_keys: vec![],
+                        association_keys: vec![],
+                    },
+                )))),
                 remove_result: tokio::sync::Mutex::new(Some(Ok(()))),
             }
         }
@@ -1080,13 +1084,29 @@ mod tests {
         MockRunner::new(vec![])
     }
 
+    fn repo_selector() -> RepoSelector {
+        RepoSelector::Path(repo_root())
+    }
+
+    fn local_command(action: CommandAction) -> Command {
+        Command { host: None, context_repo: None, action }
+    }
+
+    fn fresh_checkout_action(branch: &str) -> CommandAction {
+        CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::FreshBranch(branch.to_string()), issue_ids: vec![] }
+    }
+
+    fn remove_checkout_action(branch: &str, terminal_keys: Vec<ManagedTerminalId>) -> CommandAction {
+        CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(branch.to_string()), terminal_keys }
+    }
+
     async fn run_execute(
-        command: Command,
+        action: CommandAction,
         registry: &ProviderRegistry,
         providers_data: &ProviderData,
         runner: &MockRunner,
     ) -> CommandResult {
-        execute(command, &repo_root(), registry, providers_data, runner, &config_base()).await
+        execute(action, &repo_root(), registry, providers_data, runner, &config_base()).await
     }
 
     fn assert_error_contains(result: CommandResult, expected_substring: &str) {
@@ -1107,7 +1127,7 @@ mod tests {
 
     fn assert_checkout_created_branch(result: CommandResult, expected_branch: &str) {
         match result {
-            CommandResult::CheckoutCreated { branch } => {
+            CommandResult::CheckoutCreated { branch, .. } => {
                 assert_eq!(branch, expected_branch);
             }
             other => panic!("expected CheckoutCreated, got {:?}", other),
@@ -1120,6 +1140,15 @@ mod tests {
                 assert_eq!(info.branch, expected_branch);
             }
             other => panic!("expected CheckoutStatus, got {:?}", other),
+        }
+    }
+
+    fn assert_checkout_removed_branch(result: CommandResult, expected_branch: &str) {
+        match result {
+            CommandResult::CheckoutRemoved { branch } => {
+                assert_eq!(branch, expected_branch);
+            }
+            other => panic!("expected CheckoutRemoved, got {:?}", other),
         }
     }
 
@@ -1151,7 +1180,7 @@ mod tests {
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
 
         assert_ok(result);
     }
@@ -1165,7 +1194,7 @@ mod tests {
         data.sessions.insert("sess-1".to_string(), make_session_for("cursor", "sess-1"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
 
         assert_ok(result);
     }
@@ -1179,7 +1208,7 @@ mod tests {
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
 
         assert_ok(result);
     }
@@ -1190,9 +1219,13 @@ mod tests {
         let data = empty_data();
         let runner = runner_ok();
 
-        let result =
-            run_execute(Command::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/nonexistent") }, &registry, &data, &runner)
-                .await;
+        let result = run_execute(
+            CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/nonexistent") },
+            &registry,
+            &data,
+            &runner,
+        )
+        .await;
 
         assert_error_contains(result, "checkout not found");
     }
@@ -1206,7 +1239,7 @@ mod tests {
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
 
         assert_error_eq(result, "ws creation failed");
     }
@@ -1220,7 +1253,7 @@ mod tests {
         let registry = empty_registry();
         let runner = runner_ok();
 
-        let result = run_execute(Command::SelectWorkspace { ws_ref: "my-ws".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::SelectWorkspace { ws_ref: "my-ws".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1231,7 +1264,7 @@ mod tests {
         registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
         let runner = runner_ok();
 
-        let result = run_execute(Command::SelectWorkspace { ws_ref: "my-ws".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::SelectWorkspace { ws_ref: "my-ws".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1242,7 +1275,7 @@ mod tests {
         registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("select failed"))));
         let runner = runner_ok();
 
-        let result = run_execute(Command::SelectWorkspace { ws_ref: "bad-ws".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::SelectWorkspace { ws_ref: "bad-ws".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_error_eq(result, "select failed");
     }
@@ -1254,15 +1287,9 @@ mod tests {
     #[tokio::test]
     async fn create_checkout_no_manager() {
         let registry = empty_registry();
-        let runner = runner_ok();
+        let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
-        let result = run_execute(
-            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
-            &registry,
-            &empty_data(),
-            &runner,
-        )
-        .await;
+        let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
 
         assert_error_contains(result, "No checkout manager available");
     }
@@ -1273,15 +1300,9 @@ mod tests {
         registry
             .checkout_managers
             .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
-        let runner = runner_ok();
+        let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
-        let result = run_execute(
-            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
-            &registry,
-            &empty_data(),
-            &runner,
-        )
-        .await;
+        let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
 
         assert_checkout_created_branch(result, "feat-x");
     }
@@ -1292,13 +1313,13 @@ mod tests {
         registry
             .checkout_managers
             .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
-        // The runner needs one Ok response for the git config write
-        let runner = MockRunner::new(vec![Ok(String::new())]);
+        // Two validation probes (branch absent locally/remotely), then the git config write.
+        let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string()), Ok(String::new())]);
 
         let result = run_execute(
-            Command::CreateCheckout {
-                branch: "feat-x".to_string(),
-                create_branch: true,
+            CommandAction::Checkout {
+                repo: repo_selector(),
+                target: CheckoutTarget::FreshBranch("feat-x".to_string()),
                 issue_ids: vec![("github".to_string(), "42".to_string())],
             },
             &registry,
@@ -1314,15 +1335,9 @@ mod tests {
     async fn create_checkout_failure() {
         let mut registry = empty_registry();
         registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::failing("branch already exists"))));
-        let runner = runner_ok();
+        let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
-        let result = run_execute(
-            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
-            &registry,
-            &empty_data(),
-            &runner,
-        )
-        .await;
+        let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
 
         assert_error_eq(result, "branch already exists");
     }
@@ -1334,15 +1349,9 @@ mod tests {
             .checkout_managers
             .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
         registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed"))));
-        let runner = runner_ok();
+        let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
-        let result = run_execute(
-            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
-            &registry,
-            &empty_data(),
-            &runner,
-        )
-        .await;
+        let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
 
         // Workspace failure is logged but checkout still reports success
         assert_checkout_created_branch(result, "feat-x");
@@ -1355,11 +1364,11 @@ mod tests {
     #[tokio::test]
     async fn remove_checkout_no_manager() {
         let registry = empty_registry();
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
         let runner = runner_ok();
 
-        let result =
-            run_execute(Command::RemoveCheckout { branch: "old".to_string(), terminal_keys: vec![] }, &registry, &empty_data(), &runner)
-                .await;
+        let result = run_execute(remove_checkout_action("old", vec![]), &registry, &data, &runner).await;
 
         assert_error_contains(result, "No checkout manager available");
     }
@@ -1368,24 +1377,24 @@ mod tests {
     async fn remove_checkout_success() {
         let mut registry = empty_registry();
         registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old"))));
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
         let runner = runner_ok();
 
-        let result =
-            run_execute(Command::RemoveCheckout { branch: "old".to_string(), terminal_keys: vec![] }, &registry, &empty_data(), &runner)
-                .await;
+        let result = run_execute(remove_checkout_action("old", vec![]), &registry, &data, &runner).await;
 
-        assert_ok(result);
+        assert_checkout_removed_branch(result, "old");
     }
 
     #[tokio::test]
     async fn remove_checkout_failure() {
         let mut registry = empty_registry();
         registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::failing("cannot remove trunk"))));
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-main"), make_checkout("main", "/repo/wt-main"));
         let runner = runner_ok();
 
-        let result =
-            run_execute(Command::RemoveCheckout { branch: "main".to_string(), terminal_keys: vec![] }, &registry, &empty_data(), &runner)
-                .await;
+        let result = run_execute(remove_checkout_action("main", vec![]), &registry, &data, &runner).await;
 
         assert_error_eq(result, "cannot remove trunk");
     }
@@ -1425,17 +1434,13 @@ mod tests {
             .checkout_managers
             .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
         registry.terminal_pool = Some((desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>));
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
 
         let runner = runner_ok();
-        let result = run_execute(
-            Command::RemoveCheckout { branch: "feat-x".into(), terminal_keys: vec![terminal_id.clone()] },
-            &registry,
-            &empty_data(),
-            &runner,
-        )
-        .await;
+        let result = run_execute(remove_checkout_action("feat-x", vec![terminal_id.clone()]), &registry, &data, &runner).await;
 
-        assert_ok(result);
+        assert_checkout_removed_branch(result, "feat-x");
         let killed = mock_pool.killed.lock().await;
         assert_eq!(killed.len(), 1);
         assert_eq!(killed[0], terminal_id);
@@ -1457,7 +1462,7 @@ mod tests {
         let runner = MockRunner::new(vec![Err("err".to_string()), Err("err".to_string()), Err("err".to_string()), Err("err".to_string())]);
 
         let result = run_execute(
-            Command::FetchCheckoutStatus {
+            CommandAction::FetchCheckoutStatus {
                 branch: "feat".to_string(),
                 checkout_path: Some(PathBuf::from("/repo/wt")),
                 change_request_id: Some("42".to_string()),
@@ -1482,7 +1487,7 @@ mod tests {
         ]);
 
         let result = run_execute(
-            Command::FetchCheckoutStatus {
+            CommandAction::FetchCheckoutStatus {
                 branch: "feat".to_string(),
                 checkout_path: Some(PathBuf::from("/repo/wt")),
                 change_request_id: None,
@@ -1511,7 +1516,7 @@ mod tests {
         let registry = empty_registry();
         let runner = runner_ok();
 
-        let result = run_execute(Command::OpenChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::OpenChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1522,7 +1527,7 @@ mod tests {
         registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
         let runner = runner_ok();
 
-        let result = run_execute(Command::OpenChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::OpenChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1536,7 +1541,7 @@ mod tests {
         let registry = empty_registry();
         let runner = runner_ok();
 
-        let result = run_execute(Command::CloseChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::CloseChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1547,7 +1552,7 @@ mod tests {
         registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
         let runner = runner_ok();
 
-        let result = run_execute(Command::CloseChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::CloseChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1561,7 +1566,7 @@ mod tests {
         let registry = empty_registry();
         let runner = runner_ok();
 
-        let result = run_execute(Command::OpenIssue { id: "10".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::OpenIssue { id: "10".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1572,7 +1577,7 @@ mod tests {
         registry.issue_trackers.insert("github".to_string(), (desc("github"), Arc::new(MockIssueTracker)));
         let runner = runner_ok();
 
-        let result = run_execute(Command::OpenIssue { id: "10".to_string() }, &registry, &empty_data(), &runner).await;
+        let result = run_execute(CommandAction::OpenIssue { id: "10".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_ok(result);
     }
@@ -1589,7 +1594,10 @@ mod tests {
         let runner = MockRunner::new(vec![Ok("Existing PR body".to_string()), Ok(String::new())]);
 
         let result = run_execute(
-            Command::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string(), "20".to_string()] },
+            CommandAction::LinkIssuesToChangeRequest {
+                change_request_id: "55".to_string(),
+                issue_ids: vec!["10".to_string(), "20".to_string()],
+            },
             &registry,
             &empty_data(),
             &runner,
@@ -1608,7 +1616,7 @@ mod tests {
         ]);
 
         let result = run_execute(
-            Command::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
+            CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
             &registry,
             &empty_data(),
             &runner,
@@ -1624,7 +1632,7 @@ mod tests {
         let runner = MockRunner::new(vec![Err("gh not found".to_string())]);
 
         let result = run_execute(
-            Command::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
+            CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
             &registry,
             &empty_data(),
             &runner,
@@ -1640,7 +1648,7 @@ mod tests {
         let runner = MockRunner::new(vec![Ok("body text".to_string()), Err("permission denied".to_string())]);
 
         let result = run_execute(
-            Command::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
+            CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
             &registry,
             &empty_data(),
             &runner,
@@ -1660,7 +1668,7 @@ mod tests {
         let runner = runner_ok();
 
         let result =
-            run_execute(Command::ArchiveSession { session_id: "nonexistent".to_string() }, &registry, &empty_data(), &runner).await;
+            run_execute(CommandAction::ArchiveSession { session_id: "nonexistent".to_string() }, &registry, &empty_data(), &runner).await;
 
         assert_error_contains(result, "session not found");
     }
@@ -1672,7 +1680,7 @@ mod tests {
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
 
         assert_error_contains(result, "No coding agent provider: claude");
     }
@@ -1685,7 +1693,7 @@ mod tests {
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
 
         assert_ok(result);
     }
@@ -1698,7 +1706,7 @@ mod tests {
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::ArchiveSession { session_id: "sess-1".to_string() }, &registry, &data, &runner).await;
 
         assert_error_eq(result, "archive failed");
     }
@@ -1716,7 +1724,7 @@ mod tests {
         data.issues.insert("42".to_string(), make_issue("42", "Add login feature"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::GenerateBranchName { issue_keys: vec!["42".to_string()] }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, &registry, &data, &runner).await;
 
         assert_branch_name_generated(result, "feat/add-login", &[("github", "42")]);
     }
@@ -1729,7 +1737,7 @@ mod tests {
         data.issues.insert("42".to_string(), make_issue("42", "Add login"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::GenerateBranchName { issue_keys: vec!["42".to_string()] }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, &registry, &data, &runner).await;
 
         assert_branch_name_generated(result, "issue-42", &[("issues", "42")]);
     }
@@ -1741,7 +1749,7 @@ mod tests {
         data.issues.insert("7".to_string(), make_issue("7", "Fix bug"));
         let runner = runner_ok();
 
-        let result = run_execute(Command::GenerateBranchName { issue_keys: vec!["7".to_string()] }, &registry, &data, &runner).await;
+        let result = run_execute(CommandAction::GenerateBranchName { issue_keys: vec!["7".to_string()] }, &registry, &data, &runner).await;
 
         // No issue tracker registered, defaults to "issues"
         assert_branch_name_generated(result, "issue-7", &[("issues", "7")]);
@@ -1757,9 +1765,13 @@ mod tests {
         data.issues.insert("2".to_string(), make_issue("2", "Signup feature"));
         let runner = runner_ok();
 
-        let result =
-            run_execute(Command::GenerateBranchName { issue_keys: vec!["1".to_string(), "2".to_string()] }, &registry, &data, &runner)
-                .await;
+        let result = run_execute(
+            CommandAction::GenerateBranchName { issue_keys: vec!["1".to_string(), "2".to_string()] },
+            &registry,
+            &data,
+            &runner,
+        )
+        .await;
 
         assert_branch_name_generated(result, "feat/login-and-signup", &[("github", "1"), ("github", "2")]);
     }
@@ -1771,7 +1783,7 @@ mod tests {
         let runner = runner_ok();
 
         let result =
-            run_execute(Command::GenerateBranchName { issue_keys: vec!["nonexistent".to_string()] }, &registry, &data, &runner).await;
+            run_execute(CommandAction::GenerateBranchName { issue_keys: vec!["nonexistent".to_string()] }, &registry, &data, &runner).await;
 
         // No issues found, so empty fallback
         assert_branch_name_generated(result, "", &[]);
@@ -1796,7 +1808,7 @@ mod tests {
         let runner = runner_ok();
 
         let result = run_execute(
-            Command::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
+            CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
             &registry,
             &data,
             &runner,
@@ -1822,7 +1834,7 @@ mod tests {
         assert_eq!(attach, "agent --resume sess-1");
 
         let result = run_execute(
-            Command::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
+            CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
             &registry,
             &data,
             &runner,
@@ -1845,7 +1857,7 @@ mod tests {
         let runner = runner_ok();
 
         let result = run_execute(
-            Command::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: None },
+            CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: None },
             &registry,
             &data,
             &runner,
@@ -1864,7 +1876,7 @@ mod tests {
         let runner = runner_ok();
 
         let result = run_execute(
-            Command::TeleportSession { session_id: "sess-1".to_string(), branch: None, checkout_key: None },
+            CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: None, checkout_key: None },
             &registry,
             &data,
             &runner,
@@ -1886,7 +1898,7 @@ mod tests {
         let runner = runner_ok();
 
         let result = run_execute(
-            Command::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
+            CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
             &registry,
             &data,
             &runner,
@@ -1909,7 +1921,7 @@ mod tests {
         let runner = runner_ok();
 
         let result = run_execute(
-            Command::TeleportSession { session_id: "sess-1".to_string(), branch: None, checkout_key: Some(path) },
+            CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: None, checkout_key: Some(path) },
             &registry,
             &data,
             &runner,
@@ -1930,13 +1942,13 @@ mod tests {
         let runner = runner_ok();
 
         let daemon_commands = vec![
-            Command::AddRepo { path: PathBuf::from("/repo") },
-            Command::RemoveRepo { path: PathBuf::from("/repo") },
-            Command::Refresh,
-            Command::SetIssueViewport { repo: PathBuf::from("/repo"), visible_count: 10 },
-            Command::FetchMoreIssues { repo: PathBuf::from("/repo"), desired_count: 20 },
-            Command::SearchIssues { repo: PathBuf::from("/repo"), query: "bug".to_string() },
-            Command::ClearIssueSearch { repo: PathBuf::from("/repo") },
+            CommandAction::AddRepo { path: PathBuf::from("/repo") },
+            CommandAction::RemoveRepo { repo: RepoSelector::Path(PathBuf::from("/repo")) },
+            CommandAction::Refresh { repo: None },
+            CommandAction::SetIssueViewport { repo: PathBuf::from("/repo"), visible_count: 10 },
+            CommandAction::FetchMoreIssues { repo: PathBuf::from("/repo"), desired_count: 20 },
+            CommandAction::SearchIssues { repo: PathBuf::from("/repo"), query: "bug".to_string() },
+            CommandAction::ClearIssueSearch { repo: PathBuf::from("/repo") },
         ];
 
         for cmd in daemon_commands {
@@ -1964,12 +1976,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn run_build_plan(
-        command: Command,
+        action: CommandAction,
         registry: ProviderRegistry,
         providers_data: ProviderData,
         runner: MockRunner,
     ) -> ExecutionPlan {
-        build_plan(command, repo_root(), Arc::new(registry), Arc::new(providers_data), Arc::new(runner), config_base()).await
+        build_plan(local_command(action), repo_root(), Arc::new(registry), Arc::new(providers_data), Arc::new(runner), config_base()).await
     }
 
     // -----------------------------------------------------------------------
@@ -1986,13 +1998,7 @@ mod tests {
         let data = empty_data();
         let runner = runner_ok();
 
-        let plan = run_build_plan(
-            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
-            registry,
-            data,
-            runner,
-        )
-        .await;
+        let plan = run_build_plan(fresh_checkout_action("feat-x"), registry, data, runner).await;
 
         match plan {
             ExecutionPlan::Steps(step_plan) => {
@@ -2015,13 +2021,7 @@ mod tests {
         data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
         let runner = runner_ok();
 
-        let plan = run_build_plan(
-            Command::CreateCheckout { branch: "feat-x".to_string(), create_branch: true, issue_ids: vec![] },
-            registry,
-            data,
-            runner,
-        )
-        .await;
+        let plan = run_build_plan(fresh_checkout_action("feat-x"), registry, data, runner).await;
 
         match plan {
             ExecutionPlan::Steps(step_plan) => {
@@ -2046,7 +2046,7 @@ mod tests {
         let runner = runner_ok();
 
         let plan = run_build_plan(
-            Command::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
+            CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
             registry,
             data,
             runner,
@@ -2066,11 +2066,11 @@ mod tests {
     async fn build_plan_remove_checkout_returns_steps() {
         let mut registry = empty_registry();
         registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old"))));
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
         let runner = runner_ok();
 
-        let plan =
-            run_build_plan(Command::RemoveCheckout { branch: "old".to_string(), terminal_keys: vec![] }, registry, empty_data(), runner)
-                .await;
+        let plan = run_build_plan(remove_checkout_action("old", vec![]), registry, data, runner).await;
 
         match plan {
             ExecutionPlan::Steps(step_plan) => {
@@ -2087,7 +2087,7 @@ mod tests {
         registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
         let runner = runner_ok();
 
-        let plan = run_build_plan(Command::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
+        let plan = run_build_plan(CommandAction::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
 
         match plan {
             ExecutionPlan::Immediate(result) => {

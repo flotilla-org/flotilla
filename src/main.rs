@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use clap::Parser;
 use color_eyre::Result;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::output::OutputFormat;
+use flotilla_protocol::{output::OutputFormat, CheckoutSelector, CheckoutTarget, Command, CommandAction, RepoSelector};
 use flotilla_tui::{app, event_log};
 use tracing::info;
 
@@ -51,32 +51,50 @@ enum SubCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Query a specific repo
-    Repo {
+    /// Trigger a refresh for one repo or all tracked repos
+    Refresh {
         /// Repo path, name, or slug (e.g. "owner/repo")
-        slug: String,
+        repo: Option<String>,
         /// Output as JSON instead of human-readable text
         #[arg(long)]
         json: bool,
+    },
+    /// Query or control repositories
+    Repo {
+        /// Repo arguments, e.g. `owner/repo`, `add /path`, `remove owner/repo`,
+        /// or `owner/repo checkout --fresh feature/x`
+        #[arg(value_name = "ARGS", num_args = 1.., allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a checkout
+    Checkout {
+        /// Checkout path or branch name
+        checkout: String,
         #[command(subcommand)]
-        command: Option<RepoSubCommand>,
+        command: CheckoutSubCommand,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Route a control command to a specific host
+    Host {
+        /// Logical host name
+        host: String,
+        /// Host-scoped control command arguments
+        #[arg(value_name = "ARGS", num_args = 1.., allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 }
 
 #[derive(clap::Subcommand)]
-enum RepoSubCommand {
-    /// Show provider discovery and instances
-    Providers {
-        /// Output as JSON instead of human-readable text
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show work items
-    Work {
-        /// Output as JSON instead of human-readable text
-        #[arg(long)]
-        json: bool,
-    },
+enum CheckoutSubCommand {
+    Remove,
 }
 
 impl Cli {
@@ -98,7 +116,35 @@ async fn main() -> Result<()> {
         Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, *timeout).await,
         Some(SubCommand::Status { json }) => run_status(&cli, OutputFormat::from_json_flag(*json)).await,
         Some(SubCommand::Watch { json }) => run_watch(&cli, OutputFormat::from_json_flag(*json)).await,
-        Some(SubCommand::Repo { slug, json, command }) => run_repo(&cli, slug, OutputFormat::from_json_flag(*json), command.as_ref()).await,
+        Some(SubCommand::Refresh { repo, json }) => {
+            run_control_command(
+                &cli,
+                Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::Refresh { repo: repo.as_ref().map(|value| RepoSelector::Query(value.clone())) },
+                },
+                OutputFormat::from_json_flag(*json),
+            )
+            .await
+        }
+        Some(SubCommand::Repo { args, json }) => run_repo(&cli, args, OutputFormat::from_json_flag(*json)).await,
+        Some(SubCommand::Checkout { checkout, command: CheckoutSubCommand::Remove, json }) => {
+            run_control_command(
+                &cli,
+                Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(checkout.clone()), terminal_keys: vec![] },
+                },
+                OutputFormat::from_json_flag(*json),
+            )
+            .await
+        }
+        Some(SubCommand::Host { host, args, json }) => {
+            let command = parse_host_control_command(host, args).map_err(|e| color_eyre::eyre::eyre!(e))?;
+            run_control_command(&cli, command, OutputFormat::from_json_flag(*json)).await
+        }
         None => run_tui(cli).await,
     }
 }
@@ -214,24 +260,124 @@ async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
     flotilla_tui::cli::run_watch(&cli.socket_path(), format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-async fn run_repo(cli: &Cli, slug: &str, format: OutputFormat, command: Option<&RepoSubCommand>) -> Result<()> {
-    reset_sigpipe();
+enum RepoCommand {
+    Query { slug: String, detail: Option<RepoQueryCommand> },
+    Control(Command),
+}
+
+enum RepoQueryCommand {
+    Providers,
+    Work,
+}
+
+fn parse_repo_command(args: &[String]) -> Result<RepoCommand, String> {
+    if args.is_empty() {
+        return Err("missing repo arguments".into());
+    }
+
+    match args[0].as_str() {
+        "add" if args.len() == 2 => Ok(RepoCommand::Control(Command {
+            host: None,
+            context_repo: None,
+            action: CommandAction::AddRepo { path: PathBuf::from(&args[1]) },
+        })),
+        "remove" if args.len() == 2 => Ok(RepoCommand::Control(Command {
+            host: None,
+            context_repo: None,
+            action: CommandAction::RemoveRepo { repo: RepoSelector::Query(args[1].clone()) },
+        })),
+        slug => {
+            if args.len() == 1 {
+                return Ok(RepoCommand::Query { slug: slug.into(), detail: None });
+            }
+            if args.len() == 2 {
+                return match args[1].as_str() {
+                    "providers" => Ok(RepoCommand::Query { slug: slug.into(), detail: Some(RepoQueryCommand::Providers) }),
+                    "work" => Ok(RepoCommand::Query { slug: slug.into(), detail: Some(RepoQueryCommand::Work) }),
+                    _ => Err(format!("unrecognized repo command: {}", args[1])),
+                };
+            }
+            if args.len() == 3 && args[1] == "checkout" {
+                return Ok(RepoCommand::Control(Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::Checkout {
+                        repo: RepoSelector::Query(slug.into()),
+                        target: CheckoutTarget::Branch(args[2].clone()),
+                        issue_ids: vec![],
+                    },
+                }));
+            }
+            if args.len() == 4 && args[1] == "checkout" && args[2] == "--fresh" {
+                return Ok(RepoCommand::Control(Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::Checkout {
+                        repo: RepoSelector::Query(slug.into()),
+                        target: CheckoutTarget::FreshBranch(args[3].clone()),
+                        issue_ids: vec![],
+                    },
+                }));
+            }
+            Err("unsupported repo arguments".into())
+        }
+    }
+}
+
+fn parse_host_control_command(host: &str, args: &[String]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Err("missing host command".into());
+    }
+
+    let mut command = match args[0].as_str() {
+        "refresh" => Command {
+            host: None,
+            context_repo: None,
+            action: CommandAction::Refresh { repo: args.get(1).cloned().map(RepoSelector::Query) },
+        },
+        "repo" => match parse_repo_command(&args[1..])? {
+            RepoCommand::Control(command) => command,
+            RepoCommand::Query { .. } => return Err("host only supports control commands".into()),
+        },
+        "checkout" if args.len() == 3 && args[2] == "remove" => Command {
+            host: None,
+            context_repo: None,
+            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(args[1].clone()), terminal_keys: vec![] },
+        },
+        _ => return Err("unsupported host control command".into()),
+    };
+    command.host = Some(flotilla_protocol::HostName::new(host));
+    Ok(command)
+}
+
+async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     let socket_path = cli.socket_path();
     let config_dir = cli.config_dir();
     let daemon = flotilla_tui::socket::connect_or_spawn(&socket_path, &config_dir, cli.config_dir.as_deref(), cli.socket.as_deref())
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
+    Ok(daemon as Arc<dyn DaemonHandle>)
+}
 
-    let result = match command {
-        None => flotilla_tui::cli::run_repo_detail(&*daemon, slug, format).await,
-        Some(RepoSubCommand::Providers { json: sub_json }) => {
-            let fmt = if *sub_json { OutputFormat::Json } else { format };
-            flotilla_tui::cli::run_repo_providers(&*daemon, slug, fmt).await
+async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    let daemon = connect_daemon(cli).await?;
+    flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_repo(cli: &Cli, args: &[String], format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    let parsed = parse_repo_command(args).map_err(|e| color_eyre::eyre::eyre!(e))?;
+    match parsed {
+        RepoCommand::Control(command) => run_control_command(cli, command, format).await,
+        RepoCommand::Query { slug, detail } => {
+            let daemon = connect_daemon(cli).await?;
+            let result = match detail {
+                None => flotilla_tui::cli::run_repo_detail(&*daemon, &slug, format).await,
+                Some(RepoQueryCommand::Providers) => flotilla_tui::cli::run_repo_providers(&*daemon, &slug, format).await,
+                Some(RepoQueryCommand::Work) => flotilla_tui::cli::run_repo_work(&*daemon, &slug, format).await,
+            };
+            result.map_err(|e| color_eyre::eyre::eyre!(e))
         }
-        Some(RepoSubCommand::Work { json: sub_json }) => {
-            let fmt = if *sub_json { OutputFormat::Json } else { format };
-            flotilla_tui::cli::run_repo_work(&*daemon, slug, fmt).await
-        }
-    };
-    result.map_err(|e| color_eyre::eyre::eyre!(e))
+    }
 }

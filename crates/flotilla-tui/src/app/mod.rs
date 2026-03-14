@@ -21,8 +21,8 @@ use flotilla_core::{
     data::{self, GroupEntry, SectionLabels},
 };
 use flotilla_protocol::{
-    Command, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo, RepoLabels, Snapshot, SnapshotDelta,
-    StepStatus, WorkItem,
+    Command, CommandAction, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoInfo, RepoLabels, RepoSelector,
+    Snapshot, SnapshotDelta, StepStatus, WorkItem,
 };
 pub use intent::Intent;
 use tui_input::Input;
@@ -114,18 +114,21 @@ impl TuiModel {
         let mut repos = HashMap::new();
         let mut order = Vec::new();
         for info in repos_info {
-            repos.insert(info.path.clone(), TuiRepoModel {
-                providers: Arc::new(ProviderData::default()),
-                labels: info.labels,
-                provider_names: info.provider_names,
-                provider_health: info.provider_health,
-                loading: info.loading,
-                issue_has_more: false,
-                issue_total: None,
-                issue_search_active: false,
-                issue_fetch_pending: false,
-                issue_initial_requested: false,
-            });
+            repos.insert(
+                info.path.clone(),
+                TuiRepoModel {
+                    providers: Arc::new(ProviderData::default()),
+                    labels: info.labels,
+                    provider_names: info.provider_names,
+                    provider_health: info.provider_health,
+                    loading: info.loading,
+                    issue_has_more: false,
+                    issue_total: None,
+                    issue_search_active: false,
+                    issue_fetch_pending: false,
+                    issue_initial_requested: false,
+                },
+            );
             order.push(info.path);
         }
         Self {
@@ -228,6 +231,14 @@ impl App {
         self.config.save_layout(layout);
     }
 
+    pub fn command(&self, action: CommandAction) -> Command {
+        Command { host: None, context_repo: None, action }
+    }
+
+    pub fn repo_command(&self, action: CommandAction) -> Command {
+        Command { host: None, context_repo: Some(RepoSelector::Path(self.model.active_repo_root().clone())), action }
+    }
+
     // ── Daemon event handling ──
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
@@ -236,7 +247,7 @@ impl App {
             DaemonEvent::SnapshotDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoRemoved { path } => self.handle_repo_removed(&path),
-            DaemonEvent::CommandStarted { command_id, repo, description } => {
+            DaemonEvent::CommandStarted { command_id, repo, description, .. } => {
                 tracing::info!(%command_id, %description, "command started");
                 self.in_flight.insert(command_id, InFlightCommand { repo, description });
             }
@@ -339,7 +350,7 @@ impl App {
         if !rm.issue_initial_requested {
             rm.issue_initial_requested = true;
             let visible = self.ui.layout.table_area.height.saturating_sub(2) as usize;
-            self.proto_commands.push(Command::SetIssueViewport { repo: path, visible_count: visible.max(20) });
+            self.proto_commands.push(self.command(CommandAction::SetIssueViewport { repo: path, visible_count: visible.max(20) }));
         }
     }
 
@@ -434,18 +445,21 @@ impl App {
         if self.model.repos.contains_key(&path) {
             return;
         }
-        self.model.repos.insert(path.clone(), TuiRepoModel {
-            providers: Arc::new(ProviderData::default()),
-            labels: info.labels,
-            provider_names: info.provider_names,
-            provider_health: info.provider_health,
-            loading: info.loading,
-            issue_has_more: false,
-            issue_total: None,
-            issue_search_active: false,
-            issue_fetch_pending: false,
-            issue_initial_requested: false,
-        });
+        self.model.repos.insert(
+            path.clone(),
+            TuiRepoModel {
+                providers: Arc::new(ProviderData::default()),
+                labels: info.labels,
+                provider_names: info.provider_names,
+                provider_health: info.provider_health,
+                loading: info.loading,
+                issue_has_more: false,
+                issue_total: None,
+                issue_search_active: false,
+                issue_fetch_pending: false,
+                issue_initial_requested: false,
+            },
+        );
         self.model.repo_order.push(path.clone());
         self.ui.repo_ui.insert(path, RepoUiState::default());
     }
@@ -504,7 +518,7 @@ impl App {
     pub(super) fn clear_active_issue_search(&mut self, dispatch: ClearDispatch) {
         if dispatch == ClearDispatch::Always || self.active_ui().active_search_query.is_some() {
             let repo = self.model.active_repo_root().clone();
-            self.proto_commands.push(Command::ClearIssueSearch { repo });
+            self.proto_commands.push(self.command(CommandAction::ClearIssueSearch { repo }));
         }
         self.active_ui_mut().active_search_query = None;
     }
@@ -531,10 +545,14 @@ mod tests {
     #[test]
     fn command_queue_push_and_take_fifo() {
         let mut q = CommandQueue::default();
-        q.push(Command::Refresh);
-        q.push(Command::OpenChangeRequest { id: "1".into() });
-        assert!(matches!(q.take_next(), Some(Command::Refresh)));
-        assert!(matches!(q.take_next(), Some(Command::OpenChangeRequest { .. })));
+        q.push(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
+        q.push(Command {
+            host: None,
+            context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+            action: CommandAction::OpenChangeRequest { id: "1".into() },
+        });
+        assert!(matches!(q.take_next(), Some(Command { action: CommandAction::Refresh { .. }, .. })));
+        assert!(matches!(q.take_next(), Some(Command { action: CommandAction::OpenChangeRequest { .. }, .. })));
     }
 
     #[test]
@@ -739,7 +757,7 @@ mod tests {
         app.apply_snapshot(snap);
 
         let cmd = app.proto_commands.take_next();
-        assert!(matches!(cmd, Some(Command::SetIssueViewport { .. })));
+        assert!(matches!(cmd, Some(Command { action: CommandAction::SetIssueViewport { .. }, .. })));
         // Second snapshot should NOT queue another
         let snap2 = snapshot(&repo);
         app.apply_snapshot(snap2);
@@ -811,11 +829,14 @@ mod tests {
         let mut app = stub_app();
         let repo = active_repo_path(&app);
 
-        let change = delta(&repo, vec![flotilla_protocol::Change::ProviderHealth {
-            category: "vcs".into(),
-            provider: "git".into(),
-            op: flotilla_protocol::EntryOp::Added(true),
-        }]);
+        let change = delta(
+            &repo,
+            vec![flotilla_protocol::Change::ProviderHealth {
+                category: "vcs".into(),
+                provider: "git".into(),
+                op: flotilla_protocol::EntryOp::Added(true),
+            }],
+        );
         app.apply_delta(change);
 
         assert_eq!(app.model.provider_statuses[&(repo.clone(), "vcs".into(), "git".into())], ProviderStatus::Ok,);
@@ -829,11 +850,14 @@ mod tests {
 
         app.model.repos.get_mut(&repo).unwrap().provider_health.entry("vcs".into()).or_default().insert("git".into(), true);
 
-        let change = delta(&repo, vec![flotilla_protocol::Change::ProviderHealth {
-            category: "vcs".into(),
-            provider: "git".into(),
-            op: flotilla_protocol::EntryOp::Removed,
-        }]);
+        let change = delta(
+            &repo,
+            vec![flotilla_protocol::Change::ProviderHealth {
+                category: "vcs".into(),
+                provider: "git".into(),
+                op: flotilla_protocol::EntryOp::Removed,
+            }],
+        );
         app.apply_delta(change);
 
         assert!(!app.model.repos[&repo].provider_health.contains_key("vcs"));
@@ -855,19 +879,22 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         let inactive_repo = app.model.repo_order[1].clone();
 
-        let change = delta(&inactive_repo, vec![flotilla_protocol::Change::Session {
-            key: "s1".into(),
-            op: flotilla_protocol::EntryOp::Added(flotilla_protocol::CloudAgentSession {
-                title: "new session".into(),
-                status: flotilla_protocol::SessionStatus::Running,
-                model: None,
-                updated_at: None,
-                correlation_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            }),
-        }]);
+        let change = delta(
+            &inactive_repo,
+            vec![flotilla_protocol::Change::Session {
+                key: "s1".into(),
+                op: flotilla_protocol::EntryOp::Added(flotilla_protocol::CloudAgentSession {
+                    title: "new session".into(),
+                    status: flotilla_protocol::SessionStatus::Running,
+                    model: None,
+                    updated_at: None,
+                    correlation_keys: vec![],
+                    provider_name: String::new(),
+                    provider_display_name: String::new(),
+                    item_noun: String::new(),
+                }),
+            }],
+        );
         app.apply_delta(change);
 
         assert!(app.ui.repo_ui[&inactive_repo].has_unseen_changes);
@@ -878,11 +905,14 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         let inactive_repo = app.model.repo_order[1].clone();
 
-        let change = delta(&inactive_repo, vec![flotilla_protocol::Change::ProviderHealth {
-            category: "vcs".into(),
-            provider: "git".into(),
-            op: flotilla_protocol::EntryOp::Added(true),
-        }]);
+        let change = delta(
+            &inactive_repo,
+            vec![flotilla_protocol::Change::ProviderHealth {
+                category: "vcs".into(),
+                provider: "git".into(),
+                op: flotilla_protocol::EntryOp::Added(true),
+            }],
+        );
         app.apply_delta(change);
 
         assert!(!app.ui.repo_ui[&inactive_repo].has_unseen_changes);
@@ -954,7 +984,12 @@ mod tests {
         let mut app = stub_app();
         let repo = app.model.repo_order[0].clone();
 
-        app.handle_daemon_event(DaemonEvent::CommandStarted { command_id: 99, repo: repo.clone(), description: "test cmd".into() });
+        app.handle_daemon_event(DaemonEvent::CommandStarted {
+            command_id: 99,
+            host: HostName::local(),
+            repo: repo.clone(),
+            description: "test cmd".into(),
+        });
 
         assert!(app.in_flight.contains_key(&99));
         assert_eq!(app.in_flight[&99].description, "test cmd");
@@ -1000,7 +1035,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
-        assert!(matches!(cmd, Some(Command::CloseChangeRequest { id }) if id == "42"));
+        assert!(matches!(cmd, Some(Command { action: CommandAction::CloseChangeRequest { id }, .. }) if id == "42"));
     }
 
     #[test]
@@ -1010,7 +1045,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
-        assert!(matches!(cmd, Some(Command::CloseChangeRequest { id }) if id == "42"));
+        assert!(matches!(cmd, Some(Command { action: CommandAction::CloseChangeRequest { id }, .. }) if id == "42"));
     }
 
     #[test]

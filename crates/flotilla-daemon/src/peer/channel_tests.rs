@@ -212,10 +212,7 @@ async fn routed_command_request_reaches_target_through_relay() {
         }),
     };
 
-    net.manager(a)
-        .send_to(&HostName::new("host-c"), PeerWireMessage::Routed(request))
-        .await
-        .expect("send command request");
+    net.manager(a).send_to(&HostName::new("host-c"), PeerWireMessage::Routed(request)).await.expect("send command request");
 
     let b_results = net.process_peer_with_results(b).await;
     assert!(b_results.iter().all(|result| matches!(result, HandleResult::Ignored)));

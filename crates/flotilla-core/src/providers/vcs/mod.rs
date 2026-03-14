@@ -138,20 +138,20 @@ mod tests {
     fn parse_issue_links_single_provider() {
         let git_output = "branch.feat-x.flotilla.issues.github 123,456\n";
         let keys = parse_issue_config_output(git_output);
-        assert_eq!(keys, vec![
-            AssociationKey::IssueRef("github".into(), "123".into()),
-            AssociationKey::IssueRef("github".into(), "456".into()),
-        ]);
+        assert_eq!(
+            keys,
+            vec![AssociationKey::IssueRef("github".into(), "123".into()), AssociationKey::IssueRef("github".into(), "456".into()),]
+        );
     }
 
     #[test]
     fn parse_issue_links_multiple_providers() {
         let git_output = "branch.feat-x.flotilla.issues.github 42\nbranch.feat-x.flotilla.issues.linear ABC-123\n";
         let keys = parse_issue_config_output(git_output);
-        assert_eq!(keys, vec![
-            AssociationKey::IssueRef("github".into(), "42".into()),
-            AssociationKey::IssueRef("linear".into(), "ABC-123".into()),
-        ]);
+        assert_eq!(
+            keys,
+            vec![AssociationKey::IssueRef("github".into(), "42".into()), AssociationKey::IssueRef("linear".into(), "ABC-123".into()),]
+        );
     }
 
     #[test]

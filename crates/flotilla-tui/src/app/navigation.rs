@@ -1,5 +1,4 @@
 use flotilla_core::data::GroupEntry;
-use flotilla_protocol::Command;
 
 use super::{App, UiMode};
 
@@ -97,7 +96,7 @@ impl App {
             if let Some(rm) = self.model.repos.get_mut(&repo) {
                 rm.issue_fetch_pending = true;
             }
-            self.proto_commands.push(Command::FetchMoreIssues { repo, desired_count: desired });
+            self.proto_commands.push(self.command(flotilla_protocol::CommandAction::FetchMoreIssues { repo, desired_count: desired }));
         }
     }
 
@@ -151,7 +150,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-    use flotilla_protocol::{Command, WorkItemIdentity};
+    use flotilla_protocol::WorkItemIdentity;
     use ratatui::layout::Rect;
 
     use super::*;
@@ -370,7 +369,10 @@ mod tests {
         let cmd = app.proto_commands.take_next();
         assert!(cmd.is_some(), "expected FetchMoreIssues command");
         match cmd.unwrap() {
-            Command::FetchMoreIssues { repo: cmd_repo, desired_count } => {
+            flotilla_protocol::Command {
+                action: flotilla_protocol::CommandAction::FetchMoreIssues { repo: cmd_repo, desired_count },
+                ..
+            } => {
                 assert_eq!(cmd_repo, repo);
                 // providers.issues is empty (default), so desired = 0 + 50
                 assert_eq!(desired_count, 50);

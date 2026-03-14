@@ -51,7 +51,7 @@ impl DaemonHandle for StubDaemon {
         Ok(vec![])
     }
 
-    async fn execute(&self, _repo: &Path, _command: Command) -> Result<u64, String> {
+    async fn execute(&self, _command: Command) -> Result<u64, String> {
         Ok(1)
     }
 

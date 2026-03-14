@@ -189,12 +189,18 @@ mod tests {
     async fn completed_with_overrides_result() {
         let (cancel, tx) = setup();
         let plan = StepPlan::new(vec![
-            make_step("step-a", Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch: "feat/x".into() }))),
+            make_step(
+                "step-a",
+                Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated {
+                    branch: "feat/x".into(),
+                    path: PathBuf::from("/repo/wt-feat-x"),
+                })),
+            ),
             make_step("step-b", Ok(StepOutcome::Completed)),
         ]);
 
         let result = run_step_plan(plan, 1, HostName::local(), PathBuf::from("/repo"), cancel, tx).await;
-        assert_eq!(result, CommandResult::CheckoutCreated { branch: "feat/x".into() });
+        assert_eq!(result, CommandResult::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
     }
 
     #[tokio::test]

@@ -197,16 +197,19 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
 
     let updated_at = task.updated_at.and_then(epoch_to_rfc3339);
 
-    (task.id.clone(), CloudAgentSession {
-        title,
-        status,
-        model: None,
-        updated_at,
-        correlation_keys,
-        provider_name: provider_name.to_string(),
-        provider_display_name: "Codex".into(),
-        item_noun: "Task".into(),
-    })
+    (
+        task.id.clone(),
+        CloudAgentSession {
+            title,
+            status,
+            model: None,
+            updated_at,
+            correlation_keys,
+            provider_name: provider_name.to_string(),
+            provider_display_name: "Codex".into(),
+            item_noun: "Task".into(),
+        },
+    )
 }
 
 // --- CodexCodingAgent struct and HTTP helpers ---

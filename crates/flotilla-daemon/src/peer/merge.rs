@@ -75,16 +75,19 @@ mod tests {
     #[test]
     fn merge_preserves_local_service_data() {
         let mut local = ProviderData::default();
-        local.change_requests.insert("PR-1".into(), ChangeRequest {
-            title: "Fix bug".into(),
-            branch: "fix-bug".into(),
-            status: ChangeRequestStatus::Open,
-            body: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        });
+        local.change_requests.insert(
+            "PR-1".into(),
+            ChangeRequest {
+                title: "Fix bug".into(),
+                branch: "fix-bug".into(),
+                status: ChangeRequestStatus::Open,
+                body: None,
+                correlation_keys: vec![],
+                association_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            },
+        );
         let remote = ProviderData::default();
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.change_requests.len(), 1);
@@ -102,10 +105,11 @@ mod tests {
         let mut peer_b = ProviderData::default();
         peer_b.managed_terminals.insert("shell".into(), make_terminal("peer-b"));
 
-        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[
-            (HostName::new("desktop"), &peer_a),
-            (HostName::new("server"), &peer_b),
-        ]);
+        let merged = merge_provider_data(
+            &local,
+            &HostName::new("laptop"),
+            &[(HostName::new("desktop"), &peer_a), (HostName::new("server"), &peer_b)],
+        );
         assert_eq!(merged.managed_terminals.len(), 3);
         assert!(merged.managed_terminals.contains_key("local-shell"));
         assert!(merged.managed_terminals.contains_key("desktop:shell"));
@@ -116,16 +120,19 @@ mod tests {
     fn merge_with_empty_peers_returns_local_unchanged() {
         let mut local = ProviderData::default();
         local.checkouts.insert(HostPath::new(HostName::new("laptop"), "/repo"), make_checkout("main"));
-        local.change_requests.insert("PR-1".into(), ChangeRequest {
-            title: "T".into(),
-            branch: "b".into(),
-            status: ChangeRequestStatus::Open,
-            body: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        });
+        local.change_requests.insert(
+            "PR-1".into(),
+            ChangeRequest {
+                title: "T".into(),
+                branch: "b".into(),
+                status: ChangeRequestStatus::Open,
+                body: None,
+                correlation_keys: vec![],
+                association_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            },
+        );
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[]);
         assert_eq!(merged, local);
     }

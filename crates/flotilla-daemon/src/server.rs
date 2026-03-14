@@ -863,13 +863,7 @@ async fn execute_forwarded_command(
                     requester_host: requester_host.clone(),
                     responder_host: responder_host.clone(),
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                    event: Box::new(CommandPeerEvent::StepUpdate {
-                        repo,
-                        step_index,
-                        step_count,
-                        description,
-                        status,
-                    }),
+                    event: Box::new(CommandPeerEvent::StepUpdate { repo, step_index, step_count, description, status }),
                 };
                 let pm = peer_manager.lock().await;
                 let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(event)).await;
@@ -916,12 +910,7 @@ async fn emit_remote_command_event(
     match event {
         CommandPeerEvent::Started { repo, description } => {
             entry.repo = Some(repo.clone());
-            daemon.send_event(DaemonEvent::CommandStarted {
-                command_id: entry.command_id,
-                host: responder_host,
-                repo,
-                description,
-            });
+            daemon.send_event(DaemonEvent::CommandStarted { command_id: entry.command_id, host: responder_host, repo, description });
         }
         CommandPeerEvent::StepUpdate { repo, step_index, step_count, description, status } => {
             entry.repo = Some(repo.clone());
@@ -938,12 +927,7 @@ async fn emit_remote_command_event(
         CommandPeerEvent::Finished { repo, result } => {
             entry.repo = Some(repo.clone());
             entry.finished_via_event = true;
-            daemon.send_event(DaemonEvent::CommandFinished {
-                command_id: entry.command_id,
-                host: responder_host,
-                repo,
-                result,
-            });
+            daemon.send_event(DaemonEvent::CommandFinished { command_id: entry.command_id, host: responder_host, repo, result });
         }
     }
 }
@@ -1456,11 +1440,10 @@ async fn dispatch_request(
                     pm.next_request_id()
                 };
                 let command_id = next_remote_command_id.fetch_add(1, Ordering::Relaxed);
-                pending_remote_commands.lock().await.insert(request_id, PendingRemoteCommand {
-                    command_id,
-                    repo: None,
-                    finished_via_event: false,
-                });
+                pending_remote_commands
+                    .lock()
+                    .await
+                    .insert(request_id, PendingRemoteCommand { command_id, repo: None, finished_via_event: false });
 
                 let routed = RoutedPeerMessage::CommandRequest {
                     request_id,
@@ -1608,13 +1591,16 @@ mod tests {
 
     use async_trait::async_trait;
     use flotilla_protocol::{
-        Checkout, Command, CommandAction, CommandPeerEvent, CommandResult, DaemonEvent, HostName, HostPath, PeerDataKind,
-        PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoInfo, RoutedPeerMessage, VectorClock,
+        Checkout, Command, CommandAction, CommandPeerEvent, CommandResult, DaemonEvent, HostName, HostPath, PeerDataKind, PeerDataMessage,
+        PeerWireMessage, ProviderData, RepoIdentity, RepoInfo, RoutedPeerMessage, VectorClock,
     };
     use indexmap::IndexMap;
 
     use super::*;
-    use crate::peer::{test_support::{ensure_test_connection_generation, handle_test_peer_data}, PeerSender};
+    use crate::peer::{
+        test_support::{ensure_test_connection_generation, handle_test_peer_data},
+        PeerSender,
+    };
 
     struct CapturePeerSender {
         sent: Arc<StdMutex<Vec<PeerWireMessage>>>,
@@ -1652,11 +1638,7 @@ mod tests {
         (tmp, daemon)
     }
 
-    fn empty_routing_state() -> (
-        Arc<Mutex<PeerManager>>,
-        Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>,
-        Arc<AtomicU64>,
-    ) {
+    fn empty_routing_state() -> (Arc<Mutex<PeerManager>>, Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>, Arc<AtomicU64>) {
         (
             Arc::new(Mutex::new(PeerManager::new(HostName::new("local")))),
             Arc::new(Mutex::new(HashMap::new())),
@@ -1666,16 +1648,7 @@ mod tests {
 
     async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, params: serde_json::Value) -> Message {
         let (peer_manager, pending_remote_commands, next_remote_command_id) = empty_routing_state();
-        dispatch_request(
-            daemon,
-            &peer_manager,
-            &pending_remote_commands,
-            &next_remote_command_id,
-            id,
-            method,
-            params,
-        )
-        .await
+        dispatch_request(daemon, &peer_manager, &pending_remote_commands, &next_remote_command_id, id, method, params).await
     }
 
     fn checkout(branch: &str) -> Checkout {
@@ -1818,10 +1791,7 @@ mod tests {
         let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
         let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
         let sent = Arc::new(StdMutex::new(Vec::new()));
-        peer_manager.lock().await.register_sender(
-            HostName::new("feta"),
-            Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }),
-        );
+        peer_manager.lock().await.register_sender(HostName::new("feta"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
 
         let response = dispatch_request(
             &daemon,
@@ -1860,11 +1830,7 @@ mod tests {
                 assert_eq!(target_host, &HostName::new("feta"));
                 assert_eq!(
                     command.as_ref(),
-                    &Command {
-                        host: Some(HostName::new("feta")),
-                        context_repo: None,
-                        action: CommandAction::Refresh { repo: None },
-                    }
+                    &Command { host: Some(HostName::new("feta")), context_repo: None, action: CommandAction::Refresh { repo: None } }
                 );
             }
             other => panic!("expected routed command request, got {other:?}"),
@@ -1880,10 +1846,7 @@ mod tests {
         let daemon = InProcessDaemon::new(vec![repo.clone()], config).await;
         let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
         let sent = Arc::new(StdMutex::new(Vec::new()));
-        peer_manager.lock().await.register_sender(
-            HostName::new("relay"),
-            Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }),
-        );
+        peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
 
         execute_forwarded_command(
             Arc::clone(&daemon),
@@ -1891,11 +1854,7 @@ mod tests {
             7,
             HostName::new("desktop"),
             HostName::new("relay"),
-            Command {
-                host: Some(daemon.host_name().clone()),
-                context_repo: None,
-                action: CommandAction::Refresh { repo: None },
-            },
+            Command { host: Some(daemon.host_name().clone()), context_repo: None, action: CommandAction::Refresh { repo: None } },
         )
         .await;
 
@@ -1926,7 +1885,9 @@ mod tests {
                         CommandPeerEvent::StepUpdate { .. } => {}
                     }
                 }
-                PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse { request_id, requester_host, responder_host, result, .. }) => {
+                PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse {
+                    request_id, requester_host, responder_host, result, ..
+                }) => {
                     assert_eq!(*request_id, 7);
                     assert_eq!(requester_host, &HostName::new("desktop"));
                     assert_eq!(responder_host, daemon.host_name());
@@ -1976,10 +1937,10 @@ mod tests {
             .collect();
         statuses.sort_by(|a, b| a.0.cmp(&b.0));
 
-        assert_eq!(statuses, vec![
-            (HostName::new("feta"), PeerConnectionState::Disconnected),
-            (HostName::new("udder"), PeerConnectionState::Disconnected),
-        ]);
+        assert_eq!(
+            statuses,
+            vec![(HostName::new("feta"), PeerConnectionState::Disconnected), (HostName::new("udder"), PeerConnectionState::Disconnected),]
+        );
     }
 
     fn test_peer_msg(host: &str) -> PeerDataMessage {
@@ -2387,16 +2348,31 @@ mod tests {
         };
         daemon.add_virtual_repo(synthetic.clone(), merged).await.expect("add virtual repo");
         daemon
-            .set_peer_providers(&synthetic, vec![
-                (HostName::new("peer-a"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
-                    ..Default::default()
-                }),
-                (HostName::new("peer-b"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"), checkout("feature-b"))]),
-                    ..Default::default()
-                }),
-            ])
+            .set_peer_providers(
+                &synthetic,
+                vec![
+                    (
+                        HostName::new("peer-a"),
+                        ProviderData {
+                            checkouts: IndexMap::from([(
+                                HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"),
+                                checkout("feature-a"),
+                            )]),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        HostName::new("peer-b"),
+                        ProviderData {
+                            checkouts: IndexMap::from([(
+                                HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"),
+                                checkout("feature-b"),
+                            )]),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+            )
             .await;
         {
             let mut pm = peer_manager.lock().await;

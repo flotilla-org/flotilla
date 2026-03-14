@@ -124,21 +124,9 @@ pub enum RoutedPeerMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum CommandPeerEvent {
-    Started {
-        repo: PathBuf,
-        description: String,
-    },
-    StepUpdate {
-        repo: PathBuf,
-        step_index: usize,
-        step_count: usize,
-        description: String,
-        status: StepStatus,
-    },
-    Finished {
-        repo: PathBuf,
-        result: CommandResult,
-    },
+    Started { repo: PathBuf, description: String },
+    StepUpdate { repo: PathBuf, step_index: usize, step_count: usize, description: String, status: StepStatus },
+    Finished { repo: PathBuf, result: CommandResult },
 }
 
 /// The payload kind within a peer data exchange.

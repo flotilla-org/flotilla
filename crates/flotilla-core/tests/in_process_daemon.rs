@@ -1,7 +1,9 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, DaemonEvent, HostName, ProviderData, RepoSelector};
+use flotilla_protocol::{
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, DaemonEvent, HostName, ProviderData, RepoSelector,
+};
 
 async fn daemon_for_cwd() -> (PathBuf, Arc<InProcessDaemon>) {
     let repo = std::env::current_dir().unwrap();
@@ -191,7 +193,11 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     assert_eq!(repos[0].path, repo);
 
     let remove_id = daemon
-        .execute(Command { host: None, context_repo: None, action: CommandAction::RemoveRepo { repo: RepoSelector::Query("new-repo".into()) } })
+        .execute(Command {
+            host: None,
+            context_repo: None,
+            action: CommandAction::RemoveRepo { repo: RepoSelector::Query("new-repo".into()) },
+        })
         .await
         .expect("remove_repo command should return an id");
     let (finished_remove, removed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -317,10 +323,7 @@ async fn remove_checkout_command_accepts_selector_queries() {
         .execute(Command {
             host: None,
             context_repo: None,
-            action: CommandAction::RemoveCheckout {
-                checkout: CheckoutSelector::Query("does-not-exist".into()),
-                terminal_keys: vec![],
-            },
+            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()), terminal_keys: vec![] },
         })
         .await
         .expect_err("missing checkout should fail cleanly");

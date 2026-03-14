@@ -352,22 +352,25 @@ impl InProcessDaemon {
             let slug = repo_slug.clone();
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
-            repos.insert(path.clone(), RepoState {
-                model,
-                slug,
-                repo_bag,
-                unmet,
-                seq: 0,
-                last_snapshot: Arc::new(RefreshSnapshot::default()),
-                issue_cache: IssueCache::new(),
-                search_results: None,
-                issue_fetch_mutex: Arc::new(Mutex::new(())),
-                last_broadcast_providers: ProviderData::default(),
-                last_broadcast_health: HashMap::new(),
-                last_broadcast_errors: Vec::new(),
-                delta_log: VecDeque::new(),
-                local_data_version: 0,
-            });
+            repos.insert(
+                path.clone(),
+                RepoState {
+                    model,
+                    slug,
+                    repo_bag,
+                    unmet,
+                    seq: 0,
+                    last_snapshot: Arc::new(RefreshSnapshot::default()),
+                    issue_cache: IssueCache::new(),
+                    search_results: None,
+                    issue_fetch_mutex: Arc::new(Mutex::new(())),
+                    last_broadcast_providers: ProviderData::default(),
+                    last_broadcast_health: HashMap::new(),
+                    last_broadcast_errors: Vec::new(),
+                    delta_log: VecDeque::new(),
+                    local_data_version: 0,
+                },
+            );
             order.push(path);
         }
 
@@ -454,10 +457,7 @@ impl InProcessDaemon {
         }
     }
 
-    async fn resolve_checkout_selector(
-        &self,
-        selector: &flotilla_protocol::CheckoutSelector,
-    ) -> Result<(PathBuf, String), String> {
+    async fn resolve_checkout_selector(&self, selector: &flotilla_protocol::CheckoutSelector) -> Result<(PathBuf, String), String> {
         let repos = self.repos.read().await;
         let mut matches = Vec::new();
         for (repo_path, state) in repos.iter() {
@@ -468,9 +468,7 @@ impl InProcessDaemon {
                 let matched = match selector {
                     flotilla_protocol::CheckoutSelector::Path(path) => host_path.path == *path,
                     flotilla_protocol::CheckoutSelector::Query(query) => {
-                        checkout.branch == *query
-                            || checkout.branch.contains(query)
-                            || host_path.path.to_string_lossy().contains(query)
+                        checkout.branch == *query || checkout.branch.contains(query) || host_path.path.to_string_lossy().contains(query)
                     }
                 };
                 if matched {
@@ -494,7 +492,8 @@ impl InProcessDaemon {
             CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
             CommandAction::FetchCheckoutStatus { checkout_path: Some(path), .. } => {
                 let repos = self.repos.read().await;
-                repos.keys()
+                repos
+                    .keys()
                     .find(|repo_root| path.starts_with(repo_root))
                     .cloned()
                     .ok_or_else(|| format!("repo not tracked: {}", path.display()))
@@ -980,22 +979,25 @@ impl InProcessDaemon {
             if repos.contains_key(&synthetic_path) {
                 return Ok(());
             }
-            repos.insert(synthetic_path.clone(), RepoState {
-                model,
-                slug: None,
-                repo_bag: EnvironmentBag::new(),
-                unmet: Vec::new(),
-                seq: 0,
-                last_snapshot: Arc::new(RefreshSnapshot::default()),
-                issue_cache: IssueCache::new(),
-                search_results: None,
-                issue_fetch_mutex: Arc::new(Mutex::new(())),
-                last_broadcast_providers: ProviderData::default(),
-                last_broadcast_health: HashMap::new(),
-                last_broadcast_errors: Vec::new(),
-                delta_log: VecDeque::new(),
-                local_data_version: 0,
-            });
+            repos.insert(
+                synthetic_path.clone(),
+                RepoState {
+                    model,
+                    slug: None,
+                    repo_bag: EnvironmentBag::new(),
+                    unmet: Vec::new(),
+                    seq: 0,
+                    last_snapshot: Arc::new(RefreshSnapshot::default()),
+                    issue_cache: IssueCache::new(),
+                    search_results: None,
+                    issue_fetch_mutex: Arc::new(Mutex::new(())),
+                    last_broadcast_providers: ProviderData::default(),
+                    last_broadcast_health: HashMap::new(),
+                    last_broadcast_errors: Vec::new(),
+                    delta_log: VecDeque::new(),
+                    local_data_version: 0,
+                },
+            );
             order.push(synthetic_path.clone());
         }
 
@@ -1280,12 +1282,8 @@ impl DaemonHandle for InProcessDaemon {
             match plan {
                 ExecutionPlan::Immediate(result) => {
                     refresh_trigger.notify_one();
-                    let _ = event_tx.send(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        host: command_host.clone(),
-                        repo: repo_path,
-                        result,
-                    });
+                    let _ =
+                        event_tx.send(DaemonEvent::CommandFinished { command_id: id, host: command_host.clone(), repo: repo_path, result });
                 }
                 ExecutionPlan::Steps(step_plan) => {
                     // Reject if another step command is already running.
@@ -1314,12 +1312,7 @@ impl DaemonHandle for InProcessDaemon {
                     if guard.as_ref().map(|a| a.command_id) == Some(id) {
                         *guard = None;
                     }
-                    let _ = event_tx.send(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        host: command_host,
-                        repo: repo_path,
-                        result,
-                    });
+                    let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, host: command_host, repo: repo_path, result });
                 }
             }
         });
@@ -1420,22 +1413,25 @@ impl DaemonHandle for InProcessDaemon {
             if repos.contains_key(&path) {
                 return Ok(());
             }
-            repos.insert(path.clone(), RepoState {
-                model,
-                slug,
-                repo_bag,
-                unmet,
-                seq: 0,
-                last_snapshot: Arc::new(RefreshSnapshot::default()),
-                issue_cache: IssueCache::new(),
-                search_results: None,
-                issue_fetch_mutex: Arc::new(Mutex::new(())),
-                last_broadcast_providers: ProviderData::default(),
-                last_broadcast_health: HashMap::new(),
-                last_broadcast_errors: Vec::new(),
-                delta_log: VecDeque::new(),
-                local_data_version: 0,
-            });
+            repos.insert(
+                path.clone(),
+                RepoState {
+                    model,
+                    slug,
+                    repo_bag,
+                    unmet,
+                    seq: 0,
+                    last_snapshot: Arc::new(RefreshSnapshot::default()),
+                    issue_cache: IssueCache::new(),
+                    search_results: None,
+                    issue_fetch_mutex: Arc::new(Mutex::new(())),
+                    last_broadcast_providers: ProviderData::default(),
+                    last_broadcast_health: HashMap::new(),
+                    last_broadcast_errors: Vec::new(),
+                    delta_log: VecDeque::new(),
+                    local_data_version: 0,
+                },
+            );
             order.push(path.clone());
         }
 
@@ -1734,21 +1730,27 @@ mod tests {
         let base = ProviderData::default();
 
         let mut cache = IssueCache::new();
-        cache.add_pinned(vec![("1".into(), Issue {
-            title: "cached".into(),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        })]);
+        cache.add_pinned(vec![(
+            "1".into(),
+            Issue {
+                title: "cached".into(),
+                labels: vec![],
+                association_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            },
+        )]);
 
-        let search_results = Some(vec![("2".into(), Issue {
-            title: "search".into(),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        })]);
+        let search_results = Some(vec![(
+            "2".into(),
+            Issue {
+                title: "search".into(),
+                labels: vec![],
+                association_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            },
+        )]);
 
         let from_search = inject_issues(&base, &cache, &search_results);
         assert_eq!(from_search.issues.len(), 1);
@@ -1820,13 +1822,16 @@ mod tests {
         let mut cache = IssueCache::new();
         cache.total_count = Some(5);
         cache.has_more = true;
-        cache.add_pinned(vec![("9".into(), Issue {
-            title: "cached issue".into(),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        })]);
+        cache.add_pinned(vec![(
+            "9".into(),
+            Issue {
+                title: "cached issue".into(),
+                labels: vec![],
+                association_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            },
+        )]);
 
         let snap = build_repo_snapshot(Path::new("/tmp/repo"), 7, &RefreshSnapshot::default(), &cache, &None, &HostName::local());
         assert_eq!(snap.seq, 7);
