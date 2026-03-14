@@ -168,6 +168,36 @@ pub struct VisibleStatusItem {
     pub text: String,
 }
 
+fn error_status_item(message: &str) -> VisibleStatusItem {
+    VisibleStatusItem { id: 0, text: format!("ERROR {}", message) }
+}
+
+fn peer_status_item(index: usize, peer: &PeerHostStatus) -> Option<VisibleStatusItem> {
+    let label = match peer.status {
+        PeerStatus::Disconnected => "HOST DOWN",
+        PeerStatus::Connecting => "HOST CONNECTING",
+        PeerStatus::Reconnecting => "HOST RECONNECTING",
+        PeerStatus::Connected => return None,
+    };
+    Some(VisibleStatusItem { id: index + 1, text: format!("{label} {}", peer.name) })
+}
+
+pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<VisibleStatusItem> {
+    let mut items = vec![];
+
+    if let Some(message) = &model.status_message {
+        items.push(error_status_item(message));
+    }
+
+    for (index, peer) in model.peer_hosts.iter().enumerate() {
+        if let Some(item) = peer_status_item(index, peer) {
+            items.push(item);
+        }
+    }
+
+    items.into_iter().filter(|item| !ui.status_bar.dismissed_status_ids.contains(&item.id)).collect()
+}
+
 /// Log provider errors and format them into a status message.
 ///
 /// Suppresses "issues disabled" messages since the daemon handles those.
@@ -235,24 +265,18 @@ impl App {
     }
 
     pub fn visible_status_items(&self) -> Vec<VisibleStatusItem> {
-        let mut items = vec![];
-
-        if let Some(message) = &self.model.status_message {
-            items.push(VisibleStatusItem { id: 0, text: message.clone() });
-        }
-
-        for (index, peer) in self.model.peer_hosts.iter().enumerate() {
-            if matches!(peer.status, PeerStatus::Connected) {
-                continue;
-            }
-            items.push(VisibleStatusItem { id: index + 1, text: format!("{}: {:?}", peer.name, peer.status) });
-        }
-
-        items.into_iter().filter(|item| !self.ui.status_bar.dismissed_status_ids.contains(&item.id)).collect()
+        collect_visible_status_items(&self.model, &self.ui)
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {
         self.ui.status_bar.dismissed_status_ids.insert(id);
+    }
+
+    fn set_status_message(&mut self, status_message: Option<String>) {
+        if self.model.status_message != status_message {
+            self.ui.status_bar.dismissed_status_ids.remove(&0);
+        }
+        self.model.status_message = status_message;
     }
 
     // ── Daemon event handling ──
@@ -359,7 +383,7 @@ impl App {
         }
 
         // Log and display errors (clears status when errors resolve)
-        self.model.status_message = format_error_status(&snap.errors, &path);
+        self.set_status_message(format_error_status(&snap.errors, &path));
 
         // Request initial issue fetch once per repo (on first snapshot received)
         let rm = self.model.repos.get_mut(&path).unwrap();
@@ -372,6 +396,7 @@ impl App {
 
     fn apply_delta(&mut self, delta: SnapshotDelta) {
         let path = delta.repo;
+        let mut status_message_update = None;
         let rm = match self.model.repos.get_mut(&path) {
             Some(rm) => rm,
             None => return,
@@ -407,7 +432,7 @@ impl App {
                     }
                 }
                 flotilla_protocol::Change::ErrorsChanged(errors) => {
-                    self.model.status_message = format_error_status(errors, &path);
+                    status_message_update = Some(format_error_status(errors, &path));
                 }
                 _ => {}
             }
@@ -453,6 +478,10 @@ impl App {
 
         if let Some(rui) = self.ui.repo_ui.get_mut(&path) {
             rui.update_table_view(table_view);
+        }
+
+        if let Some(status_message) = status_message_update {
+            self.set_status_message(status_message);
         }
     }
 
@@ -741,7 +770,7 @@ mod tests {
     #[test]
     fn dismissing_status_message_hides_only_that_message() {
         let mut app = stub_app();
-        app.model.status_message = Some("rate limit exceeded".into());
+        app.set_status_message(Some("rate limit exceeded".into()));
 
         let id = app.visible_status_items()[0].id;
         app.dismiss_status_item(id);
@@ -750,10 +779,33 @@ mod tests {
     }
 
     #[test]
+    fn new_status_message_reappears_after_dismissing_old_one() {
+        let mut app = stub_app();
+        app.set_status_message(Some("old error".into()));
+        app.dismiss_status_item(0);
+
+        app.set_status_message(Some("new error".into()));
+
+        assert_eq!(app.visible_status_items(), vec![VisibleStatusItem { id: 0, text: "ERROR new error".into() }]);
+    }
+
+    #[test]
+    fn visible_status_items_use_shared_error_and_peer_labels() {
+        let mut app = stub_app();
+        app.set_status_message(Some("boom".into()));
+        app.model.peer_hosts = vec![PeerHostStatus { name: flotilla_protocol::HostName::new("host-a"), status: PeerStatus::Disconnected }];
+
+        assert_eq!(app.visible_status_items(), vec![VisibleStatusItem { id: 0, text: "ERROR boom".into() }, VisibleStatusItem {
+            id: 1,
+            text: "HOST DOWN host-a".into()
+        },]);
+    }
+
+    #[test]
     fn apply_snapshot_clears_status_on_no_errors() {
         let mut app = stub_app();
         let repo = active_repo_path(&app);
-        app.model.status_message = Some("old error".into());
+        app.set_status_message(Some("old error".into()));
 
         let snap = snapshot(&repo);
         app.apply_snapshot(snap);

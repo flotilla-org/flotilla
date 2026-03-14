@@ -14,8 +14,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        BranchInputKind, InFlightCommand, PeerHostStatus, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiModel, UiMode, UiState,
-        VisibleStatusItem,
+        collect_visible_status_items, BranchInputKind, InFlightCommand, PeerHostStatus, PeerStatus, ProviderStatus, RepoViewLayout, TabId,
+        TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
     status_bar::{
@@ -292,7 +292,7 @@ fn status_bar_content(
     ui: &UiState,
     in_flight: &HashMap<u64, InFlightCommand>,
 ) -> (StatusSection, Vec<KeyChip>, Option<TaskSection>) {
-    let visible_error = first_visible_status_item(model, ui);
+    let visible_error = collect_visible_status_items(model, ui).into_iter().next();
 
     match &ui.mode {
         UiMode::Normal => {
@@ -378,33 +378,6 @@ fn status_bar_content(
             None,
         ),
     }
-}
-
-fn first_visible_status_item(model: &TuiModel, ui: &UiState) -> Option<VisibleStatusItem> {
-    if let Some(message) = &model.status_message {
-        if !ui.status_bar.dismissed_status_ids.contains(&0) {
-            return Some(VisibleStatusItem { id: 0, text: format!("ERROR {}", message) });
-        }
-    }
-
-    for (index, peer) in model.peer_hosts.iter().enumerate() {
-        if matches!(peer.status, PeerStatus::Connected) {
-            continue;
-        }
-        let id = index + 1;
-        if ui.status_bar.dismissed_status_ids.contains(&id) {
-            continue;
-        }
-        let label = match peer.status {
-            PeerStatus::Disconnected => "HOST DOWN",
-            PeerStatus::Connecting => "HOST CONNECTING",
-            PeerStatus::Reconnecting => "HOST RECONNECTING",
-            PeerStatus::Connected => continue,
-        };
-        return Some(VisibleStatusItem { id, text: format!("{label} {}", peer.name) });
-    }
-
-    None
 }
 
 fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<(String, usize)> {

@@ -178,10 +178,15 @@ pub struct StatusBarLayout {
     pub dismiss_targets: Vec<StatusBarTarget>,
 }
 
-#[derive(Default)]
 pub struct StatusBarUiState {
     pub show_keys: bool,
     pub dismissed_status_ids: HashSet<usize>,
+}
+
+impl Default for StatusBarUiState {
+    fn default() -> Self {
+        Self { show_keys: true, dismissed_status_ids: HashSet::new() }
+    }
 }
 
 #[derive(Default)]
@@ -229,7 +234,7 @@ impl UiState {
             mode: UiMode::default(),
             repo_ui,
             view_layout: RepoViewLayout::default(),
-            status_bar: StatusBarUiState { show_keys: true, ..StatusBarUiState::default() },
+            status_bar: StatusBarUiState::default(),
             layout: LayoutAreas::default(),
             drag: DragState::default(),
             double_click: DoubleClickState::default(),
@@ -321,6 +326,11 @@ mod tests {
     fn ui_state_defaults_to_showing_status_bar_keys() {
         let state = UiState::new(&[]);
         assert!(state.status_bar.show_keys);
+    }
+
+    #[test]
+    fn status_bar_ui_state_defaults_to_showing_keys() {
+        assert!(StatusBarUiState::default().show_keys);
     }
 
     #[test]
