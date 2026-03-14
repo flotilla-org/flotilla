@@ -13,6 +13,7 @@ color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+libc = "0.2"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tui-input = "0.15"

@@ -2,7 +2,7 @@ use std::{io::stdout, time::Duration};
 
 use color_eyre::Result;
 use crossterm::{
-    event::{EnableMouseCapture, KeyCode, MouseButton, MouseEventKind},
+    event::{EnableMouseCapture, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
 };
 
@@ -86,6 +86,16 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     app.handle_daemon_event(*daemon_evt);
                 }
                 Event::Key(k) => {
+                    // Ctrl-Z: suspend/resume (unix only)
+                    #[cfg(unix)]
+                    if k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                        match crate::terminal::suspend_and_resume() {
+                            Ok(new_terminal) => terminal = new_terminal,
+                            Err(e) => tracing::warn!(err = %e, "suspend/resume failed"),
+                        }
+                        continue;
+                    }
+
                     let is_normal = matches!(app.ui.mode, UiMode::Normal);
                     if k.code == KeyCode::Char('r') && is_normal {
                         let repo = app.model.active_repo_root().clone();
