@@ -2,10 +2,13 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::RepoIdentity;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoSelector {
     Path(PathBuf),
     Query(String),
+    Identity(RepoIdentity),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,7 +166,13 @@ pub enum CommandResult {
     Refreshed { repos: Vec<PathBuf> },
     CheckoutCreated { branch: String, path: PathBuf },
     CheckoutRemoved { branch: String },
-    TerminalPrepared { target_host: crate::HostName, branch: String, checkout_path: PathBuf, commands: Vec<PreparedTerminalCommand> },
+    TerminalPrepared {
+        repo_identity: RepoIdentity,
+        target_host: crate::HostName,
+        branch: String,
+        checkout_path: PathBuf,
+        commands: Vec<PreparedTerminalCommand>,
+    },
     BranchNameGenerated { name: String, issue_ids: Vec<(String, String)> },
     CheckoutStatus(CheckoutStatus),
     Error { message: String },
@@ -195,7 +204,11 @@ pub struct CheckoutStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_helpers::assert_json_roundtrip, HostName};
+    use crate::{test_helpers::assert_json_roundtrip, HostName, RepoIdentity};
+
+    fn repo_identity() -> RepoIdentity {
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
+    }
 
     #[test]
     fn command_roundtrip_covers_all_variants() {
@@ -232,7 +245,7 @@ mod tests {
             },
             Command {
                 host: Some(HostName::new("desktop")),
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+                context_repo: Some(RepoSelector::Identity(repo_identity())),
                 action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/remote/repo/feat-x") },
             },
             Command {
@@ -251,7 +264,7 @@ mod tests {
             },
             Command {
                 host: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+                context_repo: Some(RepoSelector::Identity(repo_identity())),
                 action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repo/wt") },
             },
             Command { host: None, context_repo: None, action: CommandAction::SelectWorkspace { ws_ref: "ws://1".into() } },
@@ -290,7 +303,7 @@ mod tests {
             },
             Command {
                 host: Some(HostName::new("feta")),
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+                context_repo: Some(RepoSelector::Identity(repo_identity())),
                 action: CommandAction::TeleportSession {
                     session_id: "session-1".into(),
                     branch: Some("feat-x".into()),
@@ -337,6 +350,7 @@ mod tests {
             CommandResult::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/repos/project/wt-1") },
             CommandResult::CheckoutRemoved { branch: "feat-old".into() },
             CommandResult::TerminalPrepared {
+                repo_identity: repo_identity(),
                 target_host: HostName::new("desktop"),
                 branch: "feat-x".into(),
                 checkout_path: PathBuf::from("/remote/repo/feat-x"),
@@ -366,6 +380,11 @@ mod tests {
         let result = CommandResult::CheckoutCreated { branch: "x".into(), path: PathBuf::from("/tmp/x") };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("checkout_created"));
+    }
+
+    #[test]
+    fn repo_selector_identity_roundtrip() {
+        assert_json_roundtrip(&RepoSelector::Identity(repo_identity()));
     }
 
     #[test]

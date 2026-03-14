@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    host::{HostName, HostPath},
+    host::{HostName, HostPath, RepoIdentity},
     provider_data::{Issue, ProviderData},
 };
 
@@ -45,6 +45,7 @@ pub struct RepoLabels {
 /// Repo info for list_repos response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
+    pub identity: RepoIdentity,
     pub path: PathBuf,
     pub name: String,
     pub labels: RepoLabels,
@@ -57,6 +58,7 @@ pub struct RepoInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub seq: u64,
+    pub repo_identity: RepoIdentity,
     pub repo: PathBuf,
     /// The daemon's host identity.
     pub host_name: HostName,
@@ -168,6 +170,7 @@ mod tests {
         assert_json_roundtrip(&labels);
 
         let info = RepoInfo {
+            identity: RepoIdentity { authority: "github.com".into(), path: "owner/test".into() },
             path: PathBuf::from("/repos/test"),
             name: "test".into(),
             labels,
@@ -180,6 +183,7 @@ mod tests {
         };
         let json = serde_json::to_string(&info).expect("serialize");
         let decoded: RepoInfo = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.identity, RepoIdentity { authority: "github.com".into(), path: "owner/test".into() });
         assert_eq!(decoded.path, PathBuf::from("/repos/test"));
         assert_eq!(decoded.name, "test");
         assert!(decoded.loading);
@@ -198,6 +202,7 @@ mod tests {
     fn snapshot_roundtrip_covers_empty_and_populated() {
         let empty = Snapshot {
             seq: 0,
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/empty".into() },
             repo: PathBuf::from("/repos/empty"),
             host_name: HostName::new("test-host"),
             work_items: vec![],
@@ -211,10 +216,12 @@ mod tests {
         let json = serde_json::to_string(&empty).expect("serialize");
         let decoded_empty: Snapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded_empty.seq, 0);
+        assert_eq!(decoded_empty.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/empty".into() });
         assert!(decoded_empty.work_items.is_empty());
 
         let populated = Snapshot {
             seq: 42,
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/project".into() },
             repo: PathBuf::from("/repos/project"),
             host_name: HostName::new("test-host"),
             work_items: vec![
