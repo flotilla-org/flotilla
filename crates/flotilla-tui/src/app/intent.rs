@@ -824,34 +824,28 @@ mod tests {
         let mut app = stub_app();
 
         let mut providers = ProviderData::default();
-        providers.change_requests.insert(
-            "42".into(),
-            ChangeRequest {
-                title: "Fix bug".into(),
-                branch: "feat/x".into(),
-                status: ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                // PR already has issue "10" linked
-                association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
+        providers.change_requests.insert("42".into(), ChangeRequest {
+            title: "Fix bug".into(),
+            branch: "feat/x".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            // PR already has issue "10" linked
+            association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
         let co_path = HostPath::new(HostName::local(), PathBuf::from("/tmp/feat-x"));
-        providers.checkouts.insert(
-            co_path.clone(),
-            Checkout {
-                branch: "feat/x".into(),
-                is_main: false,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone())],
-                association_keys: checkout_issue_ids.iter().map(|id| AssociationKey::IssueRef("gh".into(), (*id).into())).collect(),
-            },
-        );
+        providers.checkouts.insert(co_path.clone(), Checkout {
+            branch: "feat/x".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone())],
+            association_keys: checkout_issue_ids.iter().map(|id| AssociationKey::IssueRef("gh".into(), (*id).into())).collect(),
+        });
 
         app.model.repos.get_mut(&PathBuf::from("/tmp/test-repo")).unwrap().providers = Arc::new(providers);
 
@@ -1044,19 +1038,16 @@ mod tests {
         let repo = app.model.repo_order[0].clone();
         let rm = app.model.repos.get_mut(&repo).unwrap();
         let mut providers = ProviderData::default();
-        providers.change_requests.insert(
-            "55".to_string(),
-            flotilla_protocol::ChangeRequest {
-                title: "My PR".into(),
-                branch: "feat/x".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            },
-        );
+        providers.change_requests.insert("55".to_string(), flotilla_protocol::ChangeRequest {
+            title: "My PR".into(),
+            branch: "feat/x".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        });
         rm.providers = Arc::new(providers);
 
         let item = pr_item("55");
@@ -1074,19 +1065,16 @@ mod tests {
         let repo = app.model.repo_order[0].clone();
         let rm = app.model.repos.get_mut(&repo).unwrap();
         let mut providers = ProviderData::default();
-        providers.change_requests.insert(
-            "56".to_string(),
-            flotilla_protocol::ChangeRequest {
-                title: "Done PR".into(),
-                branch: "feat/done".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Merged,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            },
-        );
+        providers.change_requests.insert("56".to_string(), flotilla_protocol::ChangeRequest {
+            title: "Done PR".into(),
+            branch: "feat/done".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Merged,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        });
         rm.providers = Arc::new(providers);
 
         let item = pr_item("56");

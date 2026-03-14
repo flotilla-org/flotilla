@@ -9,9 +9,8 @@ use flotilla_protocol::{CheckoutStatus, WorkItemIdentity};
 use ratatui::{layout::Rect, widgets::TableState};
 use tui_input::Input;
 
-use crate::status_bar::StatusBarTarget;
-
 use super::intent::Intent;
+use crate::status_bar::StatusBarTarget;
 
 #[derive(Clone)]
 pub struct DirEntry {

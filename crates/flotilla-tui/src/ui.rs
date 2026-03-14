@@ -19,7 +19,8 @@ use crate::{
     },
     event_log::{self, LevelExt},
     status_bar::{
-        KeyChip, StatusBarAction, StatusBarInput, StatusBarModel, StatusBarTarget, StatusSection, TaskSection, DEFAULT_STATUS_WIDTH_BUDGET,
+        KeyChip, StatusBarAction, StatusBarInput, StatusBarModel, StatusBarTarget, StatusSection, TaskSection, CHEVRON_SEPARATOR,
+        DEFAULT_STATUS_WIDTH_BUDGET,
     },
     ui_helpers,
 };
@@ -254,13 +255,13 @@ fn render_status_bar(model: &TuiModel, ui: &mut UiState, in_flight: &HashMap<u64
 
     for chip in &status_model.visible_keys {
         let ribbon_start = x;
-        spans.push(Span::styled("", Style::default().fg(Color::Black).bg(Color::DarkGray)));
+        spans.push(Span::styled(CHEVRON_SEPARATOR, Style::default().fg(Color::Black).bg(Color::DarkGray)));
         spans.push(Span::styled(" ", Style::default().fg(Color::Black).bg(Color::DarkGray)));
         spans.push(Span::styled("<", Style::default().fg(Color::Black).bg(Color::DarkGray).bold()));
         spans.push(Span::styled(chip.key.clone(), Style::default().fg(Color::Indexed(208)).bg(Color::DarkGray).bold()));
         spans.push(Span::styled(">", Style::default().fg(Color::Black).bg(Color::DarkGray).bold()));
         spans.push(Span::styled(format!(" {} ", chip.label), Style::default().fg(Color::Black).bg(Color::DarkGray).bold()));
-        spans.push(Span::styled("", Style::default().fg(Color::DarkGray).bg(Color::Black)));
+        spans.push(Span::styled(CHEVRON_SEPARATOR, Style::default().fg(Color::DarkGray).bg(Color::Black)));
 
         ui.layout.status_bar.key_targets.push(StatusBarTarget::new(
             Rect::new(area.x + ribbon_start as u16, area.y, chip.ribbon_width() as u16, 1),

@@ -5,9 +5,8 @@ use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
-use crate::status_bar::StatusBarAction;
-
 use super::{App, BranchInputKind, ClearDispatch, Intent, UiMode};
+use crate::status_bar::StatusBarAction;
 
 impl App {
     // ── Key handling ──
@@ -525,8 +524,10 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{super::RepoViewLayout, *};
-    use crate::app::test_support::{checkout_item, key, setup_selectable_table as setup_table, stub_app};
-    use crate::status_bar::{StatusBarAction, StatusBarTarget};
+    use crate::{
+        app::test_support::{checkout_item, key, setup_selectable_table as setup_table, stub_app},
+        status_bar::{StatusBarAction, StatusBarTarget},
+    };
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::local(), PathBuf::from(path))

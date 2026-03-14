@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const CHEVRON_SEPARATOR: &str = "";
 pub const DEFAULT_STATUS_WIDTH_BUDGET: usize = 28;
@@ -186,7 +186,7 @@ fn ellipsize(text: &str, max_width: usize) -> String {
     let mut result = String::new();
     let mut used = 0;
     for ch in text.chars() {
-        let glyph_width = ch.to_string().width();
+        let glyph_width = ch.width().unwrap_or(0);
         if used + glyph_width >= max_width {
             break;
         }
