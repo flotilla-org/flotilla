@@ -96,7 +96,10 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
         CommandResult::CheckoutStatus(info) => {
             let (terminal_keys, identity) = match &app.ui.mode {
                 UiMode::DeleteConfirm { terminal_keys, identity, .. } => (terminal_keys.clone(), identity.clone()),
-                _ => (vec![], WorkItemIdentity::Session(String::new())),
+                other => {
+                    tracing::warn!(mode = ?std::mem::discriminant(other), "CheckoutStatus arrived outside DeleteConfirm");
+                    (vec![], WorkItemIdentity::Session(String::new()))
+                }
             };
             app.ui.mode = UiMode::DeleteConfirm { info: Some(info), loading: false, terminal_keys, identity };
         }

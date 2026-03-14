@@ -1061,6 +1061,30 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirm_attaches_pending_context() {
+        let mut app = stub_app();
+        let item = make_work_item("a");
+        app.ui.mode = UiMode::DeleteConfirm {
+            info: Some(CheckoutStatus {
+                branch: "feat/a".into(),
+                change_request_status: None,
+                merge_commit_sha: None,
+                unpushed_commits: vec![],
+                has_uncommitted: false,
+                uncommitted_files: vec![],
+                base_detection_warning: None,
+            }),
+            loading: false,
+            terminal_keys: vec![],
+            identity: item.identity.clone(),
+        };
+        app.handle_key(key(KeyCode::Char('y')));
+        let (_, ctx) = app.proto_commands.take_next().expect("should have command");
+        let ctx = ctx.expect("should have pending context");
+        assert_eq!(ctx.identity, item.identity);
+    }
+
+    #[test]
     fn delete_confirm_ignores_while_loading() {
         let mut app = stub_app();
         app.ui.mode =
