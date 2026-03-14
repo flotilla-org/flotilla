@@ -2,9 +2,10 @@ use flotilla_protocol::{HostName, ProviderData};
 
 /// Merge local ProviderData with peer data from remote hosts.
 ///
-/// Host-scoped data (checkouts, managed terminals) is combined from all hosts.
-/// Checkouts already carry HostPath keys, so no additional namespacing is needed.
-/// Terminal names are prefixed with the peer host name to avoid collisions.
+/// Host-scoped data is merged with ownership-aware rules:
+/// - checkouts are accepted only from the host that owns the `HostPath`
+/// - local-host checkouts are never overwritten by peer data
+/// - managed terminals and workspaces are namespaced by peer host to avoid collisions
 ///
 /// Service-level data (change_requests, issues, sessions) comes only
 /// from the leader — followers don't poll external APIs, so there are no

@@ -155,4 +155,16 @@ mod tests {
         assert_eq!(merged.checkouts.len(), 1);
         assert_eq!(merged.checkouts[&host_path].branch, "new-branch");
     }
+
+    #[test]
+    fn merge_drops_checkout_claimed_for_third_party_host() {
+        let local = ProviderData::default();
+        let spoofed_path = HostPath::new(HostName::new("server"), "/repo");
+        let remote =
+            ProviderData { checkouts: IndexMap::from([(spoofed_path.clone(), make_checkout("spoofed-branch"))]), ..Default::default() };
+
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
+
+        assert!(!merged.checkouts.contains_key(&spoofed_path), "peer-owned merge should reject checkout data for a third-party host path");
+    }
 }

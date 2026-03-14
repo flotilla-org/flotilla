@@ -300,6 +300,8 @@ async fn daemon_snapshot_includes_follower_checkout_overlay() {
     let mut follower_data = ProviderData::default();
     follower_data.checkouts.insert(follower_checkout.clone(), make_checkout("feature-x"));
 
+    // `set_peer_providers` updates the overlay and rebuilds the snapshot synchronously,
+    // so `get_state` can assert on the merged view immediately.
     daemon.set_peer_providers(&repo, vec![(follower_host.clone(), follower_data)]).await;
 
     let snapshot = daemon.get_state(&repo).await.expect("get_state");

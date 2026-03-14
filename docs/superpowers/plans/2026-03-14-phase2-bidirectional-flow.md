@@ -18,20 +18,20 @@
 - Modify: `crates/flotilla-core/src/merge.rs`
 - Test: `crates/flotilla-daemon/src/peer/merge.rs`
 
-- [ ] **Step 1: Write failing merge tests for host-owned precedence**
+- [x] **Step 1: Write failing merge tests for host-owned precedence**
 
 Add tests in `crates/flotilla-daemon/src/peer/merge.rs` covering:
 - local checkout for `HostPath(local_host, "/repo")` is not overwritten by peer data for the same host path
 - peer checkout for `HostPath(peer_host, "/repo")` overwrites stale local data for that same peer-owned host path
 - service-level data remains local-first when peers provide duplicates
 
-- [ ] **Step 2: Run the targeted merge tests to verify failure**
+- [x] **Step 2: Run the targeted merge tests to verify failure**
 
 Run: `cargo test -p flotilla-daemon --locked peer::merge::tests:: -- --nocapture`
 
 Expected: New assertions fail because `merge_provider_data()` still treats `local_host` as unused placeholder state.
 
-- [ ] **Step 3: Implement host-aware merge rules**
+- [x] **Step 3: Implement host-aware merge rules**
 
 Update `crates/flotilla-core/src/merge.rs` so that:
 - `local_host` is actively used
@@ -40,13 +40,13 @@ Update `crates/flotilla-core/src/merge.rs` so that:
 - existing namespacing for peer terminals and workspaces stays unchanged
 - branch behavior remains conservative/local-first
 
-- [ ] **Step 4: Run the targeted merge tests to verify pass**
+- [x] **Step 4: Run the targeted merge tests to verify pass**
 
 Run: `cargo test -p flotilla-daemon --locked peer::merge::tests:: -- --nocapture`
 
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/flotilla-core/src/merge.rs crates/flotilla-daemon/src/peer/merge.rs
@@ -60,20 +60,20 @@ git commit -m "feat: add host-aware peer merge semantics"
 **Files:**
 - Modify: `crates/flotilla-daemon/src/peer/channel_tests.rs`
 
-- [ ] **Step 1: Add failing channel/relay tests for reverse-direction behavior if gaps remain**
+- [x] **Step 1: Add failing channel/relay tests for reverse-direction behavior if gaps remain**
 
 Review existing channel tests and add only missing cases needed to prove `#267`, for example:
 - follower-origin snapshot relays through an intermediate peer and is stored by the leader
 - duplicate follower snapshot clocks do not create repeat application after relay
 - leader and follower can each originate snapshots for the same repo identity without transport-level breakage
 
-- [ ] **Step 2: Run the targeted channel tests**
+- [x] **Step 2: Run the targeted channel tests**
 
 Run: `cargo test -p flotilla-daemon --locked peer::channel_tests:: -- --nocapture`
 
 Expected: Either PASS immediately (evidence that transport was already correct) or fail on the newly added coverage.
 
-- [ ] **Step 3: Implement only the minimal transport/peer-manager glue if the tests reveal a real gap**
+- [x] **Step 3: Implement only the minimal transport/peer-manager glue if the tests reveal a real gap**
 
 Possible touch points if required:
 - `crates/flotilla-daemon/src/peer_networking.rs`
@@ -81,13 +81,13 @@ Possible touch points if required:
 
 Do not add new protocol types. Only fix concrete gaps proved by tests.
 
-- [ ] **Step 4: Re-run the targeted channel tests**
+- [x] **Step 4: Re-run the targeted channel tests**
 
 Run: `cargo test -p flotilla-daemon --locked peer::channel_tests:: -- --nocapture`
 
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/flotilla-daemon/src/peer/channel_tests.rs crates/flotilla-daemon/src/peer_networking.rs crates/flotilla-daemon/src/peer/manager.rs
@@ -103,14 +103,14 @@ git commit -m "test: prove bidirectional peer snapshot flow"
 - Modify: `crates/flotilla-daemon/src/server.rs`
 - Optional Modify: `crates/flotilla-daemon/src/peer_networking.rs`
 
-- [ ] **Step 1: Add failing daemon-level tests for follower-to-leader ingestion**
+- [x] **Step 1: Add failing daemon-level tests for follower-to-leader ingestion**
 
 In `crates/flotilla-daemon/tests/multi_host.rs` and/or `crates/flotilla-daemon/src/server.rs`, cover:
 - leader overlay rebuild when follower snapshot updates an existing local repo identity
 - remote-only repo rebuild remains correct after follower-origin updates
 - no accidental dependence on ambient tool detection in these daemon tests
 
-- [ ] **Step 2: Run the affected daemon tests to verify current behavior**
+- [x] **Step 2: Run the affected daemon tests to verify current behavior**
 
 Run:
 - `cargo test -p flotilla-daemon --locked --test multi_host -- --nocapture`
@@ -118,7 +118,7 @@ Run:
 
 Expected: Any missing integration behavior shows up here.
 
-- [ ] **Step 3: Implement only the minimal daemon-side fixes if needed**
+- [x] **Step 3: Implement only the minimal daemon-side fixes if needed**
 
 Likely areas:
 - `crates/flotilla-daemon/src/peer_networking.rs` for overlay rebuild/update behavior
@@ -126,7 +126,7 @@ Likely areas:
 
 Do not broaden scope into host metadata or inventory work.
 
-- [ ] **Step 4: Re-run the affected daemon tests**
+- [x] **Step 4: Re-run the affected daemon tests**
 
 Run:
 - `cargo test -p flotilla-daemon --locked --test multi_host -- --nocapture`
@@ -134,7 +134,7 @@ Run:
 
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/flotilla-daemon/tests/multi_host.rs crates/flotilla-daemon/src/server.rs crates/flotilla-daemon/src/peer_networking.rs
@@ -148,7 +148,7 @@ git commit -m "feat: verify leader ingest of follower peer data"
 **Files:**
 - Modify: none expected
 
-- [ ] **Step 1: Run formatting/lint verification on touched files**
+- [x] **Step 1: Run formatting/lint verification on touched files**
 
 Run:
 - `cargo +nightly fmt --check`
@@ -156,13 +156,13 @@ Run:
 
 Expected: PASS
 
-- [ ] **Step 2: Run the full workspace tests**
+- [x] **Step 2: Run the full workspace tests**
 
 Run: `cargo test --workspace --locked`
 
 Expected: PASS
 
-- [ ] **Step 3: Run diff sanity checks**
+- [x] **Step 3: Run diff sanity checks**
 
 Run:
 - `git diff --check`
@@ -170,7 +170,7 @@ Run:
 
 Expected: No whitespace errors; only intended files modified.
 
-- [ ] **Step 4: Final commit if verification required follow-up changes**
+- [x] **Step 4: Final commit if verification required follow-up changes**
 
 ```bash
 git add <touched-files>
