@@ -158,9 +158,21 @@ impl PeerNetworkingTask {
                     let peer_connected_tx_clone = peer_connected_tx_for_ssh.clone();
 
                     tokio::spawn(async move {
+                        // Track the remote daemon's session ID to detect restarts.
+                        // When session_id changes on reconnect, stale peer data must
+                        // be cleared before the new connection is used.
+                        let mut last_known_session_id: Option<uuid::Uuid> = None;
+
                         // Forward from initial connection if available
                         if let Some((generation, mut inbound_rx)) = initial_rx {
                             let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
+
+                            // Save initial session ID
+                            last_known_session_id = {
+                                let pm_lock = pm.lock().await;
+                                pm_lock.peer_session_id(&peer_name)
+                            };
+
                             let sender = {
                                 let pm_lock = pm.lock().await;
                                 pm_lock.get_sender_if_current(&peer_name, generation)
@@ -225,6 +237,26 @@ impl PeerNetworkingTask {
                             match reconnect_result {
                                 Ok((generation, mut inbound_rx)) => {
                                     info!(peer = %peer_name, "reconnected successfully");
+
+                                    // Detect remote daemon restart by comparing session IDs.
+                                    // reconnect_peer() does NOT call disconnect_peer() — it only
+                                    // does transport.disconnect() which does NOT clear stale peer
+                                    // data. When session_id changes, explicitly clear stale data.
+                                    let current_session_id = {
+                                        let pm_lock = pm.lock().await;
+                                        pm_lock.peer_session_id(&peer_name)
+                                    };
+                                    if let (Some(prev), Some(curr)) = (last_known_session_id, current_session_id) {
+                                        if prev != curr {
+                                            info!(
+                                                peer = %peer_name,
+                                                "remote daemon restarted (session_id changed), clearing stale data"
+                                            );
+                                            disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
+                                        }
+                                    }
+                                    last_known_session_id = current_session_id;
+
                                     daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
                                         host: peer_name.clone(),
                                         status: PeerConnectionState::Connected,

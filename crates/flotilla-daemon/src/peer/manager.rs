@@ -279,6 +279,11 @@ impl PeerManager {
         self.active_connections.get(host).and_then(|c| c.session_id)
     }
 
+    /// Return the remote session ID from the transport's last handshake, if any.
+    pub fn transport_remote_session_id(&self, name: &HostName) -> Option<uuid::Uuid> {
+        self.peers.get(name).and_then(|t| t.remote_session_id())
+    }
+
     pub fn reconnect_suppressed_until(&mut self, name: &HostName) -> Option<Instant> {
         match self.reconnect_suppressed_until.get(name).copied() {
             Some(deadline) if deadline > Instant::now() => Some(deadline),
