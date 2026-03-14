@@ -100,7 +100,10 @@ impl CloudAgentService for SlowCloudAgent {
 
     async fn archive_session(&self, _: &str) -> Result<(), String> {
         // The test waits for this notification before cancelling, so this must
-        // fire after the provider future is actively running.
+        // fire after the provider future is actively running. notify_waiters()
+        // is not buffered; if release_archive() runs before notified().await
+        // below, the wakeup is lost and the timeout in wait_for_archive_start()
+        // is the only backstop against a hang.
         self.archive_started.notify_waiters();
         self.archive_release.notified().await;
         Ok(())
@@ -163,7 +166,10 @@ impl SlowAiUtility {
 impl AiUtility for SlowAiUtility {
     async fn generate_branch_name(&self, _: &str) -> Result<String, String> {
         // The test waits for this notification before cancelling, so this must
-        // fire after the provider future is actively running.
+        // fire after the provider future is actively running. notify_waiters()
+        // is not buffered; if release_generation() runs before notified().await
+        // below, the wakeup is lost and the timeout in wait_for_generation_start()
+        // is the only backstop against a hang.
         self.generation_started.notify_waiters();
         self.generation_release.notified().await;
         Ok("feat/slow-branch".into())
