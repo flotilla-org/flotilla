@@ -6,8 +6,8 @@ use std::{
 };
 
 use flotilla_protocol::{
-    ConfigLabel, GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage,
-    VectorClock,
+    Command, CommandPeerEvent, CommandResult, ConfigLabel, GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage,
+    ProviderData, RepoIdentity, RoutedPeerMessage, VectorClock,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -38,6 +38,12 @@ pub enum HandleResult {
     /// A delta was received but cannot be applied (seq gap or not yet implemented).
     /// Caller should request a full resync from the origin.
     NeedsResync { from: HostName, repo: RepoIdentity },
+    /// A routed command targeted this daemon and should be executed locally.
+    CommandRequested { request_id: u64, requester_host: HostName, reply_via: HostName, command: Command },
+    /// A routed command lifecycle event reached the original requester.
+    CommandEventReceived { request_id: u64, responder_host: HostName, event: CommandPeerEvent },
+    /// A routed command completed and the final result reached the requester.
+    CommandResponseReceived { request_id: u64, responder_host: HostName, result: CommandResult },
     /// Nothing to do (e.g. message from self).
     Ignored,
 }
@@ -95,6 +101,13 @@ pub struct ReversePathKey {
     pub requester_host: HostName,
     pub target_host: HostName,
     pub repo_identity: RepoIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommandReversePathKey {
+    pub request_id: u64,
+    pub requester_host: HostName,
+    pub target_host: HostName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +174,7 @@ pub struct PeerManager {
     /// TODO: expire abandoned reverse-path entries when routed replies time out
     /// instead of only clearing them on reply delivery or disconnect.
     reverse_paths: HashMap<ReversePathKey, ReversePathHop>,
+    command_reverse_paths: HashMap<CommandReversePathKey, ReversePathHop>,
     /// TODO: sweep overdue requests by deadline_at; today these are removed on
     /// reply, targeted disconnect, or process restart.
     pending_resync_requests: HashMap<ReversePathKey, PendingResyncRequest>,
@@ -198,6 +212,7 @@ impl PeerManager {
             request_id_counter: 0,
             peer_data: HashMap::new(),
             known_remote_repos: HashMap::new(),
+            command_reverse_paths: HashMap::new(),
             last_seen_clocks: HashMap::new(),
         }
     }
@@ -608,8 +623,106 @@ impl PeerManager {
                 self.reverse_paths.remove(&key);
                 HandleResult::Ignored
             }
-            RoutedPeerMessage::CommandRequest { .. } | RoutedPeerMessage::CommandResponse { .. } => {
-                // Routed command forwarding is implemented in a later chunk.
+            RoutedPeerMessage::CommandRequest { request_id, requester_host, target_host, remaining_hops, command } => {
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+                if target_host == self.local_host {
+                    return HandleResult::CommandRequested {
+                        request_id,
+                        requester_host,
+                        reply_via: connection_peer,
+                        command: *command,
+                    };
+                }
+
+                let key = CommandReversePathKey { request_id, requester_host: requester_host.clone(), target_host: target_host.clone() };
+                let learned_at = self.next_route_epoch();
+                self.command_reverse_paths.insert(key, ReversePathHop {
+                    next_hop: connection_peer,
+                    next_hop_generation: connection_generation,
+                    learned_at,
+                });
+
+                let forwarded = RoutedPeerMessage::CommandRequest {
+                    request_id,
+                    requester_host,
+                    target_host: target_host.clone(),
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    command,
+                };
+                let _ = self.send_to(&target_host, PeerWireMessage::Routed(forwarded)).await;
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::CommandEvent { request_id, requester_host, responder_host, remaining_hops, event } => {
+                let key = CommandReversePathKey {
+                    request_id,
+                    requester_host: requester_host.clone(),
+                    target_host: responder_host.clone(),
+                };
+
+                if requester_host == self.local_host {
+                    return HandleResult::CommandEventReceived { request_id, responder_host, event: *event };
+                }
+
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+
+                let Some(reverse_hop) = self.command_reverse_paths.get(&key).cloned() else {
+                    return HandleResult::Ignored;
+                };
+                if !self.generation_is_current(&reverse_hop.next_hop, reverse_hop.next_hop_generation) {
+                    self.command_reverse_paths.remove(&key);
+                    return HandleResult::Ignored;
+                }
+
+                let forwarded = RoutedPeerMessage::CommandEvent {
+                    request_id,
+                    requester_host,
+                    responder_host,
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    event,
+                };
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop) {
+                    let _ = sender.send(PeerWireMessage::Routed(forwarded)).await;
+                }
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::CommandResponse { request_id, requester_host, responder_host, remaining_hops, result } => {
+                let key = CommandReversePathKey {
+                    request_id,
+                    requester_host: requester_host.clone(),
+                    target_host: responder_host.clone(),
+                };
+
+                if requester_host == self.local_host {
+                    return HandleResult::CommandResponseReceived { request_id, responder_host, result: *result };
+                }
+
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+
+                let Some(reverse_hop) = self.command_reverse_paths.get(&key).cloned() else {
+                    return HandleResult::Ignored;
+                };
+                if !self.generation_is_current(&reverse_hop.next_hop, reverse_hop.next_hop_generation) {
+                    self.command_reverse_paths.remove(&key);
+                    return HandleResult::Ignored;
+                }
+
+                let forwarded = RoutedPeerMessage::CommandResponse {
+                    request_id,
+                    requester_host,
+                    responder_host,
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    result,
+                };
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop) {
+                    let _ = sender.send(PeerWireMessage::Routed(forwarded)).await;
+                }
+                self.command_reverse_paths.remove(&key);
                 HandleResult::Ignored
             }
         }
@@ -910,6 +1023,7 @@ impl PeerManager {
         self.generations.remove(name);
         self.displaced_senders.retain(|(host, _), _| host != name);
         self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
+        self.command_reverse_paths.retain(|_, hop| hop.next_hop != *name);
         self.pending_resync_requests.retain(|key, _| key.target_host != *name);
 
         let mut affected_repos = Vec::new();

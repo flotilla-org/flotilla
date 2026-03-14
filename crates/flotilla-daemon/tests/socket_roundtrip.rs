@@ -246,7 +246,7 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
 
     let mut rx = client.subscribe();
     let command_id = client
-        .execute(Command { host: None, repo: None, action: CommandAction::Refresh { repo: None } })
+        .execute(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
         .await
         .expect("execute refresh all");
 

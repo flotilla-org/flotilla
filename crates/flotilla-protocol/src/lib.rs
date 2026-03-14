@@ -9,7 +9,7 @@ pub mod query;
 pub mod snapshot;
 
 pub use host::{HostName, HostPath, RepoIdentity};
-pub use peer::{GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
+pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 
 #[cfg(test)]
 pub(crate) mod test_helpers {

@@ -508,7 +508,7 @@ impl InProcessDaemon {
             | CommandAction::TeleportSession { .. }
             | CommandAction::CreateWorkspaceForCheckout { .. }
             | CommandAction::SelectWorkspace { .. } => {
-                let selector = command.repo.as_ref().ok_or_else(|| "command requires repo context".to_string())?;
+                let selector = command.context_repo.as_ref().ok_or_else(|| "command requires repo context".to_string())?;
                 self.resolve_repo_selector(selector).await
             }
             _ => Err("command does not resolve to a single repo".to_string()),
@@ -1115,7 +1115,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute(&self, command: Command) -> Result<u64, String> {
-        let command_host = command.host.clone().unwrap_or_else(HostName::local);
+        let command_host = command.host.clone().unwrap_or_else(|| self.host_name.clone());
         if command_host != self.host_name {
             return Err(format!("remote command routing not implemented yet for host {command_host}"));
         }
@@ -1282,7 +1282,7 @@ impl DaemonHandle for InProcessDaemon {
                     refresh_trigger.notify_one();
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
-                        host: HostName::local(),
+                        host: command_host.clone(),
                         repo: repo_path,
                         result,
                     });
@@ -1297,7 +1297,7 @@ impl DaemonHandle for InProcessDaemon {
                         if let Some(active) = &*guard {
                             let _ = event_tx.send(DaemonEvent::CommandFinished {
                                 command_id: id,
-                                host: HostName::local(),
+                                host: command_host.clone(),
                                 repo: repo_path,
                                 result: flotilla_protocol::CommandResult::Error {
                                     message: format!("another command is already running (id {})", active.command_id),
@@ -1308,7 +1308,7 @@ impl DaemonHandle for InProcessDaemon {
                         *guard = Some(ActiveCommand { command_id: id, token: token.clone() });
                     }
 
-                    let result = run_step_plan(step_plan, id, repo_path.clone(), token, event_tx.clone()).await;
+                    let result = run_step_plan(step_plan, id, command_host.clone(), repo_path.clone(), token, event_tx.clone()).await;
                     refresh_trigger.notify_one();
                     let mut guard = active_ref.lock().await;
                     if guard.as_ref().map(|a| a.command_id) == Some(id) {
@@ -1316,7 +1316,7 @@ impl DaemonHandle for InProcessDaemon {
                     }
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
-                        host: HostName::local(),
+                        host: command_host,
                         repo: repo_path,
                         result,
                     });

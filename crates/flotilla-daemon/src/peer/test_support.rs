@@ -97,6 +97,12 @@ impl TestNetwork {
     /// Process all pending inbound messages for a single peer.
     /// Replicates the relay-then-handle pattern from server.rs.
     pub async fn process_peer(&mut self, peer_idx: usize) -> usize {
+        self.process_peer_with_results(peer_idx).await.len()
+    }
+
+    /// Process all pending inbound messages for a single peer and return the
+    /// handle results in arrival order.
+    pub async fn process_peer_with_results(&mut self, peer_idx: usize) -> Vec<HandleResult> {
         let mut messages = Vec::new();
         for (connection_peer, gen, receiver) in &mut self.peers[peer_idx].receivers {
             while let Ok(msg) = receiver.try_recv() {
@@ -104,8 +110,8 @@ impl TestNetwork {
             }
         }
 
-        let count = messages.len();
         let peer = &mut self.peers[peer_idx];
+        let mut results = Vec::new();
 
         for (connection_peer, generation, msg) in messages {
             if let PeerWireMessage::Data(ref data_msg) = msg {
@@ -115,10 +121,10 @@ impl TestNetwork {
             }
 
             let env = InboundPeerEnvelope { msg, connection_generation: generation, connection_peer };
-            peer.manager.handle_inbound(env).await;
+            results.push(peer.manager.handle_inbound(env).await);
         }
 
-        count
+        results
     }
 
     /// Process messages across all peers until quiescent.

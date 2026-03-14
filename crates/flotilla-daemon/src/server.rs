@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
-    Command, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message, PeerConnectionState, PeerDataMessage, PeerWireMessage,
-    PROTOCOL_VERSION,
+    Command, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message, PeerConnectionState,
+    PeerDataMessage, PeerWireMessage, RoutedPeerMessage, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -55,6 +55,13 @@ struct PeerConnectedNotice {
     generation: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingRemoteCommand {
+    command_id: u64,
+    repo: Option<PathBuf>,
+    finished_via_event: bool,
+}
+
 /// The daemon server that listens on a Unix socket and dispatches requests
 /// to an `InProcessDaemon`.
 pub struct DaemonServer {
@@ -71,6 +78,8 @@ pub struct DaemonServer {
     peer_data_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
     /// Manages connections to remote peer hosts and stores their provider data.
     peer_manager: Arc<Mutex<PeerManager>>,
+    pending_remote_commands: Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>,
+    next_remote_command_id: Arc<AtomicU64>,
 }
 
 impl DaemonServer {
@@ -134,6 +143,8 @@ impl DaemonServer {
             peer_data_tx,
             peer_data_rx: Some(peer_data_rx),
             peer_manager: Arc::new(Mutex::new(peer_manager)),
+            pending_remote_commands: Arc::new(Mutex::new(HashMap::new())),
+            next_remote_command_id: Arc::new(AtomicU64::new(1 << 62)),
         })
     }
 
@@ -172,6 +183,8 @@ impl DaemonServer {
         let socket_path = self.socket_path.clone();
         let client_notify = self.client_notify;
         let peer_data_tx = self.peer_data_tx;
+        let pending_remote_commands = self.pending_remote_commands;
+        let next_remote_command_id = self.next_remote_command_id;
         let (peer_connected_tx, peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
 
         // Spawn idle timeout watcher (disabled for follower-mode daemons
@@ -219,6 +232,7 @@ impl DaemonServer {
         let peer_data_tx_for_ssh = peer_data_tx.clone();
         let peer_connected_tx_for_ssh = peer_connected_tx.clone();
         let peer_daemon = Arc::clone(&daemon);
+        let pending_remote_commands_task = Arc::clone(&pending_remote_commands);
         tokio::spawn(async move {
             if let Some(mut rx) = peer_data_rx {
                 let mut resync_sweep = tokio::time::interval(Duration::from_secs(5));
@@ -525,6 +539,39 @@ impl DaemonServer {
                         HandleResult::ReconnectSuppressed { peer } => {
                             info!(peer = %peer, "peer requested reconnect suppression");
                         }
+                        HandleResult::CommandRequested { request_id, requester_host, reply_via, command } => {
+                            drop(pm);
+                            tokio::spawn(execute_forwarded_command(
+                                Arc::clone(&peer_daemon),
+                                Arc::clone(&peer_manager_task),
+                                request_id,
+                                requester_host,
+                                reply_via,
+                                command,
+                            ));
+                        }
+                        HandleResult::CommandEventReceived { request_id, responder_host, event } => {
+                            drop(pm);
+                            emit_remote_command_event(
+                                &peer_daemon,
+                                &pending_remote_commands_task,
+                                request_id,
+                                responder_host,
+                                event,
+                            )
+                            .await;
+                        }
+                        HandleResult::CommandResponseReceived { request_id, responder_host, result } => {
+                            drop(pm);
+                            complete_remote_command(
+                                &peer_daemon,
+                                &pending_remote_commands_task,
+                                request_id,
+                                responder_host,
+                                result,
+                            )
+                            .await;
+                        }
                         HandleResult::Ignored => {}
                     }
                         }
@@ -639,6 +686,8 @@ impl DaemonServer {
                             let shutdown_rx = shutdown_rx.clone();
                             let peer_data_tx = peer_data_tx.clone();
                             let peer_manager = Arc::clone(&peer_manager);
+                            let pending_remote_commands = Arc::clone(&pending_remote_commands);
+                            let next_remote_command_id = Arc::clone(&next_remote_command_id);
                             let peer_connected_tx = peer_connected_tx.clone();
 
                             tokio::spawn(async move {
@@ -648,6 +697,8 @@ impl DaemonServer {
                                     shutdown_rx,
                                     peer_data_tx,
                                     peer_manager,
+                                    pending_remote_commands,
+                                    next_remote_command_id,
                                     client_count,
                                     client_notify,
                                     peer_connected_tx,
@@ -745,6 +796,7 @@ async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManager>>, reques
             flotilla_protocol::RoutedPeerMessage::RequestResync { target_host, .. } => target_host.clone(),
             flotilla_protocol::RoutedPeerMessage::ResyncSnapshot { requester_host, .. } => requester_host.clone(),
             flotilla_protocol::RoutedPeerMessage::CommandRequest { target_host, .. } => target_host.clone(),
+            flotilla_protocol::RoutedPeerMessage::CommandEvent { requester_host, .. } => requester_host.clone(),
             flotilla_protocol::RoutedPeerMessage::CommandResponse { requester_host, .. } => requester_host.clone(),
         };
         let sender = {
@@ -762,6 +814,162 @@ async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManager>>, reques
             warn!(peer = %target, err = %e, "failed to dispatch routed resync request");
         }
     }
+}
+
+async fn execute_forwarded_command(
+    daemon: Arc<InProcessDaemon>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+    request_id: u64,
+    requester_host: HostName,
+    reply_via: HostName,
+    command: Command,
+) {
+    let mut event_rx = daemon.subscribe();
+    let responder_host = daemon.host_name().clone();
+    let command_id = match daemon.execute(command).await {
+        Ok(command_id) => command_id,
+        Err(message) => {
+            let response = RoutedPeerMessage::CommandResponse {
+                request_id,
+                requester_host,
+                responder_host,
+                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                result: Box::new(CommandResult::Error { message }),
+            };
+            let pm = peer_manager.lock().await;
+            let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(response)).await;
+            return;
+        }
+    };
+
+    loop {
+        match event_rx.recv().await {
+            Ok(DaemonEvent::CommandStarted { command_id: id, repo, description, .. }) if id == command_id => {
+                let event = RoutedPeerMessage::CommandEvent {
+                    request_id,
+                    requester_host: requester_host.clone(),
+                    responder_host: responder_host.clone(),
+                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                    event: Box::new(CommandPeerEvent::Started { repo, description }),
+                };
+                let pm = peer_manager.lock().await;
+                let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(event)).await;
+            }
+            Ok(DaemonEvent::CommandStepUpdate { command_id: id, repo, step_index, step_count, description, status, .. })
+                if id == command_id =>
+            {
+                let event = RoutedPeerMessage::CommandEvent {
+                    request_id,
+                    requester_host: requester_host.clone(),
+                    responder_host: responder_host.clone(),
+                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                    event: Box::new(CommandPeerEvent::StepUpdate {
+                        repo,
+                        step_index,
+                        step_count,
+                        description,
+                        status,
+                    }),
+                };
+                let pm = peer_manager.lock().await;
+                let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(event)).await;
+            }
+            Ok(DaemonEvent::CommandFinished { command_id: id, repo, result, .. }) if id == command_id => {
+                let finished = RoutedPeerMessage::CommandEvent {
+                    request_id,
+                    requester_host: requester_host.clone(),
+                    responder_host: responder_host.clone(),
+                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                    event: Box::new(CommandPeerEvent::Finished { repo, result: result.clone() }),
+                };
+                let response = RoutedPeerMessage::CommandResponse {
+                    request_id,
+                    requester_host,
+                    responder_host,
+                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                    result: Box::new(result),
+                };
+                let pm = peer_manager.lock().await;
+                let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(finished)).await;
+                let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(response)).await;
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn emit_remote_command_event(
+    daemon: &Arc<InProcessDaemon>,
+    pending_remote_commands: &Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>,
+    request_id: u64,
+    responder_host: HostName,
+    event: CommandPeerEvent,
+) {
+    let mut pending = pending_remote_commands.lock().await;
+    let Some(entry) = pending.get_mut(&request_id) else {
+        return;
+    };
+
+    match event {
+        CommandPeerEvent::Started { repo, description } => {
+            entry.repo = Some(repo.clone());
+            daemon.send_event(DaemonEvent::CommandStarted {
+                command_id: entry.command_id,
+                host: responder_host,
+                repo,
+                description,
+            });
+        }
+        CommandPeerEvent::StepUpdate { repo, step_index, step_count, description, status } => {
+            entry.repo = Some(repo.clone());
+            daemon.send_event(DaemonEvent::CommandStepUpdate {
+                command_id: entry.command_id,
+                host: responder_host,
+                repo,
+                step_index,
+                step_count,
+                description,
+                status,
+            });
+        }
+        CommandPeerEvent::Finished { repo, result } => {
+            entry.repo = Some(repo.clone());
+            entry.finished_via_event = true;
+            daemon.send_event(DaemonEvent::CommandFinished {
+                command_id: entry.command_id,
+                host: responder_host,
+                repo,
+                result,
+            });
+        }
+    }
+}
+
+async fn complete_remote_command(
+    daemon: &Arc<InProcessDaemon>,
+    pending_remote_commands: &Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>,
+    request_id: u64,
+    responder_host: HostName,
+    result: CommandResult,
+) {
+    let mut pending = pending_remote_commands.lock().await;
+    let Some(entry) = pending.remove(&request_id) else {
+        return;
+    };
+
+    if entry.finished_via_event {
+        return;
+    }
+
+    daemon.send_event(DaemonEvent::CommandFinished {
+        command_id: entry.command_id,
+        host: responder_host,
+        repo: entry.repo.unwrap_or_default(),
+        result,
+    });
 }
 
 async fn disconnect_peer_and_rebuild(
@@ -970,6 +1178,8 @@ async fn handle_client(
     mut shutdown_rx: watch::Receiver<bool>,
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
+    pending_remote_commands: Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>,
+    next_remote_command_id: Arc<AtomicU64>,
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
@@ -1027,7 +1237,8 @@ async fn handle_client(
                 }
             });
 
-            let first_response = dispatch_request(&daemon, id, &method, params).await;
+            let first_response =
+                dispatch_request(&daemon, &peer_manager, &pending_remote_commands, &next_remote_command_id, id, &method, params).await;
             if write_message(&writer, &first_response).await.is_ok() {
                 loop {
                     tokio::select! {
@@ -1043,7 +1254,16 @@ async fn handle_client(
                                     };
                                     match msg {
                                         Message::Request { id, method, params } => {
-                                            let response = dispatch_request(&daemon, id, &method, params).await;
+                                            let response = dispatch_request(
+                                                &daemon,
+                                                &peer_manager,
+                                                &pending_remote_commands,
+                                                &next_remote_command_id,
+                                                id,
+                                                &method,
+                                                params,
+                                            )
+                                            .await;
                                             if write_message(&writer, &response).await.is_err() {
                                                 break;
                                             }
@@ -1192,7 +1412,15 @@ async fn handle_client(
 }
 
 /// Dispatch a request to the appropriate `DaemonHandle` method.
-async fn dispatch_request(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, params: serde_json::Value) -> Message {
+async fn dispatch_request(
+    daemon: &Arc<InProcessDaemon>,
+    peer_manager: &Arc<Mutex<PeerManager>>,
+    pending_remote_commands: &Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>,
+    next_remote_command_id: &Arc<AtomicU64>,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Message {
     match method {
         "list_repos" => match daemon.list_repos().await {
             Ok(repos) => Message::ok_response(id, &repos),
@@ -1220,9 +1448,44 @@ async fn dispatch_request(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, 
                 Ok(cmd) => cmd,
                 Err(e) => return Message::error_response(id, e),
             };
-            match daemon.execute(command).await {
-                Ok(command_id) => Message::ok_response(id, &command_id),
-                Err(e) => Message::error_response(id, e),
+
+            let target_host = command.host.clone().unwrap_or_else(|| daemon.host_name().clone());
+            if target_host != *daemon.host_name() {
+                let request_id = {
+                    let mut pm = peer_manager.lock().await;
+                    pm.next_request_id()
+                };
+                let command_id = next_remote_command_id.fetch_add(1, Ordering::Relaxed);
+                pending_remote_commands.lock().await.insert(request_id, PendingRemoteCommand {
+                    command_id,
+                    repo: None,
+                    finished_via_event: false,
+                });
+
+                let routed = RoutedPeerMessage::CommandRequest {
+                    request_id,
+                    requester_host: daemon.host_name().clone(),
+                    target_host: target_host.clone(),
+                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                    command: Box::new(command),
+                };
+                let send_result = {
+                    let pm = peer_manager.lock().await;
+                    pm.send_to(&target_host, PeerWireMessage::Routed(routed)).await
+                };
+
+                match send_result {
+                    Ok(()) => Message::ok_response(id, &command_id),
+                    Err(e) => {
+                        pending_remote_commands.lock().await.remove(&request_id);
+                        Message::error_response(id, e)
+                    }
+                }
+            } else {
+                match daemon.execute(command).await {
+                    Ok(command_id) => Message::ok_response(id, &command_id),
+                    Err(e) => Message::error_response(id, e),
+                }
             }
         }
 
@@ -1341,16 +1604,34 @@ fn extract_str_param(params: &serde_json::Value, field: &str) -> Result<String, 
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::Mutex as StdMutex};
 
+    use async_trait::async_trait;
     use flotilla_protocol::{
-        Checkout, DaemonEvent, HostName, HostPath, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoInfo,
-        VectorClock,
+        Checkout, Command, CommandAction, CommandPeerEvent, CommandResult, DaemonEvent, HostName, HostPath, PeerDataKind,
+        PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoInfo, RoutedPeerMessage, VectorClock,
     };
     use indexmap::IndexMap;
 
     use super::*;
-    use crate::peer::test_support::{ensure_test_connection_generation, handle_test_peer_data};
+    use crate::peer::{test_support::{ensure_test_connection_generation, handle_test_peer_data}, PeerSender};
+
+    struct CapturePeerSender {
+        sent: Arc<StdMutex<Vec<PeerWireMessage>>>,
+    }
+
+    #[async_trait]
+    impl PeerSender for CapturePeerSender {
+        async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
+            self.sent.lock().expect("lock").push(msg);
+            Ok(())
+        }
+
+        async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
+            self.sent.lock().expect("lock").push(PeerWireMessage::Goodbye { reason });
+            Ok(())
+        }
+    }
 
     fn assert_ok_empty_response(msg: Message, expected_id: u64) {
         match msg {
@@ -1369,6 +1650,32 @@ mod tests {
         let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
         let daemon = InProcessDaemon::new(vec![], config).await;
         (tmp, daemon)
+    }
+
+    fn empty_routing_state() -> (
+        Arc<Mutex<PeerManager>>,
+        Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>,
+        Arc<AtomicU64>,
+    ) {
+        (
+            Arc::new(Mutex::new(PeerManager::new(HostName::new("local")))),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU64::new(1 << 62)),
+        )
+    }
+
+    async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, params: serde_json::Value) -> Message {
+        let (peer_manager, pending_remote_commands, next_remote_command_id) = empty_routing_state();
+        dispatch_request(
+            daemon,
+            &peer_manager,
+            &pending_remote_commands,
+            &next_remote_command_id,
+            id,
+            method,
+            params,
+        )
+        .await
     }
 
     fn checkout(branch: &str) -> Checkout {
@@ -1440,7 +1747,7 @@ mod tests {
     async fn dispatch_request_handles_unknown_and_missing_params() {
         let (_tmp, daemon) = empty_daemon().await;
 
-        let unknown = dispatch_request(&daemon, 1, "not_a_method", serde_json::json!({})).await;
+        let unknown = dispatch_request_test(&daemon, 1, "not_a_method", serde_json::json!({})).await;
         match unknown {
             Message::Response { id, ok, data, error } => {
                 assert_eq!(id, 1);
@@ -1451,7 +1758,7 @@ mod tests {
             other => panic!("expected response, got {other:?}"),
         }
 
-        let missing_repo = dispatch_request(&daemon, 2, "get_state", serde_json::json!({})).await;
+        let missing_repo = dispatch_request_test(&daemon, 2, "get_state", serde_json::json!({})).await;
         match missing_repo {
             Message::Response { id, ok, data, error } => {
                 assert_eq!(id, 2);
@@ -1469,10 +1776,10 @@ mod tests {
         let repo_path = tmp.path().join("repo-a");
         std::fs::create_dir_all(&repo_path).unwrap();
 
-        let add = dispatch_request(&daemon, 10, "add_repo", serde_json::json!({ "path": repo_path })).await;
+        let add = dispatch_request_test(&daemon, 10, "add_repo", serde_json::json!({ "path": repo_path })).await;
         assert_ok_empty_response(add, 10);
 
-        let list = dispatch_request(&daemon, 11, "list_repos", serde_json::json!({})).await;
+        let list = dispatch_request_test(&daemon, 11, "list_repos", serde_json::json!({})).await;
         let listed: Vec<RepoInfo> = match list {
             Message::Response { id, ok, data, error } => {
                 assert_eq!(id, 11);
@@ -1484,7 +1791,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, repo_path);
 
-        let remove = dispatch_request(&daemon, 12, "remove_repo", serde_json::json!({ "path": listed[0].path })).await;
+        let remove = dispatch_request_test(&daemon, 12, "remove_repo", serde_json::json!({ "path": listed[0].path })).await;
         assert_ok_empty_response(remove, 12);
     }
 
@@ -1492,7 +1799,7 @@ mod tests {
     async fn dispatch_replay_since_with_bad_payload_degrades_to_empty_last_seen() {
         let (_tmp, daemon) = empty_daemon().await;
 
-        let replay = dispatch_request(&daemon, 30, "replay_since", serde_json::json!({ "last_seen": "invalid-shape" })).await;
+        let replay = dispatch_request_test(&daemon, 30, "replay_since", serde_json::json!({ "last_seen": "invalid-shape" })).await;
         match replay {
             Message::Response { id, ok, data, error } => {
                 assert_eq!(id, 30);
@@ -1502,6 +1809,137 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_execute_remote_routes_command_through_peer_manager() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+        let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+        let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        peer_manager.lock().await.register_sender(
+            HostName::new("feta"),
+            Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }),
+        );
+
+        let response = dispatch_request(
+            &daemon,
+            &peer_manager,
+            &pending_remote_commands,
+            &next_remote_command_id,
+            40,
+            "execute",
+            serde_json::json!({
+                "command": Command {
+                    host: Some(HostName::new("feta")),
+                    context_repo: None,
+                    action: CommandAction::Refresh { repo: None },
+                }
+            }),
+        )
+        .await;
+
+        let command_id = match response {
+            Message::Response { id, ok, data, error } => {
+                assert_eq!(id, 40);
+                assert!(ok, "remote execute should succeed: {error:?}");
+                serde_json::from_value::<u64>(data.expect("command id")).expect("parse command id")
+            }
+            other => panic!("expected response, got {other:?}"),
+        };
+
+        assert!(command_id >= (1 << 62));
+        assert_eq!(pending_remote_commands.lock().await.len(), 1);
+
+        let sent = sent.lock().expect("lock");
+        assert_eq!(sent.len(), 1);
+        match &sent[0] {
+            PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_host, target_host, command, .. }) => {
+                assert_eq!(requester_host, daemon.host_name());
+                assert_eq!(target_host, &HostName::new("feta"));
+                assert_eq!(
+                    command.as_ref(),
+                    &Command {
+                        host: Some(HostName::new("feta")),
+                        context_repo: None,
+                        action: CommandAction::Refresh { repo: None },
+                    }
+                );
+            }
+            other => panic!("expected routed command request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_forwarded_command_proxies_lifecycle_and_response() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create .git");
+        let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+        let daemon = InProcessDaemon::new(vec![repo.clone()], config).await;
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        peer_manager.lock().await.register_sender(
+            HostName::new("relay"),
+            Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }),
+        );
+
+        execute_forwarded_command(
+            Arc::clone(&daemon),
+            Arc::clone(&peer_manager),
+            7,
+            HostName::new("desktop"),
+            HostName::new("relay"),
+            Command {
+                host: Some(daemon.host_name().clone()),
+                context_repo: None,
+                action: CommandAction::Refresh { repo: None },
+            },
+        )
+        .await;
+
+        let sent = sent.lock().expect("lock");
+        assert!(sent.len() >= 3, "expected started event, finished event, and response");
+
+        let mut saw_started = false;
+        let mut saw_finished = false;
+        let mut saw_response = false;
+
+        for msg in sent.iter() {
+            match msg {
+                PeerWireMessage::Routed(RoutedPeerMessage::CommandEvent { request_id, requester_host, responder_host, event, .. }) => {
+                    assert_eq!(*request_id, 7);
+                    assert_eq!(requester_host, &HostName::new("desktop"));
+                    assert_eq!(responder_host, daemon.host_name());
+                    match event.as_ref() {
+                        CommandPeerEvent::Started { repo: event_repo, description } => {
+                            assert_eq!(event_repo, &repo);
+                            assert_eq!(description, "Refreshing...");
+                            saw_started = true;
+                        }
+                        CommandPeerEvent::Finished { repo: event_repo, result } => {
+                            assert_eq!(event_repo, &repo);
+                            assert_eq!(result, &CommandResult::Refreshed { repos: vec![repo.clone()] });
+                            saw_finished = true;
+                        }
+                        CommandPeerEvent::StepUpdate { .. } => {}
+                    }
+                }
+                PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse { request_id, requester_host, responder_host, result, .. }) => {
+                    assert_eq!(*request_id, 7);
+                    assert_eq!(requester_host, &HostName::new("desktop"));
+                    assert_eq!(responder_host, daemon.host_name());
+                    assert_eq!(result.as_ref(), &CommandResult::Refreshed { repos: vec![repo.clone()] });
+                    saw_response = true;
+                }
+                other => panic!("unexpected proxied message: {other:?}"),
+            }
+        }
+
+        assert!(saw_started);
+        assert!(saw_finished);
+        assert!(saw_response);
     }
 
     #[tokio::test]
@@ -1574,7 +2012,21 @@ mod tests {
         let notify_ref = Arc::clone(&client_notify);
         let daemon_for_task = Arc::clone(&daemon);
         let handle = tokio::spawn(async move {
-            handle_client(server_stream, daemon_for_task, shutdown_rx, peer_data_tx, pm, count_ref, notify_ref, peer_connected_tx).await;
+            let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+            let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+            handle_client(
+                server_stream,
+                daemon_for_task,
+                shutdown_rx,
+                peer_data_tx,
+                pm,
+                pending_remote_commands,
+                next_remote_command_id,
+                count_ref,
+                notify_ref,
+                peer_connected_tx,
+            )
+            .await;
         });
 
         let (read_half, write_half) = client_stream.into_split();
@@ -1724,7 +2176,21 @@ mod tests {
         let count_ref = Arc::clone(&client_count);
         let notify_ref = Arc::clone(&client_notify);
         let handle = tokio::spawn(async move {
-            handle_client(server_stream, daemon, shutdown_rx, peer_data_tx, pm, count_ref, notify_ref, peer_connected_tx).await;
+            let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+            let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+            handle_client(
+                server_stream,
+                daemon,
+                shutdown_rx,
+                peer_data_tx,
+                pm,
+                pending_remote_commands,
+                next_remote_command_id,
+                count_ref,
+                notify_ref,
+                peer_connected_tx,
+            )
+            .await;
         });
 
         let (read_half, write_half) = client_stream.into_split();
@@ -1796,10 +2262,38 @@ mod tests {
         let peer_connected_tx_b = peer_connected_tx.clone();
 
         let handle_a = tokio::spawn(async move {
-            handle_client(server_stream_a, daemon_a, shutdown_rx_a, tx_a, pm_a, count_a, notify_a, peer_connected_tx_a).await;
+            let pending_remote_commands_a = Arc::new(Mutex::new(HashMap::new()));
+            let next_remote_command_id_a = Arc::new(AtomicU64::new(1 << 62));
+            handle_client(
+                server_stream_a,
+                daemon_a,
+                shutdown_rx_a,
+                tx_a,
+                pm_a,
+                pending_remote_commands_a,
+                next_remote_command_id_a,
+                count_a,
+                notify_a,
+                peer_connected_tx_a,
+            )
+            .await;
         });
         let handle_b = tokio::spawn(async move {
-            handle_client(server_stream_b, daemon_b, shutdown_rx_b, tx_b, pm_b, count_b, notify_b, peer_connected_tx_b).await;
+            let pending_remote_commands_b = Arc::new(Mutex::new(HashMap::new()));
+            let next_remote_command_id_b = Arc::new(AtomicU64::new(1 << 62));
+            handle_client(
+                server_stream_b,
+                daemon_b,
+                shutdown_rx_b,
+                tx_b,
+                pm_b,
+                pending_remote_commands_b,
+                next_remote_command_id_b,
+                count_b,
+                notify_b,
+                peer_connected_tx_b,
+            )
+            .await;
         });
 
         async fn send_peer_hello(

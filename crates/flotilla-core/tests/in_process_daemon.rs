@@ -45,7 +45,7 @@ async fn execute_broadcasts_lifecycle_events() {
     // We only care about the lifecycle events, not the command result.
     let command = Command {
         host: None,
-        repo: Some(RepoSelector::Path(repo.clone())),
+        context_repo: Some(RepoSelector::Path(repo.clone())),
         action: CommandAction::ArchiveSession { session_id: "nonexistent-session".into() },
     };
     let command_id = daemon.execute(command).await.expect("execute should return a command id");
@@ -162,7 +162,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     let mut rx = daemon.subscribe();
 
     let add_id = daemon
-        .execute(Command { host: None, repo: None, action: CommandAction::AddRepo { path: repo.clone() } })
+        .execute(Command { host: None, context_repo: None, action: CommandAction::AddRepo { path: repo.clone() } })
         .await
         .expect("add_repo command should return an id");
 
@@ -191,7 +191,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     assert_eq!(repos[0].path, repo);
 
     let remove_id = daemon
-        .execute(Command { host: None, repo: None, action: CommandAction::RemoveRepo { repo: RepoSelector::Query("new-repo".into()) } })
+        .execute(Command { host: None, context_repo: None, action: CommandAction::RemoveRepo { repo: RepoSelector::Query("new-repo".into()) } })
         .await
         .expect("remove_repo command should return an id");
     let (finished_remove, removed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -227,7 +227,7 @@ async fn inline_issue_command_returns_zero_and_skips_lifecycle_events() {
     let _ = recv_event(&mut rx).await;
 
     let command_id = daemon
-        .execute(Command { host: None, repo: None, action: CommandAction::ClearIssueSearch { repo: repo.clone() } })
+        .execute(Command { host: None, context_repo: None, action: CommandAction::ClearIssueSearch { repo: repo.clone() } })
         .await
         .expect("inline command should succeed");
     assert_eq!(command_id, 0, "inline issue commands should return id=0");
@@ -258,7 +258,7 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
     let err = daemon
         .execute(Command {
             host: None,
-            repo: None,
+            context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
         })
         .await
@@ -291,7 +291,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     let mut rx = daemon.subscribe();
 
     let refresh_id = daemon
-        .execute(Command { host: None, repo: None, action: CommandAction::Refresh { repo: None } })
+        .execute(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
         .await
         .expect("refresh all should return an id");
 
@@ -316,7 +316,7 @@ async fn remove_checkout_command_accepts_selector_queries() {
     let err = daemon
         .execute(Command {
             host: None,
-            repo: None,
+            context_repo: None,
             action: CommandAction::RemoveCheckout {
                 checkout: CheckoutSelector::Query("does-not-exist".into()),
                 terminal_keys: vec![],
@@ -339,7 +339,7 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
     let branch_id = daemon
         .execute(Command {
             host: None,
-            repo: None,
+            context_repo: None,
             action: CommandAction::Checkout {
                 repo: RepoSelector::Path(repo.clone()),
                 target: CheckoutTarget::Branch("definitely-missing-branch".into()),
@@ -352,7 +352,7 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
     let fresh_id = daemon
         .execute(Command {
             host: None,
-            repo: None,
+            context_repo: None,
             action: CommandAction::Checkout {
                 repo: RepoSelector::Path(repo),
                 target: CheckoutTarget::FreshBranch("main".into()),

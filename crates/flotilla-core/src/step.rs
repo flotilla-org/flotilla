@@ -1,6 +1,6 @@
 use std::{future::Future, path::PathBuf, pin::Pin};
 
-use flotilla_protocol::{CommandResult, DaemonEvent, StepStatus};
+use flotilla_protocol::{CommandResult, DaemonEvent, HostName, StepStatus};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -38,13 +38,13 @@ impl StepPlan {
 pub async fn run_step_plan(
     plan: StepPlan,
     command_id: u64,
+    host: HostName,
     repo: PathBuf,
     cancel: CancellationToken,
     event_tx: broadcast::Sender<DaemonEvent>,
 ) -> CommandResult {
     let step_count = plan.steps.len();
     let mut final_result = CommandResult::Ok;
-    let host = flotilla_protocol::HostName::local();
 
     for (i, step) in plan.steps.into_iter().enumerate() {
         if cancel.is_cancelled() {
@@ -142,7 +142,7 @@ mod tests {
         let mut rx = tx.subscribe();
         let plan = StepPlan::new(vec![make_step("step-a", Ok(StepOutcome::Completed)), make_step("step-b", Ok(StepOutcome::Completed))]);
 
-        let result = run_step_plan(plan, 1, PathBuf::from("/repo"), cancel, tx).await;
+        let result = run_step_plan(plan, 1, HostName::local(), PathBuf::from("/repo"), cancel, tx).await;
         assert_eq!(result, CommandResult::Ok);
 
         // Should have 4 events: Started+Succeeded for each step
@@ -162,7 +162,7 @@ mod tests {
             make_step("step-c", Ok(StepOutcome::Completed)),
         ]);
 
-        let result = run_step_plan(plan, 1, PathBuf::from("/repo"), cancel, tx).await;
+        let result = run_step_plan(plan, 1, HostName::local(), PathBuf::from("/repo"), cancel, tx).await;
         assert_eq!(result, CommandResult::Error { message: "boom".into() });
     }
 
@@ -172,7 +172,7 @@ mod tests {
         cancel.cancel();
         let plan = StepPlan::new(vec![make_step("step-a", Ok(StepOutcome::Completed))]);
 
-        let result = run_step_plan(plan, 1, PathBuf::from("/repo"), cancel, tx).await;
+        let result = run_step_plan(plan, 1, HostName::local(), PathBuf::from("/repo"), cancel, tx).await;
         assert_eq!(result, CommandResult::Cancelled);
     }
 
@@ -181,7 +181,7 @@ mod tests {
         let (cancel, tx) = setup();
         let plan = StepPlan::new(vec![make_step("step-a", Ok(StepOutcome::Skipped)), make_step("step-b", Ok(StepOutcome::Completed))]);
 
-        let result = run_step_plan(plan, 1, PathBuf::from("/repo"), cancel, tx).await;
+        let result = run_step_plan(plan, 1, HostName::local(), PathBuf::from("/repo"), cancel, tx).await;
         assert_eq!(result, CommandResult::Ok);
     }
 
@@ -193,7 +193,7 @@ mod tests {
             make_step("step-b", Ok(StepOutcome::Completed)),
         ]);
 
-        let result = run_step_plan(plan, 1, PathBuf::from("/repo"), cancel, tx).await;
+        let result = run_step_plan(plan, 1, HostName::local(), PathBuf::from("/repo"), cancel, tx).await;
         assert_eq!(result, CommandResult::CheckoutCreated { branch: "feat/x".into() });
     }
 
@@ -202,7 +202,7 @@ mod tests {
         let (cancel, tx) = setup();
         let plan = StepPlan::new(vec![]);
 
-        let result = run_step_plan(plan, 1, PathBuf::from("/repo"), cancel, tx).await;
+        let result = run_step_plan(plan, 1, HostName::local(), PathBuf::from("/repo"), cancel, tx).await;
         assert_eq!(result, CommandResult::Ok);
     }
 }
