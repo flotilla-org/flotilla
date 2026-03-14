@@ -2,7 +2,7 @@ use std::{io::stdout, time::Duration};
 
 use color_eyre::Result;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, KeyCode, MouseButton, MouseEventKind},
+    event::{EnableMouseCapture, KeyCode, MouseButton, MouseEventKind},
     execute,
 };
 
@@ -195,6 +195,9 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     }
                 }
                 Event::Tick => {} // already filtered out
+                Event::Signal => {
+                    app.should_quit = true;
+                }
             }
         }
 
@@ -230,7 +233,6 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
     }
 
-    execute!(stdout(), DisableMouseCapture)?;
-    ratatui::restore();
+    crate::terminal::restore_terminal();
     Ok(())
 }
