@@ -15,7 +15,8 @@ fn elapsed_since_start() -> Duration {
 }
 
 fn has_true_color() -> bool {
-    std::env::var("COLORTERM").map(|v| v == "truecolor" || v == "24bit").unwrap_or(false)
+    static TRUE_COLOR: OnceLock<bool> = OnceLock::new();
+    *TRUE_COLOR.get_or_init(|| std::env::var("COLORTERM").map(|v| v == "truecolor" || v == "24bit").unwrap_or(false))
 }
 
 fn blend(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
@@ -43,25 +44,23 @@ pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     let base: (u8, u8, u8) = (140, 130, 40);
     let highlight: (u8, u8, u8) = (255, 240, 120);
 
-    chars
-        .iter()
-        .enumerate()
-        .map(|(i, ch)| {
-            let dist = ((i as f32 + padding as f32) - pos).abs();
-            let t = if dist <= band_half_width { 0.5 * (1.0 + (std::f32::consts::PI * dist / band_half_width).cos()) } else { 0.0 };
+    let mut spans = Vec::with_capacity(chars.len());
+    for (i, ch) in chars.iter().enumerate() {
+        let dist = ((i as f32 + padding as f32) - pos).abs();
+        let t = if dist <= band_half_width { 0.5 * (1.0 + (std::f32::consts::PI * dist / band_half_width).cos()) } else { 0.0 };
 
-            let style = if true_color {
-                let (r, g, b) = blend(highlight, base, t.clamp(0.0, 1.0));
-                Style::default().fg(Color::Rgb(r, g, b))
-            } else if t < 0.2 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)
-            } else if t < 0.6 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            };
+        let style = if true_color {
+            let (r, g, b) = blend(highlight, base, t);
+            Style::default().fg(Color::Rgb(r, g, b))
+        } else if t < 0.2 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)
+        } else if t < 0.6 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        };
 
-            Span::styled(ch.to_string(), style)
-        })
-        .collect()
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    spans
 }
