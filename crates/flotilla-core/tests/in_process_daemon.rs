@@ -12,6 +12,7 @@ use flotilla_core::{
     in_process::InProcessDaemon,
     providers::{
         ai_utility::AiUtility,
+        code_review::CodeReview,
         coding_agent::CloudAgentService,
         discovery::{
             test_support::{
@@ -20,7 +21,7 @@ use flotilla_core::{
             },
             DiscoveryRuntime, EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement,
         },
-        types::{CloudAgentSession, RepoCriteria, SessionStatus},
+        types::{ChangeRequest, CloudAgentSession, RepoCriteria, SessionStatus},
     },
 };
 use flotilla_protocol::{
@@ -160,10 +161,44 @@ fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
     runtime
 }
 
+struct FailingCodeReview;
+
+#[async_trait]
+impl CodeReview for FailingCodeReview {
+    async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+        Err("change request listing failed".into())
+    }
+
+    async fn get_change_request(&self, _: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+        Err(format!("change request {id} not found"))
+    }
+
+    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
+        Err("merged branch listing failed".into())
+    }
+}
+
 async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
+    (temp, repo, daemon)
+}
+
+async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
     (temp, repo, daemon)
@@ -951,6 +986,59 @@ async fn get_repo_work_returns_work_items() {
     let work = daemon.get_repo_work(repo_name).await.expect("get_repo_work failed");
     assert_eq!(work.path, repo);
     // Work items may or may not be present depending on repo state, but the call should succeed
+}
+
+#[tokio::test]
+async fn get_repo_detail_returns_provider_health_and_errors() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        fake_discovery_with_providers(None, Some(Arc::new(FailingCodeReview)), None),
+        HostName::local(),
+    )
+    .await;
+    let mut rx = daemon.subscribe();
+    trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
+    let detail = daemon.get_repo_detail(repo_name).await.expect("get_repo_detail failed");
+
+    assert_eq!(detail.path, repo);
+    let code_review_health = detail.provider_health.get("code_review").expect("code_review health should be present");
+    assert!(code_review_health.values().any(|healthy| !healthy), "provider health should reflect refresh errors");
+    assert!(
+        detail.errors.iter().any(|err| err.category == "PRs" && err.message == "change request listing failed"),
+        "should expose refresh errors from the failing provider"
+    );
+}
+
+#[tokio::test]
+async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery() {
+    let (_temp, repo, daemon) = daemon_for_plain_dir().await;
+
+    let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
+    let providers = daemon.get_repo_providers(repo_name).await.expect("get_repo_providers failed");
+
+    assert_eq!(providers.path, repo);
+    assert!(
+        providers.host_discovery.iter().any(|entry| entry.kind == "binary_available" && entry.detail.get("name") == Some(&"git".into())),
+        "should include host discovery assertions"
+    );
+    assert!(
+        providers
+            .unmet_requirements
+            .iter()
+            .any(|req| { req.factory == "github" && req.kind == "missing_binary" && req.value.as_deref() == Some("gh") }),
+        "should expose structured valued unmet requirements"
+    );
+    assert!(
+        providers.unmet_requirements.iter().any(|req| req.factory == "git" && req.kind == "no_vcs_checkout" && req.value.is_none()),
+        "should expose valueless unmet requirements without forcing a placeholder string"
+    );
 }
 
 #[tokio::test]
