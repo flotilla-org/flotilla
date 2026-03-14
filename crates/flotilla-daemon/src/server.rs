@@ -1651,7 +1651,9 @@ mod tests {
         (tmp, daemon)
     }
 
-    fn empty_routing_state() -> (Arc<Mutex<PeerManager>>, Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>, Arc<AtomicU64>) {
+    type RoutingState = (Arc<Mutex<PeerManager>>, Arc<Mutex<HashMap<u64, PendingRemoteCommand>>>, Arc<AtomicU64>);
+
+    fn empty_routing_state() -> RoutingState {
         (
             Arc::new(Mutex::new(PeerManager::new(HostName::new("local")))),
             Arc::new(Mutex::new(HashMap::new())),

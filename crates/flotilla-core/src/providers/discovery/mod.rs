@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn unmet_requirement_variants() {
         // Verify that all UnmetRequirement variants can be constructed and compared
-        let reqs = vec![
+        let reqs = [
             UnmetRequirement::MissingBinary("git".into()),
             UnmetRequirement::MissingEnvVar("TOKEN".into()),
             UnmetRequirement::MissingAuth("github".into()),

@@ -643,7 +643,7 @@ mod tests {
 
         // Spawn a real process that will respond to SIGTERM.
         // Pass "sleep" as expected_name so the PID-reuse guard accepts it.
-        let child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("60")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -661,6 +661,7 @@ mod tests {
         assert!(!pid_path.exists(), "pid file should be removed after SIGTERM");
         // Process should be dead
         assert!(!ShpoolTerminalPool::is_process_alive(pid as i32), "process should be dead after SIGTERM");
+        let _ = child.wait();
     }
 
     #[tokio::test]
@@ -670,7 +671,7 @@ mod tests {
         let pid_path = dir.path().join("daemonized-shpool.pid");
 
         // Spawn a sleep process but tell stop_daemon to expect "shpool"
-        let child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("60")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -693,6 +694,7 @@ mod tests {
 
         // Clean up the sleep process
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let _ = child.wait();
     }
 
     /// Create a ShpoolTerminalPool via the async factory method.

@@ -499,8 +499,8 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
-            if finished.is_some() && added.is_some() {
-                break (finished.expect("finished set"), added.expect("added set"));
+            if let (Some(_), Some(_)) = (&finished, &added) {
+                break (finished.take().unwrap(), added.take().unwrap());
             }
         }
     })
@@ -531,8 +531,8 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
-            if finished.is_some() && removed.is_some() {
-                break (finished.expect("finished set"), removed.expect("removed set"));
+            if let (Some(_), Some(_)) = (&finished, &removed) {
+                break (finished.take().unwrap(), removed.take().unwrap());
             }
         }
     })
