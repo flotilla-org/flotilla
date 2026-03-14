@@ -29,7 +29,26 @@ pub async fn dispatch(cmd: Command, app: &mut App) {
 
     match app.daemon.execute(cmd).await {
         Ok(_command_id) => {}
-        Err(e) => app.model.status_message = Some(e),
+        Err(e) => {
+            // Reset loading modes so the error message is visible.
+            reset_loading_mode(app);
+            app.model.status_message = Some(e);
+        }
+    }
+}
+
+/// Reset UI modes that are waiting for a command result.
+///
+/// When a command fails (either synchronously from `dispatch` or
+/// asynchronously via `CommandResult::Error`), loading modes like
+/// `DeleteConfirm { loading: true }` must be cleared so the user
+/// can see the error message and isn't stuck in a loading state.
+fn reset_loading_mode(app: &mut App) {
+    match &app.ui.mode {
+        UiMode::DeleteConfirm { loading: true, .. } | UiMode::BranchInput { kind: super::BranchInputKind::Generating, .. } => {
+            app.ui.mode = UiMode::Normal;
+        }
+        _ => {}
     }
 }
 
@@ -65,9 +84,11 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
             app.ui.mode = UiMode::DeleteConfirm { info: Some(info), loading: false, terminal_keys };
         }
         CommandResult::Error { message } => {
+            reset_loading_mode(app);
             app.model.status_message = Some(message);
         }
         CommandResult::Cancelled => {
+            reset_loading_mode(app);
             app.model.status_message = Some("Command cancelled".into());
         }
     }
