@@ -478,10 +478,7 @@ mod tests {
 
     #[test]
     fn replay_cursor_roundtrip_preserves_repo_identity() {
-        let cursor = ReplayCursor {
-            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            seq: 42,
-        };
+        let cursor = ReplayCursor { repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }, seq: 42 };
         test_helpers::assert_roundtrip(&cursor);
     }
 

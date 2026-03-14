@@ -358,11 +358,7 @@ impl App {
     }
 
     pub fn persisted_tab_order_paths(&self) -> Vec<PathBuf> {
-        self.model
-            .repo_order
-            .iter()
-            .filter_map(|repo_identity| self.model.repos.get(repo_identity).map(|repo| repo.path.clone()))
-            .collect()
+        self.model.repo_order.iter().filter_map(|repo_identity| self.model.repos.get(repo_identity).map(|repo| repo.path.clone())).collect()
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {
@@ -1349,11 +1345,7 @@ mod tests {
             status: PendingStatus::InFlight,
             description: "test".into(),
         });
-        app.in_flight.insert(42, InFlightCommand {
-            repo_identity: repo.clone(),
-            repo: repo_path.clone(),
-            description: "test".into(),
-        });
+        app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
         app.handle_daemon_event(DaemonEvent::CommandFinished {
             command_id: 42,
@@ -1380,11 +1372,7 @@ mod tests {
             status: PendingStatus::InFlight,
             description: "test".into(),
         });
-        app.in_flight.insert(42, InFlightCommand {
-            repo_identity: repo.clone(),
-            repo: repo_path.clone(),
-            description: "test".into(),
-        });
+        app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
         app.handle_daemon_event(DaemonEvent::CommandFinished {
             command_id: 42,
@@ -1412,11 +1400,7 @@ mod tests {
             status: PendingStatus::InFlight,
             description: "test".into(),
         });
-        app.in_flight.insert(42, InFlightCommand {
-            repo_identity: repo.clone(),
-            repo: repo_path.clone(),
-            description: "test".into(),
-        });
+        app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
         app.handle_daemon_event(DaemonEvent::CommandFinished {
             command_id: 42,
@@ -1444,11 +1428,7 @@ mod tests {
             status: PendingStatus::InFlight,
             description: "test".into(),
         });
-        app.in_flight.insert(42, InFlightCommand {
-            repo_identity: repo.clone(),
-            repo: repo_path.clone(),
-            description: "test".into(),
-        });
+        app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
         app.handle_daemon_event(DaemonEvent::CommandFinished {
             command_id: 42,

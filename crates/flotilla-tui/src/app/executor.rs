@@ -182,10 +182,7 @@ mod tests {
         let (cmd, _) = app.proto_commands.take_next().expect("queued workspace creation");
         assert_eq!(
             cmd.context_repo,
-            Some(flotilla_protocol::RepoSelector::Identity(RepoIdentity {
-                authority: "local".into(),
-                path: "/tmp/repo-0".into(),
-            }))
+            Some(flotilla_protocol::RepoSelector::Identity(RepoIdentity { authority: "local".into(), path: "/tmp/repo-0".into() }))
         );
     }
 }

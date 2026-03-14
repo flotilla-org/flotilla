@@ -1,12 +1,8 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-};
+use std::{collections::HashMap, path::Path};
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    Command, DaemonEvent, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot,
-    StatusResponse,
+    Command, DaemonEvent, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse,
 };
 use tokio::sync::broadcast;
 

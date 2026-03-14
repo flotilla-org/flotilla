@@ -399,11 +399,8 @@ fn status_bar_content(
 
 fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<(String, usize)> {
     let active_repo = &model.repo_order[model.active_repo];
-    let active_cmds: Vec<&str> = in_flight
-        .values()
-        .filter(|cmd| &cmd.repo_identity == active_repo)
-        .map(|cmd| cmd.description.as_str())
-        .collect();
+    let active_cmds: Vec<&str> =
+        in_flight.values().filter(|cmd| &cmd.repo_identity == active_repo).map(|cmd| cmd.description.as_str()).collect();
 
     if active_cmds.is_empty() {
         return None;

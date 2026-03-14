@@ -106,10 +106,7 @@ fn merge_local_provider_data(base: &mut ProviderData, other: &ProviderData) {
     }
 }
 
-fn merge_provider_health(
-    merged: &mut HashMap<(&'static str, String), bool>,
-    next: &HashMap<(&'static str, String), bool>,
-) {
+fn merge_provider_health(merged: &mut HashMap<(&'static str, String), bool>, next: &HashMap<(&'static str, String), bool>) {
     for (provider, healthy) in next {
         merged.entry(provider.clone()).and_modify(|existing| *existing &= *healthy).or_insert(*healthy);
     }
@@ -374,6 +371,9 @@ impl RepoState {
         if self.contains_path(&root.path) {
             return false;
         }
+        // Keep local roots ahead of synthetic remote-only roots so
+        // preferred_root() remains the executable local instance whenever
+        // this identity is tracked on disk.
         let preferred_changed = !self.preferred_root().is_local && root.is_local;
         if preferred_changed {
             self.roots.insert(0, root);
@@ -545,14 +545,7 @@ impl InProcessDaemon {
             let slug = repo_slug.clone();
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
-            let root = RepoRootState {
-                path: path.clone(),
-                model,
-                slug,
-                repo_bag,
-                unmet,
-                is_local: true,
-            };
+            let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
             if let Some(state) = repos.get_mut(&identity) {
                 state.add_root(root);
@@ -567,7 +560,7 @@ impl InProcessDaemon {
             &host_name,
             &host_bag,
             crate::host_summary::provider_statuses_from_registries(
-                repos.values().map(|state| state.preferred_root().model.registry.as_ref())
+                repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
             ),
             &*discovery.env,
         );
@@ -674,14 +667,13 @@ impl InProcessDaemon {
                 let entries: Vec<_> = repos.iter().map(|(_, state)| (state.preferred_path(), state.slug())).collect();
                 crate::resolve::resolve_repo(query, entries.into_iter()).map_err(|e| e.to_string())
             }
-            flotilla_protocol::RepoSelector::Identity(identity) => {
-                self.repos
-                    .read()
-                    .await
-                    .get(identity)
-                    .map(|state| state.preferred_path().to_path_buf())
-                    .ok_or_else(|| format!("repo not tracked: {identity}"))
-            }
+            flotilla_protocol::RepoSelector::Identity(identity) => self
+                .repos
+                .read()
+                .await
+                .get(identity)
+                .map(|state| state.preferred_path().to_path_buf())
+                .ok_or_else(|| format!("repo not tracked: {identity}")),
         }
     }
 
@@ -689,6 +681,9 @@ impl InProcessDaemon {
         let repos = self.repos.read().await;
         let mut matches = Vec::new();
         for state in repos.values() {
+            // The preferred root's provider view is the merged per-identity
+            // checkout set after the first broadcast cycle. Before that first
+            // broadcast, only the preferred root's own checkouts are present.
             for (host_path, checkout) in &state.preferred_root().model.data.providers.checkouts {
                 if host_path.host != self.host_name {
                     continue;
@@ -745,9 +740,14 @@ impl InProcessDaemon {
         let identity = self.find_identity_for_path(repo).await?;
         let repos = self.repos.read().await;
         let state = repos.get(&identity)?;
+        // add_root() keeps any local root ahead of synthetic remote-only
+        // roots, so a non-local preferred root means this identity currently
+        // has no executable local instance.
         if !state.preferred_root().is_local {
             return None;
         }
+        // last_snapshot stores the merged per-identity view; normalize back to
+        // this host's authoritative data before returning it for replication.
         let providers = normalize_local_provider_hosts(
             inject_issues(&state.last_snapshot.providers, &state.issue_cache, &state.search_results),
             &self.host_name,
@@ -850,13 +850,7 @@ impl InProcessDaemon {
             };
             let (work_items, correlation_groups) = crate::data::correlate(&providers);
 
-            let re_snapshot = RefreshSnapshot {
-                providers,
-                work_items,
-                correlation_groups,
-                errors,
-                provider_health,
-            };
+            let re_snapshot = RefreshSnapshot { providers, work_items, correlation_groups, errors, provider_health };
             updates.push((identity, re_snapshot, issue_total, issue_has_more, search_results));
         }
 
@@ -896,6 +890,8 @@ impl InProcessDaemon {
 
             state.seq += 1;
             state.local_data_version += 1;
+            // Persist the merged per-identity snapshot so follow-up reads and
+            // delta generation see the same local+peer view that was emitted.
             state.last_snapshot = Arc::new(re_snapshot.clone());
 
             let event = choose_event(proto_snapshot, delta_entry);
@@ -1252,14 +1248,17 @@ impl InProcessDaemon {
             if repos.contains_key(&identity) {
                 return Ok(());
             }
-            repos.insert(identity.clone(), RepoState::new(identity.clone(), RepoRootState {
-                path: synthetic_path.clone(),
-                model,
-                slug: None,
-                repo_bag: EnvironmentBag::new(),
-                unmet: Vec::new(),
-                is_local: false,
-            }));
+            repos.insert(
+                identity.clone(),
+                RepoState::new(identity.clone(), RepoRootState {
+                    path: synthetic_path.clone(),
+                    model,
+                    slug: None,
+                    repo_bag: EnvironmentBag::new(),
+                    unmet: Vec::new(),
+                    is_local: false,
+                }),
+            );
             order.push(identity.clone());
         }
 
@@ -1549,12 +1548,7 @@ impl DaemonHandle for InProcessDaemon {
             let repos = self.repos.read().await;
             let identity = self.find_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            (
-                state.identity.clone(),
-                state.registry(),
-                state.providers(),
-                state.refresh_trigger(),
-            )
+            (state.identity.clone(), state.registry(), state.providers(), state.refresh_trigger())
         };
 
         // Broadcast started after repo validation (ensures no orphaned CommandStarted)
@@ -1731,14 +1725,7 @@ impl DaemonHandle for InProcessDaemon {
         let slug = repo_slug.clone();
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
         model.data.loading = true;
-        let root = RepoRootState {
-            path: path.clone(),
-            model,
-            slug,
-            repo_bag,
-            unmet,
-            is_local: true,
-        };
+        let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
@@ -1767,9 +1754,8 @@ impl DaemonHandle for InProcessDaemon {
                 order.push(identity.clone());
                 added_new_identity = true;
             }
+            self.path_identities.write().await.insert(path.clone(), identity.clone());
         }
-
-        self.path_identities.write().await.insert(path.clone(), identity.clone());
 
         // Persist to config
         self.config.save_repo(&path);
@@ -2320,17 +2306,14 @@ mod tests {
 
     /// Helper to create a minimal RepoState for delta testing.
     fn make_repo_state() -> RepoState {
-        RepoState::new(
-            fallback_repo_identity(Path::new("/virtual")),
-            RepoRootState {
-                path: PathBuf::from("/virtual"),
-                model: crate::model::RepoModel::new_virtual(),
-                slug: None,
-                repo_bag: crate::providers::discovery::EnvironmentBag::new(),
-                unmet: Vec::new(),
-                is_local: false,
-            },
-        )
+        RepoState::new(fallback_repo_identity(Path::new("/virtual")), RepoRootState {
+            path: PathBuf::from("/virtual"),
+            model: crate::model::RepoModel::new_virtual(),
+            slug: None,
+            repo_bag: crate::providers::discovery::EnvironmentBag::new(),
+            unmet: Vec::new(),
+            is_local: false,
+        })
     }
 
     #[tokio::test]

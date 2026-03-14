@@ -12,8 +12,7 @@ use async_trait::async_trait;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
     Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message,
-    PeerConnectionState, PeerDataMessage, PeerWireMessage, ReplayCursor, RepoIdentity, RepoSelector, RoutedPeerMessage,
-    PROTOCOL_VERSION,
+    PeerConnectionState, PeerDataMessage, PeerWireMessage, ReplayCursor, RepoIdentity, RepoSelector, RoutedPeerMessage, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},

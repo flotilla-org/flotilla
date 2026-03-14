@@ -78,8 +78,7 @@ impl SocketDaemon {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
 
@@ -384,10 +383,7 @@ async fn send_request(
 }
 
 fn encode_replay_cursors(last_seen: &HashMap<RepoIdentity, u64>) -> Vec<ReplayCursor> {
-    last_seen
-        .iter()
-        .map(|(repo_identity, &seq)| ReplayCursor { repo_identity: repo_identity.clone(), seq })
-        .collect()
+    last_seen.iter().map(|(repo_identity, &seq)| ReplayCursor { repo_identity: repo_identity.clone(), seq }).collect()
 }
 
 /// Handle a daemon event in the background reader: update local seq tracking,
@@ -829,8 +825,7 @@ mod tests {
     async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -865,8 +860,7 @@ mod tests {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         local_seqs.write().unwrap().insert(repo_identity(), 1);
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         recovering.lock().unwrap().insert(repo_identity(), vec![]);
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
@@ -955,8 +949,7 @@ mod tests {
     async fn handle_event_starts_recovery_for_unknown_repo_delta() {
         let repo = PathBuf::from("/tmp/unknown-repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, _event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -983,8 +976,7 @@ mod tests {
         let repo = PathBuf::from("/tmp/gap-repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 5);
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, _event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1011,8 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_repo_added() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1034,8 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_command_started() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1062,8 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_command_finished() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1090,8 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_command_step_update() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1121,8 +1109,7 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_peer_status_changed() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1150,8 +1137,7 @@ mod tests {
         let repo = PathBuf::from("/tmp/removed-repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 42);
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
