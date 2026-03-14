@@ -188,6 +188,12 @@ mod tests {
                 context_repo: None,
                 action: CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) },
             },
+            Command { host: None, context_repo: None, action: CommandAction::AddRepo { path: PathBuf::from("/repo") } },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::RemoveRepo { repo: RepoSelector::Query("owner/repo".into()) },
+            },
             Command {
                 host: None,
                 context_repo: None,
@@ -202,6 +208,79 @@ mod tests {
                 context_repo: None,
                 action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()), terminal_keys: vec![] },
             },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+                action: CommandAction::FetchCheckoutStatus {
+                    branch: "feat-x".into(),
+                    checkout_path: None,
+                    change_request_id: Some("123".into()),
+                },
+            },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+                action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repo/wt") },
+            },
+            Command { host: None, context_repo: None, action: CommandAction::SelectWorkspace { ws_ref: "ws://1".into() } },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Query("owner/repo".into())),
+                action: CommandAction::OpenChangeRequest { id: "99".into() },
+            },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Query("owner/repo".into())),
+                action: CommandAction::CloseChangeRequest { id: "99".into() },
+            },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Query("owner/repo".into())),
+                action: CommandAction::OpenIssue { id: "42".into() },
+            },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Query("owner/repo".into())),
+                action: CommandAction::LinkIssuesToChangeRequest {
+                    change_request_id: "99".into(),
+                    issue_ids: vec!["42".into(), "43".into()],
+                },
+            },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Query("owner/repo".into())),
+                action: CommandAction::ArchiveSession { session_id: "session-1".into() },
+            },
+            Command {
+                host: None,
+                context_repo: Some(RepoSelector::Query("owner/repo".into())),
+                action: CommandAction::GenerateBranchName { issue_keys: vec!["ISSUE-1".into(), "ISSUE-2".into()] },
+            },
+            Command {
+                host: Some(HostName::new("feta")),
+                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
+                action: CommandAction::TeleportSession {
+                    session_id: "session-1".into(),
+                    branch: Some("feat-x".into()),
+                    checkout_key: Some(PathBuf::from("/repo/wt")),
+                },
+            },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::SetIssueViewport { repo: PathBuf::from("/repo"), visible_count: 25 },
+            },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::FetchMoreIssues { repo: PathBuf::from("/repo"), desired_count: 50 },
+            },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::SearchIssues { repo: PathBuf::from("/repo"), query: "bug".into() },
+            },
+            Command { host: None, context_repo: None, action: CommandAction::ClearIssueSearch { repo: PathBuf::from("/repo") } },
         ];
 
         for cmd in cases {

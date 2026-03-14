@@ -335,6 +335,20 @@ async fn remove_checkout_command_accepts_selector_queries() {
 }
 
 #[tokio::test]
+async fn fetch_checkout_status_uses_context_repo_when_checkout_path_is_absent() {
+    let (repo, daemon) = daemon_for_cwd().await;
+
+    let command = Command {
+        host: None,
+        context_repo: Some(RepoSelector::Path(repo.clone())),
+        action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
+    };
+
+    let command_id = daemon.execute(command).await.expect("status command should resolve via context repo");
+    assert_ne!(command_id, 0, "status command should execute through the normal command path");
+}
+
+#[tokio::test]
 async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
     let (repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();

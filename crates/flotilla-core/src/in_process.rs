@@ -510,7 +510,8 @@ impl InProcessDaemon {
                     .cloned()
                     .ok_or_else(|| format!("repo not tracked: {}", path.display()))
             }
-            CommandAction::OpenChangeRequest { .. }
+            CommandAction::FetchCheckoutStatus { checkout_path: None, .. }
+            | CommandAction::OpenChangeRequest { .. }
             | CommandAction::CloseChangeRequest { .. }
             | CommandAction::OpenIssue { .. }
             | CommandAction::LinkIssuesToChangeRequest { .. }
