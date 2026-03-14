@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, path::Path};
 
-use flotilla_protocol::{CheckoutRef, DiscoveryEntry, HostName, ProviderError, Snapshot, WorkItem};
+use flotilla_protocol::{CheckoutRef, DiscoveryEntry, HostName, ProviderError, RepoIdentity, Snapshot, WorkItem};
 
 use crate::{
     data::{CorrelationResult, RefreshError},
@@ -117,9 +117,10 @@ pub fn health_to_proto(health: &HashMap<(&'static str, String), bool>) -> HashMa
     nested
 }
 
-pub fn snapshot_to_proto(repo: &Path, seq: u64, refresh: &RefreshSnapshot, host_name: &HostName) -> Snapshot {
+pub fn snapshot_to_proto(repo_identity: RepoIdentity, repo: &Path, seq: u64, refresh: &RefreshSnapshot, host_name: &HostName) -> Snapshot {
     Snapshot {
         seq,
+        repo_identity,
         repo: repo.to_path_buf(),
         host_name: host_name.clone(),
         work_items: refresh

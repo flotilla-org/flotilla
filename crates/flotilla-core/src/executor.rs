@@ -50,6 +50,7 @@ enum CheckoutIntent {
 /// commands delegate to `execute()` and return `ExecutionPlan::Immediate`.
 pub async fn build_plan(
     cmd: Command,
+    repo_identity: flotilla_protocol::RepoIdentity,
     repo_root: PathBuf,
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
@@ -93,7 +94,8 @@ pub async fn build_plan(
         }
 
         action => {
-            let result = execute(action, &repo_root, &registry, &providers_data, &*runner, &config_base, &local_host).await;
+            let result =
+                execute(action, repo_identity, &repo_root, &registry, &providers_data, &*runner, &config_base, &local_host).await;
             ExecutionPlan::Immediate(result)
         }
     }
@@ -394,6 +396,7 @@ fn build_remove_checkout_plan(
 /// should not reach this function — the caller should handle them directly.
 pub async fn execute(
     action: CommandAction,
+    repo_identity: flotilla_protocol::RepoIdentity,
     repo_root: &Path,
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
@@ -494,7 +497,13 @@ pub async fn execute(
             if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
                 match prepare_terminal_commands(repo_root, &co.branch, &checkout_path, registry, config_base).await {
                     Ok(commands) => {
-                        CommandResult::TerminalPrepared { target_host: local_host.clone(), branch: co.branch, checkout_path, commands }
+                        CommandResult::TerminalPrepared {
+                            repo_identity,
+                            target_host: local_host.clone(),
+                            branch: co.branch,
+                            checkout_path,
+                            commands,
+                        }
                     }
                     Err(message) => CommandResult::Error { message },
                 }
@@ -1224,7 +1233,17 @@ mod tests {
         providers_data: &ProviderData,
         runner: &MockRunner,
     ) -> CommandResult {
-        execute(action, &repo_root(), registry, providers_data, runner, &config_base(), &local_host()).await
+        execute(
+            action,
+            flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            &repo_root(),
+            registry,
+            providers_data,
+            runner,
+            &config_base(),
+            &local_host(),
+        )
+        .await
     }
 
     fn assert_error_contains(result: CommandResult, expected_substring: &str) {
@@ -1374,7 +1393,8 @@ mod tests {
             run_execute(CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone() }, &registry, &data, &runner).await;
 
         match result {
-            CommandResult::TerminalPrepared { target_host, branch, checkout_path, commands } => {
+            CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, commands } => {
+                assert_eq!(repo_identity, flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
                 assert_eq!(target_host, HostName::local());
                 assert_eq!(branch, "feat");
                 assert_eq!(checkout_path, path);
@@ -1404,6 +1424,7 @@ mod tests {
                 checkout_path: PathBuf::from("/remote/feat"),
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
             },
+            flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             &repo_root(),
             &registry,
             &empty_data(),
@@ -2165,6 +2186,7 @@ mod tests {
     ) -> ExecutionPlan {
         build_plan(
             local_command(action),
+            flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repo_root(),
             Arc::new(registry),
             Arc::new(providers_data),

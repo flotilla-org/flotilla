@@ -36,6 +36,14 @@ use crate::{
     step::run_step_plan,
 };
 
+fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
+    flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.to_string_lossy().into_owned() }
+}
+
+fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
+    bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
+}
+
 fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -111,6 +119,7 @@ fn inject_issues(base_providers: &ProviderData, cache: &IssueCache, search_resul
 
 /// Build a proto Snapshot by injecting issues, re-correlating, and patching issue metadata.
 fn build_repo_snapshot(
+    repo_identity: flotilla_protocol::RepoIdentity,
     path: &Path,
     seq: u64,
     base: &RefreshSnapshot,
@@ -118,11 +127,12 @@ fn build_repo_snapshot(
     search_results: &Option<Vec<(String, Issue)>>,
     host_name: &HostName,
 ) -> Snapshot {
-    build_repo_snapshot_with_peers(path, seq, base, cache, search_results, host_name, None)
+    build_repo_snapshot_with_peers(repo_identity, path, seq, base, cache, search_results, host_name, None)
 }
 
 /// Build a proto Snapshot, optionally merging peer provider data before correlation.
 fn build_repo_snapshot_with_peers(
+    repo_identity: flotilla_protocol::RepoIdentity,
     path: &Path,
     seq: u64,
     base: &RefreshSnapshot,
@@ -149,7 +159,7 @@ fn build_repo_snapshot_with_peers(
         errors: base.errors.clone(),
         provider_health: base.provider_health.clone(),
     };
-    let mut snapshot = snapshot_to_proto(path, seq, &re_snapshot, host_name);
+    let mut snapshot = snapshot_to_proto(repo_identity, path, seq, &re_snapshot, host_name);
     snapshot.issue_total = cache.total_count;
     snapshot.issue_has_more = cache.has_more;
     snapshot.issue_search_results = search_results.clone();
@@ -170,11 +180,12 @@ fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
         return DaemonEvent::SnapshotFull(Box::new(snapshot));
     }
 
-    let snapshot_delta = flotilla_protocol::SnapshotDelta {
-        seq: delta.seq,
-        prev_seq: delta.prev_seq,
-        repo: snapshot.repo.clone(),
-        changes: delta.changes,
+        let snapshot_delta = flotilla_protocol::SnapshotDelta {
+            seq: delta.seq,
+            prev_seq: delta.prev_seq,
+            repo_identity: snapshot.repo_identity.clone(),
+            repo: snapshot.repo.clone(),
+            changes: delta.changes,
         work_items: snapshot.work_items.clone(),
         issue_total: snapshot.issue_total,
         issue_has_more: snapshot.issue_has_more,
@@ -201,6 +212,7 @@ fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
 const DELTA_LOG_CAPACITY: usize = 16;
 
 struct RepoState {
+    identity: flotilla_protocol::RepoIdentity,
     model: RepoModel,
     slug: Option<String>,
     repo_bag: EnvironmentBag,
@@ -374,11 +386,14 @@ impl InProcessDaemon {
             if let Some(identity) = host_repo_bag.repo_identity() {
                 identities.insert(identity, path.clone());
             }
+            let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+            identities.insert(identity.clone(), path.clone());
 
             let slug = repo_slug.clone();
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
             repos.insert(path.clone(), RepoState {
+                identity,
                 model,
                 slug,
                 repo_bag,
@@ -483,6 +498,14 @@ impl InProcessDaemon {
                 let repos = self.repos.read().await;
                 let entries: Vec<_> = repos.iter().map(|(path, state)| (path.as_path(), state.slug.as_deref())).collect();
                 crate::resolve::resolve_repo(query, entries.into_iter()).map_err(|e| e.to_string())
+            }
+            flotilla_protocol::RepoSelector::Identity(identity) => {
+                self.repo_identities
+                    .read()
+                    .await
+                    .get(identity)
+                    .cloned()
+                    .ok_or_else(|| format!("repo not tracked: {identity}"))
             }
         }
     }
@@ -652,7 +675,7 @@ impl InProcessDaemon {
             state.model.data.provider_health = snapshot.provider_health.clone();
             state.model.data.loading = false;
 
-            let mut proto_snapshot = snapshot_to_proto(&path, state.seq + 1, &re_snapshot, &self.host_name);
+            let mut proto_snapshot = snapshot_to_proto(state.identity.clone(), &path, state.seq + 1, &re_snapshot, &self.host_name);
             proto_snapshot.provider_health = crate::convert::health_to_proto(&state.model.data.provider_health);
             proto_snapshot.issue_total = issue_total;
             proto_snapshot.issue_has_more = issue_has_more;
@@ -989,7 +1012,12 @@ impl InProcessDaemon {
     /// initial merged data from peer snapshots.
     ///
     /// Emits `DaemonEvent::RepoAdded` so the TUI creates a tab.
-    pub async fn add_virtual_repo(&self, synthetic_path: PathBuf, provider_data: ProviderData) -> Result<(), String> {
+    pub async fn add_virtual_repo(
+        &self,
+        identity: flotilla_protocol::RepoIdentity,
+        synthetic_path: PathBuf,
+        provider_data: ProviderData,
+    ) -> Result<(), String> {
         // Check if already tracked
         {
             let repos = self.repos.read().await;
@@ -1003,6 +1031,7 @@ impl InProcessDaemon {
         model.data.loading = false;
 
         let repo_info = RepoInfo {
+            identity: identity.clone(),
             path: synthetic_path.clone(),
             name: repo_name(&synthetic_path),
             labels: model.labels.clone(),
@@ -1019,6 +1048,7 @@ impl InProcessDaemon {
                 return Ok(());
             }
             repos.insert(synthetic_path.clone(), RepoState {
+                identity: identity.clone(),
                 model,
                 slug: None,
                 repo_bag: EnvironmentBag::new(),
@@ -1036,6 +1066,8 @@ impl InProcessDaemon {
             });
             order.push(synthetic_path.clone());
         }
+
+        self.repo_identities.write().await.insert(identity, synthetic_path.clone());
 
         // Virtual repos are not persisted to config — they come and go
         // with peer connections.
@@ -1067,6 +1099,7 @@ impl InProcessDaemon {
         };
 
         let proto_snapshot = build_repo_snapshot_with_peers(
+            state.identity.clone(),
             repo,
             state.seq + 1,
             &state.last_snapshot,
@@ -1123,6 +1156,7 @@ impl DaemonHandle for InProcessDaemon {
         let state = repos.get(repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
 
         Ok(build_repo_snapshot_with_peers(
+            state.identity.clone(),
             repo,
             state.seq,
             &state.last_snapshot,
@@ -1140,6 +1174,7 @@ impl DaemonHandle for InProcessDaemon {
         for path in order.iter() {
             if let Some(state) = repos.get(path) {
                 result.push(RepoInfo {
+                    identity: state.identity.clone(),
                     path: path.clone(),
                     name: repo_name(path),
                     labels: state.model.labels.clone(),
@@ -1196,6 +1231,7 @@ impl DaemonHandle for InProcessDaemon {
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity: fallback_repo_identity(path),
                     repo: path.clone(),
                     description,
                 });
@@ -1206,6 +1242,7 @@ impl DaemonHandle for InProcessDaemon {
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity: self.find_identity_for_path(path).await.unwrap_or_else(|| fallback_repo_identity(path)),
                     repo: path.clone(),
                     result,
                 });
@@ -1213,10 +1250,12 @@ impl DaemonHandle for InProcessDaemon {
             }
             flotilla_protocol::CommandAction::RemoveRepo { repo } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
+                let repo_identity = self.find_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity: repo_identity.clone(),
                     repo: repo_path.clone(),
                     description,
                 });
@@ -1227,6 +1266,7 @@ impl DaemonHandle for InProcessDaemon {
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity,
                     repo: repo_path,
                     result,
                 });
@@ -1238,10 +1278,13 @@ impl DaemonHandle for InProcessDaemon {
                     order.clone()
                 };
                 let display_repo = repo_paths.first().cloned().unwrap_or_default();
+                let display_repo_identity =
+                    self.find_identity_for_path(&display_repo).await.unwrap_or_else(|| fallback_repo_identity(&display_repo));
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity: display_repo_identity.clone(),
                     repo: display_repo.clone(),
                     description,
                 });
@@ -1253,6 +1296,7 @@ impl DaemonHandle for InProcessDaemon {
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity: display_repo_identity,
                     repo: display_repo,
                     result: flotilla_protocol::CommandResult::Refreshed { repos: refreshed },
                 });
@@ -1260,10 +1304,12 @@ impl DaemonHandle for InProcessDaemon {
             }
             flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } => {
                 let repo_path = self.resolve_repo_selector(selector).await?;
+                let repo_identity = self.find_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity: repo_identity.clone(),
                     repo: repo_path.clone(),
                     description,
                 });
@@ -1274,6 +1320,7 @@ impl DaemonHandle for InProcessDaemon {
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
                     host: self.host_name.clone(),
+                    repo_identity,
                     repo: repo_path,
                     result,
                 });
@@ -1286,10 +1333,11 @@ impl DaemonHandle for InProcessDaemon {
         let repo = self.resolve_repo_for_command(&command).await?;
         let runner = Arc::clone(&self.discovery.runner);
         let event_tx = self.event_tx.clone();
-        let (registry, providers_data, refresh_trigger) = {
+        let (repo_identity, registry, providers_data, refresh_trigger) = {
             let repos = self.repos.read().await;
             let state = repos.get(&repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             (
+                state.identity.clone(),
                 Arc::clone(&state.model.registry),
                 Arc::clone(&state.model.data.providers),
                 Arc::clone(&state.model.refresh_handle.refresh_trigger),
@@ -1303,6 +1351,7 @@ impl DaemonHandle for InProcessDaemon {
         let _ = self.event_tx.send(DaemonEvent::CommandStarted {
             command_id: id,
             host: self.host_name.clone(),
+            repo_identity: repo_identity.clone(),
             repo: repo_path.clone(),
             description,
         });
@@ -1314,13 +1363,21 @@ impl DaemonHandle for InProcessDaemon {
         let active_ref = Arc::clone(&self.active_command);
         let local_host = self.host_name.clone();
         tokio::spawn(async move {
-            let plan = executor::build_plan(command, repo_path.clone(), registry, providers_data, runner, config_base, local_host).await;
+            let plan =
+                executor::build_plan(command, repo_identity.clone(), repo_path.clone(), registry, providers_data, runner, config_base, local_host)
+                    .await;
 
             match plan {
                 ExecutionPlan::Immediate(result) => {
                     refresh_trigger.notify_one();
                     let _ =
-                        event_tx.send(DaemonEvent::CommandFinished { command_id: id, host: command_host.clone(), repo: repo_path, result });
+                        event_tx.send(DaemonEvent::CommandFinished {
+                            command_id: id,
+                            host: command_host.clone(),
+                            repo_identity: repo_identity.clone(),
+                            repo: repo_path,
+                            result,
+                        });
                 }
                 ExecutionPlan::Steps(step_plan) => {
                     // Reject if another step command is already running.
@@ -1333,6 +1390,7 @@ impl DaemonHandle for InProcessDaemon {
                             let _ = event_tx.send(DaemonEvent::CommandFinished {
                                 command_id: id,
                                 host: command_host.clone(),
+                                repo_identity: repo_identity.clone(),
                                 repo: repo_path,
                                 result: flotilla_protocol::CommandResult::Error {
                                     message: format!("another command is already running (id {})", active.command_id),
@@ -1343,13 +1401,28 @@ impl DaemonHandle for InProcessDaemon {
                         *guard = Some(ActiveCommand { command_id: id, token: token.clone() });
                     }
 
-                    let result = run_step_plan(step_plan, id, command_host.clone(), repo_path.clone(), token, event_tx.clone()).await;
+                    let result = run_step_plan(
+                        step_plan,
+                        id,
+                        command_host.clone(),
+                        repo_identity.clone(),
+                        repo_path.clone(),
+                        token,
+                        event_tx.clone(),
+                    )
+                    .await;
                     refresh_trigger.notify_one();
                     let mut guard = active_ref.lock().await;
                     if guard.as_ref().map(|a| a.command_id) == Some(id) {
                         *guard = None;
                     }
-                    let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, host: command_host, repo: repo_path, result });
+                    let _ = event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        host: command_host,
+                        repo_identity,
+                        repo: repo_path,
+                        result,
+                    });
                 }
             }
         });
@@ -1430,11 +1503,13 @@ impl DaemonHandle for InProcessDaemon {
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
+        let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
         let slug = repo_slug.clone();
         let mut model = RepoModel::new(path.clone(), registry, repo_slug);
         model.data.loading = true;
 
         let repo_info = RepoInfo {
+            identity: identity.clone(),
             path: path.clone(),
             name: repo_name(&path),
             labels: model.labels.clone(),
@@ -1451,6 +1526,7 @@ impl DaemonHandle for InProcessDaemon {
                 return Ok(());
             }
             repos.insert(path.clone(), RepoState {
+                identity: identity.clone(),
                 model,
                 slug,
                 repo_bag,
@@ -1470,9 +1546,7 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         // Register RepoIdentity for peer routing
-        if let Some(identity) = host_repo_bag.repo_identity() {
-            self.repo_identities.write().await.insert(identity, path.clone());
-        }
+        self.repo_identities.write().await.insert(identity, path.clone());
 
         // Persist to config
         self.config.save_repo(&path);
@@ -1499,8 +1573,17 @@ impl DaemonHandle for InProcessDaemon {
             if state.seq == 0 {
                 continue;
             }
-            let snapshot =
-                || build_repo_snapshot(path, state.seq, &state.last_snapshot, &state.issue_cache, &state.search_results, &self.host_name);
+            let snapshot = || {
+                build_repo_snapshot(
+                    state.identity.clone(),
+                    path,
+                    state.seq,
+                    &state.last_snapshot,
+                    &state.issue_cache,
+                    &state.search_results,
+                    &self.host_name,
+                )
+            };
 
             match last_seen.get(path) {
                 Some(&client_seq) => {
@@ -1515,6 +1598,7 @@ impl DaemonHandle for InProcessDaemon {
                             events.push(DaemonEvent::SnapshotDelta(Box::new(flotilla_protocol::SnapshotDelta {
                                 seq: entry.seq,
                                 prev_seq: entry.prev_seq,
+                                repo_identity: state.identity.clone(),
                                 repo: path.clone(),
                                 changes: entry.changes.clone(),
                                 work_items: entry.work_items.clone(),
@@ -1548,6 +1632,7 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn remove_repo(&self, path: &Path) -> Result<(), String> {
         let path = path.to_path_buf();
+        let repo_identity = self.find_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
 
         {
             let mut repos = self.repos.write().await;
@@ -1574,7 +1659,7 @@ impl DaemonHandle for InProcessDaemon {
         self.config.save_tab_order(&order);
 
         info!(repo = %path.display(), "removed repo");
-        let _ = self.event_tx.send(DaemonEvent::RepoRemoved { path });
+        let _ = self.event_tx.send(DaemonEvent::RepoRemoved { repo_identity, path });
 
         Ok(())
     }
@@ -1589,6 +1674,7 @@ impl DaemonHandle for InProcessDaemon {
             let Some(state) = repos.get(path) else { continue };
             let peer_overlay = peer_providers.get(path).cloned();
             let snapshot = build_repo_snapshot_with_peers(
+                state.identity.clone(),
                 path,
                 state.seq,
                 &state.last_snapshot,
@@ -1620,6 +1706,7 @@ impl DaemonHandle for InProcessDaemon {
         };
         let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let snapshot = build_repo_snapshot_with_peers(
+            state.identity.clone(),
             &path,
             state.seq,
             &state.last_snapshot,
@@ -1649,6 +1736,7 @@ impl DaemonHandle for InProcessDaemon {
         };
         let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let snapshot = build_repo_snapshot_with_peers(
+            state.identity.clone(),
             &path,
             state.seq,
             &state.last_snapshot,
@@ -1700,6 +1788,7 @@ impl DaemonHandle for InProcessDaemon {
         };
         let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let snapshot = build_repo_snapshot_with_peers(
+            state.identity.clone(),
             &path,
             state.seq,
             &state.last_snapshot,
@@ -1797,6 +1886,7 @@ mod tests {
         let repo = PathBuf::from("/tmp/repo");
         let snapshot = Snapshot {
             seq: 2,
+            repo_identity: fallback_repo_identity(&repo),
             repo: repo.clone(),
             host_name: HostName::local(),
             work_items: vec![],
@@ -1824,6 +1914,7 @@ mod tests {
     fn choose_event_falls_back_to_full_when_delta_is_larger() {
         let snapshot = Snapshot {
             seq: 3,
+            repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
             repo: PathBuf::from("/tmp/repo"),
             host_name: HostName::local(),
             work_items: vec![],
@@ -1858,7 +1949,15 @@ mod tests {
             provider_display_name: String::new(),
         })]);
 
-        let snap = build_repo_snapshot(Path::new("/tmp/repo"), 7, &RefreshSnapshot::default(), &cache, &None, &HostName::local());
+        let snap = build_repo_snapshot(
+            fallback_repo_identity(Path::new("/tmp/repo")),
+            Path::new("/tmp/repo"),
+            7,
+            &RefreshSnapshot::default(),
+            &cache,
+            &None,
+            &HostName::local(),
+        );
         assert_eq!(snap.seq, 7);
         assert_eq!(snap.issue_total, Some(5));
         assert!(snap.issue_has_more);

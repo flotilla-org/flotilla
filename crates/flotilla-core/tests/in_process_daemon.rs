@@ -1,14 +1,17 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     sync::Arc,
 };
 
 use flotilla_core::{
-    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
+    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon,
+    providers::discovery::test_support::{fake_discovery, git_process_discovery},
 };
 use flotilla_protocol::{
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, DaemonEvent, HostName, ProviderData, RepoSelector,
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, DaemonEvent, HostName, ProviderData, RepoIdentity,
+    RepoSelector,
 };
 
 async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
@@ -18,6 +21,37 @@ async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
     (temp, repo, daemon)
+}
+
+fn init_git_repo_with_remote(path: &Path, remote: &str) {
+    std::fs::create_dir_all(path).expect("create repo dir");
+
+    let status = ProcessCommand::new("git").args(["init", "--initial-branch=main"]).arg(path).status().expect("git init");
+    assert!(status.success(), "git init should succeed");
+
+    let path_str = path.to_str().expect("repo path utf8");
+    let status = ProcessCommand::new("git").args(["-C", path_str, "config", "user.name", "Flotilla Tests"]).status().expect("git config name");
+    assert!(status.success(), "git config user.name should succeed");
+
+    let status = ProcessCommand::new("git")
+        .args(["-C", path_str, "config", "user.email", "flotilla@example.com"])
+        .status()
+        .expect("git config email");
+    assert!(status.success(), "git config user.email should succeed");
+
+    let status =
+        ProcessCommand::new("git").args(["-C", path_str, "remote", "add", "origin", remote]).status().expect("git remote add origin");
+    assert!(status.success(), "git remote add origin should succeed");
+}
+
+async fn daemon_for_git_repo(remote: &str) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, RepoIdentity) {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    init_git_repo_with_remote(&repo, remote);
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::local()).await;
+    let identity = daemon.find_identity_for_path(&repo).await.expect("repo identity should be detected");
+    (temp, repo, daemon, identity)
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {
@@ -55,7 +89,7 @@ async fn daemon_broadcasts_snapshots() {
 
 #[tokio::test]
 async fn execute_broadcasts_lifecycle_events() {
-    let (_temp, repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon, identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
     let mut rx = daemon.subscribe();
 
     // Execute a command that goes through the spawned task path.
@@ -64,7 +98,7 @@ async fn execute_broadcasts_lifecycle_events() {
     // We only care about the lifecycle events, not the command result.
     let command = Command {
         host: None,
-        context_repo: Some(RepoSelector::Path(repo.clone())),
+        context_repo: Some(RepoSelector::Identity(identity.clone())),
         action: CommandAction::ArchiveSession { session_id: "nonexistent-session".into() },
     };
     let command_id = daemon.execute(command).await.expect("execute should return a command id");
@@ -80,14 +114,16 @@ async fn execute_broadcasts_lifecycle_events() {
     let result = tokio::time::timeout(timeout, async {
         while !got_started || !got_finished {
             match rx.recv().await {
-                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo: ref event_repo, .. }) => {
+                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo_identity, repo: ref event_repo, .. }) => {
                     assert_eq!(host, HostName::local(), "CommandStarted host should default to local host");
+                    assert_eq!(repo_identity, identity, "CommandStarted repo identity should match executed repo");
                     assert_eq!(event_repo, &repo, "CommandStarted repo should match executed repo");
                     started_id = Some(id);
                     got_started = true;
                 }
-                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo: ref event_repo, .. }) => {
+                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo_identity, repo: ref event_repo, .. }) => {
                     assert_eq!(host, HostName::local(), "CommandFinished host should default to local host");
+                    assert_eq!(repo_identity, identity, "CommandFinished repo identity should match executed repo");
                     assert_eq!(event_repo, &repo, "CommandFinished repo should match executed repo");
                     finished_id = Some(id);
                     got_finished = true;
@@ -106,6 +142,37 @@ async fn execute_broadcasts_lifecycle_events() {
     // Both events must carry the same command ID returned by execute()
     assert_eq!(started_id, Some(command_id), "CommandStarted id should match the id returned by execute()");
     assert_eq!(finished_id, Some(command_id), "CommandFinished id should match the id returned by execute()");
+}
+
+#[tokio::test]
+async fn fetch_checkout_status_accepts_identity_context_repo() {
+    let (_temp, _repo, daemon, identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
+    let mut rx = daemon.subscribe();
+
+    let command = Command {
+        host: None,
+        context_repo: Some(RepoSelector::Identity(identity.clone())),
+        action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
+    };
+
+    let command_id = daemon.execute(command).await.expect("status command should resolve via identity context repo");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: finished_id, repo_identity, result, .. }) if finished_id == command_id => {
+                    assert_eq!(repo_identity, identity, "finished event should preserve repo identity");
+                    break result;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for checkout status command to finish");
+
+    assert!(matches!(result, CommandResult::CheckoutStatus(_)), "expected checkout status result via identity context repo, got {result:?}");
 }
 
 #[tokio::test]
@@ -223,7 +290,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
         loop {
             match rx.recv().await {
                 Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == remove_id => finished = Some(result),
-                Ok(DaemonEvent::RepoRemoved { path }) => removed = Some(path),
+                Ok(DaemonEvent::RepoRemoved { path, .. }) => removed = Some(path),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
@@ -482,7 +549,8 @@ async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
     let mut rx = daemon.subscribe();
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
-    daemon.add_virtual_repo(synthetic_path.clone(), ProviderData::default()).await.expect("add_virtual_repo should succeed");
+    let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
+    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), ProviderData::default()).await.expect("add_virtual_repo should succeed");
 
     // Should receive a RepoAdded event
     let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -496,6 +564,7 @@ async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
     })
     .await
     .expect("timeout waiting for RepoAdded");
+    assert_eq!(added.identity, identity);
     assert_eq!(added.path, synthetic_path);
     assert!(!added.loading, "virtual repos should not be in loading state");
 
@@ -512,10 +581,11 @@ async fn add_virtual_repo_is_idempotent() {
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
-    daemon.add_virtual_repo(synthetic_path.clone(), ProviderData::default()).await.expect("first add should succeed");
+    let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
+    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), ProviderData::default()).await.expect("first add should succeed");
 
     // Second add with same path should be a no-op
-    daemon.add_virtual_repo(synthetic_path.clone(), ProviderData::default()).await.expect("second add should succeed (idempotent)");
+    daemon.add_virtual_repo(identity, synthetic_path.clone(), ProviderData::default()).await.expect("second add should succeed (idempotent)");
 
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1, "should still have exactly one repo");
