@@ -374,8 +374,13 @@ impl RepoState {
         if self.contains_path(&root.path) {
             return false;
         }
-        self.roots.push(root);
-        true
+        let preferred_changed = !self.preferred_root().is_local && root.is_local;
+        if preferred_changed {
+            self.roots.insert(0, root);
+        } else {
+            self.roots.push(root);
+        }
+        preferred_changed
     }
 
     fn remove_root(&mut self, path: &Path) -> bool {
@@ -1747,6 +1752,7 @@ impl DaemonHandle for InProcessDaemon {
 
         // Insert under write lock — re-check to avoid TOCTOU duplicate
         let mut added_new_identity = false;
+        let mut preferred_changed = false;
         let already_tracked = self.path_identities.read().await.contains_key(&path);
         if already_tracked {
             return Ok(());
@@ -1755,7 +1761,7 @@ impl DaemonHandle for InProcessDaemon {
             let mut repos = self.repos.write().await;
             let mut order = self.repo_order.write().await;
             if let Some(state) = repos.get_mut(&identity) {
-                state.add_root(root);
+                preferred_changed = state.add_root(root);
             } else {
                 repos.insert(identity.clone(), RepoState::new(identity.clone(), root));
                 order.push(identity.clone());
@@ -1777,6 +1783,8 @@ impl DaemonHandle for InProcessDaemon {
         info!(repo = %path.display(), "added repo");
         if added_new_identity {
             let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
+        } else if preferred_changed {
+            self.broadcast_snapshot_inner(&path, false).await;
         }
 
         Ok(())
@@ -1858,12 +1866,14 @@ impl DaemonHandle for InProcessDaemon {
         let repo_identity = self.find_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
 
         let mut removed_identity = false;
+        let mut new_preferred_path = None;
         {
             let mut repos = self.repos.write().await;
             let mut order = self.repo_order.write().await;
             let Some(state) = repos.get_mut(&repo_identity) else {
                 return Err(format!("repo not tracked: {}", path.display()));
             };
+            let previous_preferred = state.preferred_path().to_path_buf();
             if !state.remove_root(&path) {
                 return Err(format!("repo not tracked: {}", path.display()));
             }
@@ -1871,6 +1881,8 @@ impl DaemonHandle for InProcessDaemon {
                 repos.remove(&repo_identity);
                 order.retain(|repo| repo != &repo_identity);
                 removed_identity = true;
+            } else if previous_preferred == path {
+                new_preferred_path = Some(state.preferred_path().to_path_buf());
             }
         }
 
@@ -1893,6 +1905,8 @@ impl DaemonHandle for InProcessDaemon {
         info!(repo = %path.display(), "removed repo");
         if removed_identity {
             let _ = self.event_tx.send(DaemonEvent::RepoRemoved { repo_identity, path });
+        } else if let Some(preferred_path) = new_preferred_path {
+            self.broadcast_snapshot_inner(&preferred_path, false).await;
         }
 
         Ok(())

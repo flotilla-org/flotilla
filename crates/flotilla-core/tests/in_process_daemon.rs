@@ -590,6 +590,56 @@ async fn duplicate_local_roots_share_identity_but_remain_tracked() {
 }
 
 #[tokio::test]
+async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let local_repo = temp.path().join("repo");
+    let identity = init_git_repo_with_remote(&local_repo, "git@github.com:owner/repo.git");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+
+    daemon
+        .add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), ProviderData::default())
+        .await
+        .expect("add virtual repo");
+    daemon.add_repo(&local_repo).await.expect("add local repo");
+
+    let repos = daemon.list_repos().await.expect("list repos");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].identity, identity);
+    assert_eq!(repos[0].path, local_repo, "local clone should become the preferred executable path");
+    assert_eq!(daemon.find_repo_by_identity(&identity).await, Some(local_repo.clone()));
+    assert!(daemon.get_local_providers(&local_repo).await.is_some(), "local providers should now resolve for the identity");
+    assert_eq!(daemon.tracked_repo_paths().await, vec![local_repo]);
+}
+
+#[tokio::test]
+async fn removing_preferred_root_emits_snapshot_for_new_preferred_path() {
+    let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_git_repos("git@github.com:owner/repo.git").await;
+    let mut rx = daemon.subscribe();
+
+    daemon.refresh(&repo_a).await.expect("refresh first repo");
+    let _ = recv_event(&mut rx).await;
+
+    daemon.remove_repo(&repo_a).await.expect("remove preferred root");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::SnapshotFull(snapshot)) => break Some(snapshot.repo),
+                Ok(DaemonEvent::SnapshotDelta(delta)) => break Some(delta.repo),
+                Ok(_) => {}
+                Err(_) => break None,
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for preferred-path snapshot")
+    .expect("snapshot event");
+
+    assert_eq!(event, repo_b, "surviving root should be broadcast immediately as the new preferred path");
+}
+
+#[tokio::test]
 async fn inline_issue_command_returns_zero_and_skips_lifecycle_events() {
     let (_temp, repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();
