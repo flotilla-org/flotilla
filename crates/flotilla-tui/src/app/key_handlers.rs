@@ -354,8 +354,6 @@ impl App {
                     self.enter_branch_input(BranchInputKind::Generating);
                 }
                 Intent::CloseChangeRequest => {
-                    // CloseChangeRequest doesn't push now — the confirm handler
-                    // creates its own PendingActionContext when the user confirms.
                     self.ui.mode = UiMode::CloseConfirm {
                         id: match &cmd {
                             Command { action: CommandAction::CloseChangeRequest { id }, .. } => id.clone(),
@@ -363,6 +361,7 @@ impl App {
                         },
                         title: item.description.clone(),
                         identity: item.identity.clone(),
+                        command: cmd,
                     };
                     return;
                 }
@@ -517,14 +516,13 @@ impl App {
     fn handle_close_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                if let UiMode::CloseConfirm { ref id, ref identity, .. } = self.ui.mode {
+                if let UiMode::CloseConfirm { ref id, ref identity, ref command, .. } = self.ui.mode {
                     let ctx = PendingActionContext {
                         identity: identity.clone(),
                         description: format!("Close {}", id),
                         repo_path: self.model.active_repo_root().clone(),
                     };
-                    self.proto_commands
-                        .push_with_context(self.repo_command(CommandAction::CloseChangeRequest { id: id.clone() }), Some(ctx));
+                    self.proto_commands.push_with_context(command.clone(), Some(ctx));
                 }
                 self.ui.mode = UiMode::Normal;
             }
@@ -1509,11 +1507,37 @@ mod tests {
         let mut app = stub_app();
         let item = make_work_item("a");
         // Set up CloseConfirm mode with the item's identity
-        app.ui.mode = UiMode::CloseConfirm { id: "PR-1".into(), title: "test".into(), identity: item.identity.clone() };
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "PR-1".into(),
+            title: "test".into(),
+            identity: item.identity.clone(),
+            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "PR-1".into() } },
+        };
         // Simulate pressing 'y' to confirm
         app.handle_key(key(KeyCode::Char('y')));
         let (_, ctx) = app.proto_commands.take_next().expect("should have command");
         let ctx = ctx.expect("should have pending context");
         assert_eq!(ctx.identity, item.identity);
+    }
+
+    #[test]
+    fn close_confirm_preserves_resolved_remote_command() {
+        let mut app = stub_app();
+        let expected = Command {
+            host: Some(HostName::new("remote-host")),
+            context_repo: Some(flotilla_protocol::RepoSelector::Identity(app.model.active_repo_identity().clone())),
+            action: CommandAction::CloseChangeRequest { id: "PR-1".into() },
+        };
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "PR-1".into(),
+            title: "test".into(),
+            identity: WorkItemIdentity::ChangeRequest("PR-1".into()),
+            command: expected.clone(),
+        };
+
+        app.handle_key(key(KeyCode::Char('y')));
+
+        let (command, _) = app.proto_commands.take_next().expect("should have command");
+        assert_eq!(command, expected);
     }
 }

@@ -60,6 +60,7 @@ pub enum UiMode {
         id: String,
         title: String,
         identity: WorkItemIdentity,
+        command: flotilla_protocol::Command,
     },
     IssueSearch {
         input: Input,
@@ -317,7 +318,19 @@ mod tests {
                 },
                 false,
             ),
-            (UiMode::CloseConfirm { id: "42".into(), title: "test".into(), identity: WorkItemIdentity::Session("test".into()) }, false),
+            (
+                UiMode::CloseConfirm {
+                    id: "42".into(),
+                    title: "test".into(),
+                    identity: WorkItemIdentity::Session("test".into()),
+                    command: flotilla_protocol::Command {
+                        host: None,
+                        context_repo: None,
+                        action: flotilla_protocol::CommandAction::CloseChangeRequest { id: "42".into() },
+                    },
+                },
+                false,
+            ),
             (UiMode::IssueSearch { input: Input::default() }, false),
         ];
         for (mode, expected) in &cases {

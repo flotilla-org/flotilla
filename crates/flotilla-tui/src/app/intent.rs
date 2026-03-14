@@ -135,10 +135,13 @@ impl Intent {
                     None
                 }
             }
-            Intent::OpenChangeRequest => {
-                item.change_request_key.as_ref().map(|k| app.repo_command(CommandAction::OpenChangeRequest { id: k.clone() }))
+            Intent::OpenChangeRequest => item
+                .change_request_key
+                .as_ref()
+                .map(|k| app.provider_repo_command(CommandAction::OpenChangeRequest { id: k.clone() }, item)),
+            Intent::OpenIssue => {
+                item.issue_keys.first().map(|k| app.provider_repo_command(CommandAction::OpenIssue { id: k.clone() }, item))
             }
-            Intent::OpenIssue => item.issue_keys.first().map(|k| app.repo_command(CommandAction::OpenIssue { id: k.clone() })),
             Intent::LinkIssuesToChangeRequest => {
                 let change_request_key = item.change_request_key.as_ref()?;
                 let co_key = item.checkout_key()?;
@@ -171,10 +174,10 @@ impl Intent {
                 if missing.is_empty() {
                     return None;
                 }
-                Some(app.repo_command(CommandAction::LinkIssuesToChangeRequest {
-                    change_request_id: change_request_key.clone(),
-                    issue_ids: missing,
-                }))
+                Some(app.provider_repo_command(
+                    CommandAction::LinkIssuesToChangeRequest { change_request_id: change_request_key.clone(), issue_ids: missing },
+                    item,
+                ))
             }
             Intent::TeleportSession => item.session_key.as_ref().map(|k| {
                 app.repo_command(CommandAction::TeleportSession {
@@ -184,7 +187,7 @@ impl Intent {
                 })
             }),
             Intent::ArchiveSession => {
-                item.session_key.as_ref().map(|k| app.repo_command(CommandAction::ArchiveSession { session_id: k.clone() }))
+                item.session_key.as_ref().map(|k| app.provider_repo_command(CommandAction::ArchiveSession { session_id: k.clone() }, item))
             }
             Intent::CloseChangeRequest => {
                 let cr_key = item.change_request_key.as_ref()?;
@@ -193,7 +196,7 @@ impl Intent {
                 if cr.status != flotilla_protocol::ChangeRequestStatus::Open {
                     return None;
                 }
-                Some(app.repo_command(CommandAction::CloseChangeRequest { id: cr_key.clone() }))
+                Some(app.provider_repo_command(CommandAction::CloseChangeRequest { id: cr_key.clone() }, item))
             }
         }
     }
@@ -221,12 +224,18 @@ impl Intent {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
-    use flotilla_protocol::{CategoryLabels, CheckoutRef, HostName, HostPath, RepoLabels};
+    use flotilla_protocol::{
+        CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CorrelationKey, HostName, HostPath, RepoLabels,
+        RepoSelector,
+    };
 
     use super::*;
-    use crate::app::test_support::{bare_item, checkout_item, pr_item, remote_branch_item, session_item, stub_app};
+    use crate::app::{
+        test_support::{bare_item, checkout_item, pr_item, remote_branch_item, session_item, stub_app},
+        TuiRepoModel,
+    };
 
     // ── Helpers ──
 
@@ -535,7 +544,6 @@ mod tests {
     // ── resolve tests ──
     //
     // resolve() requires &App so we use the shared TUI test harness.
-    use std::sync::Arc;
 
     use flotilla_protocol::ProviderData;
 
@@ -773,6 +781,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_open_pr_on_remote_only_repo_routes_to_remote_host_by_identity() {
+        let app = remote_only_app();
+        let mut item = pr_item("123");
+        item.host = HostName::new("desktop");
+        let cmd = Intent::OpenChangeRequest.resolve(&item, &app).expect("command");
+        match cmd {
+            Command { host, context_repo, action: CommandAction::OpenChangeRequest { id } } => {
+                assert_eq!(host, Some(HostName::new("desktop")));
+                assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
+                assert_eq!(id, "123");
+            }
+            other => panic!("expected remote OpenChangeRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_open_pr_none_without_change_request_key() {
         let app = stub_app();
         let item = bare_item();
@@ -792,6 +816,23 @@ mod tests {
                 assert_eq!(id, "7");
             }
             other => panic!("expected OpenIssue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_open_issue_on_remote_only_repo_routes_to_remote_host_by_identity() {
+        let app = remote_only_app();
+        let mut item = bare_item();
+        item.host = HostName::new("desktop");
+        item.issue_keys = vec!["7".into(), "8".into()];
+        let cmd = Intent::OpenIssue.resolve(&item, &app).expect("command");
+        match cmd {
+            Command { host, context_repo, action: CommandAction::OpenIssue { id } } => {
+                assert_eq!(host, Some(HostName::new("desktop")));
+                assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
+                assert_eq!(id, "7");
+            }
+            other => panic!("expected remote OpenIssue, got {other:?}"),
         }
     }
 
@@ -856,6 +897,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_archive_session_on_remote_only_repo_routes_to_remote_host_by_identity() {
+        let app = remote_only_app();
+        let mut item = session_item("sess-99");
+        item.host = HostName::new("desktop");
+        let cmd = Intent::ArchiveSession.resolve(&item, &app).expect("command");
+        match cmd {
+            Command { host, context_repo, action: CommandAction::ArchiveSession { session_id } } => {
+                assert_eq!(host, Some(HostName::new("desktop")));
+                assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
+                assert_eq!(session_id, "sess-99");
+            }
+            other => panic!("expected remote ArchiveSession, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_archive_session_none_without_session() {
         let app = stub_app();
         let item = bare_item();
@@ -901,6 +958,64 @@ mod tests {
         app
     }
 
+    fn remote_only_app() -> App {
+        let mut app = stub_app();
+        let old_path = PathBuf::from("/tmp/test-repo");
+        let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
+        let old = app.model.repos.remove(&old_path).expect("default repo");
+        let model = TuiRepoModel {
+            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            providers: old.providers,
+            labels: old.labels,
+            provider_names: old.provider_names,
+            provider_health: old.provider_health,
+            loading: old.loading,
+            issue_has_more: old.issue_has_more,
+            issue_total: old.issue_total,
+            issue_search_active: old.issue_search_active,
+            issue_fetch_pending: old.issue_fetch_pending,
+            issue_initial_requested: old.issue_initial_requested,
+        };
+        app.model.repo_order[0] = synthetic_path.clone();
+        app.model.repos.insert(synthetic_path, model);
+        app.model.my_host = Some(HostName::local());
+        app
+    }
+
+    fn remote_only_app_with_providers() -> App {
+        use flotilla_protocol::AssociationKey;
+
+        let mut app = remote_only_app();
+        let remote_host = HostName::new("desktop");
+        let checkout_path = HostPath::new(remote_host.clone(), PathBuf::from("/srv/repo.feat-x"));
+
+        let mut providers = flotilla_protocol::ProviderData::default();
+        providers.change_requests.insert("42".into(), ChangeRequest {
+            title: "Fix bug".into(),
+            branch: "feat/x".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
+        providers.checkouts.insert(checkout_path.clone(), Checkout {
+            branch: "feat/x".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path)],
+            association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into()), AssociationKey::IssueRef("gh".into(), "20".into())],
+        });
+
+        let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
+        app.model.repos.get_mut(&synthetic_path).expect("remote repo").providers = Arc::new(providers);
+        app
+    }
+
     #[test]
     fn resolve_link_issues_to_pr_returns_none_when_provider_data_missing() {
         // Even if the WorkItem has the right keys, resolve needs matching
@@ -935,6 +1050,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_link_issues_to_pr_on_remote_only_repo_routes_to_remote_host_by_identity() {
+        let app = remote_only_app_with_providers();
+
+        let mut item = checkout_item("feat/x", "/srv/repo.feat-x", false);
+        item.host = HostName::new("desktop");
+        item.checkout =
+            Some(CheckoutRef { key: HostPath::new(HostName::new("desktop"), PathBuf::from("/srv/repo.feat-x")), is_main_checkout: false });
+        item.change_request_key = Some("42".into());
+        item.issue_keys = vec!["10".into(), "20".into()];
+
+        let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app).expect("command");
+        match cmd {
+            Command { host, context_repo, action: CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } } => {
+                assert_eq!(host, Some(HostName::new("desktop")));
+                assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
+                assert_eq!(change_request_id, "42");
+                assert_eq!(issue_ids, vec!["20".to_string()]);
+            }
+            other => panic!("expected remote LinkIssuesToChangeRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_link_issues_to_pr_none_when_all_issues_already_linked() {
         // Checkout has only issue "10", which is already on the PR
         let app = app_with_pr_and_issues(&["10"]);
@@ -946,6 +1084,23 @@ mod tests {
         // All issues already linked -> returns None
         let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app);
         assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn resolve_close_change_request_on_remote_only_repo_routes_to_remote_host_by_identity() {
+        let app = remote_only_app_with_providers();
+        let mut item = pr_item("42");
+        item.host = HostName::new("desktop");
+
+        let cmd = Intent::CloseChangeRequest.resolve(&item, &app).expect("command");
+        match cmd {
+            Command { host, context_repo, action: CommandAction::CloseChangeRequest { id } } => {
+                assert_eq!(host, Some(HostName::new("desktop")));
+                assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
+                assert_eq!(id, "42");
+            }
+            other => panic!("expected remote CloseChangeRequest, got {other:?}"),
+        }
     }
 
     // ── Combined availability scenario ──

@@ -327,6 +327,14 @@ impl App {
         }
     }
 
+    pub fn provider_repo_command(&self, action: CommandAction, item: &WorkItem) -> Command {
+        if self.active_repo_is_remote_only() {
+            self.item_host_repo_command(action, item)
+        } else {
+            self.repo_command(action)
+        }
+    }
+
     pub fn repo_path_for_identity(&self, identity: &RepoIdentity) -> Option<PathBuf> {
         self.model.repos.iter().find(|(_, repo)| &repo.identity == identity).map(|(path, _)| path.clone())
     }
@@ -336,6 +344,10 @@ impl App {
             Some(my_host) if item.host != *my_host => Some(item.host.clone()),
             _ => None,
         }
+    }
+
+    fn active_repo_is_remote_only(&self) -> bool {
+        self.model.active_repo_root().starts_with(Path::new("<remote>"))
     }
 
     pub fn visible_status_items(&self) -> Vec<VisibleStatusItem> {
@@ -1192,7 +1204,12 @@ mod tests {
     #[test]
     fn close_confirm_y_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+            identity: WorkItemIdentity::Session("test".into()),
+            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
+        };
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
@@ -1202,7 +1219,12 @@ mod tests {
     #[test]
     fn close_confirm_enter_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+            identity: WorkItemIdentity::Session("test".into()),
+            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
+        };
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next();
@@ -1212,7 +1234,12 @@ mod tests {
     #[test]
     fn close_confirm_esc_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+            identity: WorkItemIdentity::Session("test".into()),
+            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
+        };
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());
@@ -1221,7 +1248,12 @@ mod tests {
     #[test]
     fn close_confirm_n_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm { id: "42".into(), title: "Test PR".into(), identity: WorkItemIdentity::Session("test".into()) };
+        app.ui.mode = UiMode::CloseConfirm {
+            id: "42".into(),
+            title: "Test PR".into(),
+            identity: WorkItemIdentity::Session("test".into()),
+            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
+        };
         app.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         assert!(app.proto_commands.take_next().is_none());
