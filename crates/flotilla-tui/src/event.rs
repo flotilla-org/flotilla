@@ -11,6 +11,7 @@ pub enum Event {
     Key(crossterm::event::KeyEvent),
     Mouse(crossterm::event::MouseEvent),
     Daemon(Box<DaemonEvent>),
+    Signal,
 }
 
 pub struct EventHandler {
@@ -38,9 +39,19 @@ impl EventHandler {
             }
 
             let mut interval = tokio::time::interval(tick_rate);
+            #[cfg(unix)]
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
             loop {
                 let delay = interval.tick();
                 let event = reader.next().fuse();
+                // On non-unix platforms there is no SIGTERM; use a never-resolving
+                // future as a stand-in so that the single select! can be used on
+                // all platforms.
+                #[cfg(unix)]
+                let sigterm_recv = sigterm.recv();
+                #[cfg(not(unix))]
+                let sigterm_recv = std::future::pending::<()>();
                 tokio::select! {
                     _ = delay => { let _ = tx_clone.send(Event::Tick); }
                     maybe = event => match maybe {
@@ -53,6 +64,9 @@ impl EventHandler {
                             let _ = tx_clone.send(Event::Mouse(m));
                         }
                         _ => {}
+                    },
+                    _ = sigterm_recv => {
+                        let _ = tx_clone.send(Event::Signal);
                     }
                 }
             }
