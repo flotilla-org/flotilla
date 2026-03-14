@@ -1,6 +1,10 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use flotilla_core::{config::ConfigStore, daemon::DaemonHandle};
+use flotilla_core::{
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    providers::discovery::test_support::git_process_discovery,
+};
 use flotilla_daemon::server::DaemonServer;
 use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent};
 use tokio::time::Instant;
@@ -18,7 +22,13 @@ async fn socket_roundtrip() {
 
     // Start daemon server
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
-    let server = DaemonServer::new(vec![repo.clone()], config, socket_path.clone(), Duration::from_secs(300))
+    let server = DaemonServer::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        socket_path.clone(),
+        Duration::from_secs(300),
+    )
         .await
         .expect("server config should be valid");
 
@@ -105,7 +115,13 @@ async fn query_commands_roundtrip() {
 
     // Start daemon server
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
-    let server = DaemonServer::new(vec![repo.clone()], config, socket_path.clone(), Duration::from_secs(300))
+    let server = DaemonServer::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        socket_path.clone(),
+        Duration::from_secs(300),
+    )
         .await
         .expect("server config should be valid");
 
@@ -195,7 +211,13 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
     let repo = manifest_dir.parent().expect("parent").parent().expect("grandparent").to_path_buf();
 
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
-    let server = DaemonServer::new(vec![repo.clone()], config, socket_path.clone(), Duration::from_secs(300))
+    let server = DaemonServer::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        socket_path.clone(),
+        Duration::from_secs(300),
+    )
         .await
         .expect("server config should be valid");
 

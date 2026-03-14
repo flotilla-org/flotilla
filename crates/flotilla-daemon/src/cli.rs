@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
-use flotilla_core::config::ConfigStore;
+use flotilla_core::{config::ConfigStore, providers::discovery::DiscoveryRuntime};
 use tracing::info;
 
 use crate::server::DaemonServer;
@@ -22,7 +22,9 @@ pub async fn run(socket_path: &Path, timeout_secs: u64) -> Result<(), String> {
     let repo_roots = config.load_repos();
     info!(repo_count = repo_roots.len(), "starting daemon");
 
-    let server = DaemonServer::new(repo_roots, config, socket_path.to_path_buf(), timeout).await?;
+    let daemon_config = config.load_daemon_config();
+    let discovery = DiscoveryRuntime::for_process(daemon_config.follower);
+    let server = DaemonServer::new(repo_roots, config, discovery, socket_path.to_path_buf(), timeout).await?;
 
     server.run().await
 }
