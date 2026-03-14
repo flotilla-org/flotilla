@@ -44,6 +44,7 @@ pub async fn run_step_plan(
 ) -> CommandResult {
     let step_count = plan.steps.len();
     let mut final_result = CommandResult::Ok;
+    let host = flotilla_protocol::HostName::local();
 
     for (i, step) in plan.steps.into_iter().enumerate() {
         if cancel.is_cancelled() {
@@ -52,6 +53,7 @@ pub async fn run_step_plan(
 
         let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
             command_id,
+            host: host.clone(),
             repo: repo.clone(),
             step_index: i,
             step_count,
@@ -63,6 +65,7 @@ pub async fn run_step_plan(
             Ok(StepOutcome::Completed) => {
                 let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
                     command_id,
+                    host: host.clone(),
                     repo: repo.clone(),
                     step_index: i,
                     step_count,
@@ -74,6 +77,7 @@ pub async fn run_step_plan(
                 final_result = result;
                 let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
                     command_id,
+                    host: host.clone(),
                     repo: repo.clone(),
                     step_index: i,
                     step_count,
@@ -84,6 +88,7 @@ pub async fn run_step_plan(
             Ok(StepOutcome::Skipped) => {
                 let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
                     command_id,
+                    host: host.clone(),
                     repo: repo.clone(),
                     step_index: i,
                     step_count,
@@ -94,6 +99,7 @@ pub async fn run_step_plan(
             Err(e) => {
                 let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
                     command_id,
+                    host: host.clone(),
                     repo: repo.clone(),
                     step_index: i,
                     step_count,

@@ -608,6 +608,10 @@ impl PeerManager {
                 self.reverse_paths.remove(&key);
                 HandleResult::Ignored
             }
+            RoutedPeerMessage::CommandRequest { .. } | RoutedPeerMessage::CommandResponse { .. } => {
+                // Routed command forwarding is implemented in a later chunk.
+                HandleResult::Ignored
+            }
         }
     }
 

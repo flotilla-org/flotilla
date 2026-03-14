@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{Command, DaemonEvent, HostName, ProviderData};
+use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, DaemonEvent, HostName, ProviderData, RepoSelector};
 
 async fn daemon_for_cwd() -> (PathBuf, Arc<InProcessDaemon>) {
     let repo = std::env::current_dir().unwrap();
@@ -43,8 +43,12 @@ async fn execute_broadcasts_lifecycle_events() {
     // ArchiveSession with a non-existent ID returns immediately with
     // "session not found" — no external API calls, deterministic.
     // We only care about the lifecycle events, not the command result.
-    let command = Command::ArchiveSession { session_id: "nonexistent-session".into() };
-    let command_id = daemon.execute(&repo, command).await.expect("execute should return a command id");
+    let command = Command {
+        host: None,
+        repo: Some(RepoSelector::Path(repo.clone())),
+        action: CommandAction::ArchiveSession { session_id: "nonexistent-session".into() },
+    };
+    let command_id = daemon.execute(command).await.expect("execute should return a command id");
 
     // Collect CommandStarted and CommandFinished events, skipping any
     // Snapshot events that arrive from the background refresh loop.
@@ -57,12 +61,14 @@ async fn execute_broadcasts_lifecycle_events() {
     let result = tokio::time::timeout(timeout, async {
         while !got_started || !got_finished {
             match rx.recv().await {
-                Ok(DaemonEvent::CommandStarted { command_id: id, repo: ref event_repo, .. }) => {
+                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo: ref event_repo, .. }) => {
+                    assert_eq!(host, HostName::local(), "CommandStarted host should default to local host");
                     assert_eq!(event_repo, &repo, "CommandStarted repo should match executed repo");
                     started_id = Some(id);
                     got_started = true;
                 }
-                Ok(DaemonEvent::CommandFinished { command_id: id, repo: ref event_repo, .. }) => {
+                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo: ref event_repo, .. }) => {
+                    assert_eq!(host, HostName::local(), "CommandFinished host should default to local host");
                     assert_eq!(event_repo, &repo, "CommandFinished repo should match executed repo");
                     finished_id = Some(id);
                     got_finished = true;
@@ -155,44 +161,61 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     let daemon = InProcessDaemon::new(vec![], config).await;
     let mut rx = daemon.subscribe();
 
-    daemon.add_repo(&repo).await.expect("add_repo should succeed");
+    let add_id = daemon
+        .execute(Command { host: None, repo: None, action: CommandAction::AddRepo { path: repo.clone() } })
+        .await
+        .expect("add_repo command should return an id");
 
-    let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (finished_add, added) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut finished = None;
+        let mut added = None;
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::RepoAdded(info)) => break *info,
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == add_id => finished = Some(result),
+                Ok(DaemonEvent::RepoAdded(info)) => added = Some(*info),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+            if finished.is_some() && added.is_some() {
+                break (finished.expect("finished set"), added.expect("added set"));
             }
         }
     })
     .await
-    .expect("timeout waiting for RepoAdded");
+    .expect("timeout waiting for add command events");
+    assert!(matches!(finished_add, CommandResult::RepoAdded { path } if path == repo));
     assert_eq!(added.path, repo);
 
     let repos = daemon.list_repos().await.expect("list_repos after add");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].path, repo);
 
-    daemon.remove_repo(&repo).await.expect("remove_repo should succeed");
-    let removed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let remove_id = daemon
+        .execute(Command { host: None, repo: None, action: CommandAction::RemoveRepo { repo: RepoSelector::Query("new-repo".into()) } })
+        .await
+        .expect("remove_repo command should return an id");
+    let (finished_remove, removed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut finished = None;
+        let mut removed = None;
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::RepoRemoved { path }) => break path,
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == remove_id => finished = Some(result),
+                Ok(DaemonEvent::RepoRemoved { path }) => removed = Some(path),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+            if finished.is_some() && removed.is_some() {
+                break (finished.expect("finished set"), removed.expect("removed set"));
             }
         }
     })
     .await
-    .expect("timeout waiting for RepoRemoved");
+    .expect("timeout waiting for remove command events");
+    assert!(matches!(finished_remove, CommandResult::RepoRemoved { path } if path == repo));
     assert_eq!(removed, repo);
 
     let repos = daemon.list_repos().await.expect("list_repos after remove");
     assert!(repos.is_empty());
-
-    let err = daemon.remove_repo(&repo).await.expect_err("removing missing repo should fail");
-    assert!(err.contains("repo not tracked"));
 }
 
 #[tokio::test]
@@ -203,7 +226,10 @@ async fn inline_issue_command_returns_zero_and_skips_lifecycle_events() {
     // Wait for initial snapshot event before issuing command.
     let _ = recv_event(&mut rx).await;
 
-    let command_id = daemon.execute(&repo, Command::ClearIssueSearch { repo: repo.clone() }).await.expect("inline command should succeed");
+    let command_id = daemon
+        .execute(Command { host: None, repo: None, action: CommandAction::ClearIssueSearch { repo: repo.clone() } })
+        .await
+        .expect("inline command should succeed");
     assert_eq!(command_id, 0, "inline issue commands should return id=0");
 
     // Inline commands should not emit CommandStarted/Finished lifecycle events.
@@ -229,7 +255,14 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
-    let err = daemon.execute(&repo, Command::Refresh).await.expect_err("untracked repo should fail");
+    let err = daemon
+        .execute(Command {
+            host: None,
+            repo: None,
+            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
+        })
+        .await
+        .expect_err("untracked repo should fail");
     assert!(err.contains("repo not tracked"));
 
     let started = tokio::time::timeout(std::time::Duration::from_millis(200), async {
@@ -243,6 +276,113 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
     })
     .await;
     assert!(started.is_err() || !started.unwrap(), "should not emit CommandStarted for invalid repo");
+}
+
+#[tokio::test]
+async fn refresh_all_command_refreshes_every_tracked_repo() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    std::fs::create_dir_all(&repo_b).unwrap();
+
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config).await;
+    let mut rx = daemon.subscribe();
+
+    let refresh_id = daemon
+        .execute(Command { host: None, repo: None, action: CommandAction::Refresh { repo: None } })
+        .await
+        .expect("refresh all should return an id");
+
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == refresh_id => break result,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for refresh all CommandFinished");
+
+    assert!(matches!(finished, CommandResult::Refreshed { repos } if repos.len() == 2));
+}
+
+#[tokio::test]
+async fn remove_checkout_command_accepts_selector_queries() {
+    let (repo, daemon) = daemon_for_cwd().await;
+    let err = daemon
+        .execute(Command {
+            host: None,
+            repo: None,
+            action: CommandAction::RemoveCheckout {
+                checkout: CheckoutSelector::Query("does-not-exist".into()),
+                terminal_keys: vec![],
+            },
+        })
+        .await
+        .expect_err("missing checkout should fail cleanly");
+
+    assert!(
+        err.contains("checkout") || err.contains("does-not-exist") || err.contains(repo.to_string_lossy().as_ref()),
+        "expected checkout resolution error, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
+    let (repo, daemon) = daemon_for_cwd().await;
+    let mut rx = daemon.subscribe();
+
+    let branch_id = daemon
+        .execute(Command {
+            host: None,
+            repo: None,
+            action: CommandAction::Checkout {
+                repo: RepoSelector::Path(repo.clone()),
+                target: CheckoutTarget::Branch("definitely-missing-branch".into()),
+                issue_ids: vec![],
+            },
+        })
+        .await
+        .expect("checking out a missing existing branch should return a command id");
+
+    let fresh_id = daemon
+        .execute(Command {
+            host: None,
+            repo: None,
+            action: CommandAction::Checkout {
+                repo: RepoSelector::Path(repo),
+                target: CheckoutTarget::FreshBranch("main".into()),
+                issue_ids: vec![],
+            },
+        })
+        .await
+        .expect("creating a fresh branch that already exists should return a command id");
+    let mut branch_err = None;
+    let mut fresh_err = None;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while branch_err.is_none() || fresh_err.is_none() {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == branch_id => match result {
+                    CommandResult::Error { message } => branch_err = Some(message),
+                    other => panic!("expected error for Branch checkout, got {other:?}"),
+                },
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == fresh_id => match result {
+                    CommandResult::Error { message } => fresh_err = Some(message),
+                    other => panic!("expected error for FreshBranch checkout, got {other:?}"),
+                },
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await;
+    outcome.expect("timed out waiting for checkout failures");
+
+    assert_ne!(branch_err, fresh_err, "Branch and FreshBranch should remain distinct intents");
 }
 
 #[tokio::test]

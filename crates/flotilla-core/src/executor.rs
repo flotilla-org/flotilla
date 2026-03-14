@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{Command, CommandResult, ManagedTerminalId};
+use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, ManagedTerminalId};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -35,6 +35,12 @@ pub enum ExecutionPlan {
     Steps(StepPlan),
 }
 
+#[derive(Clone, Copy)]
+enum CheckoutIntent {
+    ExistingBranch,
+    FreshBranch,
+}
+
 /// Build an execution plan for a command.
 ///
 /// Multi-step commands (CreateCheckout, TeleportSession, RemoveCheckout) return
@@ -49,12 +55,18 @@ pub async fn build_plan(
     config_base: PathBuf,
 ) -> ExecutionPlan {
     let local_host = flotilla_protocol::HostName::local();
+    let Command { action, .. } = cmd;
 
-    match cmd {
-        Command::CreateCheckout { branch, create_branch, issue_ids } => {
+    match action {
+        CommandAction::Checkout { target, issue_ids, .. } => {
+            let (branch, create_branch, intent) = match target {
+                CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
+                CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
+            };
             build_create_checkout_plan(
                 branch,
                 create_branch,
+                intent,
                 issue_ids,
                 repo_root,
                 registry,
@@ -66,15 +78,20 @@ pub async fn build_plan(
             .await
         }
 
-        Command::TeleportSession { session_id, branch, checkout_key } => {
+        CommandAction::TeleportSession { session_id, branch, checkout_key } => {
             build_teleport_session_plan(session_id, branch, checkout_key, repo_root, registry, providers_data, config_base, local_host)
                 .await
         }
 
-        Command::RemoveCheckout { branch, terminal_keys } => build_remove_checkout_plan(branch, terminal_keys, repo_root, registry),
+        CommandAction::RemoveCheckout { checkout, terminal_keys } => {
+            match resolve_checkout_branch(&checkout, &providers_data, &local_host) {
+                Ok(branch) => build_remove_checkout_plan(branch, terminal_keys, repo_root, registry),
+                Err(message) => ExecutionPlan::Immediate(CommandResult::Error { message }),
+            }
+        }
 
-        cmd => {
-            let result = execute(cmd, &repo_root, &registry, &providers_data, &*runner, &config_base).await;
+        action => {
+            let result = execute(action, &repo_root, &registry, &providers_data, &*runner, &config_base).await;
             ExecutionPlan::Immediate(result)
         }
     }
@@ -90,6 +107,7 @@ pub async fn build_plan(
 async fn build_create_checkout_plan(
     branch: String,
     create_branch: bool,
+    intent: CheckoutIntent,
     issue_ids: Vec<(String, String)>,
     repo_root: PathBuf,
     registry: Arc<ProviderRegistry>,
@@ -118,12 +136,17 @@ async fn build_create_checkout_plan(
         let branch = branch.clone();
         let repo_root = repo_root.clone();
         let registry = Arc::clone(&registry);
+        let runner = Arc::clone(&runner);
         steps.push(Step {
             description: format!("Create checkout for branch {branch}"),
             action: Box::new(move || {
                 Box::pin(async move {
+                    validate_checkout_target(&repo_root, &branch, intent, &*runner).await?;
                     // Skip if checkout already exists
                     if slot.lock().await.is_some() {
+                        if matches!(intent, CheckoutIntent::FreshBranch) {
+                            return Err(format!("branch already exists: {branch}"));
+                        }
                         return Ok(StepOutcome::Skipped);
                     }
                     let cm = registry
@@ -134,8 +157,8 @@ async fn build_create_checkout_plan(
                         .ok_or_else(|| "No checkout manager available".to_string())?;
                     let (path, _checkout) = cm.create_checkout(&repo_root, &branch, create_branch).await?;
                     info!(checkout_path = %path.display(), "created checkout");
-                    *slot.lock().await = Some(path);
-                    Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch }))
+                    *slot.lock().await = Some(path.clone());
+                    Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch, path }))
                 })
             }),
         });
@@ -368,7 +391,7 @@ fn build_remove_checkout_plan(
 /// Commands that are handled at the daemon level (AddRepo, RemoveRepo, Refresh)
 /// should not reach this function — the caller should handle them directly.
 pub async fn execute(
-    cmd: Command,
+    action: CommandAction,
     repo_root: &Path,
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
@@ -376,8 +399,8 @@ pub async fn execute(
     config_base: &Path,
 ) -> CommandResult {
     let local_host = flotilla_protocol::HostName::local();
-    match cmd {
-        Command::CreateWorkspaceForCheckout { checkout_path } => {
+    match action {
+        CommandAction::CreateWorkspaceForCheckout { checkout_path } => {
             let host_key = flotilla_protocol::HostPath::new(local_host.clone(), checkout_path.clone());
             if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
                 info!(branch = %co.branch, "entering workspace");
@@ -396,7 +419,7 @@ pub async fn execute(
             }
         }
 
-        Command::SelectWorkspace { ws_ref } => {
+        CommandAction::SelectWorkspace { ws_ref } => {
             info!(%ws_ref, "switching to workspace");
             if let Some((_, ws_mgr)) = &registry.workspace_manager {
                 if let Err(e) = ws_mgr.select_workspace(&ws_ref).await {
@@ -406,7 +429,14 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::CreateCheckout { branch, create_branch, issue_ids } => {
+        CommandAction::Checkout { target, issue_ids, .. } => {
+            let (branch, create_branch, intent) = match target {
+                CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
+                CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
+            };
+            if let Err(message) = validate_checkout_target(repo_root, &branch, intent, runner).await {
+                return CommandResult::Error { message };
+            }
             info!(%branch, "creating checkout");
             let checkout_result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
                 Some(cm.create_checkout(repo_root, &branch, create_branch).await)
@@ -432,7 +462,7 @@ pub async fn execute(
                             error!(err = %e, "workspace creation failed after checkout");
                         }
                     }
-                    CommandResult::CheckoutCreated { branch: branch.clone() }
+                    CommandResult::CheckoutCreated { branch: branch.clone(), path: checkout_path }
                 }
                 Some(Err(e)) => {
                     error!(err = %e, "create checkout failed");
@@ -442,7 +472,11 @@ pub async fn execute(
             }
         }
 
-        Command::RemoveCheckout { branch, terminal_keys } => {
+        CommandAction::RemoveCheckout { checkout, terminal_keys } => {
+            let branch = match resolve_checkout_branch(&checkout, providers_data, &local_host) {
+                Ok(branch) => branch,
+                Err(message) => return CommandResult::Error { message },
+            };
             info!(%branch, "removing checkout");
             let result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
                 Some(cm.remove_checkout(repo_root, &branch).await)
@@ -463,20 +497,20 @@ pub async fn execute(
                             }
                         }
                     }
-                    CommandResult::Ok
+                    CommandResult::CheckoutRemoved { branch }
                 }
                 Some(Err(e)) => CommandResult::Error { message: e },
                 None => CommandResult::Error { message: "No checkout manager available".to_string() },
             }
         }
 
-        Command::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
+        CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
             let info =
                 data::fetch_checkout_status(&branch, checkout_path.as_deref(), change_request_id.as_deref(), repo_root, runner).await;
             CommandResult::CheckoutStatus(info)
         }
 
-        Command::OpenChangeRequest { id } => {
+        CommandAction::OpenChangeRequest { id } => {
             debug!(%id, "opening change request in browser");
             if let Some((_, cr)) = registry.code_review.values().next() {
                 let _ = cr.open_in_browser(repo_root, &id).await;
@@ -484,7 +518,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::CloseChangeRequest { id } => {
+        CommandAction::CloseChangeRequest { id } => {
             debug!(%id, "closing change request");
             if let Some((_, cr)) = registry.code_review.values().next() {
                 let _ = cr.close_change_request(repo_root, &id).await;
@@ -492,7 +526,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::OpenIssue { id } => {
+        CommandAction::OpenIssue { id } => {
             debug!(%id, "opening issue in browser");
             if let Some((_, it)) = registry.issue_trackers.values().next() {
                 let _ = it.open_in_browser(repo_root, &id).await;
@@ -500,7 +534,7 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        Command::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
+        CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
             info!(issue_ids = ?issue_ids, %change_request_id, "linking issues to change request");
             let body_result = run!(runner, "gh", &["pr", "view", &change_request_id, "--json", "body", "--jq", ".body",], repo_root,);
             match body_result {
@@ -530,7 +564,7 @@ pub async fn execute(
             }
         }
 
-        Command::ArchiveSession { session_id } => {
+        CommandAction::ArchiveSession { session_id } => {
             if let Some(session) = providers_data.sessions.get(session_id.as_str()) {
                 info!(%session_id, "archiving session");
                 if let Some(key) = session_provider_key(session, &session_id) {
@@ -550,7 +584,7 @@ pub async fn execute(
             }
         }
 
-        Command::GenerateBranchName { issue_keys } => {
+        CommandAction::GenerateBranchName { issue_keys } => {
             let issues: Vec<(String, String)> = issue_keys
                 .iter()
                 .filter_map(|k| providers_data.issues.get(k.as_str()).map(|issue| (k.clone(), issue.title.clone())))
@@ -583,7 +617,7 @@ pub async fn execute(
             }
         }
 
-        Command::TeleportSession { session_id, branch, checkout_key } => {
+        CommandAction::TeleportSession { session_id, branch, checkout_key } => {
             info!(%session_id, "teleporting to session");
             let teleport_cmd = match resolve_attach_command(&session_id, registry, providers_data).await {
                 Ok(cmd) => cmd,
@@ -623,15 +657,64 @@ pub async fn execute(
 
         // These are handled at the daemon level (InProcessDaemon / SocketDaemon),
         // not by the per-repo executor. If they reach here, it's a routing bug.
-        Command::AddRepo { .. }
-        | Command::RemoveRepo { .. }
-        | Command::Refresh
-        | Command::SetIssueViewport { .. }
-        | Command::FetchMoreIssues { .. }
-        | Command::SearchIssues { .. }
-        | Command::ClearIssueSearch { .. } => {
+        CommandAction::AddRepo { .. }
+        | CommandAction::RemoveRepo { .. }
+        | CommandAction::Refresh { .. }
+        | CommandAction::SetIssueViewport { .. }
+        | CommandAction::FetchMoreIssues { .. }
+        | CommandAction::SearchIssues { .. }
+        | CommandAction::ClearIssueSearch { .. } => {
             CommandResult::Error { message: "bug: daemon-level command reached per-repo executor".to_string() }
         }
+    }
+}
+
+fn resolve_checkout_branch(
+    selector: &CheckoutSelector,
+    providers_data: &ProviderData,
+    local_host: &flotilla_protocol::HostName,
+) -> Result<String, String> {
+    match selector {
+        CheckoutSelector::Path(path) => providers_data
+            .checkouts
+            .iter()
+            .find(|(host_path, _)| host_path.host == *local_host && host_path.path == *path)
+            .map(|(_, checkout)| checkout.branch.clone())
+            .ok_or_else(|| format!("checkout not found: {}", path.display())),
+        CheckoutSelector::Query(query) => {
+            let matches: Vec<String> = providers_data
+                .checkouts
+                .iter()
+                .filter(|(host_path, checkout)| {
+                    host_path.host == *local_host
+                        && (checkout.branch == *query
+                            || checkout.branch.contains(query)
+                            || host_path.path.to_string_lossy().contains(query))
+                })
+                .map(|(_, checkout)| checkout.branch.clone())
+                .collect();
+            match matches.len() {
+                0 => Err(format!("checkout not found: {query}")),
+                1 => Ok(matches[0].clone()),
+                _ => Err(format!("checkout selector is ambiguous: {query}")),
+            }
+        }
+    }
+}
+
+async fn validate_checkout_target(
+    repo_root: &Path,
+    branch: &str,
+    intent: CheckoutIntent,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let local_exists = run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")], repo_root).is_ok();
+    let remote_exists = run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")], repo_root).is_ok();
+    match intent {
+        CheckoutIntent::ExistingBranch if local_exists || remote_exists => Ok(()),
+        CheckoutIntent::ExistingBranch => Err(format!("branch not found: {branch}")),
+        CheckoutIntent::FreshBranch if local_exists || remote_exists => Err(format!("branch already exists: {branch}")),
+        CheckoutIntent::FreshBranch => Ok(()),
     }
 }
 

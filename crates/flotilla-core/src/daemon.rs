@@ -24,7 +24,7 @@ pub trait DaemonHandle: Send + Sync {
 
     /// Execute a command. Returns a command ID; the result arrives via
     /// CommandStarted/CommandFinished events.
-    async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String>;
+    async fn execute(&self, command: Command) -> Result<u64, String>;
 
     /// Cancel a running command. The command will finish with
     /// `CommandResult::Cancelled` once cancellation takes effect.

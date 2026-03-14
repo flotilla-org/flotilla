@@ -744,6 +744,8 @@ async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManager>>, reques
         let target = match &request {
             flotilla_protocol::RoutedPeerMessage::RequestResync { target_host, .. } => target_host.clone(),
             flotilla_protocol::RoutedPeerMessage::ResyncSnapshot { requester_host, .. } => requester_host.clone(),
+            flotilla_protocol::RoutedPeerMessage::CommandRequest { target_host, .. } => target_host.clone(),
+            flotilla_protocol::RoutedPeerMessage::CommandResponse { requester_host, .. } => requester_host.clone(),
         };
         let sender = {
             let pm = peer_manager.lock().await;
@@ -1209,10 +1211,6 @@ async fn dispatch_request(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, 
         }
 
         "execute" => {
-            let repo = match extract_repo_path(&params) {
-                Ok(p) => p,
-                Err(e) => return Message::error_response(id, e),
-            };
             let command: Command = match params
                 .get("command")
                 .cloned()
@@ -1222,7 +1220,7 @@ async fn dispatch_request(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, 
                 Ok(cmd) => cmd,
                 Err(e) => return Message::error_response(id, e),
             };
-            match daemon.execute(&repo, command).await {
+            match daemon.execute(command).await {
                 Ok(command_id) => Message::ok_response(id, &command_id),
                 Err(e) => Message::error_response(id, e),
             }
