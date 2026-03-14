@@ -257,6 +257,14 @@ impl App {
         }
     }
 
+    /// Returns true when the UI has in-progress work that should be animated.
+    pub fn needs_animation(&self) -> bool {
+        if !self.in_flight.is_empty() {
+            return true;
+        }
+        matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. } | UiMode::DeleteConfirm { loading: true, .. })
+    }
+
     pub fn persist_layout(&self) {
         let layout = match self.ui.view_layout {
             RepoViewLayout::Auto => RepoViewLayoutConfig::Auto,

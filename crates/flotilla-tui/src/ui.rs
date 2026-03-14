@@ -18,6 +18,7 @@ use crate::{
         TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
+    shimmer::shimmer_spans,
     status_bar::{
         KeyChip, StatusBarAction, StatusBarInput, StatusBarModel, StatusBarTarget, StatusSection, TaskSection, CHEVRON_SEPARATOR,
         DEFAULT_STATUS_WIDTH_BUDGET,
@@ -297,7 +298,11 @@ fn render_status_bar(model: &TuiModel, ui: &mut UiState, in_flight: &HashMap<u64
     }
 
     if !status_model.task_text.is_empty() {
-        spans.push(Span::styled(status_model.task_text.clone(), Style::default().fg(Color::White).bg(Color::Black)));
+        let task_spans = shimmer_spans(&status_model.task_text);
+        for mut s in task_spans {
+            s.style = s.style.bg(Color::Black);
+            spans.push(s);
+        }
         x += status_model.task_text.width();
     }
 
@@ -843,7 +848,8 @@ fn render_input_popup(ui: &UiState, frame: &mut Frame) {
     let (_area, inner_area) = ui_helpers::render_popup_frame(frame, frame.area(), 50, 20, " New Branch ");
 
     if *kind == BranchInputKind::Generating {
-        let paragraph = Paragraph::new("  Generating branch name...").style(Style::default().fg(Color::Yellow));
+        let spans = shimmer_spans("  Generating branch name...");
+        let paragraph = Paragraph::new(Line::from(spans));
         frame.render_widget(paragraph, inner_area);
         return;
     }
@@ -873,7 +879,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
     const MAX_COMMITS: usize = 5;
 
     if loading {
-        lines.push(Line::from(Span::styled("Loading safety info...", Style::default().fg(Color::Yellow))));
+        lines.push(Line::from(shimmer_spans("Loading safety info...")));
     } else if let Some(info) = info {
         lines.push(Line::from(vec![Span::raw("Branch: "), Span::styled(&info.branch, Style::default().bold())]));
         lines.push(Line::from(""));
