@@ -145,24 +145,6 @@ pub fn fake_discovery(follower: bool) -> super::DiscoveryRuntime {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::providers::discovery::{run_host_detectors, EnvironmentAssertion};
-
-    #[tokio::test]
-    async fn fake_discovery_uses_only_git_host_detector() {
-        let runtime = fake_discovery(false);
-        let bag = run_host_detectors(&runtime.host_detectors, &*runtime.runner, &*runtime.env).await;
-
-        assert!(matches!(
-            bag.assertions(),
-            [EnvironmentAssertion::BinaryAvailable { name, version, .. }]
-            if name == "git" && version.as_deref() == Some("2.43.0")
-        ));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Fake providers for integration / E2E tests
 // ---------------------------------------------------------------------------
@@ -456,5 +438,23 @@ pub fn fake_discovery_with_providers(
             workspace_managers: vec![],
             terminal_pools: vec![],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::discovery::{run_host_detectors, EnvironmentAssertion};
+
+    #[tokio::test]
+    async fn fake_discovery_uses_only_git_host_detector() {
+        let runtime = fake_discovery(false);
+        let bag = run_host_detectors(&runtime.host_detectors, &*runtime.runner, &*runtime.env).await;
+
+        assert!(matches!(
+            bag.assertions(),
+            [EnvironmentAssertion::BinaryAvailable { name, version, .. }]
+            if name == "git" && version.as_deref() == Some("2.43.0")
+        ));
     }
 }
