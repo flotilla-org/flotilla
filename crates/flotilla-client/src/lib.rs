@@ -490,7 +490,7 @@ fn handle_event(
                 }
             }
         }
-        DaemonEvent::RepoRemoved { path } => {
+        DaemonEvent::RepoRemoved { path, .. } => {
             // Sync lock: evict before dispatching
             local_seqs.write().unwrap().remove(path);
             let _ = event_tx.send(event);
@@ -651,7 +651,7 @@ impl DaemonHandle for SocketDaemon {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{Snapshot, SnapshotDelta};
+    use flotilla_protocol::{RepoIdentity, Snapshot, SnapshotDelta};
     use tokio::net::{unix::OwnedReadHalf, UnixStream};
 
     use super::*;
@@ -667,9 +667,14 @@ mod tests {
         lines: RequestLines,
     }
 
+    fn repo_identity() -> RepoIdentity {
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
+    }
+
     fn make_snapshot(repo: &Path, seq: u64) -> Snapshot {
         Snapshot {
             seq,
+            repo_identity: repo_identity(),
             repo: repo.to_path_buf(),
             host_name: flotilla_protocol::HostName::new("test-host"),
             work_items: vec![],
@@ -686,6 +691,7 @@ mod tests {
         SnapshotDelta {
             seq,
             prev_seq,
+            repo_identity: repo_identity(),
             repo: repo.to_path_buf(),
             changes: vec![],
             work_items: vec![],

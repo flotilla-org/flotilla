@@ -6,7 +6,9 @@ use std::{
 };
 
 use flotilla_core::{
-    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon,
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
     providers::discovery::test_support::{fake_discovery, git_process_discovery},
 };
 use flotilla_protocol::{
@@ -30,7 +32,8 @@ fn init_git_repo_with_remote(path: &Path, remote: &str) {
     assert!(status.success(), "git init should succeed");
 
     let path_str = path.to_str().expect("repo path utf8");
-    let status = ProcessCommand::new("git").args(["-C", path_str, "config", "user.name", "Flotilla Tests"]).status().expect("git config name");
+    let status =
+        ProcessCommand::new("git").args(["-C", path_str, "config", "user.name", "Flotilla Tests"]).status().expect("git config name");
     assert!(status.success(), "git config user.name should succeed");
 
     let status = ProcessCommand::new("git")
@@ -172,7 +175,10 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
     .await
     .expect("timeout waiting for checkout status command to finish");
 
-    assert!(matches!(result, CommandResult::CheckoutStatus(_)), "expected checkout status result via identity context repo, got {result:?}");
+    assert!(
+        matches!(result, CommandResult::CheckoutStatus(_)),
+        "expected checkout status result via identity context repo, got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -550,7 +556,10 @@ async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
-    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), ProviderData::default()).await.expect("add_virtual_repo should succeed");
+    daemon
+        .add_virtual_repo(identity.clone(), synthetic_path.clone(), ProviderData::default())
+        .await
+        .expect("add_virtual_repo should succeed");
 
     // Should receive a RepoAdded event
     let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -585,7 +594,10 @@ async fn add_virtual_repo_is_idempotent() {
     daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), ProviderData::default()).await.expect("first add should succeed");
 
     // Second add with same path should be a no-op
-    daemon.add_virtual_repo(identity, synthetic_path.clone(), ProviderData::default()).await.expect("second add should succeed (idempotent)");
+    daemon
+        .add_virtual_repo(identity, synthetic_path.clone(), ProviderData::default())
+        .await
+        .expect("second add should succeed (idempotent)");
 
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1, "should still have exactly one repo");

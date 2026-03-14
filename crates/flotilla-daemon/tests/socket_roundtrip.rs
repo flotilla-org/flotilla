@@ -254,13 +254,13 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
         let mut started = None;
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo: event_repo, description }) if id == command_id => {
+                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo: event_repo, description, .. }) if id == command_id => {
                     assert_eq!(host, flotilla_protocol::HostName::local());
                     assert_eq!(event_repo, repo);
                     assert_eq!(description, "Refreshing...");
                     started = Some(id);
                 }
-                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo: event_repo, result }) if id == command_id => {
+                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo: event_repo, result, .. }) if id == command_id => {
                     assert_eq!(host, flotilla_protocol::HostName::local());
                     assert_eq!(event_repo, repo);
                     break (started, Some((id, result)));

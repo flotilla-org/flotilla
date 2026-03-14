@@ -161,11 +161,22 @@ impl Command {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandResult {
     Ok,
-    RepoAdded { path: PathBuf },
-    RepoRemoved { path: PathBuf },
-    Refreshed { repos: Vec<PathBuf> },
-    CheckoutCreated { branch: String, path: PathBuf },
-    CheckoutRemoved { branch: String },
+    RepoAdded {
+        path: PathBuf,
+    },
+    RepoRemoved {
+        path: PathBuf,
+    },
+    Refreshed {
+        repos: Vec<PathBuf>,
+    },
+    CheckoutCreated {
+        branch: String,
+        path: PathBuf,
+    },
+    CheckoutRemoved {
+        branch: String,
+    },
     TerminalPrepared {
         repo_identity: RepoIdentity,
         target_host: crate::HostName,
@@ -173,9 +184,14 @@ pub enum CommandResult {
         checkout_path: PathBuf,
         commands: Vec<PreparedTerminalCommand>,
     },
-    BranchNameGenerated { name: String, issue_ids: Vec<(String, String)> },
+    BranchNameGenerated {
+        name: String,
+        issue_ids: Vec<(String, String)>,
+    },
     CheckoutStatus(CheckoutStatus),
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Cancelled,
 }
 

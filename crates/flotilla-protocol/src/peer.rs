@@ -126,9 +126,9 @@ pub enum RoutedPeerMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum CommandPeerEvent {
-    Started { repo: PathBuf, description: String },
-    StepUpdate { repo: PathBuf, step_index: usize, step_count: usize, description: String, status: StepStatus },
-    Finished { repo: PathBuf, result: CommandResult },
+    Started { repo_identity: RepoIdentity, repo: PathBuf, description: String },
+    StepUpdate { repo_identity: RepoIdentity, repo: PathBuf, step_index: usize, step_count: usize, description: String, status: StepStatus },
+    Finished { repo_identity: RepoIdentity, repo: PathBuf, result: CommandResult },
 }
 
 /// The payload kind within a peer data exchange.
@@ -349,6 +349,7 @@ mod tests {
             responder_host: HostName::new("feta"),
             remaining_hops: 5,
             event: Box::new(CommandPeerEvent::StepUpdate {
+                repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
                 repo: PathBuf::from("/repo"),
                 step_index: 1,
                 step_count: 3,
@@ -365,6 +366,7 @@ mod tests {
                 assert_eq!(responder_host, HostName::new("feta"));
                 assert_eq!(remaining_hops, 5);
                 assert_eq!(*event, CommandPeerEvent::StepUpdate {
+                    repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
                     repo: PathBuf::from("/repo"),
                     step_index: 1,
                     step_count: 3,

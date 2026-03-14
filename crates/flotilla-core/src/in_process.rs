@@ -118,29 +118,23 @@ fn inject_issues(base_providers: &ProviderData, cache: &IssueCache, search_resul
 }
 
 /// Build a proto Snapshot by injecting issues, re-correlating, and patching issue metadata.
-fn build_repo_snapshot(
+struct SnapshotBuildContext<'a> {
     repo_identity: flotilla_protocol::RepoIdentity,
-    path: &Path,
+    path: &'a Path,
     seq: u64,
-    base: &RefreshSnapshot,
-    cache: &IssueCache,
-    search_results: &Option<Vec<(String, Issue)>>,
-    host_name: &HostName,
-) -> Snapshot {
-    build_repo_snapshot_with_peers(repo_identity, path, seq, base, cache, search_results, host_name, None)
+    base: &'a RefreshSnapshot,
+    cache: &'a IssueCache,
+    search_results: &'a Option<Vec<(String, Issue)>>,
+    host_name: &'a HostName,
+}
+
+fn build_repo_snapshot(ctx: SnapshotBuildContext<'_>) -> Snapshot {
+    build_repo_snapshot_with_peers(ctx, None)
 }
 
 /// Build a proto Snapshot, optionally merging peer provider data before correlation.
-fn build_repo_snapshot_with_peers(
-    repo_identity: flotilla_protocol::RepoIdentity,
-    path: &Path,
-    seq: u64,
-    base: &RefreshSnapshot,
-    cache: &IssueCache,
-    search_results: &Option<Vec<(String, Issue)>>,
-    host_name: &HostName,
-    peer_overlay: Option<&[(HostName, ProviderData)]>,
-) -> Snapshot {
+fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: Option<&[(HostName, ProviderData)]>) -> Snapshot {
+    let SnapshotBuildContext { repo_identity, path, seq, base, cache, search_results, host_name } = ctx;
     let local_providers = normalize_local_provider_hosts(inject_issues(&base.providers, cache, search_results), host_name);
 
     // Merge peer provider data if any
@@ -180,12 +174,12 @@ fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
         return DaemonEvent::SnapshotFull(Box::new(snapshot));
     }
 
-        let snapshot_delta = flotilla_protocol::SnapshotDelta {
-            seq: delta.seq,
-            prev_seq: delta.prev_seq,
-            repo_identity: snapshot.repo_identity.clone(),
-            repo: snapshot.repo.clone(),
-            changes: delta.changes,
+    let snapshot_delta = flotilla_protocol::SnapshotDelta {
+        seq: delta.seq,
+        prev_seq: delta.prev_seq,
+        repo_identity: snapshot.repo_identity.clone(),
+        repo: snapshot.repo.clone(),
+        changes: delta.changes,
         work_items: snapshot.work_items.clone(),
         issue_total: snapshot.issue_total,
         issue_has_more: snapshot.issue_has_more,
@@ -500,12 +494,7 @@ impl InProcessDaemon {
                 crate::resolve::resolve_repo(query, entries.into_iter()).map_err(|e| e.to_string())
             }
             flotilla_protocol::RepoSelector::Identity(identity) => {
-                self.repo_identities
-                    .read()
-                    .await
-                    .get(identity)
-                    .cloned()
-                    .ok_or_else(|| format!("repo not tracked: {identity}"))
+                self.repo_identities.read().await.get(identity).cloned().ok_or_else(|| format!("repo not tracked: {identity}"))
             }
         }
     }
@@ -1099,13 +1088,15 @@ impl InProcessDaemon {
         };
 
         let proto_snapshot = build_repo_snapshot_with_peers(
-            state.identity.clone(),
-            repo,
-            state.seq + 1,
-            &state.last_snapshot,
-            &state.issue_cache,
-            &state.search_results,
-            &self.host_name,
+            SnapshotBuildContext {
+                repo_identity: state.identity.clone(),
+                path: repo,
+                seq: state.seq + 1,
+                base: &state.last_snapshot,
+                cache: &state.issue_cache,
+                search_results: &state.search_results,
+                host_name: &self.host_name,
+            },
             peer_overlay.as_deref(),
         );
 
@@ -1156,13 +1147,15 @@ impl DaemonHandle for InProcessDaemon {
         let state = repos.get(repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
 
         Ok(build_repo_snapshot_with_peers(
-            state.identity.clone(),
-            repo,
-            state.seq,
-            &state.last_snapshot,
-            &state.issue_cache,
-            &state.search_results,
-            &self.host_name,
+            SnapshotBuildContext {
+                repo_identity: state.identity.clone(),
+                path: repo,
+                seq: state.seq,
+                base: &state.last_snapshot,
+                cache: &state.issue_cache,
+                search_results: &state.search_results,
+                host_name: &self.host_name,
+            },
             peer_overlay.as_deref(),
         ))
     }
@@ -1363,21 +1356,27 @@ impl DaemonHandle for InProcessDaemon {
         let active_ref = Arc::clone(&self.active_command);
         let local_host = self.host_name.clone();
         tokio::spawn(async move {
-            let plan =
-                executor::build_plan(command, repo_identity.clone(), repo_path.clone(), registry, providers_data, runner, config_base, local_host)
-                    .await;
+            let plan = executor::build_plan(
+                command,
+                executor::RepoExecutionContext { identity: repo_identity.clone(), root: repo_path.clone() },
+                registry,
+                providers_data,
+                runner,
+                config_base,
+                local_host,
+            )
+            .await;
 
             match plan {
                 ExecutionPlan::Immediate(result) => {
                     refresh_trigger.notify_one();
-                    let _ =
-                        event_tx.send(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            host: command_host.clone(),
-                            repo_identity: repo_identity.clone(),
-                            repo: repo_path,
-                            result,
-                        });
+                    let _ = event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        host: command_host.clone(),
+                        repo_identity: repo_identity.clone(),
+                        repo: repo_path,
+                        result,
+                    });
                 }
                 ExecutionPlan::Steps(step_plan) => {
                     // Reject if another step command is already running.
@@ -1574,15 +1573,15 @@ impl DaemonHandle for InProcessDaemon {
                 continue;
             }
             let snapshot = || {
-                build_repo_snapshot(
-                    state.identity.clone(),
+                build_repo_snapshot(SnapshotBuildContext {
+                    repo_identity: state.identity.clone(),
                     path,
-                    state.seq,
-                    &state.last_snapshot,
-                    &state.issue_cache,
-                    &state.search_results,
-                    &self.host_name,
-                )
+                    seq: state.seq,
+                    base: &state.last_snapshot,
+                    cache: &state.issue_cache,
+                    search_results: &state.search_results,
+                    host_name: &self.host_name,
+                })
             };
 
             match last_seen.get(path) {
@@ -1674,13 +1673,15 @@ impl DaemonHandle for InProcessDaemon {
             let Some(state) = repos.get(path) else { continue };
             let peer_overlay = peer_providers.get(path).cloned();
             let snapshot = build_repo_snapshot_with_peers(
-                state.identity.clone(),
-                path,
-                state.seq,
-                &state.last_snapshot,
-                &state.issue_cache,
-                &state.search_results,
-                &self.host_name,
+                SnapshotBuildContext {
+                    repo_identity: state.identity.clone(),
+                    path,
+                    seq: state.seq,
+                    base: &state.last_snapshot,
+                    cache: &state.issue_cache,
+                    search_results: &state.search_results,
+                    host_name: &self.host_name,
+                },
                 peer_overlay.as_deref(),
             );
             summaries.push(RepoSummary {
@@ -1706,13 +1707,15 @@ impl DaemonHandle for InProcessDaemon {
         };
         let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let snapshot = build_repo_snapshot_with_peers(
-            state.identity.clone(),
-            &path,
-            state.seq,
-            &state.last_snapshot,
-            &state.issue_cache,
-            &state.search_results,
-            &self.host_name,
+            SnapshotBuildContext {
+                repo_identity: state.identity.clone(),
+                path: &path,
+                seq: state.seq,
+                base: &state.last_snapshot,
+                cache: &state.issue_cache,
+                search_results: &state.search_results,
+                host_name: &self.host_name,
+            },
             peer_overlay.as_deref(),
         );
         Ok(RepoDetailResponse {
@@ -1736,13 +1739,15 @@ impl DaemonHandle for InProcessDaemon {
         };
         let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let snapshot = build_repo_snapshot_with_peers(
-            state.identity.clone(),
-            &path,
-            state.seq,
-            &state.last_snapshot,
-            &state.issue_cache,
-            &state.search_results,
-            &self.host_name,
+            SnapshotBuildContext {
+                repo_identity: state.identity.clone(),
+                path: &path,
+                seq: state.seq,
+                base: &state.last_snapshot,
+                cache: &state.issue_cache,
+                search_results: &state.search_results,
+                host_name: &self.host_name,
+            },
             peer_overlay.as_deref(),
         );
 
@@ -1788,13 +1793,15 @@ impl DaemonHandle for InProcessDaemon {
         };
         let state = repos.get(&path).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let snapshot = build_repo_snapshot_with_peers(
-            state.identity.clone(),
-            &path,
-            state.seq,
-            &state.last_snapshot,
-            &state.issue_cache,
-            &state.search_results,
-            &self.host_name,
+            SnapshotBuildContext {
+                repo_identity: state.identity.clone(),
+                path: &path,
+                seq: state.seq,
+                base: &state.last_snapshot,
+                cache: &state.issue_cache,
+                search_results: &state.search_results,
+                host_name: &self.host_name,
+            },
             peer_overlay.as_deref(),
         );
         Ok(RepoWorkResponse { path, slug: state.slug.clone(), work_items: snapshot.work_items })
@@ -1949,15 +1956,15 @@ mod tests {
             provider_display_name: String::new(),
         })]);
 
-        let snap = build_repo_snapshot(
-            fallback_repo_identity(Path::new("/tmp/repo")),
-            Path::new("/tmp/repo"),
-            7,
-            &RefreshSnapshot::default(),
-            &cache,
-            &None,
-            &HostName::local(),
-        );
+        let snap = build_repo_snapshot(SnapshotBuildContext {
+            repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
+            path: Path::new("/tmp/repo"),
+            seq: 7,
+            base: &RefreshSnapshot::default(),
+            cache: &cache,
+            search_results: &None,
+            host_name: &HostName::local(),
+        });
         assert_eq!(snap.seq, 7);
         assert_eq!(snap.issue_total, Some(5));
         assert!(snap.issue_has_more);

@@ -37,6 +37,12 @@ pub enum ExecutionPlan {
     Steps(StepPlan),
 }
 
+#[derive(Clone)]
+pub struct RepoExecutionContext {
+    pub identity: flotilla_protocol::RepoIdentity,
+    pub root: PathBuf,
+}
+
 #[derive(Clone, Copy)]
 enum CheckoutIntent {
     ExistingBranch,
@@ -50,8 +56,7 @@ enum CheckoutIntent {
 /// commands delegate to `execute()` and return `ExecutionPlan::Immediate`.
 pub async fn build_plan(
     cmd: Command,
-    repo_identity: flotilla_protocol::RepoIdentity,
-    repo_root: PathBuf,
+    repo: RepoExecutionContext,
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
     runner: Arc<dyn CommandRunner>,
@@ -71,7 +76,7 @@ pub async fn build_plan(
                 create_branch,
                 intent,
                 issue_ids,
-                repo_root,
+                repo.root,
                 registry,
                 providers_data,
                 runner,
@@ -82,20 +87,19 @@ pub async fn build_plan(
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
-            build_teleport_session_plan(session_id, branch, checkout_key, repo_root, registry, providers_data, config_base, local_host)
+            build_teleport_session_plan(session_id, branch, checkout_key, repo.root, registry, providers_data, config_base, local_host)
                 .await
         }
 
         CommandAction::RemoveCheckout { checkout, terminal_keys } => {
             match resolve_checkout_branch(&checkout, &providers_data, &local_host) {
-                Ok(branch) => build_remove_checkout_plan(branch, terminal_keys, repo_root, registry),
+                Ok(branch) => build_remove_checkout_plan(branch, terminal_keys, repo.root, registry),
                 Err(message) => ExecutionPlan::Immediate(CommandResult::Error { message }),
             }
         }
 
         action => {
-            let result =
-                execute(action, repo_identity, &repo_root, &registry, &providers_data, &*runner, &config_base, &local_host).await;
+            let result = execute(action, &repo, &registry, &providers_data, &*runner, &config_base, &local_host).await;
             ExecutionPlan::Immediate(result)
         }
     }
@@ -396,8 +400,7 @@ fn build_remove_checkout_plan(
 /// should not reach this function — the caller should handle them directly.
 pub async fn execute(
     action: CommandAction,
-    repo_identity: flotilla_protocol::RepoIdentity,
-    repo_root: &Path,
+    repo: &RepoExecutionContext,
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
     runner: &dyn CommandRunner,
@@ -410,7 +413,7 @@ pub async fn execute(
             if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
                 info!(branch = %co.branch, "entering workspace");
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                    let mut config = workspace_config(repo_root, &co.branch, &checkout_path, "claude", config_base);
+                    let mut config = workspace_config(&repo.root, &co.branch, &checkout_path, "claude", config_base);
                     if let Some((_, tp)) = &registry.terminal_pool {
                         resolve_terminal_pool(&mut config, tp.as_ref()).await;
                     }
@@ -430,7 +433,7 @@ pub async fn execute(
                     Ok(commands) => commands,
                     Err(message) => return CommandResult::Error { message },
                 };
-                let mut config = workspace_config(repo_root, &branch, repo_root, "claude", config_base);
+                let mut config = workspace_config(&repo.root, &branch, &repo.root, "claude", config_base);
                 config.resolved_commands = Some(wrapped.into_iter().map(|cmd| (cmd.role, cmd.command)).collect());
                 if let Err(e) = ws_mgr.create_workspace(&config).await {
                     return CommandResult::Error { message: e };
@@ -454,12 +457,12 @@ pub async fn execute(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            if let Err(message) = validate_checkout_target(repo_root, &branch, intent, runner).await {
+            if let Err(message) = validate_checkout_target(&repo.root, &branch, intent, runner).await {
                 return CommandResult::Error { message };
             }
             info!(%branch, "creating checkout");
             let checkout_result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
-                Some(cm.create_checkout(repo_root, &branch, create_branch).await)
+                Some(cm.create_checkout(&repo.root, &branch, create_branch).await)
             } else {
                 None
             };
@@ -467,12 +470,12 @@ pub async fn execute(
                 Some(Ok((checkout_path, _checkout))) => {
                     // Write issue links to git config
                     if !issue_ids.is_empty() {
-                        write_branch_issue_links(repo_root, &branch, &issue_ids, runner).await;
+                        write_branch_issue_links(&repo.root, &branch, &issue_ids, runner).await;
                     }
                     info!(checkout_path = %checkout_path.display(), "created checkout");
                     // Create workspace if manager available
                     if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                        let mut config = workspace_config(repo_root, &branch, &checkout_path, "claude", config_base);
+                        let mut config = workspace_config(&repo.root, &branch, &checkout_path, "claude", config_base);
                         if let Some((_, tp)) = &registry.terminal_pool {
                             resolve_terminal_pool(&mut config, tp.as_ref()).await;
                         }
@@ -495,16 +498,14 @@ pub async fn execute(
         CommandAction::PrepareTerminalForCheckout { checkout_path } => {
             let host_key = HostPath::new(local_host.clone(), checkout_path.clone());
             if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
-                match prepare_terminal_commands(repo_root, &co.branch, &checkout_path, registry, config_base).await {
-                    Ok(commands) => {
-                        CommandResult::TerminalPrepared {
-                            repo_identity,
-                            target_host: local_host.clone(),
-                            branch: co.branch,
-                            checkout_path,
-                            commands,
-                        }
-                    }
+                match prepare_terminal_commands(&repo.root, &co.branch, &checkout_path, registry, config_base).await {
+                    Ok(commands) => CommandResult::TerminalPrepared {
+                        repo_identity: repo.identity.clone(),
+                        target_host: local_host.clone(),
+                        branch: co.branch,
+                        checkout_path,
+                        commands,
+                    },
                     Err(message) => CommandResult::Error { message },
                 }
             } else {
@@ -519,7 +520,7 @@ pub async fn execute(
             };
             info!(%branch, "removing checkout");
             let result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
-                Some(cm.remove_checkout(repo_root, &branch).await)
+                Some(cm.remove_checkout(&repo.root, &branch).await)
             } else {
                 None
             };
@@ -546,14 +547,14 @@ pub async fn execute(
 
         CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
             let info =
-                data::fetch_checkout_status(&branch, checkout_path.as_deref(), change_request_id.as_deref(), repo_root, runner).await;
+                data::fetch_checkout_status(&branch, checkout_path.as_deref(), change_request_id.as_deref(), &repo.root, runner).await;
             CommandResult::CheckoutStatus(info)
         }
 
         CommandAction::OpenChangeRequest { id } => {
             debug!(%id, "opening change request in browser");
             if let Some((_, cr)) = registry.code_review.values().next() {
-                let _ = cr.open_in_browser(repo_root, &id).await;
+                let _ = cr.open_in_browser(&repo.root, &id).await;
             }
             CommandResult::Ok
         }
@@ -561,7 +562,7 @@ pub async fn execute(
         CommandAction::CloseChangeRequest { id } => {
             debug!(%id, "closing change request");
             if let Some((_, cr)) = registry.code_review.values().next() {
-                let _ = cr.close_change_request(repo_root, &id).await;
+                let _ = cr.close_change_request(&repo.root, &id).await;
             }
             CommandResult::Ok
         }
@@ -569,14 +570,14 @@ pub async fn execute(
         CommandAction::OpenIssue { id } => {
             debug!(%id, "opening issue in browser");
             if let Some((_, it)) = registry.issue_trackers.values().next() {
-                let _ = it.open_in_browser(repo_root, &id).await;
+                let _ = it.open_in_browser(&repo.root, &id).await;
             }
             CommandResult::Ok
         }
 
         CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
             info!(issue_ids = ?issue_ids, %change_request_id, "linking issues to change request");
-            let body_result = run!(runner, "gh", &["pr", "view", &change_request_id, "--json", "body", "--jq", ".body",], repo_root,);
+            let body_result = run!(runner, "gh", &["pr", "view", &change_request_id, "--json", "body", "--jq", ".body",], &repo.root,);
             match body_result {
                 Ok(current_body) => {
                     let fixes_lines: Vec<String> = issue_ids.iter().map(|id| format!("Fixes #{id}")).collect();
@@ -585,7 +586,7 @@ pub async fn execute(
                     } else {
                         format!("{}\n\n{}", current_body.trim(), fixes_lines.join("\n"))
                     };
-                    let result = run!(runner, "gh", &["pr", "edit", &change_request_id, "--body", &new_body], repo_root,);
+                    let result = run!(runner, "gh", &["pr", "edit", &change_request_id, "--body", &new_body], &repo.root,);
                     match result {
                         Ok(_) => {
                             info!(%change_request_id, "linked issues to change request");
@@ -668,7 +669,7 @@ pub async fn execute(
                 providers_data.checkouts.get(&host_key).map(|_| key.clone())
             } else if let Some(branch_name) = &branch {
                 let checkout_result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
-                    cm.create_checkout(repo_root, branch_name, false).await.ok()
+                    cm.create_checkout(&repo.root, branch_name, false).await.ok()
                 } else {
                     None
                 };
@@ -679,7 +680,7 @@ pub async fn execute(
             if let Some(path) = wt_path {
                 let name = branch.as_deref().unwrap_or("session");
                 if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                    let mut config = workspace_config(repo_root, name, &path, &teleport_cmd, config_base);
+                    let mut config = workspace_config(&repo.root, name, &path, &teleport_cmd, config_base);
                     if let Some((_, tp)) = &registry.terminal_pool {
                         resolve_terminal_pool(&mut config, tp.as_ref()).await;
                     }
@@ -1233,17 +1234,11 @@ mod tests {
         providers_data: &ProviderData,
         runner: &MockRunner,
     ) -> CommandResult {
-        execute(
-            action,
-            flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            &repo_root(),
-            registry,
-            providers_data,
-            runner,
-            &config_base(),
-            &local_host(),
-        )
-        .await
+        let repo = RepoExecutionContext {
+            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            root: repo_root(),
+        };
+        execute(action, &repo, registry, providers_data, runner, &config_base(), &local_host()).await
     }
 
     fn assert_error_contains(result: CommandResult, expected_substring: &str) {
@@ -1417,6 +1412,10 @@ mod tests {
         )
         .expect("write hosts config");
 
+        let repo = RepoExecutionContext {
+            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            root: repo_root(),
+        };
         let result = execute(
             CommandAction::CreateWorkspaceFromPreparedTerminal {
                 target_host: HostName::new("desktop"),
@@ -1424,8 +1423,7 @@ mod tests {
                 checkout_path: PathBuf::from("/remote/feat"),
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
             },
-            flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            &repo_root(),
+            &repo,
             &registry,
             &empty_data(),
             &runner,
@@ -2186,8 +2184,10 @@ mod tests {
     ) -> ExecutionPlan {
         build_plan(
             local_command(action),
-            flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            repo_root(),
+            RepoExecutionContext {
+                identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+                root: repo_root(),
+            },
             Arc::new(registry),
             Arc::new(providers_data),
             Arc::new(runner),

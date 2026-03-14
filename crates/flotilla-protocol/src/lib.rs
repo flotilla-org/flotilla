@@ -148,7 +148,13 @@ pub enum DaemonEvent {
     #[serde(rename = "command_started")]
     CommandStarted { command_id: u64, host: HostName, repo_identity: RepoIdentity, repo: std::path::PathBuf, description: String },
     #[serde(rename = "command_finished")]
-    CommandFinished { command_id: u64, host: HostName, repo_identity: RepoIdentity, repo: std::path::PathBuf, result: commands::CommandResult },
+    CommandFinished {
+        command_id: u64,
+        host: HostName,
+        repo_identity: RepoIdentity,
+        repo: std::path::PathBuf,
+        result: commands::CommandResult,
+    },
     #[serde(rename = "command_step_update")]
     CommandStepUpdate {
         command_id: u64,

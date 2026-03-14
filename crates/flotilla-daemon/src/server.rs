@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
-    Command, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message, PeerConnectionState,
-    PeerDataMessage, PeerWireMessage, RoutedPeerMessage, PROTOCOL_VERSION,
+    Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message,
+    PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -53,8 +53,21 @@ impl PeerSender for SocketPeerSender {
 #[derive(Debug, Clone)]
 struct PendingRemoteCommand {
     command_id: u64,
+    repo_identity: Option<RepoIdentity>,
     repo: Option<PathBuf>,
     finished_via_event: bool,
+}
+
+fn extract_command_repo_identity(command: &Command) -> Option<RepoIdentity> {
+    if let Some(RepoSelector::Identity(identity)) = command.context_repo.as_ref() {
+        return Some(identity.clone());
+    }
+    match &command.action {
+        CommandAction::Checkout { repo: RepoSelector::Identity(identity), .. } => Some(identity.clone()),
+        CommandAction::RemoveRepo { repo: RepoSelector::Identity(identity) } => Some(identity.clone()),
+        CommandAction::Refresh { repo: Some(RepoSelector::Identity(identity)) } => Some(identity.clone()),
+        _ => None,
+    }
 }
 
 /// The daemon server that listens on a Unix socket and dispatches requests
@@ -437,7 +450,7 @@ impl DaemonServer {
                                 );
 
                                 if let Err(e) = peer_daemon
-                                    .add_virtual_repo(synthetic.clone(), merged)
+                                    .add_virtual_repo(updated_repo_id.clone(), synthetic.clone(), merged)
                                     .await
                                 {
                                     warn!(
@@ -840,37 +853,37 @@ async fn execute_forwarded_command(
 
     loop {
         match event_rx.recv().await {
-            Ok(DaemonEvent::CommandStarted { command_id: id, repo, description, .. }) if id == command_id => {
+            Ok(DaemonEvent::CommandStarted { command_id: id, repo_identity, repo, description, .. }) if id == command_id => {
                 let event = RoutedPeerMessage::CommandEvent {
                     request_id,
                     requester_host: requester_host.clone(),
                     responder_host: responder_host.clone(),
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                    event: Box::new(CommandPeerEvent::Started { repo, description }),
+                    event: Box::new(CommandPeerEvent::Started { repo_identity, repo, description }),
                 };
                 let pm = peer_manager.lock().await;
                 let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(event)).await;
             }
-            Ok(DaemonEvent::CommandStepUpdate { command_id: id, repo, step_index, step_count, description, status, .. })
-                if id == command_id =>
-            {
+            Ok(DaemonEvent::CommandStepUpdate {
+                command_id: id, repo_identity, repo, step_index, step_count, description, status, ..
+            }) if id == command_id => {
                 let event = RoutedPeerMessage::CommandEvent {
                     request_id,
                     requester_host: requester_host.clone(),
                     responder_host: responder_host.clone(),
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                    event: Box::new(CommandPeerEvent::StepUpdate { repo, step_index, step_count, description, status }),
+                    event: Box::new(CommandPeerEvent::StepUpdate { repo_identity, repo, step_index, step_count, description, status }),
                 };
                 let pm = peer_manager.lock().await;
                 let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(event)).await;
             }
-            Ok(DaemonEvent::CommandFinished { command_id: id, repo, result, .. }) if id == command_id => {
+            Ok(DaemonEvent::CommandFinished { command_id: id, repo_identity, repo, result, .. }) if id == command_id => {
                 let finished = RoutedPeerMessage::CommandEvent {
                     request_id,
                     requester_host: requester_host.clone(),
                     responder_host: responder_host.clone(),
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                    event: Box::new(CommandPeerEvent::Finished { repo, result: result.clone() }),
+                    event: Box::new(CommandPeerEvent::Finished { repo_identity, repo, result: result.clone() }),
                 };
                 let response = RoutedPeerMessage::CommandResponse {
                     request_id,
@@ -904,15 +917,24 @@ async fn emit_remote_command_event(
     };
 
     match event {
-        CommandPeerEvent::Started { repo, description } => {
+        CommandPeerEvent::Started { repo_identity, repo, description } => {
+            entry.repo_identity = Some(repo_identity.clone());
             entry.repo = Some(repo.clone());
-            daemon.send_event(DaemonEvent::CommandStarted { command_id: entry.command_id, host: responder_host, repo, description });
+            daemon.send_event(DaemonEvent::CommandStarted {
+                command_id: entry.command_id,
+                host: responder_host,
+                repo_identity,
+                repo,
+                description,
+            });
         }
-        CommandPeerEvent::StepUpdate { repo, step_index, step_count, description, status } => {
+        CommandPeerEvent::StepUpdate { repo_identity, repo, step_index, step_count, description, status } => {
+            entry.repo_identity = Some(repo_identity.clone());
             entry.repo = Some(repo.clone());
             daemon.send_event(DaemonEvent::CommandStepUpdate {
                 command_id: entry.command_id,
                 host: responder_host,
+                repo_identity,
                 repo,
                 step_index,
                 step_count,
@@ -920,10 +942,17 @@ async fn emit_remote_command_event(
                 status,
             });
         }
-        CommandPeerEvent::Finished { repo, result } => {
+        CommandPeerEvent::Finished { repo_identity, repo, result } => {
+            entry.repo_identity = Some(repo_identity.clone());
             entry.repo = Some(repo.clone());
             entry.finished_via_event = true;
-            daemon.send_event(DaemonEvent::CommandFinished { command_id: entry.command_id, host: responder_host, repo, result });
+            daemon.send_event(DaemonEvent::CommandFinished {
+                command_id: entry.command_id,
+                host: responder_host,
+                repo_identity,
+                repo,
+                result,
+            });
         }
     }
 }
@@ -947,6 +976,16 @@ async fn complete_remote_command(
     daemon.send_event(DaemonEvent::CommandFinished {
         command_id: entry.command_id,
         host: responder_host,
+        repo_identity: entry
+            .repo_identity
+            .or_else(|| match &result {
+                CommandResult::TerminalPrepared { repo_identity, .. } => Some(repo_identity.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| RepoIdentity {
+                authority: "local".into(),
+                path: entry.repo.clone().unwrap_or_default().display().to_string(),
+            }),
         repo: entry.repo.unwrap_or_default(),
         result,
     });
@@ -1445,6 +1484,7 @@ async fn dispatch_request(
                 let command_id = next_remote_command_id.fetch_add(1, Ordering::Relaxed);
                 pending_remote_commands.lock().await.insert(request_id, PendingRemoteCommand {
                     command_id,
+                    repo_identity: extract_command_repo_identity(&command),
                     repo: None,
                     finished_via_event: false,
                 });
@@ -1711,6 +1751,15 @@ mod tests {
         assert!(status.success(), "git commit should succeed");
     }
 
+    fn init_git_repo_with_remote(path: &Path, remote: &str) -> RepoIdentity {
+        init_git_repo(path);
+        let repo = path.to_str().expect("repo path utf8");
+        let status =
+            ProcessCommand::new("git").args(["-C", repo, "remote", "add", "origin", remote]).status().expect("git remote add origin");
+        assert!(status.success(), "git remote add origin should succeed");
+        RepoIdentity::from_remote_url(remote).expect("remote should produce repo identity")
+    }
+
     async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandResult {
         tokio::time::timeout(StdDuration::from_secs(5), async {
             loop {
@@ -1918,12 +1967,12 @@ mod tests {
                     assert_eq!(requester_host, &HostName::new("desktop"));
                     assert_eq!(responder_host, daemon.host_name());
                     match event.as_ref() {
-                        CommandPeerEvent::Started { repo: event_repo, description } => {
+                        CommandPeerEvent::Started { repo: event_repo, description, .. } => {
                             assert_eq!(event_repo, &repo);
                             assert_eq!(description, "Refreshing...");
                             saw_started = true;
                         }
-                        CommandPeerEvent::Finished { repo: event_repo, result } => {
+                        CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
                             assert_eq!(event_repo, &repo);
                             assert_eq!(result, &CommandResult::Refreshed { repos: vec![repo.clone()] });
                             saw_finished = true;
@@ -1952,8 +2001,8 @@ mod tests {
     #[tokio::test]
     async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        init_git_repo(&repo);
+        let repo = tmp.path().join("remote-root").join("repo");
+        let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
         let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
         let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
         daemon.refresh(&repo).await.expect("refresh repo");
@@ -1964,7 +2013,7 @@ mod tests {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
-                    repo: RepoSelector::Path(repo.clone()),
+                    repo: RepoSelector::Identity(repo_identity.clone()),
                     target: CheckoutTarget::FreshBranch("feat-remote".into()),
                     issue_ids: vec![],
                 },
@@ -2004,7 +2053,7 @@ mod tests {
             HostName::new("relay"),
             Command {
                 host: Some(daemon.host_name().clone()),
-                context_repo: Some(RepoSelector::Path(repo.clone())),
+                context_repo: Some(RepoSelector::Identity(repo_identity.clone())),
                 action: CommandAction::PrepareTerminalForCheckout { checkout_path: checkout_path.clone() },
             },
         )
@@ -2022,15 +2071,24 @@ mod tests {
                     assert_eq!(requester_host, &HostName::new("desktop"));
                     assert_eq!(responder_host, daemon.host_name());
                     match event.as_ref() {
-                        CommandPeerEvent::Started { repo: event_repo, description } => {
+                        CommandPeerEvent::Started { repo_identity: event_identity, repo: event_repo, description } => {
+                            assert_eq!(event_identity, &repo_identity);
                             assert_eq!(event_repo, &repo);
                             assert_eq!(description, "Preparing terminal...");
                             saw_preparing = true;
                         }
-                        CommandPeerEvent::Finished { repo: event_repo, result } => {
+                        CommandPeerEvent::Finished { repo_identity: event_identity, repo: event_repo, result } => {
+                            assert_eq!(event_identity, &repo_identity);
                             assert_eq!(event_repo, &repo);
                             match result {
-                                CommandResult::TerminalPrepared { target_host, branch, checkout_path: returned_path, commands } => {
+                                CommandResult::TerminalPrepared {
+                                    repo_identity: result_identity,
+                                    target_host,
+                                    branch,
+                                    checkout_path: returned_path,
+                                    commands,
+                                } => {
+                                    assert_eq!(result_identity, &repo_identity);
                                     assert_eq!(target_host, daemon.host_name());
                                     assert_eq!(branch, "feat-remote");
                                     assert_eq!(returned_path, &checkout_path);
@@ -2040,7 +2098,9 @@ mod tests {
                             }
                             saw_finished = true;
                         }
-                        CommandPeerEvent::StepUpdate { .. } => {}
+                        CommandPeerEvent::StepUpdate { repo_identity: event_identity, .. } => {
+                            assert_eq!(event_identity, &repo_identity);
+                        }
                     }
                 }
                 PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse {
@@ -2050,7 +2110,14 @@ mod tests {
                     assert_eq!(requester_host, &HostName::new("desktop"));
                     assert_eq!(responder_host, daemon.host_name());
                     match result.as_ref() {
-                        CommandResult::TerminalPrepared { target_host, branch, checkout_path: returned_path, commands } => {
+                        CommandResult::TerminalPrepared {
+                            repo_identity: result_identity,
+                            target_host,
+                            branch,
+                            checkout_path: returned_path,
+                            commands,
+                        } => {
+                            assert_eq!(result_identity, &repo_identity);
                             assert_eq!(target_host, daemon.host_name());
                             assert_eq!(branch, "feat-remote");
                             assert_eq!(returned_path, &checkout_path);
@@ -2067,6 +2134,48 @@ mod tests {
         assert!(saw_preparing);
         assert!(saw_finished);
         assert!(saw_response);
+    }
+
+    #[tokio::test]
+    async fn execute_forwarded_checkout_resolves_repo_identity_across_different_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote_repo = tmp.path().join("remote-root").join("repo");
+        let requester_repo = tmp.path().join("requester-root").join("repo");
+        let repo_identity = init_git_repo_with_remote(&remote_repo, "git@github.com:owner/repo.git");
+        init_git_repo_with_remote(&requester_repo, "git@github.com:owner/repo.git");
+
+        let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+        let daemon = InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+        daemon.refresh(&remote_repo).await.expect("refresh repo");
+
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+
+        execute_forwarded_command(
+            Arc::clone(&daemon),
+            Arc::clone(&peer_manager),
+            9,
+            HostName::new("desktop"),
+            HostName::new("relay"),
+            Command {
+                host: Some(daemon.host_name().clone()),
+                context_repo: None,
+                action: CommandAction::Checkout {
+                    repo: RepoSelector::Identity(repo_identity.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-routed".into()),
+                    issue_ids: vec![],
+                },
+            },
+        )
+        .await;
+
+        let sent = sent.lock().expect("lock");
+        assert!(sent.iter().any(|msg| matches!(
+            msg,
+            PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse { result, .. })
+                if matches!(result.as_ref(), CommandResult::CheckoutCreated { branch, .. } if branch == "feat-routed")
+        )));
     }
 
     #[tokio::test]
@@ -2515,7 +2624,7 @@ mod tests {
                 &peers.iter().map(|(h, d)| (h.clone(), d)).collect::<Vec<_>>(),
             )
         };
-        daemon.add_virtual_repo(synthetic.clone(), merged).await.expect("add virtual repo");
+        daemon.add_virtual_repo(repo_identity.clone(), synthetic.clone(), merged).await.expect("add virtual repo");
         daemon
             .set_peer_providers(&synthetic, vec![
                 (HostName::new("peer-a"), ProviderData {

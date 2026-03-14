@@ -275,6 +275,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
                 responder_host: HostName::new("host-c"),
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 event: Box::new(CommandPeerEvent::StepUpdate {
+                    repo_identity: test_repo(),
                     repo: PathBuf::from("/repo"),
                     step_index: 0,
                     step_count: 2,
@@ -293,6 +294,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
             if responder_host == &HostName::new("host-c")
                 && *event
                     == CommandPeerEvent::StepUpdate {
+                        repo_identity: test_repo(),
                         repo: PathBuf::from("/repo"),
                         step_index: 0,
                         step_count: 2,

@@ -417,7 +417,7 @@ impl PeerNetworkingTask {
                                 );
 
                                 if let Err(e) = peer_daemon
-                                    .add_virtual_repo(synthetic.clone(), merged)
+                                    .add_virtual_repo(updated_repo_id.clone(), synthetic.clone(), merged)
                                     .await
                                 {
                                     warn!(
