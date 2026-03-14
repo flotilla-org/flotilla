@@ -11,7 +11,7 @@ use flotilla_tui::{
     app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState},
     ui,
 };
-use ratatui::{backend::TestBackend, Terminal};
+use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
@@ -116,6 +116,12 @@ impl TestHarness {
 
     /// Render the UI into a string via TestBackend.
     pub fn render_to_string(&mut self) -> String {
+        let buffer = self.render_to_buffer();
+        buffer_to_string(&buffer)
+    }
+
+    /// Render the UI into a test buffer for symbol/style assertions.
+    pub fn render_to_buffer(&mut self) -> Buffer {
         let backend = TestBackend::new(self.width, self.height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -123,8 +129,7 @@ impl TestHarness {
                 ui::render(&self.model, &mut self.ui, &self.in_flight, frame);
             })
             .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        buffer_to_string(&buffer)
+        terminal.backend().buffer().clone()
     }
 }
 

@@ -22,6 +22,7 @@
 | `p` | Open PR in browser |
 | `v` | Cycle preview mode (`auto` → `right` → `below`) |
 | `P` | Hide/show preview panel |
+| `K` | Hide/show status bar key ribbons |
 | `r` | Refresh data |
 | `a` | Add repo tab |
 | `c` | Toggle providers panel |
@@ -42,6 +43,13 @@
 | `?` | Toggle help overlay |
 | `D` | Toggle debug panel |
 | `q` / Esc | Quit |
+
+## Status Bar
+
+| Interaction | Action |
+|-------------|--------|
+| Click a key ribbon | Trigger that action |
+| Click `×` on an error | Dismiss that status item |
 
 ## Action menu
 

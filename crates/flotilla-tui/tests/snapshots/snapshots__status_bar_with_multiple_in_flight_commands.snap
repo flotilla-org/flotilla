@@ -1,5 +1,6 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 304
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
@@ -31,4 +32,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
- Refreshing repository... (2 commands)
+LAYOUT AUTO                  <ENT> OPEN  <.> MENU  </> SEARCH  <n> NEW           - Refreshing repository... (+1)

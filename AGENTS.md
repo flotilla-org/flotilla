@@ -31,6 +31,7 @@ The app auto-detects git, GitHub (`gh` CLI), Claude, and terminal multiplexers f
 |------|---------|
 | Build | `cargo build --locked` |
 | Lint (format) | `cargo fmt --check` |
+| Lint (format, repo convention) | `cargo +nightly fmt --check` |
 | Lint (clippy) | `cargo clippy --all-targets --locked -- -D warnings` |
 | Test | `cargo test --workspace --locked` |
 | Test (sandbox) | `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` |
@@ -39,6 +40,7 @@ The app auto-detects git, GitHub (`gh` CLI), Claude, and terminal multiplexers f
 ### Gotchas
 
 - `cargo build` without `--locked` may update `Cargo.lock`; use `--locked` for reproducible builds.
+- Repo formatting follows `cargo +nightly fmt`; `cargo fmt` may not match the checked-in style on stable.
 - The TUI needs a real terminal (TTY). Use `cargo run` inside a terminal emulator, not piped.
 
 ## Testing Providers with Record/Replay

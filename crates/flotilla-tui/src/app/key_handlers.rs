@@ -1,17 +1,27 @@
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{App, BranchInputKind, ClearDispatch, Intent, UiMode};
+use crate::status_bar::StatusBarAction;
 
 impl App {
     // ── Key handling ──
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        self.model.status_message = None;
+        if key.code == KeyCode::Char('K')
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && !matches!(
+                self.ui.mode,
+                UiMode::BranchInput { kind: BranchInputKind::Manual, .. } | UiMode::IssueSearch { .. } | UiMode::FilePicker { .. }
+            )
+        {
+            self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
+            return;
+        }
 
         // Toggle help from Normal or Help modes
         if key.code == KeyCode::Char('?') {
@@ -137,8 +147,8 @@ impl App {
     // ── Mouse handling ──
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if matches!(mouse.kind, MouseEventKind::Down(_)) {
-            self.model.status_message = None;
+        if self.handle_status_bar_mouse(mouse) {
+            return;
         }
 
         match self.ui.mode {
@@ -196,6 +206,37 @@ impl App {
     }
 
     // ── Private helpers ──
+
+    fn handle_status_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return false;
+        }
+
+        for target in &self.ui.layout.status_bar.dismiss_targets {
+            if target.contains(mouse.column, mouse.row) {
+                if let StatusBarAction::ClearError(id) = target.action {
+                    self.dismiss_status_item(id);
+                    return true;
+                }
+            }
+        }
+
+        for target in &self.ui.layout.status_bar.key_targets {
+            if target.contains(mouse.column, mouse.row) {
+                self.dispatch_status_bar_action(target.action.clone());
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn dispatch_status_bar_action(&mut self, action: StatusBarAction) {
+        match action {
+            StatusBarAction::KeyPress { code, modifiers } => self.handle_key(KeyEvent::new(code, modifiers)),
+            StatusBarAction::ClearError(id) => self.dismiss_status_item(id),
+        }
+    }
 
     fn handle_menu_mouse(&mut self, mouse: MouseEvent) {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -478,11 +519,15 @@ impl App {
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use flotilla_protocol::{CheckoutStatus, Command, HostName, HostPath, WorkItemIdentity};
+    use ratatui::layout::Rect;
 
     use super::{super::RepoViewLayout, *};
-    use crate::app::test_support::{checkout_item, key, setup_selectable_table as setup_table, stub_app};
+    use crate::{
+        app::test_support::{checkout_item, key, setup_selectable_table as setup_table, stub_app},
+        status_bar::{StatusBarAction, StatusBarTarget},
+    };
 
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::local(), PathBuf::from(path))
@@ -507,6 +552,10 @@ mod tests {
             loading: false,
             terminal_keys: vec![],
         }
+    }
+
+    fn left_click(x: u16, y: u16) -> MouseEvent {
+        MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE }
     }
 
     // ── handle_key — top-level dispatch ──────────────────────────────
@@ -536,12 +585,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_clears_status_message() {
+    fn handle_key_preserves_status_message_until_dismissed() {
         let mut app = stub_app();
         app.model.status_message = Some("old status".into());
-        // Any key should clear status
         app.handle_key(key(KeyCode::Char('r')));
-        assert!(app.model.status_message.is_none());
+        assert_eq!(app.model.status_message.as_deref(), Some("old status"));
     }
 
     #[test]
@@ -730,6 +778,16 @@ mod tests {
     }
 
     #[test]
+    fn normal_uppercase_k_toggles_status_bar_keys() {
+        let mut app = stub_app();
+        assert!(app.ui.status_bar.show_keys);
+        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
+        assert!(!app.ui.status_bar.show_keys);
+        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
+        assert!(app.ui.status_bar.show_keys);
+    }
+
+    #[test]
     fn normal_dot_opens_action_menu() {
         let mut app = stub_app();
         // Need an item with available intents — a checkout item can CreateWorkspace
@@ -737,6 +795,40 @@ mod tests {
         setup_table(&mut app, vec![item]);
         app.handle_key(key(KeyCode::Char('.')));
         assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
+    }
+
+    #[test]
+    fn clicking_search_status_target_enters_issue_search_mode() {
+        let mut app = stub_app();
+        app.ui.layout.status_bar.key_targets =
+            vec![StatusBarTarget::new(Rect::new(10, 29, 12, 1), StatusBarAction::key(KeyCode::Char('/')))];
+
+        app.handle_mouse(left_click(12, 29));
+
+        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+    }
+
+    #[test]
+    fn clicking_layout_status_cycles_layout() {
+        let mut app = stub_app();
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Auto);
+        app.ui.layout.status_bar.key_targets =
+            vec![StatusBarTarget::new(Rect::new(0, 29, 12, 1), StatusBarAction::key(KeyCode::Char('l')))];
+
+        app.handle_mouse(left_click(4, 29));
+
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Zoom);
+    }
+
+    #[test]
+    fn clicking_dismiss_status_target_hides_visible_error() {
+        let mut app = stub_app();
+        app.model.status_message = Some("boom".into());
+        app.ui.layout.status_bar.dismiss_targets = vec![StatusBarTarget::new(Rect::new(20, 29, 1, 1), StatusBarAction::ClearError(0))];
+
+        app.handle_mouse(left_click(20, 29));
+
+        assert!(app.visible_status_items().is_empty());
     }
 
     // ── handle_menu_key ──────────────────────────────────────────────

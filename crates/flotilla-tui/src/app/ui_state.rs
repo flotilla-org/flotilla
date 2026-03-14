@@ -10,6 +10,7 @@ use ratatui::{layout::Rect, widgets::TableState};
 use tui_input::Input;
 
 use super::intent::Intent;
+use crate::status_bar::StatusBarTarget;
 
 #[derive(Clone)]
 pub struct DirEntry {
@@ -164,9 +165,28 @@ pub struct LayoutAreas {
     pub table_area: Rect,
     pub menu_area: Rect,
     pub tab_areas: BTreeMap<TabId, Rect>,
+    pub status_bar: StatusBarLayout,
     pub event_log_filter_area: Rect,
     pub file_picker_area: Rect,
     pub file_picker_list_area: Rect,
+}
+
+#[derive(Default)]
+pub struct StatusBarLayout {
+    pub area: Rect,
+    pub key_targets: Vec<StatusBarTarget>,
+    pub dismiss_targets: Vec<StatusBarTarget>,
+}
+
+pub struct StatusBarUiState {
+    pub show_keys: bool,
+    pub dismissed_status_ids: HashSet<usize>,
+}
+
+impl Default for StatusBarUiState {
+    fn default() -> Self {
+        Self { show_keys: true, dismissed_status_ids: HashSet::new() }
+    }
 }
 
 #[derive(Default)]
@@ -198,6 +218,7 @@ pub struct UiState {
     pub mode: UiMode,
     pub repo_ui: HashMap<PathBuf, RepoUiState>,
     pub view_layout: RepoViewLayout,
+    pub status_bar: StatusBarUiState,
     pub layout: LayoutAreas,
     pub drag: DragState,
     pub double_click: DoubleClickState,
@@ -213,6 +234,7 @@ impl UiState {
             mode: UiMode::default(),
             repo_ui,
             view_layout: RepoViewLayout::default(),
+            status_bar: StatusBarUiState::default(),
             layout: LayoutAreas::default(),
             drag: DragState::default(),
             double_click: DoubleClickState::default(),
@@ -298,6 +320,17 @@ mod tests {
     fn ui_state_defaults_to_auto_layout() {
         let state = UiState::new(&[]);
         assert_eq!(state.view_layout, RepoViewLayout::Auto);
+    }
+
+    #[test]
+    fn ui_state_defaults_to_showing_status_bar_keys() {
+        let state = UiState::new(&[]);
+        assert!(state.status_bar.show_keys);
+    }
+
+    #[test]
+    fn status_bar_ui_state_defaults_to_showing_keys() {
+        assert!(StatusBarUiState::default().show_keys);
     }
 
     #[test]
