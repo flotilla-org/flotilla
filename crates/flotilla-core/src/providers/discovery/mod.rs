@@ -23,6 +23,7 @@ use futures::stream;
 use crate::{
     config::ConfigStore,
     providers::{
+        CommandRunner,
         ai_utility::AiUtility,
         code_review::CodeReview,
         coding_agent::CloudAgentService,
@@ -31,7 +32,6 @@ use crate::{
         terminal::TerminalPool,
         vcs::{CheckoutManager, Vcs},
         workspace::WorkspaceManager,
-        CommandRunner,
     },
 };
 
@@ -327,6 +327,34 @@ pub struct FactoryRegistry {
     pub ai_utilities: Vec<Box<AiUtilityFactory>>,
     pub workspace_managers: Vec<Box<WorkspaceManagerFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
+}
+
+pub struct DiscoveryRuntime {
+    pub runner: Arc<dyn CommandRunner>,
+    pub env: Arc<dyn EnvVars>,
+    pub host_detectors: Vec<Box<dyn HostDetector>>,
+    pub repo_detectors: Vec<Box<dyn RepoDetector>>,
+    pub factories: FactoryRegistry,
+}
+
+impl DiscoveryRuntime {
+    pub fn for_process(follower: bool) -> Self {
+        let factories = if follower { FactoryRegistry::for_follower() } else { FactoryRegistry::default_all() };
+        Self {
+            runner: Arc::new(crate::providers::ProcessCommandRunner),
+            env: Arc::new(ProcessEnvVars),
+            host_detectors: detectors::default_host_detectors(),
+            repo_detectors: detectors::default_repo_detectors(),
+            factories,
+        }
+    }
+
+    pub fn is_follower(&self) -> bool {
+        self.factories.code_review.is_empty()
+            && self.factories.issue_trackers.is_empty()
+            && self.factories.cloud_agents.is_empty()
+            && self.factories.ai_utilities.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------

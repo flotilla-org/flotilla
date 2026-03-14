@@ -7,8 +7,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -18,7 +18,7 @@ use flotilla_protocol::{
     AssociationKey, Command, DaemonEvent, DeltaEntry, HostName, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo,
     RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSummary, RepoWorkResponse, Snapshot, StatusResponse, UnmetRequirementInfo,
 };
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -29,11 +29,8 @@ use crate::{
     delta,
     executor::{self, ExecutionPlan},
     issue_cache::IssueCache,
-    model::{provider_names_from_registry, repo_name, RepoModel},
-    providers::{
-        discovery::{discover_providers, DiscoveryResult, EnvironmentBag, FactoryRegistry, ProcessEnvVars, RepoDetector, UnmetRequirement},
-        CommandRunner,
-    },
+    model::{RepoModel, provider_names_from_registry, repo_name},
+    providers::discovery::{DiscoveryResult, DiscoveryRuntime, EnvironmentBag, UnmetRequirement, discover_providers},
     refresh::RefreshSnapshot,
     step::run_step_plan,
 };
@@ -272,7 +269,6 @@ pub struct InProcessDaemon {
     repo_order: RwLock<Vec<PathBuf>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     config: Arc<ConfigStore>,
-    runner: Arc<dyn CommandRunner>,
     next_command_id: AtomicU64,
     host_name: HostName,
     /// When true, only local providers (VCS, checkout manager, workspace
@@ -293,10 +289,9 @@ pub struct InProcessDaemon {
     /// Host-level environment assertions, computed once at startup and
     /// reused for each repo discovery.
     host_bag: EnvironmentBag,
-    /// Repo-level detectors, computed once at startup.
-    repo_detectors: Vec<Box<dyn RepoDetector>>,
-    /// Provider factories, computed once at startup (follower vs full).
-    factories: FactoryRegistry,
+    /// Discovery dependencies and configuration used for all daemon-side
+    /// provider detection, both at startup and for later repo additions.
+    discovery: DiscoveryRuntime,
     /// The currently active step-based command, if any — for cancellation.
     active_command: Arc<Mutex<Option<ActiveCommand>>>,
     /// Unique identity for this daemon instance, generated at startup.
@@ -310,39 +305,32 @@ impl InProcessDaemon {
     /// Returns `Arc<Self>` because a background poll task is spawned that
     /// holds a reference. The poll loop checks every 100ms for new refresh
     /// snapshots and broadcasts delta or full events for each change.
-    pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<Self> {
-        Self::new_with_options(repo_paths, config, false, HostName::local()).await
-    }
+    pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>, discovery: DiscoveryRuntime, host_name: HostName) -> Arc<Self> {
+        use crate::providers::discovery::{self, DiscoveryResult};
 
-    /// Create a new in-process daemon with explicit follower mode.
-    ///
-    /// When `follower` is true, external providers (code review, issue
-    /// tracker, cloud agents, AI utilities) are skipped during provider
-    /// discovery. The follower daemon only reports local state (VCS,
-    /// checkouts, workspace manager, terminal pool). Service-level data
-    /// arrives from the leader via PeerData messages.
-    pub async fn new_with_options(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>, follower: bool, host_name: HostName) -> Arc<Self> {
-        use crate::providers::discovery::{self, detectors, DiscoveryResult, FactoryRegistry, ProcessEnvVars};
-
+        let follower = discovery.is_follower();
         let (event_tx, _) = broadcast::channel(256);
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let mut repos = HashMap::new();
         let mut order = Vec::new();
         let mut identities = HashMap::new();
 
         // Run host detection once before the repo loop
-        let host_detectors = detectors::default_host_detectors();
-        let repo_detectors = detectors::default_repo_detectors();
-        let host_bag = discovery::run_host_detectors(&host_detectors, &*runner, &ProcessEnvVars).await;
-        let factories = if follower { FactoryRegistry::for_follower() } else { FactoryRegistry::default_all() };
+        let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
 
         for path in repo_paths {
             if repos.contains_key(&path) {
                 continue;
             }
-            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } =
-                discovery::discover_providers(&host_bag, &path, &repo_detectors, &factories, &config, Arc::clone(&runner), &ProcessEnvVars)
-                    .await;
+            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discovery::discover_providers(
+                &host_bag,
+                &path,
+                &discovery.repo_detectors,
+                &discovery.factories,
+                &config,
+                Arc::clone(&discovery.runner),
+                &*discovery.env,
+            )
+            .await;
             if !unmet.is_empty() {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
@@ -379,7 +367,6 @@ impl InProcessDaemon {
             repo_order: RwLock::new(order),
             event_tx,
             config,
-            runner,
             next_command_id: AtomicU64::new(1),
             host_name,
             follower,
@@ -387,8 +374,7 @@ impl InProcessDaemon {
             repo_identities: RwLock::new(identities),
             peer_status: RwLock::new(HashMap::new()),
             host_bag,
-            repo_detectors,
-            factories,
+            discovery,
             active_command: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4(),
         });
@@ -1081,7 +1067,7 @@ impl DaemonHandle for InProcessDaemon {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
 
         // Gather what the spawned task needs — validate repo before broadcasting
-        let runner = Arc::clone(&self.runner);
+        let runner = Arc::clone(&self.discovery.runner);
         let event_tx = self.event_tx.clone();
         let (registry, providers_data, refresh_trigger) = {
             let repos = self.repos.read().await;
@@ -1209,11 +1195,11 @@ impl DaemonHandle for InProcessDaemon {
         let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
             &self.host_bag,
             &path,
-            &self.repo_detectors,
-            &self.factories,
+            &self.discovery.repo_detectors,
+            &self.discovery.factories,
             &self.config,
-            Arc::clone(&self.runner),
-            &ProcessEnvVars,
+            Arc::clone(&self.discovery.runner),
+            &*self.discovery.env,
         )
         .await;
         if !unmet.is_empty() {

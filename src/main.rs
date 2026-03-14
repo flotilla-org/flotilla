@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use clap::Parser;
 use color_eyre::Result;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{output::OutputFormat, HostName};
+use flotilla_protocol::{HostName, output::OutputFormat};
 use flotilla_tui::{app, event_log};
 use tracing::info;
 
@@ -142,7 +142,8 @@ async fn run_tui(cli: Cli) -> Result<()> {
             // Load daemon config for host name (peer identity)
             let daemon_config = config_clone.load_daemon_config();
             let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-            let d = InProcessDaemon::new_with_options(repo_roots, Arc::clone(&config_clone), daemon_config.follower, host_name).await;
+            let discovery = flotilla_core::providers::discovery::DiscoveryRuntime::for_process(daemon_config.follower);
+            let d = InProcessDaemon::new(repo_roots, Arc::clone(&config_clone), discovery, host_name).await;
 
             // Spawn peer networking if peers are configured
             match flotilla_daemon::peer_networking::PeerNetworkingTask::new(Arc::clone(&d), &config_clone) {

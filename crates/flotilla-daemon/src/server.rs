@@ -1,25 +1,25 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{Command, DaemonEvent, GoodbyeReason, HostName, Message, PeerConnectionState, PeerWireMessage, PROTOCOL_VERSION};
+use flotilla_protocol::{Command, DaemonEvent, GoodbyeReason, HostName, Message, PROTOCOL_VERSION, PeerConnectionState, PeerWireMessage};
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
     net::UnixListener,
-    sync::{mpsc, watch, Mutex, Notify},
+    sync::{Mutex, Notify, mpsc, watch},
 };
 use tracing::{error, info, warn};
 
 use crate::{
     peer::{ActivationResult, ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, PeerSender},
-    peer_networking::{disconnect_peer_and_rebuild, PeerConnectedNotice},
+    peer_networking::{PeerConnectedNotice, disconnect_peer_and_rebuild},
 };
 
 struct SocketPeerSender {
@@ -77,8 +77,8 @@ impl DaemonServer {
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config();
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-
-        let daemon = InProcessDaemon::new_with_options(repo_paths, config.clone(), daemon_config.follower, host_name).await;
+        let discovery = flotilla_core::providers::discovery::DiscoveryRuntime::for_process(daemon_config.follower);
+        let daemon = InProcessDaemon::new(repo_paths, config.clone(), discovery, host_name).await;
 
         let (peer_networking, peer_manager, peer_data_tx) = crate::peer_networking::PeerNetworkingTask::new(Arc::clone(&daemon), &config)?;
 
@@ -670,7 +670,13 @@ mod tests {
     async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
         let tmp = tempfile::tempdir().unwrap();
         let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
-        let daemon = InProcessDaemon::new(vec![], config).await;
+        let daemon = InProcessDaemon::new(
+            vec![],
+            config,
+            flotilla_core::providers::discovery::DiscoveryRuntime::for_process(false),
+            HostName::local(),
+        )
+        .await;
         (tmp, daemon)
     }
 

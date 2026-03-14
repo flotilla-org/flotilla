@@ -1,25 +1,89 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
+use async_trait::async_trait;
+use flotilla_core::{
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+    providers::{
+        ChannelLabel, CommandOutput, CommandRunner,
+        discovery::{DiscoveryRuntime, EnvVars},
+    },
+};
 use flotilla_protocol::{Command, DaemonEvent, HostName, ProviderData};
 
-async fn daemon_for_cwd() -> (PathBuf, Arc<InProcessDaemon>) {
-    let repo = std::env::current_dir().unwrap();
-    let config = Arc::new(ConfigStore::new());
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config).await;
-    (repo, daemon)
+#[derive(Default)]
+struct StaticEnvVars;
+
+impl EnvVars for StaticEnvVars {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+}
+
+struct FakeRunner;
+
+#[async_trait]
+impl CommandRunner for FakeRunner {
+    async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        if cmd == "git" && args == ["--version"] {
+            return Ok("git version 2.43.0\n".into());
+        }
+        Err(format!("fake runner: no response for {cmd} {}", args.join(" ")))
+    }
+
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+        match self.run(cmd, args, cwd, label).await {
+            Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
+            Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
+        }
+    }
+
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        false
+    }
+}
+
+async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let discovery = process_discovery(false);
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    (temp, repo, daemon)
+}
+
+fn process_discovery(follower: bool) -> DiscoveryRuntime {
+    let mut runtime = DiscoveryRuntime::for_process(follower);
+    runtime.runner = Arc::new(FakeRunner);
+    runtime.env = Arc::new(StaticEnvVars);
+    runtime
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {
     tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.expect("timeout waiting for event").expect("recv error")
 }
 
+async fn trigger_refresh_and_recv(
+    daemon: &Arc<InProcessDaemon>,
+    repo: &Path,
+    rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+) -> DaemonEvent {
+    daemon.refresh(repo).await.expect("refresh should succeed");
+    recv_event(rx).await
+}
+
 #[tokio::test]
 async fn daemon_broadcasts_snapshots() {
-    let (repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();
 
-    let event = recv_event(&mut rx).await;
+    let event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     match event {
         DaemonEvent::SnapshotFull(snap) => {
@@ -36,7 +100,7 @@ async fn daemon_broadcasts_snapshots() {
 
 #[tokio::test]
 async fn execute_broadcasts_lifecycle_events() {
-    let (repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();
 
     // Execute a command that goes through the spawned task path.
@@ -85,11 +149,11 @@ async fn execute_broadcasts_lifecycle_events() {
 
 #[tokio::test]
 async fn replay_since_returns_full_snapshot_for_unknown_seq() {
-    let (repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
 
     // Wait for at least one broadcast so the daemon has state
     let mut rx = daemon.subscribe();
-    let _ = recv_event(&mut rx).await;
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     // Request replay with a seq that won't be in the delta log
     let last_seen = HashMap::from([(repo.clone(), 999999)]);
@@ -106,11 +170,11 @@ async fn replay_since_returns_full_snapshot_for_unknown_seq() {
 
 #[tokio::test]
 async fn replay_since_returns_full_snapshot_for_new_repo() {
-    let (repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
 
     // Wait for at least one broadcast
     let mut rx = daemon.subscribe();
-    let _ = recv_event(&mut rx).await;
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     // Request replay with empty last_seen (new client)
     let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
@@ -126,11 +190,11 @@ async fn replay_since_returns_full_snapshot_for_new_repo() {
 
 #[tokio::test]
 async fn replay_since_returns_empty_when_up_to_date() {
-    let (repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
 
     // Wait for the first snapshot to get the current seq
     let mut rx = daemon.subscribe();
-    let event = recv_event(&mut rx).await;
+    let event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let current_seq = match event {
         DaemonEvent::SnapshotFull(snap) => snap.seq,
@@ -152,7 +216,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     std::fs::create_dir_all(&repo).unwrap();
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon = InProcessDaemon::new(vec![], config).await;
+    let daemon = InProcessDaemon::new(vec![], config, process_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
     daemon.add_repo(&repo).await.expect("add_repo should succeed");
@@ -197,11 +261,11 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
 
 #[tokio::test]
 async fn inline_issue_command_returns_zero_and_skips_lifecycle_events() {
-    let (repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();
 
     // Wait for initial snapshot event before issuing command.
-    let _ = recv_event(&mut rx).await;
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let command_id = daemon.execute(&repo, Command::ClearIssueSearch { repo: repo.clone() }).await.expect("inline command should succeed");
     assert_eq!(command_id, 0, "inline issue commands should return id=0");
@@ -225,7 +289,7 @@ async fn inline_issue_command_returns_zero_and_skips_lifecycle_events() {
 #[tokio::test]
 async fn execute_on_untracked_repo_returns_error_without_started_event() {
     let config = Arc::new(ConfigStore::new());
-    let daemon = InProcessDaemon::new(vec![], config).await;
+    let daemon = InProcessDaemon::new(vec![], config, process_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
@@ -248,10 +312,10 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
 #[tokio::test]
 async fn follower_mode_flag_is_stored() {
     let config = Arc::new(ConfigStore::new());
-    let leader = InProcessDaemon::new(vec![], config.clone()).await;
+    let leader = InProcessDaemon::new(vec![], config.clone(), process_discovery(false), HostName::local()).await;
     assert!(!leader.is_follower(), "default daemon should not be follower");
 
-    let follower = InProcessDaemon::new_with_options(vec![], config, true, HostName::local()).await;
+    let follower = InProcessDaemon::new(vec![], config, process_discovery(true), HostName::local()).await;
     assert!(follower.is_follower(), "follower daemon should report follower=true");
 }
 
@@ -263,7 +327,7 @@ async fn follower_mode_skips_external_providers() {
     std::fs::create_dir_all(repo.join(".git")).unwrap();
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon = InProcessDaemon::new_with_options(vec![repo.clone()], config, true, HostName::local()).await;
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, process_discovery(true), HostName::local()).await;
 
     assert!(daemon.is_follower());
 
@@ -290,7 +354,7 @@ async fn follower_mode_skips_external_providers() {
 #[tokio::test]
 async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
     let config = Arc::new(ConfigStore::new());
-    let daemon = InProcessDaemon::new(vec![], config).await;
+    let daemon = InProcessDaemon::new(vec![], config, process_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
@@ -321,7 +385,7 @@ async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
 #[tokio::test]
 async fn add_virtual_repo_is_idempotent() {
     let config = Arc::new(ConfigStore::new());
-    let daemon = InProcessDaemon::new(vec![], config).await;
+    let daemon = InProcessDaemon::new(vec![], config, process_discovery(false), HostName::local()).await;
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     daemon.add_virtual_repo(synthetic_path.clone(), ProviderData::default()).await.expect("first add should succeed");
@@ -335,9 +399,10 @@ async fn add_virtual_repo_is_idempotent() {
 
 #[tokio::test]
 async fn get_status_returns_repo_summaries() {
-    let (_repo, daemon) = daemon_for_cwd().await;
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let repo = daemon.list_repos().await.expect("list_repos").into_iter().next().expect("tracked repo").path;
     let mut rx = daemon.subscribe();
-    recv_event(&mut rx).await;
+    trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let status = daemon.get_status().await.expect("get_status failed");
     assert!(!status.repos.is_empty());
@@ -347,9 +412,9 @@ async fn get_status_returns_repo_summaries() {
 
 #[tokio::test]
 async fn get_repo_work_returns_work_items() {
-    let (repo, daemon) = daemon_for_cwd().await;
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();
-    recv_event(&mut rx).await;
+    trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
     let work = daemon.get_repo_work(repo_name).await.expect("get_repo_work failed");

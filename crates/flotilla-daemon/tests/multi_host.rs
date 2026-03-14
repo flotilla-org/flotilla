@@ -13,16 +13,63 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_core::{
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+    providers::{
+        ChannelLabel, CommandOutput, CommandRunner,
+        discovery::{DiscoveryRuntime, EnvVars},
+    },
+};
 use flotilla_daemon::peer::{
-    merge::merge_provider_data, test_support::handle_test_peer_data, HandleResult, PeerConnectionStatus, PeerManager, PeerSender,
-    PeerTransport,
+    HandleResult, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport, merge::merge_provider_data,
+    test_support::handle_test_peer_data,
 };
 use flotilla_protocol::{
     Checkout, GoodbyeReason, HostName, HostPath, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, VectorClock,
 };
 use indexmap::IndexMap;
 use tokio::sync::mpsc;
+
+#[derive(Default)]
+struct StaticEnvVars;
+
+impl EnvVars for StaticEnvVars {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+}
+
+struct FakeRunner;
+
+#[async_trait]
+impl CommandRunner for FakeRunner {
+    async fn run(&self, cmd: &str, args: &[&str], _cwd: &std::path::Path, _label: &ChannelLabel) -> Result<String, String> {
+        if cmd == "git" && args == ["--version"] {
+            return Ok("git version 2.43.0\n".into());
+        }
+        Err(format!("fake runner: no response for {cmd} {}", args.join(" ")))
+    }
+
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &std::path::Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+        match self.run(cmd, args, cwd, label).await {
+            Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
+            Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
+        }
+    }
+
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        false
+    }
+}
+
+fn test_discovery_runtime(follower: bool) -> DiscoveryRuntime {
+    let mut runtime = DiscoveryRuntime::for_process(follower);
+    runtime.runner = Arc::new(FakeRunner);
+    runtime.env = Arc::new(StaticEnvVars);
+    runtime
+}
 
 // ---------------------------------------------------------------------------
 // Mock transport
@@ -241,10 +288,11 @@ async fn daemon_snapshot_has_correct_host_attribution() {
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config).await;
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, test_discovery_runtime(false), HostName::local()).await;
 
-    // Wait for the first snapshot via the event stream
+    // Subscribe first, then trigger a refresh so the snapshot cannot race ahead.
     let mut rx = daemon.subscribe();
+    daemon.refresh(&repo).await.expect("refresh");
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             match rx.recv().await {
@@ -444,8 +492,8 @@ fn merge_preserves_local_service_data_with_peer_checkouts() {
 #[tokio::test]
 async fn delta_message_returns_needs_resync() {
     use flotilla_protocol::{
-        delta::{Branch, BranchStatus, EntryOp},
         Change,
+        delta::{Branch, BranchStatus, EntryOp},
     };
 
     let mut mgr = PeerManager::new(HostName::new("leader"));
@@ -483,7 +531,7 @@ async fn follower_mode_has_only_local_providers() {
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon = InProcessDaemon::new_with_options(vec![repo], config, true, HostName::local()).await;
+    let daemon = InProcessDaemon::new(vec![repo], config, test_discovery_runtime(true), HostName::local()).await;
 
     assert!(daemon.is_follower(), "daemon should be in follower mode");
 
