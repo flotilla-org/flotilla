@@ -29,7 +29,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     }
 
     execute!(stdout(), EnableMouseCapture)?;
-    let mut events = event::EventHandler::new(Duration::from_millis(250));
+    let mut events = event::EventHandler::new(Duration::from_millis(50));
     events.attach_daemon(daemon_rx);
 
     // Initial draw before entering the event loop
@@ -69,7 +69,12 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     }
                     _ => other_events.push(evt),
                 },
-                Event::Tick => {} // discard ticks
+                Event::Tick => {
+                    // Keep one tick to trigger a redraw when shimmer animation is active.
+                    if app.needs_animation() && !other_events.iter().any(|e| matches!(e, Event::Tick)) {
+                        other_events.push(evt);
+                    }
+                }
                 _ => other_events.push(evt),
             }
         }

@@ -4,6 +4,7 @@ pub mod event;
 pub mod event_log;
 pub mod run;
 pub use flotilla_client as socket;
+mod shimmer;
 pub mod splash;
 pub mod status_bar;
 pub mod ui;
