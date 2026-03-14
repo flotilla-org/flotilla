@@ -8,8 +8,82 @@ use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 use super::{ui_state::PendingActionContext, App, BranchInputKind, ClearDispatch, Intent, UiMode};
 use crate::status_bar::StatusBarAction;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    SelectNext,
+    SelectPrev,
+    Confirm,
+    Dismiss,
+    Quit,
+    Refresh,
+    PrevTab,
+    NextTab,
+    MoveTabLeft,
+    MoveTabRight,
+    ToggleHelp,
+    ToggleMultiSelect,
+    ToggleProviders,
+    ToggleDebug,
+    CycleHost,
+    CycleLayout,
+    OpenActionMenu,
+    OpenBranchInput,
+    OpenIssueSearch,
+    OpenFilePicker,
+    Dispatch(Intent),
+}
+
 impl App {
     // ── Key handling ──
+
+    fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
+        let is_text_entry_mode = matches!(
+            self.ui.mode,
+            UiMode::BranchInput { kind: BranchInputKind::Manual, .. } | UiMode::IssueSearch { .. } | UiMode::FilePicker { .. }
+        );
+
+        if is_text_entry_mode {
+            return match key.code {
+                KeyCode::Esc => Some(Action::Dismiss),
+                KeyCode::Enter => Some(Action::Confirm),
+                _ => None,
+            };
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
+            KeyCode::Enter => Some(Action::Confirm),
+            KeyCode::Esc => Some(Action::Dismiss),
+            KeyCode::Char('q') => match self.ui.mode {
+                UiMode::Normal => Some(Action::Quit),
+                UiMode::Help
+                | UiMode::Config
+                | UiMode::ActionMenu { .. }
+                | UiMode::DeleteConfirm { .. }
+                | UiMode::CloseConfirm { .. } => Some(Action::Dismiss),
+                UiMode::BranchInput { .. } | UiMode::IssueSearch { .. } | UiMode::FilePicker { .. } => None,
+            },
+            KeyCode::Char('r') => Some(Action::Refresh),
+            KeyCode::Char('[') => Some(Action::PrevTab),
+            KeyCode::Char(']') => Some(Action::NextTab),
+            KeyCode::Char('{') => Some(Action::MoveTabLeft),
+            KeyCode::Char('}') => Some(Action::MoveTabRight),
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Char(' ') => Some(Action::ToggleMultiSelect),
+            KeyCode::Char('h') => Some(Action::CycleHost),
+            KeyCode::Char('l') => Some(Action::CycleLayout),
+            KeyCode::Char('.') => Some(Action::OpenActionMenu),
+            KeyCode::Char('n') => Some(Action::OpenBranchInput),
+            KeyCode::Char('/') => Some(Action::OpenIssueSearch),
+            KeyCode::Char('a') => Some(Action::OpenFilePicker),
+            KeyCode::Char('c') => Some(Action::ToggleProviders),
+            KeyCode::Char('D') => Some(Action::ToggleDebug),
+            KeyCode::Char('d') => Some(Action::Dispatch(Intent::RemoveCheckout)),
+            KeyCode::Char('p') => Some(Action::Dispatch(Intent::OpenChangeRequest)),
+            _ => None,
+        }
+    }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('K')
@@ -598,6 +672,48 @@ mod tests {
     }
 
     // ── handle_key — top-level dispatch ──────────────────────────────
+
+    #[test]
+    fn resolve_action_maps_shared_navigation_keys() {
+        let app = stub_app();
+
+        assert_eq!(app.resolve_action(key(KeyCode::Char('j'))), Some(Action::SelectNext));
+        assert_eq!(app.resolve_action(key(KeyCode::Down)), Some(Action::SelectNext));
+        assert_eq!(app.resolve_action(key(KeyCode::Char('k'))), Some(Action::SelectPrev));
+        assert_eq!(app.resolve_action(key(KeyCode::Up)), Some(Action::SelectPrev));
+        assert_eq!(app.resolve_action(key(KeyCode::Enter)), Some(Action::Confirm));
+        assert_eq!(app.resolve_action(key(KeyCode::Esc)), Some(Action::Dismiss));
+        assert_eq!(app.resolve_action(key(KeyCode::Char('?'))), Some(Action::ToggleHelp));
+    }
+
+    #[test]
+    fn resolve_action_maps_domain_shortcuts_to_dispatch_intents() {
+        let app = stub_app();
+
+        assert_eq!(app.resolve_action(key(KeyCode::Char('d'))), Some(Action::Dispatch(Intent::RemoveCheckout)));
+        assert_eq!(app.resolve_action(key(KeyCode::Char('p'))), Some(Action::Dispatch(Intent::OpenChangeRequest)));
+    }
+
+    #[test]
+    fn resolve_action_maps_q_by_mode() {
+        let mut app = stub_app();
+
+        assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Quit));
+
+        app.ui.mode = UiMode::Config;
+        assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Dismiss));
+
+        app.ui.mode = UiMode::Help;
+        assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Dismiss));
+    }
+
+    #[test]
+    fn resolve_action_does_not_intercept_manual_branch_input_text() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+
+        assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), None);
+    }
 
     #[test]
     fn question_mark_toggles_help_from_normal() {
