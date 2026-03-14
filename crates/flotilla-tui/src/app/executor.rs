@@ -1,14 +1,21 @@
 use flotilla_protocol::{Command, CommandAction, CommandResult};
 use tracing::info;
 
-use super::{ui_state::UiMode, App};
+use super::{
+    ui_state::{PendingAction, PendingActionContext, PendingStatus, UiMode},
+    App,
+};
 
 /// Dispatch a single protocol command through the daemon.
 ///
 /// Most commands go through the shared `execute(command)` path and return a
 /// command ID immediately. Issue fetch/search commands are spawned in the
 /// background because they may do network I/O inline before returning.
-pub async fn dispatch(cmd: Command, app: &mut App) {
+///
+/// When `pending_ctx` is provided the successful command ID is recorded as a
+/// [`PendingAction`] on the active repo's UI state so the renderer can show
+/// an in-flight indicator on the affected work item row.
+pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>) {
     app.model.status_message = None;
 
     let background_issue_command = matches!(
@@ -28,7 +35,17 @@ pub async fn dispatch(cmd: Command, app: &mut App) {
     }
 
     match app.daemon.execute(cmd).await {
-        Ok(_command_id) => {}
+        Ok(command_id) => {
+            if let Some(ctx) = pending_ctx {
+                if let Some(rui) = app.ui.repo_ui.get_mut(&ctx.repo_path) {
+                    rui.pending_actions.insert(ctx.identity, PendingAction {
+                        command_id,
+                        status: PendingStatus::InFlight,
+                        description: ctx.description,
+                    });
+                }
+            }
+        }
         Err(e) => {
             // Reset loading modes so the error message is visible.
             reset_loading_mode(app);

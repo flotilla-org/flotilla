@@ -333,7 +333,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
 
         // Should have pushed an AddRepo command
-        let cmd = app.proto_commands.take_next().expect("expected a command");
+        let (cmd, _) = app.proto_commands.take_next().expect("expected a command");
         match cmd {
             Command { action: CommandAction::AddRepo { path }, .. } => {
                 let canonical = std::fs::canonicalize(&repo_dir).unwrap();

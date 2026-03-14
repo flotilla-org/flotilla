@@ -5,7 +5,7 @@ use flotilla_core::data::{GroupEntry, SectionHeader};
 use flotilla_protocol::{ProviderData, WorkItem};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
     Frame,
@@ -14,12 +14,13 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        collect_visible_status_items, BranchInputKind, InFlightCommand, PeerHostStatus, PeerStatus, ProviderStatus, RepoViewLayout, TabId,
-        TuiModel, UiMode, UiState,
+        collect_visible_status_items,
+        ui_state::{PendingAction, PendingStatus},
+        BranchInputKind, InFlightCommand, PeerHostStatus, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
     segment_bar::{self, BarStyle},
-    shimmer::shimmer_spans,
+    shimmer::{shimmer_spans, Shimmer},
     status_bar::{
         KeyChip, StatusBarAction, StatusBarInput, StatusBarModel, StatusBarTarget, StatusSection, TaskSection, DEFAULT_STATUS_WIDTH_BUDGET,
     },
@@ -542,7 +543,9 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, a
                     build_header_row(header)
                 }
                 GroupEntry::Item(item) => {
-                    let mut row = build_item_row(item, &rm.providers, &col_widths, model.active_repo_root(), prev_source.as_deref());
+                    let pending = rui.pending_actions.get(&item.identity);
+                    let mut row =
+                        build_item_row(item, &rm.providers, &col_widths, model.active_repo_root(), prev_source.as_deref(), pending);
                     prev_source = item.source.clone();
                     if is_multi_selected {
                         row = row.style(Style::default().bg(Color::Indexed(236)));
@@ -614,6 +617,7 @@ fn build_item_row<'a>(
     col_widths: &[u16],
     repo_root: &Path,
     prev_source: Option<&str>,
+    pending: Option<&PendingAction>,
 ) -> Row<'a> {
     let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
     let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status);
@@ -678,6 +682,59 @@ fn build_item_row<'a>(
     } else {
         String::new()
     };
+
+    // Pending action rendering — column order must mirror the Row::new path below.
+    if let Some(pending) = pending {
+        match &pending.status {
+            PendingStatus::InFlight => {
+                let total_width: usize = col_widths.iter().map(|w| *w as usize).sum();
+                let shimmer = Shimmer::new(total_width);
+                let spinner = ui_helpers::spinner_char();
+
+                let mut offset: usize = 0;
+                let cells = vec![
+                    (format!(" {spinner}"), col_widths.first().copied().unwrap_or(3) as usize),
+                    (source_display.clone(), col_widths.get(1).copied().unwrap_or(8) as usize),
+                    (path_display.clone(), col_widths.get(2).copied().unwrap_or(14) as usize),
+                    (description.clone(), col_widths.get(3).copied().unwrap_or(15) as usize),
+                    (branch_display.clone(), col_widths.get(4).copied().unwrap_or(25) as usize),
+                    (wt_indicator.to_string(), col_widths.get(5).copied().unwrap_or(3) as usize),
+                    (ws_indicator.clone(), col_widths.get(6).copied().unwrap_or(3) as usize),
+                    (pr_display.clone(), col_widths.get(7).copied().unwrap_or(8) as usize),
+                    (session_display.clone(), col_widths.get(8).copied().unwrap_or(8) as usize),
+                    (issues_display.clone(), col_widths.get(9).copied().unwrap_or(8) as usize),
+                    (git_display.clone(), col_widths.get(10).copied().unwrap_or(5) as usize),
+                ];
+
+                let shimmer_cells: Vec<Cell> = cells
+                    .into_iter()
+                    .map(|(text, width)| {
+                        let spans = shimmer.spans(&text, offset);
+                        offset += width;
+                        Cell::from(Line::from(spans))
+                    })
+                    .collect();
+
+                return Row::new(shimmer_cells);
+            }
+            PendingStatus::Failed(_) => {
+                let error_style = Style::default().fg(Color::Red).add_modifier(Modifier::DIM);
+                return Row::new(vec![
+                    Cell::from(Span::styled(" \u{2717}", Style::default().fg(Color::Red))),
+                    Cell::from(Span::styled(source_display, error_style)),
+                    Cell::from(Span::styled(path_display, error_style)),
+                    Cell::from(Span::styled(description, error_style)),
+                    Cell::from(Span::styled(branch_display, error_style)),
+                    Cell::from(Span::styled(wt_indicator.to_string(), error_style)),
+                    Cell::from(Span::styled(ws_indicator, error_style)),
+                    Cell::from(Span::styled(pr_display, error_style)),
+                    Cell::from(Span::styled(session_display, error_style)),
+                    Cell::from(Span::styled(issues_display, error_style)),
+                    Cell::from(Span::styled(git_display, error_style)),
+                ]);
+            }
+        }
+    }
 
     Row::new(vec![
         Cell::from(Span::styled(format!(" {icon}"), Style::default().fg(icon_color))),
@@ -948,7 +1005,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
 }
 
 fn render_close_confirm(model: &TuiModel, ui: &UiState, frame: &mut Frame) {
-    let UiMode::CloseConfirm { ref id, ref title } = ui.mode else {
+    let UiMode::CloseConfirm { ref id, ref title, .. } = ui.mode else {
         return;
     };
 

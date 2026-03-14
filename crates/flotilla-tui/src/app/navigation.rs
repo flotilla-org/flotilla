@@ -366,9 +366,9 @@ mod tests {
         app.select_next(); // 0 -> 1
 
         // At this point next=1, 1+5=6 >= 6, so it should trigger
-        let cmd = app.proto_commands.take_next();
-        assert!(cmd.is_some(), "expected FetchMoreIssues command");
-        match cmd.unwrap() {
+        let entry = app.proto_commands.take_next();
+        assert!(entry.is_some(), "expected FetchMoreIssues command");
+        match entry.unwrap().0 {
             flotilla_protocol::Command {
                 action: flotilla_protocol::CommandAction::FetchMoreIssues { repo: cmd_repo, desired_count },
                 ..

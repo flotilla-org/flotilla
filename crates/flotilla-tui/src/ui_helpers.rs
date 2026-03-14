@@ -195,6 +195,14 @@ fn shorten_against_home(path: &Path) -> String {
     path.display().to_string()
 }
 
+const BRAILLE_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+
+pub fn spinner_char() -> char {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    BRAILLE_SPINNER[(ms / 100) as usize % BRAILLE_SPINNER.len()]
+}
+
 /// Return the workspace indicator: "" for 0, "●" for 1, count as string for >1.
 pub fn workspace_indicator(count: usize) -> String {
     match count {
@@ -400,6 +408,12 @@ mod tests {
         assert_eq!(workspace_indicator(1), "●");
         assert_eq!(workspace_indicator(2), "2");
         assert_eq!(workspace_indicator(10), "10");
+    }
+
+    #[test]
+    fn spinner_char_returns_valid_braille() {
+        let ch = spinner_char();
+        assert!(BRAILLE_SPINNER.contains(&ch));
     }
 
     #[test]

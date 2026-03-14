@@ -218,8 +218,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
 
         // ── Process queued commands ──
-        while let Some(cmd) = app.proto_commands.take_next() {
-            app::executor::dispatch(cmd, &mut app).await;
+        while let Some((cmd, pending_ctx)) = app.proto_commands.take_next() {
+            app::executor::dispatch(cmd, &mut app, pending_ctx).await;
         }
 
         // ── Draw once ──
