@@ -2225,7 +2225,7 @@ content:
 
         write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
 
-        // Single provider groups into one git config call — the runner consumed 1 response
+        assert_eq!(runner.remaining(), 0, "single provider should consume exactly 1 response");
     }
 
     #[tokio::test]
@@ -2235,7 +2235,7 @@ content:
 
         write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
 
-        // Two providers produce two git config calls — the runner consumed 2 responses
+        assert_eq!(runner.remaining(), 0, "two providers should consume exactly 2 responses");
     }
 
     #[tokio::test]
@@ -2243,16 +2243,18 @@ content:
         let runner = MockRunner::new(vec![Err("git config failed".to_string())]);
         let issue_ids = vec![("github".to_string(), "10".to_string())];
 
-        // Should not panic even though git config fails
         write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
+
+        assert_eq!(runner.remaining(), 0, "should still consume the response even on error");
     }
 
     #[tokio::test]
     async fn write_branch_issue_links_empty_is_noop() {
-        let runner = runner_ok();
+        let runner = MockRunner::new(vec![]);
 
-        // No issue ids means no git config calls, no responses consumed
         write_branch_issue_links(&repo_root(), "feat-x", &[], &runner).await;
+
+        assert_eq!(runner.remaining(), 0, "empty issue_ids should make zero calls");
     }
 
     // -----------------------------------------------------------------------

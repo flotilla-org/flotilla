@@ -369,6 +369,11 @@ pub(crate) mod testing {
         pub fn new(responses: Vec<Result<String, String>>) -> Self {
             Self { responses: std::sync::Mutex::new(responses.into()) }
         }
+
+        /// Returns the number of unconsumed canned responses.
+        pub fn remaining(&self) -> usize {
+            self.responses.lock().unwrap().len()
+        }
     }
 
     #[async_trait]
