@@ -14,8 +14,8 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoDetailResponse, RepoInfo, RepoLabels, RepoProvidersResponse,
-    RepoWorkResponse, Snapshot, SnapshotDelta, StatusResponse, WorkItem,
+    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels,
+    RepoProvidersResponse, RepoWorkResponse, Snapshot, SnapshotDelta, StatusResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
@@ -71,7 +71,7 @@ impl DaemonHandle for StubDaemon {
         Ok(())
     }
 
-    async fn replay_since(&self, _last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String> {
+    async fn replay_since(&self, _last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
         Ok(vec![])
     }
 
@@ -102,7 +102,7 @@ pub(crate) fn stub_app_with_repos(count: usize) -> App {
 }
 
 pub(crate) fn active_repo_path(app: &App) -> PathBuf {
-    app.model.repo_order[app.model.active_repo].clone()
+    app.model.active_repo_root().clone()
 }
 
 pub(crate) fn provider_error(category: &str, provider: &str, message: &str) -> ProviderError {
@@ -142,6 +142,7 @@ pub(crate) fn delta(repo: &Path, changes: Vec<Change>) -> SnapshotDelta {
 pub(crate) fn default_repo_model(labels: RepoLabels) -> TuiRepoModel {
     TuiRepoModel {
         identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
+        path: PathBuf::from("/tmp/test-repo"),
         providers: Arc::new(flotilla_protocol::ProviderData::default()),
         labels,
         provider_names: HashMap::new(),

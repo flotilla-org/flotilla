@@ -93,7 +93,8 @@ impl App {
             let repo = self.model.active_repo_root().clone();
             let issue_count = self.model.active().providers.issues.len();
             let desired = issue_count + 50;
-            if let Some(rm) = self.model.repos.get_mut(&repo) {
+            let repo_identity = self.model.active_repo_identity().clone();
+            if let Some(rm) = self.model.repos.get_mut(&repo_identity) {
                 rm.issue_fetch_pending = true;
             }
             self.proto_commands.push(self.command(flotilla_protocol::CommandAction::FetchMoreIssues { repo, desired_count: desired }));
@@ -373,7 +374,7 @@ mod tests {
                 action: flotilla_protocol::CommandAction::FetchMoreIssues { repo: cmd_repo, desired_count },
                 ..
             } => {
-                assert_eq!(cmd_repo, repo);
+                assert_eq!(cmd_repo, app.model.repos[&repo].path);
                 // providers.issues is empty (default), so desired = 0 + 50
                 assert_eq!(desired_count, 50);
             }

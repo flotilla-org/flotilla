@@ -953,18 +953,21 @@ mod tests {
             association_keys: checkout_issue_ids.iter().map(|id| AssociationKey::IssueRef("gh".into(), (*id).into())).collect(),
         });
 
-        app.model.repos.get_mut(&PathBuf::from("/tmp/test-repo")).unwrap().providers = Arc::new(providers);
+        let repo_identity = app.model.active_repo_identity().clone();
+        app.model.repos.get_mut(&repo_identity).unwrap().providers = Arc::new(providers);
 
         app
     }
 
     fn remote_only_app() -> App {
         let mut app = stub_app();
-        let old_path = PathBuf::from("/tmp/test-repo");
+        let old_identity = app.model.active_repo_identity().clone();
         let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
-        let old = app.model.repos.remove(&old_path).expect("default repo");
+        let old = app.model.repos.remove(&old_identity).expect("default repo");
+        let remote_identity = flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() };
         let model = TuiRepoModel {
-            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            identity: remote_identity.clone(),
+            path: synthetic_path.clone(),
             providers: old.providers,
             labels: old.labels,
             provider_names: old.provider_names,
@@ -976,8 +979,8 @@ mod tests {
             issue_fetch_pending: old.issue_fetch_pending,
             issue_initial_requested: old.issue_initial_requested,
         };
-        app.model.repo_order[0] = synthetic_path.clone();
-        app.model.repos.insert(synthetic_path, model);
+        app.model.repo_order[0] = remote_identity.clone();
+        app.model.repos.insert(remote_identity, model);
         app.model.my_host = Some(HostName::local());
         app
     }
@@ -1011,8 +1014,8 @@ mod tests {
             association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into()), AssociationKey::IssueRef("gh".into(), "20".into())],
         });
 
-        let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
-        app.model.repos.get_mut(&synthetic_path).expect("remote repo").providers = Arc::new(providers);
+        let repo_identity = app.model.active_repo_identity().clone();
+        app.model.repos.get_mut(&repo_identity).expect("remote repo").providers = Arc::new(providers);
         app
     }
 

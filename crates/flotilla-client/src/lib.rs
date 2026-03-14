@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, DaemonEvent, Message, RawResponse, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot,
-    StatusResponse,
+    Command, DaemonEvent, Message, RawResponse, ReplayCursor, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse,
+    RepoWorkResponse, Snapshot, StatusResponse,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -25,7 +25,7 @@ use tracing::{debug, error, warn};
 /// operations (no async work while holding the lock), and using a sync lock
 /// avoids the race where a spawned seq update hasn't run before the next delta
 /// arrives.
-type SeqMap = std::sync::RwLock<HashMap<PathBuf, u64>>;
+type SeqMap = std::sync::RwLock<HashMap<RepoIdentity, u64>>;
 
 /// RAII guard that removes a lock file when dropped.
 ///
@@ -78,7 +78,8 @@ impl SocketDaemon {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
 
@@ -382,6 +383,13 @@ async fn send_request(
     }
 }
 
+fn encode_replay_cursors(last_seen: &HashMap<RepoIdentity, u64>) -> Vec<ReplayCursor> {
+    last_seen
+        .iter()
+        .map(|(repo_identity, &seq)| ReplayCursor { repo_identity: repo_identity.clone(), seq })
+        .collect()
+}
+
 /// Handle a daemon event in the background reader: update local seq tracking,
 /// forward to TUI subscribers, and spawn gap recovery if needed.
 ///
@@ -391,7 +399,7 @@ async fn send_request(
 fn handle_event(
     event: DaemonEvent,
     local_seqs: &Arc<SeqMap>,
-    recovering: &Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>>,
+    recovering: &Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
     event_tx: &broadcast::Sender<DaemonEvent>,
     writer: &Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
     pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>>,
@@ -399,34 +407,26 @@ fn handle_event(
 ) {
     match &event {
         DaemonEvent::SnapshotFull(snap) => {
-            debug!(
-                repo = %snap.repo.display(),
-                seq = snap.seq,
-                "received full snapshot"
-            );
+            debug!(repo_identity = %snap.repo_identity, repo = %snap.repo.display(), seq = snap.seq, "received full snapshot");
             // Sync lock: update seq before dispatching event so a
             // quickly-following delta sees the correct local seq.
-            local_seqs.write().unwrap().insert(snap.repo.clone(), snap.seq);
+            local_seqs.write().unwrap().insert(snap.repo_identity.clone(), snap.seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::SnapshotDelta(delta) => {
             let repo = delta.repo.clone();
+            let repo_identity = delta.repo_identity.clone();
             let prev_seq = delta.prev_seq;
             let seq = delta.seq;
 
             // Check seq under sync lock, then spawn only if recovery needed.
-            let local_seq = local_seqs.read().unwrap().get(&repo).copied();
+            let local_seq = local_seqs.read().unwrap().get(&repo_identity).copied();
 
             match local_seq {
                 Some(ls) if prev_seq == ls => {
                     // Happy path: apply delta (sync lock, no spawn needed)
-                    local_seqs.write().unwrap().insert(repo.clone(), seq);
-                    debug!(
-                        repo = %repo.display(),
-                        %prev_seq,
-                        %seq,
-                        "applied delta"
-                    );
+                    local_seqs.write().unwrap().insert(repo_identity.clone(), seq);
+                    debug!(repo_identity = %repo_identity, repo = %repo.display(), %prev_seq, %seq, "applied delta");
                     let _ = event_tx.send(event);
                 }
                 _ => {
@@ -435,30 +435,18 @@ fn handle_event(
                     // re-processed after recovery completes (prevents permanent staleness
                     // when a live delta arrives during the recovery window).
                     let mut guard = recovering.lock().unwrap();
-                    if let Some(buf) = guard.get_mut(&repo) {
-                        debug!(
-                            repo = %repo.display(),
-                            %seq,
-                            "recovery in progress, buffering delta"
-                        );
+                    if let Some(buf) = guard.get_mut(&repo_identity) {
+                        debug!(repo_identity = %repo_identity, repo = %repo.display(), %seq, "recovery in progress, buffering delta");
                         buf.push(event);
                         return;
                     }
-                    guard.insert(repo.clone(), vec![event]);
+                    guard.insert(repo_identity.clone(), vec![event]);
                     drop(guard);
 
                     if let Some(ls) = local_seq {
-                        warn!(
-                            repo = %repo.display(),
-                            local_seq = ls,
-                            %prev_seq,
-                            "seq gap, requesting replay"
-                        );
+                        warn!(repo_identity = %repo_identity, repo = %repo.display(), local_seq = ls, %prev_seq, "seq gap, requesting replay");
                     } else {
-                        warn!(
-                            repo = %repo.display(),
-                            "received delta for unknown repo, requesting replay"
-                        );
+                        warn!(repo_identity = %repo_identity, repo = %repo.display(), "received delta for unknown repo, requesting replay");
                     }
 
                     let local_seqs = Arc::clone(local_seqs);
@@ -473,8 +461,8 @@ fn handle_event(
                         // Drain buffered deltas, discarding any that recovery
                         // already covered (their seq <= recovered local_seq).
                         // Only re-process deltas that are genuinely ahead.
-                        let buffered = recovering.lock().unwrap().remove(&repo).unwrap_or_default();
-                        let recovered_seq = local_seqs.read().unwrap().get(&repo).copied();
+                        let buffered = recovering.lock().unwrap().remove(&repo_identity).unwrap_or_default();
+                        let recovered_seq = local_seqs.read().unwrap().get(&repo_identity).copied();
                         for buffered_event in buffered {
                             let dominated = match &buffered_event {
                                 DaemonEvent::SnapshotDelta(d) => recovered_seq.is_some_and(|rs| d.seq <= rs),
@@ -490,9 +478,9 @@ fn handle_event(
                 }
             }
         }
-        DaemonEvent::RepoRemoved { path, .. } => {
+        DaemonEvent::RepoRemoved { repo_identity, .. } => {
             // Sync lock: evict before dispatching
-            local_seqs.write().unwrap().remove(path);
+            local_seqs.write().unwrap().remove(repo_identity);
             let _ = event_tx.send(event);
         }
         DaemonEvent::RepoAdded(_)
@@ -516,9 +504,10 @@ async fn recover_from_gap(
 ) {
     let last_seen = {
         let seqs = local_seqs.read().unwrap();
-        seqs.iter().map(|(path, &seq)| (path.clone(), seq)).collect::<HashMap<_, _>>()
+        seqs.iter().map(|(repo_identity, &seq)| (repo_identity.clone(), seq)).collect::<HashMap<_, _>>()
     };
 
+    let last_seen = encode_replay_cursors(&last_seen);
     let resp = send_request(writer, pending, next_id, "replay_since", serde_json::json!({ "last_seen": last_seen })).await;
 
     match resp {
@@ -532,15 +521,15 @@ async fn recover_from_gap(
                     for event in &events {
                         match event {
                             DaemonEvent::SnapshotFull(snap) => {
-                                let current = seqs.get(&snap.repo).copied().unwrap_or(0);
+                                let current = seqs.get(&snap.repo_identity).copied().unwrap_or(0);
                                 if snap.seq >= current {
-                                    seqs.insert(snap.repo.clone(), snap.seq);
+                                    seqs.insert(snap.repo_identity.clone(), snap.seq);
                                 }
                             }
                             DaemonEvent::SnapshotDelta(delta) => {
-                                let current = seqs.get(&delta.repo).copied().unwrap_or(0);
+                                let current = seqs.get(&delta.repo_identity).copied().unwrap_or(0);
                                 if delta.seq >= current {
-                                    seqs.insert(delta.repo.clone(), delta.seq);
+                                    seqs.insert(delta.repo_identity.clone(), delta.seq);
                                 }
                             }
                             _ => {}
@@ -604,7 +593,8 @@ impl DaemonHandle for SocketDaemon {
         resp.parse_empty()
     }
 
-    async fn replay_since(&self, last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String> {
+    async fn replay_since(&self, last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
+        let last_seen = encode_replay_cursors(last_seen);
         let resp = self.request("replay_since", serde_json::json!({ "last_seen": last_seen })).await?;
         let events: Vec<DaemonEvent> = resp.parse()?;
 
@@ -615,10 +605,10 @@ impl DaemonHandle for SocketDaemon {
             for event in &events {
                 match event {
                     DaemonEvent::SnapshotFull(snap) => {
-                        seqs.insert(snap.repo.clone(), snap.seq);
+                        seqs.insert(snap.repo_identity.clone(), snap.seq);
                     }
                     DaemonEvent::SnapshotDelta(delta) => {
-                        seqs.insert(delta.repo.clone(), delta.seq);
+                        seqs.insert(delta.repo_identity.clone(), delta.seq);
                     }
                     _ => {}
                 }
@@ -839,7 +829,8 @@ mod tests {
     async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -866,16 +857,17 @@ mod tests {
         assert!(matches!(first, DaemonEvent::SnapshotFull(_)));
         let second = event_rx.recv().await.expect("event");
         assert!(matches!(second, DaemonEvent::SnapshotDelta(_)));
-        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&11));
+        assert_eq!(local_seqs.read().unwrap().get(&repo_identity()), Some(&11));
     }
 
     #[tokio::test]
     async fn handle_event_buffers_delta_when_recovery_already_running() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().unwrap().insert(repo.clone(), 1);
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        recovering.lock().unwrap().insert(repo.clone(), vec![]);
+        local_seqs.write().unwrap().insert(repo_identity(), 1);
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        recovering.lock().unwrap().insert(repo_identity(), vec![]);
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -889,7 +881,7 @@ mod tests {
             &next_id,
         );
 
-        let buffered = recovering.lock().unwrap().get(&repo).cloned().expect("buffer exists");
+        let buffered = recovering.lock().unwrap().get(&repo_identity()).cloned().expect("buffer exists");
         assert_eq!(buffered.len(), 1);
         assert!(event_rx.try_recv().is_err(), "buffered delta should not dispatch");
     }
@@ -898,7 +890,7 @@ mod tests {
     async fn recover_from_gap_requests_replay_and_applies_seqs() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().unwrap().insert(repo.clone(), 3);
+        local_seqs.write().unwrap().insert(repo_identity(), 3);
         let (event_tx, mut event_rx) = broadcast::channel(16);
 
         let mut harness = request_harness();
@@ -923,7 +915,7 @@ mod tests {
 
         let event = event_rx.recv().await.expect("forwarded replay event");
         assert!(matches!(event, DaemonEvent::SnapshotDelta(_)));
-        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&4));
+        assert_eq!(local_seqs.read().unwrap().get(&repo_identity()), Some(&4));
     }
 
     #[test]
@@ -963,7 +955,8 @@ mod tests {
     async fn handle_event_starts_recovery_for_unknown_repo_delta() {
         let repo = PathBuf::from("/tmp/unknown-repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, _event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -980,7 +973,7 @@ mod tests {
 
         // Recovery should have been initiated: repo should appear in recovering map.
         let guard = recovering.lock().expect("recovering mutex not poisoned");
-        assert!(guard.contains_key(&repo), "unknown repo delta should start recovery");
+        assert!(guard.contains_key(&repo_identity()), "unknown repo delta should start recovery");
     }
 
     // --- Gap detection: delta with seq gap triggers recovery ---
@@ -989,8 +982,9 @@ mod tests {
     async fn handle_event_starts_recovery_on_seq_gap() {
         let repo = PathBuf::from("/tmp/gap-repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 5);
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 5);
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, _event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1006,9 +1000,9 @@ mod tests {
         );
 
         let guard = recovering.lock().expect("recovering mutex not poisoned");
-        assert!(guard.contains_key(&repo), "seq gap should start recovery");
+        assert!(guard.contains_key(&repo_identity()), "seq gap should start recovery");
         // The triggering delta should be buffered as the first entry.
-        let buffered = guard.get(&repo).expect("buffered events");
+        let buffered = guard.get(&repo_identity()).expect("buffered events");
         assert_eq!(buffered.len(), 1);
     }
 
@@ -1017,7 +1011,8 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_repo_added() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1039,7 +1034,8 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_command_started() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1066,7 +1062,8 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_command_finished() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1093,7 +1090,8 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_command_step_update() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1123,7 +1121,8 @@ mod tests {
     #[tokio::test]
     async fn handle_event_forwards_peer_status_changed() {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1150,8 +1149,9 @@ mod tests {
     async fn handle_event_repo_removed_evicts_seq_and_forwards() {
         let repo = PathBuf::from("/tmp/removed-repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 42);
-        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 42);
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let (writer, pending, next_id, _server) = event_harness();
 
@@ -1166,7 +1166,7 @@ mod tests {
         );
 
         // Seq should be evicted.
-        assert!(local_seqs.read().expect("local_seqs read lock").get(&repo).is_none(), "seq should be evicted for removed repo");
+        assert!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()).is_none(), "seq should be evicted for removed repo");
         // Event should be forwarded.
         let event = event_rx.try_recv().expect("should receive RepoRemoved");
         assert!(matches!(event, DaemonEvent::RepoRemoved { .. }));
@@ -1176,9 +1176,8 @@ mod tests {
 
     #[tokio::test]
     async fn recover_from_gap_handles_parse_error_gracefully() {
-        let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 3);
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 3);
         let (event_tx, _event_rx) = broadcast::channel(16);
 
         let mut harness = request_harness();
@@ -1202,16 +1201,15 @@ mod tests {
         // Should complete without panic.
         recover_task.await.expect("recover_from_gap should not panic on parse error");
         // Local seqs should remain unchanged.
-        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo), Some(&3));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&3));
     }
 
     // --- recover_from_gap: request write failure ---
 
     #[tokio::test]
     async fn recover_from_gap_handles_request_failure_gracefully() {
-        let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 5);
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 5);
         let (event_tx, _event_rx) = broadcast::channel(16);
 
         let (writer, pending, next_id) = broken_request_harness();
@@ -1219,16 +1217,15 @@ mod tests {
         // recover_from_gap should complete without panic even when the request fails.
         recover_from_gap(&local_seqs, &event_tx, &writer, &pending, &next_id).await;
         // Local seqs should remain unchanged.
-        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo), Some(&5));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&5));
     }
 
     // --- recover_from_gap: response with ok=false ---
 
     #[tokio::test]
     async fn recover_from_gap_handles_error_response_gracefully() {
-        let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 7);
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 7);
         let (event_tx, _event_rx) = broadcast::channel(16);
 
         let mut harness = request_harness();
@@ -1250,7 +1247,7 @@ mod tests {
         tx.send(RawResponse { ok: false, data: None, error: Some("internal error".into()) }).expect("send error response");
 
         recover_task.await.expect("recover_from_gap should not panic on error response");
-        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo), Some(&7));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&7));
     }
 
     // --- recover_from_gap: replay with SnapshotFull updates seqs ---
@@ -1259,7 +1256,7 @@ mod tests {
     async fn recover_from_gap_applies_full_snapshot_seqs() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 2);
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 2);
         let (event_tx, mut event_rx) = broadcast::channel(16);
 
         let mut harness = request_harness();
@@ -1286,7 +1283,7 @@ mod tests {
 
         let event = event_rx.recv().await.expect("forwarded replay event");
         assert!(matches!(event, DaemonEvent::SnapshotFull(_)));
-        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo), Some(&10));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&10));
     }
 
     // --- recover_from_gap: monotonic seq update (live event advances while replay in flight) ---
@@ -1295,7 +1292,7 @@ mod tests {
     async fn recover_from_gap_does_not_regress_seq_from_concurrent_live_update() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 3);
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 3);
         let (event_tx, _event_rx) = broadcast::channel(16);
 
         let mut harness = request_harness();
@@ -1305,10 +1302,10 @@ mod tests {
         let recover_writer = Arc::clone(&harness.writer);
         let recover_pending = Arc::clone(&harness.pending);
         let recover_next_id = Arc::clone(&harness.next_id);
-        let repo_clone = repo.clone();
+        let identity = repo_identity();
         let recover_task = tokio::spawn(async move {
             // Set seq high before recovery starts to validate the monotonic guard.
-            recover_local_seqs.write().expect("local_seqs write lock").insert(repo_clone, 20);
+            recover_local_seqs.write().expect("local_seqs write lock").insert(identity, 20);
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
@@ -1323,7 +1320,7 @@ mod tests {
         recover_task.await.expect("join recover");
 
         // Seq should not regress: should remain at 20 (the higher value).
-        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo), Some(&20));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&20));
     }
 
     // --- recover_from_gap: replay with non-snapshot events (e.g. CommandStarted) ---
@@ -1332,7 +1329,7 @@ mod tests {
     async fn recover_from_gap_forwards_non_snapshot_replay_events() {
         let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 1);
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 1);
         let (event_tx, mut event_rx) = broadcast::channel(16);
 
         let mut harness = request_harness();
@@ -1365,16 +1362,15 @@ mod tests {
         let event = event_rx.recv().await.expect("should receive non-snapshot replay event");
         assert!(matches!(event, DaemonEvent::CommandStarted { command_id: 99, .. }));
         // Seq should be unchanged since CommandStarted doesn't carry a seq.
-        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo), Some(&1));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&1));
     }
 
     // --- recover_from_gap: empty replay events ---
 
     #[tokio::test]
     async fn recover_from_gap_handles_empty_replay() {
-        let repo = PathBuf::from("/tmp/repo");
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        local_seqs.write().expect("local_seqs write lock").insert(repo.clone(), 5);
+        local_seqs.write().expect("local_seqs write lock").insert(repo_identity(), 5);
         let (event_tx, mut event_rx) = broadcast::channel(16);
 
         let mut harness = request_harness();
@@ -1401,7 +1397,7 @@ mod tests {
         // No events forwarded.
         assert!(event_rx.try_recv().is_err(), "no events should be forwarded for empty replay");
         // Seq unchanged.
-        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo), Some(&5));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&5));
     }
 
     // --- RawResponse parse error paths ---

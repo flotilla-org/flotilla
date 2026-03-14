@@ -2,8 +2,8 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use flotilla_core::data::{group_work_items, SectionLabels};
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, ProviderData, RepoLabels,
-    SessionStatus, WorkItem,
+    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, ProviderData, RepoIdentity,
+    RepoLabels, SessionStatus, WorkItem,
 };
 // Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
 pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
@@ -15,6 +15,10 @@ use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
+
+fn repo_identity(name: &str) -> RepoIdentity {
+    RepoIdentity { authority: "local".into(), path: format!("/test/{name}") }
+}
 
 pub struct TestHarness {
     pub model: TuiModel,
@@ -80,8 +84,8 @@ impl TestHarness {
 
     /// Set provider names for a repo so the config screen can look up statuses.
     pub fn with_provider_names(mut self, repo: &str, names: Vec<(&str, &str)>) -> Self {
-        let path = PathBuf::from(format!("/test/{repo}"));
-        let rm = self.model.repos.get_mut(&path).unwrap();
+        let repo_identity = repo_identity(repo);
+        let rm = self.model.repos.get_mut(&repo_identity).unwrap();
         for (category, name) in names {
             rm.provider_names.entry(category.to_string()).or_default().push(name.to_string());
         }
@@ -90,15 +94,15 @@ impl TestHarness {
 
     /// Set a provider status for a repo.
     pub fn with_provider_status(mut self, repo: &str, category: &str, provider: &str, status: ProviderStatus) -> Self {
-        let path = PathBuf::from(format!("/test/{repo}"));
-        self.model.provider_statuses.insert((path, category.to_string(), provider.to_string()), status);
+        let repo_identity = repo_identity(repo);
+        self.model.provider_statuses.insert((repo_identity, category.to_string(), provider.to_string()), status);
         self
     }
 
     /// Set provider data and work items for the active (first) repo.
     pub fn with_provider_data(mut self, providers: ProviderData, items: Vec<WorkItem>) -> Self {
-        let path = self.model.repo_order[0].clone();
-        let rm = self.model.repos.get_mut(&path).unwrap();
+        let repo_identity = self.model.repo_order[0].clone();
+        let rm = self.model.repos.get_mut(&repo_identity).unwrap();
         rm.providers = Arc::new(providers);
 
         let section_labels = SectionLabels {
@@ -107,9 +111,9 @@ impl TestHarness {
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.cloud_agents.section.clone(),
         };
-        let table_view = group_work_items(&items, &rm.providers, &section_labels, &path);
+        let table_view = group_work_items(&items, &rm.providers, &section_labels, &rm.path);
 
-        let rui = self.ui.repo_ui.get_mut(&path).unwrap();
+        let rui = self.ui.repo_ui.get_mut(&repo_identity).unwrap();
         rui.update_table_view(table_view);
         self
     }

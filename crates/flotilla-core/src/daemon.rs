@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    Command, DaemonEvent, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse,
+    Command, DaemonEvent, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot,
+    StatusResponse,
 };
 use tokio::sync::broadcast;
 
@@ -46,7 +47,7 @@ pub trait DaemonHandle: Send + Sync {
     /// - If not replayable (seq too old or unknown): returns `SnapshotFull`
     ///
     /// Repos not in `last_seen` get a `SnapshotFull`.
-    async fn replay_since(&self, last_seen: &HashMap<PathBuf, u64>) -> Result<Vec<DaemonEvent>, String>;
+    async fn replay_since(&self, last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String>;
 
     /// High-level status: repos, health, counts.
     async fn get_status(&self) -> Result<StatusResponse, String>;

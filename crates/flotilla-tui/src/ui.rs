@@ -124,10 +124,10 @@ fn render_tab_bar(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
     tab_ids.push(TabId::Flotilla);
 
     // Repo tabs
-    for (i, path) in model.repo_order.iter().enumerate() {
-        let rm = &model.repos[path];
-        let rui = &ui.repo_ui[path];
-        let name = TuiModel::repo_name(path);
+    for (i, repo_identity) in model.repo_order.iter().enumerate() {
+        let rm = &model.repos[repo_identity];
+        let rui = &ui.repo_ui[repo_identity];
+        let name = TuiModel::repo_name(&rm.path);
         let is_active = !ui.mode.is_config() && i == model.active_repo;
         let loading = if rm.loading { " ⟳" } else { "" };
         let changed = if rui.has_unseen_changes { "*" } else { "" };
@@ -399,7 +399,11 @@ fn status_bar_content(
 
 fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<(String, usize)> {
     let active_repo = &model.repo_order[model.active_repo];
-    let active_cmds: Vec<&str> = in_flight.values().filter(|cmd| &cmd.repo == active_repo).map(|cmd| cmd.description.as_str()).collect();
+    let active_cmds: Vec<&str> = in_flight
+        .values()
+        .filter(|cmd| &cmd.repo_identity == active_repo)
+        .map(|cmd| cmd.description.as_str())
+        .collect();
 
     if active_cmds.is_empty() {
         return None;
@@ -461,8 +465,8 @@ fn render_content(model: &TuiModel, ui: &mut UiState, frame: &mut Frame, area: R
 }
 
 fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, area: Rect) {
-    let path = &model.repo_order[model.active_repo];
-    let rm = &model.repos[path];
+    let repo_identity = &model.repo_order[model.active_repo];
+    let rm = &model.repos[repo_identity];
 
     let mut rows: Vec<Row> = Vec::new();
 
@@ -470,7 +474,7 @@ fn render_repo_providers(model: &TuiModel, _ui: &UiState, frame: &mut Frame, are
         if let Some(pnames) = rm.provider_names.get(key) {
             for (i, pname) in pnames.iter().enumerate() {
                 let label = if i == 0 { category } else { "" };
-                let status = model.provider_statuses.get(&(path.clone(), key.to_string(), pname.clone())).copied();
+                let status = model.provider_statuses.get(&(repo_identity.clone(), key.to_string(), pname.clone())).copied();
                 rows.push(provider_row(label, pname, status));
             }
         } else {
@@ -1211,13 +1215,13 @@ fn render_global_status(model: &TuiModel, frame: &mut Frame, area: Rect) {
     }
     let mut by_category: HashMap<&str, Vec<ProviderEntry>> = HashMap::new();
 
-    for path in &model.repo_order {
-        let rm = &model.repos[path];
+    for repo_identity in &model.repo_order {
+        let rm = &model.repos[repo_identity];
         for &(_, key) in &PROVIDER_CATEGORIES {
             if let Some(pnames) = rm.provider_names.get(key) {
                 let entries = by_category.entry(key).or_default();
                 for pname in pnames {
-                    let status = model.provider_statuses.get(&(path.clone(), key.to_string(), pname.clone())).copied();
+                    let status = model.provider_statuses.get(&(repo_identity.clone(), key.to_string(), pname.clone())).copied();
                     if let Some(existing) = entries.iter_mut().find(|e| e.name == *pname) {
                         // Worst-wins: Error beats Ok beats None.
                         existing.status = worse_status(existing.status, status);

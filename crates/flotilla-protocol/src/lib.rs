@@ -55,6 +55,12 @@ pub struct ConfigLabel(pub String);
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayCursor {
+    pub repo_identity: RepoIdentity,
+    pub seq: u64,
+}
+
 /// Top-level message envelope for the JSON protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -468,6 +474,15 @@ mod tests {
         let decoded: SnapshotDelta = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
         assert_eq!(decoded.repo, PathBuf::from("/tmp/repo"));
+    }
+
+    #[test]
+    fn replay_cursor_roundtrip_preserves_repo_identity() {
+        let cursor = ReplayCursor {
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            seq: 42,
+        };
+        test_helpers::assert_roundtrip(&cursor);
     }
 
     #[test]

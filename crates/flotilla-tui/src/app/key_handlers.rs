@@ -128,12 +128,12 @@ impl App {
             KeyCode::Char(']') => self.next_tab(),
             KeyCode::Char('{') => {
                 if !self.ui.mode.is_config() && self.move_tab(-1) {
-                    self.config.save_tab_order(&self.model.repo_order);
+                    self.config.save_tab_order(&self.persisted_tab_order_paths());
                 }
             }
             KeyCode::Char('}') => {
                 if !self.ui.mode.is_config() && self.move_tab(1) {
-                    self.config.save_tab_order(&self.model.repo_order);
+                    self.config.save_tab_order(&self.persisted_tab_order_paths());
                 }
             }
             KeyCode::Char('/') => {
@@ -370,7 +370,7 @@ impl App {
             let pending_ctx = PendingActionContext {
                 identity: item.identity.clone(),
                 description: intent.label(self.model.active_labels()),
-                repo_path: self.model.active_repo_root().clone(),
+                repo_identity: self.model.active_repo_identity().clone(),
             };
             self.proto_commands.push_with_context(cmd, Some(pending_ctx));
         }
@@ -493,7 +493,7 @@ impl App {
                         let ctx = PendingActionContext {
                             identity: identity.clone(),
                             description: format!("Remove {}", info.branch),
-                            repo_path: self.model.active_repo_root().clone(),
+                            repo_identity: self.model.active_repo_identity().clone(),
                         };
                         self.proto_commands.push_with_context(
                             self.command(CommandAction::RemoveCheckout {
@@ -520,7 +520,7 @@ impl App {
                     let ctx = PendingActionContext {
                         identity: identity.clone(),
                         description: format!("Close {}", id),
-                        repo_path: self.model.active_repo_root().clone(),
+                        repo_identity: self.model.active_repo_identity().clone(),
                     };
                     self.proto_commands.push_with_context(command.clone(), Some(ctx));
                 }

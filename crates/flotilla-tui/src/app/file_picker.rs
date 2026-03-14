@@ -155,7 +155,7 @@ impl App {
                 }
                 let is_git_repo = path.join(".git").exists();
                 let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-                let is_added = model.repos.contains_key(&canonical);
+                let is_added = model.repos.values().any(|repo| repo.path == canonical);
                 entries.push(DirEntry { name, is_dir, is_git_repo, is_added });
             }
         }
@@ -544,7 +544,12 @@ mod tests {
 
         // Add the canonical path of repo_dir to model.repos so it's "already added"
         let canonical = std::fs::canonicalize(&repo_dir).unwrap();
-        app.model.repos.insert(canonical, default_repo_model(RepoLabels::default()));
+        let repo_identity = flotilla_protocol::RepoIdentity { authority: "local".into(), path: canonical.to_string_lossy().into_owned() };
+        let mut model = default_repo_model(RepoLabels::default());
+        model.identity = repo_identity.clone();
+        model.path = canonical.clone();
+        app.model.repos.insert(repo_identity.clone(), model);
+        app.model.repo_order[0] = repo_identity;
 
         let dir_path = format!("{}/", tmp.path().to_string_lossy());
         enter_file_picker(&mut app, &dir_path, vec![]);

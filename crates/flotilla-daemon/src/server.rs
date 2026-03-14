@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
     Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message,
-    PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, PROTOCOL_VERSION,
+    PeerConnectionState, PeerDataMessage, PeerWireMessage, ReplayCursor, RepoIdentity, RepoSelector, RoutedPeerMessage,
+    PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -1727,8 +1728,12 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
         }
 
         "replay_since" => {
-            let last_seen: std::collections::HashMap<std::path::PathBuf, u64> =
-                params.get("last_seen").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_else(|| {
+            let last_seen = params
+                .get("last_seen")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<ReplayCursor>>(v).ok())
+                .map(|entries| entries.into_iter().map(|entry| (entry.repo_identity, entry.seq)).collect())
+                .unwrap_or_else(|| {
                     warn!("replay_since: failed to parse last_seen, returning full snapshots");
                     std::collections::HashMap::new()
                 });

@@ -184,7 +184,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                         MouseEventKind::Up(MouseButton::Left) => {
                             if app.ui.drag.dragging_tab.take().is_some() {
                                 if app.ui.drag.active {
-                                    app.config.save_tab_order(&app.model.repo_order);
+                                    app.config.save_tab_order(&app.persisted_tab_order_paths());
                                 }
                                 app.ui.drag.active = false;
                             }

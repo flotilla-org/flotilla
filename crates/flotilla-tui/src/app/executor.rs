@@ -37,7 +37,7 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
     match app.daemon.execute(cmd).await {
         Ok(command_id) => {
             if let Some(ctx) = pending_ctx {
-                if let Some(rui) = app.ui.repo_ui.get_mut(&ctx.repo_path) {
+                if let Some(rui) = app.ui.repo_ui.get_mut(&ctx.repo_identity) {
                     rui.pending_actions.insert(ctx.identity, PendingAction {
                         command_id,
                         status: PendingStatus::InFlight,
@@ -91,8 +91,8 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
             info!(%branch, "removed checkout");
         }
         CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, commands } => {
-            if let Some(repo_path) = app.repo_path_for_identity(&repo_identity) {
-                app.proto_commands.push(app.repo_command_for_path(repo_path, CommandAction::CreateWorkspaceFromPreparedTerminal {
+            if app.repo_path_for_identity(&repo_identity).is_some() {
+                app.proto_commands.push(app.repo_command_for_identity(repo_identity, CommandAction::CreateWorkspaceFromPreparedTerminal {
                     target_host,
                     branch,
                     checkout_path,
@@ -180,6 +180,12 @@ mod tests {
         );
 
         let (cmd, _) = app.proto_commands.take_next().expect("queued workspace creation");
-        assert_eq!(cmd.context_repo, Some(flotilla_protocol::RepoSelector::Path(PathBuf::from("/tmp/repo-0"))));
+        assert_eq!(
+            cmd.context_repo,
+            Some(flotilla_protocol::RepoSelector::Identity(RepoIdentity {
+                authority: "local".into(),
+                path: "/tmp/repo-0".into(),
+            }))
+        );
     }
 }

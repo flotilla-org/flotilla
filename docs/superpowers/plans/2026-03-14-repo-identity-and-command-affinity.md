@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Re-key remote repo handling around `RepoIdentity`, fix cross-host routed repo resolution, and restore correct command affinity for provider-backed actions and async terminal preparation.
+**Goal:** Re-key remote repo handling around `RepoIdentity`, fix cross-host routed repo resolution, preserve multi-root local discovery for shared identities, and restore correct command affinity for provider-backed actions and async terminal preparation.
 
-**Architecture:** Introduce repo identity as the stable key across protocol, daemon state, client replay, and TUI tabs. Keep per-host paths as metadata for local execution and display, and tighten command routing so only genuinely execution-host-owned actions are sent remotely.
+**Architecture:** Introduce repo identity as the stable key across protocol, daemon state, client replay, and TUI tabs. Keep per-host paths and tracked local roots as daemon-local metadata for execution, discovery, and display, and tighten command routing so only genuinely execution-host-owned actions are sent remotely. Where one concrete local path is required, resolve an explicit preferred local instance instead of relying on last-writer-wins path maps.
 
 **Tech Stack:** Rust, Tokio, serde protocol types, existing `DaemonHandle` / socket client / in-process daemon, ratatui TUI state, multi-host daemon tests.
 
@@ -21,7 +21,7 @@
 - Modify: `crates/flotilla-core/src/daemon.rs`
   - Change replay bookkeeping trait signatures from path-keyed to identity-keyed.
 - Modify: `crates/flotilla-core/src/in_process.rs`
-  - Re-key daemon repo state, peer overlays, replay handling, and command resolution by `RepoIdentity`.
+  - Re-key daemon repo state, peer overlays, replay handling, and command resolution by `RepoIdentity` while preserving multiple tracked local roots per identity.
 - Modify: `crates/flotilla-core/src/executor.rs`
   - Preserve repo identity through terminal-prep results and local workspace follow-up.
 - Modify: `crates/flotilla-daemon/src/server.rs`
@@ -114,6 +114,7 @@ Cover:
 - `replay_since()` uses identity-keyed last-seen maps
 - `resolve_repo_for_command()` accepts `RepoSelector::Identity`
 - command lifecycle events report repo identity consistently
+- multiple tracked local clones with the same identity remain discoverable instead of collapsing to one stored path
 
 - [ ] **Step 2: Run targeted tests to verify failure**
 
@@ -124,9 +125,9 @@ Expected: FAIL because daemon/client traits and repo state are still path-keyed.
 
 Change:
 - `repos`, `repo_order`, and `peer_providers` to `RepoIdentity` keys
-- store daemon-local path inside `RepoState`
+- store all daemon-local roots inside `RepoState`, plus an explicit preferred execution instance when one path is required
 - make replay bookkeeping and event emission identity-based
-- keep path accessors for local execution and display
+- keep path accessors for local execution and display without reintroducing path-keyed indexing
 
 - [ ] **Step 4: Run targeted tests to verify pass**
 
@@ -243,6 +244,7 @@ Expected: FAIL because TUI state and in-flight tracking are still path-keyed.
 
 Update:
 - `TuiModel.repos`, `repo_order`, provider status maps, and `UiState.repo_ui` to use `RepoIdentity`
+- `TuiRepoModel` to preserve enough local-instance metadata for deterministic display when multiple local roots share one identity
 - `InFlightCommand` to store repo identity (and path only if still needed for display)
 - `handle_result()` to queue `CreateWorkspaceFromPreparedTerminal` against the originating identity
 
