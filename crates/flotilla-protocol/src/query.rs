@@ -63,7 +63,9 @@ pub struct ProviderInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnmetRequirementInfo {
     pub factory: String,
-    pub requirement: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 // --- repo work ---
@@ -73,4 +75,33 @@ pub struct RepoWorkResponse {
     pub path: PathBuf,
     pub slug: Option<String>,
     pub work_items: Vec<WorkItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::UnmetRequirementInfo;
+
+    #[test]
+    fn unmet_requirement_info_omits_none_value_when_serialized() {
+        let without_value = UnmetRequirementInfo { factory: "git".into(), kind: "no_vcs_checkout".into(), value: None };
+        let with_value = UnmetRequirementInfo { factory: "github".into(), kind: "missing_binary".into(), value: Some("gh".into()) };
+
+        assert_eq!(
+            serde_json::to_value(&without_value).expect("serialize without value"),
+            json!({
+                "factory": "git",
+                "kind": "no_vcs_checkout"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&with_value).expect("serialize with value"),
+            json!({
+                "factory": "github",
+                "kind": "missing_binary",
+                "value": "gh"
+            })
+        );
+    }
 }

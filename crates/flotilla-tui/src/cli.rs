@@ -226,7 +226,10 @@ fn format_repo_providers_human(resp: &RepoProvidersResponse) -> String {
     if !resp.unmet_requirements.is_empty() {
         out.push_str("\nUnmet Requirements:\n");
         for ur in &resp.unmet_requirements {
-            out.push_str(&format!("  {}: {}\n", ur.factory, ur.requirement));
+            match &ur.value {
+                Some(value) => out.push_str(&format!("  {}: {} ({value})\n", ur.factory, ur.kind)),
+                None => out.push_str(&format!("  {}: {}\n", ur.factory, ur.kind)),
+            }
         }
     }
     out
@@ -845,12 +848,15 @@ mod tests {
         #[test]
         fn with_unmet_requirements() {
             let mut resp = empty_response();
-            resp.unmet_requirements =
-                vec![UnmetRequirementInfo { factory: "GitHubCodeReview".into(), requirement: "gh CLI not found".into() }];
+            resp.unmet_requirements = vec![
+                UnmetRequirementInfo { factory: "GitHubCodeReview".into(), kind: "missing_binary".into(), value: Some("gh".into()) },
+                UnmetRequirementInfo { factory: "Git".into(), kind: "no_vcs_checkout".into(), value: None },
+            ];
             let output = format_repo_providers_human(&resp);
             assert!(output.contains("Unmet Requirements:"), "should show unmet requirements header");
             assert!(output.contains("GitHubCodeReview"), "should show factory name");
-            assert!(output.contains("gh CLI not found"), "should show requirement description");
+            assert!(output.contains("missing_binary (gh)"), "should show kind and value");
+            assert!(output.contains("no_vcs_checkout"), "should show kind without empty value");
         }
 
         #[test]
