@@ -85,6 +85,57 @@ impl App {
         }
     }
 
+    fn dispatch_action(&mut self, action: Action) {
+        match action {
+            Action::ToggleHelp => match self.ui.mode {
+                UiMode::Normal => self.ui.mode = UiMode::Help,
+                UiMode::Help => {
+                    self.ui.mode = UiMode::Normal;
+                    self.ui.help_scroll = 0;
+                }
+                _ => {}
+            },
+            Action::Dismiss => match self.ui.mode.focus_target() {
+                super::ui_state::FocusTarget::WorkItemTable => {
+                    // Cancellation takes priority over other dismiss actions while a command is running.
+                    if let Some(&command_id) = self.in_flight.keys().next() {
+                        self.pending_cancel = Some(command_id);
+                    } else if self.active_ui().active_search_query.is_some() {
+                        self.clear_active_issue_search(ClearDispatch::OnlyIfActive);
+                    } else if self.active_ui().show_providers {
+                        self.active_ui_mut().show_providers = false;
+                    } else if !self.active_ui().multi_selected.is_empty() {
+                        self.active_ui_mut().multi_selected.clear();
+                    } else {
+                        self.should_quit = true;
+                    }
+                }
+                super::ui_state::FocusTarget::EventLog => {
+                    self.ui.mode = UiMode::Normal;
+                }
+                super::ui_state::FocusTarget::HelpText => {
+                    self.ui.mode = UiMode::Normal;
+                    self.ui.help_scroll = 0;
+                }
+                super::ui_state::FocusTarget::ActionMenu
+                | super::ui_state::FocusTarget::BranchInput
+                | super::ui_state::FocusTarget::FilePickerList
+                | super::ui_state::FocusTarget::DeleteConfirmDialog
+                | super::ui_state::FocusTarget::CloseConfirmDialog => {
+                    self.ui.mode = UiMode::Normal;
+                }
+                super::ui_state::FocusTarget::IssueSearchInput => {
+                    self.clear_active_issue_search(ClearDispatch::Always);
+                    self.ui.mode = UiMode::Normal;
+                }
+            },
+            Action::Quit => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('K')
             && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -97,19 +148,10 @@ impl App {
             return;
         }
 
-        // Toggle help from Normal or Help modes
-        if key.code == KeyCode::Char('?') {
-            match self.ui.mode {
-                UiMode::Normal => {
-                    self.ui.mode = UiMode::Help;
-                    return;
-                }
-                UiMode::Help => {
-                    self.ui.mode = UiMode::Normal;
-                    self.ui.help_scroll = 0;
-                    return;
-                }
-                _ => {}
+        if let Some(action) = self.resolve_action(key) {
+            if matches!(action, Action::ToggleHelp | Action::Dismiss | Action::Quit) {
+                self.dispatch_action(action);
+                return;
             }
         }
 
@@ -758,19 +800,21 @@ mod tests {
     // ── handle_config_key ────────────────────────────────────────────
 
     #[test]
-    fn config_q_quits() {
+    fn config_q_dismisses_to_normal() {
         let mut app = stub_app();
         app.ui.mode = UiMode::Config;
         app.handle_key(key(KeyCode::Char('q')));
-        assert!(app.should_quit);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.should_quit);
     }
 
     #[test]
-    fn config_esc_quits() {
+    fn config_esc_dismisses_to_normal() {
         let mut app = stub_app();
         app.ui.mode = UiMode::Config;
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.should_quit);
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -844,6 +888,18 @@ mod tests {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn help_q_returns_to_normal_and_resets_scroll() {
+        let mut app = stub_app();
+        app.ui.mode = UiMode::Help;
+        app.ui.help_scroll = 7;
+
+        app.handle_key(key(KeyCode::Char('q')));
+
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.ui.help_scroll, 0);
     }
 
     #[test]
