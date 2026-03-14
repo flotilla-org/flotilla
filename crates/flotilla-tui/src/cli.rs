@@ -110,10 +110,11 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
         }
         DaemonEvent::PeerStatusChanged { host, status } => {
             let state = match status {
-                PeerConnectionState::Connected => "connected",
-                PeerConnectionState::Disconnected => "disconnected",
-                PeerConnectionState::Connecting => "connecting",
-                PeerConnectionState::Reconnecting => "reconnecting",
+                PeerConnectionState::Connected => "connected".to_string(),
+                PeerConnectionState::Disconnected => "disconnected".to_string(),
+                PeerConnectionState::Connecting => "connecting".to_string(),
+                PeerConnectionState::Reconnecting => "reconnecting".to_string(),
+                PeerConnectionState::Rejected { reason } => format!("rejected: {reason}"),
             };
             format!("[peer]     {host}: {state}")
         }
@@ -510,6 +511,7 @@ mod tests {
                 (PeerConnectionState::Disconnected, "disconnected"),
                 (PeerConnectionState::Connecting, "connecting"),
                 (PeerConnectionState::Reconnecting, "reconnecting"),
+                (PeerConnectionState::Rejected { reason: "protocol mismatch".to_string() }, "rejected"),
             ] {
                 let event = DaemonEvent::PeerStatusChanged { host: HostName::new("host-2"), status: state };
                 let line = format_event_human(&event);

@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use clap::Parser;
 use color_eyre::Result;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{output::OutputFormat, CheckoutSelector, CheckoutTarget, Command, CommandAction, RepoSelector};
+use flotilla_protocol::{output::OutputFormat, CheckoutSelector, CheckoutTarget, Command, CommandAction, HostName, RepoSelector};
 use flotilla_tui::{app, event_log};
 use tracing::info;
 
@@ -185,7 +185,19 @@ async fn run_tui(cli: Cli) -> Result<()> {
     let config_clone = Arc::clone(&config);
     let daemon_task = tokio::spawn(async move {
         let daemon: Result<Arc<dyn DaemonHandle>, String> = if embedded {
-            let d = InProcessDaemon::new(repo_roots, config_clone).await;
+            let daemon_config = config_clone.load_daemon_config();
+            let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
+            let d = InProcessDaemon::new_with_options(repo_roots, Arc::clone(&config_clone), daemon_config.follower, host_name).await;
+
+            match flotilla_daemon::peer_networking::PeerNetworkingTask::new(Arc::clone(&d), &config_clone) {
+                Ok((peer_networking, _peer_manager, _peer_data_tx)) => {
+                    let _ = peer_networking.spawn();
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "peer networking not started in embedded mode");
+                }
+            }
+
             Ok(d as Arc<dyn DaemonHandle>)
         } else {
             let socket_path = cli.socket_path();

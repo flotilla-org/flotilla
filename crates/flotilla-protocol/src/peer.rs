@@ -68,6 +68,8 @@ pub enum PeerWireMessage {
     Data(PeerDataMessage),
     Routed(RoutedPeerMessage),
     Goodbye { reason: GoodbyeReason },
+    Ping { timestamp: u64 },
+    Pong { timestamp: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +244,25 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(back.kind, PeerDataKind::RequestResync { since_seq: 5 }));
+    }
+
+    #[test]
+    fn ping_pong_roundtrip() {
+        let ping = PeerWireMessage::Ping { timestamp: 1234567890 };
+        let json = serde_json::to_string(&ping).expect("serialize ping");
+        let decoded: PeerWireMessage = serde_json::from_str(&json).expect("deserialize ping");
+        match decoded {
+            PeerWireMessage::Ping { timestamp } => assert_eq!(timestamp, 1234567890),
+            other => panic!("expected Ping, got {:?}", other),
+        }
+
+        let pong = PeerWireMessage::Pong { timestamp: 1234567890 };
+        let json = serde_json::to_string(&pong).expect("serialize pong");
+        let decoded: PeerWireMessage = serde_json::from_str(&json).expect("deserialize pong");
+        match decoded {
+            PeerWireMessage::Pong { timestamp } => assert_eq!(timestamp, 1234567890),
+            other => panic!("expected Pong, got {:?}", other),
+        }
     }
 
     #[test]

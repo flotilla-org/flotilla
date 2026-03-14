@@ -248,6 +248,27 @@ fn render_status_bar(model: &TuiModel, ui: &mut UiState, in_flight: &HashMap<u64
         x += status_width;
     }
 
+    // Show disconnected/reconnecting peers as a warning in the status bar
+    let problem_peers: Vec<&PeerHostStatus> = model.peer_hosts.iter().filter(|p| !matches!(p.status, PeerStatus::Connected)).collect();
+    if !problem_peers.is_empty() {
+        let names: Vec<String> = problem_peers
+            .iter()
+            .map(|p| {
+                let icon = match p.status {
+                    PeerStatus::Disconnected => "\u{25cb}", // ○
+                    PeerStatus::Connecting => "\u{25d0}",   // ◐
+                    PeerStatus::Reconnecting => "\u{25d0}", // ◐
+                    PeerStatus::Connected => "\u{25cf}",    // ● (shouldn't reach here)
+                    PeerStatus::Rejected => "\u{2717}",     // ✗
+                };
+                format!("{icon} {}", p.name)
+            })
+            .collect();
+        let msg = format!(" Hosts: {}", names.join("  "));
+        spans.push(Span::styled(msg, Style::default().fg(Color::Yellow).bg(Color::Black)));
+        x += names.iter().map(|n| n.len() + 2).sum::<usize>() + 8;
+    }
+
     if x < status_model.keys_start {
         spans.push(Span::styled(" ".repeat(status_model.keys_start - x), Style::default().fg(Color::White).bg(Color::Black)));
         x = status_model.keys_start;
@@ -1174,6 +1195,7 @@ fn render_hosts_status(frame: &mut Frame, area: Rect, hosts: &[PeerHostStatus]) 
                 PeerStatus::Disconnected => ("\u{25cb}", Style::default().fg(Color::Red)),
                 PeerStatus::Connecting => ("\u{25d0}", Style::default().fg(Color::Yellow)),
                 PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(Color::Yellow)),
+                PeerStatus::Rejected => ("\u{2717}", Style::default().fg(Color::Red)),
             };
             ListItem::new(Line::from(vec![Span::styled(format!("{icon} "), style), Span::raw(h.name.as_str())]))
         })

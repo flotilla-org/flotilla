@@ -17,10 +17,11 @@ where
     }
 
     for direction in [ConnectionDirection::Inbound, ConnectionDirection::Outbound] {
-        match mgr.activate_connection(
+        match mgr.activate_connection_with_session(
             origin.clone(),
             make_sender(),
             ConnectionMeta { direction, config_label: None, expected_peer: Some(origin.clone()), config_backed: false },
+            None,
         ) {
             ActivationResult::Accepted { generation, .. } => return generation,
             ActivationResult::Rejected { .. } => continue,

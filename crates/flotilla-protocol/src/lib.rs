@@ -48,7 +48,7 @@ pub use snapshot::{CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLab
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Top-level message envelope for the JSON protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,12 @@ pub enum Message {
     #[serde(rename = "event")]
     Event { event: Box<DaemonEvent> },
     #[serde(rename = "hello")]
-    Hello { protocol_version: u32, host_name: HostName },
+    Hello {
+        protocol_version: u32,
+        host_name: HostName,
+        #[serde(default = "uuid::Uuid::nil")]
+        session_id: uuid::Uuid,
+    },
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),
 }
@@ -157,12 +162,13 @@ pub enum DaemonEvent {
 }
 
 /// Peer connection state as seen by the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerConnectionState {
     Connected,
     Disconnected,
     Connecting,
     Reconnecting,
+    Rejected { reason: String },
 }
 
 /// A delta update for a repo snapshot.
@@ -425,7 +431,7 @@ mod tests {
 
     #[test]
     fn message_hello_roundtrip() {
-        let msg = Message::Hello { protocol_version: 1, host_name: HostName::new("desktop") };
+        let msg = Message::Hello { protocol_version: 2, host_name: HostName::new("desktop"), session_id: uuid::Uuid::nil() };
 
         test_helpers::assert_json_roundtrip(&msg);
     }

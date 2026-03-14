@@ -298,8 +298,11 @@ async fn relay_excludes_origin_and_sends_to_other_peers() {
     data.checkouts.insert(HostPath::new(HostName::new("follower-a"), "/home/dev/repo"), make_checkout("feature"));
     let msg = snapshot_msg("follower-a", 1, data);
 
-    // Relay should forward to b and c, but not back to a
-    mgr.relay(&HostName::new("follower-a"), &msg).await;
+    // prepare_relay should return targets for b and c, but not a
+    let targets = mgr.prepare_relay(&HostName::new("follower-a"), &msg);
+    for (name, sender, relayed_msg) in targets {
+        sender.send(PeerWireMessage::Data(relayed_msg)).await.unwrap_or_else(|e| panic!("send to {name} failed: {e}"));
+    }
 
     assert!(sent_a.lock().expect("lock").is_empty(), "origin (follower-a) should NOT receive relayed message");
     assert_eq!(sent_b.lock().expect("lock").len(), 1, "follower-b should receive exactly one relayed message");
@@ -326,7 +329,10 @@ async fn relay_excludes_self_even_if_registered_as_peer() {
     mgr.register_sender(HostName::new("follower"), other_sender);
 
     let msg = snapshot_msg("remote", 1, ProviderData::default());
-    mgr.relay(&HostName::new("remote"), &msg).await;
+    let targets = mgr.prepare_relay(&HostName::new("remote"), &msg);
+    for (name, sender, relayed_msg) in targets {
+        sender.send(PeerWireMessage::Data(relayed_msg)).await.unwrap_or_else(|e| panic!("send to {name} failed: {e}"));
+    }
 
     assert!(sent_self.lock().expect("lock").is_empty(), "self (leader) should NOT receive relayed message");
     assert_eq!(sent_other.lock().expect("lock").len(), 1, "follower should receive the relayed message");

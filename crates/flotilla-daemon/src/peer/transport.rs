@@ -29,4 +29,9 @@ pub trait PeerTransport: Send + Sync {
 
     /// Return a sender for outbound peer messages when the transport is connected.
     fn sender(&self) -> Option<Arc<dyn PeerSender>>;
+
+    /// Return the session ID received during the last handshake, if any.
+    fn remote_session_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
 }

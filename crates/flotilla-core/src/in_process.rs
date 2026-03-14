@@ -299,6 +299,9 @@ pub struct InProcessDaemon {
     factories: FactoryRegistry,
     /// The currently active step-based command, if any — for cancellation.
     active_command: Arc<Mutex<Option<ActiveCommand>>>,
+    /// Unique identity for this daemon instance, generated at startup.
+    /// Used in peer Hello handshake to detect remote daemon restarts.
+    session_id: uuid::Uuid,
 }
 
 impl InProcessDaemon {
@@ -390,6 +393,7 @@ impl InProcessDaemon {
             repo_detectors,
             factories,
             active_command: Arc::new(Mutex::new(None)),
+            session_id: uuid::Uuid::new_v4(),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -413,6 +417,14 @@ impl InProcessDaemon {
     /// Returns the host name for this daemon.
     pub fn host_name(&self) -> &HostName {
         &self.host_name
+    }
+
+    /// Returns the session ID for this daemon instance.
+    ///
+    /// Generated once at startup via `Uuid::new_v4()`. Used in peer Hello
+    /// handshake so peers can detect daemon restarts.
+    pub fn session_id(&self) -> uuid::Uuid {
+        self.session_id
     }
 
     /// Returns whether this daemon is running in follower mode.
@@ -1065,7 +1077,7 @@ impl InProcessDaemon {
             // Use try_write to avoid blocking; if contended, the replay
             // will use a slightly stale value — acceptable for display.
             if let Ok(mut map) = self.peer_status.try_write() {
-                map.insert(host.clone(), *status);
+                map.insert(host.clone(), status.clone());
             }
         }
         let _ = self.event_tx.send(event);
@@ -1506,7 +1518,7 @@ impl DaemonHandle for InProcessDaemon {
         // Include current peer status so late-subscribing clients see it
         let peer_status = self.peer_status.read().await;
         for (host, status) in peer_status.iter() {
-            events.push(DaemonEvent::PeerStatusChanged { host: host.clone(), status: *status });
+            events.push(DaemonEvent::PeerStatusChanged { host: host.clone(), status: status.clone() });
         }
 
         Ok(events)

@@ -66,6 +66,7 @@ pub struct ConnectionMeta {
 struct ActiveConnection {
     generation: u64,
     meta: ConnectionMeta,
+    session_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +289,11 @@ impl PeerManager {
         self.active_connections.get(name).map(|active| active.generation)
     }
 
+    /// Return the session ID for a connected peer, if known.
+    pub fn peer_session_id(&self, host: &HostName) -> Option<uuid::Uuid> {
+        self.active_connections.get(host).and_then(|active| active.session_id)
+    }
+
     pub fn reconnect_suppressed_until(&mut self, name: &HostName) -> Option<Instant> {
         match self.reconnect_suppressed_until.get(name).copied() {
             Some(deadline) if deadline > Instant::now() => Some(deadline),
@@ -412,6 +418,16 @@ impl PeerManager {
     }
 
     pub fn activate_connection(&mut self, host: HostName, sender: Arc<dyn PeerSender>, meta: ConnectionMeta) -> ActivationResult {
+        self.activate_connection_with_session(host, sender, meta, None)
+    }
+
+    pub fn activate_connection_with_session(
+        &mut self,
+        host: HostName,
+        sender: Arc<dyn PeerSender>,
+        meta: ConnectionMeta,
+        session_id: Option<uuid::Uuid>,
+    ) -> ActivationResult {
         let displaced = if let Some(active) = self.active_connections.get(&host) {
             if !self.should_accept_candidate(&host, active, &meta) {
                 return ActivationResult::Rejected { reason: GoodbyeReason::Superseded };
@@ -429,7 +445,7 @@ impl PeerManager {
             }
         }
         self.senders.insert(host.clone(), sender);
-        self.active_connections.insert(host.clone(), ActiveConnection { generation, meta: meta.clone() });
+        self.active_connections.insert(host.clone(), ActiveConnection { generation, meta: meta.clone(), session_id });
         self.install_direct_route(&host, generation);
 
         if let Some(label) = meta.config_label {
@@ -518,6 +534,7 @@ impl PeerManager {
                     HandleResult::ReconnectSuppressed { peer: env.connection_peer }
                 }
             },
+            PeerWireMessage::Ping { .. } | PeerWireMessage::Pong { .. } => HandleResult::Ignored,
         }
     }
 
@@ -766,6 +783,22 @@ impl PeerManager {
         &self.peer_data
     }
 
+    /// Snapshot relay targets without performing any async sends.
+    ///
+    /// Returns a list of `(target, sender, stamped message)` tuples for peers
+    /// that should receive the relayed message. The caller sends concurrently
+    /// outside the PeerManager lock, eliminating head-of-line blocking.
+    pub fn prepare_relay(&self, origin: &HostName, msg: &PeerDataMessage) -> Vec<(HostName, Arc<dyn PeerSender>, PeerDataMessage)> {
+        let mut relayed_msg = msg.clone();
+        relayed_msg.clock.tick(&self.local_host);
+
+        self.senders
+            .iter()
+            .filter(|(name, _)| *name != origin && *name != &self.local_host && msg.clock.get(name) == 0)
+            .map(|(name, sender)| (name.clone(), Arc::clone(sender), relayed_msg.clone()))
+            .collect()
+    }
+
     /// Connect all registered peer transports and return inbound receivers.
     ///
     /// For each successfully connected peer, calls `subscribe()` to obtain the
@@ -780,7 +813,8 @@ impl PeerManager {
                     Ok(()) => {
                         let sender = transport.sender();
                         let subscribe_result = transport.subscribe().await;
-                        Ok((sender, subscribe_result))
+                        let remote_session_id = transport.remote_session_id();
+                        Ok((sender, subscribe_result, remote_session_id))
                     }
                     Err(e) => Err(e),
                 }
@@ -789,11 +823,11 @@ impl PeerManager {
             };
 
             match connect_result {
-                Ok((sender, subscribe_result)) => {
+                Ok((sender, subscribe_result, remote_session_id)) => {
                     info!(peer = %name, "peer transport connected");
                     let mut generation = 0;
                     if let Some(sender) = sender {
-                        let displaced = match self.activate_connection(
+                        let displaced = match self.activate_connection_with_session(
                             name.clone(),
                             sender,
                             ConnectionMeta {
@@ -802,6 +836,7 @@ impl PeerManager {
                                 expected_peer: Some(name.clone()),
                                 config_backed: true,
                             },
+                            remote_session_id,
                         ) {
                             ActivationResult::Accepted { generation: accepted, displaced: displaced_generation } => {
                                 generation = accepted;
@@ -955,7 +990,7 @@ impl PeerManager {
             return Err(format!("reconnect suppressed until {:?}", deadline));
         }
 
-        let (sender, rx) = {
+        let (sender, rx, remote_session_id) = {
             let transport = self.peers.get_mut(name).ok_or_else(|| format!("unknown peer: {name}"))?;
 
             // Best-effort disconnect before reconnecting
@@ -964,12 +999,13 @@ impl PeerManager {
             transport.connect().await?;
             let sender = transport.sender();
             let rx = transport.subscribe().await?;
-            (sender, rx)
+            let remote_session_id = transport.remote_session_id();
+            (sender, rx, remote_session_id)
         };
 
         let mut generation = 0;
         if let Some(sender) = sender {
-            let displaced = match self.activate_connection(
+            let displaced = match self.activate_connection_with_session(
                 name.clone(),
                 sender,
                 ConnectionMeta {
@@ -978,6 +1014,7 @@ impl PeerManager {
                     expected_peer: Some(name.clone()),
                     config_backed: true,
                 },
+                remote_session_id,
             ) {
                 ActivationResult::Accepted { generation: accepted, displaced: displaced_generation } => {
                     generation = accepted;
@@ -998,6 +1035,20 @@ impl PeerManager {
         }
 
         Ok((generation, rx))
+    }
+
+    /// Clear all stored peer data originating from a specific host.
+    ///
+    /// Used when a remote daemon restart is detected (session_id changed).
+    /// Unlike `disconnect_peer`, this does NOT tear down the connection.
+    pub fn clear_peer_data_for_restart(&mut self, origin: &HostName) -> Vec<RepoIdentity> {
+        let Some(repos) = self.peer_data.remove(origin) else {
+            return Vec::new();
+        };
+        let affected: Vec<RepoIdentity> = repos.keys().cloned().collect();
+        self.last_seen_clocks.retain(|(host, _), _| host != origin);
+        info!(peer = %origin, repo_count = affected.len(), "cleared stale peer data after restart");
+        affected
     }
 
     pub fn disconnect_peer(&mut self, name: &HostName, generation: u64) -> DisconnectPlan {
