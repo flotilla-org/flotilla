@@ -19,6 +19,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(cmux::CmuxDetector),
         Box::new(EnvVarDetector::new("TMUX")),
         Box::new(EnvVarDetector::new("ZELLIJ")),
+        Box::new(EnvVarDetector::new("ZELLIJ_SESSION_NAME")),
         Box::new(CommandDetector::new("zellij", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("shpool", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("gemini", &["--version"], parse_first_dotted_version)),
@@ -50,8 +51,12 @@ mod tests {
     #[tokio::test]
     async fn simple_env_var_detectors_are_table_driven() {
         let runner = DiscoveryMockRunner::builder().build();
-        let cases =
-            [("cursor-env", "CURSOR_API_KEY", "cursor-secret"), ("tmux", "TMUX", "/tmp/tmux.sock,123,0"), ("zellij-env", "ZELLIJ", "0")];
+        let cases = [
+            ("cursor-env", "CURSOR_API_KEY", "cursor-secret"),
+            ("tmux", "TMUX", "/tmp/tmux.sock,123,0"),
+            ("zellij-env", "ZELLIJ", "0"),
+            ("zellij-session", "ZELLIJ_SESSION_NAME", "my-session"),
+        ];
 
         for (_detector_name, key, value) in cases {
             let detector = EnvVarDetector::new(key);

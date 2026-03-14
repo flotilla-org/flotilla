@@ -417,6 +417,7 @@ impl App {
                         }
                         StepStatus::Failed { ref message } => {
                             tracing::warn!(%command_id, %description, error = %message, "step failed");
+                            self.set_status_message(Some(format!("{description}: {message}")));
                         }
                     }
                 }
@@ -1171,6 +1172,32 @@ mod tests {
 
         assert!(app.in_flight.contains_key(&99));
         assert_eq!(app.in_flight[&99].description, "test cmd");
+    }
+
+    #[test]
+    fn step_failure_surfaces_error_in_status_message() {
+        let mut app = stub_app();
+        let repo = app.model.repo_order[0].clone();
+
+        app.in_flight.insert(42, InFlightCommand {
+            repo_identity: app.model.active_repo_identity().clone(),
+            repo: repo.clone(),
+            description: "Creating checkout...".into(),
+        });
+
+        app.handle_daemon_event(DaemonEvent::CommandStepUpdate {
+            command_id: 42,
+            host: HostName::local(),
+            repo_identity: app.model.active_repo_identity().clone(),
+            repo,
+            step_index: 0,
+            step_count: 1,
+            description: "Create checkout for branch my-branch".into(),
+            status: StepStatus::Failed { message: "branch already exists: my-branch".into() },
+        });
+
+        let msg = app.model.status_message.as_deref().expect("status_message should be set");
+        assert!(msg.contains("branch already exists"), "expected error detail in status message, got: {msg}");
     }
 
     #[test]

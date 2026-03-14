@@ -2,14 +2,20 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tokio::sync::Semaphore;
+use tracing::{info, warn};
 
 use crate::providers::{run, types::*, CommandRunner};
+
+/// Timeout for individual `zellij action` calls.  If the Zellij server is
+/// deadlocked or unresponsive, we don't want to pile up blocked child processes
+/// forever.
+const ZELLIJ_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ZellijState {
@@ -28,25 +34,40 @@ pub struct ZellijWorkspaceManager {
     /// Optional override for the session name. When `None`, falls back to
     /// the `ZELLIJ_SESSION_NAME` environment variable.
     session_name_override: Option<String>,
+    /// Serialise all `zellij action` calls so we don't pile up child processes
+    /// when the server is slow or unresponsive.
+    action_semaphore: Semaphore,
 }
 
 impl ZellijWorkspaceManager {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner, session_name_override: None }
+        Self { runner, session_name_override: None, action_semaphore: Semaphore::new(1) }
     }
 
     /// Create a manager targeting a specific session name, avoiding the need
     /// to read `ZELLIJ_SESSION_NAME` from the process environment.
     pub fn with_session_name(runner: Arc<dyn CommandRunner>, session_name: String) -> Self {
-        Self { runner, session_name_override: Some(session_name) }
+        Self { runner, session_name_override: Some(session_name), action_semaphore: Semaphore::new(1) }
     }
 
     /// Run `zellij action <args>` and return stdout, or an error on failure.
+    ///
+    /// Serialised via a semaphore and wrapped in a timeout to prevent runaway
+    /// child processes when the Zellij server is unresponsive.
     async fn zellij_action(&self, args: &[&str]) -> Result<String, String> {
+        let _permit = self.action_semaphore.acquire().await.map_err(|_| "zellij action semaphore closed".to_string())?;
+
         let mut cmd_args = vec!["action"];
         cmd_args.extend_from_slice(args);
 
-        run!(self.runner, "zellij", &cmd_args, Path::new(".")).map(|s| s.trim().to_string())
+        let action_desc = args.first().copied().unwrap_or("unknown");
+        match tokio::time::timeout(ZELLIJ_ACTION_TIMEOUT, async { run!(self.runner, "zellij", &cmd_args, Path::new(".")) }).await {
+            Ok(result) => result.map(|s| s.trim().to_string()),
+            Err(_) => {
+                warn!(action = %action_desc, timeout_secs = ZELLIJ_ACTION_TIMEOUT.as_secs(), "zellij action timed out");
+                Err(format!("zellij action '{action_desc}' timed out after {}s", ZELLIJ_ACTION_TIMEOUT.as_secs()))
+            }
+        }
     }
 
     /// Check that `zellij --version` reports >= 0.40.

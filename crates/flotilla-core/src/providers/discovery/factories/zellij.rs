@@ -36,7 +36,11 @@ impl Factory for ZellijWorkspaceManagerFactory {
 
         ZellijWorkspaceManager::check_version(&*runner).await.map_err(|e| vec![UnmetRequirement::MissingBinary(e)])?;
 
-        Ok(Arc::new(ZellijWorkspaceManager::new(runner)))
+        let mgr = match env.find_env_var("ZELLIJ_SESSION_NAME") {
+            Some(name) => ZellijWorkspaceManager::with_session_name(runner, name.to_string()),
+            None => ZellijWorkspaceManager::new(runner),
+        };
+        Ok(Arc::new(mgr))
     }
 }
 
@@ -89,6 +93,18 @@ mod tests {
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Err("command not found".into())).build());
         let result = ZellijWorkspaceManagerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn zellij_factory_succeeds_with_session_name_env() {
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("ZELLIJ", "0"))
+            .with(EnvironmentAssertion::env_var("ZELLIJ_SESSION_NAME", "my-session"));
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let config = ConfigStore::with_base(dir.path());
+        let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.42.2".into())).build());
+        let result = ZellijWorkspaceManagerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        assert!(result.is_ok(), "factory should succeed when ZELLIJ_SESSION_NAME is set");
     }
 
     #[tokio::test]
