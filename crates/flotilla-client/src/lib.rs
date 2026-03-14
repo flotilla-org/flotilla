@@ -950,6 +950,490 @@ mod tests {
         assert!(waiter_result.is_none(), "waiter should return None after spawner releases lock");
         let _ = std::fs::remove_file(&lock_path);
     }
+
+    // --- Gap detection: delta for unknown repo triggers recovery ---
+
+    #[tokio::test]
+    async fn handle_event_starts_recovery_for_unknown_repo_delta() {
+        let repo = PathBuf::from("/tmp/unknown-repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        // Delta for a repo we have no local seq for — should start recovery.
+        handle_event(
+            DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 0, 1))),
+            &local_seqs,
+            &recovering,
+            &event_tx,
+            &writer,
+            &pending,
+            &next_id,
+        );
+
+        // Recovery should have been initiated: repo should appear in recovering map.
+        let guard = recovering.lock().unwrap();
+        assert!(guard.contains_key(&repo), "unknown repo delta should start recovery");
+    }
+
+    // --- Gap detection: delta with seq gap triggers recovery ---
+
+    #[tokio::test]
+    async fn handle_event_starts_recovery_on_seq_gap() {
+        let repo = PathBuf::from("/tmp/gap-repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 5);
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        // Delta with prev_seq=10 but local is 5 — gap.
+        handle_event(
+            DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 10, 11))),
+            &local_seqs,
+            &recovering,
+            &event_tx,
+            &writer,
+            &pending,
+            &next_id,
+        );
+
+        let guard = recovering.lock().unwrap();
+        assert!(guard.contains_key(&repo), "seq gap should start recovery");
+        // The triggering delta should be buffered as the first entry.
+        let buffered = guard.get(&repo).expect("buffered events");
+        assert_eq!(buffered.len(), 1);
+    }
+
+    // --- Non-snapshot events pass through unchanged ---
+
+    #[tokio::test]
+    async fn handle_event_forwards_repo_added() {
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        let repo_info = flotilla_protocol::RepoInfo {
+            path: PathBuf::from("/tmp/new-repo"),
+            name: "new-repo".into(),
+            labels: flotilla_protocol::RepoLabels::default(),
+            provider_names: HashMap::new(),
+            provider_health: HashMap::new(),
+            loading: false,
+        };
+        handle_event(DaemonEvent::RepoAdded(Box::new(repo_info)), &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
+
+        let event = event_rx.try_recv().expect("should receive RepoAdded");
+        assert!(matches!(event, DaemonEvent::RepoAdded(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_event_forwards_command_started() {
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        handle_event(
+            DaemonEvent::CommandStarted {
+                command_id: 42,
+                host: flotilla_protocol::HostName::new("test"),
+                repo: PathBuf::from("/tmp/repo"),
+                description: "testing".into(),
+            },
+            &local_seqs,
+            &recovering,
+            &event_tx,
+            &writer,
+            &pending,
+            &next_id,
+        );
+
+        let event = event_rx.try_recv().expect("should receive CommandStarted");
+        assert!(matches!(event, DaemonEvent::CommandStarted { command_id: 42, .. }));
+    }
+
+    #[tokio::test]
+    async fn handle_event_forwards_command_finished() {
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        handle_event(
+            DaemonEvent::CommandFinished {
+                command_id: 7,
+                host: flotilla_protocol::HostName::new("host"),
+                repo: PathBuf::from("/tmp/repo"),
+                result: flotilla_protocol::commands::CommandResult::Ok,
+            },
+            &local_seqs,
+            &recovering,
+            &event_tx,
+            &writer,
+            &pending,
+            &next_id,
+        );
+
+        let event = event_rx.try_recv().expect("should receive CommandFinished");
+        assert!(matches!(event, DaemonEvent::CommandFinished { command_id: 7, .. }));
+    }
+
+    #[tokio::test]
+    async fn handle_event_forwards_command_step_update() {
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        handle_event(
+            DaemonEvent::CommandStepUpdate {
+                command_id: 3,
+                host: flotilla_protocol::HostName::new("host"),
+                repo: PathBuf::from("/tmp/repo"),
+                step_index: 1,
+                step_count: 3,
+                description: "step 2".into(),
+                status: flotilla_protocol::commands::StepStatus::Started,
+            },
+            &local_seqs,
+            &recovering,
+            &event_tx,
+            &writer,
+            &pending,
+            &next_id,
+        );
+
+        let event = event_rx.try_recv().expect("should receive CommandStepUpdate");
+        assert!(matches!(event, DaemonEvent::CommandStepUpdate { command_id: 3, .. }));
+    }
+
+    #[tokio::test]
+    async fn handle_event_forwards_peer_status_changed() {
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        handle_event(
+            DaemonEvent::PeerStatusChanged {
+                host: flotilla_protocol::HostName::new("peer-1"),
+                status: flotilla_protocol::PeerConnectionState::Connected,
+            },
+            &local_seqs,
+            &recovering,
+            &event_tx,
+            &writer,
+            &pending,
+            &next_id,
+        );
+
+        let event = event_rx.try_recv().expect("should receive PeerStatusChanged");
+        assert!(matches!(event, DaemonEvent::PeerStatusChanged { .. }));
+    }
+
+    // --- RepoRemoved evicts seq and forwards ---
+
+    #[tokio::test]
+    async fn handle_event_repo_removed_evicts_seq_and_forwards() {
+        let repo = PathBuf::from("/tmp/removed-repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 42);
+        let recovering: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+
+        handle_event(DaemonEvent::RepoRemoved { path: repo.clone() }, &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
+
+        // Seq should be evicted.
+        assert!(local_seqs.read().unwrap().get(&repo).is_none(), "seq should be evicted for removed repo");
+        // Event should be forwarded.
+        let event = event_rx.try_recv().expect("should receive RepoRemoved");
+        assert!(matches!(event, DaemonEvent::RepoRemoved { .. }));
+    }
+
+    // --- recover_from_gap: parse error in replay response ---
+
+    #[tokio::test]
+    async fn recover_from_gap_handles_parse_error_gracefully() {
+        let repo = PathBuf::from("/tmp/repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 3);
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let mut harness = request_harness();
+
+        let recover_local_seqs = Arc::clone(&local_seqs);
+        let recover_event_tx = event_tx.clone();
+        let recover_writer = Arc::clone(&harness.writer);
+        let recover_pending = Arc::clone(&harness.pending);
+        let recover_next_id = Arc::clone(&harness.next_id);
+        let recover_task = tokio::spawn(async move {
+            recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        });
+
+        let (id, method, _) = read_request(&mut harness.lines).await;
+        assert_eq!(method, "replay_since");
+
+        // Respond with ok: true but data that cannot be parsed as Vec<DaemonEvent>.
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
+        tx.send(RawResponse { ok: true, data: Some(serde_json::json!({"not": "a vec"})), error: None }).expect("send bad response");
+
+        // Should complete without panic.
+        recover_task.await.expect("recover_from_gap should not panic on parse error");
+        // Local seqs should remain unchanged.
+        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&3));
+    }
+
+    // --- recover_from_gap: request write failure ---
+
+    #[tokio::test]
+    async fn recover_from_gap_handles_request_failure_gracefully() {
+        let repo = PathBuf::from("/tmp/repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 5);
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let (writer, pending, next_id) = broken_request_harness();
+
+        // recover_from_gap should complete without panic even when the request fails.
+        recover_from_gap(&local_seqs, &event_tx, &writer, &pending, &next_id).await;
+        // Local seqs should remain unchanged.
+        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&5));
+    }
+
+    // --- recover_from_gap: response with ok=false ---
+
+    #[tokio::test]
+    async fn recover_from_gap_handles_error_response_gracefully() {
+        let repo = PathBuf::from("/tmp/repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 7);
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let mut harness = request_harness();
+
+        let recover_local_seqs = Arc::clone(&local_seqs);
+        let recover_event_tx = event_tx.clone();
+        let recover_writer = Arc::clone(&harness.writer);
+        let recover_pending = Arc::clone(&harness.pending);
+        let recover_next_id = Arc::clone(&harness.next_id);
+        let recover_task = tokio::spawn(async move {
+            recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        });
+
+        let (id, method, _) = read_request(&mut harness.lines).await;
+        assert_eq!(method, "replay_since");
+
+        // Respond with ok: false (server-side error).
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
+        tx.send(RawResponse { ok: false, data: None, error: Some("internal error".into()) }).expect("send error response");
+
+        recover_task.await.expect("recover_from_gap should not panic on error response");
+        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&7));
+    }
+
+    // --- recover_from_gap: replay with SnapshotFull updates seqs ---
+
+    #[tokio::test]
+    async fn recover_from_gap_applies_full_snapshot_seqs() {
+        let repo = PathBuf::from("/tmp/repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 2);
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let mut harness = request_harness();
+
+        let recover_local_seqs = Arc::clone(&local_seqs);
+        let recover_event_tx = event_tx.clone();
+        let recover_writer = Arc::clone(&harness.writer);
+        let recover_pending = Arc::clone(&harness.pending);
+        let recover_next_id = Arc::clone(&harness.next_id);
+        let recover_task = tokio::spawn(async move {
+            recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        });
+
+        let (id, method, _) = read_request(&mut harness.lines).await;
+        assert_eq!(method, "replay_since");
+
+        // Respond with a full snapshot event.
+        let replay_events = vec![DaemonEvent::SnapshotFull(Box::new(make_snapshot(&repo, 10)))];
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
+        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
+            .expect("send replay response");
+
+        recover_task.await.expect("join recover");
+
+        let event = event_rx.recv().await.expect("forwarded replay event");
+        assert!(matches!(event, DaemonEvent::SnapshotFull(_)));
+        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&10));
+    }
+
+    // --- recover_from_gap: monotonic seq update (live event advances while replay in flight) ---
+
+    #[tokio::test]
+    async fn recover_from_gap_does_not_regress_seq_from_concurrent_live_update() {
+        let repo = PathBuf::from("/tmp/repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 3);
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let mut harness = request_harness();
+
+        let recover_local_seqs = Arc::clone(&local_seqs);
+        let recover_event_tx = event_tx.clone();
+        let recover_writer = Arc::clone(&harness.writer);
+        let recover_pending = Arc::clone(&harness.pending);
+        let recover_next_id = Arc::clone(&harness.next_id);
+        let repo_clone = repo.clone();
+        let recover_task = tokio::spawn(async move {
+            // Simulate a live event advancing local_seqs while recovery is in flight.
+            recover_local_seqs.write().unwrap().insert(repo_clone, 20);
+            recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        });
+
+        let (id, _method, _) = read_request(&mut harness.lines).await;
+
+        // Replay returns events with seq=10, which is behind the live update of 20.
+        let replay_events = vec![DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 3, 10)))];
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
+        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
+            .expect("send replay response");
+
+        recover_task.await.expect("join recover");
+
+        // Seq should not regress: should remain at 20 (the higher value).
+        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&20));
+    }
+
+    // --- recover_from_gap: replay with non-snapshot events (e.g. CommandStarted) ---
+
+    #[tokio::test]
+    async fn recover_from_gap_forwards_non_snapshot_replay_events() {
+        let repo = PathBuf::from("/tmp/repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 1);
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let mut harness = request_harness();
+
+        let recover_local_seqs = Arc::clone(&local_seqs);
+        let recover_event_tx = event_tx.clone();
+        let recover_writer = Arc::clone(&harness.writer);
+        let recover_pending = Arc::clone(&harness.pending);
+        let recover_next_id = Arc::clone(&harness.next_id);
+        let recover_task = tokio::spawn(async move {
+            recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        });
+
+        let (id, _method, _) = read_request(&mut harness.lines).await;
+
+        // Replay includes a non-snapshot event — it should still be forwarded.
+        let replay_events = vec![DaemonEvent::CommandStarted {
+            command_id: 99,
+            host: flotilla_protocol::HostName::new("test"),
+            repo: repo.clone(),
+            description: "replayed".into(),
+        }];
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
+        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
+            .expect("send replay response");
+
+        recover_task.await.expect("join recover");
+
+        let event = event_rx.recv().await.expect("should receive non-snapshot replay event");
+        assert!(matches!(event, DaemonEvent::CommandStarted { command_id: 99, .. }));
+        // Seq should be unchanged since CommandStarted doesn't carry a seq.
+        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&1));
+    }
+
+    // --- recover_from_gap: empty replay events ---
+
+    #[tokio::test]
+    async fn recover_from_gap_handles_empty_replay() {
+        let repo = PathBuf::from("/tmp/repo");
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        local_seqs.write().unwrap().insert(repo.clone(), 5);
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let mut harness = request_harness();
+
+        let recover_local_seqs = Arc::clone(&local_seqs);
+        let recover_event_tx = event_tx.clone();
+        let recover_writer = Arc::clone(&harness.writer);
+        let recover_pending = Arc::clone(&harness.pending);
+        let recover_next_id = Arc::clone(&harness.next_id);
+        let recover_task = tokio::spawn(async move {
+            recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        });
+
+        let (id, _method, _) = read_request(&mut harness.lines).await;
+
+        // Respond with empty event list.
+        let replay_events: Vec<DaemonEvent> = vec![];
+        let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
+        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
+            .expect("send replay response");
+
+        recover_task.await.expect("join recover");
+
+        // No events forwarded.
+        assert!(event_rx.try_recv().is_err(), "no events should be forwarded for empty replay");
+        // Seq unchanged.
+        assert_eq!(local_seqs.read().unwrap().get(&repo), Some(&5));
+    }
+
+    // --- RawResponse parse error paths ---
+
+    #[test]
+    fn raw_response_parse_returns_error_when_not_ok() {
+        let resp = RawResponse { ok: false, data: None, error: Some("something broke".into()) };
+        let err = resp.parse::<Vec<String>>().expect_err("should fail");
+        assert!(err.contains("something broke"));
+    }
+
+    #[test]
+    fn raw_response_parse_returns_unknown_error_when_not_ok_and_no_error() {
+        let resp = RawResponse { ok: false, data: None, error: None };
+        let err = resp.parse::<Vec<String>>().expect_err("should fail");
+        assert!(err.contains("unknown error"));
+    }
+
+    #[test]
+    fn raw_response_parse_returns_error_when_data_missing() {
+        let resp = RawResponse { ok: true, data: None, error: None };
+        let err = resp.parse::<Vec<String>>().expect_err("should fail");
+        assert!(err.contains("missing data"));
+    }
+
+    #[test]
+    fn raw_response_parse_returns_error_when_data_wrong_type() {
+        let resp = RawResponse { ok: true, data: Some(serde_json::json!(42)), error: None };
+        let err = resp.parse::<Vec<String>>().expect_err("should fail");
+        assert!(err.contains("failed to parse"));
+    }
+
+    #[test]
+    fn raw_response_parse_empty_returns_error_when_not_ok() {
+        let resp = RawResponse { ok: false, data: None, error: Some("refused".into()) };
+        let err = resp.parse_empty().expect_err("should fail");
+        assert!(err.contains("refused"));
+    }
+
+    #[test]
+    fn raw_response_parse_empty_returns_unknown_error_when_not_ok_and_no_error() {
+        let resp = RawResponse { ok: false, data: None, error: None };
+        let err = resp.parse_empty().expect_err("should fail");
+        assert!(err.contains("unknown error"));
+    }
+
+    #[test]
+    fn raw_response_parse_empty_succeeds_when_ok() {
+        let resp = RawResponse { ok: true, data: None, error: None };
+        resp.parse_empty().expect("should succeed");
+    }
 }
 
 #[cfg(test)]
