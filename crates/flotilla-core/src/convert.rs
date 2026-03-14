@@ -13,7 +13,7 @@ use crate::{
     data::{CorrelationResult, RefreshError},
     providers::{
         correlation::{CorrelatedGroup, ItemKind as CorItemKind},
-        discovery::EnvironmentAssertion,
+        discovery::{EnvironmentAssertion, EnvironmentBag},
     },
     refresh::RefreshSnapshot,
 };
@@ -119,7 +119,7 @@ pub fn health_to_proto(health: &HashMap<(&'static str, String), bool>) -> HashMa
     nested
 }
 
-pub fn inventory_from_bag(bag: &crate::providers::discovery::EnvironmentBag) -> ToolInventory {
+pub fn inventory_from_bag(bag: &EnvironmentBag) -> ToolInventory {
     let mut inventory = ToolInventory::default();
 
     for assertion in bag.assertions() {
@@ -132,13 +132,16 @@ pub fn inventory_from_bag(bag: &crate::providers::discovery::EnvironmentBag) -> 
                 inventory.binaries.push(DiscoveryFact { name: name.clone(), detail });
             }
             EnvironmentAssertion::SocketAvailable { name, path } => {
-                inventory.sockets.push(DiscoveryFact { name: name.clone(), detail: vec![("path".into(), path.display().to_string())] });
+                let detail = vec![("path".into(), path.display().to_string())];
+                inventory.sockets.push(DiscoveryFact { name: name.clone(), detail });
             }
             EnvironmentAssertion::AuthFileExists { provider, path } => {
-                inventory.auth.push(DiscoveryFact { name: provider.clone(), detail: vec![("path".into(), path.display().to_string())] });
+                let detail = vec![("path".into(), path.display().to_string())];
+                inventory.auth.push(DiscoveryFact { name: provider.clone(), detail });
             }
             EnvironmentAssertion::EnvVarSet { key, .. } => {
-                inventory.env_vars.push(DiscoveryFact { name: key.clone(), detail: vec![("value".into(), "<set>".into())] });
+                let detail = vec![("value".into(), "<set>".into())];
+                inventory.env_vars.push(DiscoveryFact { name: key.clone(), detail });
             }
             EnvironmentAssertion::VcsCheckoutDetected { .. } | EnvironmentAssertion::RemoteHost { .. } => {}
         }
