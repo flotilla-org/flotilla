@@ -756,8 +756,8 @@ mod tests {
         assert_eq!(model.repos.len(), 2);
         assert_eq!(model.repo_order.len(), 2);
         assert_eq!(model.active_repo, 0);
-        assert!(model.repos.values().any(|repo| repo.path == PathBuf::from("/tmp/repo-a")));
-        assert!(model.repos.values().any(|repo| repo.path == PathBuf::from("/tmp/repo-b")));
+        assert!(model.repos.values().any(|repo| repo.path.as_path() == Path::new("/tmp/repo-a")));
+        assert!(model.repos.values().any(|repo| repo.path.as_path() == Path::new("/tmp/repo-b")));
         assert!(model.status_message.is_none());
     }
 
@@ -1132,7 +1132,7 @@ mod tests {
         app.handle_repo_added(info);
 
         assert_eq!(app.model.repos.len(), 2);
-        assert!(app.model.repos.values().any(|repo| repo.path == PathBuf::from("/tmp/new-repo")));
+        assert!(app.model.repos.values().any(|repo| repo.path.as_path() == Path::new("/tmp/new-repo")));
         assert_eq!(app.model.repos[app.model.repo_order.last().unwrap()].path, PathBuf::from("/tmp/new-repo"));
         // Adding a repo should not switch to it (it may arrive asynchronously)
         assert_eq!(app.model.active_repo, 0);

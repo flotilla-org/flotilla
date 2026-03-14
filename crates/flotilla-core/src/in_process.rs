@@ -486,6 +486,9 @@ pub struct InProcessDaemon {
     /// the local snapshot during broadcast.
     peer_providers: RwLock<HashMap<flotilla_protocol::RepoIdentity, Vec<(HostName, ProviderData)>>>,
     /// Maps local tracked paths (including virtual synthetic paths) to RepoIdentity.
+    // Lock ordering: do not hold path_identities across awaits that later take
+    // repos/repo_order; add_repo intentionally takes it last while already
+    // holding those write locks.
     path_identities: RwLock<HashMap<PathBuf, flotilla_protocol::RepoIdentity>>,
     /// Current peer connection status, updated via `set_peer_status()` and
     /// replayed to late-subscribing clients via `replay_since()`.
@@ -664,7 +667,7 @@ impl InProcessDaemon {
             }
             flotilla_protocol::RepoSelector::Query(query) => {
                 let repos = self.repos.read().await;
-                let entries: Vec<_> = repos.iter().map(|(_, state)| (state.preferred_path(), state.slug())).collect();
+                let entries: Vec<_> = repos.values().map(|state| (state.preferred_path(), state.slug())).collect();
                 crate::resolve::resolve_repo(query, entries.into_iter()).map_err(|e| e.to_string())
             }
             flotilla_protocol::RepoSelector::Identity(identity) => self
