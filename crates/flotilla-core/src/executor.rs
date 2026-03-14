@@ -2093,4 +2093,232 @@ mod tests {
             ExecutionPlan::Steps(_) => panic!("expected Immediate, got Steps"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Tests: resolve_checkout_branch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_checkout_branch_path_found() {
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-branch", "/repo/wt-feat"));
+        let local_host = HostName::local();
+
+        let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/repo/wt-feat")), &data, &local_host);
+
+        assert_eq!(result.unwrap(), "feat-branch");
+    }
+
+    #[test]
+    fn resolve_checkout_branch_path_not_found() {
+        let data = empty_data();
+        let local_host = HostName::local();
+
+        let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/nonexistent")), &data, &local_host);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("checkout not found"));
+    }
+
+    #[test]
+    fn resolve_checkout_branch_query_exact_match() {
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-login", "/repo/wt-feat"));
+        let local_host = HostName::local();
+
+        let result = resolve_checkout_branch(&CheckoutSelector::Query("feat-login".to_string()), &data, &local_host);
+
+        assert_eq!(result.unwrap(), "feat-login");
+    }
+
+    #[test]
+    fn resolve_checkout_branch_query_substring_match() {
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-login-page", "/repo/wt-feat"));
+        let local_host = HostName::local();
+
+        let result = resolve_checkout_branch(&CheckoutSelector::Query("login".to_string()), &data, &local_host);
+
+        assert_eq!(result.unwrap(), "feat-login-page");
+    }
+
+    #[test]
+    fn resolve_checkout_branch_query_not_found() {
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-login", "/repo/wt-feat"));
+        let local_host = HostName::local();
+
+        let result = resolve_checkout_branch(&CheckoutSelector::Query("nonexistent".to_string()), &data, &local_host);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("checkout not found"));
+    }
+
+    #[test]
+    fn resolve_checkout_branch_query_ambiguous() {
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-feat-a"), make_checkout("feat-a", "/repo/wt-feat-a"));
+        data.checkouts.insert(hp("/repo/wt-feat-b"), make_checkout("feat-b", "/repo/wt-feat-b"));
+        let local_host = HostName::local();
+
+        let result = resolve_checkout_branch(&CheckoutSelector::Query("feat".to_string()), &data, &local_host);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ambiguous"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: resolve_terminal_pool
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_terminal_pool_no_template_uses_default() {
+        let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+        let mut config = WorkspaceConfig {
+            name: "test-branch".to_string(),
+            working_directory: PathBuf::from("/repo/wt"),
+            template_vars: [("main_command".to_string(), "claude".to_string())].into_iter().collect(),
+            template_yaml: None,
+            resolved_commands: None,
+        };
+
+        resolve_terminal_pool(&mut config, mock_pool.as_ref()).await;
+
+        // Default template has one "main" terminal entry
+        assert!(config.resolved_commands.is_some());
+        let commands = config.resolved_commands.unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "main");
+    }
+
+    #[tokio::test]
+    async fn resolve_terminal_pool_skips_non_terminal_content() {
+        let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+        let yaml = r#"
+content:
+  - role: docs
+    type: webview
+    command: "http://localhost:3000"
+"#;
+        let mut config = WorkspaceConfig {
+            name: "test-branch".to_string(),
+            working_directory: PathBuf::from("/repo/wt"),
+            template_vars: std::collections::HashMap::new(),
+            template_yaml: Some(yaml.to_string()),
+            resolved_commands: None,
+        };
+
+        resolve_terminal_pool(&mut config, mock_pool.as_ref()).await;
+
+        // All content entries were non-terminal, so resolved_commands stays None
+        assert!(config.resolved_commands.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: write_branch_issue_links
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_branch_issue_links_single_provider_multiple_issues() {
+        let runner = MockRunner::new(vec![Ok(String::new())]);
+        let issue_ids = vec![("github".to_string(), "10".to_string()), ("github".to_string(), "20".to_string())];
+
+        write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
+
+        // Single provider groups into one git config call — the runner consumed 1 response
+    }
+
+    #[tokio::test]
+    async fn write_branch_issue_links_multiple_providers() {
+        let runner = MockRunner::new(vec![Ok(String::new()), Ok(String::new())]);
+        let issue_ids = vec![("github".to_string(), "10".to_string()), ("jira".to_string(), "PROJ-5".to_string())];
+
+        write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
+
+        // Two providers produce two git config calls — the runner consumed 2 responses
+    }
+
+    #[tokio::test]
+    async fn write_branch_issue_links_git_error_tolerated() {
+        let runner = MockRunner::new(vec![Err("git config failed".to_string())]);
+        let issue_ids = vec![("github".to_string(), "10".to_string())];
+
+        // Should not panic even though git config fails
+        write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
+    }
+
+    #[tokio::test]
+    async fn write_branch_issue_links_empty_is_noop() {
+        let runner = runner_ok();
+
+        // No issue ids means no git config calls, no responses consumed
+        write_branch_issue_links(&repo_root(), "feat-x", &[], &runner).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: validate_checkout_target
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_fresh_branch_succeeds_when_neither_exists() {
+        // local check -> Err (not found), remote check -> Err (not found)
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target(&repo_root(), "new-branch", CheckoutIntent::FreshBranch, &runner).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_fresh_branch_fails_when_local_exists() {
+        // local check -> Ok (found), remote check -> Err (not found)
+        let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target(&repo_root(), "existing", CheckoutIntent::FreshBranch, &runner).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn validate_fresh_branch_fails_when_remote_exists() {
+        // local check -> Err (not found), remote check -> Ok (found)
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
+
+        let result = validate_checkout_target(&repo_root(), "remote-only", CheckoutIntent::FreshBranch, &runner).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn validate_existing_branch_succeeds_when_local_exists() {
+        // local check -> Ok (found), remote check -> Err (not found)
+        let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target(&repo_root(), "local-branch", CheckoutIntent::ExistingBranch, &runner).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_existing_branch_succeeds_when_remote_exists() {
+        // local check -> Err (not found), remote check -> Ok (found)
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
+
+        let result = validate_checkout_target(&repo_root(), "remote-branch", CheckoutIntent::ExistingBranch, &runner).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_existing_branch_fails_when_neither_exists() {
+        // local check -> Err (not found), remote check -> Err (not found)
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target(&repo_root(), "ghost-branch", CheckoutIntent::ExistingBranch, &runner).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("branch not found"));
+    }
 }
