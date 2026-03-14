@@ -146,8 +146,8 @@ mod tests {
 
     #[test]
     fn merge_peer_checkout_overwrites_same_host_path() {
-        // If a peer sends updated checkout data for the same HostPath,
-        // the peer's version should overwrite the local one.
+        // For a peer-owned HostPath, an updated snapshot from that owning peer
+        // should overwrite any stale locally cached copy of the same path.
         let host_path = HostPath::new(HostName::new("desktop"), "/repo");
         let local = ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("old-branch"))]), ..Default::default() };
         let remote = ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("new-branch"))]), ..Default::default() };

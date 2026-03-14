@@ -49,8 +49,8 @@ pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &
         }
 
         // Service-level data (PRs, issues, sessions) comes only from leader.
-        // Followers don't poll external APIs so their maps are empty — no
-        // conflict. We merge unconditionally so followers see leader's data.
+        // Followers don't poll external APIs so their maps are normally empty.
+        // Local entries stay authoritative; peer data only fills gaps.
         for (key, cr) in &peer_data.change_requests {
             merged.change_requests.entry(key.clone()).or_insert_with(|| cr.clone());
         }
