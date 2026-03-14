@@ -520,6 +520,9 @@ pub async fn execute(
                     Ok(commands) => commands,
                     Err(message) => return CommandResult::Error { message },
                 };
+                // The workspace itself is local to the presentation host, so its
+                // working directory remains rooted at the tracked repo. The wrapped
+                // attach commands handle entering the remote checkout path.
                 let mut config = workspace_config(&repo.root, &branch, &repo.root, "claude", config_base);
                 config.resolved_commands = Some(wrapped.into_iter().map(|cmd| (cmd.role, cmd.command)).collect());
                 if let Err(e) = ws_mgr.create_workspace(&config).await {

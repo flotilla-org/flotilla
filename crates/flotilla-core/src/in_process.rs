@@ -484,6 +484,17 @@ impl InProcessDaemon {
         identities.iter().find(|(_, path)| path.as_path() == repo_path).map(|(id, _)| id.clone())
     }
 
+    async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
+        let mut repo_bag = EnvironmentBag::new();
+        let runner = &*self.discovery.runner;
+        let env = &*self.discovery.env;
+        for detector in &self.discovery.repo_detectors {
+            repo_bag = repo_bag.extend(detector.detect(repo_path, runner, env).await);
+        }
+        let combined = self.host_bag.merge(&repo_bag);
+        repo_identity_from_bag_or_path(repo_path, &combined)
+    }
+
     /// Returns the paths of all locally tracked repos.
     ///
     /// Only local repo paths, not remote/virtual ones. Used by the outbound
@@ -1226,11 +1237,12 @@ impl DaemonHandle for InProcessDaemon {
 
         match &command.action {
             flotilla_protocol::CommandAction::AddRepo { path } => {
+                let repo_identity = self.detect_repo_identity(path).await;
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
                     host: self.host_name.clone(),
-                    repo_identity: fallback_repo_identity(path),
+                    repo_identity: repo_identity.clone(),
                     repo: path.clone(),
                     description,
                 });
@@ -1241,7 +1253,7 @@ impl DaemonHandle for InProcessDaemon {
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
                     host: self.host_name.clone(),
-                    repo_identity: self.find_identity_for_path(path).await.unwrap_or_else(|| fallback_repo_identity(path)),
+                    repo_identity: self.find_identity_for_path(path).await.unwrap_or(repo_identity),
                     repo: path.clone(),
                     result,
                 });

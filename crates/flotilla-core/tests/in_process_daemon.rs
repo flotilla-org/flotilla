@@ -496,7 +496,7 @@ async fn replay_since_returns_empty_when_up_to_date() {
 async fn add_and_remove_repo_updates_state_and_emits_events() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("new-repo");
-    std::fs::create_dir_all(&repo).unwrap();
+    init_git_repo_with_remote(&repo, "git@github.com:owner/new-repo.git");
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
@@ -507,24 +507,31 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
         .await
         .expect("add_repo command should return an id");
 
-    let (finished_add, added) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (started_add, finished_add, added) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut started = None;
         let mut finished = None;
         let mut added = None;
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == add_id => finished = Some(result),
+                Ok(DaemonEvent::CommandStarted { command_id, repo_identity, .. }) if command_id == add_id => started = Some(repo_identity),
+                Ok(DaemonEvent::CommandFinished { command_id, repo_identity, result, .. }) if command_id == add_id => {
+                    finished = Some((repo_identity, result));
+                }
                 Ok(DaemonEvent::RepoAdded(info)) => added = Some(*info),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
-            if let (Some(_), Some(_)) = (&finished, &added) {
-                break (finished.take().expect("finished set"), added.take().expect("added set"));
+            if let (Some(_), Some(_), Some(_)) = (&started, &finished, &added) {
+                break (started.take().expect("started set"), finished.take().expect("finished set"), added.take().expect("added set"));
             }
         }
     })
     .await
     .expect("timeout waiting for add command events");
-    assert!(matches!(finished_add, CommandResult::RepoAdded { path } if path == repo));
+    let (finished_identity, finished_result) = finished_add;
+    assert!(matches!(finished_result, CommandResult::RepoAdded { path } if path == repo));
+    assert_eq!(finished_identity, added.identity, "CommandFinished should use the tracked repo identity");
+    assert_eq!(started_add, added.identity, "CommandStarted should use the tracked repo identity");
     assert_eq!(added.path, repo);
 
     let repos = daemon.list_repos().await.expect("list_repos after add");
