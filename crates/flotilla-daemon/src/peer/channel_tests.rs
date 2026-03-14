@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
-use flotilla_protocol::{GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, ProviderData, RepoIdentity, VectorClock};
+use flotilla_protocol::{
+    Command, CommandAction, CommandPeerEvent, CommandResult, GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage,
+    ProviderData, RepoIdentity, RepoSelector, RoutedPeerMessage, StepStatus, VectorClock,
+};
 
-use crate::peer::test_support::TestNetwork;
+use crate::peer::{test_support::TestNetwork, HandleResult, PeerManager};
 
 fn test_repo() -> RepoIdentity {
     RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
@@ -180,4 +183,173 @@ async fn reverse_direction_snapshot_in_chain() {
 
     assert!(has_peer_data(&net, b, "host-c", &repo), "host-b should have host-c's data");
     assert!(has_peer_data(&net, a, "host-c", &repo), "host-a should have host-c's data via relay through host-b");
+}
+
+#[tokio::test]
+async fn routed_command_request_reaches_target_through_relay() {
+    let mut net = TestNetwork::new();
+    let a = net.add_peer("host-a");
+    let b = net.add_peer("host-b");
+    let c = net.add_peer("host-c");
+    net.connect(a, b);
+    net.connect(b, c);
+    net.start().await;
+
+    let repo = test_repo();
+    net.inject_local_data(c, snapshot_msg("host-c", &repo, 1)).await;
+    net.inject_local_data(a, snapshot_msg("host-a", &repo, 1)).await;
+    net.settle().await;
+
+    let request = RoutedPeerMessage::CommandRequest {
+        request_id: 42,
+        requester_host: HostName::new("host-a"),
+        target_host: HostName::new("host-c"),
+        remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+        command: Box::new(Command {
+            host: Some(HostName::new("host-c")),
+            context_repo: None,
+            action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
+        }),
+    };
+
+    net.manager(a).send_to(&HostName::new("host-c"), PeerWireMessage::Routed(request)).await.expect("send command request");
+
+    let b_results = net.process_peer_with_results(b).await;
+    assert!(b_results.iter().all(|result| matches!(result, HandleResult::Ignored)));
+
+    let c_results = net.process_peer_with_results(c).await;
+    assert!(matches!(
+        c_results.as_slice(),
+        [HandleResult::CommandRequested { request_id: 42, requester_host, reply_via, command }]
+            if requester_host == &HostName::new("host-a")
+                && reply_via == &HostName::new("host-b")
+                && *command
+                    == Command {
+                        host: Some(HostName::new("host-c")),
+                        context_repo: None,
+                        action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
+                    }
+    ));
+}
+
+#[tokio::test]
+async fn routed_command_event_and_response_reach_requester_through_relay() {
+    let mut net = TestNetwork::new();
+    let a = net.add_peer("host-a");
+    let b = net.add_peer("host-b");
+    let c = net.add_peer("host-c");
+    net.connect(a, b);
+    net.connect(b, c);
+    net.start().await;
+
+    let repo = test_repo();
+    net.inject_local_data(c, snapshot_msg("host-c", &repo, 1)).await;
+    net.settle().await;
+
+    net.manager(a)
+        .send_to(
+            &HostName::new("host-c"),
+            PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
+                request_id: 77,
+                requester_host: HostName::new("host-a"),
+                target_host: HostName::new("host-c"),
+                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                command: Box::new(Command {
+                    host: Some(HostName::new("host-c")),
+                    context_repo: None,
+                    action: CommandAction::Refresh { repo: None },
+                }),
+            }),
+        )
+        .await
+        .expect("send command request");
+    net.process_peer_with_results(b).await;
+    net.process_peer_with_results(c).await;
+
+    net.manager(c)
+        .send_to(
+            &HostName::new("host-b"),
+            PeerWireMessage::Routed(RoutedPeerMessage::CommandEvent {
+                request_id: 77,
+                requester_host: HostName::new("host-a"),
+                responder_host: HostName::new("host-c"),
+                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                event: Box::new(CommandPeerEvent::StepUpdate {
+                    repo: PathBuf::from("/repo"),
+                    step_index: 0,
+                    step_count: 2,
+                    description: "Refreshing".into(),
+                    status: StepStatus::Started,
+                }),
+            }),
+        )
+        .await
+        .expect("send command event");
+    net.process_peer_with_results(b).await;
+    let a_event_results = net.process_peer_with_results(a).await;
+    assert!(matches!(
+        a_event_results.as_slice(),
+        [HandleResult::CommandEventReceived { request_id: 77, responder_host, event }]
+            if responder_host == &HostName::new("host-c")
+                && *event
+                    == CommandPeerEvent::StepUpdate {
+                        repo: PathBuf::from("/repo"),
+                        step_index: 0,
+                        step_count: 2,
+                        description: "Refreshing".into(),
+                        status: StepStatus::Started,
+                    }
+    ));
+
+    net.manager(c)
+        .send_to(
+            &HostName::new("host-b"),
+            PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse {
+                request_id: 77,
+                requester_host: HostName::new("host-a"),
+                responder_host: HostName::new("host-c"),
+                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                result: Box::new(CommandResult::Refreshed { repos: vec![PathBuf::from("/repo")] }),
+            }),
+        )
+        .await
+        .expect("send command response");
+    net.process_peer_with_results(b).await;
+    let a_response_results = net.process_peer_with_results(a).await;
+    assert!(matches!(
+        a_response_results.as_slice(),
+        [HandleResult::CommandResponseReceived { request_id: 77, responder_host, result }]
+            if responder_host == &HostName::new("host-c")
+                && *result == CommandResult::Refreshed { repos: vec![PathBuf::from("/repo")] }
+    ));
+}
+
+#[tokio::test]
+async fn routed_command_returns_clear_error_for_unknown_target() {
+    let mut net = TestNetwork::new();
+    let a = net.add_peer("host-a");
+    let b = net.add_peer("host-b");
+    net.connect(a, b);
+    net.start().await;
+
+    let err = net
+        .manager(a)
+        .send_to(
+            &HostName::new("host-z"),
+            PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
+                request_id: 1,
+                requester_host: HostName::new("host-a"),
+                target_host: HostName::new("host-z"),
+                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                command: Box::new(Command {
+                    host: Some(HostName::new("host-z")),
+                    context_repo: None,
+                    action: CommandAction::Refresh { repo: None },
+                }),
+            }),
+        )
+        .await
+        .expect_err("unknown target should fail");
+
+    assert!(err.contains("unknown peer: host-z"));
 }

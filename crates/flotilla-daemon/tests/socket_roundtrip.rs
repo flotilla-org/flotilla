@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle};
 use flotilla_daemon::server::DaemonServer;
-use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent};
 use tokio::time::Instant;
 
 #[tokio::test]
@@ -182,5 +182,101 @@ async fn query_commands_roundtrip() {
     assert!(err.is_err(), "nonexistent slug should return error");
 
     // Clean up
+    server_handle.abort();
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
+async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let socket_path = tmp.path().join("test.sock");
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo = manifest_dir.parent().expect("parent").parent().expect("grandparent").to_path_buf();
+
+    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let server = DaemonServer::new(vec![repo.clone()], config, socket_path.clone(), Duration::from_secs(300))
+        .await
+        .expect("server config should be valid");
+
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    let connect_deadline = Instant::now() + Duration::from_secs(10);
+    let client = loop {
+        match flotilla_client::SocketDaemon::connect(&socket_path).await {
+            Ok(client) => break client,
+            Err(connect_err) => {
+                if server_handle.is_finished() {
+                    match server_handle.await {
+                        Ok(Ok(())) => panic!("daemon server exited before client connected (last connect error: {connect_err})"),
+                        Ok(Err(server_err)) => {
+                            if server_err.contains("Operation not permitted") {
+                                eprintln!(
+                                    "skipping execute_refresh_all_roundtrip_emits_lifecycle_events: unix socket bind not permitted in this environment: {server_err}"
+                                );
+                                return;
+                            }
+                            panic!("daemon server failed before client connected: {server_err} (last connect error: {connect_err})")
+                        }
+                        Err(join_err) => {
+                            panic!("daemon server task panicked before client connected: {join_err} (last connect error: {connect_err})")
+                        }
+                    }
+                }
+                if Instant::now() >= connect_deadline {
+                    server_handle.abort();
+                    panic!("timed out connecting to daemon: {connect_err}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    let data_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if client.get_state(&repo).await.is_ok() {
+            break;
+        }
+        if Instant::now() >= data_deadline {
+            server_handle.abort();
+            panic!("timed out waiting for initial snapshot data");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut rx = client.subscribe();
+    let command_id = client
+        .execute(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
+        .await
+        .expect("execute refresh all");
+
+    let lifecycle = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut started = None;
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo: event_repo, description }) if id == command_id => {
+                    assert_eq!(host, flotilla_protocol::HostName::local());
+                    assert_eq!(event_repo, repo);
+                    assert_eq!(description, "Refreshing...");
+                    started = Some(id);
+                }
+                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo: event_repo, result }) if id == command_id => {
+                    assert_eq!(host, flotilla_protocol::HostName::local());
+                    assert_eq!(event_repo, repo);
+                    break (started, Some((id, result)));
+                }
+                Ok(_) => {}
+                Err(err) => panic!("event stream closed unexpectedly: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for command lifecycle");
+
+    assert_eq!(lifecycle.0, Some(command_id));
+    let (finished_id, result) = lifecycle.1.expect("command finished event");
+    assert_eq!(finished_id, command_id);
+    assert_eq!(result, CommandResult::Refreshed { repos: vec![repo.clone()] });
+
     server_handle.abort();
 }

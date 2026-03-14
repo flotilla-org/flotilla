@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::data::GroupEntry;
-use flotilla_protocol::{Command, WorkItem};
+use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{App, BranchInputKind, ClearDispatch, Intent, UiMode};
@@ -313,7 +313,7 @@ impl App {
         all_issue_keys.dedup();
         if !all_issue_keys.is_empty() {
             self.enter_branch_input(BranchInputKind::Generating);
-            self.proto_commands.push(Command::GenerateBranchName { issue_keys: all_issue_keys });
+            self.proto_commands.push(self.repo_command(CommandAction::GenerateBranchName { issue_keys: all_issue_keys }));
         }
         self.active_ui_mut().multi_selected.clear();
     }
@@ -347,7 +347,7 @@ impl App {
                 Intent::CloseChangeRequest => {
                     self.ui.mode = UiMode::CloseConfirm {
                         id: match &cmd {
-                            Command::CloseChangeRequest { id } => id.clone(),
+                            Command { action: CommandAction::CloseChangeRequest { id }, .. } => id.clone(),
                             _ => return,
                         },
                         title: item.description.clone(),
@@ -426,7 +426,11 @@ impl App {
                 return;
             };
             if !branch.is_empty() {
-                self.proto_commands.push(Command::CreateCheckout { branch, create_branch: true, issue_ids });
+                self.proto_commands.push(self.command(CommandAction::Checkout {
+                    repo: flotilla_protocol::RepoSelector::Path(self.model.active_repo_root().clone()),
+                    target: CheckoutTarget::FreshBranch(branch),
+                    issue_ids,
+                }));
             }
             self.ui.mode = UiMode::Normal;
             return;
@@ -450,7 +454,7 @@ impl App {
                 };
                 if !query.is_empty() {
                     let repo = self.model.active_repo_root().clone();
-                    self.proto_commands.push(Command::SearchIssues { repo, query: query.clone() });
+                    self.proto_commands.push(self.command(CommandAction::SearchIssues { repo, query: query.clone() }));
                     self.active_ui_mut().active_search_query = Some(query);
                 }
                 self.ui.mode = UiMode::Normal;
@@ -470,8 +474,10 @@ impl App {
                 if !loading {
                     // Extract branch from CheckoutStatus and send RemoveCheckout
                     if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, .. } = self.ui.mode {
-                        self.proto_commands
-                            .push(Command::RemoveCheckout { branch: info.branch.clone(), terminal_keys: terminal_keys.clone() });
+                        self.proto_commands.push(self.command(CommandAction::RemoveCheckout {
+                            checkout: CheckoutSelector::Query(info.branch.clone()),
+                            terminal_keys: terminal_keys.clone(),
+                        }));
                     }
                     self.ui.mode = UiMode::Normal;
                 }
@@ -487,7 +493,7 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if let UiMode::CloseConfirm { ref id, .. } = self.ui.mode {
-                    self.proto_commands.push(Command::CloseChangeRequest { id: id.clone() });
+                    self.proto_commands.push(self.repo_command(CommandAction::CloseChangeRequest { id: id.clone() }));
                 }
                 self.ui.mode = UiMode::Normal;
             }
@@ -734,7 +740,7 @@ mod tests {
         // RemoveCheckout resolves to FetchCheckoutStatus, then sets DeleteConfirm mode
         assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
-        assert!(matches!(cmd, Command::FetchCheckoutStatus { .. }));
+        assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
     }
 
     #[test]
@@ -903,9 +909,8 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::CreateCheckout { branch, create_branch, issue_ids } => {
-                assert_eq!(branch, "my-branch");
-                assert!(create_branch);
+            Command { action: CommandAction::Checkout { target, issue_ids, .. }, .. } => {
+                assert_eq!(target, CheckoutTarget::FreshBranch("my-branch".into()));
                 assert!(issue_ids.is_empty());
             }
             other => panic!("expected CreateCheckout, got {:?}", other),
@@ -923,7 +928,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::CreateCheckout { issue_ids, .. } => {
+            Command { action: CommandAction::Checkout { issue_ids, .. }, .. } => {
                 assert_eq!(issue_ids, vec![("github".into(), "42".into())]);
             }
             other => panic!("expected CreateCheckout, got {:?}", other),
@@ -963,7 +968,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::ClearIssueSearch { repo } => {
+            Command { action: CommandAction::ClearIssueSearch { repo }, .. } => {
                 assert_eq!(repo, PathBuf::from("/tmp/test-repo"));
             }
             other => panic!("expected ClearIssueSearch, got {:?}", other),
@@ -978,7 +983,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::SearchIssues { repo, query } => {
+            Command { action: CommandAction::SearchIssues { repo, query }, .. } => {
                 assert_eq!(repo, PathBuf::from("/tmp/test-repo"));
                 assert_eq!(query, "bug fix");
             }
@@ -1005,8 +1010,8 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::RemoveCheckout { branch, .. } => {
-                assert_eq!(branch, "feat/x");
+            Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
+                assert_eq!(checkout, CheckoutSelector::Query("feat/x".into()));
             }
             other => panic!("expected RemoveCheckout, got {:?}", other),
         }
@@ -1020,8 +1025,8 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Normal));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::RemoveCheckout { branch, .. } => {
-                assert_eq!(branch, "feat/y");
+            Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
+                assert_eq!(checkout, CheckoutSelector::Query("feat/y".into()));
             }
             other => panic!("expected RemoveCheckout, got {:?}", other),
         }
@@ -1100,7 +1105,7 @@ mod tests {
         app.action_enter();
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::CreateWorkspaceForCheckout { checkout_path } => {
+            Command { action: CommandAction::CreateWorkspaceForCheckout { checkout_path }, .. } => {
                 assert_eq!(checkout_path, PathBuf::from("/tmp/a"));
             }
             other => panic!("expected CreateWorkspaceForCheckout, got {:?}", other),
@@ -1124,7 +1129,7 @@ mod tests {
         app.action_enter();
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::SelectWorkspace { ws_ref } => {
+            Command { action: CommandAction::SelectWorkspace { ws_ref }, .. } => {
                 assert_eq!(ws_ref, "my-workspace");
             }
             other => panic!("expected SelectWorkspace, got {:?}", other),
@@ -1141,7 +1146,7 @@ mod tests {
         // CreateWorkspace is available for a checkout item without workspace
         app.dispatch_if_available(Intent::CreateWorkspace);
         let cmd = app.proto_commands.take_next().unwrap();
-        assert!(matches!(cmd, Command::CreateWorkspaceForCheckout { .. }));
+        assert!(matches!(cmd, Command { action: CommandAction::CreateWorkspaceForCheckout { .. }, .. }));
     }
 
     #[test]
@@ -1171,7 +1176,7 @@ mod tests {
         app.resolve_and_push(Intent::RemoveCheckout, &item);
         assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
-        assert!(matches!(cmd, Command::FetchCheckoutStatus { .. }));
+        assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
     }
 
     #[test]
@@ -1183,7 +1188,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::GenerateBranchName { issue_keys } => {
+            Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
                 assert_eq!(issue_keys, vec!["ISSUE-1".to_string()]);
             }
             other => panic!("expected GenerateBranchName, got {:?}", other),
@@ -1200,7 +1205,7 @@ mod tests {
         app.ui.mode = UiMode::ActionMenu { items: vec![Intent::CreateWorkspace, Intent::RemoveCheckout], index: 0 };
         app.execute_menu_action();
         let cmd = app.proto_commands.take_next().unwrap();
-        assert!(matches!(cmd, Command::CreateWorkspaceForCheckout { .. }));
+        assert!(matches!(cmd, Command { action: CommandAction::CreateWorkspaceForCheckout { .. }, .. }));
     }
 
     #[test]
@@ -1270,7 +1275,7 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::GenerateBranchName { issue_keys } => {
+            Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
                 assert!(issue_keys.contains(&"ISSUE-1".to_string()));
                 assert!(issue_keys.contains(&"ISSUE-2".to_string()));
             }
@@ -1371,7 +1376,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('p')));
         let cmd = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command::OpenChangeRequest { id } => {
+            Command { action: CommandAction::OpenChangeRequest { id }, .. } => {
                 assert_eq!(id, "PR#42");
             }
             other => panic!("expected OpenChangeRequest, got {:?}", other),

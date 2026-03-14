@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{App, DirEntry, UiMode};
@@ -79,7 +79,7 @@ impl App {
         if entry.is_git_repo && !entry.is_added {
             let path = PathBuf::from(format!("{}{}", base, entry.name));
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            self.proto_commands.push(Command::AddRepo { path: canonical });
+            self.proto_commands.push(self.command(CommandAction::AddRepo { path: canonical }));
             self.ui.mode = UiMode::Normal;
         } else if entry.is_dir {
             let new_path = format!("{}{}/", base, entry.name);
@@ -335,7 +335,7 @@ mod tests {
         // Should have pushed an AddRepo command
         let cmd = app.proto_commands.take_next().expect("expected a command");
         match cmd {
-            Command::AddRepo { path } => {
+            Command { action: CommandAction::AddRepo { path }, .. } => {
                 let canonical = std::fs::canonicalize(&repo_dir).unwrap();
                 assert_eq!(path, canonical);
             }

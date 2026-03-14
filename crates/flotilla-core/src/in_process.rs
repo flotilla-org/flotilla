@@ -448,6 +448,82 @@ impl InProcessDaemon {
         self.repos.read().await.keys().cloned().collect()
     }
 
+    async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
+        match selector {
+            flotilla_protocol::RepoSelector::Path(path) => {
+                let repos = self.repos.read().await;
+                if repos.contains_key(path) {
+                    Ok(path.clone())
+                } else {
+                    Err(format!("repo not tracked: {}", path.display()))
+                }
+            }
+            flotilla_protocol::RepoSelector::Query(query) => {
+                let repos = self.repos.read().await;
+                let entries: Vec<_> = repos.iter().map(|(path, state)| (path.as_path(), state.slug.as_deref())).collect();
+                crate::resolve::resolve_repo(query, entries.into_iter()).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    async fn resolve_checkout_selector(&self, selector: &flotilla_protocol::CheckoutSelector) -> Result<(PathBuf, String), String> {
+        let repos = self.repos.read().await;
+        let mut matches = Vec::new();
+        for (repo_path, state) in repos.iter() {
+            for (host_path, checkout) in &state.model.data.providers.checkouts {
+                if host_path.host != self.host_name {
+                    continue;
+                }
+                let matched = match selector {
+                    flotilla_protocol::CheckoutSelector::Path(path) => host_path.path == *path,
+                    flotilla_protocol::CheckoutSelector::Query(query) => {
+                        checkout.branch == *query || checkout.branch.contains(query) || host_path.path.to_string_lossy().contains(query)
+                    }
+                };
+                if matched {
+                    matches.push((repo_path.clone(), checkout.branch.clone()));
+                }
+            }
+        }
+        match matches.len() {
+            0 => Err("checkout not found".into()),
+            1 => Ok(matches.remove(0)),
+            _ => Err("checkout selector is ambiguous".into()),
+        }
+    }
+
+    async fn resolve_repo_for_command(&self, command: &Command) -> Result<PathBuf, String> {
+        use flotilla_protocol::CommandAction;
+
+        match &command.action {
+            CommandAction::Checkout { repo, .. } => self.resolve_repo_selector(repo).await,
+            CommandAction::RemoveCheckout { checkout, .. } => self.resolve_checkout_selector(checkout).await.map(|(repo, _)| repo),
+            CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
+            CommandAction::FetchCheckoutStatus { checkout_path: Some(path), .. } => {
+                let repos = self.repos.read().await;
+                repos
+                    .keys()
+                    .find(|repo_root| path.starts_with(repo_root))
+                    .cloned()
+                    .ok_or_else(|| format!("repo not tracked: {}", path.display()))
+            }
+            CommandAction::FetchCheckoutStatus { checkout_path: None, .. }
+            | CommandAction::OpenChangeRequest { .. }
+            | CommandAction::CloseChangeRequest { .. }
+            | CommandAction::OpenIssue { .. }
+            | CommandAction::LinkIssuesToChangeRequest { .. }
+            | CommandAction::ArchiveSession { .. }
+            | CommandAction::GenerateBranchName { .. }
+            | CommandAction::TeleportSession { .. }
+            | CommandAction::CreateWorkspaceForCheckout { .. }
+            | CommandAction::SelectWorkspace { .. } => {
+                let selector = command.context_repo.as_ref().ok_or_else(|| "command requires repo context".to_string())?;
+                self.resolve_repo_selector(selector).await
+            }
+            _ => Err("command does not resolve to a single repo".to_string()),
+        }
+    }
+
     /// Get the local-only provider data for a repo (without peer overlay).
     ///
     /// Used by the outbound replication task to send only this host's
@@ -1047,26 +1123,31 @@ impl DaemonHandle for InProcessDaemon {
         Ok(result)
     }
 
-    async fn execute(&self, repo: &Path, command: Command) -> Result<u64, String> {
+    async fn execute(&self, command: Command) -> Result<u64, String> {
+        let command_host = command.host.clone().unwrap_or_else(|| self.host_name.clone());
+        if command_host != self.host_name {
+            return Err(format!("remote command routing not implemented yet for host {command_host}"));
+        }
+
         // Issue commands: execute inline, no lifecycle events.
         // These are synchronous cache operations that return immediately.
-        match &command {
-            Command::SetIssueViewport { visible_count, .. } => {
+        match &command.action {
+            flotilla_protocol::CommandAction::SetIssueViewport { repo, visible_count } => {
                 self.ensure_issues_cached(repo, *visible_count * 2).await;
                 self.broadcast_snapshot(repo).await;
                 return Ok(INLINE_COMMAND_ID);
             }
-            Command::FetchMoreIssues { desired_count, .. } => {
+            flotilla_protocol::CommandAction::FetchMoreIssues { repo, desired_count } => {
                 self.ensure_issues_cached(repo, *desired_count).await;
                 self.broadcast_snapshot(repo).await;
                 return Ok(INLINE_COMMAND_ID);
             }
-            Command::SearchIssues { query, .. } => {
+            flotilla_protocol::CommandAction::SearchIssues { repo, query } => {
                 self.search_issues(repo, query).await;
                 self.broadcast_snapshot(repo).await;
                 return Ok(INLINE_COMMAND_ID);
             }
-            Command::ClearIssueSearch { .. } => {
+            flotilla_protocol::CommandAction::ClearIssueSearch { repo } => {
                 let mut repos = self.repos.write().await;
                 if let Some(state) = repos.get_mut(repo) {
                     state.search_results = None;
@@ -1080,12 +1161,105 @@ impl DaemonHandle for InProcessDaemon {
 
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
 
+        match &command.action {
+            flotilla_protocol::CommandAction::AddRepo { path } => {
+                let description = command.description().to_string();
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: path.clone(),
+                    description,
+                });
+                let result = match self.add_repo(path).await {
+                    Ok(()) => flotilla_protocol::CommandResult::RepoAdded { path: path.clone() },
+                    Err(message) => flotilla_protocol::CommandResult::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: path.clone(),
+                    result,
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::RemoveRepo { repo } => {
+                let repo_path = self.resolve_repo_selector(repo).await?;
+                let description = command.description().to_string();
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: repo_path.clone(),
+                    description,
+                });
+                let result = match self.remove_repo(&repo_path).await {
+                    Ok(()) => flotilla_protocol::CommandResult::RepoRemoved { path: repo_path.clone() },
+                    Err(message) => flotilla_protocol::CommandResult::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: repo_path,
+                    result,
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::Refresh { repo: None } => {
+                let repo_paths = {
+                    let order = self.repo_order.read().await;
+                    order.clone()
+                };
+                let display_repo = repo_paths.first().cloned().unwrap_or_default();
+                let description = command.description().to_string();
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: display_repo.clone(),
+                    description,
+                });
+                let mut refreshed = Vec::new();
+                for repo in &repo_paths {
+                    self.refresh(repo).await?;
+                    refreshed.push(repo.clone());
+                }
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: display_repo,
+                    result: flotilla_protocol::CommandResult::Refreshed { repos: refreshed },
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } => {
+                let repo_path = self.resolve_repo_selector(selector).await?;
+                let description = command.description().to_string();
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: repo_path.clone(),
+                    description,
+                });
+                let result = match self.refresh(&repo_path).await {
+                    Ok(()) => flotilla_protocol::CommandResult::Refreshed { repos: vec![repo_path.clone()] },
+                    Err(message) => flotilla_protocol::CommandResult::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo: repo_path,
+                    result,
+                });
+                return Ok(id);
+            }
+            _ => {}
+        }
+
         // Gather what the spawned task needs — validate repo before broadcasting
+        let repo = self.resolve_repo_for_command(&command).await?;
         let runner = Arc::clone(&self.runner);
         let event_tx = self.event_tx.clone();
         let (registry, providers_data, refresh_trigger) = {
             let repos = self.repos.read().await;
-            let state = repos.get(repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+            let state = repos.get(&repo).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             (
                 Arc::clone(&state.model.registry),
                 Arc::clone(&state.model.data.providers),
@@ -1097,7 +1271,12 @@ impl DaemonHandle for InProcessDaemon {
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
         let config_base = self.config.base_path().to_path_buf();
-        let _ = self.event_tx.send(DaemonEvent::CommandStarted { command_id: id, repo: repo_path.clone(), description });
+        let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            command_id: id,
+            host: self.host_name.clone(),
+            repo: repo_path.clone(),
+            description,
+        });
 
         // Spawn the entire build_plan + execution so execute() returns the
         // command_id immediately. This keeps the TUI event loop responsive —
@@ -1110,7 +1289,8 @@ impl DaemonHandle for InProcessDaemon {
             match plan {
                 ExecutionPlan::Immediate(result) => {
                     refresh_trigger.notify_one();
-                    let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
+                    let _ =
+                        event_tx.send(DaemonEvent::CommandFinished { command_id: id, host: command_host.clone(), repo: repo_path, result });
                 }
                 ExecutionPlan::Steps(step_plan) => {
                     // Reject if another step command is already running.
@@ -1122,6 +1302,7 @@ impl DaemonHandle for InProcessDaemon {
                         if let Some(active) = &*guard {
                             let _ = event_tx.send(DaemonEvent::CommandFinished {
                                 command_id: id,
+                                host: command_host.clone(),
                                 repo: repo_path,
                                 result: flotilla_protocol::CommandResult::Error {
                                     message: format!("another command is already running (id {})", active.command_id),
@@ -1132,13 +1313,13 @@ impl DaemonHandle for InProcessDaemon {
                         *guard = Some(ActiveCommand { command_id: id, token: token.clone() });
                     }
 
-                    let result = run_step_plan(step_plan, id, repo_path.clone(), token, event_tx.clone()).await;
+                    let result = run_step_plan(step_plan, id, command_host.clone(), repo_path.clone(), token, event_tx.clone()).await;
                     refresh_trigger.notify_one();
                     let mut guard = active_ref.lock().await;
                     if guard.as_ref().map(|a| a.command_id) == Some(id) {
                         *guard = None;
                     }
-                    let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, repo: repo_path, result });
+                    let _ = event_tx.send(DaemonEvent::CommandFinished { command_id: id, host: command_host, repo: repo_path, result });
                 }
             }
         });

@@ -2,7 +2,9 @@ use std::path::Path;
 
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
-use flotilla_protocol::{output::OutputFormat, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse};
+use flotilla_protocol::{
+    output::OutputFormat, Command, CommandResult, DaemonEvent, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse,
+};
 
 use crate::socket::SocketDaemon;
 
@@ -64,7 +66,11 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandResult) ->
     use flotilla_protocol::commands::CommandResult;
     match result {
         CommandResult::Ok => "ok".to_string(),
-        CommandResult::CheckoutCreated { branch } => format!("checkout created: {branch}"),
+        CommandResult::RepoAdded { path } => format!("repo added: {}", path.display()),
+        CommandResult::RepoRemoved { path } => format!("repo removed: {}", path.display()),
+        CommandResult::Refreshed { repos } => format!("refreshed {} repo(s)", repos.len()),
+        CommandResult::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
+        CommandResult::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
         CommandResult::BranchNameGenerated { name, .. } => format!("branch name: {name}"),
         CommandResult::CheckoutStatus(_) => "checkout status received".to_string(),
         CommandResult::Error { message } => format!("error: {message}"),
@@ -274,6 +280,51 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
     Ok(())
 }
 
+pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {
+    let mut rx = daemon.subscribe();
+    let command_id = daemon.execute(command).await?;
+
+    loop {
+        match rx.recv().await {
+            Ok(event @ DaemonEvent::CommandStarted { command_id: id, .. }) if id == command_id => {
+                if matches!(format, OutputFormat::Human) {
+                    println!("{}", format_event_human(&event));
+                }
+            }
+            Ok(event @ DaemonEvent::CommandStepUpdate { command_id: id, .. }) if id == command_id => {
+                if matches!(format, OutputFormat::Human) {
+                    println!("{}", format_event_human(&event));
+                }
+            }
+            Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
+                match format {
+                    OutputFormat::Human => {
+                        println!("{}", format_event_human(event));
+                    }
+                    OutputFormat::Json => {
+                        println!("{}", flotilla_protocol::output::json_pretty(&result));
+                    }
+                }
+                let result = result.clone();
+                return match result {
+                    CommandResult::Error { message } => Err(message),
+                    CommandResult::Cancelled => Err("command cancelled".into()),
+                    _ => Ok(()),
+                };
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                if matches!(format, OutputFormat::Human) {
+                    eprintln!("warning: skipped {n} events");
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return Err("daemon disconnected".into());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, path::PathBuf};
@@ -415,8 +466,12 @@ mod tests {
 
         #[test]
         fn command_started() {
-            let event =
-                DaemonEvent::CommandStarted { command_id: 1, repo: PathBuf::from("/tmp/my-repo"), description: "Refreshing...".into() };
+            let event = DaemonEvent::CommandStarted {
+                command_id: 1,
+                host: HostName::local(),
+                repo: PathBuf::from("/tmp/my-repo"),
+                description: "Refreshing...".into(),
+            };
             let line = format_event_human(&event);
             assert!(line.contains("[command]"), "should have command tag");
             assert!(line.contains("started"), "should say started");
@@ -425,7 +480,12 @@ mod tests {
 
         #[test]
         fn command_finished_ok() {
-            let event = DaemonEvent::CommandFinished { command_id: 1, repo: PathBuf::from("/tmp/my-repo"), result: CommandResult::Ok };
+            let event = DaemonEvent::CommandFinished {
+                command_id: 1,
+                host: HostName::local(),
+                repo: PathBuf::from("/tmp/my-repo"),
+                result: CommandResult::Ok,
+            };
             let line = format_event_human(&event);
             assert!(line.contains("[command]"), "should have command tag");
             assert!(line.contains("finished"), "should say finished");
@@ -436,6 +496,7 @@ mod tests {
         fn command_finished_error() {
             let event = DaemonEvent::CommandFinished {
                 command_id: 1,
+                host: HostName::local(),
                 repo: PathBuf::from("/tmp/my-repo"),
                 result: CommandResult::Error { message: "boom".into() },
             };
