@@ -2,7 +2,7 @@ mod support;
 
 use std::path::PathBuf;
 
-use flotilla_protocol::{ProviderData, SessionStatus};
+use flotilla_protocol::{HostName, HostPath, ProviderData, SessionStatus, WorkItemIdentity};
 use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, UiMode};
 use ratatui::style::Color;
 use support::*;
@@ -349,6 +349,7 @@ fn delete_confirm_safe_to_delete() {
         }),
         loading: false,
         terminal_keys: vec![],
+        identity: WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-cleanup"))),
     });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
@@ -368,6 +369,7 @@ fn delete_confirm_with_uncommitted_files() {
         }),
         loading: false,
         terminal_keys: vec![],
+        identity: WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-wip"))),
     });
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
@@ -387,6 +389,7 @@ fn delete_confirm_with_many_uncommitted_files() {
             base_detection_warning: None,
         }),
         loading: false,
+        identity: WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-big-wip"))),
         terminal_keys: vec![],
     });
     let output = harness.render_to_string();
