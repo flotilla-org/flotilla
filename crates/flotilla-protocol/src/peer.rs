@@ -364,16 +364,13 @@ mod tests {
                 assert_eq!(requester_host, HostName::new("workstation"));
                 assert_eq!(responder_host, HostName::new("feta"));
                 assert_eq!(remaining_hops, 5);
-                assert_eq!(
-                    *event,
-                    CommandPeerEvent::StepUpdate {
-                        repo: PathBuf::from("/repo"),
-                        step_index: 1,
-                        step_count: 3,
-                        description: "Creating worktree".into(),
-                        status: StepStatus::Started,
-                    }
-                );
+                assert_eq!(*event, CommandPeerEvent::StepUpdate {
+                    repo: PathBuf::from("/repo"),
+                    step_index: 1,
+                    step_count: 3,
+                    description: "Creating worktree".into(),
+                    status: StepStatus::Started,
+                });
             }
             other => panic!("expected CommandEvent, got {:?}", other),
         }

@@ -355,25 +355,22 @@ impl InProcessDaemon {
             let slug = repo_slug.clone();
             let mut model = RepoModel::new(path.clone(), registry, repo_slug);
             model.data.loading = true;
-            repos.insert(
-                path.clone(),
-                RepoState {
-                    model,
-                    slug,
-                    repo_bag,
-                    unmet,
-                    seq: 0,
-                    last_snapshot: Arc::new(RefreshSnapshot::default()),
-                    issue_cache: IssueCache::new(),
-                    search_results: None,
-                    issue_fetch_mutex: Arc::new(Mutex::new(())),
-                    last_broadcast_providers: ProviderData::default(),
-                    last_broadcast_health: HashMap::new(),
-                    last_broadcast_errors: Vec::new(),
-                    delta_log: VecDeque::new(),
-                    local_data_version: 0,
-                },
-            );
+            repos.insert(path.clone(), RepoState {
+                model,
+                slug,
+                repo_bag,
+                unmet,
+                seq: 0,
+                last_snapshot: Arc::new(RefreshSnapshot::default()),
+                issue_cache: IssueCache::new(),
+                search_results: None,
+                issue_fetch_mutex: Arc::new(Mutex::new(())),
+                last_broadcast_providers: ProviderData::default(),
+                last_broadcast_health: HashMap::new(),
+                last_broadcast_errors: Vec::new(),
+                delta_log: VecDeque::new(),
+                local_data_version: 0,
+            });
             order.push(path);
         }
 
@@ -992,25 +989,22 @@ impl InProcessDaemon {
             if repos.contains_key(&synthetic_path) {
                 return Ok(());
             }
-            repos.insert(
-                synthetic_path.clone(),
-                RepoState {
-                    model,
-                    slug: None,
-                    repo_bag: EnvironmentBag::new(),
-                    unmet: Vec::new(),
-                    seq: 0,
-                    last_snapshot: Arc::new(RefreshSnapshot::default()),
-                    issue_cache: IssueCache::new(),
-                    search_results: None,
-                    issue_fetch_mutex: Arc::new(Mutex::new(())),
-                    last_broadcast_providers: ProviderData::default(),
-                    last_broadcast_health: HashMap::new(),
-                    last_broadcast_errors: Vec::new(),
-                    delta_log: VecDeque::new(),
-                    local_data_version: 0,
-                },
-            );
+            repos.insert(synthetic_path.clone(), RepoState {
+                model,
+                slug: None,
+                repo_bag: EnvironmentBag::new(),
+                unmet: Vec::new(),
+                seq: 0,
+                last_snapshot: Arc::new(RefreshSnapshot::default()),
+                issue_cache: IssueCache::new(),
+                search_results: None,
+                issue_fetch_mutex: Arc::new(Mutex::new(())),
+                last_broadcast_providers: ProviderData::default(),
+                last_broadcast_health: HashMap::new(),
+                last_broadcast_errors: Vec::new(),
+                delta_log: VecDeque::new(),
+                local_data_version: 0,
+            });
             order.push(synthetic_path.clone());
         }
 
@@ -1426,25 +1420,22 @@ impl DaemonHandle for InProcessDaemon {
             if repos.contains_key(&path) {
                 return Ok(());
             }
-            repos.insert(
-                path.clone(),
-                RepoState {
-                    model,
-                    slug,
-                    repo_bag,
-                    unmet,
-                    seq: 0,
-                    last_snapshot: Arc::new(RefreshSnapshot::default()),
-                    issue_cache: IssueCache::new(),
-                    search_results: None,
-                    issue_fetch_mutex: Arc::new(Mutex::new(())),
-                    last_broadcast_providers: ProviderData::default(),
-                    last_broadcast_health: HashMap::new(),
-                    last_broadcast_errors: Vec::new(),
-                    delta_log: VecDeque::new(),
-                    local_data_version: 0,
-                },
-            );
+            repos.insert(path.clone(), RepoState {
+                model,
+                slug,
+                repo_bag,
+                unmet,
+                seq: 0,
+                last_snapshot: Arc::new(RefreshSnapshot::default()),
+                issue_cache: IssueCache::new(),
+                search_results: None,
+                issue_fetch_mutex: Arc::new(Mutex::new(())),
+                last_broadcast_providers: ProviderData::default(),
+                last_broadcast_health: HashMap::new(),
+                last_broadcast_errors: Vec::new(),
+                delta_log: VecDeque::new(),
+                local_data_version: 0,
+            });
             order.push(path.clone());
         }
 
@@ -1743,27 +1734,21 @@ mod tests {
         let base = ProviderData::default();
 
         let mut cache = IssueCache::new();
-        cache.add_pinned(vec![(
-            "1".into(),
-            Issue {
-                title: "cached".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )]);
+        cache.add_pinned(vec![("1".into(), Issue {
+            title: "cached".into(),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })]);
 
-        let search_results = Some(vec![(
-            "2".into(),
-            Issue {
-                title: "search".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )]);
+        let search_results = Some(vec![("2".into(), Issue {
+            title: "search".into(),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })]);
 
         let from_search = inject_issues(&base, &cache, &search_results);
         assert_eq!(from_search.issues.len(), 1);
@@ -1835,16 +1820,13 @@ mod tests {
         let mut cache = IssueCache::new();
         cache.total_count = Some(5);
         cache.has_more = true;
-        cache.add_pinned(vec![(
-            "9".into(),
-            Issue {
-                title: "cached issue".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )]);
+        cache.add_pinned(vec![("9".into(), Issue {
+            title: "cached issue".into(),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })]);
 
         let snap = build_repo_snapshot(Path::new("/tmp/repo"), 7, &RefreshSnapshot::default(), &cache, &None, &HostName::local());
         assert_eq!(snap.seq, 7);

@@ -134,10 +134,11 @@ impl GhApi for GhApiClient {
 
         if let Some(ref etag) = parsed.etag {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.insert(
-                endpoint.to_string(),
-                CacheEntry { etag: etag.clone(), body: parsed.body.clone(), has_next_page: parsed.has_next_page },
-            );
+            cache.insert(endpoint.to_string(), CacheEntry {
+                etag: etag.clone(),
+                body: parsed.body.clone(),
+                has_next_page: parsed.has_next_page,
+            });
         }
 
         Ok(parsed)

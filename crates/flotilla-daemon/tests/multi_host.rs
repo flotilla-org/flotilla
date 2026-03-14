@@ -410,19 +410,16 @@ fn merge_preserves_local_service_data_with_peer_checkouts() {
     let local_host = HostName::new("leader");
     let mut local = ProviderData::default();
     local.checkouts.insert(HostPath::new(local_host.clone(), "/home/dev/repo"), make_checkout("main"));
-    local.change_requests.insert(
-        "PR-42".into(),
-        ChangeRequest {
-            title: "Add feature".into(),
-            branch: "feature".into(),
-            status: ChangeRequestStatus::Open,
-            body: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        },
-    );
+    local.change_requests.insert("PR-42".into(), ChangeRequest {
+        title: "Add feature".into(),
+        branch: "feature".into(),
+        status: ChangeRequestStatus::Open,
+        body: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+        provider_name: String::new(),
+        provider_display_name: String::new(),
+    });
 
     // Follower only has checkouts (no service data — as expected in follower mode)
     let peer_host = HostName::new("follower");

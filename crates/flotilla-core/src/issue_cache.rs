@@ -114,16 +114,13 @@ mod tests {
     use super::*;
 
     fn issue(id: &str) -> (String, Issue) {
-        (
-            id.to_string(),
-            Issue {
-                title: format!("Issue {}", id),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        )
+        (id.to_string(), Issue {
+            title: format!("Issue {}", id),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        })
     }
 
     #[test]
@@ -177,16 +174,13 @@ mod tests {
 
         let changeset = IssueChangeset {
             updated: vec![
-                (
-                    "2".to_string(),
-                    Issue {
-                        title: "Updated Issue 2".to_string(),
-                        labels: vec!["changed".to_string()],
-                        association_keys: vec![],
-                        provider_name: String::new(),
-                        provider_display_name: String::new(),
-                    },
-                ),
+                ("2".to_string(), Issue {
+                    title: "Updated Issue 2".to_string(),
+                    labels: vec!["changed".to_string()],
+                    association_keys: vec![],
+                    provider_name: String::new(),
+                    provider_display_name: String::new(),
+                }),
                 issue("4"),
             ],
             closed_ids: vec!["3".to_string()],

@@ -30,14 +30,11 @@ impl GitCheckoutManager {
 
         let rendered = self
             .env
-            .render_str(
-                &self.config.path,
-                minijinja::context! {
-                    repo_path => repo_root.to_string_lossy(),
-                    repo => repo_name,
-                    branch => branch,
-                },
-            )
+            .render_str(&self.config.path, minijinja::context! {
+                repo_path => repo_root.to_string_lossy(),
+                repo => repo_name,
+                branch => branch,
+            })
             .map_err(|e| format!("failed to render worktree path: {e}"))?;
 
         let path = PathBuf::from(rendered.trim());
@@ -134,19 +131,16 @@ impl GitCheckoutManager {
             async { super::read_branch_issue_links(path, branch, &*self.runner).await },
         );
 
-        (
-            path.to_path_buf(),
-            Checkout {
-                branch: branch.to_string(),
-                is_main,
-                trunk_ahead_behind: trunk_ab,
-                remote_ahead_behind: remote_ab,
-                working_tree: wt_status,
-                last_commit: commit,
-                correlation_keys,
-                association_keys: issue_links,
-            },
-        )
+        (path.to_path_buf(), Checkout {
+            branch: branch.to_string(),
+            is_main,
+            trunk_ahead_behind: trunk_ab,
+            remote_ahead_behind: remote_ab,
+            working_tree: wt_status,
+            last_commit: commit,
+            correlation_keys,
+            association_keys: issue_links,
+        })
     }
 }
 

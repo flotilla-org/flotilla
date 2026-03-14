@@ -196,10 +196,11 @@ impl SshTransport {
             .await
             .map_err(|e| format!("failed to connect to forwarded socket {}: {e}", self.local_socket_path.display()))?;
 
-        flotilla_protocol::framing::write_message_line(
-            &mut stream,
-            &Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: self.local_host.clone(), session_id: self.local_session_id },
-        )
+        flotilla_protocol::framing::write_message_line(&mut stream, &Message::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            host_name: self.local_host.clone(),
+            session_id: self.local_session_id,
+        })
         .await?;
 
         let (read_half, write_half) = stream.into_split();

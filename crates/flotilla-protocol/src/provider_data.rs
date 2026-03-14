@@ -382,16 +382,13 @@ mod tests {
     #[test]
     fn issue_changeset_roundtrip() {
         let changeset = IssueChangeset {
-            updated: vec![(
-                "42".into(),
-                Issue {
-                    title: "Updated issue".into(),
-                    labels: vec!["bug".into()],
-                    association_keys: vec![],
-                    provider_name: String::new(),
-                    provider_display_name: String::new(),
-                },
-            )],
+            updated: vec![("42".into(), Issue {
+                title: "Updated issue".into(),
+                labels: vec!["bug".into()],
+                association_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            })],
             closed_ids: vec!["7".into(), "13".into()],
             has_more: false,
         };
@@ -405,45 +402,36 @@ mod tests {
     #[test]
     fn provider_data_roundtrip_and_preserves_indexmap_order() {
         let mut pd = ProviderData::default();
-        pd.change_requests.insert(
-            "3".into(),
-            ChangeRequest {
-                title: "Third".into(),
-                branch: "b3".into(),
-                status: ChangeRequestStatus::Open,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
-        pd.change_requests.insert(
-            "1".into(),
-            ChangeRequest {
-                title: "First".into(),
-                branch: "b1".into(),
-                status: ChangeRequestStatus::Draft,
-                body: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
-        );
-        pd.checkouts.insert(
-            hp("/repos/proj"),
-            Checkout {
-                branch: "main".into(),
-                is_main: true,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
-            },
-        );
+        pd.change_requests.insert("3".into(), ChangeRequest {
+            title: "Third".into(),
+            branch: "b3".into(),
+            status: ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
+        pd.change_requests.insert("1".into(), ChangeRequest {
+            title: "First".into(),
+            branch: "b1".into(),
+            status: ChangeRequestStatus::Draft,
+            body: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        });
+        pd.checkouts.insert(hp("/repos/proj"), Checkout {
+            branch: "main".into(),
+            is_main: true,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+        });
 
         assert_roundtrip(&pd);
 

@@ -94,16 +94,13 @@ fn action_menu() {
 fn config_screen() {
     let mut harness = TestHarness::single_repo("my-project")
         .with_mode(UiMode::Config)
-        .with_provider_names(
-            "my-project",
-            vec![
-                ("code_review", "GitHub"),
-                ("issue_tracker", "GitHub"),
-                ("vcs", "Git"),
-                ("checkout_manager", "Git Worktrees"),
-                ("cloud_agent", "Claude"),
-            ],
-        )
+        .with_provider_names("my-project", vec![
+            ("code_review", "GitHub"),
+            ("issue_tracker", "GitHub"),
+            ("vcs", "Git"),
+            ("checkout_manager", "Git Worktrees"),
+            ("cloud_agent", "Claude"),
+        ])
         .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok);
     let output = harness.render_to_string();
     assert!(output.contains(""));
@@ -326,11 +323,12 @@ fn issue_search_mode_status_bar() {
 fn file_picker_popup() {
     let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::FilePicker {
         input: Input::from("/test"),
-        dir_entries: vec![
-            picker_entry("repo-a", true, false),
-            picker_entry("repo-b", true, true),
-            flotilla_tui::app::DirEntry { name: "notes.txt".into(), is_dir: false, is_git_repo: false, is_added: false },
-        ],
+        dir_entries: vec![picker_entry("repo-a", true, false), picker_entry("repo-b", true, true), flotilla_tui::app::DirEntry {
+            name: "notes.txt".into(),
+            is_dir: false,
+            is_git_repo: false,
+            is_added: false,
+        }],
         selected: 1,
     });
     let output = harness.render_to_string();
@@ -398,10 +396,12 @@ fn delete_confirm_with_many_uncommitted_files() {
 #[test]
 fn providers_overlay() {
     let mut harness = TestHarness::single_repo("my-project")
-        .with_provider_names(
-            "my-project",
-            vec![("vcs", "Git"), ("checkout_manager", "Git Worktrees"), ("code_review", "GitHub"), ("cloud_agent", "Claude")],
-        )
+        .with_provider_names("my-project", vec![
+            ("vcs", "Git"),
+            ("checkout_manager", "Git Worktrees"),
+            ("code_review", "GitHub"),
+            ("cloud_agent", "Claude"),
+        ])
         .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok)
         .with_provider_status("my-project", "code_review", "GitHub", ProviderStatus::Error);
     let repo = harness.model.repo_order[0].clone();

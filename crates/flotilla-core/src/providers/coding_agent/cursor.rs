@@ -193,20 +193,17 @@ impl super::CloudAgentService for CursorCodingAgent {
                 }
                 let title = if a.name.is_empty() { a.id.clone() } else { a.name.clone() };
 
-                (
-                    a.id.clone(),
-                    CloudAgentSession {
-                        title,
-                        status: a.session_status(),
-                        model: None,
-                        // Cursor API has no updatedAt; createdAt is the best proxy.
-                        updated_at: if a.created_at.is_empty() { None } else { Some(a.created_at) },
-                        correlation_keys,
-                        provider_name: provider_name.clone(),
-                        provider_display_name: "Cursor".into(),
-                        item_noun: "Agent".into(),
-                    },
-                )
+                (a.id.clone(), CloudAgentSession {
+                    title,
+                    status: a.session_status(),
+                    model: None,
+                    // Cursor API has no updatedAt; createdAt is the best proxy.
+                    updated_at: if a.created_at.is_empty() { None } else { Some(a.created_at) },
+                    correlation_keys,
+                    provider_name: provider_name.clone(),
+                    provider_display_name: "Cursor".into(),
+                    item_noun: "Agent".into(),
+                })
             })
             .collect())
     }

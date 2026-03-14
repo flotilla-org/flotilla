@@ -69,25 +69,22 @@ impl WtWorktree {
         let path = self.path;
         let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), path.clone());
         let correlation_keys = vec![CorrelationKey::Branch(self.branch.clone()), CorrelationKey::CheckoutPath(host_path)];
-        (
-            path,
-            Checkout {
-                branch: self.branch,
-                is_main: self.is_main,
-                trunk_ahead_behind: self.main.map(|m| AheadBehind { ahead: m.ahead, behind: m.behind }),
-                remote_ahead_behind: self.remote.map(|r| AheadBehind { ahead: r.ahead, behind: r.behind }),
-                working_tree: self.working_tree.map(|w| WorkingTreeStatus {
-                    staged: if w.staged { 1 } else { 0 },
-                    modified: if w.modified { 1 } else { 0 },
-                    untracked: if w.untracked { 1 } else { 0 },
-                }),
-                last_commit: self
-                    .commit
-                    .map(|c| CommitInfo { short_sha: c.short_sha.unwrap_or_default(), message: c.message.unwrap_or_default() }),
-                correlation_keys,
-                association_keys: Vec::new(),
-            },
-        )
+        (path, Checkout {
+            branch: self.branch,
+            is_main: self.is_main,
+            trunk_ahead_behind: self.main.map(|m| AheadBehind { ahead: m.ahead, behind: m.behind }),
+            remote_ahead_behind: self.remote.map(|r| AheadBehind { ahead: r.ahead, behind: r.behind }),
+            working_tree: self.working_tree.map(|w| WorkingTreeStatus {
+                staged: if w.staged { 1 } else { 0 },
+                modified: if w.modified { 1 } else { 0 },
+                untracked: if w.untracked { 1 } else { 0 },
+            }),
+            last_commit: self
+                .commit
+                .map(|c| CommitInfo { short_sha: c.short_sha.unwrap_or_default(), message: c.message.unwrap_or_default() }),
+            correlation_keys,
+            association_keys: Vec::new(),
+        })
     }
 }
 

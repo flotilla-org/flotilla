@@ -285,10 +285,10 @@ mod tests {
 
         // Create state with a window entry
         let mut state = TmuxState::default();
-        state.windows.insert(
-            "my-window".to_string(),
-            WindowState { working_directory: "/tmp/work".to_string(), created_at: "1234567890".to_string() },
-        );
+        state.windows.insert("my-window".to_string(), WindowState {
+            working_directory: "/tmp/work".to_string(),
+            created_at: "1234567890".to_string(),
+        });
 
         // Save manually (since state_path uses dirs::config_dir)
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
@@ -316,10 +316,10 @@ mod tests {
     #[test]
     fn state_serialization_format() {
         let mut state = TmuxState::default();
-        state.windows.insert(
-            "feat-branch".to_string(),
-            WindowState { working_directory: "/home/user/project".to_string(), created_at: "1000".to_string() },
-        );
+        state.windows.insert("feat-branch".to_string(), WindowState {
+            working_directory: "/home/user/project".to_string(),
+            created_at: "1000".to_string(),
+        });
         let serialized = toml::to_string(&state).unwrap();
         assert!(serialized.contains("[windows.feat-branch]"));
         assert!(serialized.contains("working_directory"));

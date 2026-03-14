@@ -619,10 +619,9 @@ mod tests {
             "github".to_string(),
             (
                 desc("github"),
-                Arc::new(MockCodeReview::ok(
-                    vec![("42".to_string(), make_change_request("Add feature", "feat-a"))],
-                    vec!["shared".to_string()],
-                )),
+                Arc::new(MockCodeReview::ok(vec![("42".to_string(), make_change_request("Add feature", "feat-a"))], vec![
+                    "shared".to_string()
+                ])),
             ),
         );
         registry.cloud_agents.insert(

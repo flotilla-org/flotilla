@@ -855,19 +855,16 @@ mod tests {
     impl MockCheckoutManager {
         fn succeeding(branch: &str, path: &str) -> Self {
             Self {
-                create_result: tokio::sync::Mutex::new(Some(Ok((
-                    PathBuf::from(path),
-                    Checkout {
-                        branch: branch.to_string(),
-                        is_main: false,
-                        trunk_ahead_behind: None,
-                        remote_ahead_behind: None,
-                        working_tree: None,
-                        last_commit: None,
-                        correlation_keys: vec![],
-                        association_keys: vec![],
-                    },
-                )))),
+                create_result: tokio::sync::Mutex::new(Some(Ok((PathBuf::from(path), Checkout {
+                    branch: branch.to_string(),
+                    is_main: false,
+                    trunk_ahead_behind: None,
+                    remote_ahead_behind: None,
+                    working_tree: None,
+                    last_commit: None,
+                    correlation_keys: vec![],
+                    association_keys: vec![],
+                })))),
                 remove_result: tokio::sync::Mutex::new(Some(Ok(()))),
             }
         }

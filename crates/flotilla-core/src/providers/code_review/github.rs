@@ -87,19 +87,16 @@ impl GitHubCodeReview {
         let status =
             if pr.state.to_uppercase() == "OPEN" && pr.is_draft { ChangeRequestStatus::Draft } else { Self::parse_state(&pr.state) };
 
-        (
-            id,
-            ChangeRequest {
-                title: pr.title.clone(),
-                branch: pr.head_ref_name.clone(),
-                status,
-                body: pr.body.clone(),
-                correlation_keys,
-                association_keys,
-                provider_name: self.provider_name.clone(),
-                provider_display_name: "GitHub".into(),
-            },
-        )
+        (id, ChangeRequest {
+            title: pr.title.clone(),
+            branch: pr.head_ref_name.clone(),
+            status,
+            body: pr.body.clone(),
+            correlation_keys,
+            association_keys,
+            provider_name: self.provider_name.clone(),
+            provider_display_name: "GitHub".into(),
+        })
     }
 }
 

@@ -1339,10 +1339,9 @@ mod tests {
     #[test]
     fn correlate_remote_branches_appear_as_standalone() {
         let mut providers = new_providers();
-        providers.branches.insert(
-            "feature/remote-only".to_string(),
-            flotilla_protocol::delta::Branch { status: flotilla_protocol::BranchStatus::Remote },
-        );
+        providers.branches.insert("feature/remote-only".to_string(), flotilla_protocol::delta::Branch {
+            status: flotilla_protocol::BranchStatus::Remote,
+        });
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
@@ -1586,15 +1585,12 @@ mod tests {
         let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
 
         let branches = item_branches(&result.table_entries);
-        assert_eq!(
-            branches,
-            vec![
-                Some("main".to_string()),     // main always first
-                Some("a-branch".to_string()), // then by path ascending
-                Some("m-branch".to_string()),
-                Some("z-branch".to_string()),
-            ]
-        );
+        assert_eq!(branches, vec![
+            Some("main".to_string()),     // main always first
+            Some("a-branch".to_string()), // then by path ascending
+            Some("m-branch".to_string()),
+            Some("z-branch".to_string()),
+        ]);
     }
 
     #[test]
@@ -1615,15 +1611,12 @@ mod tests {
         let result = group_work_items(&items, &providers, &labels, repo_root);
 
         let branches = item_branches(&result.table_entries);
-        assert_eq!(
-            branches,
-            vec![
-                Some("main".to_string()),           // main always first
-                Some("checkout-order".to_string()), // siblings next
-                Some("low-hang-13".to_string()),
-                Some("codex-detached".to_string()), // external worktrees last
-            ]
-        );
+        assert_eq!(branches, vec![
+            Some("main".to_string()),           // main always first
+            Some("checkout-order".to_string()), // siblings next
+            Some("low-hang-13".to_string()),
+            Some("codex-detached".to_string()), // external worktrees last
+        ]);
     }
 
     #[test]
@@ -1720,45 +1713,36 @@ mod tests {
     fn group_work_items_sessions_sorted_by_updated_at_descending() {
         let mut providers = new_providers();
         // Populate providers with sessions that have updated_at
-        providers.sessions.insert(
-            "s-old".to_string(),
-            CloudAgentSession {
-                title: "Old".to_string(),
-                status: SessionStatus::Idle,
-                model: None,
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        );
-        providers.sessions.insert(
-            "s-new".to_string(),
-            CloudAgentSession {
-                title: "New".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-03-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        );
-        providers.sessions.insert(
-            "s-mid".to_string(),
-            CloudAgentSession {
-                title: "Mid".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-02-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        );
+        providers.sessions.insert("s-old".to_string(), CloudAgentSession {
+            title: "Old".to_string(),
+            status: SessionStatus::Idle,
+            model: None,
+            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
+        providers.sessions.insert("s-new".to_string(), CloudAgentSession {
+            title: "New".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-03-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
+        providers.sessions.insert("s-mid".to_string(), CloudAgentSession {
+            title: "Mid".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-02-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
 
         let labels = default_labels();
         let si1 = to_proto(&session_item("s-old", "Old"));
@@ -1775,45 +1759,36 @@ mod tests {
     #[test]
     fn group_work_items_sessions_grouped_by_provider_then_time() {
         let mut providers = new_providers();
-        providers.sessions.insert(
-            "s-claude-old".to_string(),
-            CloudAgentSession {
-                title: "Claude Old".to_string(),
-                status: SessionStatus::Idle,
-                model: None,
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: "claude".to_string(),
-                provider_display_name: "Claude".to_string(),
-                item_noun: "Agent".to_string(),
-            },
-        );
-        providers.sessions.insert(
-            "s-codex-new".to_string(),
-            CloudAgentSession {
-                title: "Codex New".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-03-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: "codex".to_string(),
-                provider_display_name: "Codex".to_string(),
-                item_noun: "Task".to_string(),
-            },
-        );
-        providers.sessions.insert(
-            "s-claude-new".to_string(),
-            CloudAgentSession {
-                title: "Claude New".to_string(),
-                status: SessionStatus::Running,
-                model: None,
-                updated_at: Some("2026-02-01T00:00:00Z".to_string()),
-                correlation_keys: vec![],
-                provider_name: "claude".to_string(),
-                provider_display_name: "Claude".to_string(),
-                item_noun: "Agent".to_string(),
-            },
-        );
+        providers.sessions.insert("s-claude-old".to_string(), CloudAgentSession {
+            title: "Claude Old".to_string(),
+            status: SessionStatus::Idle,
+            model: None,
+            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: "claude".to_string(),
+            provider_display_name: "Claude".to_string(),
+            item_noun: "Agent".to_string(),
+        });
+        providers.sessions.insert("s-codex-new".to_string(), CloudAgentSession {
+            title: "Codex New".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-03-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: "codex".to_string(),
+            provider_display_name: "Codex".to_string(),
+            item_noun: "Task".to_string(),
+        });
+        providers.sessions.insert("s-claude-new".to_string(), CloudAgentSession {
+            title: "Claude New".to_string(),
+            status: SessionStatus::Running,
+            model: None,
+            updated_at: Some("2026-02-01T00:00:00Z".to_string()),
+            correlation_keys: vec![],
+            provider_name: "claude".to_string(),
+            provider_display_name: "Claude".to_string(),
+            item_noun: "Agent".to_string(),
+        });
 
         let labels = default_labels();
         let items = vec![
@@ -1933,16 +1908,13 @@ mod tests {
 
         let terminal_id = flotilla_protocol::ManagedTerminalId { checkout: "feat-term".to_string(), role: "dev".to_string(), index: 0 };
         let terminal_key = terminal_id.to_string();
-        providers.managed_terminals.insert(
-            terminal_key.clone(),
-            flotilla_protocol::ManagedTerminal {
-                id: terminal_id.clone(),
-                role: "dev".to_string(),
-                command: "bash".to_string(),
-                working_directory: PathBuf::from("/tmp/feat-term"),
-                status: flotilla_protocol::TerminalStatus::Running,
-            },
-        );
+        providers.managed_terminals.insert(terminal_key.clone(), flotilla_protocol::ManagedTerminal {
+            id: terminal_id.clone(),
+            role: "dev".to_string(),
+            command: "bash".to_string(),
+            working_directory: PathBuf::from("/tmp/feat-term"),
+            status: flotilla_protocol::TerminalStatus::Running,
+        });
 
         let (items, _) = correlate(&providers);
 

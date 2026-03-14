@@ -177,8 +177,7 @@ pub struct CheckoutStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::assert_json_roundtrip;
-    use crate::HostName;
+    use crate::{test_helpers::assert_json_roundtrip, HostName};
 
     #[test]
     fn command_roundtrip_covers_all_variants() {
@@ -334,12 +333,9 @@ mod tests {
     fn step_status_roundtrip() {
         use crate::test_helpers::assert_roundtrip;
 
-        let cases = vec![
-            StepStatus::Skipped,
-            StepStatus::Started,
-            StepStatus::Succeeded,
-            StepStatus::Failed { message: "workspace creation failed".into() },
-        ];
+        let cases = vec![StepStatus::Skipped, StepStatus::Started, StepStatus::Succeeded, StepStatus::Failed {
+            message: "workspace creation failed".into(),
+        }];
         for case in cases {
             assert_roundtrip(&case);
         }

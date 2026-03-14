@@ -378,10 +378,10 @@ mod tests {
 
     #[test]
     fn checkout_ref_roundtrip_covers_both_boolean_values() {
-        let cases = vec![
-            CheckoutRef { key: hp("/repos/proj/wt-1"), is_main_checkout: true },
-            CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false },
-        ];
+        let cases = vec![CheckoutRef { key: hp("/repos/proj/wt-1"), is_main_checkout: true }, CheckoutRef {
+            key: hp("/tmp/wt"),
+            is_main_checkout: false,
+        }];
         for case in &cases {
             let json = serde_json::to_string(case).expect("serialize");
             let decoded: CheckoutRef = serde_json::from_str(&json).expect("deserialize");

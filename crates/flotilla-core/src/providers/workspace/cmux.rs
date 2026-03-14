@@ -272,14 +272,14 @@ mod tests {
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[0].0, "workspace:10");
         assert_eq!(workspaces[1].0, "workspace:11");
-        assert_eq!(
-            workspaces[0].1.correlation_keys,
-            vec![CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), "/tmp/repo-a"))]
-        );
-        assert_eq!(
-            workspaces[1].1.correlation_keys,
-            vec![CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), "/tmp/repo-b"))]
-        );
+        assert_eq!(workspaces[0].1.correlation_keys, vec![CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
+            flotilla_protocol::HostName::local(),
+            "/tmp/repo-a"
+        ))]);
+        assert_eq!(workspaces[1].1.correlation_keys, vec![CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
+            flotilla_protocol::HostName::local(),
+            "/tmp/repo-b"
+        ))]);
     }
 
     #[tokio::test]

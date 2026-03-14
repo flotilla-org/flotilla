@@ -480,10 +480,10 @@ mod tests {
     #[test]
     fn apply_added_then_removed() {
         let mut pd = ProviderData::default();
-        let changes = vec![
-            Change::Issue { key: "1".into(), op: EntryOp::Added(issue("task")) },
-            Change::Issue { key: "1".into(), op: EntryOp::Removed },
-        ];
+        let changes = vec![Change::Issue { key: "1".into(), op: EntryOp::Added(issue("task")) }, Change::Issue {
+            key: "1".into(),
+            op: EntryOp::Removed,
+        }];
         apply_changes(&mut pd, changes);
         assert!(pd.issues.is_empty());
     }

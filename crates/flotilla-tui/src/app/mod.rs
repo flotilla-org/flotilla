@@ -116,21 +116,18 @@ impl TuiModel {
         let mut repos = HashMap::new();
         let mut order = Vec::new();
         for info in repos_info {
-            repos.insert(
-                info.path.clone(),
-                TuiRepoModel {
-                    providers: Arc::new(ProviderData::default()),
-                    labels: info.labels,
-                    provider_names: info.provider_names,
-                    provider_health: info.provider_health,
-                    loading: info.loading,
-                    issue_has_more: false,
-                    issue_total: None,
-                    issue_search_active: false,
-                    issue_fetch_pending: false,
-                    issue_initial_requested: false,
-                },
-            );
+            repos.insert(info.path.clone(), TuiRepoModel {
+                providers: Arc::new(ProviderData::default()),
+                labels: info.labels,
+                provider_names: info.provider_names,
+                provider_health: info.provider_health,
+                loading: info.loading,
+                issue_has_more: false,
+                issue_total: None,
+                issue_search_active: false,
+                issue_fetch_pending: false,
+                issue_initial_requested: false,
+            });
             order.push(info.path);
         }
         Self {
@@ -503,21 +500,18 @@ impl App {
         if self.model.repos.contains_key(&path) {
             return;
         }
-        self.model.repos.insert(
-            path.clone(),
-            TuiRepoModel {
-                providers: Arc::new(ProviderData::default()),
-                labels: info.labels,
-                provider_names: info.provider_names,
-                provider_health: info.provider_health,
-                loading: info.loading,
-                issue_has_more: false,
-                issue_total: None,
-                issue_search_active: false,
-                issue_fetch_pending: false,
-                issue_initial_requested: false,
-            },
-        );
+        self.model.repos.insert(path.clone(), TuiRepoModel {
+            providers: Arc::new(ProviderData::default()),
+            labels: info.labels,
+            provider_names: info.provider_names,
+            provider_health: info.provider_health,
+            loading: info.loading,
+            issue_has_more: false,
+            issue_total: None,
+            issue_search_active: false,
+            issue_fetch_pending: false,
+            issue_initial_requested: false,
+        });
         self.model.repo_order.push(path.clone());
         self.ui.repo_ui.insert(path, RepoUiState::default());
     }
@@ -815,10 +809,10 @@ mod tests {
         app.set_status_message(Some("boom".into()));
         app.model.peer_hosts = vec![PeerHostStatus { name: flotilla_protocol::HostName::new("host-a"), status: PeerStatus::Disconnected }];
 
-        assert_eq!(
-            app.visible_status_items(),
-            vec![VisibleStatusItem { id: 0, text: "ERROR boom".into() }, VisibleStatusItem { id: 1, text: "HOST DOWN host-a".into() },]
-        );
+        assert_eq!(app.visible_status_items(), vec![VisibleStatusItem { id: 0, text: "ERROR boom".into() }, VisibleStatusItem {
+            id: 1,
+            text: "HOST DOWN host-a".into()
+        },]);
     }
 
     #[test]
@@ -921,14 +915,11 @@ mod tests {
         let mut app = stub_app();
         let repo = active_repo_path(&app);
 
-        let change = delta(
-            &repo,
-            vec![flotilla_protocol::Change::ProviderHealth {
-                category: "vcs".into(),
-                provider: "git".into(),
-                op: flotilla_protocol::EntryOp::Added(true),
-            }],
-        );
+        let change = delta(&repo, vec![flotilla_protocol::Change::ProviderHealth {
+            category: "vcs".into(),
+            provider: "git".into(),
+            op: flotilla_protocol::EntryOp::Added(true),
+        }]);
         app.apply_delta(change);
 
         assert_eq!(app.model.provider_statuses[&(repo.clone(), "vcs".into(), "git".into())], ProviderStatus::Ok,);
@@ -942,14 +933,11 @@ mod tests {
 
         app.model.repos.get_mut(&repo).unwrap().provider_health.entry("vcs".into()).or_default().insert("git".into(), true);
 
-        let change = delta(
-            &repo,
-            vec![flotilla_protocol::Change::ProviderHealth {
-                category: "vcs".into(),
-                provider: "git".into(),
-                op: flotilla_protocol::EntryOp::Removed,
-            }],
-        );
+        let change = delta(&repo, vec![flotilla_protocol::Change::ProviderHealth {
+            category: "vcs".into(),
+            provider: "git".into(),
+            op: flotilla_protocol::EntryOp::Removed,
+        }]);
         app.apply_delta(change);
 
         assert!(!app.model.repos[&repo].provider_health.contains_key("vcs"));
@@ -971,22 +959,19 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         let inactive_repo = app.model.repo_order[1].clone();
 
-        let change = delta(
-            &inactive_repo,
-            vec![flotilla_protocol::Change::Session {
-                key: "s1".into(),
-                op: flotilla_protocol::EntryOp::Added(flotilla_protocol::CloudAgentSession {
-                    title: "new session".into(),
-                    status: flotilla_protocol::SessionStatus::Running,
-                    model: None,
-                    updated_at: None,
-                    correlation_keys: vec![],
-                    provider_name: String::new(),
-                    provider_display_name: String::new(),
-                    item_noun: String::new(),
-                }),
-            }],
-        );
+        let change = delta(&inactive_repo, vec![flotilla_protocol::Change::Session {
+            key: "s1".into(),
+            op: flotilla_protocol::EntryOp::Added(flotilla_protocol::CloudAgentSession {
+                title: "new session".into(),
+                status: flotilla_protocol::SessionStatus::Running,
+                model: None,
+                updated_at: None,
+                correlation_keys: vec![],
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
+            }),
+        }]);
         app.apply_delta(change);
 
         assert!(app.ui.repo_ui[&inactive_repo].has_unseen_changes);
@@ -997,14 +982,11 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         let inactive_repo = app.model.repo_order[1].clone();
 
-        let change = delta(
-            &inactive_repo,
-            vec![flotilla_protocol::Change::ProviderHealth {
-                category: "vcs".into(),
-                provider: "git".into(),
-                op: flotilla_protocol::EntryOp::Added(true),
-            }],
-        );
+        let change = delta(&inactive_repo, vec![flotilla_protocol::Change::ProviderHealth {
+            category: "vcs".into(),
+            provider: "git".into(),
+            op: flotilla_protocol::EntryOp::Added(true),
+        }]);
         app.apply_delta(change);
 
         assert!(!app.ui.repo_ui[&inactive_repo].has_unseen_changes);

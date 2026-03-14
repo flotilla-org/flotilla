@@ -1290,14 +1290,11 @@ async fn handle_client(
                 return;
             }
 
-            if write_message(
-                &writer,
-                &Message::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                    host_name: daemon.host_name().clone(),
-                    session_id: daemon.session_id(),
-                },
-            )
+            if write_message(&writer, &Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                host_name: daemon.host_name().clone(),
+                session_id: daemon.session_id(),
+            })
             .await
             .is_err()
             {
@@ -1450,10 +1447,11 @@ async fn dispatch_request(
                     pm.next_request_id()
                 };
                 let command_id = next_remote_command_id.fetch_add(1, Ordering::Relaxed);
-                pending_remote_commands
-                    .lock()
-                    .await
-                    .insert(request_id, PendingRemoteCommand { command_id, repo: None, finished_via_event: false });
+                pending_remote_commands.lock().await.insert(request_id, PendingRemoteCommand {
+                    command_id,
+                    repo: None,
+                    finished_via_event: false,
+                });
 
                 let routed = RoutedPeerMessage::CommandRequest {
                     request_id,
@@ -1838,10 +1836,11 @@ mod tests {
             PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_host, target_host, command, .. }) => {
                 assert_eq!(requester_host, daemon.host_name());
                 assert_eq!(target_host, &HostName::new("feta"));
-                assert_eq!(
-                    command.as_ref(),
-                    &Command { host: Some(HostName::new("feta")), context_repo: None, action: CommandAction::Refresh { repo: None } }
-                );
+                assert_eq!(command.as_ref(), &Command {
+                    host: Some(HostName::new("feta")),
+                    context_repo: None,
+                    action: CommandAction::Refresh { repo: None }
+                });
             }
             other => panic!("expected routed command request, got {other:?}"),
         }
@@ -1947,10 +1946,10 @@ mod tests {
             .collect();
         statuses.sort_by(|a, b| a.0.cmp(&b.0));
 
-        assert_eq!(
-            statuses,
-            vec![(HostName::new("feta"), PeerConnectionState::Disconnected), (HostName::new("udder"), PeerConnectionState::Disconnected),]
-        );
+        assert_eq!(statuses, vec![
+            (HostName::new("feta"), PeerConnectionState::Disconnected),
+            (HostName::new("udder"), PeerConnectionState::Disconnected),
+        ]);
     }
 
     fn test_peer_msg(host: &str) -> PeerDataMessage {
@@ -2361,31 +2360,16 @@ mod tests {
         };
         daemon.add_virtual_repo(synthetic.clone(), merged).await.expect("add virtual repo");
         daemon
-            .set_peer_providers(
-                &synthetic,
-                vec![
-                    (
-                        HostName::new("peer-a"),
-                        ProviderData {
-                            checkouts: IndexMap::from([(
-                                HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"),
-                                checkout("feature-a"),
-                            )]),
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        HostName::new("peer-b"),
-                        ProviderData {
-                            checkouts: IndexMap::from([(
-                                HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"),
-                                checkout("feature-b"),
-                            )]),
-                            ..Default::default()
-                        },
-                    ),
-                ],
-            )
+            .set_peer_providers(&synthetic, vec![
+                (HostName::new("peer-a"), ProviderData {
+                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
+                    ..Default::default()
+                }),
+                (HostName::new("peer-b"), ProviderData {
+                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"), checkout("feature-b"))]),
+                    ..Default::default()
+                }),
+            ])
             .await;
         {
             let mut pm = peer_manager.lock().await;
