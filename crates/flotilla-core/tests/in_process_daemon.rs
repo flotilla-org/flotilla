@@ -337,6 +337,7 @@ async fn remove_checkout_command_accepts_selector_queries() {
 #[tokio::test]
 async fn fetch_checkout_status_uses_context_repo_when_checkout_path_is_absent() {
     let (repo, daemon) = daemon_for_cwd().await;
+    let mut rx = daemon.subscribe();
 
     let command = Command {
         host: None,
@@ -345,7 +346,20 @@ async fn fetch_checkout_status_uses_context_repo_when_checkout_path_is_absent() 
     };
 
     let command_id = daemon.execute(command).await.expect("status command should resolve via context repo");
-    assert_ne!(command_id, 0, "status command should execute through the normal command path");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: finished_id, result, .. }) if finished_id == command_id => break result,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for checkout status command to finish");
+
+    assert!(matches!(result, CommandResult::CheckoutStatus(_)), "expected checkout status result via context repo, got {result:?}");
 }
 
 #[tokio::test]
