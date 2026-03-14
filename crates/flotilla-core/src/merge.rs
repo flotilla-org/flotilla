@@ -2,24 +2,30 @@ use flotilla_protocol::{HostName, ProviderData};
 
 /// Merge local ProviderData with peer data from remote hosts.
 ///
-/// Host-scoped data (checkouts, managed terminals) is combined from all hosts.
-/// Checkouts already carry HostPath keys, so no additional namespacing is needed.
-/// Terminal names are prefixed with the peer host name to avoid collisions.
+/// Host-scoped data is merged with ownership-aware rules:
+/// - checkouts are accepted only from the host that owns the `HostPath`
+/// - local-host checkouts are never overwritten by peer data
+/// - managed terminals and workspaces are namespaced by peer host to avoid collisions
 ///
 /// Service-level data (change_requests, issues, sessions) comes only
 /// from the leader — followers don't poll external APIs, so there are no
 /// duplicates to reconcile. If a peer does send service-level data (e.g. the
 /// leader relaying its own data), we include it.
-pub fn merge_provider_data(
-    local: &ProviderData,
-    _local_host: &HostName, // reserved: Phase 2 will use for conflict resolution
-    peers: &[(HostName, &ProviderData)],
-) -> ProviderData {
+pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &[(HostName, &ProviderData)]) -> ProviderData {
     let mut merged = local.clone();
 
     for (peer_host, peer_data) in peers {
-        // Merge checkouts — HostPath keys already carry the peer's host
+        // Merge checkouts by host ownership.
+        // - local host paths are authoritative locally, so peer data must not
+        //   overwrite them
+        // - peer-owned host paths are only accepted from that owning peer
         for (host_path, checkout) in &peer_data.checkouts {
+            if &host_path.host == local_host {
+                continue;
+            }
+            if &host_path.host != peer_host {
+                continue;
+            }
             merged.checkouts.insert(host_path.clone(), checkout.clone());
         }
 
@@ -43,8 +49,8 @@ pub fn merge_provider_data(
         }
 
         // Service-level data (PRs, issues, sessions) comes only from leader.
-        // Followers don't poll external APIs so their maps are empty — no
-        // conflict. We merge unconditionally so followers see leader's data.
+        // Followers don't poll external APIs so their maps are normally empty.
+        // Local entries stay authoritative; peer data only fills gaps.
         for (key, cr) in &peer_data.change_requests {
             merged.change_requests.entry(key.clone()).or_insert_with(|| cr.clone());
         }

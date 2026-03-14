@@ -275,6 +275,54 @@ async fn daemon_snapshot_has_correct_host_attribution() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 4b: Leader snapshot rebuild includes follower checkout overlay
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn daemon_snapshot_includes_follower_checkout_overlay() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().to_path_buf();
+    std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
+
+    let follower_host = HostName::new("follower");
+    let follower_checkout = HostPath::new(follower_host.clone(), "/remote/repo");
+
+    daemon.refresh(&repo).await.expect("refresh");
+    let baseline = daemon.get_state(&repo).await.expect("baseline get_state");
+    assert!(
+        baseline.work_items.iter().all(|item| item.checkout_key() != Some(&follower_checkout)),
+        "baseline snapshot should not already contain follower overlay data"
+    );
+
+    let mut follower_data = ProviderData::default();
+    follower_data.checkouts.insert(follower_checkout.clone(), make_checkout("feature-x"));
+
+    // `set_peer_providers` updates the overlay and rebuilds the snapshot synchronously,
+    // so `get_state` can assert on the merged view immediately.
+    daemon.set_peer_providers(&repo, vec![(follower_host.clone(), follower_data)]).await;
+
+    let snapshot = daemon.get_state(&repo).await.expect("get_state");
+
+    assert!(
+        snapshot.providers.checkouts.contains_key(&follower_checkout),
+        "rebuilt snapshot should include the follower checkout in provider data"
+    );
+
+    let checkout_items: Vec<_> = snapshot.work_items.iter().filter_map(|item| item.checkout_key().map(|key| (item, key))).collect();
+    assert!(
+        checkout_items.iter().any(|(_, key)| *key == &follower_checkout),
+        "expected follower checkout work item in snapshot: {:?}",
+        snapshot.work_items
+    );
+
+    let item = checkout_items.iter().find_map(|(item, key)| (*key == &follower_checkout).then_some(*item)).expect("follower checkout item");
+    assert_eq!(item.host, follower_host);
+}
+
+// ---------------------------------------------------------------------------
 // Test 5: Peer data relay excludes origin
 // ---------------------------------------------------------------------------
 

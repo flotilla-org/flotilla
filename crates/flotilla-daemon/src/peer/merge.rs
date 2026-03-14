@@ -131,14 +131,40 @@ mod tests {
     }
 
     #[test]
+    fn merge_local_checkout_wins_for_same_local_host_path() {
+        let local_host = HostName::new("laptop");
+        let host_path = HostPath::new(local_host.clone(), "/repo");
+        let local = ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("main"))]), ..Default::default() };
+        let remote =
+            ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("stale-peer-view"))]), ..Default::default() };
+
+        let merged = merge_provider_data(&local, &local_host, &[(HostName::new("desktop"), &remote)]);
+
+        assert_eq!(merged.checkouts.len(), 1);
+        assert_eq!(merged.checkouts[&host_path].branch, "main");
+    }
+
+    #[test]
     fn merge_peer_checkout_overwrites_same_host_path() {
-        // If a peer sends updated checkout data for the same HostPath,
-        // the peer's version should overwrite the local one.
+        // For a peer-owned HostPath, an updated snapshot from that owning peer
+        // should overwrite any stale locally cached copy of the same path.
         let host_path = HostPath::new(HostName::new("desktop"), "/repo");
         let local = ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("old-branch"))]), ..Default::default() };
         let remote = ProviderData { checkouts: IndexMap::from([(host_path.clone(), make_checkout("new-branch"))]), ..Default::default() };
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.checkouts.len(), 1);
         assert_eq!(merged.checkouts[&host_path].branch, "new-branch");
+    }
+
+    #[test]
+    fn merge_drops_checkout_claimed_for_third_party_host() {
+        let local = ProviderData::default();
+        let spoofed_path = HostPath::new(HostName::new("server"), "/repo");
+        let remote =
+            ProviderData { checkouts: IndexMap::from([(spoofed_path.clone(), make_checkout("spoofed-branch"))]), ..Default::default() };
+
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
+
+        assert!(!merged.checkouts.contains_key(&spoofed_path), "peer-owned merge should reject checkout data for a third-party host path");
     }
 }
