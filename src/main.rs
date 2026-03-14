@@ -158,6 +158,8 @@ async fn run_tui(cli: Cli) -> Result<()> {
     // Mouse capture is enabled AFTER the splash so mouse events don't cut it short.
     let mut terminal = ratatui::init();
     flotilla_tui::terminal::install_panic_hook();
+    #[cfg(unix)]
+    flotilla_tui::terminal::install_sigterm_handler();
 
     // Resolve repos before splash (fast — just reads config files).
     let embedded = cli.embedded;

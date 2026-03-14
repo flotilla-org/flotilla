@@ -23,6 +23,22 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Spawn a background task that listens for SIGTERM and cleanly exits.
+///
+/// Must be called after `ratatui::init()` within a tokio runtime.
+/// Covers the entire process lifetime — including the startup window
+/// before the event loop begins.
+#[cfg(unix)]
+pub fn install_sigterm_handler() {
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    tokio::spawn(async move {
+        sigterm.recv().await;
+        restore_terminal();
+        std::process::exit(0);
+    });
+}
+
 /// Suspend the process (Ctrl-Z / SIGTSTP).
 ///
 /// Restores the terminal to its original state, delivers SIGTSTP to the
@@ -32,17 +48,18 @@ pub fn install_panic_hook() {
 /// Returns the new [`ratatui::DefaultTerminal`] — callers must replace
 /// their existing terminal binding with this value.
 #[cfg(unix)]
-pub fn suspend_and_resume() -> std::io::Result<ratatui::DefaultTerminal> {
+pub fn suspend_and_resume() -> ratatui::DefaultTerminal {
     use crossterm::{event::EnableMouseCapture, execute};
 
     restore_terminal();
     // SAFETY: kill(0, SIGTSTP) sends the signal to the entire process group.
     // The process suspends at this point and resumes on SIGCONT.
-    unsafe {
-        libc::kill(0, libc::SIGTSTP);
+    let rc = unsafe { libc::kill(0, libc::SIGTSTP) };
+    if rc == -1 {
+        tracing::warn!(err = %std::io::Error::last_os_error(), "SIGTSTP delivery failed");
     }
     // Resumed — re-initialise terminal
     let terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture)?;
-    Ok(terminal)
+    let _ = execute!(stdout(), EnableMouseCapture);
+    terminal
 }

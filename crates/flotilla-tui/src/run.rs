@@ -89,10 +89,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     // Ctrl-Z: suspend/resume (unix only)
                     #[cfg(unix)]
                     if k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL) {
-                        match crate::terminal::suspend_and_resume() {
-                            Ok(new_terminal) => terminal = new_terminal,
-                            Err(e) => tracing::warn!(err = %e, "suspend/resume failed"),
-                        }
+                        terminal = crate::terminal::suspend_and_resume();
                         continue;
                     }
 
@@ -205,9 +202,6 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     }
                 }
                 Event::Tick => {} // already filtered out
-                Event::Signal => {
-                    app.should_quit = true;
-                }
             }
         }
 
