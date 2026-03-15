@@ -80,22 +80,28 @@ impl<T: ?Sized> ProviderSet<T> {
     }
 
     /// Reorder so that the first entry whose descriptor.backend matches is first.
-    /// No-op if no entry matches.
-    pub fn prefer_by_backend(&mut self, backend: &str) {
+    /// Returns `true` if a match was found, `false` otherwise.
+    pub fn prefer_by_backend(&mut self, backend: &str) -> bool {
         if let Some(idx) = self.inner.values().position(|(desc, _)| desc.backend == backend) {
             if idx > 0 {
                 self.inner.move_index(idx, 0);
             }
+            true
+        } else {
+            false
         }
     }
 
     /// Reorder so that the entry with the given implementation key is first.
-    /// No-op if no entry matches.
-    pub fn prefer_by_implementation(&mut self, implementation: &str) {
+    /// Returns `true` if a match was found, `false` otherwise.
+    pub fn prefer_by_implementation(&mut self, implementation: &str) -> bool {
         if let Some(idx) = self.inner.get_index_of(implementation) {
             if idx > 0 {
                 self.inner.move_index(idx, 0);
             }
+            true
+        } else {
+            false
         }
     }
 }

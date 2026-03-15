@@ -443,6 +443,24 @@ impl ConfigStore {
         }
     }
 
+    /// Resolve checkout strategy for a repo: per-repo override > global > defaults.
+    pub fn resolve_checkout_strategy(&self, repo_root: &Path) -> String {
+        let global = self.load_config();
+        let slug = path_to_slug(repo_root);
+        let repo_file = self.repos_dir().join(format!("{slug}.toml"));
+        if let Ok(content) = std::fs::read_to_string(&repo_file) {
+            match toml::from_str::<RepoFileConfig>(&content) {
+                Ok(repo_cfg) => {
+                    return repo_cfg.vcs.git.checkout_strategy.unwrap_or_else(|| global.vcs.git.checkout_strategy.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(path = %repo_file.display(), err = %e, "failed to parse");
+                }
+            }
+        }
+        global.vcs.git.checkout_strategy.clone()
+    }
+
     /// Resolve checkout path for a repo: per-repo override > global > defaults.
     pub fn resolve_checkout_path(&self, repo_root: &Path) -> String {
         let global = self.load_config();

@@ -850,7 +850,7 @@ async fn prepare_terminal_commands(
         // The requesting host sent its template's role→command mappings.
         // If a terminal pool is available, wrap each command through it
         // for persistent sessions. Otherwise return as-is for passthrough.
-        if let Some((_, tp)) = &registry.terminal_pool {
+        if let Some(tp) = registry.terminal_pools.preferred() {
             let mut resolved = Vec::new();
             let mut role_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
             for cmd in requested_commands {
@@ -1584,7 +1584,7 @@ mod tests {
     async fn create_workspace_from_prepared_terminal_prefixes_name_with_host() {
         let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>));
+        registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
         let runner = runner_ok();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_root = temp.path().join("repo");

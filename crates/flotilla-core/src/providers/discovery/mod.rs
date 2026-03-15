@@ -27,7 +27,7 @@ use crate::{
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         issue_tracker::IssueTracker,
-        registry::ProviderRegistry,
+        registry::{ProviderRegistry, ProviderSet},
         terminal::TerminalPool,
         vcs::{CheckoutManager, Vcs},
         workspace::WorkspaceManager,
@@ -238,6 +238,11 @@ pub enum UnmetRequirement {
     MissingAuth(String),
     MissingRemoteHost(HostPlatform),
     NoVcsCheckout,
+    /// Config references a backend or implementation that no factory provides.
+    UnknownProviderPreference {
+        category: ProviderCategory,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -525,35 +530,74 @@ pub async fn discover_providers(
     })
     .await;
 
-    // Apply provider preferences from config
+    // Apply provider preferences from config, tracking unresolved preferences.
     let flotilla_config = config.load_config();
 
-    if let Some(backend) = flotilla_config.change_request.preference.backend.as_deref() {
-        registry.change_requests.prefer_by_backend(backend);
-    }
-    if let Some(backend) = flotilla_config.issue_tracker.preference.backend.as_deref() {
-        registry.issue_trackers.prefer_by_backend(backend);
-    }
-    if let Some(backend) = flotilla_config.cloud_agent.preference.backend.as_deref() {
-        registry.cloud_agents.prefer_by_backend(backend);
-    }
-    if let Some(backend) = flotilla_config.ai_utility.preference.backend.as_deref() {
-        registry.ai_utilities.prefer_by_backend(backend);
-    }
-    if let Some(impl_name) = flotilla_config.ai_utility.claude.as_ref().and_then(|c| c.implementation.as_deref()) {
-        registry.ai_utilities.prefer_by_implementation(impl_name);
-    }
-    if let Some(backend) = flotilla_config.workspace_manager.preference.backend.as_deref() {
-        registry.workspace_managers.prefer_by_backend(backend);
-    }
-    if let Some(backend) = flotilla_config.terminal_pool.preference.backend.as_deref() {
-        registry.terminal_pools.prefer_by_backend(backend);
+    fn apply_backend_pref(
+        set: &mut ProviderSet<impl ?Sized>,
+        category: ProviderCategory,
+        config_backend: Option<&str>,
+        unmet: &mut Vec<(String, UnmetRequirement)>,
+    ) {
+        if let Some(backend) = config_backend {
+            if !set.prefer_by_backend(backend) {
+                unmet.push((category.slug().into(), UnmetRequirement::UnknownProviderPreference { category, key: backend.into() }));
+            }
+        }
     }
 
-    // Checkout strategy (nested under vcs.git)
-    let checkout_strategy = &flotilla_config.vcs.git.checkout_strategy;
-    if checkout_strategy != "auto" {
-        registry.checkout_managers.prefer_by_implementation(checkout_strategy);
+    apply_backend_pref(
+        &mut registry.change_requests,
+        ProviderCategory::ChangeRequest,
+        flotilla_config.change_request.preference.backend.as_deref(),
+        &mut unmet,
+    );
+    apply_backend_pref(
+        &mut registry.issue_trackers,
+        ProviderCategory::IssueTracker,
+        flotilla_config.issue_tracker.preference.backend.as_deref(),
+        &mut unmet,
+    );
+    apply_backend_pref(
+        &mut registry.cloud_agents,
+        ProviderCategory::CloudAgent,
+        flotilla_config.cloud_agent.preference.backend.as_deref(),
+        &mut unmet,
+    );
+    apply_backend_pref(
+        &mut registry.ai_utilities,
+        ProviderCategory::AiUtility,
+        flotilla_config.ai_utility.preference.backend.as_deref(),
+        &mut unmet,
+    );
+    if let Some(impl_name) = flotilla_config.ai_utility.claude.as_ref().and_then(|c| c.implementation.as_deref()) {
+        if !registry.ai_utilities.prefer_by_implementation(impl_name) {
+            unmet.push((ProviderCategory::AiUtility.slug().into(), UnmetRequirement::UnknownProviderPreference {
+                category: ProviderCategory::AiUtility,
+                key: impl_name.into(),
+            }));
+        }
+    }
+    apply_backend_pref(
+        &mut registry.workspace_managers,
+        ProviderCategory::WorkspaceManager,
+        flotilla_config.workspace_manager.preference.backend.as_deref(),
+        &mut unmet,
+    );
+    apply_backend_pref(
+        &mut registry.terminal_pools,
+        ProviderCategory::TerminalPool,
+        flotilla_config.terminal_pool.preference.backend.as_deref(),
+        &mut unmet,
+    );
+
+    // Checkout strategy — resolved per-repo, nested under vcs.git
+    let checkout_strategy = config.resolve_checkout_strategy(repo_root);
+    if checkout_strategy != "auto" && !registry.checkout_managers.prefer_by_implementation(&checkout_strategy) {
+        unmet.push((ProviderCategory::CheckoutManager.slug().into(), UnmetRequirement::UnknownProviderPreference {
+            category: ProviderCategory::CheckoutManager,
+            key: checkout_strategy,
+        }));
     }
 
     let repo_slug = combined.repo_slug();
@@ -695,6 +739,7 @@ mod tests {
             UnmetRequirement::MissingAuth("github".into()),
             UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub),
             UnmetRequirement::NoVcsCheckout,
+            UnmetRequirement::UnknownProviderPreference { category: ProviderCategory::AiUtility, key: "nonexistent".into() },
         ];
         assert_eq!(reqs[0], UnmetRequirement::MissingBinary("git".into()));
         assert_ne!(reqs[0], reqs[1]);

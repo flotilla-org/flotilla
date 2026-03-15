@@ -163,6 +163,7 @@ pub fn unmet_requirement_to_proto(factory: &str, requirement: &UnmetRequirement)
         UnmetRequirement::MissingAuth(provider) => ("missing_auth", Some(provider.clone())),
         UnmetRequirement::MissingRemoteHost(platform) => ("missing_remote_host", Some(host_platform_name(*platform).to_string())),
         UnmetRequirement::NoVcsCheckout => ("no_vcs_checkout", None),
+        UnmetRequirement::UnknownProviderPreference { key, .. } => ("unknown_provider_preference", Some(key.clone())),
     };
 
     UnmetRequirementInfo { factory: factory.to_string(), kind: kind.to_string(), value }
