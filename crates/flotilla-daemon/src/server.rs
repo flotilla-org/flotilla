@@ -75,9 +75,9 @@ type PendingRemoteCancelMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), 
 /// Notification sent from connection sites to the outbound task when a
 /// peer connects or reconnects. The outbound task responds by sending
 /// current local state for all repos to the specific peer.
-struct PeerConnectedNotice {
-    peer: HostName,
-    generation: u64,
+pub struct PeerConnectedNotice {
+    pub peer: HostName,
+    pub generation: u64,
 }
 
 fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<Arc<Mutex<PeerManager>>, String> {
@@ -129,6 +129,32 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
         pending_remote_cancels,
     );
     Ok(handle)
+}
+
+/// Spawn the peer networking runtime with pre-built components.
+///
+/// Test-only entry point: callers provide a PeerManager with pre-configured
+/// senders (e.g. CapturePeerSender). Passes `None` for `peer_data_rx` to skip
+/// the inbound connection task — tests drive the outbound task via the returned
+/// `PeerConnectedNotice` sender.
+#[doc(hidden)]
+pub fn spawn_test_peer_networking(
+    daemon: Arc<InProcessDaemon>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) {
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(256);
+    let pending_remote_commands: PendingRemoteCommandMap = Arc::new(Mutex::new(HashMap::new()));
+    let forwarded_commands: ForwardedCommandMap = Arc::new(Mutex::new(HashMap::new()));
+    let pending_remote_cancels: PendingRemoteCancelMap = Arc::new(Mutex::new(HashMap::new()));
+    spawn_peer_networking_runtime(
+        daemon,
+        peer_manager,
+        None, // No inbound task — test drives outbound via PeerConnectedNotice
+        peer_data_tx,
+        pending_remote_commands,
+        forwarded_commands,
+        pending_remote_cancels,
+    )
 }
 
 struct DispatchContext<'a> {
