@@ -40,7 +40,7 @@ impl FactoryRegistry {
                 Box::new(cursor::CursorCodingAgentFactory),
                 Box::new(codex::CodexCodingAgentFactory),
             ],
-            ai_utilities: vec![Box::new(claude::ClaudeAiUtilityFactory)],
+            ai_utilities: vec![Box::new(claude::ClaudeApiAiUtilityFactory), Box::new(claude::ClaudeCliAiUtilityFactory)],
             // Priority: inside-cmux > inside-zellij > inside-tmux > cmux-binary-fallback
             workspace_managers: workspace_factories(),
             terminal_pools: terminal_pool_factories(),
