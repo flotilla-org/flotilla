@@ -1303,10 +1303,9 @@ fn render_event_log(ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Re
                     Span::raw(&entry.message),
                 ]))
             }
-            DisplayEntry::RetentionMarker(level) => ListItem::new(Line::from(Span::styled(
-                format!("── {level} retention starts here ──"),
-                Style::default().fg(theme.muted),
-            ))),
+            DisplayEntry::RetentionMarker(level) => {
+                ListItem::new(Line::from(Span::styled(format!("── {level} retention starts here ──"), Style::default().fg(theme.muted))))
+            }
         })
         .collect();
 

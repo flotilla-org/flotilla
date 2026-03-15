@@ -453,9 +453,8 @@ fn theme_switching_changes_output() {
     providers.checkouts.insert(path, checkout);
     let items = vec![make_work_item_checkout("feat-login", "/test/my-project/feat-login")];
 
-    let mut classic_harness = TestHarness::single_repo("my-project")
-        .with_provider_data(providers.clone(), items.clone())
-        .with_theme(Theme::classic());
+    let mut classic_harness =
+        TestHarness::single_repo("my-project").with_provider_data(providers.clone(), items.clone()).with_theme(Theme::classic());
     let classic_buf = classic_harness.render_to_buffer();
 
     let mut catppuccin_harness =

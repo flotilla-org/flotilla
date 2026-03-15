@@ -247,9 +247,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     }
 
-    let theme_name = cli_theme
-        .or_else(|| config.load_config().ui.theme.clone())
-        .unwrap_or_else(|| "catppuccin-mocha".to_string());
+    let theme_name = cli_theme.or_else(|| config.load_config().ui.theme.clone()).unwrap_or_else(|| "catppuccin-mocha".to_string());
     let initial_theme = theme::theme_by_name(&theme_name);
 
     let repos_info = daemon.list_repos().await.unwrap_or_default();

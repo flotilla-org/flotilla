@@ -54,7 +54,12 @@ pub fn render_popup_frame(frame: &mut ratatui::Frame, container: Rect, percent_x
 
 /// Return (icon, color) for a work item based on its kind, workspace status,
 /// and optional session status.
-pub fn work_item_icon(kind: &WorkItemKind, has_workspace: bool, session_status: Option<&SessionStatus>, theme: &Theme) -> (&'static str, Color) {
+pub fn work_item_icon(
+    kind: &WorkItemKind,
+    has_workspace: bool,
+    session_status: Option<&SessionStatus>,
+    theme: &Theme,
+) -> (&'static str, Color) {
     match kind {
         WorkItemKind::Checkout => {
             if has_workspace {
