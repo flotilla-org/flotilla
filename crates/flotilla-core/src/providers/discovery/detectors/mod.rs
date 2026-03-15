@@ -72,6 +72,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::type_complexity)]
     async fn simple_command_detectors_are_table_driven() {
         let cases: Vec<(&str, &str, &[&str], &str, Option<&str>)> = vec![
             ("git-binary", "git", &["--version"], "git version 2.43.0\n", Some("2.43.0")),

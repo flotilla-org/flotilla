@@ -99,11 +99,15 @@ pub fn resolve_template_commands(
         std::fs::read_to_string(&tmpl_path).ok().or_else(|| std::fs::read_to_string(config_base.join("workspace.yaml")).ok());
 
     let tmpl = if let Some(ref yaml) = template_yaml {
-        serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|_| default_template())
+        serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
+            tracing::warn!(err = %e, "failed to parse workspace template, using default");
+            default_template()
+        })
     } else {
         default_template()
     };
 
+    // Must match the main_command value used in executor::workspace_config.
     let mut vars = std::collections::HashMap::new();
     vars.insert("main_command".to_string(), "claude".to_string());
     let rendered = tmpl.render(&vars);

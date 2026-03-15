@@ -139,7 +139,7 @@ pub struct RemoteHostConfig {
 #[derive(Debug, Deserialize)]
 struct RawHostsConfig {
     #[serde(default)]
-    ssh: Option<SshConfig>,
+    ssh: SshConfig,
     #[serde(default)]
     hosts: HashMap<String, RawRemoteHostConfig>,
 }
@@ -159,7 +159,7 @@ impl<'de> Deserialize<'de> for HostsConfig {
         D: serde::Deserializer<'de>,
     {
         let raw = RawHostsConfig::deserialize(deserializer)?;
-        let ssh = raw.ssh.unwrap_or_default();
+        let ssh = raw.ssh;
         let hosts = raw
             .hosts
             .into_iter()

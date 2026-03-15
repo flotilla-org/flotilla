@@ -90,7 +90,7 @@ No structural changes — just E2E validation and fixing whatever breaks.
 When creating a workspace via `CreateWorkspaceFromPreparedTerminal`, prefix the workspace name with the target host:
 
 ```
-feta:feat
+feat@feta
 ```
 
 instead of:
@@ -103,7 +103,7 @@ This gives immediate visibility in the workspace manager's own UI (cmux tab bar,
 
 Future directions (deferred): policy-driven naming, workspace manager styling (icons, colours), cross-host workspaces showing all agents on a work item across hosts.
 
-**Files:** `crates/flotilla-core/src/executor.rs` — modify `CreateWorkspaceFromPreparedTerminal` arm to prefix `config.name` with `target_host:`.
+**Files:** `crates/flotilla-core/src/executor.rs` — modify `CreateWorkspaceFromPreparedTerminal` arm to format `config.name` as `branch@host`.
 
 ### 5. Test coverage
 
