@@ -904,8 +904,25 @@ fn wrap_remote_attach_commands(
     commands: &[PreparedTerminalCommand],
     config_base: &Path,
 ) -> Result<Vec<PreparedTerminalCommand>, String> {
-    let ssh_target = remote_ssh_target(target_host, config_base)?;
+    let info = remote_ssh_info(target_host, config_base)?;
     let remote_dir = checkout_path.display().to_string();
+
+    let multiplex_args = if info.multiplex {
+        let ctrl_dir = config_base.join("ssh");
+        if let Err(e) = std::fs::create_dir_all(&ctrl_dir) {
+            tracing::warn!(err = %e, "failed to create SSH control socket directory, disabling multiplexing");
+            String::new()
+        } else {
+            let ctrl_path = ctrl_dir.join("ctrl-%r@%h-%p");
+            format!(
+                " -o ControlMaster=auto -o ControlPath={} -o ControlPersist=60",
+                shell_quote(&ctrl_path.display().to_string()),
+            )
+        }
+    } else {
+        String::new()
+    };
+
     Ok(commands
         .iter()
         .map(|entry| {
@@ -913,24 +930,31 @@ fn wrap_remote_attach_commands(
             let login_wrapped = format!("$SHELL -l -c \"{}\"", escape_for_double_quotes(&inner));
             PreparedTerminalCommand {
                 role: entry.role.clone(),
-                command: format!("ssh -t {} {}", shell_quote(&ssh_target), shell_quote(&login_wrapped)),
+                command: format!("ssh -t{} {} {}", multiplex_args, shell_quote(&info.target), shell_quote(&login_wrapped)),
             }
         })
         .collect())
 }
 
-fn remote_ssh_target(target_host: &HostName, config_base: &Path) -> Result<String, String> {
+struct RemoteSshInfo {
+    target: String,
+    multiplex: bool,
+}
+
+fn remote_ssh_info(target_host: &HostName, config_base: &Path) -> Result<RemoteSshInfo, String> {
     let config = crate::config::ConfigStore::with_base(config_base);
     let hosts = config.load_hosts()?;
-    let remote = hosts
+    let (label, remote) = hosts
         .hosts
-        .values()
-        .find(|host| host.expected_host_name == target_host.as_str())
+        .iter()
+        .find(|(_, host)| host.expected_host_name == target_host.as_str())
         .ok_or_else(|| format!("unknown remote host: {target_host}"))?;
-    Ok(match &remote.user {
+    let target = match &remote.user {
         Some(user) => format!("{user}@{}", remote.hostname),
         None => remote.hostname.clone(),
-    })
+    };
+    let multiplex = hosts.resolved_ssh_multiplex(label);
+    Ok(RemoteSshInfo { target, multiplex })
 }
 
 fn shell_quote(input: &str) -> String {
@@ -2871,6 +2895,87 @@ content:
         assert_eq!(
             escape_for_double_quotes("shpool --socket /tmp/s.sock attach flotilla/feat/main/0"),
             "shpool --socket /tmp/s.sock attach flotilla/feat/main/0"
+        );
+    }
+
+    #[test]
+    fn wrap_remote_attach_commands_includes_multiplex_args() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("hosts.toml"),
+            "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
+        )
+        .expect("write hosts config");
+
+        let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
+        let result = wrap_remote_attach_commands(
+            &HostName::new("desktop"),
+            &PathBuf::from("/home/dev/project"),
+            &commands,
+            temp.path(),
+        )
+        .unwrap();
+
+        // Default is multiplex=true
+        assert!(
+            result[0].command.contains("ControlMaster=auto"),
+            "expected ControlMaster, got: {}",
+            result[0].command
+        );
+        assert!(
+            result[0].command.contains("ControlPersist=60"),
+            "expected ControlPersist, got: {}",
+            result[0].command
+        );
+    }
+
+    #[test]
+    fn wrap_remote_attach_commands_omits_multiplex_when_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("hosts.toml"),
+            "[ssh]\nmultiplex = false\n\n[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
+        )
+        .expect("write hosts config");
+
+        let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
+        let result = wrap_remote_attach_commands(
+            &HostName::new("desktop"),
+            &PathBuf::from("/home/dev/project"),
+            &commands,
+            temp.path(),
+        )
+        .unwrap();
+
+        assert!(
+            !result[0].command.contains("ControlMaster"),
+            "should not have ControlMaster when disabled, got: {}",
+            result[0].command
+        );
+    }
+
+    #[test]
+    fn wrap_remote_attach_commands_per_host_multiplex_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("hosts.toml"),
+            "[ssh]\nmultiplex = true\n\n[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\nssh_multiplex = false\n",
+        )
+        .expect("write hosts config");
+
+        let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
+        let result = wrap_remote_attach_commands(
+            &HostName::new("desktop"),
+            &PathBuf::from("/home/dev/project"),
+            &commands,
+            temp.path(),
+        )
+        .unwrap();
+
+        assert!(
+            !result[0].command.contains("ControlMaster"),
+            "per-host override should disable multiplex, got: {}",
+            result[0].command
         );
     }
 }
