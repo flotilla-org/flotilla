@@ -487,7 +487,7 @@ pub async fn execute(
                 // working directory only needs to be a valid local directory.
                 // The wrapped attach commands handle entering the remote checkout path.
                 let working_dir = local_workspace_directory(&repo.root, config_base);
-                let remote_name = format!("{}:{}", target_host, branch);
+                let remote_name = format!("{}@{}", target_host, branch);
                 let mut config = workspace_config(&repo.root, &remote_name, &working_dir, "claude", config_base);
                 config.resolved_commands = Some(wrapped.into_iter().map(|cmd| (cmd.role, cmd.command)).collect());
                 if let Err(e) = ws_mgr.create_workspace(&config).await {
@@ -1606,7 +1606,7 @@ mod tests {
         assert_ok(result);
         let created = workspace_manager.created_configs.lock().await;
         assert_eq!(created.len(), 1);
-        assert_eq!(created[0].name, "desktop:feat", "workspace name should be host:branch");
+        assert_eq!(created[0].name, "desktop@feat", "workspace name should be host@branch");
     }
 
     #[tokio::test]
