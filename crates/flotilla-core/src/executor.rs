@@ -863,14 +863,10 @@ async fn prepare_terminal_commands(
 ) -> Result<Vec<PreparedTerminalCommand>, String> {
     if !requested_commands.is_empty() {
         // The requesting host sent its template's role→command mappings.
-        // Use those instead of reading the local template.
-        let mut config = workspace_config(repo_root, branch, checkout_path, "claude", config_base);
-        config.resolved_commands = Some(requested_commands.iter().map(|c| (c.role.clone(), c.command.clone())).collect());
-        if let Some((_, tp)) = &registry.terminal_pool {
-            resolve_terminal_pool(&mut config, tp.as_ref()).await;
-        }
-        let commands = config.resolved_commands.unwrap_or_default();
-        return Ok(commands.into_iter().map(|(role, command)| PreparedTerminalCommand { role, command }).collect());
+        // Pass them through directly — the terminal pool resolution (which
+        // reads the local template) is skipped because the caller's template
+        // is authoritative. The commands are returned as-is for SSH wrapping.
+        return Ok(requested_commands.to_vec());
     }
 
     // Fallback: read the local template (for backwards compat or local use)
