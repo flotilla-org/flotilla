@@ -358,7 +358,7 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
 
     let follower_providers = wait_for_local_checkout(&follower, &follower_repo, "feat-remote").await;
 
-    leader.set_peer_providers(&leader_repo, vec![(HostName::new("follower"), follower_providers)]).await;
+    leader.set_peer_providers(&leader_repo, vec![(HostName::new("follower"), follower_providers)], 0).await;
 
     let snapshot = leader.get_state(&leader_repo).await.expect("leader state");
     assert!(
@@ -408,7 +408,7 @@ async fn daemon_snapshot_includes_follower_checkout_overlay() {
 
     // `set_peer_providers` updates the overlay and rebuilds the snapshot synchronously,
     // so `get_state` can assert on the merged view immediately.
-    daemon.set_peer_providers(&repo, vec![(follower_host.clone(), follower_data)]).await;
+    daemon.set_peer_providers(&repo, vec![(follower_host.clone(), follower_data)], 0).await;
 
     let snapshot = daemon.get_state(&repo).await.expect("get_state");
 

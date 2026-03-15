@@ -136,7 +136,8 @@ pub struct PendingResyncRequest {
 pub enum OverlayUpdate {
     /// Update peer_providers for a repo with remaining peer data.
     /// The caller resolves `identity` to the current local path at apply time.
-    SetProviders { identity: RepoIdentity, peers: Vec<(HostName, ProviderData)> },
+    /// `overlay_version` gates the apply — stale versions are rejected.
+    SetProviders { identity: RepoIdentity, peers: Vec<(HostName, ProviderData)>, overlay_version: u64 },
     /// Remove a virtual repo — no peers remain.
     RemoveRepo { identity: RepoIdentity, path: PathBuf },
 }
@@ -193,6 +194,10 @@ pub struct PeerManager {
     /// Last-seen vector clock per (origin_host, repo_identity) — used to
     /// detect and drop duplicate / already-seen messages.
     last_seen_clocks: HashMap<(HostName, RepoIdentity), VectorClock>,
+    /// Monotonic counter incremented on every peer-data mutation. Callers
+    /// pass this version into `set_peer_providers` so stale applies (from
+    /// a read-then-apply that lost the race) are rejected.
+    overlay_version: u64,
 }
 
 impl PeerManager {
@@ -221,7 +226,19 @@ impl PeerManager {
             known_remote_repos: HashMap::new(),
             command_reverse_paths: HashMap::new(),
             last_seen_clocks: HashMap::new(),
+            overlay_version: 0,
         }
+    }
+
+    /// Current overlay version. Callers read this while holding the PM lock
+    /// and pass it to `set_peer_providers` so stale applies are rejected.
+    pub fn overlay_version(&self) -> u64 {
+        self.overlay_version
+    }
+
+    fn bump_overlay_version(&mut self) -> u64 {
+        self.overlay_version += 1;
+        self.overlay_version
     }
 
     /// Register a peer transport.
@@ -286,6 +303,10 @@ impl PeerManager {
                 }
                 affected_repos.push(repo);
             }
+        }
+
+        if !affected_repos.is_empty() {
+            self.bump_overlay_version();
         }
 
         affected_repos
@@ -490,6 +511,7 @@ impl PeerManager {
                 });
 
                 self.observe_route(&origin, via_peer, via_generation);
+                self.bump_overlay_version();
 
                 HandleResult::Updated(repo)
             }
@@ -1160,6 +1182,9 @@ impl PeerManager {
         let affected: Vec<RepoIdentity> = repos.keys().cloned().collect();
         self.peer_host_summaries.remove(origin);
         self.last_seen_clocks.retain(|(host, _), _| host != origin);
+        if !affected.is_empty() {
+            self.bump_overlay_version();
+        }
         info!(peer = %origin, repo_count = affected.len(), "cleared stale peer data after restart");
         affected
     }
@@ -1262,6 +1287,10 @@ impl PeerManager {
         // Compute overlay updates atomically while still holding &mut self.
         // The caller resolves identity → path at apply time to avoid TOCTOU
         // with concurrent add_repo/remove_repo.
+        //
+        // Bump the overlay version once for the entire disconnect. All
+        // SetProviders updates carry this version so stale applies are rejected.
+        let overlay_version = if !affected_repos.is_empty() { self.bump_overlay_version() } else { self.overlay_version };
         let mut overlay_updates = Vec::new();
         for repo_id in &affected_repos {
             if self.has_peer_data_for(repo_id) {
@@ -1271,7 +1300,7 @@ impl PeerManager {
                     .iter()
                     .filter_map(|(host, repos)| repos.get(repo_id).map(|state| (host.clone(), state.provider_data.clone())))
                     .collect();
-                overlay_updates.push(OverlayUpdate::SetProviders { identity: repo_id.clone(), peers });
+                overlay_updates.push(OverlayUpdate::SetProviders { identity: repo_id.clone(), peers, overlay_version });
             } else if let Some(synthetic_path) = self.unregister_remote_repo(repo_id) {
                 // Remote-only, no peers remain — remove the virtual tab
                 overlay_updates.push(OverlayUpdate::RemoveRepo { identity: repo_id.clone(), path: synthetic_path });
@@ -2443,10 +2472,11 @@ mod tests {
         assert!(plan.was_active);
         assert_eq!(plan.overlay_updates.len(), 1);
         match &plan.overlay_updates[0] {
-            OverlayUpdate::SetProviders { identity, peers } => {
+            OverlayUpdate::SetProviders { identity, peers, overlay_version } => {
                 assert_eq!(identity, &test_repo());
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].0, HostName::new("laptop"));
+                assert!(*overlay_version > 0, "overlay_version should be bumped on disconnect");
             }
             other => panic!("expected SetProviders, got {:?}", other),
         }

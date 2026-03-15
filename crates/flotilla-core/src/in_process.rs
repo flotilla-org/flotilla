@@ -483,6 +483,10 @@ pub struct InProcessDaemon {
     /// Set by the DaemonServer when peer snapshots arrive. Merged into
     /// the local snapshot during broadcast.
     peer_providers: RwLock<HashMap<flotilla_protocol::RepoIdentity, Vec<(HostName, ProviderData)>>>,
+    /// Last applied overlay version per repo. `set_peer_providers` rejects
+    /// applies whose version is older than the stored value, preventing stale
+    /// data from overwriting fresher writes.
+    peer_overlay_versions: RwLock<HashMap<flotilla_protocol::RepoIdentity, u64>>,
     /// Maps local tracked paths (including virtual synthetic paths) to RepoIdentity.
     // Lock ordering: do not hold path_identities across awaits that later take
     // repos/repo_order; add_repo intentionally takes it last while already
@@ -583,6 +587,7 @@ impl InProcessDaemon {
             host_name,
             follower,
             peer_providers: RwLock::new(HashMap::new()),
+            peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
             peer_status: RwLock::new(HashMap::new()),
             configured_peer_names: RwLock::new(HashSet::new()),
@@ -837,15 +842,29 @@ impl InProcessDaemon {
     ///
     /// Called by the DaemonServer when PeerManager receives updated peer data.
     /// The peer data is merged into the local snapshot during the next broadcast.
-    pub async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>) {
+    pub async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>, overlay_version: u64) {
         let Some(identity) = self.tracked_repo_identity_for_path(repo_path).await else {
             return;
         };
+        {
+            let mut versions = self.peer_overlay_versions.write().await;
+            let stored = versions.entry(identity.clone()).or_insert(0);
+            if overlay_version < *stored {
+                return; // stale — a newer version has already been applied
+            }
+            *stored = overlay_version;
+        }
         {
             let mut pp = self.peer_providers.write().await;
             pp.insert(identity.clone(), peers);
         }
         self.broadcast_snapshot_inner(repo_path, false).await;
+    }
+
+    /// Test accessor: return the current peer providers for a given repo identity.
+    #[cfg(feature = "test-support")]
+    pub async fn peer_providers_for_test(&self, identity: &flotilla_protocol::RepoIdentity) -> Vec<(HostName, ProviderData)> {
+        self.peer_providers.read().await.get(identity).cloned().unwrap_or_default()
     }
 
     /// Poll all repos for new refresh snapshots.
@@ -1979,6 +1998,8 @@ impl DaemonHandle for InProcessDaemon {
         if removed_identity {
             let mut pp = self.peer_providers.write().await;
             pp.remove(&repo_identity);
+            drop(pp);
+            self.peer_overlay_versions.write().await.remove(&repo_identity);
         }
 
         // Persist to config
