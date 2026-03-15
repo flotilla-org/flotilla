@@ -2848,13 +2848,8 @@ content:
         .expect("write hosts config");
 
         let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }];
-        let result = wrap_remote_attach_commands(
-            &HostName::new("desktop"),
-            &PathBuf::from("/home/dev/project"),
-            &commands,
-            temp.path(),
-        )
-        .unwrap();
+        let result =
+            wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path()).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "main");
