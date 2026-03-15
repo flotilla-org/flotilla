@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
-use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent};
+use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent, HostName};
 use tokio::time::Instant;
 
 #[tokio::test]
@@ -176,6 +176,20 @@ async fn query_commands_roundtrip() {
     // Test get_repo_work
     let work = client.get_repo_work(repo_name).await.expect("get_repo_work");
     assert_eq!(work.path, repo);
+
+    // Test host query commands against the local daemon state
+    let hosts = client.list_hosts().await.expect("list_hosts");
+    assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::local() && entry.is_local));
+
+    let local_host = HostName::local().to_string();
+    let host_status = client.get_host_status(&local_host).await.expect("get_host_status");
+    assert!(host_status.is_local, "local host query should resolve to local host");
+
+    let host_providers = client.get_host_providers(&local_host).await.expect("get_host_providers");
+    assert_eq!(host_providers.summary.host_name, HostName::local());
+
+    let topology = client.get_topology().await.expect("get_topology");
+    assert_eq!(topology.local_host, HostName::local());
 
     // Test slug resolution error for nonexistent repo
     let err = client.get_repo_detail("nonexistent").await;

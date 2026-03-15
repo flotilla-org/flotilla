@@ -3,7 +3,8 @@ use std::path::Path;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandResult, DaemonEvent, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse,
+    output::OutputFormat, Command, CommandResult, DaemonEvent, HostProvidersResponse, HostStatusResponse, PeerConnectionState,
+    RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -52,6 +53,139 @@ fn format_status_response_human(status: &StatusResponse) -> String {
         ]);
     }
     format!("{table}\n")
+}
+
+fn format_connection_status(status: &PeerConnectionState) -> &'static str {
+    match status {
+        PeerConnectionState::Connected => "connected",
+        PeerConnectionState::Disconnected => "disconnected",
+        PeerConnectionState::Connecting => "connecting",
+        PeerConnectionState::Reconnecting => "reconnecting",
+        PeerConnectionState::Rejected { .. } => "rejected",
+    }
+}
+
+fn inventory_is_empty(inventory: &flotilla_protocol::ToolInventory) -> bool {
+    inventory.binaries.is_empty() && inventory.sockets.is_empty() && inventory.auth.is_empty() && inventory.env_vars.is_empty()
+}
+
+fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> String {
+    if response.hosts.is_empty() {
+        return "No hosts known.\n".into();
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Host", "Local", "Configured", "Status", "Summary", "Repos", "Work"]);
+    for host in &response.hosts {
+        table.add_row(vec![
+            Cell::new(host.host.as_str()),
+            Cell::new(if host.is_local { "yes" } else { "no" }),
+            Cell::new(if host.configured { "yes" } else { "no" }),
+            Cell::new(format_connection_status(&host.connection_status)),
+            Cell::new(if host.has_summary { "yes" } else { "no" }),
+            Cell::new(host.repo_count),
+            Cell::new(host.work_item_count),
+        ]);
+    }
+    format!("{table}\n")
+}
+
+fn format_host_status_human(response: &HostStatusResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Host: {}\n", response.host));
+    out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
+    out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
+    out.push_str(&format!("Repositories: {}\n", response.repo_count));
+    out.push_str(&format!("Work Items: {}\n", response.work_item_count));
+
+    if let Some(summary) = &response.summary {
+        out.push_str("\nSystem:\n");
+        if let Some(os) = &summary.system.os {
+            out.push_str(&format!("  OS: {os}\n"));
+        }
+        if let Some(arch) = &summary.system.arch {
+            out.push_str(&format!("  Arch: {arch}\n"));
+        }
+        if let Some(cpus) = summary.system.cpu_count {
+            out.push_str(&format!("  CPUs: {cpus}\n"));
+        }
+        if let Some(memory) = summary.system.memory_total_mb {
+            out.push_str(&format!("  Memory: {} MB\n", memory));
+        }
+    }
+
+    out
+}
+
+fn format_host_providers_human(response: &HostProvidersResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Host: {}\n", response.host));
+    out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
+    out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
+
+    out.push_str("\nInventory:\n");
+    if inventory_is_empty(&response.summary.inventory) {
+        out.push_str("  No inventory facts.\n");
+    } else {
+        for fact in &response.summary.inventory.binaries {
+            out.push_str(&format!("  binary: {}\n", fact.name));
+        }
+        for fact in &response.summary.inventory.sockets {
+            out.push_str(&format!("  socket: {}\n", fact.name));
+        }
+        for fact in &response.summary.inventory.auth {
+            out.push_str(&format!("  auth: {}\n", fact.name));
+        }
+        for fact in &response.summary.inventory.env_vars {
+            out.push_str(&format!("  env: {}\n", fact.name));
+        }
+    }
+
+    out.push_str("\nProviders:\n");
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Category", "Name", "Health"]);
+    for provider in &response.summary.providers {
+        table.add_row(vec![
+            Cell::new(&provider.category),
+            Cell::new(&provider.name),
+            Cell::new(if provider.healthy { "ok" } else { "error" }),
+        ]);
+    }
+    out.push_str(&table.to_string());
+    out.push('\n');
+    out
+}
+
+fn format_topology_human(response: &TopologyResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Local Host: {}\n", response.local_host));
+    if response.routes.is_empty() {
+        out.push_str("No routes.\n");
+        return out;
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Target", "Via", "Direct", "Connected", "Fallbacks"]);
+    for route in &response.routes {
+        let fallbacks = if route.fallbacks.is_empty() {
+            "-".to_string()
+        } else {
+            route.fallbacks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        };
+        table.add_row(vec![
+            Cell::new(route.target.as_str()),
+            Cell::new(route.next_hop.as_str()),
+            Cell::new(if route.direct { "yes" } else { "no" }),
+            Cell::new(if route.connected { "yes" } else { "no" }),
+            Cell::new(fallbacks),
+        ]);
+    }
+    out.push_str(&table.to_string());
+    out.push('\n');
+    out
 }
 
 /// Extract a short display name from a repo path (last path component).
@@ -158,6 +292,46 @@ pub async fn run_repo_work(daemon: &dyn DaemonHandle, slug: &str, format: Output
     let output = match format {
         OutputFormat::Human => format_repo_work_human(&work),
         OutputFormat::Json => flotilla_protocol::output::json_pretty(&work),
+    };
+    print!("{output}");
+    Ok(())
+}
+
+pub async fn run_host_list(daemon: &dyn DaemonHandle, format: OutputFormat) -> Result<(), String> {
+    let hosts = daemon.list_hosts().await?;
+    let output = match format {
+        OutputFormat::Human => format_host_list_human(&hosts),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&hosts),
+    };
+    print!("{output}");
+    Ok(())
+}
+
+pub async fn run_host_status(daemon: &dyn DaemonHandle, host: &str, format: OutputFormat) -> Result<(), String> {
+    let status = daemon.get_host_status(host).await?;
+    let output = match format {
+        OutputFormat::Human => format_host_status_human(&status),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&status),
+    };
+    print!("{output}");
+    Ok(())
+}
+
+pub async fn run_host_providers(daemon: &dyn DaemonHandle, host: &str, format: OutputFormat) -> Result<(), String> {
+    let providers = daemon.get_host_providers(host).await?;
+    let output = match format {
+        OutputFormat::Human => format_host_providers_human(&providers),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&providers),
+    };
+    print!("{output}");
+    Ok(())
+}
+
+pub async fn run_topology(daemon: &dyn DaemonHandle, format: OutputFormat) -> Result<(), String> {
+    let topology = daemon.get_topology().await?;
+    let output = match format {
+        OutputFormat::Human => format_topology_human(&topology),
+        OutputFormat::Json => flotilla_protocol::output::json_pretty(&topology),
     };
     print!("{output}");
     Ok(())
@@ -366,10 +540,16 @@ mod tests {
     }
 
     mod status_human {
-        use flotilla_protocol::{RepoSummary, StatusResponse};
+        use flotilla_protocol::{
+            HostEnvironment, HostListEntry, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse,
+            HostSummary, PeerConnectionState, RepoSummary, StatusResponse, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+        };
 
         use super::*;
-        use crate::cli::format_status_response_human;
+        use crate::cli::{
+            format_host_list_human, format_host_providers_human, format_host_status_human, format_status_response_human,
+            format_topology_human,
+        };
 
         #[test]
         fn empty_repos() {
@@ -391,6 +571,105 @@ mod tests {
             let output = format_status_response_human(&status);
             assert!(output.contains("my-repo"), "should contain repo name");
             assert!(output.contains("3"), "should show work item count");
+        }
+
+        fn sample_host_summary(name: &str) -> HostSummary {
+            HostSummary {
+                host_name: HostName::new(name),
+                system: SystemInfo {
+                    home_dir: Some("/home/dev".into()),
+                    os: Some("linux".into()),
+                    arch: Some("aarch64".into()),
+                    cpu_count: Some(8),
+                    memory_total_mb: Some(16384),
+                    environment: HostEnvironment::Container,
+                },
+                inventory: ToolInventory::default(),
+                providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+            }
+        }
+
+        #[test]
+        fn host_list_shows_hosts_and_counts() {
+            let response = HostListResponse {
+                hosts: vec![
+                    HostListEntry {
+                        host: HostName::new("local"),
+                        is_local: true,
+                        configured: false,
+                        connection_status: PeerConnectionState::Connected,
+                        has_summary: true,
+                        repo_count: 2,
+                        work_item_count: 5,
+                    },
+                    HostListEntry {
+                        host: HostName::new("remote"),
+                        is_local: false,
+                        configured: true,
+                        connection_status: PeerConnectionState::Disconnected,
+                        has_summary: false,
+                        repo_count: 0,
+                        work_item_count: 0,
+                    },
+                ],
+            };
+
+            let output = format_host_list_human(&response);
+            assert!(output.contains("remote"));
+            assert!(output.contains("disconnected"));
+            assert!(output.contains("5"));
+        }
+
+        #[test]
+        fn host_status_shows_summary_and_counts() {
+            let response = HostStatusResponse {
+                host: HostName::new("local"),
+                is_local: true,
+                configured: false,
+                connection_status: PeerConnectionState::Connected,
+                summary: Some(sample_host_summary("local")),
+                repo_count: 2,
+                work_item_count: 5,
+            };
+
+            let output = format_host_status_human(&response);
+            assert!(output.contains("Host: local"));
+            assert!(output.contains("Repositories: 2"));
+            assert!(output.contains("linux"));
+        }
+
+        #[test]
+        fn host_providers_shows_inventory_and_provider_rows() {
+            let response = HostProvidersResponse {
+                host: HostName::new("local"),
+                is_local: true,
+                configured: false,
+                connection_status: PeerConnectionState::Connected,
+                summary: sample_host_summary("local"),
+            };
+
+            let output = format_host_providers_human(&response);
+            assert!(output.contains("Providers:"));
+            assert!(output.contains("Git"));
+        }
+
+        #[test]
+        fn topology_shows_route_rows() {
+            let response = TopologyResponse {
+                local_host: HostName::new("local"),
+                routes: vec![TopologyRoute {
+                    target: HostName::new("remote"),
+                    next_hop: HostName::new("relay"),
+                    direct: false,
+                    connected: true,
+                    fallbacks: vec![HostName::new("backup")],
+                }],
+            };
+
+            let output = format_topology_human(&response);
+            assert!(output.contains("remote"));
+            assert!(output.contains("relay"));
+            assert!(output.contains("backup"));
         }
     }
 

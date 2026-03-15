@@ -7,7 +7,7 @@ use std::{
 
 use flotilla_protocol::{
     Command, CommandPeerEvent, CommandResult, ConfigLabel, GoodbyeReason, HostName, HostSummary, PeerDataKind, PeerDataMessage,
-    PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage, VectorClock,
+    PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage, TopologyRoute, VectorClock,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -874,6 +874,22 @@ impl PeerManager {
 
     pub fn get_peer_host_summaries(&self) -> &HashMap<HostName, HostSummary> {
         &self.peer_host_summaries
+    }
+
+    pub fn topology_routes(&self) -> Vec<TopologyRoute> {
+        let mut routes: Vec<_> = self
+            .routes
+            .iter()
+            .map(|(target, route)| TopologyRoute {
+                target: target.clone(),
+                next_hop: route.primary.next_hop.clone(),
+                direct: route.primary.next_hop == *target,
+                connected: self.route_hop_is_live(&route.primary),
+                fallbacks: route.fallbacks.iter().filter(|hop| self.route_hop_is_live(hop)).map(|hop| hop.next_hop.clone()).collect(),
+            })
+            .collect();
+        routes.sort_by(|a, b| a.target.cmp(&b.target));
+        routes
     }
 
     /// Snapshot relay targets without performing any async sends.

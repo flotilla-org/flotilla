@@ -44,8 +44,9 @@ pub use provider_data::{
     Workspace,
 };
 pub use query::{
-    DiscoveryEntry, ProviderHealthMap, ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse,
-    StatusResponse, UnmetRequirementInfo,
+    DiscoveryEntry, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap, ProviderInfo,
+    RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute,
+    UnmetRequirementInfo,
 };
 use serde::{Deserialize, Serialize};
 pub use snapshot::{CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem, WorkItemIdentity, WorkItemKind};

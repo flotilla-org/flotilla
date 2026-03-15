@@ -14,8 +14,9 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, ProviderData, ProviderError, RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels,
-    RepoProvidersResponse, RepoWorkResponse, Snapshot, SnapshotDelta, StatusResponse, WorkItem,
+    Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError,
+    RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoWorkResponse, Snapshot, SnapshotDelta,
+    StatusResponse, TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
@@ -88,6 +89,22 @@ impl DaemonHandle for StubDaemon {
     }
 
     async fn get_repo_work(&self, _slug: &str) -> Result<RepoWorkResponse, String> {
+        Err("stub".into())
+    }
+
+    async fn list_hosts(&self) -> Result<HostListResponse, String> {
+        Err("stub".into())
+    }
+
+    async fn get_host_status(&self, _host: &str) -> Result<HostStatusResponse, String> {
+        Err("stub".into())
+    }
+
+    async fn get_host_providers(&self, _host: &str) -> Result<HostProvidersResponse, String> {
+        Err("stub".into())
+    }
+
+    async fn get_topology(&self) -> Result<TopologyResponse, String> {
         Err("stub".into())
     }
 }

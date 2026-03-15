@@ -15,9 +15,9 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostName, HostPath, HostSummary, Issue, PeerConnectionState,
-    ProviderData, ProviderError, ProviderInfo, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSummary, RepoWorkResponse,
-    Snapshot, StatusResponse,
+    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
+    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDetailResponse, RepoInfo,
+    RepoProvidersResponse, RepoSummary, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -491,6 +491,14 @@ pub struct InProcessDaemon {
     /// Current peer connection status, updated via `set_peer_status()` and
     /// replayed to late-subscribing clients via `replay_since()`.
     peer_status: RwLock<HashMap<HostName, PeerConnectionState>>,
+    /// Config-backed peer host names from `hosts.toml`, mirrored in by the
+    /// server/peer wiring so daemon queries can include disconnected peers.
+    configured_peer_names: RwLock<HashSet<HostName>>,
+    /// Remote host summaries replicated from peers and mirrored in by the
+    /// server/peer wiring.
+    peer_host_summaries: RwLock<HashMap<HostName, HostSummary>>,
+    /// Current routing view mirrored in from the peer manager.
+    topology_routes: RwLock<Vec<TopologyRoute>>,
     /// Host-level environment assertions, computed once at startup and
     /// reused for each repo discovery.
     host_bag: EnvironmentBag,
@@ -577,6 +585,9 @@ impl InProcessDaemon {
             peer_providers: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
             peer_status: RwLock::new(HashMap::new()),
+            configured_peer_names: RwLock::new(HashSet::new()),
+            peer_host_summaries: RwLock::new(HashMap::new()),
+            topology_routes: RwLock::new(Vec::new()),
             host_bag,
             discovery,
             active_command: Arc::new(Mutex::new(None)),
@@ -617,6 +628,71 @@ impl InProcessDaemon {
 
     pub fn local_host_summary(&self) -> &HostSummary {
         &self.local_host_summary
+    }
+
+    pub async fn set_configured_peer_names(&self, peers: Vec<HostName>) {
+        let mut configured = self.configured_peer_names.write().await;
+        *configured = peers.into_iter().collect();
+    }
+
+    pub async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>) {
+        let mut stored = self.peer_host_summaries.write().await;
+        *stored = summaries;
+    }
+
+    pub async fn set_topology_routes(&self, mut routes: Vec<TopologyRoute>) {
+        // Normalize ordering defensively so query output stays stable even if a
+        // future caller bypasses PeerManager's already-sorted route snapshot.
+        routes.sort_by(|a, b| a.target.cmp(&b.target));
+        let mut stored = self.topology_routes.write().await;
+        *stored = routes;
+    }
+
+    async fn local_host_counts(&self) -> crate::host_queries::HostCounts {
+        let repos = self.repos.read().await;
+        let repo_order = self.repo_order.read().await;
+        let mut counts = crate::host_queries::HostCounts::default();
+
+        for identity in repo_order.iter() {
+            let Some(state) = repos.get(identity) else { continue };
+            if !state.preferred_root().is_local {
+                continue;
+            }
+
+            counts.repo_count += 1;
+            let snapshot = build_repo_snapshot_with_peers(
+                SnapshotBuildContext {
+                    repo_identity: state.identity.clone(),
+                    path: state.preferred_path(),
+                    seq: state.seq,
+                    local_providers: &state.last_local_providers,
+                    errors: &state.last_snapshot.errors,
+                    provider_health: &state.last_snapshot.provider_health,
+                    cache: &state.issue_cache,
+                    search_results: &state.search_results,
+                    host_name: &self.host_name,
+                },
+                None,
+            );
+            counts.work_item_count += snapshot.work_items.len();
+        }
+
+        counts
+    }
+
+    async fn remote_host_counts(&self) -> HashMap<HostName, crate::host_queries::HostCounts> {
+        let peer_providers = self.peer_providers.read().await;
+        let mut counts: HashMap<HostName, crate::host_queries::HostCounts> = HashMap::new();
+
+        for peers in peer_providers.values() {
+            for (host, providers) in peers {
+                let entry = counts.entry(host.clone()).or_default();
+                entry.repo_count += 1;
+                entry.work_item_count += crate::data::correlate(providers).0.len();
+            }
+        }
+
+        counts
     }
 
     /// Returns whether this daemon is running in follower mode.
@@ -2093,6 +2169,75 @@ impl DaemonHandle for InProcessDaemon {
             peer_overlay.as_deref(),
         );
         Ok(RepoWorkResponse { path, slug: state.slug().map(str::to_string), work_items: snapshot.work_items })
+    }
+
+    async fn list_hosts(&self) -> Result<HostListResponse, String> {
+        let configured = self.configured_peer_names.read().await.clone();
+        let statuses = self.peer_status.read().await.clone();
+        let summaries = self.peer_host_summaries.read().await.clone();
+        let local_counts = self.local_host_counts().await;
+        let remote_counts = self.remote_host_counts().await;
+
+        let hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts)
+            .into_iter()
+            .map(|host| {
+                crate::host_queries::build_host_list_entry(
+                    &host,
+                    &self.host_name,
+                    &configured,
+                    &statuses,
+                    &summaries,
+                    local_counts,
+                    &remote_counts,
+                )
+            })
+            .collect();
+
+        Ok(HostListResponse { hosts })
+    }
+
+    async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String> {
+        let configured = self.configured_peer_names.read().await.clone();
+        let statuses = self.peer_status.read().await.clone();
+        let summaries = self.peer_host_summaries.read().await.clone();
+        let local_counts = self.local_host_counts().await;
+        let remote_counts = self.remote_host_counts().await;
+        let known_hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts);
+        let resolved =
+            known_hosts.into_iter().find(|candidate| candidate.as_str() == host).ok_or_else(|| format!("host not found: {host}"))?;
+        let summary = if resolved == self.host_name { Some(self.local_host_summary.clone()) } else { summaries.get(&resolved).cloned() };
+
+        Ok(crate::host_queries::build_host_status(
+            &resolved,
+            &self.host_name,
+            &configured,
+            &statuses,
+            summary,
+            local_counts,
+            &remote_counts,
+        ))
+    }
+
+    async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String> {
+        let configured = self.configured_peer_names.read().await.clone();
+        let statuses = self.peer_status.read().await.clone();
+        let summaries = self.peer_host_summaries.read().await.clone();
+        let remote_counts = self.remote_host_counts().await;
+        let known_hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts);
+        let resolved =
+            known_hosts.into_iter().find(|candidate| candidate.as_str() == host).ok_or_else(|| format!("host not found: {host}"))?;
+        let summary = if resolved == self.host_name {
+            self.local_host_summary.clone()
+        } else {
+            summaries.get(&resolved).cloned().ok_or_else(|| format!("no summary available for host: {host}"))?
+        };
+
+        Ok(crate::host_queries::build_host_providers(&resolved, &self.host_name, &configured, &statuses, summary))
+    }
+
+    async fn get_topology(&self) -> Result<TopologyResponse, String> {
+        let routes = self.topology_routes.read().await.clone();
+        Ok(crate::host_queries::build_topology(&self.host_name, &routes))
     }
 }
 

@@ -113,8 +113,30 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
     Ok(Arc::new(Mutex::new(peer_manager)))
 }
 
+async fn sync_peer_query_state(peer_manager: &Arc<Mutex<PeerManager>>, daemon: &Arc<InProcessDaemon>) {
+    // Keep the PeerManager lock scoped to this snapshot read. Several call sites
+    // invoke this immediately after mutating PeerManager state; holding the lock
+    // across the daemon writes would deadlock if a future refactor re-entered
+    // PeerManager while mirroring query state.
+    let (configured, summaries, routes) = {
+        let pm = peer_manager.lock().await;
+        (pm.configured_peer_names(), pm.get_peer_host_summaries().clone(), pm.topology_routes())
+    };
+
+    daemon.set_configured_peer_names(configured).await;
+    daemon.set_peer_host_summaries(summaries).await;
+    daemon.set_topology_routes(routes).await;
+}
+
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
     let peer_manager = build_peer_manager(&daemon, config)?;
+    {
+        let daemon = Arc::clone(&daemon);
+        let peer_manager = Arc::clone(&peer_manager);
+        tokio::spawn(async move {
+            sync_peer_query_state(&peer_manager, &daemon).await;
+        });
+    }
     let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
     let pending_remote_commands: PendingRemoteCommandMap = Arc::new(Mutex::new(HashMap::new()));
     let forwarded_commands: ForwardedCommandMap = Arc::new(Mutex::new(HashMap::new()));
@@ -193,6 +215,7 @@ impl DaemonServer {
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
         let daemon = InProcessDaemon::new(repo_paths, Arc::clone(&config), discovery, host_name.clone()).await;
         let peer_manager = build_peer_manager(&daemon, &config)?;
+        sync_peer_query_state(&peer_manager, &daemon).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
 
@@ -414,6 +437,7 @@ fn spawn_peer_networking_runtime(
                     if initial_rx_map.contains_key(name) { PeerConnectionState::Connected } else { PeerConnectionState::Disconnected };
                 peer_daemon.send_event(DaemonEvent::PeerStatusChanged { host: name.clone(), status });
             }
+            sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
 
             for peer_name in peer_names {
                 let tx = peer_data_tx_for_ssh.clone();
@@ -487,6 +511,7 @@ fn spawn_peer_networking_runtime(
                                 info!(peer = %peer_name, "reconnected successfully");
                                 last_known_session_id =
                                     handle_remote_restart_if_needed(&pm, &daemon_for_cleanup, &peer_name, last_known_session_id).await;
+                                sync_peer_query_state(&pm, &daemon_for_cleanup).await;
                                 daemon_for_cleanup.send_event(DaemonEvent::PeerStatusChanged {
                                     host: peer_name.clone(),
                                     status: PeerConnectionState::Connected,
@@ -549,8 +574,9 @@ fn spawn_peer_networking_runtime(
                             relay_peer_data(&peer_manager_task, &origin, msg).await;
                         }
 
-                        let mut pm = peer_manager_task.lock().await;
-                        match pm.handle_inbound(env).await {
+                        {
+                            let mut pm = peer_manager_task.lock().await;
+                            match pm.handle_inbound(env).await {
                             HandleResult::Updated(ref updated_repo_id) => {
                                 let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
                                     .get_peer_data()
@@ -676,6 +702,8 @@ fn spawn_peer_networking_runtime(
                             }
                             HandleResult::Ignored => {}
                         }
+                        }
+                        sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
                     }
                     _ = resync_sweep.tick() => {
                         let expired_repos = {
@@ -778,6 +806,7 @@ async fn handle_remote_restart_if_needed(
             if !affected_repos.is_empty() {
                 rebuild_peer_overlays(peer_manager, daemon, affected_repos).await;
             }
+            sync_peer_query_state(peer_manager, daemon).await;
         }
     }
 
@@ -1187,6 +1216,8 @@ async fn disconnect_peer_and_rebuild(
         }
     }
 
+    sync_peer_query_state(peer_manager, daemon).await;
+
     let resync_requests = std::mem::take(&mut plan.resync_requests);
     dispatch_resync_requests(peer_manager, resync_requests).await;
     plan
@@ -1584,6 +1615,7 @@ async fn handle_client(
                     let _ = displaced.retire(GoodbyeReason::Superseded).await;
                 }
             }
+            sync_peer_query_state(&peer_manager, &daemon).await;
             daemon.send_event(DaemonEvent::PeerStatusChanged { host: host_name.clone(), status: PeerConnectionState::Connected });
             let _ = peer_connected_tx.send(PeerConnectedNotice { peer: host_name.clone(), generation });
 
@@ -1852,6 +1884,38 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
                 Err(e) => Message::error_response(id, e),
             }
         }
+
+        "list_hosts" => match ctx.daemon.list_hosts().await {
+            Ok(hosts) => Message::ok_response(id, &hosts),
+            Err(e) => Message::error_response(id, e),
+        },
+
+        "get_host_status" => {
+            let host = match extract_str_param(&params, "host") {
+                Ok(s) => s,
+                Err(e) => return Message::error_response(id, e),
+            };
+            match ctx.daemon.get_host_status(&host).await {
+                Ok(status) => Message::ok_response(id, &status),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
+
+        "get_host_providers" => {
+            let host = match extract_str_param(&params, "host") {
+                Ok(s) => s,
+                Err(e) => return Message::error_response(id, e),
+            };
+            match ctx.daemon.get_host_providers(&host).await {
+                Ok(providers) => Message::ok_response(id, &providers),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
+
+        "get_topology" => match ctx.daemon.get_topology().await {
+            Ok(topology) => Message::ok_response(id, &topology),
+            Err(e) => Message::error_response(id, e),
+        },
 
         unknown => Message::error_response(id, format!("unknown method: {unknown}")),
     }
@@ -2122,6 +2186,105 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_host_query_methods_round_trip() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let local_host = daemon.host_name().to_string();
+        daemon
+            .set_topology_routes(vec![flotilla_protocol::TopologyRoute {
+                target: HostName::new("remote"),
+                next_hop: HostName::new("relay"),
+                direct: false,
+                connected: true,
+                fallbacks: vec![],
+            }])
+            .await;
+
+        let hosts = dispatch_request_test(&daemon, 40, "list_hosts", serde_json::json!({})).await;
+        match hosts {
+            Message::Response { id, ok, data, error } => {
+                assert_eq!(id, 40);
+                assert!(ok, "list_hosts should be ok: {error:?}");
+                let parsed: flotilla_protocol::HostListResponse =
+                    serde_json::from_value(data.expect("host list data")).expect("parse host list");
+                assert!(parsed.hosts.iter().any(|entry| entry.host == HostName::local()));
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        let status = dispatch_request_test(&daemon, 41, "get_host_status", serde_json::json!({ "host": local_host })).await;
+        match status {
+            Message::Response { id, ok, data, error } => {
+                assert_eq!(id, 41);
+                assert!(ok, "get_host_status should be ok: {error:?}");
+                let parsed: flotilla_protocol::HostStatusResponse =
+                    serde_json::from_value(data.expect("host status data")).expect("parse host status");
+                assert!(parsed.is_local);
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        let providers = dispatch_request_test(&daemon, 42, "get_host_providers", serde_json::json!({ "host": daemon.host_name() })).await;
+        match providers {
+            Message::Response { id, ok, data, error } => {
+                assert_eq!(id, 42);
+                assert!(ok, "get_host_providers should be ok: {error:?}");
+                let parsed: flotilla_protocol::HostProvidersResponse =
+                    serde_json::from_value(data.expect("host providers data")).expect("parse host providers");
+                assert_eq!(parsed.summary.host_name, *daemon.host_name());
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        let topology = dispatch_request_test(&daemon, 43, "get_topology", serde_json::json!({})).await;
+        match topology {
+            Message::Response { id, ok, data, error } => {
+                assert_eq!(id, 43);
+                assert!(ok, "get_topology should be ok: {error:?}");
+                let parsed: flotilla_protocol::TopologyResponse =
+                    serde_json::from_value(data.expect("topology data")).expect("parse topology");
+                assert_eq!(parsed.routes.len(), 1);
+                assert_eq!(parsed.routes[0].next_hop, HostName::new("relay"));
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+
+        {
+            let mut pm = peer_manager.lock().await;
+            pm.store_host_summary(flotilla_protocol::HostSummary {
+                host_name: HostName::new("remote"),
+                system: flotilla_protocol::SystemInfo {
+                    home_dir: Some(PathBuf::from("/home/remote")),
+                    os: Some("linux".into()),
+                    arch: Some("aarch64".into()),
+                    cpu_count: Some(4),
+                    memory_total_mb: Some(8192),
+                    environment: flotilla_protocol::HostEnvironment::Container,
+                },
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+            });
+
+            ensure_test_connection_generation(&mut pm, &HostName::new("remote"), || {
+                Arc::new(CapturePeerSender { sent: Arc::new(StdMutex::new(Vec::new())) })
+            });
+        }
+
+        sync_peer_query_state(&peer_manager, &daemon).await;
+
+        let hosts = daemon.list_hosts().await.expect("list hosts after sync");
+        assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::new("remote") && entry.has_summary));
+
+        let topology = daemon.get_topology().await.expect("topology after sync");
+        assert!(topology.routes.iter().any(|route| route.target == HostName::new("remote") && route.next_hop == HostName::new("remote")));
     }
 
     #[tokio::test]
