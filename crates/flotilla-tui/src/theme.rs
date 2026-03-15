@@ -48,6 +48,12 @@ pub struct BarSiteStyle {
     pub label_transform: TextTransform,
 }
 
+impl BarSiteStyle {
+    pub fn transform_label(&self, text: &str) -> String {
+        self.label_transform.apply(text)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
@@ -288,10 +294,6 @@ impl Theme {
             "Connecting" | "Reconnecting" => self.warning,
             _ => self.muted,
         }
-    }
-
-    pub fn transform_label(&self, site: &BarSiteStyle, text: &str) -> String {
-        site.label_transform.apply(text)
     }
 }
 
@@ -556,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn change_request_status_other() {
+    fn change_request_status_open() {
         let t = Theme::classic();
         assert_eq!(t.change_request_status_color("open"), Color::Red);
         assert_eq!(t.change_request_status_color("Open"), Color::Red);
@@ -613,7 +615,7 @@ mod tests {
     #[test]
     fn transform_label_uses_site_transform() {
         let t = Theme::classic();
-        assert_eq!(t.transform_label(&t.status_bar, "hello"), "HELLO");
-        assert_eq!(t.transform_label(&t.tab_bar, "Hello"), "Hello");
+        assert_eq!(t.status_bar.transform_label("hello"), "HELLO");
+        assert_eq!(t.tab_bar.transform_label("Hello"), "Hello");
     }
 }

@@ -129,7 +129,7 @@ pub struct ThemedRibbonStyle<'a> {
 impl BarStyle for ThemedRibbonStyle<'_> {
     fn render_item(&self, item: &SegmentItem) -> RenderedItem {
         let key = item.key_hint.as_deref().unwrap_or("");
-        let label = self.theme.transform_label(self.site, &item.label);
+        let label = self.site.transform_label(&item.label);
         RenderedItem::from_spans(vec![
             Span::styled(CHEVRON, Style::default().fg(self.theme.bar_bg).bg(self.theme.key_chip_bg)),
             Span::styled(" ", Style::default().fg(self.theme.key_chip_fg).bg(self.theme.key_chip_bg)),
