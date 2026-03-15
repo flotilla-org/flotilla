@@ -234,12 +234,18 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             } else {
-                // Subsequent panes: create via new-pane with direction
+                // Subsequent panes: create via new-pane with direction.
+                // Note: --cwd without an explicit command doesn't reliably set the
+                // shell's working directory in Zellij — the default shell inherits the
+                // server's cwd instead. When no command is given, explicitly launch
+                // $SHELL so the --cwd flag is honoured.
                 let direction = pane.split.as_deref().unwrap_or("right");
+                let shell_fallback = "exec \"${SHELL:-sh}\"";
 
                 if let Some(surface) = pane.surfaces.first() {
                     let mut args: Vec<&str> = vec!["new-pane", "-d", direction, "--cwd", &working_dir];
-                    Self::append_command_args(&mut args, &surface.command);
+                    let cmd = if surface.command.is_empty() { shell_fallback } else { &surface.command };
+                    Self::append_command_args(&mut args, cmd);
                     self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
@@ -247,7 +253,8 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                 // Additional surfaces in this pane: stacked panes
                 for surface in pane.surfaces.iter().skip(1) {
                     let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
-                    Self::append_command_args(&mut args, &surface.command);
+                    let cmd = if surface.command.is_empty() { shell_fallback } else { &surface.command };
+                    Self::append_command_args(&mut args, cmd);
                     self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
