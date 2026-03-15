@@ -520,6 +520,63 @@ async fn replay_since_returns_empty_when_up_to_date() {
     assert!(events.is_empty(), "should be empty when up to date");
 }
 
+/// replay_since must include peer provider data, just like get_state and live
+/// broadcasts. A late-subscribing or reconnecting client should see the same
+/// merged view (local + peer checkouts with correct host attribution) as a
+/// client that was connected from the start.
+#[tokio::test]
+async fn replay_since_includes_peer_checkouts_with_correct_host() {
+    let (_temp, repo, daemon, _identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
+    let mut rx = daemon.subscribe();
+
+    // Initial refresh
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    // Use a peer host name that won't collide with the local hostname
+    let peer_host = HostName::new("remote-peer-host");
+    let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/remote/repo");
+    let mut peer_data = ProviderData::default();
+    peer_data.checkouts.insert(peer_checkout_path.clone(), Checkout {
+        branch: "peer-feature".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+    });
+
+    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), peer_data)]).await;
+    let _ = recv_event(&mut rx).await;
+
+    // Trigger refresh so poll_snapshots stores updated state
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    // Simulate a new client connecting — replay_since with empty last_seen
+    let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
+
+    let snap = events
+        .iter()
+        .find_map(|e| match e {
+            DaemonEvent::SnapshotFull(s) if s.repo == repo => Some(s),
+            _ => None,
+        })
+        .expect("should have a SnapshotFull for our repo");
+
+    // Peer checkout must be present, attributed to its real host (not local)
+    assert!(
+        snap.providers.checkouts.contains_key(&peer_checkout_path),
+        "replay snapshot must include peer checkout under remote-peer-host, got keys: {:?}",
+        snap.providers.checkouts.keys().collect::<Vec<_>>()
+    );
+
+    // No ghost checkout under local host
+    let local_host = HostName::local();
+    let ghost = HostPath::new(local_host, PathBuf::from("/srv/remote/repo"));
+    assert!(!snap.providers.checkouts.contains_key(&ghost), "replay snapshot must not re-attribute peer checkout to local host");
+}
+
 #[tokio::test]
 async fn add_and_remove_repo_updates_state_and_emits_events() {
     let temp = tempfile::tempdir().unwrap();
@@ -719,8 +776,8 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
     // Initial refresh — populates last_snapshot with local-only data
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
-    let peer_host = HostName::new("kiwi");
-    let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/kiwi/repo");
+    let peer_host = HostName::new("remote-peer-host");
+    let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/remote/repo");
     let mut peer_data = ProviderData::default();
     peer_data.checkouts.insert(peer_checkout_path.clone(), Checkout {
         branch: "peer-feature".into(),
@@ -753,7 +810,7 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
 
     // The peer checkout must NOT appear re-attributed to the local host
     let local_host = HostName::local();
-    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/srv/kiwi/repo"));
+    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/srv/remote/repo"));
     assert!(!snapshot.providers.checkouts.contains_key(&ghost_checkout), "peer checkout must not be re-stamped as a local checkout");
 }
 
@@ -767,8 +824,8 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
     // Initial refresh
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
-    let peer_host = HostName::new("kiwi");
-    let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/kiwi/repo");
+    let peer_host = HostName::new("remote-peer-host");
+    let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/remote/repo");
     let make_peer_data = |branch: &str| {
         let mut pd = ProviderData::default();
         pd.checkouts.insert(peer_checkout_path.clone(), Checkout {
@@ -802,7 +859,7 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
     assert_eq!(peer_count, 1, "peer should have exactly 1 checkout, got {peer_count}");
 
     let local_host = HostName::local();
-    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/srv/kiwi/repo"));
+    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/srv/remote/repo"));
     assert!(
         !snapshot.providers.checkouts.contains_key(&ghost_checkout),
         "peer path must not appear as a local checkout after poll + repeated peer updates"

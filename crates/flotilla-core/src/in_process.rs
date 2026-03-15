@@ -190,10 +190,6 @@ struct SnapshotBuildContext<'a> {
     host_name: &'a HostName,
 }
 
-fn build_repo_snapshot(ctx: SnapshotBuildContext<'_>) -> Snapshot {
-    build_repo_snapshot_with_peers(ctx, None)
-}
-
 /// Build a proto Snapshot, optionally merging peer provider data before correlation.
 fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: Option<&[(HostName, ProviderData)]>) -> Snapshot {
     let SnapshotBuildContext { repo_identity, path, seq, local_providers, errors, provider_health, cache, search_results, host_name } = ctx;
@@ -1802,6 +1798,7 @@ impl DaemonHandle for InProcessDaemon {
     async fn replay_since(&self, last_seen: &HashMap<flotilla_protocol::RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
+        let peer_overlay = self.peer_providers.read().await;
         let mut events = Vec::new();
 
         for identity in order.iter() {
@@ -1813,18 +1810,22 @@ impl DaemonHandle for InProcessDaemon {
             if state.seq == 0 {
                 continue;
             }
+            let peers = peer_overlay.get(identity);
             let snapshot = || {
-                build_repo_snapshot(SnapshotBuildContext {
-                    repo_identity: state.identity.clone(),
-                    path: state.preferred_path(),
-                    seq: state.seq,
-                    local_providers: &state.last_local_providers,
-                    errors: &state.last_snapshot.errors,
-                    provider_health: &state.last_snapshot.provider_health,
-                    cache: &state.issue_cache,
-                    search_results: &state.search_results,
-                    host_name: &self.host_name,
-                })
+                build_repo_snapshot_with_peers(
+                    SnapshotBuildContext {
+                        repo_identity: state.identity.clone(),
+                        path: state.preferred_path(),
+                        seq: state.seq,
+                        local_providers: &state.last_local_providers,
+                        errors: &state.last_snapshot.errors,
+                        provider_health: &state.last_snapshot.provider_health,
+                        cache: &state.issue_cache,
+                        search_results: &state.search_results,
+                        host_name: &self.host_name,
+                    },
+                    peers.map(|p| p.as_slice()),
+                )
             };
 
             match last_seen.get(&state.identity) {
@@ -2244,17 +2245,20 @@ mod tests {
         })]);
 
         let default_snap = RefreshSnapshot::default();
-        let snap = build_repo_snapshot(SnapshotBuildContext {
-            repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
-            path: Path::new("/tmp/repo"),
-            seq: 7,
-            local_providers: &default_snap.providers,
-            errors: &default_snap.errors,
-            provider_health: &default_snap.provider_health,
-            cache: &cache,
-            search_results: &None,
-            host_name: &HostName::local(),
-        });
+        let snap = build_repo_snapshot_with_peers(
+            SnapshotBuildContext {
+                repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
+                path: Path::new("/tmp/repo"),
+                seq: 7,
+                local_providers: &default_snap.providers,
+                errors: &default_snap.errors,
+                provider_health: &default_snap.provider_health,
+                cache: &cache,
+                search_results: &None,
+                host_name: &HostName::local(),
+            },
+            None,
+        );
         assert_eq!(snap.seq, 7);
         assert_eq!(snap.issue_total, Some(5));
         assert!(snap.issue_has_more);
