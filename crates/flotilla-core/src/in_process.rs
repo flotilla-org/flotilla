@@ -629,13 +629,13 @@ impl InProcessDaemon {
         self.follower
     }
 
-    /// Find the local repo path that matches a given RepoIdentity, if any.
-    pub async fn find_repo_by_identity(&self, identity: &flotilla_protocol::RepoIdentity) -> Option<PathBuf> {
+    /// Resolve a repo identity to the preferred local path for execution or overlay updates.
+    pub async fn preferred_local_path_for_identity(&self, identity: &flotilla_protocol::RepoIdentity) -> Option<PathBuf> {
         self.repos.read().await.get(identity).map(|state| state.preferred_path().to_path_buf())
     }
 
-    /// Reverse lookup: find the RepoIdentity for a given local repo path.
-    pub async fn find_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
+    /// Resolve a tracked local or synthetic repo path to its stable repo identity.
+    pub async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
         self.path_identities.read().await.get(repo_path).cloned()
     }
 
@@ -743,7 +743,7 @@ impl InProcessDaemon {
     /// Used by the outbound replication task to send only this host's
     /// authoritative data to peers, avoiding echo-back of merged peer data.
     pub async fn get_local_providers(&self, repo: &Path) -> Option<(ProviderData, u64)> {
-        let identity = self.find_identity_for_path(repo).await?;
+        let identity = self.tracked_repo_identity_for_path(repo).await?;
         let repos = self.repos.read().await;
         let state = repos.get(&identity)?;
         // add_root() keeps any local root ahead of synthetic remote-only
@@ -767,7 +767,7 @@ impl InProcessDaemon {
     /// Called by the DaemonServer when PeerManager receives updated peer data.
     /// The peer data is merged into the local snapshot during the next broadcast.
     pub async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>) {
-        let Some(identity) = self.find_identity_for_path(repo_path).await else {
+        let Some(identity) = self.tracked_repo_identity_for_path(repo_path).await else {
             return;
         };
         {
@@ -918,7 +918,7 @@ impl InProcessDaemon {
     /// Fetch issue pages until the cache has at least `desired_count` entries
     /// (or no more pages are available).
     async fn ensure_issues_cached(&self, repo: &Path, desired_count: usize) {
-        let Some(identity) = self.find_identity_for_path(repo).await else {
+        let Some(identity) = self.tracked_repo_identity_for_path(repo).await else {
             return;
         };
         // Serialize fetches per-repo to prevent concurrent calls from reading the same
@@ -984,7 +984,7 @@ impl InProcessDaemon {
 
     /// Run a search query against the issue tracker and store the results.
     async fn search_issues(&self, repo: &Path, query: &str) {
-        let Some(identity) = self.find_identity_for_path(repo).await else {
+        let Some(identity) = self.tracked_repo_identity_for_path(repo).await else {
             return;
         };
         let registry = {
@@ -1291,7 +1291,7 @@ impl InProcessDaemon {
     }
 
     async fn broadcast_snapshot_inner(&self, repo: &Path, is_local_change: bool) {
-        let Some(identity) = self.find_identity_for_path(repo).await else {
+        let Some(identity) = self.tracked_repo_identity_for_path(repo).await else {
             return;
         };
         // Read peer overlay (brief read lock)
@@ -1357,7 +1357,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn get_state(&self, repo: &Path) -> Result<Snapshot, String> {
-        let identity = self.find_identity_for_path(repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+        let identity = self.tracked_repo_identity_for_path(repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()
@@ -1424,7 +1424,7 @@ impl DaemonHandle for InProcessDaemon {
                 return Ok(INLINE_COMMAND_ID);
             }
             flotilla_protocol::CommandAction::ClearIssueSearch { repo } => {
-                let identity = self.find_identity_for_path(repo).await;
+                let identity = self.tracked_repo_identity_for_path(repo).await;
                 let mut repos = self.repos.write().await;
                 if let Some(identity) = identity.as_ref() {
                     if let Some(state) = repos.get_mut(identity) {
@@ -1458,7 +1458,7 @@ impl DaemonHandle for InProcessDaemon {
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
                     host: self.host_name.clone(),
-                    repo_identity: self.find_identity_for_path(path).await.unwrap_or(repo_identity),
+                    repo_identity: self.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
                     repo: path.clone(),
                     result,
                 });
@@ -1466,7 +1466,8 @@ impl DaemonHandle for InProcessDaemon {
             }
             flotilla_protocol::CommandAction::RemoveRepo { repo } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
-                let repo_identity = self.find_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
+                let repo_identity =
+                    self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
@@ -1499,7 +1500,7 @@ impl DaemonHandle for InProcessDaemon {
                 };
                 let display_repo = repo_paths.first().cloned().unwrap_or_default();
                 let display_repo_identity =
-                    self.find_identity_for_path(&display_repo).await.unwrap_or_else(|| fallback_repo_identity(&display_repo));
+                    self.tracked_repo_identity_for_path(&display_repo).await.unwrap_or_else(|| fallback_repo_identity(&display_repo));
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
@@ -1524,7 +1525,8 @@ impl DaemonHandle for InProcessDaemon {
             }
             flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } => {
                 let repo_path = self.resolve_repo_selector(selector).await?;
-                let repo_identity = self.find_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
+                let repo_identity =
+                    self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                     command_id: id,
@@ -1555,7 +1557,8 @@ impl DaemonHandle for InProcessDaemon {
         let event_tx = self.event_tx.clone();
         let (repo_identity, registry, providers_data, refresh_trigger) = {
             let repos = self.repos.read().await;
-            let identity = self.find_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+            let identity =
+                self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             (state.identity.clone(), state.registry(), state.providers(), state.refresh_trigger())
         };
@@ -1665,7 +1668,8 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {
         let (prev_count, registry, identity) = {
-            let identity = self.find_identity_for_path(repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+            let identity =
+                self.tracked_repo_identity_for_path(repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             let repos = self.repos.read().await;
             let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             for root in &state.roots {
@@ -1858,7 +1862,7 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn remove_repo(&self, path: &Path) -> Result<(), String> {
         let path = path.to_path_buf();
-        let repo_identity = self.find_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
+        let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
 
         let mut removed_identity = false;
         let mut new_preferred_path = None;

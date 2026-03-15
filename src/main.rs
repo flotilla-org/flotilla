@@ -190,9 +190,9 @@ async fn run_tui(cli: Cli) -> Result<()> {
             let discovery = flotilla_core::providers::discovery::DiscoveryRuntime::for_process(daemon_config.follower);
             let d = InProcessDaemon::new(repo_roots, Arc::clone(&config_clone), discovery, host_name).await;
 
-            match flotilla_daemon::peer_networking::PeerNetworkingTask::new(Arc::clone(&d), &config_clone) {
-                Ok((peer_networking, _peer_manager, _peer_data_tx)) => {
-                    let _ = peer_networking.spawn();
+            match flotilla_daemon::server::spawn_embedded_peer_networking(Arc::clone(&d), &config_clone) {
+                Ok(_peer_networking) => {
+                    // Detached background task; the TUI owns the daemon handle.
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "peer networking not started in embedded mode");

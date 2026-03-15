@@ -210,7 +210,7 @@ async fn daemon_for_git_repo(remote: &str) -> (tempfile::TempDir, PathBuf, Arc<I
     init_git_repo_with_remote(&repo, remote);
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::local()).await;
-    let identity = daemon.find_identity_for_path(&repo).await.expect("repo identity should be detected");
+    let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("repo identity should be detected");
     (temp, repo, daemon, identity)
 }
 
@@ -459,7 +459,7 @@ async fn generate_branch_name_can_be_cancelled_while_provider_call_is_in_flight(
 #[tokio::test]
 async fn replay_since_returns_full_snapshot_for_unknown_seq() {
     let (_temp, repo, daemon) = daemon_for_cwd().await;
-    let identity = daemon.find_identity_for_path(&repo).await.expect("repo identity should be detected");
+    let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("repo identity should be detected");
 
     // Wait for at least one broadcast so the daemon has state
     let mut rx = daemon.subscribe();
@@ -501,7 +501,7 @@ async fn replay_since_returns_full_snapshot_for_new_repo() {
 #[tokio::test]
 async fn replay_since_returns_empty_when_up_to_date() {
     let (_temp, repo, daemon) = daemon_for_cwd().await;
-    let identity = daemon.find_identity_for_path(&repo).await.expect("repo identity should be detected");
+    let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("repo identity should be detected");
 
     // Wait for the first snapshot to get the current seq
     let mut rx = daemon.subscribe();
@@ -602,8 +602,8 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
 async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_git_repos("git@github.com:owner/repo.git").await;
 
-    let identity_a = daemon.find_identity_for_path(&repo_a).await.expect("identity for first repo");
-    let identity_b = daemon.find_identity_for_path(&repo_b).await.expect("identity for second repo");
+    let identity_a = daemon.tracked_repo_identity_for_path(&repo_a).await.expect("identity for first repo");
+    let identity_b = daemon.tracked_repo_identity_for_path(&repo_b).await.expect("identity for second repo");
     assert_eq!(identity_a, identity_b, "same upstream repo should resolve to one repo identity");
 
     let tracked = daemon.tracked_repo_paths().await;
@@ -620,8 +620,8 @@ async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].identity, identity_b);
     assert_eq!(repos[0].path, repo_b, "remaining root should become the preferred path");
-    assert!(daemon.find_identity_for_path(&repo_a).await.is_none());
-    assert_eq!(daemon.find_identity_for_path(&repo_b).await, Some(identity_b));
+    assert!(daemon.tracked_repo_identity_for_path(&repo_a).await.is_none());
+    assert_eq!(daemon.tracked_repo_identity_for_path(&repo_b).await, Some(identity_b));
 }
 
 #[tokio::test]
@@ -642,7 +642,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].identity, identity);
     assert_eq!(repos[0].path, local_repo, "local clone should become the preferred executable path");
-    assert_eq!(daemon.find_repo_by_identity(&identity).await, Some(local_repo.clone()));
+    assert_eq!(daemon.preferred_local_path_for_identity(&identity).await, Some(local_repo.clone()));
     assert!(daemon.get_local_providers(&local_repo).await.is_some(), "local providers should now resolve for the identity");
     assert_eq!(daemon.tracked_repo_paths().await, vec![local_repo]);
 }
