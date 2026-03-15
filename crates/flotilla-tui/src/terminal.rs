@@ -60,6 +60,8 @@ pub fn suspend_and_resume() -> ratatui::DefaultTerminal {
     }
     // Resumed — re-initialise terminal
     let terminal = ratatui::init();
-    let _ = execute!(stdout(), EnableMouseCapture);
+    if let Err(e) = execute!(stdout(), EnableMouseCapture) {
+        tracing::warn!(err = %e, "failed to re-enable mouse capture after resume");
+    }
     terminal
 }
