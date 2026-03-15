@@ -905,14 +905,15 @@ fn wrap_remote_attach_commands(
     config_base: &Path,
 ) -> Result<Vec<PreparedTerminalCommand>, String> {
     let ssh_target = remote_ssh_target(target_host, config_base)?;
-    let remote_dir = shell_quote(&checkout_path.display().to_string());
+    let remote_dir = checkout_path.display().to_string();
     Ok(commands
         .iter()
         .map(|entry| {
-            let remote_shell = format!("cd {remote_dir} && {}", entry.command);
+            let inner = format!("cd {} && {}", shell_quote(&remote_dir), entry.command);
+            let login_wrapped = format!("$SHELL -l -c \"{}\"", escape_for_double_quotes(&inner));
             PreparedTerminalCommand {
                 role: entry.role.clone(),
-                command: format!("ssh -t {} {}", shell_quote(&ssh_target), shell_quote(&remote_shell)),
+                command: format!("ssh -t {} {}", shell_quote(&ssh_target), shell_quote(&login_wrapped)),
             }
         })
         .collect())
@@ -934,6 +935,20 @@ fn remote_ssh_target(target_host: &HostName, config_base: &Path) -> Result<Strin
 
 fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
+}
+
+fn escape_for_double_quotes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '"' | '$' | '`' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn session_provider_key<'a>(session: &'a CloudAgentSession, session_id: &str) -> Option<&'a str> {
@@ -1528,6 +1543,7 @@ mod tests {
         assert!(resolved[0].1.contains("desktop.local"));
         assert!(resolved[0].1.contains("/remote/feat"));
         assert!(resolved[0].1.contains("bash -l"));
+        assert!(resolved[0].1.contains("$SHELL -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
     }
 
     #[tokio::test]
@@ -1617,6 +1633,8 @@ mod tests {
         assert_eq!(created.len(), 1);
         assert!(!created[0].working_directory.to_string_lossy().starts_with("<remote>/"));
         assert!(created[0].working_directory.exists(), "fallback working directory should exist");
+        let resolved = created[0].resolved_commands.as_ref().expect("resolved commands");
+        assert!(resolved[0].1.contains("$SHELL -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
     }
 
     #[tokio::test]
@@ -2818,5 +2836,46 @@ content:
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("branch not found"));
+    }
+
+    #[test]
+    fn wrap_remote_attach_commands_uses_login_shell() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("hosts.toml"),
+            "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
+        )
+        .expect("write hosts config");
+
+        let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }];
+        let result = wrap_remote_attach_commands(
+            &HostName::new("desktop"),
+            &PathBuf::from("/home/dev/project"),
+            &commands,
+            temp.path(),
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "main");
+        assert!(result[0].command.contains("$SHELL -l -c"), "expected login shell wrapper, got: {}", result[0].command);
+        assert!(result[0].command.contains("ssh -t"), "expected ssh -t, got: {}", result[0].command);
+        assert!(result[0].command.contains("desktop.local"), "expected host, got: {}", result[0].command);
+        assert!(result[0].command.contains("/home/dev/project"), "expected remote dir, got: {}", result[0].command);
+        assert!(result[0].command.contains("claude"), "expected command, got: {}", result[0].command);
+    }
+
+    #[test]
+    fn escape_for_double_quotes_handles_special_chars() {
+        assert_eq!(escape_for_double_quotes("hello"), "hello");
+        assert_eq!(escape_for_double_quotes(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(escape_for_double_quotes("$HOME"), r"\$HOME");
+        assert_eq!(escape_for_double_quotes("a`cmd`b"), r"a\`cmd\`b");
+        assert_eq!(escape_for_double_quotes(r"back\slash"), r"back\\slash");
+        assert_eq!(escape_for_double_quotes(""), "");
+        assert_eq!(
+            escape_for_double_quotes("shpool --socket /tmp/s.sock attach flotilla/feat/main/0"),
+            "shpool --socket /tmp/s.sock attach flotilla/feat/main/0"
+        );
     }
 }
