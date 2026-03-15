@@ -195,12 +195,13 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
     while idx < args.len() {
         match args[idx].to_str() {
             Some("--embedded") => idx += 1,
-            Some("--repo-root") | Some("--config-dir") | Some("--socket") => idx += 2,
+            Some("--repo-root") | Some("--config-dir") | Some("--socket") | Some("--theme") => idx += 2,
             Some(value)
                 if value.starts_with("--embedded=")
                     || value.starts_with("--repo-root=")
                     || value.starts_with("--config-dir=")
-                    || value.starts_with("--socket=") =>
+                    || value.starts_with("--socket=")
+                    || value.starts_with("--theme=") =>
             {
                 idx += 1;
             }
