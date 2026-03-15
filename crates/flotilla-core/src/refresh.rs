@@ -158,7 +158,7 @@ async fn refresh_providers(
     );
 
     let cr_fut = collect_named_results(
-        registry.code_review.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect(),
+        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect(),
     );
 
     let sessions_fut = collect_named_results(
@@ -170,7 +170,7 @@ async fn refresh_providers(
     );
 
     let merged_fut = collect_named_results(
-        registry.code_review.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50))).collect(),
+        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50))).collect(),
     );
 
     let ws_fut = async {
@@ -249,7 +249,7 @@ fn compute_provider_health(registry: &ProviderRegistry, errors: &[RefreshError])
     let mut health = HashMap::new();
 
     insert_category_health(&mut health, errors, "cloud_agent", registry.cloud_agents.display_names().map(|s| s.to_string()), &["sessions"]);
-    insert_category_health(&mut health, errors, "code_review", registry.code_review.display_names().map(|s| s.to_string()), &[
+    insert_category_health(&mut health, errors, "change_request", registry.change_requests.display_names().map(|s| s.to_string()), &[
         "PRs", "merged",
     ]);
     insert_category_health(&mut health, errors, "checkout_manager", registry.checkout_managers.display_names().map(|s| s.to_string()), &[
@@ -274,7 +274,7 @@ mod tests {
 
     use super::*;
     use crate::providers::{
-        code_review::CodeReview,
+        change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::ProviderDescriptor,
         types::*,
@@ -315,12 +315,12 @@ mod tests {
         }
     }
 
-    struct MockCodeReview {
+    struct MockChangeRequestTracker {
         change_requests_result: Result<Vec<(String, ChangeRequest)>, String>,
         merged_result: Result<Vec<String>, String>,
     }
 
-    impl MockCodeReview {
+    impl MockChangeRequestTracker {
         fn ok(change_requests: Vec<(String, ChangeRequest)>, merged_branches: Vec<String>) -> Self {
             Self { change_requests_result: Ok(change_requests), merged_result: Ok(merged_branches) }
         }
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CodeReview for MockCodeReview {
+    impl ChangeRequestTracker for MockChangeRequestTracker {
         async fn list_change_requests(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
             self.change_requests_result.clone()
         }
@@ -551,7 +551,7 @@ mod tests {
     fn compute_provider_health_maps_error_categories() {
         let mut registry = ProviderRegistry::new();
         registry.cloud_agents.insert("claude", desc("MockCA"), Arc::new(MockCloudAgent::ok(vec![])));
-        registry.code_review.insert("github", desc("MockCR"), Arc::new(MockCodeReview::ok(vec![], vec![])));
+        registry.change_requests.insert("github", desc("MockCR"), Arc::new(MockChangeRequestTracker::ok(vec![], vec![])));
 
         let cases = vec![
             (vec![], true, true),
@@ -570,9 +570,9 @@ mod tests {
                 "cloud_agent health mismatch for errors: {errors:?}"
             );
             assert_eq!(
-                health.get(&("code_review", "MockCR".to_string())),
+                health.get(&("change_request", "MockCR".to_string())),
                 Some(&expected_review),
-                "code_review health mismatch for errors: {errors:?}"
+                "change_request health mismatch for errors: {errors:?}"
             );
         }
     }
@@ -600,13 +600,12 @@ mod tests {
             desc("wt"),
             Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))])),
         );
-        registry.code_review.insert(
+        registry.change_requests.insert(
             "github",
             desc("github"),
-            Arc::new(MockCodeReview::ok(
-                vec![("42".to_string(), make_change_request("Add feature", "feat-a"))],
-                vec!["shared".to_string()],
-            )),
+            Arc::new(MockChangeRequestTracker::ok(vec![("42".to_string(), make_change_request("Add feature", "feat-a"))], vec![
+                "shared".to_string()
+            ])),
         );
         registry.cloud_agents.insert(
             "claude",
@@ -653,7 +652,7 @@ mod tests {
             desc("wt"),
             Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))])),
         );
-        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview::failing("pr fail", "merged fail")));
+        registry.change_requests.insert("github", desc("github"), Arc::new(MockChangeRequestTracker::failing("pr fail", "merged fail")));
         registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("sessions fail")));
         registry.vcs.insert("git", desc("git"), Arc::new(MockVcs::failing("branches fail")));
         registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail")));

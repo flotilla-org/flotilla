@@ -10,7 +10,7 @@ use crate::providers::{
     CommandRunner,
 };
 
-pub struct GitHubCodeReview {
+pub struct GitHubChangeRequest {
     provider_name: String,
     repo_slug: String,
     api: Arc<dyn GhApi>,
@@ -27,7 +27,7 @@ struct GhPr {
     is_draft: bool,
 }
 
-impl GitHubCodeReview {
+impl GitHubChangeRequest {
     pub fn new(provider_name: String, repo_slug: String, api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>) -> Self {
         Self { provider_name, repo_slug, api, runner }
     }
@@ -101,7 +101,7 @@ impl GitHubCodeReview {
 }
 
 #[async_trait]
-impl super::CodeReview for GitHubCodeReview {
+impl super::ChangeRequestTracker for GitHubChangeRequest {
     async fn list_change_requests(&self, repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=open&per_page={}", self.repo_slug, per_page);
@@ -170,7 +170,7 @@ mod tests {
 
     use super::*;
     use crate::providers::{
-        code_review::CodeReview,
+        change_request::ChangeRequestTracker,
         github_test_support::{build_api_and_runner, repo_root_for_recording},
         replay::{
             Masks, {self},
@@ -178,7 +178,7 @@ mod tests {
     };
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("code_review", name)
+        crate::providers::testing::fixture_path("change_request", name)
     }
 
     #[tokio::test]
@@ -189,7 +189,7 @@ mod tests {
         let repo_root = if session.is_recording() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
         let (api, runner) = build_api_and_runner(&session);
 
-        let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
+        let provider = GitHubChangeRequest::new("github".into(), repo_slug, api, runner);
         let prs = provider.list_change_requests(&repo_root, 100).await.unwrap();
 
         // Currently 0 open PRs, so list may be empty — validate structure
@@ -210,7 +210,7 @@ mod tests {
         let repo_root = if session.is_recording() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
         let (api, runner) = build_api_and_runner(&session);
 
-        let provider = GitHubCodeReview::new("github".into(), repo_slug, api, runner);
+        let provider = GitHubChangeRequest::new("github".into(), repo_slug, api, runner);
         let branches = provider.list_merged_branch_names(&repo_root, 5).await.unwrap();
 
         // The repo has closed/merged PRs, so we expect some results
@@ -264,7 +264,7 @@ mod tests {
             ("", ChangeRequestStatus::Open),
         ];
         for (input, expected) in cases {
-            assert_eq!(GitHubCodeReview::parse_state(input), expected, "{input}");
+            assert_eq!(GitHubChangeRequest::parse_state(input), expected, "{input}");
         }
     }
 
@@ -287,21 +287,21 @@ mod tests {
         ];
         for (input, expected) in cases {
             let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
-            assert_eq!(GitHubCodeReview::parse_linked_issues(input), expected, "{input}");
+            assert_eq!(GitHubChangeRequest::parse_linked_issues(input), expected, "{input}");
         }
     }
 
     // --- gh_pr_to_change_request tests ---
 
-    /// Create a `GitHubCodeReview` with empty replay deps (the API/runner
+    /// Create a `GitHubChangeRequest` with empty replay deps (the API/runner
     /// are never called by `gh_pr_to_change_request`).
-    fn provider_with_empty_replay() -> GitHubCodeReview {
+    fn provider_with_empty_replay() -> GitHubChangeRequest {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("empty.yaml");
         std::fs::write(&path, "interactions: []\n").expect("write fixture");
         let session = replay::Session::replaying(&path, Masks::new());
         let (api, runner) = build_api_and_runner(&session);
-        GitHubCodeReview::new("github".into(), "owner/repo".into(), api, runner)
+        GitHubChangeRequest::new("github".into(), "owner/repo".into(), api, runner)
     }
 
     fn gh_pr(number: i64) -> GhPr {

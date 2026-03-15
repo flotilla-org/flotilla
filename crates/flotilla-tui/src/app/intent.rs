@@ -25,14 +25,14 @@ impl Intent {
             Intent::RemoveCheckout => format!("Remove {}", labels.checkouts.noun),
             Intent::CreateCheckout => format!("Create {}", labels.checkouts.noun),
             Intent::GenerateBranchName => "Generate branch name".into(),
-            Intent::OpenChangeRequest => format!("Open {} in browser", labels.code_review.noun),
+            Intent::OpenChangeRequest => format!("Open {} in browser", labels.change_requests.noun),
             Intent::OpenIssue => "Open issue in browser".into(),
             Intent::LinkIssuesToChangeRequest => {
-                format!("Link issues to {}", labels.code_review.noun)
+                format!("Link issues to {}", labels.change_requests.noun)
             }
             Intent::TeleportSession => "Teleport session".into(),
             Intent::ArchiveSession => "Archive session".into(),
-            Intent::CloseChangeRequest => format!("Close {}", labels.code_review.noun),
+            Intent::CloseChangeRequest => format!("Close {}", labels.change_requests.noun),
         }
     }
 
@@ -82,10 +82,10 @@ impl Intent {
         match self {
             Intent::RemoveCheckout => Some(format!("d:remove {}", labels.checkouts.noun)),
             Intent::OpenChangeRequest => {
-                if labels.code_review.abbr.is_empty() {
+                if labels.change_requests.abbr.is_empty() {
                     Some("p:show".into())
                 } else {
-                    Some(format!("p:show {}", labels.code_review.abbr))
+                    Some(format!("p:show {}", labels.change_requests.abbr))
                 }
             }
             _ => None,
@@ -251,7 +251,7 @@ mod tests {
     fn custom_labels() -> RepoLabels {
         RepoLabels {
             checkouts: CategoryLabels { section: "Worktrees".into(), noun: "worktree".into(), abbr: "wt".into() },
-            code_review: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "pr".into() },
+            change_requests: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "pr".into() },
             issues: CategoryLabels { section: "Issues".into(), noun: "issue".into(), abbr: "iss".into() },
             cloud_agents: CategoryLabels { section: "Sessions".into(), noun: "session".into(), abbr: "sess".into() },
         }

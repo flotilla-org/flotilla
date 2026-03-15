@@ -27,7 +27,7 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     }
     RepoLabels {
         checkouts: labels(&registry.checkout_managers),
-        code_review: labels(&registry.code_review),
+        change_requests: labels(&registry.change_requests),
         issues: labels(&registry.issue_trackers),
         cloud_agents: labels(&registry.cloud_agents),
     }
@@ -44,7 +44,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     }
     collect_names(&mut names, "vcs", &registry.vcs);
     collect_names(&mut names, "checkout_manager", &registry.checkout_managers);
-    collect_names(&mut names, "code_review", &registry.code_review);
+    collect_names(&mut names, "change_request", &registry.change_requests);
     collect_names(&mut names, "issue_tracker", &registry.issue_trackers);
     collect_names(&mut names, "cloud_agent", &registry.cloud_agents);
     collect_names(&mut names, "ai_utility", &registry.ai_utilities);
@@ -84,7 +84,7 @@ impl RepoModel {
         let registry = ProviderRegistry::new();
         let labels = RepoLabels {
             checkouts: CategoryLabels::new("Checkouts", "checkout", "CO"),
-            code_review: CategoryLabels::new("Change Requests", "CR", "CR"),
+            change_requests: CategoryLabels::new("Change Requests", "CR", "CR"),
             issues: CategoryLabels::new("Issues", "issue", "I"),
             cloud_agents: CategoryLabels::new("Sessions", "session", "S"),
         };
@@ -101,7 +101,7 @@ mod tests {
     use super::*;
     use crate::providers::{
         ai_utility::AiUtility,
-        code_review::CodeReview,
+        change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::ProviderDescriptor,
         issue_tracker::IssueTracker,
@@ -160,9 +160,9 @@ mod tests {
         }
     }
 
-    struct StubCodeReview;
+    struct StubChangeRequestTracker;
     #[async_trait]
-    impl CodeReview for StubCodeReview {
+    impl ChangeRequestTracker for StubChangeRequestTracker {
         async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
             Ok(vec![])
         }
@@ -232,7 +232,11 @@ mod tests {
         let mut reg = ProviderRegistry::new();
         reg.vcs.insert("vcs", named_desc("StubVcs"), Arc::new(StubVcs));
         reg.checkout_managers.insert("cm", labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"), Arc::new(StubCheckoutManager));
-        reg.code_review.insert("cr", labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview));
+        reg.change_requests.insert(
+            "cr",
+            labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"),
+            Arc::new(StubChangeRequestTracker),
+        );
         reg.issue_trackers.insert("it", labeled_desc("it", "StubIT", "#", "GitHub Issues", "issue"), Arc::new(StubIssueTracker));
         reg.cloud_agents.insert("ca", labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"), Arc::new(StubCloudAgent));
         reg.ai_utilities.insert("ai", named_desc("StubAI"), Arc::new(StubAiUtility));
@@ -252,7 +256,7 @@ mod tests {
         // Default CategoryLabels: section="—", noun="item", abbr=""
         assert_eq!(labels.checkouts.section, "\u{2014}");
         assert_eq!(labels.checkouts.noun, "item");
-        assert_eq!(labels.code_review.section, "\u{2014}");
+        assert_eq!(labels.change_requests.section, "\u{2014}");
         assert_eq!(labels.issues.section, "\u{2014}");
         assert_eq!(labels.cloud_agents.section, "\u{2014}");
     }
@@ -266,9 +270,9 @@ mod tests {
         assert_eq!(labels.checkouts.noun, "worktree");
         assert_eq!(labels.checkouts.abbr, "WT");
 
-        assert_eq!(labels.code_review.section, "Pull Requests");
-        assert_eq!(labels.code_review.noun, "pull request");
-        assert_eq!(labels.code_review.abbr, "PR");
+        assert_eq!(labels.change_requests.section, "Pull Requests");
+        assert_eq!(labels.change_requests.noun, "pull request");
+        assert_eq!(labels.change_requests.abbr, "PR");
 
         assert_eq!(labels.issues.section, "GitHub Issues");
         assert_eq!(labels.issues.noun, "issue");
@@ -293,7 +297,7 @@ mod tests {
         assert_eq!(labels.cloud_agents.section, "Cloud Agents");
 
         // Missing providers fall back to defaults.
-        assert_eq!(labels.code_review.section, "\u{2014}");
+        assert_eq!(labels.change_requests.section, "\u{2014}");
         assert_eq!(labels.issues.section, "\u{2014}");
     }
 
@@ -315,7 +319,7 @@ mod tests {
 
         assert_eq!(names.get("vcs").unwrap(), &vec!["StubVcs".to_string()]);
         assert_eq!(names.get("checkout_manager").unwrap(), &vec!["StubCM".to_string()]);
-        assert_eq!(names.get("code_review").unwrap(), &vec!["StubCR".to_string()]);
+        assert_eq!(names.get("change_request").unwrap(), &vec!["StubCR".to_string()]);
         assert_eq!(names.get("issue_tracker").unwrap(), &vec!["StubIT".to_string()]);
         assert_eq!(names.get("cloud_agent").unwrap(), &vec!["StubCA".to_string()]);
         assert_eq!(names.get("ai_utility").unwrap(), &vec!["StubAI".to_string()]);
@@ -326,11 +330,15 @@ mod tests {
     #[test]
     fn provider_names_partial_registry() {
         let mut reg = ProviderRegistry::new();
-        reg.code_review.insert("cr", labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview));
+        reg.change_requests.insert(
+            "cr",
+            labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"),
+            Arc::new(StubChangeRequestTracker),
+        );
 
         let names = provider_names_from_registry(&reg);
         assert_eq!(names.len(), 1);
-        assert_eq!(names.get("code_review").unwrap(), &vec!["StubCR".to_string()]);
+        assert_eq!(names.get("change_request").unwrap(), &vec!["StubCR".to_string()]);
         assert!(!names.contains_key("vcs"));
     }
 
@@ -374,7 +382,7 @@ mod tests {
         let model = RepoModel::new(PathBuf::from("/tmp/test-repo"), reg, Some("owner/repo".to_string()));
 
         assert_eq!(model.labels.checkouts.section, "Checkouts");
-        assert_eq!(model.labels.code_review.section, "Pull Requests");
+        assert_eq!(model.labels.change_requests.section, "Pull Requests");
         assert_eq!(model.labels.issues.section, "GitHub Issues");
         assert_eq!(model.labels.cloud_agents.section, "Cloud Agents");
 
@@ -393,7 +401,7 @@ mod tests {
         let reg = ProviderRegistry::new();
         let model = RepoModel::new(PathBuf::from("/tmp/empty"), reg, None);
         assert_eq!(model.labels.checkouts.section, "\u{2014}");
-        assert_eq!(model.labels.code_review.section, "\u{2014}");
+        assert_eq!(model.labels.change_requests.section, "\u{2014}");
         model.refresh_handle.trigger_refresh();
     }
 
@@ -402,15 +410,14 @@ mod tests {
         let model = RepoModel::new_virtual();
         assert!(model.registry.vcs.is_empty());
         assert!(model.registry.checkout_managers.is_empty());
-        assert!(model.registry.code_review.is_empty());
+        assert!(model.registry.change_requests.is_empty());
         assert!(model.registry.issue_trackers.is_empty());
         assert!(model.registry.cloud_agents.is_empty());
         assert!(model.registry.workspace_manager.is_empty());
         assert_eq!(model.labels.checkouts.section, "Checkouts");
-        assert_eq!(model.labels.code_review.section, "Change Requests");
+        assert_eq!(model.labels.change_requests.section, "Change Requests");
         assert_eq!(model.labels.issues.section, "Issues");
         assert_eq!(model.labels.cloud_agents.section, "Sessions");
         assert!(!model.data.loading);
     }
-
 }

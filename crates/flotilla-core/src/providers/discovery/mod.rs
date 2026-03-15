@@ -24,7 +24,7 @@ use crate::{
     config::ConfigStore,
     providers::{
         ai_utility::AiUtility,
-        code_review::CodeReview,
+        change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         issue_tracker::IssueTracker,
         registry::ProviderRegistry,
@@ -307,7 +307,7 @@ pub trait Factory: Send + Sync {
 
 pub type VcsFactory = dyn Factory<Output = dyn Vcs>;
 pub type CheckoutManagerFactory = dyn Factory<Output = dyn CheckoutManager>;
-pub type CodeReviewFactory = dyn Factory<Output = dyn CodeReview>;
+pub type ChangeRequestFactory = dyn Factory<Output = dyn ChangeRequestTracker>;
 pub type IssueTrackerFactory = dyn Factory<Output = dyn IssueTracker>;
 pub type CloudAgentFactory = dyn Factory<Output = dyn CloudAgentService>;
 pub type AiUtilityFactory = dyn Factory<Output = dyn AiUtility>;
@@ -321,7 +321,7 @@ pub type TerminalPoolFactory = dyn Factory<Output = dyn TerminalPool>;
 pub struct FactoryRegistry {
     pub vcs: Vec<Box<VcsFactory>>,
     pub checkout_managers: Vec<Box<CheckoutManagerFactory>>,
-    pub code_review: Vec<Box<CodeReviewFactory>>,
+    pub change_requests: Vec<Box<ChangeRequestFactory>>,
     pub issue_trackers: Vec<Box<IssueTrackerFactory>>,
     pub cloud_agents: Vec<Box<CloudAgentFactory>>,
     pub ai_utilities: Vec<Box<AiUtilityFactory>>,
@@ -353,7 +353,7 @@ impl DiscoveryRuntime {
     /// categories are registered. Update this check if new external-provider
     /// factory categories are added to `FactoryRegistry`.
     pub fn is_follower(&self) -> bool {
-        self.factories.code_review.is_empty()
+        self.factories.change_requests.is_empty()
             && self.factories.issue_trackers.is_empty()
             && self.factories.cloud_agents.is_empty()
             && self.factories.ai_utilities.is_empty()
@@ -445,8 +445,8 @@ pub async fn discover_providers(
     if let Some((desc, provider)) = probe_first(&factories.checkout_managers, &combined, config, repo_root, &runner, &mut unmet).await {
         registry.checkout_managers.insert(desc.name.clone(), desc, provider);
     }
-    probe_all(&factories.code_review, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.code_review.insert(desc.name.clone(), desc, provider);
+    probe_all(&factories.change_requests, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+        registry.change_requests.insert(desc.name.clone(), desc, provider);
     })
     .await;
     probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
@@ -801,7 +801,7 @@ mod orchestrator_tests {
         let fact_reg = FactoryRegistry {
             vcs: vec![],
             checkout_managers: vec![],
-            code_review: vec![],
+            change_requests: vec![],
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
@@ -829,7 +829,7 @@ mod orchestrator_tests {
         let fact_reg = FactoryRegistry {
             vcs: vec![],
             checkout_managers: vec![],
-            code_review: vec![],
+            change_requests: vec![],
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
@@ -841,7 +841,7 @@ mod orchestrator_tests {
 
         assert!(result.registry.vcs.is_empty());
         assert!(result.registry.checkout_managers.is_empty());
-        assert!(result.registry.code_review.is_empty());
+        assert!(result.registry.change_requests.is_empty());
         assert!(result.registry.issue_trackers.is_empty());
         assert!(result.registry.cloud_agents.is_empty());
         assert!(result.registry.ai_utilities.is_empty());

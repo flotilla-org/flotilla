@@ -92,7 +92,7 @@ User actions flow: **Intent → Command → Executor → Provider call → Refre
 Each trait lives in `crates/flotilla-core/src/providers/<category>/mod.rs` with implementations alongside:
 
 - **Vcs** + **CheckoutManager** (`vcs/git.rs`, `vcs/wt.rs`)
-- **CodeReview** (`code_review/github.rs`)
+- **ChangeRequestTracker** (`change_request/github.rs`)
 - **IssueTracker** (`issue_tracker/github.rs`)
 - **CloudAgentService** (`coding_agent/claude.rs`)
 - **AiUtility** (`ai_utility/claude.rs`)

@@ -702,7 +702,7 @@ async fn follower_mode_has_only_local_providers() {
     assert!(provider_names.contains_key("vcs"), "follower should have VCS provider");
 
     // External providers should be absent
-    assert!(!provider_names.contains_key("code_review"), "follower should NOT have code_review");
+    assert!(!provider_names.contains_key("change_request"), "follower should NOT have change_request");
     assert!(!provider_names.contains_key("issue_tracker"), "follower should NOT have issue_tracker");
     assert!(!provider_names.contains_key("cloud_agent"), "follower should NOT have cloud_agent");
     assert!(!provider_names.contains_key("ai_utility"), "follower should NOT have ai_utility");

@@ -497,7 +497,7 @@ impl App {
         // Build table view
         let section_labels = SectionLabels {
             checkouts: rm.labels.checkouts.section.clone(),
-            code_review: rm.labels.code_review.section.clone(),
+            change_requests: rm.labels.change_requests.section.clone(),
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.cloud_agents.section.clone(),
         };
@@ -593,7 +593,7 @@ impl App {
         // Use daemon's pre-correlated work items directly (no re-correlation)
         let section_labels = SectionLabels {
             checkouts: rm.labels.checkouts.section.clone(),
-            code_review: rm.labels.code_review.section.clone(),
+            change_requests: rm.labels.change_requests.section.clone(),
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.cloud_agents.section.clone(),
         };
@@ -838,10 +838,10 @@ mod tests {
 
     #[test]
     fn format_error_status_single_error() {
-        let errors = vec![provider_error("code_review", "github", "rate limited")];
+        let errors = vec![provider_error("change_request", "github", "rate limited")];
         let msg = format_error_status(&errors, Path::new("/tmp/my-repo")).unwrap();
         assert!(msg.contains("my-repo"));
-        assert!(msg.contains("code_review"));
+        assert!(msg.contains("change_request"));
         assert!(msg.contains("rate limited"));
         assert!(msg.contains("(github)"));
     }

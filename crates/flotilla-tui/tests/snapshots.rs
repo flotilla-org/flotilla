@@ -95,7 +95,7 @@ fn config_screen() {
     let mut harness = TestHarness::single_repo("my-project")
         .with_mode(UiMode::Config)
         .with_provider_names("my-project", vec![
-            ("code_review", "GitHub"),
+            ("change_request", "GitHub"),
             ("issue_tracker", "GitHub"),
             ("vcs", "Git"),
             ("checkout_manager", "Git Worktrees"),
@@ -410,11 +410,11 @@ fn providers_overlay() {
         .with_provider_names("my-project", vec![
             ("vcs", "Git"),
             ("checkout_manager", "Git Worktrees"),
-            ("code_review", "GitHub"),
+            ("change_request", "GitHub"),
             ("cloud_agent", "Claude"),
         ])
         .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok)
-        .with_provider_status("my-project", "code_review", "GitHub", ProviderStatus::Error);
+        .with_provider_status("my-project", "change_request", "GitHub", ProviderStatus::Error);
     let repo = harness.model.repo_order[0].clone();
     harness.ui.repo_ui.get_mut(&repo).unwrap().show_providers = true;
     let output = harness.render_to_string();
@@ -425,10 +425,10 @@ fn providers_overlay() {
 fn config_screen_cross_repo_worst_wins() {
     let mut harness = TestHarness::multi_repo(&["alpha", "beta"])
         .with_mode(UiMode::Config)
-        .with_provider_names("alpha", vec![("code_review", "GitHub")])
-        .with_provider_names("beta", vec![("code_review", "GitHub")])
-        .with_provider_status("alpha", "code_review", "GitHub", ProviderStatus::Ok)
-        .with_provider_status("beta", "code_review", "GitHub", ProviderStatus::Error);
+        .with_provider_names("alpha", vec![("change_request", "GitHub")])
+        .with_provider_names("beta", vec![("change_request", "GitHub")])
+        .with_provider_status("alpha", "change_request", "GitHub", ProviderStatus::Ok)
+        .with_provider_status("beta", "change_request", "GitHub", ProviderStatus::Error);
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }

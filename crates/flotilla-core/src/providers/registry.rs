@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 
 use crate::providers::{
     ai_utility::AiUtility,
-    code_review::CodeReview,
+    change_request::ChangeRequestTracker,
     coding_agent::CloudAgentService,
     discovery::ProviderDescriptor,
     issue_tracker::IssueTracker,
@@ -89,7 +89,7 @@ impl<T: ?Sized> Default for ProviderSet<T> {
 pub struct ProviderRegistry {
     pub vcs: ProviderSet<dyn Vcs>,
     pub checkout_managers: ProviderSet<dyn CheckoutManager>,
-    pub code_review: ProviderSet<dyn CodeReview>,
+    pub change_requests: ProviderSet<dyn ChangeRequestTracker>,
     pub issue_trackers: ProviderSet<dyn IssueTracker>,
     pub cloud_agents: ProviderSet<dyn CloudAgentService>,
     pub ai_utilities: ProviderSet<dyn AiUtility>,
@@ -102,7 +102,7 @@ impl ProviderRegistry {
         Self {
             vcs: ProviderSet::new(),
             checkout_managers: ProviderSet::new(),
-            code_review: ProviderSet::new(),
+            change_requests: ProviderSet::new(),
             issue_trackers: ProviderSet::new(),
             cloud_agents: ProviderSet::new(),
             ai_utilities: ProviderSet::new(),
@@ -130,7 +130,7 @@ impl ProviderRegistry {
         }
         collect(&mut infos, "vcs", &self.vcs);
         collect(&mut infos, "checkout_manager", &self.checkout_managers);
-        collect(&mut infos, "code_review", &self.code_review);
+        collect(&mut infos, "change_request", &self.change_requests);
         collect(&mut infos, "issue_tracker", &self.issue_trackers);
         collect(&mut infos, "cloud_agent", &self.cloud_agents);
         collect(&mut infos, "ai_utility", &self.ai_utilities);

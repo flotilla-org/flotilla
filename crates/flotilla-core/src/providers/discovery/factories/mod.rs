@@ -33,7 +33,7 @@ impl FactoryRegistry {
         Self {
             vcs: vec![Box::new(git::GitVcsFactory)],
             checkout_managers: checkout_manager_factories(),
-            code_review: vec![Box::new(github::GitHubCodeReviewFactory)],
+            change_requests: vec![Box::new(github::GitHubChangeRequestFactory)],
             issue_trackers: vec![Box::new(github::GitHubIssueTrackerFactory)],
             cloud_agents: vec![
                 Box::new(claude::ClaudeCodingAgentFactory),
@@ -51,7 +51,7 @@ impl FactoryRegistry {
         Self {
             vcs: vec![Box::new(git::GitVcsFactory)],
             checkout_managers: checkout_manager_factories(),
-            code_review: vec![],
+            change_requests: vec![],
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
@@ -70,7 +70,7 @@ mod tests {
         let reg = FactoryRegistry::default_all();
         assert!(!reg.vcs.is_empty());
         assert!(!reg.checkout_managers.is_empty());
-        assert!(!reg.code_review.is_empty());
+        assert!(!reg.change_requests.is_empty());
         assert!(!reg.issue_trackers.is_empty());
         assert!(!reg.cloud_agents.is_empty());
         assert!(!reg.ai_utilities.is_empty());
@@ -83,7 +83,7 @@ mod tests {
         let reg = FactoryRegistry::for_follower();
         assert!(!reg.vcs.is_empty());
         assert!(!reg.checkout_managers.is_empty());
-        assert!(reg.code_review.is_empty());
+        assert!(reg.change_requests.is_empty());
         assert!(reg.issue_trackers.is_empty());
         assert!(reg.cloud_agents.is_empty());
         assert!(reg.ai_utilities.is_empty());

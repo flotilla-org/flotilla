@@ -8,7 +8,7 @@ expression: output
 │Role             Provider                 Status                      ││                                              │
 │VCS              —                                                    ││                                              │
 │Checkout mgr     —                                                    ││                                              │
-│Code review      GitHub                   ✗                           ││                                              │
+│Change request   GitHub                   ✗                           ││                                              │
 │Issue tracker    —                                                    ││                                              │
 │Cloud agents     —                                                    ││                                              │
 │AI utility       —                                                    ││                                              │

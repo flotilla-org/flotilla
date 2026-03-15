@@ -292,7 +292,7 @@ mod tests {
             providers: ProviderData::default(),
             provider_health: HashMap::from([
                 ("vcs".to_string(), HashMap::from([("Git".to_string(), true)])),
-                ("code_review".to_string(), HashMap::from([("GitHub".to_string(), false)])),
+                ("change_request".to_string(), HashMap::from([("GitHub".to_string(), false)])),
             ]),
             errors: vec![ProviderError { category: "github".to_string(), provider: String::new(), message: "rate limited".to_string() }],
             issue_total: None,
@@ -313,7 +313,7 @@ mod tests {
                     assert_eq!(snap.work_items[0].branch.as_deref(), Some("feature-x"));
                     assert_eq!(snap.work_items[0].kind, WorkItemKind::Checkout);
                     assert!(snap.provider_health["vcs"]["Git"]);
-                    assert!(!snap.provider_health["code_review"]["GitHub"]);
+                    assert!(!snap.provider_health["change_request"]["GitHub"]);
                     assert_eq!(snap.errors.len(), 1);
                     assert_eq!(snap.errors[0].category, "github");
                 }

@@ -19,8 +19,8 @@ use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, Provider
 use crate::{
     config::ConfigStore,
     providers::{
-        code_review::CodeReview, discovery::EnvVars, issue_tracker::IssueTracker, vcs::CheckoutManager, ChannelLabel, CommandOutput,
-        CommandRunner,
+        change_request::ChangeRequestTracker, discovery::EnvVars, issue_tracker::IssueTracker, vcs::CheckoutManager, ChannelLabel,
+        CommandOutput, CommandRunner,
     },
 };
 
@@ -307,22 +307,22 @@ impl CheckoutManager for FakeCheckoutManager {
     }
 }
 
-/// A configurable fake code review provider for integration and E2E tests.
+/// A configurable fake change request provider for integration and E2E tests.
 ///
 /// Pre-seed change requests via `add_change_requests()`. Supports
 /// `close_change_request` and merged branch tracking.
-pub struct FakeCodeReview {
+pub struct FakeChangeRequest {
     pub change_requests: Arc<TokioMutex<Vec<(String, ChangeRequest)>>>,
     pub merged_branches: Arc<TokioMutex<Vec<String>>>,
 }
 
-impl Default for FakeCodeReview {
+impl Default for FakeChangeRequest {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FakeCodeReview {
+impl FakeChangeRequest {
     pub fn new() -> Self {
         Self { change_requests: Arc::new(TokioMutex::new(Vec::new())), merged_branches: Arc::new(TokioMutex::new(Vec::new())) }
     }
@@ -333,7 +333,7 @@ impl FakeCodeReview {
 }
 
 #[async_trait::async_trait]
-impl CodeReview for FakeCodeReview {
+impl ChangeRequestTracker for FakeChangeRequest {
     async fn list_change_requests(&self, _repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         let store = self.change_requests.lock().await;
         Ok(store.iter().take(limit).cloned().collect())
@@ -412,12 +412,12 @@ impl Factory for FakeCheckoutManagerFactory {
     }
 }
 
-/// Factory that always returns a pre-constructed CodeReview.
-pub struct FakeCodeReviewFactory(pub Arc<dyn CodeReview>);
+/// Factory that always returns a pre-constructed ChangeRequestTracker.
+pub struct FakeChangeRequestFactory(pub Arc<dyn ChangeRequestTracker>);
 
 #[async_trait::async_trait]
-impl Factory for FakeCodeReviewFactory {
-    type Output = dyn CodeReview;
+impl Factory for FakeChangeRequestFactory {
+    type Output = dyn ChangeRequestTracker;
 
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled("fake-cr", "Fake PRs", "PR", "Pull Requests", "pull request")
@@ -429,7 +429,7 @@ impl Factory for FakeCodeReviewFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn CodeReview>, Vec<UnmetRequirement>> {
+    ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
 }
@@ -442,7 +442,7 @@ impl Factory for FakeCodeReviewFactory {
 /// provider data without probing the real filesystem.
 pub fn fake_discovery_with_providers(
     checkout_manager: Option<Arc<dyn CheckoutManager>>,
-    code_review: Option<Arc<dyn CodeReview>>,
+    change_request: Option<Arc<dyn ChangeRequestTracker>>,
     issue_tracker: Option<Arc<dyn IssueTracker>>,
 ) -> DiscoveryRuntime {
     let runner: Arc<dyn CommandRunner> =
@@ -453,9 +453,9 @@ pub fn fake_discovery_with_providers(
         checkout_managers.push(Box::new(FakeCheckoutManagerFactory(cm)));
     }
 
-    let mut code_review_factories: Vec<Box<super::CodeReviewFactory>> = Vec::new();
-    if let Some(cr) = code_review {
-        code_review_factories.push(Box::new(FakeCodeReviewFactory(cr)));
+    let mut change_request_factories: Vec<Box<super::ChangeRequestFactory>> = Vec::new();
+    if let Some(cr) = change_request {
+        change_request_factories.push(Box::new(FakeChangeRequestFactory(cr)));
     }
 
     let mut issue_tracker_factories: Vec<Box<super::IssueTrackerFactory>> = Vec::new();
@@ -471,7 +471,7 @@ pub fn fake_discovery_with_providers(
         factories: FactoryRegistry {
             vcs: vec![],
             checkout_managers,
-            code_review: code_review_factories,
+            change_requests: change_request_factories,
             issue_trackers: issue_tracker_factories,
             cloud_agents: vec![],
             ai_utilities: vec![],

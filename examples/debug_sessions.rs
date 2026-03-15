@@ -37,7 +37,7 @@ async fn main() {
     let registry = result.registry;
     let repo_slug = result.repo_slug;
     println!("  checkout_managers: {}", registry.checkout_managers.len());
-    println!("  code_review: {}", registry.code_review.len());
+    println!("  change_requests: {}", registry.change_requests.len());
     println!("  issue_trackers: {}", registry.issue_trackers.len());
     println!("  cloud_agents: {}", registry.cloud_agents.len());
     println!("  vcs: {}", registry.vcs.len());

@@ -576,7 +576,7 @@ pub async fn execute(
 
         CommandAction::OpenChangeRequest { id } => {
             debug!(%id, "opening change request in browser");
-            if let Some(cr) = registry.code_review.preferred() {
+            if let Some(cr) = registry.change_requests.preferred() {
                 let _ = cr.open_in_browser(&repo.root, &id).await;
             }
             CommandResult::Ok
@@ -584,7 +584,7 @@ pub async fn execute(
 
         CommandAction::CloseChangeRequest { id } => {
             debug!(%id, "closing change request");
-            if let Some(cr) = registry.code_review.preferred() {
+            if let Some(cr) = registry.change_requests.preferred() {
                 let _ = cr.close_change_request(&repo.root, &id).await;
             }
             CommandResult::Ok
@@ -1064,7 +1064,7 @@ mod tests {
 
     use super::*;
     use crate::providers::{
-        ai_utility::AiUtility, code_review::CodeReview, coding_agent::CloudAgentService, discovery::ProviderDescriptor,
+        ai_utility::AiUtility, change_request::ChangeRequestTracker, coding_agent::CloudAgentService, discovery::ProviderDescriptor,
         issue_tracker::IssueTracker, testing::MockRunner, types::*, vcs::CheckoutManager, workspace::WorkspaceManager,
     };
 
@@ -1191,11 +1191,11 @@ mod tests {
         }
     }
 
-    /// A mock CodeReview provider.
-    struct MockCodeReview;
+    /// A mock ChangeRequestTracker provider.
+    struct MockChangeRequestTracker;
 
     #[async_trait]
-    impl CodeReview for MockCodeReview {
+    impl ChangeRequestTracker for MockChangeRequestTracker {
         async fn list_change_requests(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
             Ok(vec![])
         }
@@ -2010,7 +2010,7 @@ mod tests {
     #[tokio::test]
     async fn open_change_request_with_provider() {
         let mut registry = empty_registry();
-        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview));
+        registry.change_requests.insert("github", desc("github"), Arc::new(MockChangeRequestTracker));
         let runner = runner_ok();
 
         let result = run_execute(CommandAction::OpenChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
@@ -2035,7 +2035,7 @@ mod tests {
     #[tokio::test]
     async fn close_change_request_with_provider() {
         let mut registry = empty_registry();
-        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview));
+        registry.change_requests.insert("github", desc("github"), Arc::new(MockChangeRequestTracker));
         let runner = runner_ok();
 
         let result = run_execute(CommandAction::CloseChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
@@ -2649,7 +2649,7 @@ mod tests {
     #[tokio::test]
     async fn build_plan_simple_command_returns_immediate() {
         let mut registry = empty_registry();
-        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview));
+        registry.change_requests.insert("github", desc("github"), Arc::new(MockChangeRequestTracker));
         let runner = runner_ok();
 
         let plan = run_build_plan(CommandAction::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;

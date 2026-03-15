@@ -8,7 +8,7 @@ use crate::{
 };
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
-/// "code_review"). Inner key: provider name. Value: healthy.
+/// "change_request"). Inner key: provider name. Value: healthy.
 pub type ProviderHealthMap = HashMap<String, HashMap<String, bool>>;
 
 // --- status ---

@@ -247,14 +247,19 @@ pub struct DataStore {
 
 pub struct SectionLabels {
     pub checkouts: String,
-    pub code_review: String,
+    pub change_requests: String,
     pub issues: String,
     pub sessions: String,
 }
 
 impl Default for SectionLabels {
     fn default() -> Self {
-        Self { checkouts: "Checkouts".into(), code_review: "Change Requests".into(), issues: "Issues".into(), sessions: "Sessions".into() }
+        Self {
+            checkouts: "Checkouts".into(),
+            change_requests: "Change Requests".into(),
+            issues: "Issues".into(),
+            sessions: "Sessions".into(),
+        }
     }
 }
 
@@ -600,7 +605,7 @@ pub fn group_work_items(
         b_num.cmp(&a_num)
     });
     if !pr_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader(labels.code_review.clone())));
+        entries.push(GroupEntry::Header(SectionHeader(labels.change_requests.clone())));
         for item in pr_items {
             selectable.push(entries.len());
             entries.push(GroupEntry::Item(Box::new(item.clone())));
@@ -1693,7 +1698,7 @@ mod tests {
         let providers = new_providers();
         let labels = SectionLabels {
             checkouts: "Checkouts".into(),
-            code_review: "Pull Requests".into(),
+            change_requests: "Pull Requests".into(),
             issues: "Tickets".into(),
             sessions: "Agents".into(),
         };
@@ -1812,7 +1817,7 @@ mod tests {
     fn section_labels_default_values() {
         let labels = default_labels();
         assert_eq!(labels.checkouts, "Checkouts");
-        assert_eq!(labels.code_review, "Change Requests");
+        assert_eq!(labels.change_requests, "Change Requests");
         assert_eq!(labels.issues, "Issues");
         assert_eq!(labels.sessions, "Sessions");
     }

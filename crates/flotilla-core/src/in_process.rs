@@ -2673,7 +2673,7 @@ mod tests {
         let mut state = make_repo_state();
 
         // New health entry with no prior state
-        let new_health = HashMap::from([("code_review".into(), HashMap::from([("github".into(), true)]))]);
+        let new_health = HashMap::from([("change_request".into(), HashMap::from([("github".into(), true)]))]);
         let entry = state.record_delta(&ProviderData::default(), &new_health, &[], vec![]);
 
         assert!(
@@ -2683,7 +2683,7 @@ mod tests {
                     category,
                     provider,
                     op: flotilla_protocol::EntryOp::Added(true),
-                } if category == "code_review" && provider == "github"
+                } if category == "change_request" && provider == "github"
             )),
             "should have an Added health change: {:?}",
             entry.changes

@@ -1046,11 +1046,15 @@ mod tests {
                 slug: None,
                 provider_health: HashMap::new(),
                 work_items: vec![],
-                errors: vec![ProviderError { category: "code_review".into(), provider: "GitHub".into(), message: "rate limited".into() }],
+                errors: vec![ProviderError {
+                    category: "change_request".into(),
+                    provider: "GitHub".into(),
+                    message: "rate limited".into(),
+                }],
             };
             let output = format_repo_detail_human(&detail);
             assert!(output.contains("Errors:"), "should have errors header");
-            assert!(output.contains("[code_review/GitHub]"), "should show category/provider");
+            assert!(output.contains("[change_request/GitHub]"), "should show category/provider");
             assert!(output.contains("rate limited"), "should show error message");
         }
     }
@@ -1112,7 +1116,7 @@ mod tests {
         fn with_providers_table() {
             let mut resp = empty_response();
             resp.providers = vec![ProviderInfo { category: "vcs".into(), name: "Git".into(), healthy: true }, ProviderInfo {
-                category: "code_review".into(),
+                category: "change_request".into(),
                 name: "GitHub".into(),
                 healthy: false,
             }];
@@ -1128,12 +1132,12 @@ mod tests {
         fn with_unmet_requirements() {
             let mut resp = empty_response();
             resp.unmet_requirements = vec![
-                UnmetRequirementInfo { factory: "GitHubCodeReview".into(), kind: "missing_binary".into(), value: Some("gh".into()) },
+                UnmetRequirementInfo { factory: "GitHubChangeRequest".into(), kind: "missing_binary".into(), value: Some("gh".into()) },
                 UnmetRequirementInfo { factory: "Git".into(), kind: "no_vcs_checkout".into(), value: None },
             ];
             let output = format_repo_providers_human(&resp);
             assert!(output.contains("Unmet Requirements:"), "should show unmet requirements header");
-            assert!(output.contains("GitHubCodeReview"), "should show factory name");
+            assert!(output.contains("GitHubChangeRequest"), "should show factory name");
             assert!(output.contains("missing_binary (gh)"), "should show kind and value");
             assert!(output.contains("no_vcs_checkout"), "should show kind without empty value");
         }

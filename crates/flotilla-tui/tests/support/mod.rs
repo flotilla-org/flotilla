@@ -114,7 +114,7 @@ impl TestHarness {
 
         let section_labels = SectionLabels {
             checkouts: rm.labels.checkouts.section.clone(),
-            code_review: rm.labels.code_review.section.clone(),
+            change_requests: rm.labels.change_requests.section.clone(),
             issues: rm.labels.issues.section.clone(),
             sessions: rm.labels.cloud_agents.section.clone(),
         };
@@ -152,7 +152,7 @@ fn test_repo_info(name: &str) -> flotilla_protocol::RepoInfo {
 fn test_labels() -> RepoLabels {
     RepoLabels {
         checkouts: CategoryLabels { section: "Checkouts".into(), noun: "worktree".into(), abbr: "WT".into() },
-        code_review: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "PR".into() },
+        change_requests: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "PR".into() },
         issues: CategoryLabels { section: "Issues".into(), noun: "issue".into(), abbr: "IS".into() },
         cloud_agents: CategoryLabels { section: "Sessions".into(), noun: "session".into(), abbr: "SS".into() },
     }

@@ -40,7 +40,7 @@ const PREVIEW_BELOW_ASPECT_RATIO_THRESHOLD: f32 = 2.0;
 const PROVIDER_CATEGORIES: [(&str, &str); 8] = [
     ("VCS", "vcs"),
     ("Checkout mgr", "checkout_manager"),
-    ("Code review", "code_review"),
+    ("Change request", "change_request"),
     ("Issue tracker", "issue_tracker"),
     ("Cloud agents", "cloud_agent"),
     ("AI utility", "ai_utility"),
@@ -517,7 +517,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame
         Cell::from("Branch"),
         Cell::from(labels.checkouts.abbr.as_str()),
         Cell::from("WS"),
-        Cell::from(labels.code_review.abbr.as_str()),
+        Cell::from(labels.change_requests.abbr.as_str()),
         Cell::from(labels.cloud_agents.abbr.as_str()),
         Cell::from("Issues"),
         Cell::from("Git"),
@@ -819,7 +819,7 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, theme: &Theme, frame: 
             if let Some(cr) = providers.change_requests.get(pr_key.as_str()) {
                 let provider_prefix =
                     if cr.provider_display_name.is_empty() { String::new() } else { format!("{} ", cr.provider_display_name) };
-                lines.push(format!("{}{} #{}: {}", provider_prefix, model.active_labels().code_review.abbr, pr_key, cr.title));
+                lines.push(format!("{}{} #{}: {}", provider_prefix, model.active_labels().change_requests.abbr, pr_key, cr.title));
                 lines.push(format!("State: {:?}", cr.status));
             }
         }
@@ -955,7 +955,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &
             let color = theme.change_request_status_color(pr_status);
             let status_text = pr_status.as_str();
             lines.push(Line::from(vec![
-                Span::raw(format!("{}: ", model.active_labels().code_review.abbr)),
+                Span::raw(format!("{}: ", model.active_labels().change_requests.abbr)),
                 Span::styled(status_text, Style::default().fg(color).bold()),
             ]));
             if let Some(sha) = &info.merge_commit_sha {
@@ -963,7 +963,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &
             }
         } else {
             lines.push(Line::from(Span::styled(
-                format!("No {} found", model.active_labels().code_review.abbr),
+                format!("No {} found", model.active_labels().change_requests.abbr),
                 Style::default().fg(theme.muted),
             )));
         }
@@ -1028,7 +1028,7 @@ fn render_close_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &m
     let area = ui_helpers::popup_area(frame.area(), 50, 30);
     frame.render_widget(Clear, area);
 
-    let noun = &model.active_labels().code_review.noun;
+    let noun = &model.active_labels().change_requests.noun;
     let lines = vec![
         Line::from(vec![Span::raw(format!("{} #", noun)), Span::styled(id, Style::default().bold())]),
         Line::from(Span::styled(title.as_str(), Style::default().fg(theme.muted))),
@@ -1075,7 +1075,7 @@ fn render_help(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Fr
         Line::from("  Right-click      Action menu"),
         Line::from(format!("  n                New branch (enter name, creates {})", labels.checkouts.noun)),
         Line::from(format!("  d                Remove {} (with safety check)", labels.checkouts.noun)),
-        Line::from(format!("  p                Show {} in browser", labels.code_review.abbr)),
+        Line::from(format!("  p                Show {} in browser", labels.change_requests.abbr)),
         Line::from("  l                Cycle layout (auto/zoom/right/below)"),
         Line::from("  r                Refresh data"),
         Line::from("  K                Toggle status bar key ribbons"),

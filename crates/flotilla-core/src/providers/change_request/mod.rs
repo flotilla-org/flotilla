@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::providers::types::ChangeRequest;
 
 #[async_trait]
-pub trait CodeReview: Send + Sync {
+pub trait ChangeRequestTracker: Send + Sync {
     async fn list_change_requests(&self, repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String>;
     #[allow(dead_code)]
     async fn get_change_request(&self, repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String>;

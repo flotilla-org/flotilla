@@ -1,5 +1,5 @@
 pub mod ai_utility;
-pub mod code_review;
+pub mod change_request;
 pub mod coding_agent;
 pub mod correlation;
 pub mod discovery;
@@ -396,7 +396,7 @@ pub(crate) mod testing {
 
     /// Build the path to a provider fixture file.
     ///
-    /// `provider_dir` is the subdirectory under `src/providers/` (e.g. `"vcs"`, `"code_review"`).
+    /// `provider_dir` is the subdirectory under `src/providers/` (e.g. `"vcs"`, `"change_request"`).
     pub fn fixture_path(provider_dir: &str, name: &str) -> String {
         format!("{}/src/providers/{}/fixtures/{}", env!("CARGO_MANIFEST_DIR"), provider_dir, name)
     }

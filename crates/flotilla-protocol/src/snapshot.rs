@@ -37,7 +37,7 @@ impl Default for CategoryLabels {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RepoLabels {
     pub checkouts: CategoryLabels,
-    pub code_review: CategoryLabels,
+    pub change_requests: CategoryLabels,
     pub issues: CategoryLabels,
     pub cloud_agents: CategoryLabels,
 }
@@ -163,7 +163,7 @@ mod tests {
     fn repo_labels_and_repo_info_roundtrip() {
         let labels = RepoLabels {
             checkouts: CategoryLabels { section: "Worktrees".into(), noun: "worktree".into(), abbr: "WT".into() },
-            code_review: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "PR".into() },
+            change_requests: CategoryLabels { section: "Pull Requests".into(), noun: "PR".into(), abbr: "PR".into() },
             issues: CategoryLabels { section: "Issues".into(), noun: "issue".into(), abbr: "I".into() },
             cloud_agents: CategoryLabels { section: "Sessions".into(), noun: "session".into(), abbr: "S".into() },
         };
@@ -176,7 +176,7 @@ mod tests {
             labels,
             provider_names: HashMap::from([
                 ("vcs".to_string(), vec!["git".to_string()]),
-                ("code_review".to_string(), vec!["github".to_string()]),
+                ("change_request".to_string(), vec!["github".to_string()]),
             ]),
             provider_health: HashMap::from([("vcs".to_string(), HashMap::from([("Git".to_string(), true)]))]),
             loading: true,
@@ -189,11 +189,11 @@ mod tests {
         assert!(decoded.loading);
         assert_eq!(decoded.provider_names.len(), 2);
         assert_eq!(decoded.provider_names["vcs"], vec!["git".to_string()]);
-        assert_eq!(decoded.provider_names["code_review"], vec!["github".to_string()]);
+        assert_eq!(decoded.provider_names["change_request"], vec!["github".to_string()]);
         assert_eq!(decoded.provider_health.len(), 1);
         assert!(decoded.provider_health["vcs"]["Git"]);
         assert_eq!(decoded.labels.checkouts.section, "Worktrees");
-        assert_eq!(decoded.labels.code_review.noun, "PR");
+        assert_eq!(decoded.labels.change_requests.noun, "PR");
         assert_eq!(decoded.labels.issues.abbr, "I");
         assert_eq!(decoded.labels.cloud_agents.section, "Sessions");
     }
