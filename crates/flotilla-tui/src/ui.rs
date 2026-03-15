@@ -1000,7 +1000,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &
         if !info.has_uncommitted
             && info.unpushed_commits.is_empty()
             && info.base_detection_warning.is_none()
-            && info.change_request_status.as_deref() == Some("MERGED")
+            && info.change_request_status.as_ref().is_some_and(|s| s.eq_ignore_ascii_case("merged"))
         {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("✓ Safe to delete", Style::default().fg(theme.status_ok).bold())));

@@ -263,9 +263,10 @@ impl Theme {
     }
 
     pub fn change_request_status_color(&self, status: &str) -> Color {
-        match status {
-            "Merged" => self.status_ok,
-            "Closed" => self.warning,
+        let lower = status.to_ascii_lowercase();
+        match lower.as_str() {
+            "merged" => self.status_ok,
+            "closed" => self.warning,
             _ => self.error,
         }
     }
@@ -535,18 +536,21 @@ mod tests {
     #[test]
     fn change_request_status_merged() {
         let t = Theme::classic();
-        assert_eq!(t.change_request_status_color("Merged"), Color::Green);
+        assert_eq!(t.change_request_status_color("merged"), Color::Green);
+        assert_eq!(t.change_request_status_color("MERGED"), Color::Green);
     }
 
     #[test]
     fn change_request_status_closed() {
         let t = Theme::classic();
+        assert_eq!(t.change_request_status_color("closed"), Color::Yellow);
         assert_eq!(t.change_request_status_color("Closed"), Color::Yellow);
     }
 
     #[test]
     fn change_request_status_other() {
         let t = Theme::classic();
+        assert_eq!(t.change_request_status_color("open"), Color::Red);
         assert_eq!(t.change_request_status_color("Open"), Color::Red);
     }
 
