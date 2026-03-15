@@ -5,7 +5,7 @@
 ## Problem
 
 Flotilla's TUI currently defines keyboard behavior directly in mode-specific match arms in
-[`crates/flotilla-tui/src/app/key_handlers.rs`](/Users/robert/dev/flotilla.ui-batch-1/crates/flotilla-tui/src/app/key_handlers.rs).
+`crates/flotilla-tui/src/app/key_handlers.rs`.
 That structure mixes three different concerns:
 
 - physical keys such as `j`, `Esc`, `Enter`, and `?`
@@ -54,7 +54,7 @@ Batch A deliberately does not centralize everything. Text-entry modes such as br
 ## Focus Model
 
 Add a new `FocusTarget` enum in
-[`crates/flotilla-tui/src/app/ui_state.rs`](/Users/robert/dev/flotilla.ui-batch-1/crates/flotilla-tui/src/app/ui_state.rs):
+`crates/flotilla-tui/src/app/ui_state.rs`:
 
 ```rust
 pub enum FocusTarget {
@@ -132,7 +132,7 @@ That keeps domain operations isolated from keyboard policy while avoiding a larg
 ## Default Keymap
 
 Batch A uses a Rust-defined default keymap only. It should be implemented as a small helper in
-[`crates/flotilla-tui/src/app/key_handlers.rs`](/Users/robert/dev/flotilla.ui-batch-1/crates/flotilla-tui/src/app/key_handlers.rs),
+`crates/flotilla-tui/src/app/key_handlers.rs`,
 for example:
 
 ```rust
@@ -185,7 +185,7 @@ The main purpose of the mode-aware `q` rule is normalization:
 ## Dispatch Model
 
 Add a single `dispatch_action(&mut self, action: Action)` method in
-[`crates/flotilla-tui/src/app/key_handlers.rs`](/Users/robert/dev/flotilla.ui-batch-1/crates/flotilla-tui/src/app/key_handlers.rs).
+`crates/flotilla-tui/src/app/key_handlers.rs`.
 
 This method should use `FocusTarget` for shared actions and direct routing for global actions.
 
@@ -263,7 +263,7 @@ Help toggling should be modeled as an action rather than a one-off early return.
 The new action layer should not absorb responsibilities that belong elsewhere.
 
 - Table navigation stays in
-  [`crates/flotilla-tui/src/app/navigation.rs`](/Users/robert/dev/flotilla.ui-batch-1/crates/flotilla-tui/src/app/navigation.rs).
+  `crates/flotilla-tui/src/app/navigation.rs`.
 - Work-item operations stay in `Intent` resolution.
 - Text mutation for `tui_input::Input` values stays in the existing per-mode helpers for now.
 - Mouse handling remains mostly as-is in this batch. It may continue to call existing methods directly rather than dispatching through `Action`.
