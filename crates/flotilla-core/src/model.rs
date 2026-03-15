@@ -6,17 +6,18 @@ use std::{
 };
 
 pub use flotilla_protocol::{CategoryLabels, RepoLabels};
-use indexmap::IndexMap;
 
 use crate::{
     data::DataStore,
-    providers::{discovery::ProviderDescriptor, registry::ProviderRegistry, types::RepoCriteria},
+    providers::{
+        registry::{ProviderRegistry, ProviderSet},
+        types::RepoCriteria,
+    },
     refresh::RepoRefreshHandle,
 };
 pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
-    fn labels<T>(map: &IndexMap<String, (ProviderDescriptor, T)>) -> CategoryLabels {
-        map.values()
-            .next()
+    fn labels<T: ?Sized>(set: &ProviderSet<T>) -> CategoryLabels {
+        set.preferred_with_desc()
             .map(|(desc, _)| CategoryLabels {
                 section: desc.section_label.clone(),
                 noun: desc.item_noun.clone(),
@@ -35,8 +36,8 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
 pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<String, Vec<String>> {
     let mut names: HashMap<String, Vec<String>> = HashMap::new();
 
-    fn collect_names<T>(names: &mut HashMap<String, Vec<String>>, key: impl Into<String>, map: &IndexMap<String, (ProviderDescriptor, T)>) {
-        let list: Vec<String> = map.values().map(|(d, _)| d.display_name.clone()).collect();
+    fn collect_names<T: ?Sized>(names: &mut HashMap<String, Vec<String>>, key: impl Into<String>, set: &ProviderSet<T>) {
+        let list: Vec<String> = set.display_names().map(|s| s.to_string()).collect();
         if !list.is_empty() {
             names.insert(key.into(), list);
         }
@@ -47,13 +48,8 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     collect_names(&mut names, "issue_tracker", &registry.issue_trackers);
     collect_names(&mut names, "cloud_agent", &registry.cloud_agents);
     collect_names(&mut names, "ai_utility", &registry.ai_utilities);
-
-    if let Some((desc, _)) = &registry.workspace_manager {
-        names.insert("workspace_manager".into(), vec![desc.display_name.clone()]);
-    }
-    if let Some((desc, _)) = &registry.terminal_pool {
-        names.insert("terminal_pool".into(), vec![desc.display_name.clone()]);
-    }
+    collect_names(&mut names, "workspace_manager", &registry.workspace_manager);
+    collect_names(&mut names, "terminal_pool", &registry.terminal_pool);
     names
 }
 
@@ -234,15 +230,13 @@ mod tests {
     /// Build a ProviderRegistry with all provider slots populated.
     fn full_registry() -> ProviderRegistry {
         let mut reg = ProviderRegistry::new();
-        reg.vcs.insert("vcs".into(), (named_desc("StubVcs"), Arc::new(StubVcs)));
-        reg.checkout_managers
-            .insert("cm".into(), (labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"), Arc::new(StubCheckoutManager)));
-        reg.code_review
-            .insert("cr".into(), (labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview)));
-        reg.issue_trackers.insert("it".into(), (labeled_desc("it", "StubIT", "#", "GitHub Issues", "issue"), Arc::new(StubIssueTracker)));
-        reg.cloud_agents.insert("ca".into(), (labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"), Arc::new(StubCloudAgent)));
-        reg.ai_utilities.insert("ai".into(), (named_desc("StubAI"), Arc::new(StubAiUtility)));
-        reg.workspace_manager = Some((named_desc("StubWM"), Arc::new(StubWorkspaceManager)));
+        reg.vcs.insert("vcs", named_desc("StubVcs"), Arc::new(StubVcs));
+        reg.checkout_managers.insert("cm", labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"), Arc::new(StubCheckoutManager));
+        reg.code_review.insert("cr", labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview));
+        reg.issue_trackers.insert("it", labeled_desc("it", "StubIT", "#", "GitHub Issues", "issue"), Arc::new(StubIssueTracker));
+        reg.cloud_agents.insert("ca", labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"), Arc::new(StubCloudAgent));
+        reg.ai_utilities.insert("ai", named_desc("StubAI"), Arc::new(StubAiUtility));
+        reg.workspace_manager.insert("wm", named_desc("StubWM"), Arc::new(StubWorkspaceManager));
         reg
     }
 
@@ -289,9 +283,8 @@ mod tests {
     fn labels_with_partial_registry() {
         // Only checkout_managers and coding_agents registered.
         let mut reg = ProviderRegistry::new();
-        reg.checkout_managers
-            .insert("cm".into(), (labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"), Arc::new(StubCheckoutManager)));
-        reg.cloud_agents.insert("ca".into(), (labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"), Arc::new(StubCloudAgent)));
+        reg.checkout_managers.insert("cm", labeled_desc("cm", "StubCM", "WT", "Checkouts", "worktree"), Arc::new(StubCheckoutManager));
+        reg.cloud_agents.insert("ca", labeled_desc("ca", "StubCA", "CS", "Cloud Agents", "session"), Arc::new(StubCloudAgent));
 
         let labels = labels_from_registry(&reg);
 
@@ -333,8 +326,7 @@ mod tests {
     #[test]
     fn provider_names_partial_registry() {
         let mut reg = ProviderRegistry::new();
-        reg.code_review
-            .insert("cr".into(), (labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview)));
+        reg.code_review.insert("cr", labeled_desc("cr", "StubCR", "PR", "Pull Requests", "pull request"), Arc::new(StubCodeReview));
 
         let names = provider_names_from_registry(&reg);
         assert_eq!(names.len(), 1);
@@ -392,7 +384,7 @@ mod tests {
 
         assert!(model.registry.checkout_managers.contains_key("cm"));
         assert!(model.registry.cloud_agents.contains_key("ca"));
-        assert!(model.registry.workspace_manager.is_some());
+        assert!(!model.registry.workspace_manager.is_empty());
         model.refresh_handle.trigger_refresh();
     }
 
@@ -413,7 +405,7 @@ mod tests {
         assert!(model.registry.code_review.is_empty());
         assert!(model.registry.issue_trackers.is_empty());
         assert!(model.registry.cloud_agents.is_empty());
-        assert!(model.registry.workspace_manager.is_none());
+        assert!(model.registry.workspace_manager.is_empty());
         assert_eq!(model.labels.checkouts.section, "Checkouts");
         assert_eq!(model.labels.code_review.section, "Change Requests");
         assert_eq!(model.labels.issues.section, "Issues");
@@ -421,61 +413,4 @@ mod tests {
         assert!(!model.data.loading);
     }
 
-    // -------------------------------------------------------
-    // strip_external_providers
-    // -------------------------------------------------------
-
-    #[test]
-    fn strip_external_providers_keeps_local_removes_external() {
-        let mut reg = full_registry();
-
-        // Before stripping: everything populated
-        assert!(!reg.vcs.is_empty());
-        assert!(!reg.checkout_managers.is_empty());
-        assert!(!reg.code_review.is_empty());
-        assert!(!reg.issue_trackers.is_empty());
-        assert!(!reg.cloud_agents.is_empty());
-        assert!(!reg.ai_utilities.is_empty());
-        assert!(reg.workspace_manager.is_some());
-
-        reg.strip_external_providers();
-
-        // Local providers are kept
-        assert!(!reg.vcs.is_empty(), "VCS should be kept");
-        assert!(!reg.checkout_managers.is_empty(), "checkout managers should be kept");
-        assert!(reg.workspace_manager.is_some(), "workspace manager should be kept");
-
-        // External providers are removed
-        assert!(reg.code_review.is_empty(), "code review should be removed");
-        assert!(reg.issue_trackers.is_empty(), "issue trackers should be removed");
-        assert!(reg.cloud_agents.is_empty(), "cloud agents should be removed");
-        assert!(reg.ai_utilities.is_empty(), "AI utilities should be removed");
-    }
-
-    #[test]
-    fn strip_external_providers_on_empty_registry_is_noop() {
-        let mut reg = ProviderRegistry::new();
-        reg.strip_external_providers();
-        assert!(reg.vcs.is_empty());
-        assert!(reg.checkout_managers.is_empty());
-        assert!(reg.code_review.is_empty());
-    }
-
-    #[test]
-    fn provider_names_after_strip_omits_external() {
-        let mut reg = full_registry();
-        reg.strip_external_providers();
-        let names = provider_names_from_registry(&reg);
-
-        // Local providers remain
-        assert!(names.contains_key("vcs"));
-        assert!(names.contains_key("checkout_manager"));
-        assert!(names.contains_key("workspace_manager"));
-
-        // External providers gone
-        assert!(!names.contains_key("code_review"));
-        assert!(!names.contains_key("issue_tracker"));
-        assert!(!names.contains_key("cloud_agent"));
-        assert!(!names.contains_key("ai_utility"));
-    }
 }

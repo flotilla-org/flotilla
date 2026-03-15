@@ -154,27 +154,27 @@ async fn refresh_providers(
     let mut errors = Vec::new();
 
     let checkouts_fut = collect_named_results(
-        registry.checkout_managers.values().map(|(desc, cm)| (desc.display_name.clone(), cm.list_checkouts(repo_root))).collect(),
+        registry.checkout_managers.iter().map(|(desc, cm)| (desc.display_name.clone(), cm.list_checkouts(repo_root))).collect(),
     );
 
     let cr_fut = collect_named_results(
-        registry.code_review.values().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect(),
+        registry.code_review.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect(),
     );
 
     let sessions_fut = collect_named_results(
-        registry.cloud_agents.values().map(|(desc, ca)| (desc.display_name.clone(), ca.list_sessions(criteria))).collect(),
+        registry.cloud_agents.iter().map(|(desc, ca)| (desc.display_name.clone(), ca.list_sessions(criteria))).collect(),
     );
 
     let branches_fut = collect_named_results(
-        registry.vcs.values().map(|(desc, vcs)| (desc.display_name.clone(), vcs.list_remote_branches(repo_root))).collect(),
+        registry.vcs.iter().map(|(desc, vcs)| (desc.display_name.clone(), vcs.list_remote_branches(repo_root))).collect(),
     );
 
     let merged_fut = collect_named_results(
-        registry.code_review.values().map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50))).collect(),
+        registry.code_review.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50))).collect(),
     );
 
     let ws_fut = async {
-        if let Some((desc, ws_mgr)) = &registry.workspace_manager {
+        if let Some((desc, ws_mgr)) = registry.workspace_manager.preferred_with_desc() {
             let name = desc.display_name.clone();
             match ws_mgr.list_workspaces().await {
                 Ok(entries) => (entries, vec![]),
@@ -186,7 +186,7 @@ async fn refresh_providers(
     };
 
     let tp_fut = async {
-        if let Some((desc, tp)) = &registry.terminal_pool {
+        if let Some((desc, tp)) = registry.terminal_pool.preferred_with_desc() {
             let name = desc.display_name.clone();
             match tp.list_terminals().await {
                 Ok(entries) => (entries, vec![]),
@@ -248,36 +248,20 @@ async fn refresh_providers(
 fn compute_provider_health(registry: &ProviderRegistry, errors: &[RefreshError]) -> HashMap<(&'static str, String), bool> {
     let mut health = HashMap::new();
 
-    insert_category_health(
-        &mut health,
-        errors,
-        "cloud_agent",
-        registry.cloud_agents.values().map(|(desc, _)| desc.display_name.clone()),
-        &["sessions"],
-    );
-    insert_category_health(
-        &mut health,
-        errors,
-        "code_review",
-        registry.code_review.values().map(|(desc, _)| desc.display_name.clone()),
-        &["PRs", "merged"],
-    );
-    insert_category_health(
-        &mut health,
-        errors,
-        "checkout_manager",
-        registry.checkout_managers.values().map(|(desc, _)| desc.display_name.clone()),
-        &["checkouts"],
-    );
-    insert_category_health(&mut health, errors, "vcs", registry.vcs.values().map(|(desc, _)| desc.display_name.clone()), &["branches"]);
-
-    if let Some((desc, _)) = &registry.workspace_manager {
-        insert_category_health(&mut health, errors, "workspace_manager", [desc.display_name.clone()], &["workspaces"]);
-    }
-
-    if let Some((desc, _)) = &registry.terminal_pool {
-        insert_category_health(&mut health, errors, "terminal_pool", [desc.display_name.clone()], &["terminals"]);
-    }
+    insert_category_health(&mut health, errors, "cloud_agent", registry.cloud_agents.display_names().map(|s| s.to_string()), &["sessions"]);
+    insert_category_health(&mut health, errors, "code_review", registry.code_review.display_names().map(|s| s.to_string()), &[
+        "PRs", "merged",
+    ]);
+    insert_category_health(&mut health, errors, "checkout_manager", registry.checkout_managers.display_names().map(|s| s.to_string()), &[
+        "checkouts",
+    ]);
+    insert_category_health(&mut health, errors, "vcs", registry.vcs.display_names().map(|s| s.to_string()), &["branches"]);
+    insert_category_health(&mut health, errors, "workspace_manager", registry.workspace_manager.display_names().map(|s| s.to_string()), &[
+        "workspaces",
+    ]);
+    insert_category_health(&mut health, errors, "terminal_pool", registry.terminal_pool.display_names().map(|s| s.to_string()), &[
+        "terminals",
+    ]);
 
     health
 }
@@ -566,8 +550,8 @@ mod tests {
     #[test]
     fn compute_provider_health_maps_error_categories() {
         let mut registry = ProviderRegistry::new();
-        registry.cloud_agents.insert("claude".to_string(), (desc("MockCA"), Arc::new(MockCloudAgent::ok(vec![]))));
-        registry.code_review.insert("github".to_string(), (desc("MockCR"), Arc::new(MockCodeReview::ok(vec![], vec![]))));
+        registry.cloud_agents.insert("claude", desc("MockCA"), Arc::new(MockCloudAgent::ok(vec![])));
+        registry.code_review.insert("github", desc("MockCR"), Arc::new(MockCodeReview::ok(vec![], vec![])));
 
         let cases = vec![
             (vec![], true, true),
@@ -612,25 +596,29 @@ mod tests {
 
         let mut registry = ProviderRegistry::new();
         registry.checkout_managers.insert(
-            "wt".to_string(),
-            (desc("wt"), Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))]))),
+            "wt",
+            desc("wt"),
+            Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))])),
         );
         registry.code_review.insert(
-            "github".to_string(),
-            (
-                desc("github"),
-                Arc::new(MockCodeReview::ok(vec![("42".to_string(), make_change_request("Add feature", "feat-a"))], vec![
-                    "shared".to_string()
-                ])),
-            ),
+            "github",
+            desc("github"),
+            Arc::new(MockCodeReview::ok(
+                vec![("42".to_string(), make_change_request("Add feature", "feat-a"))],
+                vec!["shared".to_string()],
+            )),
         );
         registry.cloud_agents.insert(
-            "claude".to_string(),
-            (desc("claude"), Arc::new(MockCloudAgent::ok(vec![("sess-1".to_string(), make_session("Debug", "sess-1"))]))),
+            "claude",
+            desc("claude"),
+            Arc::new(MockCloudAgent::ok(vec![("sess-1".to_string(), make_session("Debug", "sess-1"))])),
         );
-        registry.vcs.insert("git".to_string(), (desc("git"), Arc::new(MockVcs::ok(vec!["remote-only".to_string(), "shared".to_string()]))));
-        registry.workspace_manager =
-            Some((desc("cmux"), Arc::new(MockWorkspaceManager::ok(vec![("ws-1".to_string(), make_workspace("dev"))]))));
+        registry.vcs.insert("git", desc("git"), Arc::new(MockVcs::ok(vec!["remote-only".to_string(), "shared".to_string()])));
+        registry.workspace_manager.insert(
+            "cmux",
+            desc("cmux"),
+            Arc::new(MockWorkspaceManager::ok(vec![("ws-1".to_string(), make_workspace("dev"))])),
+        );
 
         let mut pd = ProviderData::default();
         let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
@@ -648,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_reports_checkout_errors() {
         let mut registry = ProviderRegistry::new();
-        registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::failing("checkout failed"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("checkout failed")));
 
         let mut pd = ProviderData::default();
         let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
@@ -661,13 +649,14 @@ mod tests {
     async fn refresh_collects_multiple_errors_and_preserves_successful_providers() {
         let mut registry = ProviderRegistry::new();
         registry.checkout_managers.insert(
-            "wt".to_string(),
-            (desc("wt"), Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))]))),
+            "wt",
+            desc("wt"),
+            Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))])),
         );
-        registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview::failing("pr fail", "merged fail"))));
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::failing("sessions fail"))));
-        registry.vcs.insert("git".to_string(), (desc("git"), Arc::new(MockVcs::failing("branches fail"))));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail"))));
+        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview::failing("pr fail", "merged fail")));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("sessions fail")));
+        registry.vcs.insert("git", desc("git"), Arc::new(MockVcs::failing("branches fail")));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail")));
 
         let mut pd = ProviderData::default();
         let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
@@ -698,7 +687,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_failing_provider_sets_error_and_unhealthy_health() {
         let mut registry = ProviderRegistry::new();
-        registry.cloud_agents.insert("claude".to_string(), (desc("MockCA"), Arc::new(MockCloudAgent::failing("agent offline"))));
+        registry.cloud_agents.insert("claude", desc("MockCA"), Arc::new(MockCloudAgent::failing("agent offline")));
 
         let handle = RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), Duration::from_secs(3600));
 
@@ -723,8 +712,8 @@ mod tests {
     #[test]
     fn compute_provider_health_per_provider() {
         let mut registry = ProviderRegistry::new();
-        registry.cloud_agents.insert("claude".to_string(), (desc("Claude"), Arc::new(MockCloudAgent::ok_named("Claude", vec![]))));
-        registry.cloud_agents.insert("cursor".to_string(), (desc("Cursor"), Arc::new(MockCloudAgent::ok_named("Cursor", vec![]))));
+        registry.cloud_agents.insert("claude", desc("Claude"), Arc::new(MockCloudAgent::ok_named("Claude", vec![])));
+        registry.cloud_agents.insert("cursor", desc("Cursor"), Arc::new(MockCloudAgent::ok_named("Cursor", vec![])));
 
         // Only Cursor fails
         let errors = vec![RefreshError { category: "sessions", provider: "Cursor".to_string(), message: "auth failed".to_string() }];
@@ -737,10 +726,8 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_mixed_provider_health_isolates_failures() {
         let mut registry = ProviderRegistry::new();
-        registry.cloud_agents.insert("claude".to_string(), (desc("Claude"), Arc::new(MockCloudAgent::ok_named("Claude", vec![]))));
-        registry
-            .cloud_agents
-            .insert("cursor".to_string(), (desc("Cursor"), Arc::new(MockCloudAgent::failing_named("Cursor", "auth failed"))));
+        registry.cloud_agents.insert("claude", desc("Claude"), Arc::new(MockCloudAgent::ok_named("Claude", vec![])));
+        registry.cloud_agents.insert("cursor", desc("Cursor"), Arc::new(MockCloudAgent::failing_named("Cursor", "auth failed")));
 
         let handle = RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), Duration::from_secs(3600));
 

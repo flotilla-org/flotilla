@@ -439,30 +439,34 @@ pub async fn discover_providers(
     }
 
     probe_all(&factories.vcs, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.vcs.insert(desc.name.clone(), (desc, provider));
+        registry.vcs.insert(desc.name.clone(), desc, provider);
     })
     .await;
     if let Some((desc, provider)) = probe_first(&factories.checkout_managers, &combined, config, repo_root, &runner, &mut unmet).await {
-        registry.checkout_managers.insert(desc.name.clone(), (desc, provider));
+        registry.checkout_managers.insert(desc.name.clone(), desc, provider);
     }
     probe_all(&factories.code_review, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.code_review.insert(desc.name.clone(), (desc, provider));
+        registry.code_review.insert(desc.name.clone(), desc, provider);
     })
     .await;
     probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.issue_trackers.insert(desc.name.clone(), (desc, provider));
+        registry.issue_trackers.insert(desc.name.clone(), desc, provider);
     })
     .await;
     probe_all(&factories.cloud_agents, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.cloud_agents.insert(desc.name.clone(), (desc, provider));
+        registry.cloud_agents.insert(desc.name.clone(), desc, provider);
     })
     .await;
     probe_all(&factories.ai_utilities, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.ai_utilities.insert(desc.name.clone(), (desc, provider));
+        registry.ai_utilities.insert(desc.name.clone(), desc, provider);
     })
     .await;
-    registry.workspace_manager = probe_first(&factories.workspace_managers, &combined, config, repo_root, &runner, &mut unmet).await;
-    registry.terminal_pool = probe_first(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet).await;
+    if let Some((desc, provider)) = probe_first(&factories.workspace_managers, &combined, config, repo_root, &runner, &mut unmet).await {
+        registry.workspace_manager.insert(desc.name.clone(), desc, provider);
+    }
+    if let Some((desc, provider)) = probe_first(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet).await {
+        registry.terminal_pool.insert(desc.name.clone(), desc, provider);
+    }
 
     let repo_slug = combined.repo_slug();
 
@@ -841,8 +845,8 @@ mod orchestrator_tests {
         assert!(result.registry.issue_trackers.is_empty());
         assert!(result.registry.cloud_agents.is_empty());
         assert!(result.registry.ai_utilities.is_empty());
-        assert!(result.registry.workspace_manager.is_none());
-        assert!(result.registry.terminal_pool.is_none());
+        assert!(result.registry.workspace_manager.is_empty());
+        assert!(result.registry.terminal_pool.is_empty());
         assert!(result.unmet.is_empty());
         assert!(result.repo_slug.is_none());
     }

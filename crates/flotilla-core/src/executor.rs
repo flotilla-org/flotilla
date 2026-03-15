@@ -154,12 +154,7 @@ async fn build_create_checkout_plan(
                         }
                         return Ok(StepOutcome::Skipped);
                     }
-                    let cm = registry
-                        .checkout_managers
-                        .values()
-                        .next()
-                        .map(|(_, cm)| Arc::clone(cm))
-                        .ok_or_else(|| "No checkout manager available".to_string())?;
+                    let cm = registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
                     let (path, _checkout) = cm.create_checkout(&repo_root, &branch, create_branch).await?;
                     info!(checkout_path = %path.display(), "created checkout");
                     *slot.lock().await = Some(path.clone());
@@ -256,12 +251,7 @@ async fn build_teleport_session_plan(
                         Some(b) => b.clone(),
                         None => return Ok(StepOutcome::Skipped),
                     };
-                    let cm = registry
-                        .checkout_managers
-                        .values()
-                        .next()
-                        .map(|(_, cm)| Arc::clone(cm))
-                        .ok_or_else(|| "No checkout manager available".to_string())?;
+                    let cm = registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
                     let (path, _checkout) = cm.create_checkout(&repo_root, &branch_name, false).await?;
                     *slot.lock().await = Some(path);
                     Ok(StepOutcome::Completed)
@@ -286,9 +276,9 @@ async fn build_teleport_session_plan(
                         path_slot.lock().await.clone().ok_or_else(|| "Could not determine checkout path for teleport".to_string())?;
                     let teleport_cmd = teleport_slot.lock().await.clone().ok_or_else(|| "Attach command not resolved".to_string())?;
                     let name = branch.as_deref().unwrap_or("session");
-                    if let Some((_, ws_mgr)) = &registry.workspace_manager {
+                    if let Some(ws_mgr) = registry.workspace_manager.preferred() {
                         let mut config = workspace_config(&repo_root, name, &path, &teleport_cmd, &config_base);
-                        if let Some((_, tp)) = &registry.terminal_pool {
+                        if let Some(tp) = registry.terminal_pool.preferred() {
                             resolve_terminal_pool(&mut config, tp.as_ref()).await;
                         }
                         // Teleport always creates a new workspace — the attach command is
@@ -327,12 +317,7 @@ fn build_remove_checkout_plan(
             description: format!("Remove checkout for branch {branch}"),
             action: Box::new(move || {
                 Box::pin(async move {
-                    let cm = registry
-                        .checkout_managers
-                        .values()
-                        .next()
-                        .map(|(_, cm)| Arc::clone(cm))
-                        .ok_or_else(|| "No checkout manager available".to_string())?;
+                    let cm = registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
                     cm.remove_checkout(&repo_root, &branch).await?;
                     Ok(StepOutcome::Completed)
                 })
@@ -347,7 +332,7 @@ fn build_remove_checkout_plan(
             description: "Clean up terminal sessions".to_string(),
             action: Box::new(move || {
                 Box::pin(async move {
-                    if let Some((_, tp)) = &registry.terminal_pool {
+                    if let Some(tp) = registry.terminal_pool.preferred() {
                         for terminal_id in &terminal_keys {
                             if let Err(e) = tp.kill_terminal(terminal_id).await {
                                 warn!(
@@ -457,12 +442,12 @@ pub async fn execute(
     match action {
         CommandAction::CreateWorkspaceForCheckout { checkout_path, label } => {
             info!(%label, "entering workspace");
-            if let Some((_, ws_mgr)) = &registry.workspace_manager {
+            if let Some(ws_mgr) = registry.workspace_manager.preferred() {
                 if select_existing_workspace(ws_mgr.as_ref(), &checkout_path).await {
                     return CommandResult::Ok;
                 }
                 let mut config = workspace_config(&repo.root, &label, &checkout_path, "claude", config_base);
-                if let Some((_, tp)) = &registry.terminal_pool {
+                if let Some(tp) = registry.terminal_pool.preferred() {
                     resolve_terminal_pool(&mut config, tp.as_ref()).await;
                 }
                 if let Err(e) = ws_mgr.create_workspace(&config).await {
@@ -473,7 +458,7 @@ pub async fn execute(
         }
 
         CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, commands } => {
-            if let Some((_, ws_mgr)) = &registry.workspace_manager {
+            if let Some(ws_mgr) = registry.workspace_manager.preferred() {
                 let wrapped = match wrap_remote_attach_commands(&target_host, &checkout_path, &commands, config_base) {
                     Ok(commands) => commands,
                     Err(message) => return CommandResult::Error { message },
@@ -494,7 +479,7 @@ pub async fn execute(
 
         CommandAction::SelectWorkspace { ws_ref } => {
             info!(%ws_ref, "switching to workspace");
-            if let Some((_, ws_mgr)) = &registry.workspace_manager {
+            if let Some(ws_mgr) = registry.workspace_manager.preferred() {
                 if let Err(e) = ws_mgr.select_workspace(&ws_ref).await {
                     return CommandResult::Error { message: e };
                 }
@@ -511,7 +496,7 @@ pub async fn execute(
                 return CommandResult::Error { message };
             }
             info!(%branch, "creating checkout");
-            let checkout_result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
+            let checkout_result = if let Some(cm) = registry.checkout_managers.preferred() {
                 Some(cm.create_checkout(&repo.root, &branch, create_branch).await)
             } else {
                 None
@@ -557,7 +542,7 @@ pub async fn execute(
                 Err(message) => return CommandResult::Error { message },
             };
             info!(%branch, "removing checkout");
-            let result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
+            let result = if let Some(cm) = registry.checkout_managers.preferred() {
                 Some(cm.remove_checkout(&repo.root, &branch).await)
             } else {
                 None
@@ -565,7 +550,7 @@ pub async fn execute(
             match result {
                 Some(Ok(())) => {
                     // Best-effort cleanup of correlated terminal sessions
-                    if let Some((_, tp)) = &registry.terminal_pool {
+                    if let Some(tp) = registry.terminal_pool.preferred() {
                         for terminal_id in &terminal_keys {
                             if let Err(e) = tp.kill_terminal(terminal_id).await {
                                 warn!(
@@ -591,7 +576,7 @@ pub async fn execute(
 
         CommandAction::OpenChangeRequest { id } => {
             debug!(%id, "opening change request in browser");
-            if let Some((_, cr)) = registry.code_review.values().next() {
+            if let Some(cr) = registry.code_review.preferred() {
                 let _ = cr.open_in_browser(&repo.root, &id).await;
             }
             CommandResult::Ok
@@ -599,7 +584,7 @@ pub async fn execute(
 
         CommandAction::CloseChangeRequest { id } => {
             debug!(%id, "closing change request");
-            if let Some((_, cr)) = registry.code_review.values().next() {
+            if let Some(cr) = registry.code_review.preferred() {
                 let _ = cr.close_change_request(&repo.root, &id).await;
             }
             CommandResult::Ok
@@ -607,7 +592,7 @@ pub async fn execute(
 
         CommandAction::OpenIssue { id } => {
             debug!(%id, "opening issue in browser");
-            if let Some((_, it)) = registry.issue_trackers.values().next() {
+            if let Some(it) = registry.issue_trackers.preferred() {
                 let _ = it.open_in_browser(&repo.root, &id).await;
             }
             CommandResult::Ok
@@ -657,7 +642,7 @@ pub async fn execute(
                 let host_key = flotilla_protocol::HostPath::new(local_host.clone(), key.clone());
                 providers_data.checkouts.get(&host_key).map(|_| key.clone())
             } else if let Some(branch_name) = &branch {
-                let checkout_result = if let Some((_, cm)) = registry.checkout_managers.values().next() {
+                let checkout_result = if let Some(cm) = registry.checkout_managers.preferred() {
                     cm.create_checkout(&repo.root, branch_name, false).await.ok()
                 } else {
                     None
@@ -668,9 +653,9 @@ pub async fn execute(
             };
             if let Some(path) = wt_path {
                 let name = branch.as_deref().unwrap_or("session");
-                if let Some((_, ws_mgr)) = &registry.workspace_manager {
+                if let Some(ws_mgr) = registry.workspace_manager.preferred() {
                     let mut config = workspace_config(&repo.root, name, &path, &teleport_cmd, config_base);
-                    if let Some((_, tp)) = &registry.terminal_pool {
+                    if let Some(tp) = registry.terminal_pool.preferred() {
                         resolve_terminal_pool(&mut config, tp.as_ref()).await;
                     }
                     // Teleport always creates a new workspace — the attach command is
@@ -725,12 +710,12 @@ async fn generate_branch_name_result(issue_keys: &[String], registry: &ProviderR
         issue_keys.iter().filter_map(|k| providers_data.issues.get(k.as_str()).map(|issue| (k.clone(), issue.title.clone()))).collect();
 
     let issue_id_pairs: Vec<(String, String)> = {
-        let provider = registry.issue_trackers.keys().next().cloned().unwrap_or_else(|| "issues".to_string());
+        let provider = registry.issue_trackers.preferred_name().map(|s| s.to_string()).unwrap_or_else(|| "issues".to_string());
         issues.iter().map(|(id, _title)| (provider.clone(), id.clone())).collect()
     };
 
     info!(issue_count = issue_keys.len(), "generating branch name");
-    let branch_result = if let Some((_, ai)) = registry.ai_utilities.values().next() {
+    let branch_result = if let Some(ai) = registry.ai_utilities.preferred() {
         let context: Vec<String> = issues.iter().map(|(id, title)| format!("{} #{}", title, id)).collect();
         let prompt_text = if context.len() == 1 { context[0].clone() } else { context.join("; ") };
         Some(ai.generate_branch_name(&prompt_text).await)
@@ -890,7 +875,7 @@ async fn prepare_terminal_commands(
 
     // Fallback: read the local template (for backwards compat or local use)
     let mut config = workspace_config(repo_root, branch, checkout_path, "claude", config_base);
-    if let Some((_, tp)) = &registry.terminal_pool {
+    if let Some(tp) = registry.terminal_pool.preferred() {
         resolve_terminal_pool(&mut config, tp.as_ref()).await;
     }
 
@@ -1471,8 +1456,8 @@ mod tests {
     #[tokio::test]
     async fn archive_session_uses_provider_from_session_ref() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::failing("wrong provider"))));
-        registry.cloud_agents.insert("cursor".to_string(), (desc("cursor"), Arc::new(MockCloudAgent::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("wrong provider")));
+        registry.cloud_agents.insert("cursor", desc("cursor"), Arc::new(MockCloudAgent::succeeding()));
         let mut data = empty_data();
         data.sessions.insert("sess-1".to_string(), make_session_for("cursor", "sess-1"));
         let runner = runner_ok();
@@ -1485,7 +1470,7 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_for_checkout_success_with_ws_manager() {
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
         let runner = runner_ok();
@@ -1500,7 +1485,7 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_for_checkout_ws_manager_fails() {
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws creation failed"))));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws creation failed")));
         let data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
         let runner = runner_ok();
@@ -1543,7 +1528,7 @@ mod tests {
     async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() {
         let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
         let runner = runner_ok();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_root = temp.path().join("repo");
@@ -1636,7 +1621,7 @@ mod tests {
         let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:42".to_string(), existing_workspace)]));
 
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), ws_mgr.clone()));
+        registry.workspace_manager.insert("cmux", desc("cmux"), ws_mgr.clone());
         let mut data = empty_data();
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
@@ -1661,10 +1646,8 @@ mod tests {
         })]));
 
         let mut registry = empty_registry();
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
-        registry.workspace_manager = Some((desc("cmux"), ws_mgr.clone()));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+        registry.workspace_manager.insert("cmux", desc("cmux"), ws_mgr.clone());
         let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
         let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
@@ -1683,7 +1666,7 @@ mod tests {
     async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_only_repo() {
         let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
         let runner = runner_ok();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -1731,8 +1714,8 @@ mod tests {
         let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:77".to_string(), existing_workspace)]));
 
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
-        registry.workspace_manager = Some((desc("cmux"), ws_mgr.clone()));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
+        registry.workspace_manager.insert("cmux", desc("cmux"), ws_mgr.clone());
         let mut data = empty_data();
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
@@ -1772,7 +1755,7 @@ mod tests {
     #[tokio::test]
     async fn select_workspace_success() {
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let runner = runner_ok();
 
         let result = run_execute(CommandAction::SelectWorkspace { ws_ref: "my-ws".to_string() }, &registry, &empty_data(), &runner).await;
@@ -1783,7 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn select_workspace_failure() {
         let mut registry = empty_registry();
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("select failed"))));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("select failed")));
         let runner = runner_ok();
 
         let result = run_execute(CommandAction::SelectWorkspace { ws_ref: "bad-ws".to_string() }, &registry, &empty_data(), &runner).await;
@@ -1808,9 +1791,7 @@ mod tests {
     #[tokio::test]
     async fn create_checkout_success() {
         let mut registry = empty_registry();
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
         let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
         let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
@@ -1821,9 +1802,7 @@ mod tests {
     #[tokio::test]
     async fn create_checkout_with_issue_ids_writes_git_config() {
         let mut registry = empty_registry();
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
         // Two validation probes (branch absent locally/remotely), then the git config write.
         let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string()), Ok(String::new())]);
 
@@ -1845,7 +1824,7 @@ mod tests {
     #[tokio::test]
     async fn create_checkout_failure() {
         let mut registry = empty_registry();
-        registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::failing("branch already exists"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("branch already exists")));
         let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
         let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
@@ -1856,10 +1835,8 @@ mod tests {
     #[tokio::test]
     async fn create_checkout_success_ws_manager_fails_still_returns_created() {
         let mut registry = empty_registry();
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed")));
         let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
         let result = run_execute(fresh_checkout_action("feat-x"), &registry, &empty_data(), &runner).await;
@@ -1887,7 +1864,7 @@ mod tests {
     #[tokio::test]
     async fn remove_checkout_success() {
         let mut registry = empty_registry();
-        registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
         let mut data = empty_data();
         data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
         let runner = runner_ok();
@@ -1900,7 +1877,7 @@ mod tests {
     #[tokio::test]
     async fn remove_checkout_failure() {
         let mut registry = empty_registry();
-        registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::failing("cannot remove trunk"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("cannot remove trunk")));
         let mut data = empty_data();
         data.checkouts.insert(hp("/repo/wt-main"), make_checkout("main", "/repo/wt-main"));
         let runner = runner_ok();
@@ -1941,10 +1918,8 @@ mod tests {
         let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
 
         let mut registry = empty_registry();
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
-        registry.terminal_pool = Some((desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+        registry.terminal_pool.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
         let mut data = empty_data();
         data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
 
@@ -2035,7 +2010,7 @@ mod tests {
     #[tokio::test]
     async fn open_change_request_with_provider() {
         let mut registry = empty_registry();
-        registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
+        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview));
         let runner = runner_ok();
 
         let result = run_execute(CommandAction::OpenChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
@@ -2060,7 +2035,7 @@ mod tests {
     #[tokio::test]
     async fn close_change_request_with_provider() {
         let mut registry = empty_registry();
-        registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
+        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview));
         let runner = runner_ok();
 
         let result = run_execute(CommandAction::CloseChangeRequest { id: "42".to_string() }, &registry, &empty_data(), &runner).await;
@@ -2085,7 +2060,7 @@ mod tests {
     #[tokio::test]
     async fn open_issue_with_provider() {
         let mut registry = empty_registry();
-        registry.issue_trackers.insert("github".to_string(), (desc("github"), Arc::new(MockIssueTracker)));
+        registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueTracker));
         let runner = runner_ok();
 
         let result = run_execute(CommandAction::OpenIssue { id: "10".to_string() }, &registry, &empty_data(), &runner).await;
@@ -2199,7 +2174,7 @@ mod tests {
     #[tokio::test]
     async fn archive_session_success() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
         let mut data = empty_data();
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
@@ -2212,7 +2187,7 @@ mod tests {
     #[tokio::test]
     async fn archive_session_agent_fails() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::failing("archive failed"))));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("archive failed")));
         let mut data = empty_data();
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
@@ -2229,8 +2204,8 @@ mod tests {
     #[tokio::test]
     async fn generate_branch_name_ai_success() {
         let mut registry = empty_registry();
-        registry.ai_utilities.insert("claude".to_string(), (desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login"))));
-        registry.issue_trackers.insert("github".to_string(), (desc("github"), Arc::new(MockIssueTracker)));
+        registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login")));
+        registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueTracker));
         let mut data = empty_data();
         data.issues.insert("42".to_string(), make_issue("42", "Add login feature"));
         let runner = runner_ok();
@@ -2243,7 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn generate_branch_name_ai_failure_uses_fallback() {
         let mut registry = empty_registry();
-        registry.ai_utilities.insert("claude".to_string(), (desc("claude"), Arc::new(MockAiUtility::failing("API error"))));
+        registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::failing("API error")));
         let mut data = empty_data();
         data.issues.insert("42".to_string(), make_issue("42", "Add login"));
         let runner = runner_ok();
@@ -2269,8 +2244,8 @@ mod tests {
     #[tokio::test]
     async fn generate_branch_name_multiple_issues() {
         let mut registry = empty_registry();
-        registry.ai_utilities.insert("claude".to_string(), (desc("claude"), Arc::new(MockAiUtility::succeeding("feat/login-and-signup"))));
-        registry.issue_trackers.insert("github".to_string(), (desc("github"), Arc::new(MockIssueTracker)));
+        registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/login-and-signup")));
+        registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueTracker));
         let mut data = empty_data();
         data.issues.insert("1".to_string(), make_issue("1", "Login feature"));
         data.issues.insert("2".to_string(), make_issue("2", "Signup feature"));
@@ -2308,10 +2283,11 @@ mod tests {
     async fn teleport_session_with_checkout_key() {
         let mut registry = empty_registry();
         registry.cloud_agents.insert(
-            "claude".to_string(),
-            (desc("claude"), Arc::new(MockCloudAgent::with_attach("claude --teleport"))), // base; mock appends session_id
+            "claude",
+            desc("claude"),
+            Arc::new(MockCloudAgent::with_attach("claude --teleport")), // base; mock appends session_id
         );
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let mut data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
@@ -2332,9 +2308,9 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_uses_provider_specific_attach_command() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::with_attach("claude --teleport"))));
-        registry.cloud_agents.insert("cursor".to_string(), (desc("cursor"), Arc::new(MockCloudAgent::with_attach("agent --resume"))));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::with_attach("claude --teleport")));
+        registry.cloud_agents.insert("cursor", desc("cursor"), Arc::new(MockCloudAgent::with_attach("agent --resume")));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let mut data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
@@ -2358,11 +2334,9 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_with_branch_creates_checkout() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat"))));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let mut data = empty_data();
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
@@ -2381,7 +2355,7 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_no_path_no_branch() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
         let mut data = empty_data();
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
@@ -2400,8 +2374,8 @@ mod tests {
     #[tokio::test]
     async fn teleport_session_ws_manager_fails() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed"))));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed")));
         let mut data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
@@ -2423,8 +2397,8 @@ mod tests {
     async fn teleport_session_uses_session_as_name_when_no_branch() {
         // When checkout_key is present but branch is None, uses "session" as name.
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let mut data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
@@ -2514,10 +2488,8 @@ mod tests {
     #[tokio::test]
     async fn build_plan_create_checkout_returns_steps() {
         let mut registry = empty_registry();
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let data = empty_data();
         let runner = runner_ok();
 
@@ -2535,10 +2507,8 @@ mod tests {
     #[tokio::test]
     async fn build_plan_create_checkout_skips_existing() {
         let mut registry = empty_registry();
-        registry
-            .checkout_managers
-            .insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x"))));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let mut data = empty_data();
         // Pre-populate with an existing checkout for the branch
         data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
@@ -2558,8 +2528,8 @@ mod tests {
     #[tokio::test]
     async fn build_plan_teleport_session_returns_steps() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
-        registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
+        registry.workspace_manager.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
         let mut data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
@@ -2586,7 +2556,7 @@ mod tests {
     #[tokio::test]
     async fn build_plan_remove_checkout_returns_steps() {
         let mut registry = empty_registry();
-        registry.checkout_managers.insert("wt".to_string(), (desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old"))));
+        registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
         let mut data = empty_data();
         data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
         let runner = runner_ok();
@@ -2605,7 +2575,7 @@ mod tests {
     #[tokio::test]
     async fn build_plan_archive_session_returns_steps() {
         let mut registry = empty_registry();
-        registry.cloud_agents.insert("claude".to_string(), (desc("claude"), Arc::new(MockCloudAgent::succeeding())));
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
         let mut data = empty_data();
         data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
         let runner = runner_ok();
@@ -2624,7 +2594,7 @@ mod tests {
     #[tokio::test]
     async fn build_plan_generate_branch_name_returns_steps() {
         let mut registry = empty_registry();
-        registry.ai_utilities.insert("claude".to_string(), (desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login"))));
+        registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login")));
         let mut data = empty_data();
         data.issues.insert("42".to_string(), make_issue("42", "Add login feature"));
         let runner = runner_ok();
@@ -2679,7 +2649,7 @@ mod tests {
     #[tokio::test]
     async fn build_plan_simple_command_returns_immediate() {
         let mut registry = empty_registry();
-        registry.code_review.insert("github".to_string(), (desc("github"), Arc::new(MockCodeReview)));
+        registry.code_review.insert("github", desc("github"), Arc::new(MockCodeReview));
         let runner = runner_ok();
 
         let plan = run_build_plan(CommandAction::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
