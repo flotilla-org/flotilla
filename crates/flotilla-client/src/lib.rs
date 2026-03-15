@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, Message, RawResponse, ReplayCursor,
-    RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse,
+    RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSelector, RepoWorkResponse, Snapshot, StatusResponse,
+    TopologyResponse,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -552,7 +553,7 @@ impl DaemonHandle for SocketDaemon {
         self.event_tx.subscribe()
     }
 
-    async fn get_state(&self, repo: &Path) -> Result<Snapshot, String> {
+    async fn get_state(&self, repo: &RepoSelector) -> Result<Snapshot, String> {
         // Always RPC to server — local state only tracks seqs for gap detection,
         // not full snapshots (work_items can't be materialized client-side).
         let resp = self.request("get_state", serde_json::json!({ "repo": repo })).await?;
@@ -619,18 +620,18 @@ impl DaemonHandle for SocketDaemon {
         resp.parse()
     }
 
-    async fn get_repo_detail(&self, slug: &str) -> Result<RepoDetailResponse, String> {
-        let resp = self.request("get_repo_detail", serde_json::json!({ "slug": slug })).await?;
+    async fn get_repo_detail(&self, repo: &RepoSelector) -> Result<RepoDetailResponse, String> {
+        let resp = self.request("get_repo_detail", serde_json::json!({ "repo": repo })).await?;
         resp.parse()
     }
 
-    async fn get_repo_providers(&self, slug: &str) -> Result<RepoProvidersResponse, String> {
-        let resp = self.request("get_repo_providers", serde_json::json!({ "slug": slug })).await?;
+    async fn get_repo_providers(&self, repo: &RepoSelector) -> Result<RepoProvidersResponse, String> {
+        let resp = self.request("get_repo_providers", serde_json::json!({ "repo": repo })).await?;
         resp.parse()
     }
 
-    async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String> {
-        let resp = self.request("get_repo_work", serde_json::json!({ "slug": slug })).await?;
+    async fn get_repo_work(&self, repo: &RepoSelector) -> Result<RepoWorkResponse, String> {
+        let resp = self.request("get_repo_work", serde_json::json!({ "repo": repo })).await?;
         resp.parse()
     }
 

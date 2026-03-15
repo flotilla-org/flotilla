@@ -15,7 +15,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError,
-    RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoWorkResponse, Snapshot, SnapshotDelta,
+    RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSelector, RepoWorkResponse, Snapshot, SnapshotDelta,
     StatusResponse, TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
@@ -44,7 +44,7 @@ impl DaemonHandle for StubDaemon {
         self.tx.subscribe()
     }
 
-    async fn get_state(&self, _repo: &Path) -> Result<Snapshot, String> {
+    async fn get_state(&self, _repo: &RepoSelector) -> Result<Snapshot, String> {
         Err("stub".into())
     }
 
@@ -80,15 +80,15 @@ impl DaemonHandle for StubDaemon {
         Ok(StatusResponse { repos: vec![] })
     }
 
-    async fn get_repo_detail(&self, _slug: &str) -> Result<RepoDetailResponse, String> {
+    async fn get_repo_detail(&self, _repo: &RepoSelector) -> Result<RepoDetailResponse, String> {
         Err("stub".into())
     }
 
-    async fn get_repo_providers(&self, _slug: &str) -> Result<RepoProvidersResponse, String> {
+    async fn get_repo_providers(&self, _repo: &RepoSelector) -> Result<RepoProvidersResponse, String> {
         Err("stub".into())
     }
 
-    async fn get_repo_work(&self, _slug: &str) -> Result<RepoWorkResponse, String> {
+    async fn get_repo_work(&self, _repo: &RepoSelector) -> Result<RepoWorkResponse, String> {
         Err("stub".into())
     }
 

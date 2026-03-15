@@ -1455,14 +1455,15 @@ impl DaemonHandle for InProcessDaemon {
         self.event_tx.subscribe()
     }
 
-    async fn get_state(&self, repo: &Path) -> Result<Snapshot, String> {
-        let identity = self.tracked_repo_identity_for_path(repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+    async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Snapshot, String> {
+        let path = self.resolve_repo_selector(repo).await?;
+        let identity = self.tracked_repo_identity_for_path(&path).await.ok_or_else(|| format!("repo not tracked: {}", path.display()))?;
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()
         };
         let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", path.display()))?;
 
         Ok(build_repo_snapshot_with_peers(
             SnapshotBuildContext {
@@ -2059,23 +2060,15 @@ impl DaemonHandle for InProcessDaemon {
         Ok(StatusResponse { repos: summaries })
     }
 
-    async fn get_repo_detail(&self, slug: &str) -> Result<RepoDetailResponse, String> {
+    async fn get_repo_detail(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
+        let path = self.resolve_repo_selector(repo).await?;
+        let identity = self.tracked_repo_identity_for_path(&path).await.ok_or_else(|| format!("repo not tracked: {}", path.display()))?;
         let repos = self.repos.read().await;
-        let identity = {
-            let entries: Vec<_> = repos.iter().map(|(identity, state)| (identity, state.preferred_path(), state.slug())).collect();
-            let path = crate::resolve::resolve_repo(slug, entries.iter().map(|(_, path, repo_slug)| (*path, *repo_slug)))
-                .map_err(|e| e.to_string())?;
-            entries
-                .into_iter()
-                .find(|(_, repo_path, _)| *repo_path == path)
-                .map(|(identity, _, _)| identity.clone())
-                .expect("resolved repo path should map back to identity")
-        };
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()
         };
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {slug}"))?;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let path = state.preferred_path().to_path_buf();
         let snapshot = build_repo_snapshot_with_peers(
             SnapshotBuildContext {
@@ -2100,23 +2093,15 @@ impl DaemonHandle for InProcessDaemon {
         })
     }
 
-    async fn get_repo_providers(&self, slug: &str) -> Result<RepoProvidersResponse, String> {
+    async fn get_repo_providers(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
+        let path = self.resolve_repo_selector(repo).await?;
+        let identity = self.tracked_repo_identity_for_path(&path).await.ok_or_else(|| format!("repo not tracked: {}", path.display()))?;
         let repos = self.repos.read().await;
-        let identity = {
-            let entries: Vec<_> = repos.iter().map(|(identity, state)| (identity, state.preferred_path(), state.slug())).collect();
-            let path = crate::resolve::resolve_repo(slug, entries.iter().map(|(_, path, repo_slug)| (*path, *repo_slug)))
-                .map_err(|e| e.to_string())?;
-            entries
-                .into_iter()
-                .find(|(_, repo_path, _)| *repo_path == path)
-                .map(|(identity, _, _)| identity.clone())
-                .expect("resolved repo path should map back to identity")
-        };
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()
         };
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {slug}"))?;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let path = state.preferred_path().to_path_buf();
         let snapshot = build_repo_snapshot_with_peers(
             SnapshotBuildContext {
@@ -2161,23 +2146,15 @@ impl DaemonHandle for InProcessDaemon {
         })
     }
 
-    async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String> {
+    async fn get_repo_work(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
+        let path = self.resolve_repo_selector(repo).await?;
+        let identity = self.tracked_repo_identity_for_path(&path).await.ok_or_else(|| format!("repo not tracked: {}", path.display()))?;
         let repos = self.repos.read().await;
-        let identity = {
-            let entries: Vec<_> = repos.iter().map(|(identity, state)| (identity, state.preferred_path(), state.slug())).collect();
-            let path = crate::resolve::resolve_repo(slug, entries.iter().map(|(_, path, repo_slug)| (*path, *repo_slug)))
-                .map_err(|e| e.to_string())?;
-            entries
-                .into_iter()
-                .find(|(_, repo_path, _)| *repo_path == path)
-                .map(|(identity, _, _)| identity.clone())
-                .expect("resolved repo path should map back to identity")
-        };
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()
         };
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {slug}"))?;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", path.display()))?;
         let path = state.preferred_path().to_path_buf();
         let snapshot = build_repo_snapshot_with_peers(
             SnapshotBuildContext {

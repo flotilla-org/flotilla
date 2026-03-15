@@ -291,7 +291,7 @@ async fn daemon_snapshot_has_correct_host_attribution() {
                 Ok(flotilla_protocol::DaemonEvent::SnapshotFull(snap)) => return *snap,
                 Ok(flotilla_protocol::DaemonEvent::SnapshotDelta(_)) => {
                     // Get full state instead
-                    return daemon.get_state(&repo).await.expect("get_state");
+                    return daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
                 }
                 Ok(_) => continue,
                 Err(e) => panic!("recv error: {e:?}"),
@@ -360,7 +360,7 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
 
     leader.set_peer_providers(&leader_repo, vec![(HostName::new("follower"), follower_providers)], 0).await;
 
-    let snapshot = leader.get_state(&leader_repo).await.expect("leader state");
+    let snapshot = leader.get_state(&RepoSelector::Path(leader_repo.clone())).await.expect("leader state");
     assert!(
         snapshot
             .providers
@@ -397,7 +397,7 @@ async fn daemon_snapshot_includes_follower_checkout_overlay() {
     let follower_checkout = HostPath::new(follower_host.clone(), "/remote/repo");
 
     daemon.refresh(&repo).await.expect("refresh");
-    let baseline = daemon.get_state(&repo).await.expect("baseline get_state");
+    let baseline = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("baseline get_state");
     assert!(
         baseline.work_items.iter().all(|item| item.checkout_key() != Some(&follower_checkout)),
         "baseline snapshot should not already contain follower overlay data"
@@ -410,7 +410,7 @@ async fn daemon_snapshot_includes_follower_checkout_overlay() {
     // so `get_state` can assert on the merged view immediately.
     daemon.set_peer_providers(&repo, vec![(follower_host.clone(), follower_data)], 0).await;
 
-    let snapshot = daemon.get_state(&repo).await.expect("get_state");
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
 
     assert!(
         snapshot.providers.checkouts.contains_key(&follower_checkout),

@@ -4,7 +4,7 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     output::OutputFormat, Command, CommandResult, DaemonEvent, HostProvidersResponse, HostStatusResponse, PeerConnectionState,
-    RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, TopologyResponse,
+    RepoDetailResponse, RepoProvidersResponse, RepoSelector, RepoWorkResponse, StatusResponse, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -268,7 +268,7 @@ pub async fn run_status(socket_path: &Path, format: OutputFormat) -> Result<(), 
 }
 
 pub async fn run_repo_detail(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let detail = daemon.get_repo_detail(slug).await?;
+    let detail = daemon.get_repo_detail(&RepoSelector::Query(slug.into())).await?;
     let output = match format {
         OutputFormat::Human => format_repo_detail_human(&detail),
         OutputFormat::Json => flotilla_protocol::output::json_pretty(&detail),
@@ -278,7 +278,7 @@ pub async fn run_repo_detail(daemon: &dyn DaemonHandle, slug: &str, format: Outp
 }
 
 pub async fn run_repo_providers(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let providers = daemon.get_repo_providers(slug).await?;
+    let providers = daemon.get_repo_providers(&RepoSelector::Query(slug.into())).await?;
     let output = match format {
         OutputFormat::Human => format_repo_providers_human(&providers),
         OutputFormat::Json => flotilla_protocol::output::json_pretty(&providers),
@@ -288,7 +288,7 @@ pub async fn run_repo_providers(daemon: &dyn DaemonHandle, slug: &str, format: O
 }
 
 pub async fn run_repo_work(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let work = daemon.get_repo_work(slug).await?;
+    let work = daemon.get_repo_work(&RepoSelector::Query(slug.into())).await?;
     let output = match format {
         OutputFormat::Human => format_repo_work_human(&work),
         OutputFormat::Json => flotilla_protocol::output::json_pretty(&work),

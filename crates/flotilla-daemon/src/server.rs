@@ -1719,8 +1719,8 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
         },
 
         "get_state" => {
-            let repo = match extract_repo_path(&params) {
-                Ok(p) => p,
+            let repo = match extract_repo_selector(&params) {
+                Ok(s) => s,
                 Err(e) => return Message::error_response(id, e),
             };
             match ctx.daemon.get_state(&repo).await {
@@ -1888,33 +1888,33 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
         },
 
         "get_repo_detail" => {
-            let slug = match extract_str_param(&params, "slug") {
+            let repo = match extract_repo_selector(&params) {
                 Ok(s) => s,
                 Err(e) => return Message::error_response(id, e),
             };
-            match ctx.daemon.get_repo_detail(&slug).await {
+            match ctx.daemon.get_repo_detail(&repo).await {
                 Ok(detail) => Message::ok_response(id, &detail),
                 Err(e) => Message::error_response(id, e),
             }
         }
 
         "get_repo_providers" => {
-            let slug = match extract_str_param(&params, "slug") {
+            let repo = match extract_repo_selector(&params) {
                 Ok(s) => s,
                 Err(e) => return Message::error_response(id, e),
             };
-            match ctx.daemon.get_repo_providers(&slug).await {
+            match ctx.daemon.get_repo_providers(&repo).await {
                 Ok(providers) => Message::ok_response(id, &providers),
                 Err(e) => Message::error_response(id, e),
             }
         }
 
         "get_repo_work" => {
-            let slug = match extract_str_param(&params, "slug") {
+            let repo = match extract_repo_selector(&params) {
                 Ok(s) => s,
                 Err(e) => return Message::error_response(id, e),
             };
-            match ctx.daemon.get_repo_work(&slug).await {
+            match ctx.daemon.get_repo_work(&repo).await {
                 Ok(work) => Message::ok_response(id, &work),
                 Err(e) => Message::error_response(id, e),
             }
@@ -1954,6 +1954,12 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
 
         unknown => Message::error_response(id, format!("unknown method: {unknown}")),
     }
+}
+
+/// Extract the "repo" field from params as a RepoSelector.
+fn extract_repo_selector(params: &serde_json::Value) -> Result<RepoSelector, String> {
+    let value = params.get("repo").ok_or_else(|| "missing 'repo' parameter".to_string())?;
+    serde_json::from_value(value.clone()).map_err(|e| format!("invalid 'repo' parameter: {e}"))
 }
 
 /// Extract the "repo" field from params as a PathBuf.
@@ -2627,7 +2633,7 @@ mod tests {
         };
         let checkout_path = tokio::time::timeout(StdDuration::from_secs(5), async {
             loop {
-                let snapshot = daemon.get_state(&repo).await.expect("get state");
+                let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get state");
                 if let Some((path, _checkout)) = snapshot.providers.checkouts.iter().find(|(_, checkout)| checkout.branch == "feat-remote")
                 {
                     return path.path.clone();
@@ -3168,7 +3174,7 @@ mod tests {
             handle_remote_restart_if_needed(&peer_manager, &daemon, &HostName::new("peer-a"), Some(old_session_id)).await;
 
         assert_eq!(current_session_id, Some(new_session_id), "current session id should update to the reconnected peer session");
-        let snapshot = daemon.get_state(&synthetic).await.expect("remote-only repo should remain");
+        let snapshot = daemon.get_state(&RepoSelector::Path(synthetic.clone())).await.expect("remote-only repo should remain");
         assert!(
             !snapshot.providers.checkouts.contains_key(&HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only")),
             "restart cleanup should remove stale peer-a checkout"

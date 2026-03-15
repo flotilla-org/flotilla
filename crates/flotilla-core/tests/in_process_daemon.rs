@@ -892,7 +892,7 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
     // Now get_state reads last_snapshot (merged) as base, normalizes ALL checkouts
     // to local host, then merges peers again. With the bug, kiwi's checkout appears
     // both as local (re-stamped) and as kiwi (re-merged).
-    let snapshot = daemon.get_state(&repo).await.expect("get_state after poll with peers");
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state after poll with peers");
 
     // The peer checkout should appear exactly once, attributed to kiwi
     let kiwi_checkouts: Vec<_> = snapshot.providers.checkouts.keys().filter(|hp| hp.host == peer_host).collect();
@@ -943,7 +943,7 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
     daemon.set_peer_providers(&repo, vec![(peer_host.clone(), make_peer_data("feat-v2"))], 1).await;
     let _ = recv_event(&mut rx).await;
 
-    let snapshot = daemon.get_state(&repo).await.expect("get_state after poll + second peer update");
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state after poll + second peer update");
 
     let peer_count = snapshot.providers.checkouts.keys().filter(|hp| hp.host == peer_host).count();
     assert_eq!(peer_count, 1, "peer should have exactly 1 checkout, got {peer_count}");
@@ -1269,7 +1269,7 @@ async fn get_repo_work_returns_work_items() {
     trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
-    let work = daemon.get_repo_work(repo_name).await.expect("get_repo_work failed");
+    let work = daemon.get_repo_work(&RepoSelector::Query(repo_name.into())).await.expect("get_repo_work failed");
     assert_eq!(work.path, repo);
     // Work items may or may not be present depending on repo state, but the call should succeed
 }
@@ -1291,7 +1291,7 @@ async fn get_repo_detail_returns_provider_health_and_errors() {
     trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
-    let detail = daemon.get_repo_detail(repo_name).await.expect("get_repo_detail failed");
+    let detail = daemon.get_repo_detail(&RepoSelector::Query(repo_name.into())).await.expect("get_repo_detail failed");
 
     assert_eq!(detail.path, repo);
     let code_review_health = detail.provider_health.get("code_review").expect("code_review health should be present");
@@ -1307,7 +1307,7 @@ async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery(
     let (_temp, repo, daemon) = daemon_for_plain_dir().await;
 
     let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
-    let providers = daemon.get_repo_providers(repo_name).await.expect("get_repo_providers failed");
+    let providers = daemon.get_repo_providers(&RepoSelector::Query(repo_name.into())).await.expect("get_repo_providers failed");
 
     assert_eq!(providers.path, repo);
     assert!(

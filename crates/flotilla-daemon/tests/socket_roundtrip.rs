@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
-use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent, HostName};
+use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent, HostName, RepoSelector};
 use tokio::time::Instant;
 
 #[tokio::test]
@@ -64,7 +64,7 @@ async fn socket_roundtrip() {
     assert_eq!(repos[0].path, repo);
 
     // get_state — should return a snapshot for our repo
-    let snapshot = client.get_state(&repo).await.expect("get_state");
+    let snapshot = client.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
     assert_eq!(snapshot.repo, repo);
 
     // Subscribe BEFORE refresh to avoid race — event may fire before subscribe
@@ -77,7 +77,7 @@ async fn socket_roundtrip() {
     assert!(matches!(event, DaemonEvent::SnapshotFull(_) | DaemonEvent::SnapshotDelta(_)), "expected snapshot event, got {:?}", event);
 
     // replay_since with current seq — should return empty (up to date)
-    let snapshot = client.get_state(&repo).await.expect("get_state");
+    let snapshot = client.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
     let last_seen = HashMap::from([(snapshot.repo_identity.clone(), snapshot.seq)]);
     let replay = client.replay_since(&last_seen).await.expect("replay_since");
     assert!(replay.is_empty(), "should be empty when up to date, got {} events", replay.len());
@@ -148,7 +148,7 @@ async fn query_commands_roundtrip() {
     // connect, so subscribe+recv would race and miss it.
     let data_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if client.get_state(&repo).await.is_ok() {
+        if client.get_state(&RepoSelector::Path(repo.clone())).await.is_ok() {
             break;
         }
         if Instant::now() >= data_deadline {
@@ -165,16 +165,16 @@ async fn query_commands_roundtrip() {
 
     // Test get_repo_detail by repo directory name
     let repo_name = repo.file_name().expect("repo file_name").to_str().expect("repo name utf8");
-    let detail = client.get_repo_detail(repo_name).await.expect("get_repo_detail");
+    let detail = client.get_repo_detail(&RepoSelector::Query(repo_name.into())).await.expect("get_repo_detail");
     assert_eq!(detail.path, repo);
 
     // Test get_repo_providers
-    let providers = client.get_repo_providers(repo_name).await.expect("get_repo_providers");
+    let providers = client.get_repo_providers(&RepoSelector::Query(repo_name.into())).await.expect("get_repo_providers");
     assert_eq!(providers.path, repo);
     assert!(!providers.providers.is_empty(), "should have at least VCS provider");
 
     // Test get_repo_work
-    let work = client.get_repo_work(repo_name).await.expect("get_repo_work");
+    let work = client.get_repo_work(&RepoSelector::Query(repo_name.into())).await.expect("get_repo_work");
     assert_eq!(work.path, repo);
 
     // Test host query commands against the local daemon state
@@ -192,7 +192,7 @@ async fn query_commands_roundtrip() {
     assert_eq!(topology.local_host, HostName::local());
 
     // Test slug resolution error for nonexistent repo
-    let err = client.get_repo_detail("nonexistent").await;
+    let err = client.get_repo_detail(&RepoSelector::Query("nonexistent".into())).await;
     assert!(err.is_err(), "nonexistent slug should return error");
 
     // Clean up
@@ -248,7 +248,7 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
 
     let data_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if client.get_state(&repo).await.is_ok() {
+        if client.get_state(&RepoSelector::Path(repo.clone())).await.is_ok() {
             break;
         }
         if Instant::now() >= data_deadline {

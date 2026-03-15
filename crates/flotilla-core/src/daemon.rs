@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use async_trait::async_trait;
 use flotilla_protocol::{
     Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse,
+    RepoProvidersResponse, RepoSelector, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse,
 };
 use tokio::sync::broadcast;
 
@@ -15,7 +15,7 @@ pub trait DaemonHandle: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent>;
 
     /// Get full current state for a repo.
-    async fn get_state(&self, repo: &Path) -> Result<Snapshot, String>;
+    async fn get_state(&self, repo: &RepoSelector) -> Result<Snapshot, String>;
 
     /// List all tracked repos.
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String>;
@@ -50,13 +50,13 @@ pub trait DaemonHandle: Send + Sync {
     async fn get_status(&self) -> Result<StatusResponse, String>;
 
     /// Repo detail: work items, provider health, errors.
-    async fn get_repo_detail(&self, slug: &str) -> Result<RepoDetailResponse, String>;
+    async fn get_repo_detail(&self, repo: &RepoSelector) -> Result<RepoDetailResponse, String>;
 
     /// Repo discovery: host/repo assertions, providers, unmet requirements.
-    async fn get_repo_providers(&self, slug: &str) -> Result<RepoProvidersResponse, String>;
+    async fn get_repo_providers(&self, repo: &RepoSelector) -> Result<RepoProvidersResponse, String>;
 
     /// Repo work items.
-    async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String>;
+    async fn get_repo_work(&self, repo: &RepoSelector) -> Result<RepoWorkResponse, String>;
 
     /// Host list with connection and summary data.
     async fn list_hosts(&self) -> Result<HostListResponse, String>;
