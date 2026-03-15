@@ -180,7 +180,11 @@ struct SnapshotBuildContext<'a> {
     repo_identity: flotilla_protocol::RepoIdentity,
     path: &'a Path,
     seq: u64,
-    base: &'a RefreshSnapshot,
+    /// Local-only provider data — must NOT contain merged peer data.
+    /// Errors and health from the last snapshot are passed separately.
+    local_providers: &'a ProviderData,
+    errors: &'a [crate::data::RefreshError],
+    provider_health: &'a HashMap<(&'static str, String), bool>,
     cache: &'a IssueCache,
     search_results: &'a Option<Vec<(String, Issue)>>,
     host_name: &'a HostName,
@@ -192,8 +196,8 @@ fn build_repo_snapshot(ctx: SnapshotBuildContext<'_>) -> Snapshot {
 
 /// Build a proto Snapshot, optionally merging peer provider data before correlation.
 fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: Option<&[(HostName, ProviderData)]>) -> Snapshot {
-    let SnapshotBuildContext { repo_identity, path, seq, base, cache, search_results, host_name } = ctx;
-    let local_providers = normalize_local_provider_hosts(inject_issues(&base.providers, cache, search_results), host_name);
+    let SnapshotBuildContext { repo_identity, path, seq, local_providers, errors, provider_health, cache, search_results, host_name } = ctx;
+    let local_providers = normalize_local_provider_hosts(inject_issues(local_providers, cache, search_results), host_name);
 
     // Merge peer provider data if any
     let providers = if let Some(peers) = peer_overlay {
@@ -204,13 +208,8 @@ fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: O
     };
 
     let (work_items, correlation_groups) = crate::data::correlate(&providers);
-    let re_snapshot = RefreshSnapshot {
-        providers,
-        work_items,
-        correlation_groups,
-        errors: base.errors.clone(),
-        provider_health: base.provider_health.clone(),
-    };
+    let re_snapshot =
+        RefreshSnapshot { providers, work_items, correlation_groups, errors: errors.to_vec(), provider_health: provider_health.clone() };
     let mut snapshot = snapshot_to_proto(repo_identity, path, seq, &re_snapshot, host_name);
     snapshot.issue_total = cache.total_count;
     snapshot.issue_has_more = cache.has_more;
@@ -899,9 +898,16 @@ impl InProcessDaemon {
             state.seq += 1;
             state.local_data_version += 1;
             state.last_local_providers = last_local_providers;
-            // Persist the merged per-identity snapshot so follow-up reads and
-            // delta generation see the same local+peer view that was emitted.
-            state.last_snapshot = Arc::new(re_snapshot.clone());
+            // Store a local-only snapshot (errors + health from the refresh,
+            // providers from last_local_providers). Callers that need peer data
+            // merge it on-demand via peer_providers; storing merged data here
+            // would cause double-merge bugs in normalize_local_provider_hosts.
+            state.last_snapshot = Arc::new(RefreshSnapshot {
+                providers: Arc::new(state.last_local_providers.clone()),
+                errors: re_snapshot.errors.clone(),
+                provider_health: re_snapshot.provider_health.clone(),
+                ..Default::default()
+            });
 
             let event = choose_event(proto_snapshot, delta_entry);
             let _ = self.event_tx.send(event);
@@ -1024,7 +1030,7 @@ impl InProcessDaemon {
             repos
                 .iter()
                 .filter_map(|(identity, state)| {
-                    let linked_ids = collect_linked_issue_ids(&state.last_snapshot.providers);
+                    let linked_ids = collect_linked_issue_ids(&state.providers());
                     let missing = state.issue_cache.missing_ids(&linked_ids);
                     if missing.is_empty() {
                         return None;
@@ -1310,7 +1316,9 @@ impl InProcessDaemon {
                 repo_identity: state.identity.clone(),
                 path: state.preferred_path(),
                 seq: state.seq + 1,
-                base: &state.last_snapshot,
+                local_providers: &state.last_local_providers,
+                errors: &state.last_snapshot.errors,
+                provider_health: &state.last_snapshot.provider_health,
                 cache: &state.issue_cache,
                 search_results: &state.search_results,
                 host_name: &self.host_name,
@@ -1370,7 +1378,9 @@ impl DaemonHandle for InProcessDaemon {
                 repo_identity: state.identity.clone(),
                 path: state.preferred_path(),
                 seq: state.seq,
-                base: &state.last_snapshot,
+                local_providers: &state.last_local_providers,
+                errors: &state.last_snapshot.errors,
+                provider_health: &state.last_snapshot.provider_health,
                 cache: &state.issue_cache,
                 search_results: &state.search_results,
                 host_name: &self.host_name,
@@ -1808,7 +1818,9 @@ impl DaemonHandle for InProcessDaemon {
                     repo_identity: state.identity.clone(),
                     path: state.preferred_path(),
                     seq: state.seq,
-                    base: &state.last_snapshot,
+                    local_providers: &state.last_local_providers,
+                    errors: &state.last_snapshot.errors,
+                    provider_health: &state.last_snapshot.provider_health,
                     cache: &state.issue_cache,
                     search_results: &state.search_results,
                     host_name: &self.host_name,
@@ -1925,7 +1937,9 @@ impl DaemonHandle for InProcessDaemon {
                     repo_identity: state.identity.clone(),
                     path: state.preferred_path(),
                     seq: state.seq,
-                    base: &state.last_snapshot,
+                    local_providers: &state.last_local_providers,
+                    errors: &state.last_snapshot.errors,
+                    provider_health: &state.last_snapshot.provider_health,
                     cache: &state.issue_cache,
                     search_results: &state.search_results,
                     host_name: &self.host_name,
@@ -1966,7 +1980,9 @@ impl DaemonHandle for InProcessDaemon {
                 repo_identity: state.identity.clone(),
                 path: state.preferred_path(),
                 seq: state.seq,
-                base: &state.last_snapshot,
+                local_providers: &state.last_local_providers,
+                errors: &state.last_snapshot.errors,
+                provider_health: &state.last_snapshot.provider_health,
                 cache: &state.issue_cache,
                 search_results: &state.search_results,
                 host_name: &self.host_name,
@@ -2005,7 +2021,9 @@ impl DaemonHandle for InProcessDaemon {
                 repo_identity: state.identity.clone(),
                 path: state.preferred_path(),
                 seq: state.seq,
-                base: &state.last_snapshot,
+                local_providers: &state.last_local_providers,
+                errors: &state.last_snapshot.errors,
+                provider_health: &state.last_snapshot.provider_health,
                 cache: &state.issue_cache,
                 search_results: &state.search_results,
                 host_name: &self.host_name,
@@ -2064,7 +2082,9 @@ impl DaemonHandle for InProcessDaemon {
                 repo_identity: state.identity.clone(),
                 path: state.preferred_path(),
                 seq: state.seq,
-                base: &state.last_snapshot,
+                local_providers: &state.last_local_providers,
+                errors: &state.last_snapshot.errors,
+                provider_health: &state.last_snapshot.provider_health,
                 cache: &state.issue_cache,
                 search_results: &state.search_results,
                 host_name: &self.host_name,
@@ -2223,11 +2243,14 @@ mod tests {
             provider_display_name: String::new(),
         })]);
 
+        let default_snap = RefreshSnapshot::default();
         let snap = build_repo_snapshot(SnapshotBuildContext {
             repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
             path: Path::new("/tmp/repo"),
             seq: 7,
-            base: &RefreshSnapshot::default(),
+            local_providers: &default_snap.providers,
+            errors: &default_snap.errors,
+            provider_health: &default_snap.provider_health,
             cache: &cache,
             search_results: &None,
             host_name: &HostName::local(),
@@ -2294,12 +2317,15 @@ mod tests {
         });
 
         let peers = vec![(host_b, peer_data)];
+        let default_snap = RefreshSnapshot::default();
         let snap = build_repo_snapshot_with_peers(
             SnapshotBuildContext {
                 repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
                 path: Path::new("/tmp/repo"),
                 seq: 1,
-                base: &RefreshSnapshot::default(),
+                local_providers: &default_snap.providers,
+                errors: &default_snap.errors,
+                provider_health: &default_snap.provider_health,
                 cache: &cache,
                 search_results: &None,
                 host_name: &host_a,
@@ -2310,6 +2336,104 @@ mod tests {
         // The snapshot should contain the merged peer checkout
         assert!(!snap.providers.checkouts.is_empty(), "peer checkout should be merged");
         assert_eq!(snap.providers.checkouts.len(), 1);
+    }
+
+    /// Regression test: when `base` already contains merged peer data (as happens
+    /// after poll_snapshots stores `re_snapshot` in `last_snapshot`), calling
+    /// `build_repo_snapshot_with_peers` again must not re-attribute peer checkouts
+    /// to the local host via `normalize_local_provider_hosts`.
+    #[test]
+    fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
+        let cache = IssueCache::new();
+        let local_host = HostName::new("feta");
+        let peer_host = HostName::new("kiwi");
+
+        // Simulate local checkout
+        let mut local_providers = ProviderData::default();
+        local_providers.checkouts.insert(flotilla_protocol::HostPath::new(local_host.clone(), PathBuf::from("/home/dev/repo")), Checkout {
+            branch: "main".into(),
+            is_main: true,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+        });
+
+        // Create peer data
+        let mut peer_data = ProviderData::default();
+        peer_data.checkouts.insert(flotilla_protocol::HostPath::new(peer_host.clone(), PathBuf::from("/srv/kiwi/repo")), Checkout {
+            branch: "peer-feat".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+        });
+        let peers = vec![(peer_host.clone(), peer_data.clone())];
+        let default_snap = RefreshSnapshot::default();
+
+        // First call — simulates the initial build (local-only base).
+        // This produces a merged result containing both local + peer checkouts.
+        let first_snap = build_repo_snapshot_with_peers(
+            SnapshotBuildContext {
+                repo_identity: fallback_repo_identity(Path::new("/home/dev/repo")),
+                path: Path::new("/home/dev/repo"),
+                seq: 1,
+                local_providers: &local_providers,
+                errors: &default_snap.errors,
+                provider_health: &default_snap.provider_health,
+                cache: &cache,
+                search_results: &None,
+                host_name: &local_host,
+            },
+            Some(&peers),
+        );
+        assert_eq!(first_snap.providers.checkouts.len(), 2, "first build should have local + peer checkout");
+
+        // Simulate poll_snapshots storing the merged result as last_snapshot
+        // while last_local_providers retains only local data.
+        // The bug was: passing merged providers as the base to a second call
+        // would re-stamp peer checkouts as local via normalize_local_provider_hosts.
+        // With the fix, callers always pass local_providers, never merged data.
+
+        // Second call — uses local-only providers (the fix), not merged data.
+        let second_snap = build_repo_snapshot_with_peers(
+            SnapshotBuildContext {
+                repo_identity: fallback_repo_identity(Path::new("/home/dev/repo")),
+                path: Path::new("/home/dev/repo"),
+                seq: 2,
+                local_providers: &local_providers,
+                errors: &default_snap.errors,
+                provider_health: &default_snap.provider_health,
+                cache: &cache,
+                search_results: &None,
+                host_name: &local_host,
+            },
+            Some(&peers),
+        );
+
+        // The peer checkout must appear exactly once under kiwi
+        let kiwi_count = second_snap.providers.checkouts.keys().filter(|hp| hp.host == peer_host).count();
+        assert_eq!(kiwi_count, 1, "peer checkout should appear once under kiwi, got {kiwi_count}");
+
+        // No ghost checkout — kiwi's path must not appear under the local host
+        let ghost = flotilla_protocol::HostPath::new(local_host.clone(), PathBuf::from("/srv/kiwi/repo"));
+        assert!(
+            !second_snap.providers.checkouts.contains_key(&ghost),
+            "peer checkout at /srv/kiwi/repo must not be re-stamped as local host checkout"
+        );
+
+        // Total checkout count should remain 2 (1 local + 1 peer)
+        assert_eq!(
+            second_snap.providers.checkouts.len(),
+            2,
+            "should have exactly 2 checkouts (1 local + 1 peer), got {}",
+            second_snap.providers.checkouts.len()
+        );
     }
 
     // --- RepoState::record_delta ---
