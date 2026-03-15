@@ -692,7 +692,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
                 Ok(DaemonEvent::CommandFinished { command_id, repo_identity, result, .. }) if command_id == add_id => {
                     finished = Some((repo_identity, result));
                 }
-                Ok(DaemonEvent::RepoAdded(info)) => added = Some(*info),
+                Ok(DaemonEvent::RepoTracked(info)) => added = Some(*info),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
@@ -727,7 +727,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
         loop {
             match rx.recv().await {
                 Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == remove_id => finished = Some(result),
-                Ok(DaemonEvent::RepoRemoved { path, .. }) => removed = Some(path),
+                Ok(DaemonEvent::RepoUntracked { path, .. }) => removed = Some(path),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
@@ -1203,18 +1203,18 @@ async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
         .await
         .expect("add_virtual_repo should succeed");
 
-    // Should receive a RepoAdded event
+    // Should receive a RepoTracked event
     let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::RepoAdded(info)) => break *info,
+                Ok(DaemonEvent::RepoTracked(info)) => break *info,
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
         }
     })
     .await
-    .expect("timeout waiting for RepoAdded");
+    .expect("timeout waiting for RepoTracked");
     assert_eq!(added.identity, identity);
     assert_eq!(added.path, synthetic_path);
     assert!(!added.loading, "virtual repos should not be in loading state");

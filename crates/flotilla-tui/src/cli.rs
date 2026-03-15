@@ -228,10 +228,10 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 delta.changes.len()
             )
         }
-        DaemonEvent::RepoAdded(info) => {
+        DaemonEvent::RepoTracked(info) => {
             format!("[repo]     {}: added", info.name)
         }
-        DaemonEvent::RepoRemoved { path, .. } => {
+        DaemonEvent::RepoUntracked { path, .. } => {
             format!("[repo]     {}: removed", repo_name(path))
         }
         DaemonEvent::CommandStarted { repo, description, .. } => {
@@ -750,7 +750,7 @@ mod tests {
 
         #[test]
         fn repo_added() {
-            let event = DaemonEvent::RepoAdded(Box::new(flotilla_protocol::snapshot::RepoInfo {
+            let event = DaemonEvent::RepoTracked(Box::new(flotilla_protocol::snapshot::RepoInfo {
                 identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/added-repo".into() },
                 name: "added-repo".into(),
                 path: PathBuf::from("/tmp/added-repo"),
@@ -767,7 +767,7 @@ mod tests {
 
         #[test]
         fn repo_removed() {
-            let event = DaemonEvent::RepoRemoved {
+            let event = DaemonEvent::RepoUntracked {
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/old-repo".into() },
                 path: PathBuf::from("/tmp/old-repo"),
             };

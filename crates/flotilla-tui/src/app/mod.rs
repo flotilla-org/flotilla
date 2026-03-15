@@ -383,8 +383,8 @@ impl App {
         match event {
             DaemonEvent::SnapshotFull(snap) => self.apply_snapshot(*snap),
             DaemonEvent::SnapshotDelta(delta) => self.apply_delta(*delta),
-            DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
-            DaemonEvent::RepoRemoved { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
+            DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
+            DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
             DaemonEvent::CommandStarted { command_id, repo_identity, repo, description, .. } => {
                 tracing::info!(%command_id, %description, "command started");
                 self.in_flight.insert(command_id, InFlightCommand { repo_identity, repo, description });

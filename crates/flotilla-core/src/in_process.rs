@@ -1318,7 +1318,7 @@ impl InProcessDaemon {
     /// `<remote>/desktop/home/dev/repo`). The `provider_data` is the
     /// initial merged data from peer snapshots.
     ///
-    /// Emits `DaemonEvent::RepoAdded` so the TUI creates a tab.
+    /// Emits `DaemonEvent::RepoTracked` so the TUI creates a tab.
     pub async fn add_virtual_repo(
         &self,
         identity: flotilla_protocol::RepoIdentity,
@@ -1374,7 +1374,7 @@ impl InProcessDaemon {
         // with peer connections.
 
         info!(repo = %synthetic_path.display(), "added virtual repo");
-        let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
+        let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
 
         Ok(())
     }
@@ -1882,7 +1882,7 @@ impl DaemonHandle for InProcessDaemon {
 
         info!(repo = %path.display(), "added repo");
         if added_new_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
+            let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
         } else if preferred_changed {
             self.broadcast_snapshot_inner(&path, false).await;
         }
@@ -2013,7 +2013,7 @@ impl DaemonHandle for InProcessDaemon {
 
         info!(repo = %path.display(), "removed repo");
         if removed_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoRemoved { repo_identity, path });
+            let _ = self.event_tx.send(DaemonEvent::RepoUntracked { repo_identity, path });
         } else if let Some(preferred_path) = new_preferred_path {
             self.broadcast_snapshot_inner(&preferred_path, false).await;
         }

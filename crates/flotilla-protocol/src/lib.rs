@@ -150,10 +150,10 @@ pub enum DaemonEvent {
     /// Incremental delta — sent when only a subset of data changed.
     #[serde(rename = "snapshot_delta")]
     SnapshotDelta(Box<SnapshotDelta>),
-    #[serde(rename = "repo_added")]
-    RepoAdded(Box<RepoInfo>),
-    #[serde(rename = "repo_removed")]
-    RepoRemoved { repo_identity: RepoIdentity, path: std::path::PathBuf },
+    #[serde(rename = "repo_tracked")]
+    RepoTracked(Box<RepoInfo>),
+    #[serde(rename = "repo_untracked")]
+    RepoUntracked { repo_identity: RepoIdentity, path: std::path::PathBuf },
     #[serde(rename = "command_started")]
     CommandStarted { command_id: u64, host: HostName, repo_identity: RepoIdentity, repo: std::path::PathBuf, description: String },
     #[serde(rename = "command_finished")]
