@@ -889,11 +889,11 @@ impl InProcessDaemon {
                 proto_snapshot.work_items.clone(),
             );
             debug!(
-                "repo {}: delta seq {} → {} with {} changes",
-                state.preferred_path().display(),
-                delta_entry.prev_seq,
-                delta_entry.seq,
-                delta_entry.changes.len()
+                repo = %state.preferred_path().display(),
+                prev_seq = delta_entry.prev_seq,
+                seq = delta_entry.seq,
+                change_count = delta_entry.changes.len(),
+                "recorded repo delta"
             );
 
             state.seq += 1;
