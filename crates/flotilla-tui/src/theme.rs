@@ -106,6 +106,62 @@ pub struct Theme {
 }
 
 impl Theme {
+    pub fn catppuccin_mocha() -> Self {
+        let p = &catppuccin::PALETTE.mocha.colors;
+        Self {
+            name: "catppuccin-mocha",
+            // Chrome
+            tab_active: p.sapphire.into(),
+            tab_inactive: p.overlay0.into(),
+            border: p.surface1.into(),
+            row_highlight: p.surface0.into(),
+            multi_select_bg: p.surface1.into(),
+            section_header: p.yellow.into(),
+            muted: p.overlay0.into(),
+            // Logo tab
+            logo_fg: p.crust.into(),
+            logo_bg: p.sapphire.into(),
+            logo_config_bg: p.text.into(),
+            // Work item kinds
+            checkout: p.green.into(),
+            session: p.mauve.into(),
+            change_request: p.blue.into(),
+            issue: p.yellow.into(),
+            remote_branch: p.overlay0.into(),
+            workspace: p.green.into(),
+            // Semantic
+            branch: p.teal.into(),
+            path: p.subtext0.into(),
+            source: p.lavender.into(),
+            git_status: p.red.into(),
+            error: p.red.into(),
+            warning: p.yellow.into(),
+            info: p.blue.into(),
+            // Interactive
+            action_highlight: p.blue.into(),
+            input_text: p.teal.into(),
+            // Status
+            status_ok: p.green.into(),
+            status_error: p.red.into(),
+            // Surfaces
+            base: p.base.into(),
+            surface: p.surface0.into(),
+            text: p.text.into(),
+            subtext: p.subtext0.into(),
+            // Shimmer
+            shimmer_base: p.yellow.into(),
+            shimmer_highlight: p.rosewater.into(),
+            // Bar chrome
+            bar_bg: p.crust.into(),
+            key_hint: p.peach.into(),
+            key_chip_bg: p.surface1.into(),
+            key_chip_fg: p.crust.into(),
+            // Bar site styling
+            tab_bar: BarSiteStyle { kind: BarKind::Pipe, label_transform: TextTransform::AsIs },
+            status_bar: BarSiteStyle { kind: BarKind::Chevron, label_transform: TextTransform::Uppercase },
+        }
+    }
+
     pub fn classic() -> Self {
         Self {
             name: "classic",
@@ -160,6 +216,24 @@ impl Theme {
             status_bar: BarSiteStyle { kind: BarKind::Chevron, label_transform: TextTransform::Uppercase },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Theme registry
+// ---------------------------------------------------------------------------
+
+/// Returns the list of all built-in theme constructors.
+pub fn available_themes() -> &'static [fn() -> Theme] {
+    &[Theme::classic, Theme::catppuccin_mocha]
+}
+
+/// Looks up a theme by name (case-insensitive). Falls back to `classic`.
+pub fn theme_by_name(name: &str) -> Theme {
+    available_themes()
+        .iter()
+        .map(|ctor| ctor())
+        .find(|t| t.name.eq_ignore_ascii_case(name))
+        .unwrap_or_else(Theme::classic)
 }
 
 #[cfg(test)]
@@ -244,5 +318,56 @@ mod tests {
         assert_eq!(t.tab_bar.label_transform, TextTransform::AsIs);
         assert_eq!(t.status_bar.kind, BarKind::Chevron);
         assert_eq!(t.status_bar.label_transform, TextTransform::Uppercase);
+    }
+
+    // ---- Catppuccin Mocha ----
+
+    #[test]
+    fn catppuccin_mocha_name() {
+        assert_eq!(Theme::catppuccin_mocha().name, "catppuccin-mocha");
+    }
+
+    #[test]
+    fn catppuccin_mocha_uses_rgb_colours() {
+        let t = Theme::catppuccin_mocha();
+        // Catppuccin produces Rgb values, not named terminal colours
+        assert!(matches!(t.tab_active, Color::Rgb(_, _, _)));
+        assert!(matches!(t.base, Color::Rgb(_, _, _)));
+        assert!(matches!(t.text, Color::Rgb(_, _, _)));
+    }
+
+    #[test]
+    fn catppuccin_mocha_differs_from_classic() {
+        let c = Theme::classic();
+        let m = Theme::catppuccin_mocha();
+        assert_ne!(c.name, m.name);
+        assert_ne!(c.tab_active, m.tab_active);
+        assert_ne!(c.base, m.base);
+    }
+
+    // ---- Theme registry ----
+
+    #[test]
+    fn available_themes_length_and_names() {
+        let themes = available_themes();
+        assert_eq!(themes.len(), 2);
+        let names: Vec<&str> = themes.iter().map(|ctor| ctor().name).collect();
+        assert!(names.contains(&"classic"));
+        assert!(names.contains(&"catppuccin-mocha"));
+    }
+
+    #[test]
+    fn theme_by_name_found() {
+        assert_eq!(theme_by_name("catppuccin-mocha").name, "catppuccin-mocha");
+    }
+
+    #[test]
+    fn theme_by_name_case_insensitive() {
+        assert_eq!(theme_by_name("Catppuccin-Mocha").name, "catppuccin-mocha");
+    }
+
+    #[test]
+    fn theme_by_name_fallback() {
+        assert_eq!(theme_by_name("nonexistent").name, "classic");
     }
 }
