@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 skip-no-sandbox-tests = []
+test-support = []
 
 [dependencies]
 flotilla-core = { path = "../flotilla-core" }
@@ -18,10 +19,12 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
+visibility = "0.1.1"
 
 [dev-dependencies]
 indexmap = { workspace = true }
 tempfile = "3"
 flotilla-client = { path = "../flotilla-client" }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
+flotilla-daemon = { path = ".", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol" }

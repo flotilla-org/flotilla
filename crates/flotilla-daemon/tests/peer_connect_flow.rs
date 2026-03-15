@@ -1,4 +1,10 @@
 //! Integration test for peer connect / reconnect local state send flow (#306).
+//!
+//! Verifies the end-to-end path: peer connects → outbound task receives
+//! PeerConnectedNotice → send_local_to_peer sends data → peer receives it.
+//!
+//! Uses a `NotifyPeerSender` that signals a `tokio::sync::Notify` on each
+//! message, replacing timing-dependent sleeps with deterministic waits.
 
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -14,23 +20,42 @@ use flotilla_daemon::{
     server::PeerConnectedNotice,
 };
 use flotilla_protocol::{GoodbyeReason, HostName, PeerWireMessage};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
-struct CapturePeerSender {
+/// Peer sender that captures messages and signals a `Notify` on each send,
+/// allowing tests to wait deterministically instead of sleeping.
+struct NotifyPeerSender {
     sent: Arc<StdMutex<Vec<PeerWireMessage>>>,
+    notify: Arc<Notify>,
 }
 
 #[async_trait]
-impl PeerSender for CapturePeerSender {
+impl PeerSender for NotifyPeerSender {
     async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
         self.sent.lock().expect("lock").push(msg);
+        self.notify.notify_waiters();
         Ok(())
     }
 
     async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
         self.sent.lock().expect("lock").push(PeerWireMessage::Goodbye { reason });
+        self.notify.notify_waiters();
         Ok(())
     }
+}
+
+/// Wait until the captured message count reaches `target`, or timeout.
+async fn wait_for_messages(sent: &Arc<StdMutex<Vec<PeerWireMessage>>>, notify: &Notify, target: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if sent.lock().expect("lock").len() >= target {
+                return;
+            }
+            notify.notified().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for peer messages");
 }
 
 #[tokio::test]
@@ -43,12 +68,11 @@ async fn peer_connect_triggers_local_state_send() {
     let host_b = HostName::new("host-b");
 
     let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
-
-    // Refresh so local_data_version > 0
     daemon.refresh(&repo_path).await.expect("refresh");
 
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    let sender: Arc<dyn PeerSender> = Arc::new(CapturePeerSender { sent: Arc::clone(&sent) });
+    let notify = Arc::new(Notify::new());
+    let sender: Arc<dyn PeerSender> = Arc::new(NotifyPeerSender { sent: Arc::clone(&sent), notify: Arc::clone(&notify) });
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(host_a.clone())));
     let generation = {
         let mut pm = peer_manager.lock().await;
@@ -59,7 +83,8 @@ async fn peer_connect_triggers_local_state_send() {
 
     peer_connected_tx.send(PeerConnectedNotice { peer: host_b.clone(), generation }).expect("send notice");
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Expect at least 2 messages: HostSummary + Data for the repo
+    wait_for_messages(&sent, &notify, 2).await;
 
     let messages = sent.lock().expect("lock");
     assert!(
@@ -85,7 +110,8 @@ async fn peer_reconnect_resends_local_state() {
     daemon.refresh(&repo_path).await.expect("refresh");
 
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    let sender: Arc<dyn PeerSender> = Arc::new(CapturePeerSender { sent: Arc::clone(&sent) });
+    let notify = Arc::new(Notify::new());
+    let sender: Arc<dyn PeerSender> = Arc::new(NotifyPeerSender { sent: Arc::clone(&sent), notify: Arc::clone(&notify) });
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(host_a.clone())));
     let gen1 = {
         let mut pm = peer_manager.lock().await;
@@ -94,20 +120,23 @@ async fn peer_reconnect_resends_local_state() {
 
     let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
+    // First connection
     peer_connected_tx.send(PeerConnectedNotice { peer: host_b.clone(), generation: gen1 }).expect("send notice 1");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_messages(&sent, &notify, 2).await;
 
     let first_count = sent.lock().expect("lock").len();
     assert!(first_count > 0, "first connect should have sent messages");
 
+    // Disconnect + reconnect
     let gen2 = {
         let mut pm = peer_manager.lock().await;
         pm.disconnect_peer(&host_b, gen1);
         ensure_test_connection_generation(&mut pm, &host_b, || Arc::clone(&sender))
     };
 
+    // Second connection — expect at least first_count + 2 more messages
     peer_connected_tx.send(PeerConnectedNotice { peer: host_b.clone(), generation: gen2 }).expect("send notice 2");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_messages(&sent, &notify, first_count + 2).await;
 
     let total_count = sent.lock().expect("lock").len();
     assert!(total_count > first_count, "reconnect should resend local state (first: {first_count}, total: {total_count})");

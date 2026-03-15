@@ -75,7 +75,11 @@ type PendingRemoteCancelMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), 
 /// Notification sent from connection sites to the outbound task when a
 /// peer connects or reconnects. The outbound task responds by sending
 /// current local state for all repos to the specific peer.
-pub struct PeerConnectedNotice {
+///
+/// Visibility is promoted to `pub` with the `test-support` feature so
+/// integration tests can construct notices to drive the outbound task.
+#[cfg_attr(feature = "test-support", visibility::make(pub))]
+pub(crate) struct PeerConnectedNotice {
     pub peer: HostName,
     pub generation: u64,
 }
@@ -137,7 +141,7 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
 /// senders (e.g. CapturePeerSender). Passes `None` for `peer_data_rx` to skip
 /// the inbound connection task — tests drive the outbound task via the returned
 /// `PeerConnectedNotice` sender.
-#[doc(hidden)]
+#[cfg(feature = "test-support")]
 pub fn spawn_test_peer_networking(
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
