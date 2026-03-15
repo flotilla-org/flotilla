@@ -91,6 +91,7 @@ pub struct HostListResponse {
 pub struct HostListEntry {
     pub host: HostName,
     pub is_local: bool,
+    /// `true` only for non-local hosts that appear in `hosts.toml`.
     pub configured: bool,
     pub connection_status: PeerConnectionState,
     /// Indicates whether `get_host_status` would be able to return a
@@ -104,6 +105,7 @@ pub struct HostListEntry {
 pub struct HostStatusResponse {
     pub host: HostName,
     pub is_local: bool,
+    /// `true` only for non-local hosts that appear in `hosts.toml`.
     pub configured: bool,
     pub connection_status: PeerConnectionState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +118,7 @@ pub struct HostStatusResponse {
 pub struct HostProvidersResponse {
     pub host: HostName,
     pub is_local: bool,
+    /// `true` only for non-local hosts that appear in `hosts.toml`.
     pub configured: bool,
     pub connection_status: PeerConnectionState,
     pub summary: HostSummary,

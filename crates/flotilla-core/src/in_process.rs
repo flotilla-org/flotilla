@@ -682,11 +682,11 @@ impl InProcessDaemon {
 
     async fn remote_host_counts(&self) -> HashMap<HostName, crate::host_queries::HostCounts> {
         let peer_providers = self.peer_providers.read().await;
-        let mut counts = HashMap::new();
+        let mut counts: HashMap<HostName, crate::host_queries::HostCounts> = HashMap::new();
 
         for peers in peer_providers.values() {
             for (host, providers) in peers {
-                let entry = counts.entry(host.clone()).or_insert_with(crate::host_queries::HostCounts::default);
+                let entry = counts.entry(host.clone()).or_default();
                 entry.repo_count += 1;
                 entry.work_item_count += crate::data::correlate(providers).0.len();
             }

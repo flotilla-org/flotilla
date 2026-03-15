@@ -175,6 +175,8 @@ where
     let Some(subcommand) = args[subcommand_idx].to_str() else {
         return args;
     };
+    // Only `repo` and `host` need normalization because they capture a trailing
+    // variadic positional. `topology --json` parses directly as a named flag.
     if !matches!(subcommand, "repo" | "host") || subcommand_idx + 1 >= args.len() - 1 {
         return args;
     }
@@ -190,7 +192,12 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
         match args[idx].to_str() {
             Some("--embedded") => idx += 1,
             Some("--repo-root") | Some("--config-dir") | Some("--socket") => idx += 2,
-            Some(value) if value.starts_with("--repo-root=") || value.starts_with("--config-dir=") || value.starts_with("--socket=") => {
+            Some(value)
+                if value.starts_with("--embedded=")
+                    || value.starts_with("--repo-root=")
+                    || value.starts_with("--config-dir=")
+                    || value.starts_with("--socket=") =>
+            {
                 idx += 1;
             }
             Some(_) => return Some(idx),
