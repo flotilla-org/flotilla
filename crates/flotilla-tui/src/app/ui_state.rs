@@ -66,9 +66,36 @@ pub enum UiMode {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusTarget {
+    WorkItemTable,
+    EventLog,
+    HelpText,
+    ActionMenu,
+    BranchInput,
+    IssueSearchInput,
+    FilePickerList,
+    DeleteConfirmDialog,
+    CloseConfirmDialog,
+}
+
 impl UiMode {
     pub fn is_config(&self) -> bool {
         matches!(self, UiMode::Config)
+    }
+
+    pub fn focus_target(&self) -> FocusTarget {
+        match self {
+            UiMode::Normal => FocusTarget::WorkItemTable,
+            UiMode::Help => FocusTarget::HelpText,
+            UiMode::Config => FocusTarget::EventLog,
+            UiMode::ActionMenu { .. } => FocusTarget::ActionMenu,
+            UiMode::BranchInput { .. } => FocusTarget::BranchInput,
+            UiMode::FilePicker { .. } => FocusTarget::FilePickerList,
+            UiMode::DeleteConfirm { .. } => FocusTarget::DeleteConfirmDialog,
+            UiMode::CloseConfirm { .. } => FocusTarget::CloseConfirmDialog,
+            UiMode::IssueSearch { .. } => FocusTarget::IssueSearchInput,
+        }
     }
 }
 
@@ -350,6 +377,48 @@ mod tests {
     #[test]
     fn ui_mode_default_is_normal() {
         assert!(matches!(UiMode::default(), UiMode::Normal));
+    }
+
+    #[test]
+    fn focus_target_maps_every_mode_to_expected_widget() {
+        let cases: Vec<(UiMode, FocusTarget)> = vec![
+            (UiMode::Normal, FocusTarget::WorkItemTable),
+            (UiMode::Help, FocusTarget::HelpText),
+            (UiMode::Config, FocusTarget::EventLog),
+            (UiMode::ActionMenu { items: vec![], index: 0 }, FocusTarget::ActionMenu),
+            (
+                UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] },
+                FocusTarget::BranchInput,
+            ),
+            (UiMode::FilePicker { input: Input::default(), dir_entries: vec![], selected: 0 }, FocusTarget::FilePickerList),
+            (
+                UiMode::DeleteConfirm {
+                    info: None,
+                    loading: false,
+                    terminal_keys: vec![],
+                    identity: WorkItemIdentity::Session("test".into()),
+                },
+                FocusTarget::DeleteConfirmDialog,
+            ),
+            (
+                UiMode::CloseConfirm {
+                    id: "42".into(),
+                    title: "test".into(),
+                    identity: WorkItemIdentity::Session("test".into()),
+                    command: flotilla_protocol::Command {
+                        host: None,
+                        context_repo: None,
+                        action: flotilla_protocol::CommandAction::CloseChangeRequest { id: "42".into() },
+                    },
+                },
+                FocusTarget::CloseConfirmDialog,
+            ),
+            (UiMode::IssueSearch { input: Input::default() }, FocusTarget::IssueSearchInput),
+        ];
+
+        for (mode, expected) in cases {
+            assert_eq!(mode.focus_target(), expected);
+        }
     }
 
     // ── UiState::new tests ────────────────────────────────────────────
