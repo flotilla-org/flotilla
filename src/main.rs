@@ -433,6 +433,8 @@ fn parse_host_command(args: &[String]) -> Result<HostCommand, String> {
         return Err("missing host command".into());
     }
 
+    // `host list` is the only bare query form, so a peer literally named
+    // "list" cannot currently be addressed without additional syntax.
     if args.len() == 1 && args[0] == "list" {
         return Ok(HostCommand::List);
     }

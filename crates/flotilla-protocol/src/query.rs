@@ -93,6 +93,8 @@ pub struct HostListEntry {
     pub is_local: bool,
     pub configured: bool,
     pub connection_status: PeerConnectionState,
+    /// Indicates whether `get_host_status` would be able to return a
+    /// non-`None` summary for this host.
     pub has_summary: bool,
     pub repo_count: usize,
     pub work_item_count: usize,

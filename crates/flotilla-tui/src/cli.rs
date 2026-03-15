@@ -65,6 +65,10 @@ fn format_connection_status(status: &PeerConnectionState) -> &'static str {
     }
 }
 
+fn inventory_is_empty(inventory: &flotilla_protocol::ToolInventory) -> bool {
+    inventory.binaries.is_empty() && inventory.sockets.is_empty() && inventory.auth.is_empty() && inventory.env_vars.is_empty()
+}
+
 fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> String {
     if response.hosts.is_empty() {
         return "No hosts known.\n".into();
@@ -121,11 +125,7 @@ fn format_host_providers_human(response: &HostProvidersResponse) -> String {
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
 
     out.push_str("\nInventory:\n");
-    if response.summary.inventory.binaries.is_empty()
-        && response.summary.inventory.sockets.is_empty()
-        && response.summary.inventory.auth.is_empty()
-        && response.summary.inventory.env_vars.is_empty()
-    {
+    if inventory_is_empty(&response.summary.inventory) {
         out.push_str("  No inventory facts.\n");
     } else {
         for fact in &response.summary.inventory.binaries {

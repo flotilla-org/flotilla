@@ -641,6 +641,8 @@ impl InProcessDaemon {
     }
 
     pub async fn set_topology_routes(&self, mut routes: Vec<TopologyRoute>) {
+        // Normalize ordering defensively so query output stays stable even if a
+        // future caller bypasses PeerManager's already-sorted route snapshot.
         routes.sort_by(|a, b| a.target.cmp(&b.target));
         let mut stored = self.topology_routes.write().await;
         *stored = routes;

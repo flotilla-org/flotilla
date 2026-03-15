@@ -114,6 +114,10 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
 }
 
 async fn sync_peer_query_state(peer_manager: &Arc<Mutex<PeerManager>>, daemon: &Arc<InProcessDaemon>) {
+    // Keep the PeerManager lock scoped to this snapshot read. Several call sites
+    // invoke this immediately after mutating PeerManager state; holding the lock
+    // across the daemon writes would deadlock if a future refactor re-entered
+    // PeerManager while mirroring query state.
     let (configured, summaries, routes) = {
         let pm = peer_manager.lock().await;
         (pm.configured_peer_names(), pm.get_peer_host_summaries().clone(), pm.topology_routes())
