@@ -394,13 +394,16 @@ impl App {
                     // go through the PrepareTerminal → TerminalPrepared flow instead.
                     let is_local = self.model.my_host.as_ref().is_some_and(|my| *my == host);
                     let auto_workspace = match (&result, is_local) {
-                        (CommandResult::CheckoutCreated { path, .. }, true) => Some(path.clone()),
+                        (CommandResult::CheckoutCreated { branch, path }, true) => Some((path.clone(), branch.clone())),
                         _ => None,
                     };
                     executor::handle_result(result, self);
-                    if let Some(checkout_path) = auto_workspace {
+                    if let Some((checkout_path, label)) = auto_workspace {
                         self.proto_commands.push(
-                            self.repo_command_for_identity(repo_identity, CommandAction::CreateWorkspaceForCheckout { checkout_path }),
+                            self.repo_command_for_identity(repo_identity, CommandAction::CreateWorkspaceForCheckout {
+                                checkout_path,
+                                label,
+                            }),
                         );
                     }
 
@@ -1507,7 +1510,7 @@ mod tests {
         let (cmd, _) = app.proto_commands.take_next().expect("should queue workspace creation");
         assert_eq!(cmd.context_repo, Some(RepoSelector::Identity(repo_identity)));
         match cmd.action {
-            CommandAction::CreateWorkspaceForCheckout { checkout_path: p } => assert_eq!(p, checkout_path),
+            CommandAction::CreateWorkspaceForCheckout { checkout_path: p, .. } => assert_eq!(p, checkout_path),
             other => panic!("expected CreateWorkspaceForCheckout, got {other:?}"),
         }
     }

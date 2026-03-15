@@ -46,6 +46,7 @@ pub struct Command {
 pub enum CommandAction {
     CreateWorkspaceForCheckout {
         checkout_path: PathBuf,
+        label: String,
     },
     CreateWorkspaceFromPreparedTerminal {
         target_host: crate::HostName,
@@ -281,7 +282,7 @@ mod tests {
             Command {
                 host: None,
                 context_repo: Some(RepoSelector::Identity(repo_identity())),
-                action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repo/wt") },
+                action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repo/wt"), label: "feat-x".into() },
             },
             Command { host: None, context_repo: None, action: CommandAction::SelectWorkspace { ws_ref: "ws://1".into() } },
             Command {
@@ -447,7 +448,7 @@ mod tests {
             Command {
                 host: None,
                 context_repo: None,
-                action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/tmp") },
+                action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/tmp"), label: "ws".into() },
             },
             Command {
                 host: Some(HostName::new("desktop")),

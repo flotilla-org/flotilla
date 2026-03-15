@@ -1597,7 +1597,7 @@ mod tests {
         app.action_enter();
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command { action: CommandAction::CreateWorkspaceForCheckout { checkout_path }, .. } => {
+            Command { action: CommandAction::CreateWorkspaceForCheckout { checkout_path, .. }, .. } => {
                 assert_eq!(checkout_path, PathBuf::from("/tmp/a"));
             }
             other => panic!("expected CreateWorkspaceForCheckout, got {:?}", other),

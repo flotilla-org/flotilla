@@ -100,11 +100,13 @@ impl Intent {
                 item.workspace_refs.first().map(|ws_ref| app.repo_command(CommandAction::SelectWorkspace { ws_ref: ws_ref.clone() }))
             }
             Intent::CreateWorkspace => item.checkout_key().map(|p| {
+                let label =
+                    item.branch.clone().unwrap_or_else(|| p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
                 let command = app.item_host_repo_command(CommandAction::PrepareTerminalForCheckout { checkout_path: p.path.clone() }, item);
                 if command.host.is_some() {
                     command
                 } else {
-                    app.repo_command(CommandAction::CreateWorkspaceForCheckout { checkout_path: p.path.clone() })
+                    app.repo_command(CommandAction::CreateWorkspaceForCheckout { checkout_path: p.path.clone(), label })
                 }
             }),
             Intent::RemoveCheckout => {
@@ -586,9 +588,10 @@ mod tests {
         let cmd = Intent::CreateWorkspace.resolve(&item, &app);
         assert!(cmd.is_some());
         match cmd.unwrap() {
-            Command { host, action: CommandAction::CreateWorkspaceForCheckout { checkout_path }, .. } => {
+            Command { host, action: CommandAction::CreateWorkspaceForCheckout { checkout_path, label }, .. } => {
                 assert_eq!(host, None);
-                assert_eq!(checkout_path, PathBuf::from("/tmp/feat-x"))
+                assert_eq!(checkout_path, PathBuf::from("/tmp/feat-x"));
+                assert_eq!(label, "feat/x");
             }
             other => panic!("expected CreateWorkspaceForCheckout, got {other:?}"),
         }

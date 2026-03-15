@@ -41,8 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-03-12
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: actions/cache@v4
@@ -52,15 +53,15 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-coverage-nightly-2026-03-12-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-coverage-
+            ${{ runner.os }}-cargo-coverage-nightly-2026-03-12-
       - name: Generate coverage report
         run: |
           # NOTE: --branch crashes llvm-cov (SIGSEGV from --show-mcdc in nightly LLVM).
           # Revisit when upstream is fixed.
-          cargo +nightly llvm-cov --workspace --html --locked --remap-path-prefix
-          cargo +nightly llvm-cov --workspace --json --no-run --locked --output-path target/llvm-cov/html/coverage.json
+          cargo +nightly-2026-03-12 llvm-cov --workspace --html --locked --remap-path-prefix
+          cargo +nightly-2026-03-12 llvm-cov --workspace --json --no-run --locked --output-path target/llvm-cov/html/coverage.json
       - name: Add badge JSON
         run: |
           PERCENT=$(jq -r '.data[0].totals.lines.percent | floor' target/llvm-cov/html/coverage.json)

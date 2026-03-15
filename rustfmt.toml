@@ -1,6 +1,7 @@
 # Wider lines, fewer chain/arg explosions.
-# Requires nightly rustfmt: `cargo +nightly fmt`
-# CI uses nightly for fmt; stable silently ignores the unstable keys.
+# Requires nightly rustfmt: `cargo +nightly-2026-03-12 fmt`
+# All nightly usage is pinned to nightly-2026-03-12 (CI, coverage, Dylint).
+# Stable silently ignores the unstable keys below.
 
 max_width = 140
 # "Max" sets all sub-widths (chain, fn_call, attr, array, struct_lit,

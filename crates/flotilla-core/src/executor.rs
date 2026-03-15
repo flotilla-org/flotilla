@@ -455,26 +455,21 @@ pub async fn execute(
     local_host: &HostName,
 ) -> CommandResult {
     match action {
-        CommandAction::CreateWorkspaceForCheckout { checkout_path } => {
-            let host_key = HostPath::new(local_host.clone(), checkout_path.clone());
-            if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
-                info!(branch = %co.branch, "entering workspace");
-                if let Some((_, ws_mgr)) = &registry.workspace_manager {
-                    if select_existing_workspace(ws_mgr.as_ref(), &checkout_path).await {
-                        return CommandResult::Ok;
-                    }
-                    let mut config = workspace_config(&repo.root, &co.branch, &checkout_path, "claude", config_base);
-                    if let Some((_, tp)) = &registry.terminal_pool {
-                        resolve_terminal_pool(&mut config, tp.as_ref()).await;
-                    }
-                    if let Err(e) = ws_mgr.create_workspace(&config).await {
-                        return CommandResult::Error { message: e };
-                    }
+        CommandAction::CreateWorkspaceForCheckout { checkout_path, label } => {
+            info!(%label, "entering workspace");
+            if let Some((_, ws_mgr)) = &registry.workspace_manager {
+                if select_existing_workspace(ws_mgr.as_ref(), &checkout_path).await {
+                    return CommandResult::Ok;
                 }
-                CommandResult::Ok
-            } else {
-                CommandResult::Error { message: format!("checkout not found: {}", checkout_path.display()) }
+                let mut config = workspace_config(&repo.root, &label, &checkout_path, "claude", config_base);
+                if let Some((_, tp)) = &registry.terminal_pool {
+                    resolve_terminal_pool(&mut config, tp.as_ref()).await;
+                }
+                if let Err(e) = ws_mgr.create_workspace(&config).await {
+                    return CommandResult::Error { message: e };
+                }
             }
+            CommandResult::Ok
         }
 
         CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, commands } => {
@@ -1428,12 +1423,13 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_for_checkout_success_without_ws_manager() {
         let registry = empty_registry();
-        let mut data = empty_data();
+        let data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
-        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
 
-        let result = run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
+        let result =
+            run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path, label: "feat".into() }, &registry, &data, &runner)
+                .await;
 
         assert_ok(result);
     }
@@ -1456,43 +1452,28 @@ mod tests {
     async fn create_workspace_for_checkout_success_with_ws_manager() {
         let mut registry = empty_registry();
         registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::succeeding())));
-        let mut data = empty_data();
+        let data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
-        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
 
-        let result = run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
+        let result =
+            run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path, label: "feat".into() }, &registry, &data, &runner)
+                .await;
 
         assert_ok(result);
-    }
-
-    #[tokio::test]
-    async fn create_workspace_for_checkout_not_found() {
-        let registry = empty_registry();
-        let data = empty_data();
-        let runner = runner_ok();
-
-        let result = run_execute(
-            CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/nonexistent") },
-            &registry,
-            &data,
-            &runner,
-        )
-        .await;
-
-        assert_error_contains(result, "checkout not found");
     }
 
     #[tokio::test]
     async fn create_workspace_for_checkout_ws_manager_fails() {
         let mut registry = empty_registry();
         registry.workspace_manager = Some((desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws creation failed"))));
-        let mut data = empty_data();
+        let data = empty_data();
         let path = PathBuf::from("/repo/wt-feat");
-        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
 
-        let result = run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path }, &registry, &data, &runner).await;
+        let result =
+            run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path: path, label: "feat".into() }, &registry, &data, &runner)
+                .await;
 
         assert_error_eq(result, "ws creation failed");
     }
@@ -1621,7 +1602,8 @@ mod tests {
         data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
         let runner = runner_ok();
 
-        let result = run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path }, &registry, &data, &runner).await;
+        let result =
+            run_execute(CommandAction::CreateWorkspaceForCheckout { checkout_path, label: "feat".into() }, &registry, &data, &runner).await;
 
         assert_ok(result);
         let calls = ws_mgr.calls.lock().await;

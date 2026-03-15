@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -10,6 +10,21 @@ use crate::{
     config::CheckoutsConfig,
     providers::{run, types::*, CommandRunner, TaskId},
 };
+
+/// Resolve `.` and `..` components in-place without touching the filesystem.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 pub struct GitCheckoutManager {
     config: CheckoutsConfig,
@@ -25,6 +40,10 @@ impl GitCheckoutManager {
     }
 
     /// Render the worktree path template for a given repo and branch.
+    ///
+    /// The result is normalized to resolve `.` and `..` components so that the
+    /// returned path matches what `git worktree list` reports (which always
+    /// returns canonical absolute paths).
     fn render_worktree_path(&self, repo_root: &Path, branch: &str) -> Result<PathBuf, String> {
         let repo_name = repo_root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".to_string());
 
@@ -38,7 +57,8 @@ impl GitCheckoutManager {
             .map_err(|e| format!("failed to render worktree path: {e}"))?;
 
         let path = PathBuf::from(rendered.trim());
-        Ok(if path.is_absolute() { path } else { repo_root.join(&path) })
+        let absolute = if path.is_absolute() { path } else { repo_root.join(&path) };
+        Ok(normalize_path(&absolute))
     }
 
     /// Parse `git worktree list --porcelain` output into (path, branch) tuples.
@@ -326,7 +346,7 @@ branch refs/heads/feature
         let repo = Path::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(repo, "feature/my-branch").unwrap();
-        assert_eq!(path, PathBuf::from("/home/user/myrepo/../myrepo.feature-my-branch"));
+        assert_eq!(path, PathBuf::from("/home/user/myrepo.feature-my-branch"));
     }
 
     #[test]
