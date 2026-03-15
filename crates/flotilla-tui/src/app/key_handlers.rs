@@ -1201,10 +1201,10 @@ mod tests {
     #[test]
     fn normal_h_cycles_target_host_through_known_peers() {
         let mut app = stub_app();
-        app.model.peer_hosts = vec![
-            PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected },
-            PeerHostStatus { name: HostName::new("beta"), status: PeerStatus::Connected },
-        ];
+        app.model.peer_hosts = vec![PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected }, PeerHostStatus {
+            name: HostName::new("beta"),
+            status: PeerStatus::Connected,
+        }];
 
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.ui.target_host, Some(HostName::new("alpha")));
