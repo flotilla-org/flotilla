@@ -5,7 +5,10 @@ use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
-use super::{ui_state::PendingActionContext, App, BranchInputKind, ClearDispatch, Intent, UiMode};
+use super::{
+    ui_state::{FocusTarget, PendingActionContext},
+    App, BranchInputKind, ClearDispatch, Intent, UiMode,
+};
 use crate::status_bar::StatusBarAction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,18 +40,28 @@ impl App {
     // ── Key handling ──
 
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let is_text_entry_mode = matches!(
-            self.ui.mode,
-            UiMode::BranchInput { kind: BranchInputKind::Manual, .. } | UiMode::IssueSearch { .. } | UiMode::FilePicker { .. }
-        );
-        let in_work_item_table = matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable);
+        let focus = self.ui.mode.focus_target();
+        let in_work_item_table = matches!(focus, FocusTarget::WorkItemTable);
+        let allows_tab_switch = matches!(focus, FocusTarget::WorkItemTable | FocusTarget::EventLog);
 
-        if is_text_entry_mode {
-            return match key.code {
-                KeyCode::Esc => Some(Action::Dismiss),
-                KeyCode::Enter => Some(Action::Confirm),
-                _ => None,
-            };
+        match self.ui.mode {
+            UiMode::BranchInput { kind: BranchInputKind::Manual, .. } | UiMode::IssueSearch { .. } => {
+                return match key.code {
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter => Some(Action::Confirm),
+                    _ => None,
+                };
+            }
+            UiMode::FilePicker { .. } => {
+                return match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
+                    KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter => Some(Action::Confirm),
+                    _ => None,
+                };
+            }
+            _ => {}
         }
 
         match key.code {
@@ -58,16 +71,14 @@ impl App {
             KeyCode::Esc => Some(Action::Dismiss),
             KeyCode::Char('q') => match self.ui.mode {
                 UiMode::Normal => Some(Action::Quit),
-                UiMode::Help
-                | UiMode::Config
-                | UiMode::ActionMenu { .. }
-                | UiMode::DeleteConfirm { .. }
-                | UiMode::CloseConfirm { .. } => Some(Action::Dismiss),
+                UiMode::Help | UiMode::Config | UiMode::ActionMenu { .. } | UiMode::DeleteConfirm { .. } | UiMode::CloseConfirm { .. } => {
+                    Some(Action::Dismiss)
+                }
                 UiMode::BranchInput { .. } | UiMode::IssueSearch { .. } | UiMode::FilePicker { .. } => None,
             },
             KeyCode::Char('r') if in_work_item_table => Some(Action::Refresh),
-            KeyCode::Char('[') => Some(Action::PrevTab),
-            KeyCode::Char(']') => Some(Action::NextTab),
+            KeyCode::Char('[') if allows_tab_switch => Some(Action::PrevTab),
+            KeyCode::Char(']') if allows_tab_switch => Some(Action::NextTab),
             KeyCode::Char('{') if in_work_item_table => Some(Action::MoveTabLeft),
             KeyCode::Char('}') if in_work_item_table => Some(Action::MoveTabRight),
             KeyCode::Char('?') => Some(Action::ToggleHelp),
@@ -89,8 +100,8 @@ impl App {
     fn dispatch_action(&mut self, action: Action) {
         match action {
             Action::SelectNext => match self.ui.mode.focus_target() {
-                super::ui_state::FocusTarget::WorkItemTable => self.select_next(),
-                super::ui_state::FocusTarget::EventLog => {
+                FocusTarget::WorkItemTable => self.select_next(),
+                FocusTarget::EventLog => {
                     if let Some(sel) = self.ui.event_log.selected {
                         if sel + 1 < self.ui.event_log.count {
                             self.ui.event_log.selected = Some(sel + 1);
@@ -99,61 +110,60 @@ impl App {
                         self.ui.event_log.selected = Some(self.ui.event_log.count - 1);
                     }
                 }
-                super::ui_state::FocusTarget::HelpText => {
+                FocusTarget::HelpText => {
                     self.ui.help_scroll = self.ui.help_scroll.saturating_add(1);
                 }
-                super::ui_state::FocusTarget::ActionMenu => {
+                FocusTarget::ActionMenu => {
                     if let UiMode::ActionMenu { ref items, ref mut index } = self.ui.mode {
                         if *index < items.len().saturating_sub(1) {
                             *index += 1;
                         }
                     }
                 }
-                super::ui_state::FocusTarget::FilePickerList => self.file_picker_select_next(),
-                super::ui_state::FocusTarget::BranchInput
-                | super::ui_state::FocusTarget::IssueSearchInput
-                | super::ui_state::FocusTarget::DeleteConfirmDialog
-                | super::ui_state::FocusTarget::CloseConfirmDialog => {}
+                FocusTarget::FilePickerList => self.file_picker_select_next(),
+                FocusTarget::BranchInput
+                | FocusTarget::IssueSearchInput
+                | FocusTarget::DeleteConfirmDialog
+                | FocusTarget::CloseConfirmDialog => {}
             },
             Action::SelectPrev => match self.ui.mode.focus_target() {
-                super::ui_state::FocusTarget::WorkItemTable => self.select_prev(),
-                super::ui_state::FocusTarget::EventLog => {
+                FocusTarget::WorkItemTable => self.select_prev(),
+                FocusTarget::EventLog => {
                     if let Some(sel) = self.ui.event_log.selected {
                         if sel > 0 {
                             self.ui.event_log.selected = Some(sel - 1);
                         }
                     }
                 }
-                super::ui_state::FocusTarget::HelpText => {
+                FocusTarget::HelpText => {
                     self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1);
                 }
-                super::ui_state::FocusTarget::ActionMenu => {
+                FocusTarget::ActionMenu => {
                     if let UiMode::ActionMenu { ref mut index, .. } = self.ui.mode {
                         *index = index.saturating_sub(1);
                     }
                 }
-                super::ui_state::FocusTarget::FilePickerList => self.file_picker_select_prev(),
-                super::ui_state::FocusTarget::BranchInput
-                | super::ui_state::FocusTarget::IssueSearchInput
-                | super::ui_state::FocusTarget::DeleteConfirmDialog
-                | super::ui_state::FocusTarget::CloseConfirmDialog => {}
+                FocusTarget::FilePickerList => self.file_picker_select_prev(),
+                FocusTarget::BranchInput
+                | FocusTarget::IssueSearchInput
+                | FocusTarget::DeleteConfirmDialog
+                | FocusTarget::CloseConfirmDialog => {}
             },
             Action::Confirm => match self.ui.mode.focus_target() {
-                super::ui_state::FocusTarget::WorkItemTable => self.action_enter(),
-                super::ui_state::FocusTarget::ActionMenu => {
+                FocusTarget::WorkItemTable => self.action_enter(),
+                FocusTarget::ActionMenu => {
                     self.execute_menu_action();
                     if matches!(self.ui.mode, UiMode::ActionMenu { .. }) {
                         self.ui.mode = UiMode::Normal;
                     }
                 }
-                super::ui_state::FocusTarget::BranchInput => {
+                FocusTarget::BranchInput => {
                     if !matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }) {
-                        let (branch, issue_ids) =
-                            if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
-                                (input.value().to_string(), std::mem::take(pending_issue_ids))
-                            } else {
-                                return;
-                            };
+                        let (branch, issue_ids) = if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
+                            (input.value().to_string(), std::mem::take(pending_issue_ids))
+                        } else {
+                            return;
+                        };
                         if !branch.is_empty() {
                             self.proto_commands.push(self.targeted_command(CommandAction::Checkout {
                                 repo: flotilla_protocol::RepoSelector::Identity(self.model.active_repo_identity().clone()),
@@ -164,7 +174,7 @@ impl App {
                         self.ui.mode = UiMode::Normal;
                     }
                 }
-                super::ui_state::FocusTarget::IssueSearchInput => {
+                FocusTarget::IssueSearchInput => {
                     let query = if let UiMode::IssueSearch { ref input } = self.ui.mode {
                         input.value().to_string()
                     } else {
@@ -177,8 +187,8 @@ impl App {
                     }
                     self.ui.mode = UiMode::Normal;
                 }
-                super::ui_state::FocusTarget::FilePickerList => self.activate_dir_entry(),
-                super::ui_state::FocusTarget::DeleteConfirmDialog => {
+                FocusTarget::FilePickerList => self.activate_dir_entry(),
+                FocusTarget::DeleteConfirmDialog => {
                     let loading = matches!(self.ui.mode, UiMode::DeleteConfirm { loading: true, .. });
                     if !loading {
                         if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, ref identity, .. } = self.ui.mode {
@@ -198,7 +208,7 @@ impl App {
                         self.ui.mode = UiMode::Normal;
                     }
                 }
-                super::ui_state::FocusTarget::CloseConfirmDialog => {
+                FocusTarget::CloseConfirmDialog => {
                     if let UiMode::CloseConfirm { ref id, ref identity, ref command, .. } = self.ui.mode {
                         let ctx = PendingActionContext {
                             identity: identity.clone(),
@@ -209,9 +219,9 @@ impl App {
                     }
                     self.ui.mode = UiMode::Normal;
                 }
-                super::ui_state::FocusTarget::HelpText | super::ui_state::FocusTarget::EventLog => {}
+                FocusTarget::HelpText | FocusTarget::EventLog => {}
             },
-            Action::Refresh => {}
+            Action::Refresh => {} // handled in the main event loop
             Action::PrevTab => self.prev_tab(),
             Action::NextTab => self.next_tab(),
             Action::MoveTabLeft => {
@@ -233,55 +243,55 @@ impl App {
                 _ => {}
             },
             Action::ToggleMultiSelect => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.toggle_multi_select();
                 }
             }
             Action::ToggleProviders => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     let sp = self.active_ui().show_providers;
                     self.active_ui_mut().show_providers = !sp;
                 }
             }
             Action::ToggleDebug => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.ui.show_debug = !self.ui.show_debug;
                 }
             }
             Action::CycleHost => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     let peer_hosts = self.model.peer_hosts.iter().map(|peer| peer.name.clone()).collect::<Vec<_>>();
                     self.ui.cycle_target_host(&peer_hosts);
                 }
             }
             Action::CycleLayout => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.ui.cycle_layout();
                     self.persist_layout();
                 }
             }
             Action::OpenActionMenu => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.open_action_menu();
                 }
             }
             Action::OpenBranchInput => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.enter_branch_input(BranchInputKind::Manual);
                 }
             }
             Action::OpenIssueSearch => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.ui.mode = UiMode::IssueSearch { input: Input::default() };
                 }
             }
             Action::OpenFilePicker => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.open_file_picker_from_active_repo_parent();
                 }
             }
             Action::Dismiss => match self.ui.mode.focus_target() {
-                super::ui_state::FocusTarget::WorkItemTable => {
+                FocusTarget::WorkItemTable => {
                     // Cancellation takes priority over other dismiss actions while a command is running.
                     if let Some(&command_id) = self.in_flight.keys().next() {
                         self.pending_cancel = Some(command_id);
@@ -295,21 +305,21 @@ impl App {
                         self.should_quit = true;
                     }
                 }
-                super::ui_state::FocusTarget::EventLog => {
+                FocusTarget::EventLog => {
                     self.ui.mode = UiMode::Normal;
                 }
-                super::ui_state::FocusTarget::HelpText => {
+                FocusTarget::HelpText => {
                     self.ui.mode = UiMode::Normal;
                     self.ui.help_scroll = 0;
                 }
-                super::ui_state::FocusTarget::ActionMenu
-                | super::ui_state::FocusTarget::BranchInput
-                | super::ui_state::FocusTarget::FilePickerList
-                | super::ui_state::FocusTarget::DeleteConfirmDialog
-                | super::ui_state::FocusTarget::CloseConfirmDialog => {
+                FocusTarget::ActionMenu
+                | FocusTarget::BranchInput
+                | FocusTarget::FilePickerList
+                | FocusTarget::DeleteConfirmDialog
+                | FocusTarget::CloseConfirmDialog => {
                     self.ui.mode = UiMode::Normal;
                 }
-                super::ui_state::FocusTarget::IssueSearchInput => {
+                FocusTarget::IssueSearchInput => {
                     self.clear_active_issue_search(ClearDispatch::Always);
                     self.ui.mode = UiMode::Normal;
                 }
@@ -318,7 +328,7 @@ impl App {
                 self.should_quit = true;
             }
             Action::Dispatch(intent) => {
-                if matches!(self.ui.mode.focus_target(), super::ui_state::FocusTarget::WorkItemTable) {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.dispatch_if_available(intent);
                 }
             }
@@ -605,55 +615,14 @@ impl App {
             return;
         }
 
-        if key.code == KeyCode::Esc {
-            self.ui.mode = UiMode::Normal;
-            return;
-        }
-        if key.code == KeyCode::Enter {
-            let (branch, issue_ids) = if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
-                (input.value().to_string(), std::mem::take(pending_issue_ids))
-            } else {
-                return;
-            };
-            if !branch.is_empty() {
-                self.proto_commands.push(self.targeted_command(CommandAction::Checkout {
-                    repo: flotilla_protocol::RepoSelector::Identity(self.model.active_repo_identity().clone()),
-                    target: CheckoutTarget::FreshBranch(branch),
-                    issue_ids,
-                }));
-            }
-            self.ui.mode = UiMode::Normal;
-            return;
-        }
         if let UiMode::BranchInput { ref mut input, .. } = self.ui.mode {
             input.handle_event(&crossterm::event::Event::Key(key));
         }
     }
 
     fn handle_issue_search_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.clear_active_issue_search(ClearDispatch::Always);
-                self.ui.mode = UiMode::Normal;
-            }
-            KeyCode::Enter => {
-                let query = if let UiMode::IssueSearch { ref input } = self.ui.mode {
-                    input.value().to_string()
-                } else {
-                    return;
-                };
-                if !query.is_empty() {
-                    let repo = self.model.active_repo_root().clone();
-                    self.proto_commands.push(self.command(CommandAction::SearchIssues { repo, query: query.clone() }));
-                    self.active_ui_mut().active_search_query = Some(query);
-                }
-                self.ui.mode = UiMode::Normal;
-            }
-            _ => {
-                if let UiMode::IssueSearch { ref mut input } = self.ui.mode {
-                    input.handle_event(&crossterm::event::Event::Key(key));
-                }
-            }
+        if let UiMode::IssueSearch { ref mut input } = self.ui.mode {
+            input.handle_event(&crossterm::event::Event::Key(key));
         }
     }
 
@@ -732,10 +701,15 @@ mod tests {
     use flotilla_protocol::{CheckoutStatus, Command, HostName, HostPath, WorkItemIdentity};
     use ratatui::layout::Rect;
 
-    use super::{super::{DirEntry, RepoViewLayout}, *};
+    use super::{
+        super::{DirEntry, RepoViewLayout},
+        *,
+    };
     use crate::{
         app::{
-            test_support::{checkout_item, dir_entry, enter_file_picker, key, setup_selectable_table as setup_table, stub_app},
+            test_support::{
+                checkout_item, dir_entry, enter_file_picker, key, setup_selectable_table as setup_table, stub_app, stub_app_with_repos,
+            },
             PeerHostStatus, PeerStatus,
         },
         status_bar::{StatusBarAction, StatusBarTarget},
@@ -862,11 +836,7 @@ mod tests {
     #[test]
     fn dispatch_action_confirm_submits_branch_input() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput {
-            input: Input::from("feature/test"),
-            kind: BranchInputKind::Manual,
-            pending_issue_ids: vec![],
-        };
+        app.ui.mode = UiMode::BranchInput { input: Input::from("feature/test"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
 
         app.dispatch_action(Action::Confirm);
 
@@ -902,8 +872,8 @@ mod tests {
     fn dispatch_action_confirm_activates_file_picker_selection() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let repo_dir = tmp.path().join("my-repo");
-        std::fs::create_dir(&repo_dir).unwrap();
-        std::fs::create_dir(repo_dir.join(".git")).unwrap();
+        std::fs::create_dir(&repo_dir).expect("create repo dir");
+        std::fs::create_dir(repo_dir.join(".git")).expect("create git dir");
 
         let mut app = stub_app();
         let parent_path = format!("{}/", tmp.path().to_string_lossy());
@@ -916,7 +886,7 @@ mod tests {
         let (cmd, _) = app.proto_commands.take_next().expect("expected add repo command");
         match cmd {
             Command { action: CommandAction::AddRepo { path }, .. } => {
-                let canonical = std::fs::canonicalize(&repo_dir).unwrap();
+                let canonical = std::fs::canonicalize(&repo_dir).expect("canonicalize repo dir");
                 assert_eq!(path, canonical);
             }
             other => panic!("expected AddRepo, got {:?}", other),
@@ -955,6 +925,16 @@ mod tests {
 
         app.ui.mode = UiMode::Help;
         assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Dismiss));
+    }
+
+    #[test]
+    fn resolve_action_maps_file_picker_navigation_keys() {
+        let mut app = stub_app();
+        enter_file_picker(&mut app, "/tmp/", vec![dir_entry("alpha", false, false), dir_entry("beta", false, false)]);
+
+        assert_eq!(app.resolve_action(key(KeyCode::Char('j'))), Some(Action::SelectNext));
+        assert_eq!(app.resolve_action(key(KeyCode::Char('k'))), Some(Action::SelectPrev));
+        assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), None);
     }
 
     #[test]
@@ -1089,6 +1069,28 @@ mod tests {
         assert!(matches!(app.ui.mode, UiMode::Config));
     }
 
+    #[test]
+    fn brackets_do_not_switch_tabs_from_action_menu() {
+        let mut app = stub_app_with_repos(2);
+        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest], index: 0 };
+
+        app.handle_key(key(KeyCode::Char(']')));
+
+        assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
+        assert_eq!(app.model.active_repo, 0);
+    }
+
+    #[test]
+    fn brackets_do_not_switch_tabs_while_branch_input_generating() {
+        let mut app = stub_app_with_repos(2);
+        app.ui.mode = UiMode::BranchInput { input: Input::from("partial"), kind: BranchInputKind::Generating, pending_issue_ids: vec![] };
+
+        app.handle_key(key(KeyCode::Char(']')));
+
+        assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert_eq!(app.model.active_repo, 0);
+    }
+
     // ── handle_normal_key ────────────────────────────────────────────
 
     #[test]
@@ -1199,10 +1201,10 @@ mod tests {
     #[test]
     fn normal_h_cycles_target_host_through_known_peers() {
         let mut app = stub_app();
-        app.model.peer_hosts = vec![PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected }, PeerHostStatus {
-            name: HostName::new("beta"),
-            status: PeerStatus::Connected,
-        }];
+        app.model.peer_hosts = vec![
+            PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected },
+            PeerHostStatus { name: HostName::new("beta"), status: PeerStatus::Connected },
+        ];
 
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.ui.target_host, Some(HostName::new("alpha")));
