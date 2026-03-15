@@ -22,31 +22,11 @@ impl App {
     }
 
     pub(super) fn handle_file_picker_key(&mut self, key: KeyEvent) {
-        // Keys that change mode
-        if key.code == KeyCode::Esc {
-            self.ui.mode = UiMode::Normal;
-            return;
-        }
-        if key.code == KeyCode::Enter {
-            self.activate_dir_entry();
-            return;
-        }
-
         let needs_refresh = {
             let UiMode::FilePicker { ref mut input, ref mut dir_entries, ref mut selected } = self.ui.mode else {
                 return;
             };
             match key.code {
-                KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() || key.code == KeyCode::Down => {
-                    if !dir_entries.is_empty() {
-                        *selected = (*selected + 1).min(dir_entries.len() - 1);
-                    }
-                    false
-                }
-                KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() || key.code == KeyCode::Up => {
-                    *selected = selected.saturating_sub(1);
-                    false
-                }
                 KeyCode::Tab => {
                     if let Some(entry) = dir_entries.get(*selected).cloned() {
                         let current = input.value().to_string();
@@ -186,13 +166,13 @@ mod tests {
     use super::*;
     use crate::app::test_support::{default_repo_model, dir_entry, enter_file_picker, key, stub_app};
 
-    // ── handle_file_picker_key tests ─────────────────────────────────
+    // ── file picker interaction tests ───────────────────────────────
 
     #[test]
     fn esc_returns_to_normal() {
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![dir_entry("foo", false, false)]);
-        app.handle_file_picker_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
     }
 
@@ -202,7 +182,7 @@ mod tests {
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
 
-        app.handle_file_picker_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
             assert_eq!(selected, 1);
@@ -218,9 +198,9 @@ mod tests {
         enter_file_picker(&mut app, "/tmp/", entries);
 
         // Move to end
-        app.handle_file_picker_key(key(KeyCode::Down));
-        app.handle_file_picker_key(key(KeyCode::Down));
-        app.handle_file_picker_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
             assert_eq!(selected, 1); // stays at last index
@@ -236,9 +216,9 @@ mod tests {
         enter_file_picker(&mut app, "/tmp/", entries);
 
         // First move down twice, then up once
-        app.handle_file_picker_key(key(KeyCode::Down));
-        app.handle_file_picker_key(key(KeyCode::Down));
-        app.handle_file_picker_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Up));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
             assert_eq!(selected, 1);
@@ -253,8 +233,8 @@ mod tests {
         let entries = vec![dir_entry("aaa", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
 
-        app.handle_file_picker_key(key(KeyCode::Up));
-        app.handle_file_picker_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
             assert_eq!(selected, 0);
@@ -268,7 +248,7 @@ mod tests {
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![]);
 
-        app.handle_file_picker_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
             assert_eq!(selected, 0);
@@ -303,7 +283,7 @@ mod tests {
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
 
-        app.handle_file_picker_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('j')));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
             assert_eq!(selected, 1);
@@ -318,7 +298,7 @@ mod tests {
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         app.ui.mode = UiMode::FilePicker { input: Input::from("/tmp/"), dir_entries: entries, selected: 1 };
 
-        app.handle_file_picker_key(key(KeyCode::Char('k')));
+        app.handle_key(key(KeyCode::Char('k')));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
             assert_eq!(selected, 0);
@@ -341,7 +321,7 @@ mod tests {
         let entries = vec![DirEntry { name: "my-repo".to_string(), is_dir: true, is_git_repo: true, is_added: false }];
         enter_file_picker(&mut app, &parent_path, entries);
 
-        app.handle_file_picker_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
 
         // Mode should be Normal after adding a repo
         assert!(matches!(app.ui.mode, UiMode::Normal));
@@ -371,7 +351,7 @@ mod tests {
         let entries = vec![DirEntry { name: "existing-repo".to_string(), is_dir: true, is_git_repo: true, is_added: true }];
         enter_file_picker(&mut app, &base, entries);
 
-        app.handle_file_picker_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
 
         // It should navigate into the directory (is_dir branch)
         if let UiMode::FilePicker { ref input, selected, .. } = app.ui.mode {
@@ -391,7 +371,7 @@ mod tests {
         let entries = vec![dir_entry("subdir", false, false)];
         enter_file_picker(&mut app, "/base/path/", entries);
 
-        app.handle_file_picker_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
 
         if let UiMode::FilePicker { ref input, selected, .. } = app.ui.mode {
             assert_eq!(input.value(), "/base/path/subdir/");
@@ -406,7 +386,7 @@ mod tests {
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![]);
 
-        app.handle_file_picker_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
 
         // Mode should stay FilePicker since there are no entries to activate
         assert!(matches!(app.ui.mode, UiMode::FilePicker { .. }));
@@ -421,7 +401,7 @@ mod tests {
         let entries = vec![dir_entry("child", false, false)];
         enter_file_picker(&mut app, "foo/", entries);
 
-        app.handle_file_picker_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
 
         if let UiMode::FilePicker { ref input, .. } = app.ui.mode {
             assert_eq!(input.value(), "foo/child/");
@@ -437,7 +417,7 @@ mod tests {
         let entries = vec![dir_entry("bar", false, false)];
         app.ui.mode = UiMode::FilePicker { input: Input::from("foo/ba"), dir_entries: entries, selected: 0 };
 
-        app.handle_file_picker_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
 
         if let UiMode::FilePicker { ref input, .. } = app.ui.mode {
             assert_eq!(input.value(), "foo/bar/");
