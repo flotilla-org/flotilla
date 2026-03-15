@@ -214,6 +214,11 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         // Small delay to let zellij process the tab creation
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+        // Zellij's --cwd on new-pane doesn't reliably set the default shell's
+        // working directory — the shell inherits the server's cwd instead. When
+        // no command is given, explicitly launch $SHELL so --cwd is honoured.
+        const SHELL_FALLBACK: &str = "exec \"${SHELL:-sh}\"";
+
         for (i, pane) in rendered.panes.iter().enumerate() {
             if i == 0 {
                 // First pane is the tab's initial pane — send command via write-chars
@@ -229,22 +234,17 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                 // Additional surfaces in the first pane: stacked panes
                 for surface in pane.surfaces.iter().skip(1) {
                     let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
-                    Self::append_command_args(&mut args, &surface.command);
+                    let cmd = if surface.command.is_empty() { SHELL_FALLBACK } else { &surface.command };
+                    Self::append_command_args(&mut args, cmd);
                     self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             } else {
-                // Subsequent panes: create via new-pane with direction.
-                // Note: --cwd without an explicit command doesn't reliably set the
-                // shell's working directory in Zellij — the default shell inherits the
-                // server's cwd instead. When no command is given, explicitly launch
-                // $SHELL so the --cwd flag is honoured.
                 let direction = pane.split.as_deref().unwrap_or("right");
-                let shell_fallback = "exec \"${SHELL:-sh}\"";
 
                 if let Some(surface) = pane.surfaces.first() {
                     let mut args: Vec<&str> = vec!["new-pane", "-d", direction, "--cwd", &working_dir];
-                    let cmd = if surface.command.is_empty() { shell_fallback } else { &surface.command };
+                    let cmd = if surface.command.is_empty() { SHELL_FALLBACK } else { &surface.command };
                     Self::append_command_args(&mut args, cmd);
                     self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -253,7 +253,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
                 // Additional surfaces in this pane: stacked panes
                 for surface in pane.surfaces.iter().skip(1) {
                     let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
-                    let cmd = if surface.command.is_empty() { shell_fallback } else { &surface.command };
+                    let cmd = if surface.command.is_empty() { SHELL_FALLBACK } else { &surface.command };
                     Self::append_command_args(&mut args, cmd);
                     self.zellij_action(&args).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -375,6 +375,17 @@ mod tests {
         let mut args: Vec<&str> = vec!["new-pane"];
         ZellijWorkspaceManager::append_command_args(&mut args, "");
         assert_eq!(args, vec!["new-pane"]);
+    }
+
+    #[test]
+    fn shell_fallback_produces_explicit_shell_launch() {
+        // Simulates the call-site logic: empty command → SHELL_FALLBACK
+        const SHELL_FALLBACK: &str = "exec \"${SHELL:-sh}\"";
+        let command = "";
+        let cmd = if command.is_empty() { SHELL_FALLBACK } else { command };
+        let mut args: Vec<&str> = vec!["new-pane", "--cwd", "/tmp/repo"];
+        ZellijWorkspaceManager::append_command_args(&mut args, cmd);
+        assert_eq!(args, vec!["new-pane", "--cwd", "/tmp/repo", "--", "sh", "-c", "exec \"${SHELL:-sh}\""]);
     }
 
     #[test]
