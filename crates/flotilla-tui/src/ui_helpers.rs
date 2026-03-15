@@ -34,19 +34,26 @@ pub fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 ///
 /// Returns `(outer_area, inner_area)` where `inner_area` is the content area
 /// inside a `Block::bordered()` with the given title.
-pub fn popup_frame(container: Rect, percent_x: u16, percent_y: u16, title: &str) -> (Rect, Rect) {
+pub fn popup_frame(container: Rect, percent_x: u16, percent_y: u16, title: &str, style: ratatui::style::Style) -> (Rect, Rect) {
     let area = popup_area(container, percent_x, percent_y);
-    let block = Block::bordered().title(title);
+    let block = Block::bordered().style(style).title(title);
     let inner = block.inner(area);
     (area, inner)
 }
 
 /// Render a popup frame: clear the area and draw a bordered block with title.
 /// Returns `(outer_area, inner_area)` for the caller to render content into.
-pub fn render_popup_frame(frame: &mut ratatui::Frame, container: Rect, percent_x: u16, percent_y: u16, title: &str) -> (Rect, Rect) {
+pub fn render_popup_frame(
+    frame: &mut ratatui::Frame,
+    container: Rect,
+    percent_x: u16,
+    percent_y: u16,
+    title: &str,
+    style: ratatui::style::Style,
+) -> (Rect, Rect) {
     let area = popup_area(container, percent_x, percent_y);
     frame.render_widget(ratatui::widgets::Clear, area);
-    let block = Block::bordered().title(title);
+    let block = Block::bordered().style(style).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     (area, inner)
@@ -266,7 +273,7 @@ mod tests {
     #[test]
     fn popup_frame_returns_inner_area() {
         let area = Rect::new(0, 0, 100, 50);
-        let (popup, inner) = popup_frame(area, 50, 50, " Test ");
+        let (popup, inner) = popup_frame(area, 50, 50, " Test ", ratatui::style::Style::default());
         // Popup should be centered
         assert!(popup.x > 0);
         assert!(popup.y > 0);

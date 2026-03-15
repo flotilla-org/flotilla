@@ -251,6 +251,11 @@ impl Theme {
         Style::default().fg(self.section_header).add_modifier(Modifier::BOLD)
     }
 
+    /// Style for bordered block chrome (border lines and title text).
+    pub fn block_style(&self) -> Style {
+        Style::default().fg(self.border)
+    }
+
     pub fn log_level_style(&self, level: &str) -> Style {
         let color = match level {
             "ERROR" => self.error,

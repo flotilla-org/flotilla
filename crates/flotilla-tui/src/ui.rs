@@ -490,7 +490,7 @@ fn render_repo_providers(model: &TuiModel, _ui: &UiState, theme: &Theme, frame: 
 
     let table = Table::new(rows, provider_table_widths())
         .header(provider_table_header(theme))
-        .block(Block::bordered().title_top(Line::from(" ✕ ").right_aligned()));
+        .block(Block::bordered().style(theme.block_style()).title_top(Line::from(" ✕ ").right_aligned()));
     frame.render_widget(table, area);
 }
 
@@ -576,7 +576,7 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::bordered().title_top(Line::from(" ⚙ ").right_aligned()))
+        .block(Block::bordered().style(theme.block_style()).title_top(Line::from(" ⚙ ").right_aligned()))
         .row_highlight_style(Style::default().bg(theme.row_highlight).bold())
         .highlight_symbol(HIGHLIGHT_SYMBOL)
         .highlight_spacing(HighlightSpacing::Always);
@@ -783,7 +783,7 @@ fn render_preview(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Fra
     }
 }
 
-fn render_preview_content(model: &TuiModel, ui: &UiState, _theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_preview_content(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
     let text = if let Some(item) = selected_work_item(model, ui) {
         let rm = model.active();
         let providers = &rm.providers;
@@ -864,11 +864,11 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, _theme: &Theme, frame:
         String::new()
     };
 
-    let preview = Paragraph::new(text).block(Block::bordered().title(" Preview ")).wrap(Wrap { trim: true });
+    let preview = Paragraph::new(text).block(Block::bordered().style(theme.block_style()).title(" Preview ")).wrap(Wrap { trim: true });
     frame.render_widget(preview, area);
 }
 
-fn render_debug_panel(model: &TuiModel, ui: &UiState, _theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_debug_panel(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
     let text = if let Some(item) = selected_work_item(model, ui) {
         if !item.debug_group.is_empty() {
             item.debug_group.join("\n")
@@ -879,7 +879,8 @@ fn render_debug_panel(model: &TuiModel, ui: &UiState, _theme: &Theme, frame: &mu
         String::new()
     };
 
-    let panel = Paragraph::new(text).block(Block::bordered().title(" Debug (D to toggle) ")).wrap(Wrap { trim: true });
+    let panel =
+        Paragraph::new(text).block(Block::bordered().style(theme.block_style()).title(" Debug (D to toggle) ")).wrap(Wrap { trim: true });
     frame.render_widget(panel, area);
 }
 
@@ -897,7 +898,7 @@ fn render_action_menu(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: 
         items.iter().enumerate().map(|(i, intent)| ListItem::new(format!(" {}: {}", i + 1, intent.label(labels)))).collect();
 
     let list = List::new(list_items)
-        .block(Block::bordered().title(" Actions "))
+        .block(Block::bordered().style(theme.block_style()).title(" Actions "))
         .highlight_style(Style::default().bg(theme.action_highlight).bold())
         .highlight_symbol("▸ ");
 
@@ -911,7 +912,7 @@ fn render_input_popup(ui: &UiState, theme: &Theme, frame: &mut Frame) {
         return;
     };
 
-    let (_area, inner_area) = ui_helpers::render_popup_frame(frame, frame.area(), 50, 20, " New Branch ");
+    let (_area, inner_area) = ui_helpers::render_popup_frame(frame, frame.area(), 50, 20, " New Branch ", theme.block_style());
 
     if *kind == BranchInputKind::Generating {
         let spans = shimmer_spans("  Generating branch name...", theme);
@@ -1015,7 +1016,7 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &
     }
 
     let title = format!(" Remove {} ", model.active_labels().checkouts.noun_capitalized());
-    let paragraph = Paragraph::new(lines).block(Block::bordered().title(title)).wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(Block::bordered().style(theme.block_style()).title(title)).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
@@ -1036,7 +1037,7 @@ fn render_close_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &m
     ];
 
     let block_title = format!(" Close {} ", noun);
-    let paragraph = Paragraph::new(lines).block(Block::bordered().title(block_title)).wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(Block::bordered().style(theme.block_style()).title(block_title)).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
@@ -1116,7 +1117,10 @@ fn render_help(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Fr
         (false, false) => " Help ",
     };
 
-    let paragraph = Paragraph::new(help_text).block(Block::bordered().title(title)).scroll((scroll, 0)).wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(help_text)
+        .block(Block::bordered().style(theme.block_style()).title(title))
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
@@ -1134,7 +1138,7 @@ fn render_file_picker(ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
         return;
     };
 
-    let (area, inner) = ui_helpers::render_popup_frame(frame, frame.area(), 60, 60, " Add Repository ");
+    let (area, inner) = ui_helpers::render_popup_frame(frame, frame.area(), 60, 60, " Add Repository ", theme.block_style());
     ui.layout.file_picker_area = area;
 
     let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0)]).split(inner);
@@ -1254,8 +1258,9 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
         }
     }
 
-    let table =
-        Table::new(rows, provider_table_widths()).header(provider_table_header(theme)).block(Block::bordered().title(" Providers "));
+    let table = Table::new(rows, provider_table_widths())
+        .header(provider_table_header(theme))
+        .block(Block::bordered().style(theme.block_style()).title(" Providers "));
     frame.render_widget(table, area);
 }
 
@@ -1274,7 +1279,7 @@ fn render_hosts_status(theme: &Theme, frame: &mut Frame, area: Rect, hosts: &[Pe
         })
         .collect();
 
-    let list = List::new(items).block(Block::bordered().title(" Hosts "));
+    let list = List::new(items).block(Block::bordered().style(theme.block_style()).title(" Hosts "));
     frame.render_widget(list, area);
 }
 
@@ -1321,6 +1326,7 @@ fn render_event_log(ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Re
     let list = List::new(items)
         .block(
             Block::bordered()
+                .style(theme.block_style())
                 .title(" Event Log ")
                 .title_top(Line::from(Span::styled(filter_label, Style::default().fg(theme.muted))).right_aligned()),
         )
