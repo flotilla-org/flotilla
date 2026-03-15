@@ -148,6 +148,7 @@ Use these labels when creating or triaging issues. Combine as appropriate (e.g. 
 | `cli` | CLI commands and output formatting |
 | `infrastructure` | Build, CI, and tooling |
 | `integration` | New provider or tool integration |
+| `provider` | Provider infrastructure or implementation |
 | `vision` | Long-term direction, ambitious features |
 | `documentation` | Docs improvements |
 | `from-review` | Issue filed from PR review feedback |

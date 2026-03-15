@@ -302,7 +302,7 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
         association_keys: vec![],
     });
     daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("remote"), status: PeerConnectionState::Connected });
-    daemon.set_peer_providers(&repo, vec![(HostName::new("remote"), peer_data)]).await;
+    daemon.set_peer_providers(&repo, vec![(HostName::new("remote"), peer_data)], 0).await;
 
     let hosts = daemon.list_hosts().await.expect("list hosts");
     let remote = hosts.hosts.iter().find(|entry| entry.host == HostName::new("remote")).expect("remote host entry");
