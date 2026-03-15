@@ -1,3 +1,4 @@
+# === Cargo build stages (only executed when building 'full' target) ===
 FROM rust:slim-bookworm AS chef
 RUN cargo install cargo-chef
 WORKDIR /app
@@ -14,7 +15,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim AS runtime
+# === Shared runtime base (used by both full and dev) ===
+FROM debian:bookworm-slim AS runtime-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
@@ -36,10 +38,17 @@ RUN useradd -m -s /bin/bash flotilla \
     && chmod 700 /home/flotilla/.ssh \
     && chown flotilla:flotilla /home/flotilla/.ssh
 
-COPY --from=builder /app/target/release/flotilla /usr/local/bin/flotilla
 COPY tests/integration/docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 22
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sleep", "infinity"]
+
+# --- Full build target (default): cargo-built binary ---
+FROM runtime-base AS full
+COPY --from=builder /app/target/release/flotilla /usr/local/bin/flotilla
+
+# --- Dev target: pre-built binary from host ---
+FROM runtime-base AS dev
+COPY target/release/flotilla /usr/local/bin/flotilla
