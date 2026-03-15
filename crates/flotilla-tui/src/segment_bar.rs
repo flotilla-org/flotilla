@@ -6,6 +6,8 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use crate::theme::Theme;
+
 /// Client-provided data for one segment in a bar.
 pub struct SegmentItem {
     pub label: String,
@@ -144,6 +146,63 @@ impl BarStyle for RibbonStyle {
 
     fn background_fill(&self) -> Option<Style> {
         Some(Style::default().fg(Color::White).bg(Color::Black))
+    }
+}
+
+/// Theme-aware tab bar style: reads colours from a `Theme`.
+pub struct ThemedTabBarStyle<'a> {
+    pub theme: &'a Theme,
+}
+
+impl BarStyle for ThemedTabBarStyle<'_> {
+    fn render_item(&self, item: &SegmentItem) -> RenderedItem {
+        let style = if let Some(override_style) = item.style_override {
+            override_style
+        } else if item.active && item.dragging {
+            self.theme.tab_style(true, true)
+        } else if item.active {
+            self.theme.tab_style(true, false)
+        } else {
+            self.theme.tab_style(false, false)
+        };
+        RenderedItem::from_spans(vec![Span::styled(item.label.clone(), style)])
+    }
+
+    fn separator(&self) -> RenderedItem {
+        RenderedItem::from_spans(vec![Span::styled(" | ", Style::default().fg(self.theme.muted))])
+    }
+
+    fn background_fill(&self) -> Option<Style> {
+        None
+    }
+}
+
+/// Theme-aware ribbon style with chevron-delimited key chips.
+pub struct ThemedRibbonStyle<'a> {
+    pub theme: &'a Theme,
+}
+
+impl BarStyle for ThemedRibbonStyle<'_> {
+    fn render_item(&self, item: &SegmentItem) -> RenderedItem {
+        let key = item.key_hint.as_deref().unwrap_or("");
+        let label = self.theme.transform_label(&self.theme.status_bar, &item.label);
+        RenderedItem::from_spans(vec![
+            Span::styled(CHEVRON, Style::default().fg(self.theme.bar_bg).bg(self.theme.key_chip_bg)),
+            Span::styled(" ", Style::default().fg(self.theme.key_chip_fg).bg(self.theme.key_chip_bg)),
+            Span::styled("<", Style::default().fg(self.theme.key_chip_fg).bg(self.theme.key_chip_bg).bold()),
+            Span::styled(key.to_string(), Style::default().fg(self.theme.key_hint).bg(self.theme.key_chip_bg).bold()),
+            Span::styled(">", Style::default().fg(self.theme.key_chip_fg).bg(self.theme.key_chip_bg).bold()),
+            Span::styled(format!(" {label} "), Style::default().fg(self.theme.key_chip_fg).bg(self.theme.key_chip_bg).bold()),
+            Span::styled(CHEVRON, Style::default().fg(self.theme.key_chip_bg).bg(self.theme.bar_bg)),
+        ])
+    }
+
+    fn separator(&self) -> RenderedItem {
+        RenderedItem::empty()
+    }
+
+    fn background_fill(&self) -> Option<Style> {
+        Some(Style::default().fg(self.theme.text).bg(self.theme.bar_bg))
     }
 }
 
