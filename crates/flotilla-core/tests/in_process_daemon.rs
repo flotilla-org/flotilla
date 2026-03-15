@@ -547,7 +547,7 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
         association_keys: vec![],
     });
 
-    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), peer_data)]).await;
+    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
 
     // Trigger refresh so poll_snapshots stores updated state
@@ -750,7 +750,7 @@ async fn get_local_providers_excludes_peer_overlay_data() {
         association_keys: vec![],
     });
 
-    daemon.set_peer_providers(&repo, vec![(HostName::new("follower"), peer_data)]).await;
+    daemon.set_peer_providers(&repo, vec![(HostName::new("follower"), peer_data)], 0).await;
 
     let (providers, _) = daemon.get_local_providers(&repo).await.expect("local providers after peer overlay");
     assert!(
@@ -791,7 +791,7 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
     });
 
     // Set peer providers
-    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), peer_data)]).await;
+    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
 
     // Trigger refresh so poll_snapshots runs and stores merged data in last_snapshot.
@@ -842,7 +842,7 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
     };
 
     // First peer update
-    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), make_peer_data("feat-v1"))]).await;
+    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), make_peer_data("feat-v1"))], 0).await;
     let _ = recv_event(&mut rx).await;
 
     // Trigger refresh so poll_snapshots stores merged data in last_snapshot
@@ -850,7 +850,7 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
 
     // Second peer update — broadcast_snapshot_inner reads the merged last_snapshot,
     // normalizes all checkouts to local host, then merges peers again.
-    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), make_peer_data("feat-v2"))]).await;
+    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), make_peer_data("feat-v2"))], 1).await;
     let _ = recv_event(&mut rx).await;
 
     let snapshot = daemon.get_state(&repo).await.expect("get_state after poll + second peer update");

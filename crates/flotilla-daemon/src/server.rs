@@ -552,6 +552,7 @@ fn spawn_peer_networking_runtime(
                         let mut pm = peer_manager_task.lock().await;
                         match pm.handle_inbound(env).await {
                             HandleResult::Updated(ref updated_repo_id) => {
+                                let overlay_version = pm.overlay_version();
                                 let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
                                     .get_peer_data()
                                     .iter()
@@ -562,7 +563,7 @@ fn spawn_peer_networking_runtime(
                                 drop(pm);
 
                                 if let Some(local_path) = peer_daemon.preferred_local_path_for_identity(updated_repo_id).await {
-                                    peer_daemon.set_peer_providers(&local_path, peers).await;
+                                    peer_daemon.set_peer_providers(&local_path, peers, overlay_version).await;
                                 } else {
                                     let synthetic = crate::peer::synthetic_repo_path(&origin, &repo_path);
                                     let merged = crate::peer::merge_provider_data(
@@ -573,7 +574,7 @@ fn spawn_peer_networking_runtime(
                                     if let Err(e) = peer_daemon.add_virtual_repo(updated_repo_id.clone(), synthetic.clone(), merged).await {
                                         warn!(repo = %updated_repo_id, err = %e, "failed to add virtual repo");
                                     } else {
-                                        peer_daemon.set_peer_providers(&synthetic, peers).await;
+                                        peer_daemon.set_peer_providers(&synthetic, peers, overlay_version).await;
                                         let mut pm2 = peer_manager_task.lock().await;
                                         pm2.register_remote_repo(updated_repo_id.clone(), synthetic);
                                     }
@@ -827,19 +828,23 @@ async fn rebuild_peer_overlays(
     for repo_id in affected_repos {
         if let Some(local_path) = daemon.preferred_local_path_for_identity(&repo_id).await {
             // Local repo — rebuild its peer overlay from remaining peers
-            let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = {
+            let (peers, overlay_version) = {
                 let pm = peer_manager.lock().await;
-                pm.get_peer_data()
+                let v = pm.overlay_version();
+                let peers = pm
+                    .get_peer_data()
                     .iter()
                     .filter_map(|(host, repos)| repos.get(&repo_id).map(|state| (host.clone(), state.provider_data.clone())))
-                    .collect()
+                    .collect();
+                (peers, v)
             };
-            daemon.set_peer_providers(&local_path, peers).await;
+            daemon.set_peer_providers(&local_path, peers, overlay_version).await;
         } else {
             // Remote-only repo — rebuild or remove depending on remaining peers
             let mut pm = peer_manager.lock().await;
             if pm.has_peer_data_for(&repo_id) {
                 // Still has peer data — re-merge from remaining peers
+                let overlay_version = pm.overlay_version();
                 let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
                     .get_peer_data()
                     .iter()
@@ -848,7 +853,7 @@ async fn rebuild_peer_overlays(
 
                 if let Some(synthetic_path) = pm.known_remote_repos().get(&repo_id).cloned() {
                     drop(pm);
-                    daemon.set_peer_providers(&synthetic_path, peers).await;
+                    daemon.set_peer_providers(&synthetic_path, peers, overlay_version).await;
                 }
             } else if let Some(synthetic_path) = pm.unregister_remote_repo(&repo_id) {
                 // No peers remain — remove the virtual tab
@@ -1149,30 +1154,23 @@ async fn disconnect_peer_and_rebuild(
     // Identity → path is resolved here at apply time (not at computation time)
     // to avoid TOCTOU with concurrent add_repo/remove_repo.
     //
-    // Note: a residual apply-ordering race exists here. Between releasing
-    // the PM lock above and calling set_peer_providers below, the central
-    // processor can accept fresh inbound data and call set_peer_providers
-    // via the HandleResult::Updated path. Because set_peer_providers is a
-    // blind replace, this apply could overwrite that newer data. This is
-    // the same read-then-apply pattern shared by ALL overlay write paths
-    // (including the central processor itself). The effect is transient:
-    // the next inbound message for the affected repo will re-apply the
-    // correct state. Fully fixing this requires versioned/conditional
-    // set_peer_providers, which is a broader change tracked separately.
+    // Overlay updates carry a version from the PeerManager, so
+    // set_peer_providers will reject stale applies that lost the race
+    // against fresher inbound data.
     for update in &plan.overlay_updates {
         match update {
-            crate::peer::OverlayUpdate::SetProviders { identity, peers } => {
+            crate::peer::OverlayUpdate::SetProviders { identity, peers, overlay_version } => {
                 // Resolve identity to current local path. For remote-only repos,
                 // the path comes from known_remote_repos (already resolved in the plan).
                 // For local repos that were removed concurrently, preferred_local_path_for_identity
                 // returns None and we skip — the repo is gone, no overlay needed.
                 if let Some(local_path) = daemon.preferred_local_path_for_identity(identity).await {
-                    daemon.set_peer_providers(&local_path, peers.clone()).await;
+                    daemon.set_peer_providers(&local_path, peers.clone(), *overlay_version).await;
                 } else if let Some(synthetic_path) = {
                     let pm = peer_manager.lock().await;
                     pm.known_remote_repos().get(identity).cloned()
                 } {
-                    daemon.set_peer_providers(&synthetic_path, peers.clone()).await;
+                    daemon.set_peer_providers(&synthetic_path, peers.clone(), *overlay_version).await;
                 }
             }
             crate::peer::OverlayUpdate::RemoveRepo { identity, path } => {
@@ -2924,16 +2922,26 @@ mod tests {
         };
         daemon.add_virtual_repo(repo_identity.clone(), synthetic.clone(), merged).await.expect("add virtual repo");
         daemon
-            .set_peer_providers(&synthetic, vec![
-                (HostName::new("peer-a"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
-                    ..Default::default()
-                }),
-                (HostName::new("peer-b"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"), checkout("feature-b"))]),
-                    ..Default::default()
-                }),
-            ])
+            .set_peer_providers(
+                &synthetic,
+                vec![
+                    (HostName::new("peer-a"), ProviderData {
+                        checkouts: IndexMap::from([(
+                            HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"),
+                            checkout("feature-a"),
+                        )]),
+                        ..Default::default()
+                    }),
+                    (HostName::new("peer-b"), ProviderData {
+                        checkouts: IndexMap::from([(
+                            HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"),
+                            checkout("feature-b"),
+                        )]),
+                        ..Default::default()
+                    }),
+                ],
+                0,
+            )
             .await;
         let old_session_id = uuid::Uuid::new_v4();
         let new_session_id = uuid::Uuid::new_v4();
@@ -3277,16 +3285,26 @@ mod tests {
         };
         daemon.add_virtual_repo(repo_identity.clone(), synthetic.clone(), merged).await.expect("add virtual repo");
         daemon
-            .set_peer_providers(&synthetic, vec![
-                (HostName::new("peer-a"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
-                    ..Default::default()
-                }),
-                (HostName::new("peer-b"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"), checkout("feature-b"))]),
-                    ..Default::default()
-                }),
-            ])
+            .set_peer_providers(
+                &synthetic,
+                vec![
+                    (HostName::new("peer-a"), ProviderData {
+                        checkouts: IndexMap::from([(
+                            HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"),
+                            checkout("feature-a"),
+                        )]),
+                        ..Default::default()
+                    }),
+                    (HostName::new("peer-b"), ProviderData {
+                        checkouts: IndexMap::from([(
+                            HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"),
+                            checkout("feature-b"),
+                        )]),
+                        ..Default::default()
+                    }),
+                ],
+                0,
+            )
             .await;
         {
             let mut pm = peer_manager.lock().await;
@@ -3388,5 +3406,32 @@ mod tests {
             }
             other => panic!("expected cancel response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_peer_providers_rejects_stale_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create .git");
+        let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+        let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
+
+        let fresh_peers = vec![(HostName::new("hostB"), ProviderData {
+            checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo"), checkout("fresh"))]),
+            ..Default::default()
+        })];
+        let stale_peers = vec![(HostName::new("hostB"), ProviderData {
+            checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo"), checkout("stale"))]),
+            ..Default::default()
+        })];
+
+        // Apply version 5 first, then try to apply version 3 — should be rejected
+        daemon.set_peer_providers(&repo, fresh_peers.clone(), 5).await;
+        daemon.set_peer_providers(&repo, stale_peers, 3).await;
+
+        let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
+        let pp = daemon.peer_providers_for_test(&identity).await;
+        let branch = pp[0].1.checkouts.values().next().expect("checkout").branch.as_str();
+        assert_eq!(branch, "fresh", "stale version should have been rejected");
     }
 }
