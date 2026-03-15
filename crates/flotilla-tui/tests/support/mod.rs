@@ -9,6 +9,7 @@ use flotilla_protocol::{
 pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
 use flotilla_tui::{
     app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState},
+    theme::Theme,
     ui,
 };
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
@@ -24,6 +25,7 @@ pub struct TestHarness {
     pub model: TuiModel,
     pub ui: UiState,
     pub in_flight: HashMap<u64, InFlightCommand>,
+    theme: Option<Theme>,
     width: u16,
     height: u16,
 }
@@ -34,7 +36,7 @@ impl TestHarness {
         let info = test_repo_info("empty");
         let model = TuiModel::from_repo_info(vec![info]);
         let ui = UiState::new(&model.repo_order);
-        Self { model, ui, in_flight: HashMap::new(), width: WIDTH, height: HEIGHT }
+        Self { model, ui, in_flight: HashMap::new(), theme: None, width: WIDTH, height: HEIGHT }
     }
 
     /// Single repo with given name, empty data.
@@ -42,7 +44,7 @@ impl TestHarness {
         let info = test_repo_info(name);
         let model = TuiModel::from_repo_info(vec![info]);
         let ui = UiState::new(&model.repo_order);
-        Self { model, ui, in_flight: HashMap::new(), width: WIDTH, height: HEIGHT }
+        Self { model, ui, in_flight: HashMap::new(), theme: None, width: WIDTH, height: HEIGHT }
     }
 
     /// Multiple repos by name, all with empty data.
@@ -50,7 +52,7 @@ impl TestHarness {
         let infos = names.iter().map(|n| test_repo_info(n)).collect();
         let model = TuiModel::from_repo_info(infos);
         let ui = UiState::new(&model.repo_order);
-        Self { model, ui, in_flight: HashMap::new(), width: WIDTH, height: HEIGHT }
+        Self { model, ui, in_flight: HashMap::new(), theme: None, width: WIDTH, height: HEIGHT }
     }
 
     /// Override the terminal height for this test.
@@ -68,6 +70,11 @@ impl TestHarness {
     /// Set the UI mode.
     pub fn with_mode(mut self, mode: UiMode) -> Self {
         self.ui.mode = mode;
+        self
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = Some(theme);
         self
     }
 
@@ -127,12 +134,13 @@ impl TestHarness {
     /// Render the UI into a test buffer for symbol/style assertions.
     pub fn render_to_buffer(&mut self) -> Buffer {
         let backend = TestBackend::new(self.width, self.height);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
+        let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         terminal
             .draw(|frame| {
-                ui::render(&self.model, &mut self.ui, &self.in_flight, frame);
+                ui::render(&self.model, &mut self.ui, &self.in_flight, &theme, frame);
             })
-            .unwrap();
+            .expect("failed to draw test frame");
         terminal.backend().buffer().clone()
     }
 }

@@ -443,3 +443,46 @@ fn debug_panel_with_correlation_details() {
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
+
+#[test]
+fn theme_switching_changes_output() {
+    use flotilla_tui::theme::Theme;
+
+    let mut providers = ProviderData::default();
+    let (path, checkout) = make_checkout("feat-login", "/test/my-project/feat-login", false);
+    providers.checkouts.insert(path, checkout);
+    let items = vec![make_work_item_checkout("feat-login", "/test/my-project/feat-login")];
+
+    let mut classic_harness = TestHarness::single_repo("my-project")
+        .with_provider_data(providers.clone(), items.clone())
+        .with_theme(Theme::classic());
+    let classic_buf = classic_harness.render_to_buffer();
+
+    let mut catppuccin_harness =
+        TestHarness::single_repo("my-project").with_provider_data(providers, items).with_theme(Theme::catppuccin_mocha());
+    let catppuccin_buf = catppuccin_harness.render_to_buffer();
+
+    // Find a cell that uses a themed colour by scanning for the checkout icon
+    let area = classic_buf.area;
+    let mut classic_fg = None;
+    let mut catppuccin_fg = None;
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            let symbol = classic_buf[(x, y)].symbol();
+            if symbol == "○" || symbol == "●" {
+                classic_fg = Some(classic_buf[(x, y)].fg);
+                catppuccin_fg = Some(catppuccin_buf[(x, y)].fg);
+                break;
+            }
+        }
+        if classic_fg.is_some() {
+            break;
+        }
+    }
+    let classic_fg = classic_fg.expect("should find checkout icon in classic render");
+    let catppuccin_fg = catppuccin_fg.expect("should find checkout icon in catppuccin render");
+    assert_ne!(
+        classic_fg, catppuccin_fg,
+        "Themes should produce different colours: classic={classic_fg:?} vs catppuccin={catppuccin_fg:?}"
+    );
+}
