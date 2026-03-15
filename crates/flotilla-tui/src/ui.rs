@@ -151,7 +151,11 @@ fn render_tab_bar(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut
     tab_ids.push(TabId::Add);
 
     // Render
-    let hits = segment_bar::render(&items, &ThemedTabBarStyle { theme }, area, frame.buffer_mut());
+    let tab_style: Box<dyn BarStyle> = match theme.tab_bar.kind {
+        crate::theme::BarKind::Pipe => Box::new(ThemedTabBarStyle { theme }),
+        crate::theme::BarKind::Chevron => Box::new(ThemedRibbonStyle { theme, site: &theme.tab_bar }),
+    };
+    let hits = segment_bar::render(&items, tab_style.as_ref(), area, frame.buffer_mut());
 
     // Map hit regions to tab areas
     ui.layout.tab_areas.clear();
@@ -266,7 +270,7 @@ fn render_status_bar(
         x = status_model.keys_start;
     }
 
-    let ribbon_style = ThemedRibbonStyle { theme };
+    let ribbon_style = ThemedRibbonStyle { theme, site: &theme.status_bar };
     for chip in &status_model.visible_keys {
         let ribbon_start = x;
         let item = segment_bar::SegmentItem {

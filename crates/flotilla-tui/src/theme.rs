@@ -158,7 +158,7 @@ impl Theme {
             key_chip_bg: p.surface1.into(),
             key_chip_fg: p.crust.into(),
             // Bar site styling
-            tab_bar: BarSiteStyle { kind: BarKind::Pipe, label_transform: TextTransform::AsIs },
+            tab_bar: BarSiteStyle { kind: BarKind::Chevron, label_transform: TextTransform::AsIs },
             status_bar: BarSiteStyle { kind: BarKind::Chevron, label_transform: TextTransform::Uppercase },
         }
     }

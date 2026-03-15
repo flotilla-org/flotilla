@@ -123,12 +123,13 @@ impl BarStyle for ThemedTabBarStyle<'_> {
 /// Theme-aware ribbon style with chevron-delimited key chips.
 pub struct ThemedRibbonStyle<'a> {
     pub theme: &'a Theme,
+    pub site: &'a crate::theme::BarSiteStyle,
 }
 
 impl BarStyle for ThemedRibbonStyle<'_> {
     fn render_item(&self, item: &SegmentItem) -> RenderedItem {
         let key = item.key_hint.as_deref().unwrap_or("");
-        let label = self.theme.transform_label(&self.theme.status_bar, &item.label);
+        let label = self.theme.transform_label(self.site, &item.label);
         RenderedItem::from_spans(vec![
             Span::styled(CHEVRON, Style::default().fg(self.theme.bar_bg).bg(self.theme.key_chip_bg)),
             Span::styled(" ", Style::default().fg(self.theme.key_chip_fg).bg(self.theme.key_chip_bg)),
@@ -267,7 +268,7 @@ mod tests {
     #[test]
     fn ribbon_style_renders_with_key_hint() {
         let theme = crate::theme::Theme::classic();
-        let style = ThemedRibbonStyle { theme: &theme };
+        let style = ThemedRibbonStyle { theme: &theme, site: &theme.status_bar };
         let item = SegmentItem { label: "open".into(), key_hint: Some("ENT".into()), active: false, dragging: false, style_override: None };
         let rendered = style.render_item(&item);
         assert_eq!(rendered.spans.len(), 7);
@@ -279,13 +280,13 @@ mod tests {
     #[test]
     fn ribbon_style_separator_is_empty() {
         let theme = crate::theme::Theme::classic();
-        let sep = ThemedRibbonStyle { theme: &theme }.separator();
+        let sep = ThemedRibbonStyle { theme: &theme, site: &theme.status_bar }.separator();
         assert_eq!(sep.width, 0);
     }
 
     #[test]
     fn ribbon_style_fills_background() {
         let theme = crate::theme::Theme::classic();
-        assert!(ThemedRibbonStyle { theme: &theme }.background_fill().is_some());
+        assert!(ThemedRibbonStyle { theme: &theme, site: &theme.status_bar }.background_fill().is_some());
     }
 }
