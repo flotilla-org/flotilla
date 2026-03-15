@@ -1,0 +1,12 @@
+[project]
+name = "flotilla-integration-tests"
+requires-python = ">=3.10"
+dependencies = [
+    "pytest",
+    "pytest-timeout",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+# Per-test timeout (seconds). Topology fixture has its own internal timeouts.
+timeout = 120
