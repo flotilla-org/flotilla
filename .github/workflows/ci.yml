@@ -15,10 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-03-12
           components: rustfmt
-      - run: cargo +nightly fmt --check
+      - run: cargo +nightly-2026-03-12 fmt --check
 
   clippy:
     name: Clippy
