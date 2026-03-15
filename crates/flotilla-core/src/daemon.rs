@@ -2,7 +2,8 @@ use std::{collections::HashMap, path::Path};
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    Command, DaemonEvent, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse,
+    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoIdentity, RepoInfo,
+    RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse,
 };
 use tokio::sync::broadcast;
 
@@ -56,4 +57,16 @@ pub trait DaemonHandle: Send + Sync {
 
     /// Repo work items.
     async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String>;
+
+    /// Host list with connection and summary data.
+    async fn list_hosts(&self) -> Result<HostListResponse, String>;
+
+    /// Detailed host status.
+    async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String>;
+
+    /// Host-level inventory and providers.
+    async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String>;
+
+    /// Multi-host routing view.
+    async fn get_topology(&self) -> Result<TopologyResponse, String>;
 }

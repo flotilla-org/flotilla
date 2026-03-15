@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, DaemonEvent, Message, RawResponse, ReplayCursor, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse,
-    RepoWorkResponse, Snapshot, StatusResponse,
+    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, Message, RawResponse, ReplayCursor,
+    RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -631,6 +631,26 @@ impl DaemonHandle for SocketDaemon {
 
     async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String> {
         let resp = self.request("get_repo_work", serde_json::json!({ "slug": slug })).await?;
+        resp.parse()
+    }
+
+    async fn list_hosts(&self) -> Result<HostListResponse, String> {
+        let resp = self.request("list_hosts", serde_json::json!({})).await?;
+        resp.parse()
+    }
+
+    async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String> {
+        let resp = self.request("get_host_status", serde_json::json!({ "host": host })).await?;
+        resp.parse()
+    }
+
+    async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String> {
+        let resp = self.request("get_host_providers", serde_json::json!({ "host": host })).await?;
+        resp.parse()
+    }
+
+    async fn get_topology(&self) -> Result<TopologyResponse, String> {
+        let resp = self.request("get_topology", serde_json::json!({})).await?;
         resp.parse()
     }
 }

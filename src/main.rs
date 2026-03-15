@@ -81,11 +81,15 @@ enum SubCommand {
     },
     /// Route a control command to a specific host
     Host {
-        /// Logical host name
-        host: String,
-        /// Host-scoped control command arguments
+        /// Host query or control arguments
         #[arg(value_name = "ARGS", num_args = 1.., allow_hyphen_values = true)]
         args: Vec<String>,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the daemon's current multi-host routing view
+    Topology {
         /// Output as JSON instead of human-readable text
         #[arg(long)]
         json: bool,
@@ -141,10 +145,8 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(SubCommand::Host { host, args, json }) => {
-            let command = parse_host_control_command(host, args).map_err(|e| color_eyre::eyre::eyre!(e))?;
-            run_control_command(&cli, command, OutputFormat::from_json_flag(*json)).await
-        }
+        Some(SubCommand::Host { args, json }) => run_host(&cli, args, OutputFormat::from_json_flag(*json)).await,
+        Some(SubCommand::Topology { json }) => run_topology_command(&cli, OutputFormat::from_json_flag(*json)).await,
         None => run_tui(cli).await,
     }
 }
@@ -286,6 +288,17 @@ enum RepoQueryCommand {
     Work,
 }
 
+enum HostCommand {
+    List,
+    Query { host: String, detail: HostQueryCommand },
+    Control(Command),
+}
+
+enum HostQueryCommand {
+    Status,
+    Providers,
+}
+
 fn parse_repo_command(args: &[String]) -> Result<RepoCommand, String> {
     if args.is_empty() {
         return Err("missing repo arguments".into());
@@ -366,6 +379,28 @@ fn parse_host_control_command(host: &str, args: &[String]) -> Result<Command, St
     Ok(command)
 }
 
+fn parse_host_command(args: &[String]) -> Result<HostCommand, String> {
+    if args.is_empty() {
+        return Err("missing host command".into());
+    }
+
+    if args.len() == 1 && args[0] == "list" {
+        return Ok(HostCommand::List);
+    }
+
+    let host = &args[0];
+    let host_args = &args[1..];
+    if host_args.is_empty() {
+        return Err("missing host command".into());
+    }
+
+    match host_args {
+        [detail] if detail == "status" => Ok(HostCommand::Query { host: host.clone(), detail: HostQueryCommand::Status }),
+        [detail] if detail == "providers" => Ok(HostCommand::Query { host: host.clone(), detail: HostQueryCommand::Providers }),
+        _ => parse_host_control_command(host, host_args).map(HostCommand::Control),
+    }
+}
+
 async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     let socket_path = cli.socket_path();
     let config_dir = cli.config_dir();
@@ -395,5 +430,89 @@ async fn run_repo(cli: &Cli, args: &[String], format: OutputFormat) -> Result<()
             };
             result.map_err(|e| color_eyre::eyre::eyre!(e))
         }
+    }
+}
+
+async fn run_host(cli: &Cli, args: &[String], format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    let parsed = parse_host_command(args).map_err(|e| color_eyre::eyre::eyre!(e))?;
+    match parsed {
+        HostCommand::List => {
+            let daemon = connect_daemon(cli).await?;
+            flotilla_tui::cli::run_host_list(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+        }
+        HostCommand::Query { host, detail } => {
+            let daemon = connect_daemon(cli).await?;
+            let result = match detail {
+                HostQueryCommand::Status => flotilla_tui::cli::run_host_status(&*daemon, &host, format).await,
+                HostQueryCommand::Providers => flotilla_tui::cli::run_host_providers(&*daemon, &host, format).await,
+            };
+            result.map_err(|e| color_eyre::eyre::eyre!(e))
+        }
+        HostCommand::Control(command) => run_control_command(cli, command, format).await,
+    }
+}
+
+async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    let daemon = connect_daemon(cli).await?;
+    flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use flotilla_protocol::{CheckoutSelector, CommandAction, RepoSelector};
+
+    use super::{parse_host_command, Cli, HostCommand, HostQueryCommand, SubCommand};
+
+    #[test]
+    fn parse_host_command_list() {
+        let parsed = parse_host_command(&["list".into()]).expect("host list should parse");
+        assert!(matches!(parsed, HostCommand::List));
+    }
+
+    #[test]
+    fn parse_host_command_status() {
+        let parsed = parse_host_command(&["alpha".into(), "status".into()]).expect("host status should parse");
+        assert!(matches!(
+            parsed,
+            HostCommand::Query { host, detail: HostQueryCommand::Status } if host == "alpha"
+        ));
+    }
+
+    #[test]
+    fn parse_host_command_providers() {
+        let parsed = parse_host_command(&["alpha".into(), "providers".into()]).expect("host providers should parse");
+        assert!(matches!(
+            parsed,
+            HostCommand::Query { host, detail: HostQueryCommand::Providers } if host == "alpha"
+        ));
+    }
+
+    #[test]
+    fn parse_host_command_preserves_control_paths() {
+        let parsed = parse_host_command(&["alpha".into(), "repo".into(), "remove".into(), "owner/repo".into()])
+            .expect("host repo remove should parse");
+        assert!(matches!(
+            parsed,
+            HostCommand::Control(command)
+                if command.host.as_ref().map(|host| host.as_str()) == Some("alpha")
+                    && matches!(command.action, CommandAction::RemoveRepo { repo: RepoSelector::Query(ref value) } if value == "owner/repo")
+        ));
+
+        let parsed = parse_host_command(&["alpha".into(), "checkout".into(), "/tmp/wt".into(), "remove".into()])
+            .expect("host checkout remove should parse");
+        assert!(matches!(
+            parsed,
+            HostCommand::Control(command)
+                if matches!(command.action, CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(ref value), .. } if value == "/tmp/wt")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_topology_subcommand() {
+        let cli = Cli::try_parse_from(["flotilla", "topology"]).expect("topology cli should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Topology { json: false })));
     }
 }

@@ -26,7 +26,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, CorrelationKey, DaemonEvent,
-    HostName, HostPath, Issue, ProviderData, RepoIdentity, RepoSelector,
+    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, PeerConnectionState, ProviderData, RepoIdentity,
+    RepoSelector, SystemInfo, ToolInventory, TopologyRoute,
 };
 use tokio::sync::Notify;
 
@@ -161,6 +162,22 @@ fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
     runtime
 }
 
+fn sample_remote_host_summary(name: &str) -> HostSummary {
+    HostSummary {
+        host_name: HostName::new(name),
+        system: SystemInfo {
+            home_dir: Some(PathBuf::from(format!("/home/{name}"))),
+            os: Some("linux".into()),
+            arch: Some("aarch64".into()),
+            cpu_count: Some(4),
+            memory_total_mb: Some(8192),
+            environment: HostEnvironment::Container,
+        },
+        inventory: ToolInventory::default(),
+        providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+    }
+}
+
 struct FailingCodeReview;
 
 #[async_trait]
@@ -223,6 +240,79 @@ async fn daemon_for_duplicate_git_repos(remote: &str) -> (tempfile::TempDir, Pat
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, git_process_discovery(false), HostName::local()).await;
     (temp, repo_a, repo_b, daemon)
+}
+
+#[tokio::test]
+async fn list_hosts_includes_local_and_configured_disconnected_peers() {
+    let (_temp, _repo, daemon, _identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
+
+    daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
+
+    let hosts = daemon.list_hosts().await.expect("list hosts");
+
+    assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::local() && entry.is_local));
+    assert!(hosts.hosts.iter().any(|entry| {
+        entry.host == HostName::new("remote")
+            && entry.configured
+            && !entry.has_summary
+            && entry.connection_status == PeerConnectionState::Disconnected
+    }));
+}
+
+#[tokio::test]
+async fn get_host_providers_returns_local_summary_and_errors_for_unknown_remote_summary() {
+    let (_temp, _repo, daemon, _identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
+
+    daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
+
+    let local_host = daemon.host_name().to_string();
+    let local = daemon.get_host_providers(&local_host).await.expect("local host providers should resolve");
+    assert_eq!(local.host, *daemon.host_name());
+    assert_eq!(local.summary.host_name, *daemon.host_name());
+
+    let err = daemon.get_host_providers("remote").await.expect_err("remote host without summary should error");
+    assert!(err.contains("summary"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored_routes() {
+    let (_temp, repo, daemon, _identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
+
+    daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
+    daemon.set_peer_host_summaries(HashMap::from([(HostName::new("remote"), sample_remote_host_summary("remote"))])).await;
+    daemon
+        .set_topology_routes(vec![TopologyRoute {
+            target: HostName::new("remote"),
+            next_hop: HostName::new("relay"),
+            direct: false,
+            connected: true,
+            fallbacks: vec![HostName::new("backup-relay")],
+        }])
+        .await;
+
+    let mut peer_data = ProviderData::default();
+    peer_data.checkouts.insert(HostPath::new(HostName::new("remote"), "/srv/remote/repo"), Checkout {
+        branch: "peer-branch".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+    });
+    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("remote"), status: PeerConnectionState::Connected });
+    daemon.set_peer_providers(&repo, vec![(HostName::new("remote"), peer_data)]).await;
+
+    let hosts = daemon.list_hosts().await.expect("list hosts");
+    let remote = hosts.hosts.iter().find(|entry| entry.host == HostName::new("remote")).expect("remote host entry");
+    assert_eq!(remote.repo_count, 1);
+    assert!(remote.work_item_count >= 1, "remote overlay should contribute work items");
+
+    let topology = daemon.get_topology().await.expect("topology");
+    assert_eq!(topology.routes.len(), 1);
+    assert_eq!(topology.routes[0].target, HostName::new("remote"));
+    assert_eq!(topology.routes[0].next_hop, HostName::new("relay"));
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {
