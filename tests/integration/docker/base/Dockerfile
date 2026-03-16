@@ -1,5 +1,5 @@
 # === Cargo build stages (only executed when building 'full' target) ===
-FROM rust:slim-bookworm AS chef
+FROM rust:slim-trixie AS chef
 RUN cargo install cargo-chef
 WORKDIR /app
 
@@ -16,18 +16,18 @@ COPY . .
 RUN cargo build --release
 
 # === Shared runtime base (used by both full and dev) ===
-FROM debian:bookworm-slim AS runtime-base
+FROM debian:trixie-slim AS runtime-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
     openssh-client \
     git \
     ca-certificates \
-    libssl3 \
+    libssl3t64 \
     gosu \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir /run/sshd
+RUN mkdir -p /run/sshd
 
 # Disable password auth (pubkey is already the default)
 RUN mkdir -p /etc/ssh/sshd_config.d \
