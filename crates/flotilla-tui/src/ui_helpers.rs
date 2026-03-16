@@ -141,8 +141,8 @@ pub fn checkout_indicator(is_main: bool, has_checkout: bool) -> &'static str {
 /// (e.g. `.worktrees/feat-auth`).  Padding matches the parent-directory portion
 /// of the main display, but shrinks when `col_width` is tight so the actual
 /// name is preserved.
-pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
-    let main_display = shorten_against_home(repo_root);
+pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize, home_dir: Option<&Path>) -> String {
+    let main_display = shorten_against_home(repo_root, home_dir);
 
     // Main checkout — show the full shortened path.
     if path == repo_root {
@@ -193,12 +193,12 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize) -> String {
     }
 
     // Elsewhere — shorten against home directory.
-    shorten_against_home(path)
+    shorten_against_home(path, home_dir)
 }
 
-fn shorten_against_home(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(rel) = path.strip_prefix(&home) {
+fn shorten_against_home(path: &Path, home_dir: Option<&Path>) -> String {
+    if let Some(home) = home_dir {
+        if let Ok(rel) = path.strip_prefix(home) {
             let s = rel.to_string_lossy();
             if s.is_empty() {
                 return "~".to_string();
@@ -434,14 +434,14 @@ mod tests {
     #[test]
     fn shorten_path_main_checkout() {
         let root = Path::new("/dev/project");
-        assert_eq!(shorten_path(root, root, 40), "/dev/project");
+        assert_eq!(shorten_path(root, root, 40, None), "/dev/project");
     }
 
     #[test]
     fn shorten_path_main_checkout_under_home() {
         let home = dirs::home_dir().expect("home dir");
         let root = home.join("dev/flotilla");
-        assert_eq!(shorten_path(&root, &root, 40), "~/dev/flotilla");
+        assert_eq!(shorten_path(&root, &root, 40, Some(&home)), "~/dev/flotilla");
     }
 
     #[test]
@@ -449,7 +449,7 @@ mod tests {
         // Wide column — full padding (5 = len("/dev/")).
         let root = Path::new("/dev/project");
         let wt = Path::new("/dev/project/.worktrees/feat-auth");
-        assert_eq!(shorten_path(wt, root, 40), "     .worktrees/feat-auth");
+        assert_eq!(shorten_path(wt, root, 40, None), "     .worktrees/feat-auth");
     }
 
     #[test]
@@ -458,7 +458,7 @@ mod tests {
         let root = Path::new("/dev/project");
         let wt = Path::new("/dev/project/.worktrees/feat-auth");
         // ideal_padding = 5, col/2 = 11 → padding = 5 (same as wide)
-        assert_eq!(shorten_path(wt, root, 22), "     .worktrees/feat-auth");
+        assert_eq!(shorten_path(wt, root, 22, None), "     .worktrees/feat-auth");
     }
 
     #[test]
@@ -466,21 +466,21 @@ mod tests {
         // Very narrow — padding capped at col/2 = 5, still consistent indent.
         let root = Path::new("/dev/project");
         let wt = Path::new("/dev/project/.worktrees/feat-auth");
-        assert_eq!(shorten_path(wt, root, 10), "     .worktrees/feat-auth");
+        assert_eq!(shorten_path(wt, root, 10, None), "     .worktrees/feat-auth");
     }
 
     #[test]
     fn shorten_path_relative() {
         let root = Path::new("/dev/project");
         let sub = Path::new("/dev/project/sub/dir");
-        assert_eq!(shorten_path(sub, root, 40), "     sub/dir");
+        assert_eq!(shorten_path(sub, root, 40, None), "     sub/dir");
     }
 
     #[test]
     fn shorten_path_nested_worktree() {
         let root = Path::new("/dev/project");
         let wt = Path::new("/dev/project/.worktrees/group/feat-auth");
-        assert_eq!(shorten_path(wt, root, 40), "     .worktrees/group/feat-auth");
+        assert_eq!(shorten_path(wt, root, 40, None), "     .worktrees/group/feat-auth");
     }
 
     #[test]
@@ -488,7 +488,7 @@ mod tests {
         // padding = len("/dev/") = 5
         let root = Path::new("/dev/flotilla");
         let wt = Path::new("/dev/flotilla.feat-xyz");
-        assert_eq!(shorten_path(wt, root, 40), "     .feat-xyz");
+        assert_eq!(shorten_path(wt, root, 40, None), "     .feat-xyz");
     }
 
     #[test]
@@ -496,7 +496,7 @@ mod tests {
         // Sibling with a different name prefix is not a related worktree
         let root = Path::new("/dev/flotilla");
         let wt = Path::new("/dev/other-project");
-        assert_eq!(shorten_path(wt, root, 40), "/dev/other-project");
+        assert_eq!(shorten_path(wt, root, 40, None), "/dev/other-project");
     }
 
     #[test]
@@ -505,7 +505,7 @@ mod tests {
         let home = dirs::home_dir().expect("home dir");
         let root = home.join("dev/flotilla");
         let wt = home.join("dev/flotilla.low-hang-12");
-        assert_eq!(shorten_path(&wt, &root, 40), "      .low-hang-12");
+        assert_eq!(shorten_path(&wt, &root, 40, Some(&home)), "      .low-hang-12");
     }
 
     #[test]
@@ -515,7 +515,7 @@ mod tests {
         // padding = len("/dev/") = 5, +2 extra = 7
         let root = Path::new("/dev/flotilla");
         let wt = Path::new("/dev/flotilla.quick-wins/.claude/worktrees/agent-abc");
-        assert_eq!(shorten_path(wt, root, 60), "       .claude/worktrees/agent-abc");
+        assert_eq!(shorten_path(wt, root, 60, None), "       .claude/worktrees/agent-abc");
     }
 
     #[test]
@@ -523,13 +523,26 @@ mod tests {
         // Unrelated directory under the same parent should NOT be treated as sibling
         let root = Path::new("/dev/flotilla");
         let other = Path::new("/dev/unrelated/sub");
-        assert_eq!(shorten_path(other, root, 40), "/dev/unrelated/sub");
+        assert_eq!(shorten_path(other, root, 40, None), "/dev/unrelated/sub");
     }
 
     #[test]
     fn shorten_path_outside_root() {
         let root = Path::new("/tmp/project");
         let other = Path::new("/elsewhere/wt");
-        assert_eq!(shorten_path(other, root, 40), "/elsewhere/wt");
+        assert_eq!(shorten_path(other, root, 40, None), "/elsewhere/wt");
+    }
+
+    #[test]
+    fn shorten_path_remote_host_home() {
+        let remote_home = Path::new("/home/remoteuser");
+        let root = Path::new("/home/remoteuser/dev/project");
+        assert_eq!(shorten_path(root, root, 40, Some(remote_home)), "~/dev/project");
+    }
+
+    #[test]
+    fn shorten_path_no_home_dir() {
+        let root = Path::new("/srv/repos/project");
+        assert_eq!(shorten_path(root, root, 40, None), "/srv/repos/project");
     }
 }

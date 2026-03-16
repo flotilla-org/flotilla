@@ -562,8 +562,22 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame
                 }
                 GroupEntry::Item(item) => {
                     let pending = rui.pending_actions.get(&item.identity);
-                    let mut row =
-                        build_item_row(item, &rm.providers, &col_widths, model.active_repo_root(), prev_source.as_deref(), pending, theme);
+                    let local_home = dirs::home_dir();
+                    let home_dir = item
+                        .checkout_key()
+                        .and_then(|co| model.hosts.get(&co.host))
+                        .and_then(|h| h.summary.system.home_dir.as_deref())
+                        .or(local_home.as_deref());
+                    let mut row = build_item_row(
+                        item,
+                        &rm.providers,
+                        &col_widths,
+                        model.active_repo_root(),
+                        prev_source.as_deref(),
+                        pending,
+                        theme,
+                        home_dir,
+                    );
                     prev_source = item.source.clone();
                     if is_multi_selected {
                         row = row.style(Style::default().bg(theme.multi_select_bg));
@@ -637,6 +651,7 @@ fn build_item_row<'a>(
     prev_source: Option<&str>,
     pending: Option<&PendingAction>,
     theme: &Theme,
+    home_dir: Option<&Path>,
 ) -> Row<'a> {
     let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
     let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status, theme);
@@ -652,7 +667,7 @@ fn build_item_row<'a>(
     let branch_width = col_widths.get(4).copied().unwrap_or(25) as usize;
 
     let path_display = if let Some(p) = item.checkout_key() {
-        ui_helpers::shorten_path(&p.path, repo_root, path_width)
+        ui_helpers::shorten_path(&p.path, repo_root, path_width, home_dir)
     } else if let Some(ref ses_key) = item.session_key {
         ses_key.clone()
     } else {
