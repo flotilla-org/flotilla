@@ -1,0 +1,13 @@
+# Override: use pre-built binary from host instead of cargo build.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# The host binary must be glibc-compatible with the container's Debian trixie
+# (glibc 2.41). Most recent Linux distros (Arch, Fedora 41+, Ubuntu 25.04+) work.
+# If yours doesn't, use the full target or build statically with musl.
+services:
+  node-a:
+    build:
+      target: dev
+  node-b:
+    build:
+      target: dev
