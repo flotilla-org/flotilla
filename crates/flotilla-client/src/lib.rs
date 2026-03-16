@@ -480,12 +480,12 @@ fn handle_event(
                 }
             }
         }
-        DaemonEvent::RepoRemoved { repo_identity, .. } => {
+        DaemonEvent::RepoUntracked { repo_identity, .. } => {
             // Sync lock: evict before dispatching
             local_seqs.write().unwrap().remove(repo_identity);
             let _ = event_tx.send(event);
         }
-        DaemonEvent::RepoAdded(_)
+        DaemonEvent::RepoTracked(_)
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
         | DaemonEvent::CommandStepUpdate { .. }
@@ -1067,10 +1067,10 @@ mod tests {
             provider_health: HashMap::new(),
             loading: false,
         };
-        handle_event(DaemonEvent::RepoAdded(Box::new(repo_info)), &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
+        handle_event(DaemonEvent::RepoTracked(Box::new(repo_info)), &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
 
-        let event = event_rx.try_recv().expect("should receive RepoAdded");
-        assert!(matches!(event, DaemonEvent::RepoAdded(_)));
+        let event = event_rx.try_recv().expect("should receive RepoTracked");
+        assert!(matches!(event, DaemonEvent::RepoTracked(_)));
     }
 
     #[tokio::test]
@@ -1193,7 +1193,7 @@ mod tests {
         let (writer, pending, next_id, _server) = event_harness();
 
         handle_event(
-            DaemonEvent::RepoRemoved { path: repo.clone(), repo_identity: repo_identity() },
+            DaemonEvent::RepoUntracked { path: repo.clone(), repo_identity: repo_identity() },
             &local_seqs,
             &recovering,
             &event_tx,
@@ -1203,10 +1203,13 @@ mod tests {
         );
 
         // Seq should be evicted.
-        assert!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()).is_none(), "seq should be evicted for removed repo");
+        assert!(
+            local_seqs.read().expect("local_seqs read lock").get(&repo_identity()).is_none(),
+            "seq should be evicted for untracked repo"
+        );
         // Event should be forwarded.
-        let event = event_rx.try_recv().expect("should receive RepoRemoved");
-        assert!(matches!(event, DaemonEvent::RepoRemoved { .. }));
+        let event = event_rx.try_recv().expect("should receive RepoUntracked");
+        assert!(matches!(event, DaemonEvent::RepoUntracked { .. }));
     }
 
     // --- recover_from_gap: parse error in replay response ---

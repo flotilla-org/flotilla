@@ -892,13 +892,13 @@ mod tests {
         app.dispatch_action(Action::Confirm);
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        let (cmd, _) = app.proto_commands.take_next().expect("expected add repo command");
+        let (cmd, _) = app.proto_commands.take_next().expect("expected track repo command");
         match cmd {
-            Command { action: CommandAction::AddRepo { path }, .. } => {
+            Command { action: CommandAction::TrackRepoPath { path }, .. } => {
                 let canonical = std::fs::canonicalize(&repo_dir).expect("canonicalize repo dir");
                 assert_eq!(path, canonical);
             }
-            other => panic!("expected AddRepo, got {:?}", other),
+            other => panic!("expected TrackRepoPath, got {:?}", other),
         }
     }
 

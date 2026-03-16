@@ -163,10 +163,10 @@ pub enum DaemonEvent {
     /// Incremental delta — sent when only a subset of data changed.
     #[serde(rename = "repo_delta")]
     RepoDelta(Box<RepoDelta>),
-    #[serde(rename = "repo_added")]
-    RepoAdded(Box<RepoInfo>),
-    #[serde(rename = "repo_removed")]
-    RepoRemoved { repo_identity: RepoIdentity, path: std::path::PathBuf },
+    #[serde(rename = "repo_tracked")]
+    RepoTracked(Box<RepoInfo>),
+    #[serde(rename = "repo_untracked")]
+    RepoUntracked { repo_identity: RepoIdentity, path: std::path::PathBuf },
     #[serde(rename = "command_started")]
     CommandStarted { command_id: u64, host: HostName, repo_identity: RepoIdentity, repo: std::path::PathBuf, description: String },
     #[serde(rename = "command_finished")]
@@ -230,7 +230,7 @@ mod tests {
     }
 
     fn sample_command() -> Command {
-        Command { host: None, context_repo: None, action: CommandAction::AddRepo { path: PathBuf::from("/tmp/my-repo") } }
+        Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/my-repo") } }
     }
 
     #[test]

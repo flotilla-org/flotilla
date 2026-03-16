@@ -678,7 +678,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     let mut rx = daemon.subscribe();
 
     let add_id = daemon
-        .execute(Command { host: None, context_repo: None, action: CommandAction::AddRepo { path: repo.clone() } })
+        .execute(Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path: repo.clone() } })
         .await
         .expect("add_repo command should return an id");
 
@@ -692,7 +692,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
                 Ok(DaemonEvent::CommandFinished { command_id, repo_identity, result, .. }) if command_id == add_id => {
                     finished = Some((repo_identity, result));
                 }
-                Ok(DaemonEvent::RepoAdded(info)) => added = Some(*info),
+                Ok(DaemonEvent::RepoTracked(info)) => added = Some(*info),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
@@ -704,7 +704,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     .await
     .expect("timeout waiting for add command events");
     let (finished_identity, finished_result) = finished_add;
-    assert!(matches!(finished_result, CommandResult::RepoAdded { path } if path == repo));
+    assert!(matches!(finished_result, CommandResult::RepoTracked { ref path, .. } if *path == repo));
     assert_eq!(finished_identity, added.identity, "CommandFinished should use the tracked repo identity");
     assert_eq!(started_add, added.identity, "CommandStarted should use the tracked repo identity");
     assert_eq!(added.path, repo);
@@ -717,7 +717,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
         .execute(Command {
             host: None,
             context_repo: None,
-            action: CommandAction::RemoveRepo { repo: RepoSelector::Query("new-repo".into()) },
+            action: CommandAction::UntrackRepo { repo: RepoSelector::Query("new-repo".into()) },
         })
         .await
         .expect("remove_repo command should return an id");
@@ -727,7 +727,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
         loop {
             match rx.recv().await {
                 Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == remove_id => finished = Some(result),
-                Ok(DaemonEvent::RepoRemoved { path, .. }) => removed = Some(path),
+                Ok(DaemonEvent::RepoUntracked { path, .. }) => removed = Some(path),
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
@@ -738,7 +738,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     })
     .await
     .expect("timeout waiting for remove command events");
-    assert!(matches!(finished_remove, CommandResult::RepoRemoved { path } if path == repo));
+    assert!(matches!(finished_remove, CommandResult::RepoUntracked { ref path } if *path == repo));
     assert_eq!(removed, repo);
 
     let repos = daemon.list_repos().await.expect("list_repos after remove");
@@ -1203,18 +1203,18 @@ async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
         .await
         .expect("add_virtual_repo should succeed");
 
-    // Should receive a RepoAdded event
+    // Should receive a RepoTracked event
     let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::RepoAdded(info)) => break *info,
+                Ok(DaemonEvent::RepoTracked(info)) => break *info,
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
         }
     })
     .await
-    .expect("timeout waiting for RepoAdded");
+    .expect("timeout waiting for RepoTracked");
     assert_eq!(added.identity, identity);
     assert_eq!(added.path, synthetic_path);
     assert!(!added.loading, "virtual repos should not be in loading state");

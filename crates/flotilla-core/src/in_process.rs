@@ -1317,7 +1317,7 @@ impl InProcessDaemon {
     /// `<remote>/desktop/home/dev/repo`). The `provider_data` is the
     /// initial merged data from peer snapshots.
     ///
-    /// Emits `DaemonEvent::RepoAdded` so the TUI creates a tab.
+    /// Emits `DaemonEvent::RepoTracked` so the TUI creates a tab.
     pub async fn add_virtual_repo(
         &self,
         identity: flotilla_protocol::RepoIdentity,
@@ -1373,7 +1373,7 @@ impl InProcessDaemon {
         // with peer connections.
 
         info!(repo = %synthetic_path.display(), "added virtual repo");
-        let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
+        let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
 
         Ok(())
     }
@@ -1541,7 +1541,7 @@ impl DaemonHandle for InProcessDaemon {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
 
         match &command.action {
-            flotilla_protocol::CommandAction::AddRepo { path } => {
+            flotilla_protocol::CommandAction::TrackRepoPath { path } => {
                 let repo_identity = self.detect_repo_identity(path).await;
                 let description = command.description().to_string();
                 let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -1552,7 +1552,7 @@ impl DaemonHandle for InProcessDaemon {
                     description,
                 });
                 let result = match self.add_repo(path).await {
-                    Ok(()) => flotilla_protocol::CommandResult::RepoAdded { path: path.clone() },
+                    Ok(()) => flotilla_protocol::CommandResult::RepoTracked { path: path.clone(), resolved_from: None },
                     Err(message) => flotilla_protocol::CommandResult::Error { message },
                 };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -1564,7 +1564,7 @@ impl DaemonHandle for InProcessDaemon {
                 });
                 return Ok(id);
             }
-            flotilla_protocol::CommandAction::RemoveRepo { repo } => {
+            flotilla_protocol::CommandAction::UntrackRepo { repo } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
                 let repo_identity =
                     self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
@@ -1577,7 +1577,7 @@ impl DaemonHandle for InProcessDaemon {
                     description,
                 });
                 let result = match self.remove_repo(&repo_path).await {
-                    Ok(()) => flotilla_protocol::CommandResult::RepoRemoved { path: repo_path.clone() },
+                    Ok(()) => flotilla_protocol::CommandResult::RepoUntracked { path: repo_path.clone() },
                     Err(message) => flotilla_protocol::CommandResult::Error { message },
                 };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -1881,7 +1881,7 @@ impl DaemonHandle for InProcessDaemon {
 
         info!(repo = %path.display(), "added repo");
         if added_new_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoAdded(Box::new(repo_info)));
+            let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
         } else if preferred_changed {
             self.broadcast_snapshot_inner(&path, false).await;
         }
@@ -2012,7 +2012,7 @@ impl DaemonHandle for InProcessDaemon {
 
         info!(repo = %path.display(), "removed repo");
         if removed_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoRemoved { repo_identity, path });
+            let _ = self.event_tx.send(DaemonEvent::RepoUntracked { repo_identity, path });
         } else if let Some(preferred_path) = new_preferred_path {
             self.broadcast_snapshot_inner(&preferred_path, false).await;
         }

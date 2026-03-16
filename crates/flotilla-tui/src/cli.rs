@@ -200,8 +200,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandResult) ->
     use flotilla_protocol::commands::CommandResult;
     match result {
         CommandResult::Ok => "ok".to_string(),
-        CommandResult::RepoAdded { path } => format!("repo added: {}", path.display()),
-        CommandResult::RepoRemoved { path } => format!("repo removed: {}", path.display()),
+        CommandResult::RepoTracked { path, .. } => format!("repo tracked: {}", path.display()),
+        CommandResult::RepoUntracked { path } => format!("repo untracked: {}", path.display()),
         CommandResult::Refreshed { repos } => format!("refreshed {} repo(s)", repos.len()),
         CommandResult::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
         CommandResult::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
@@ -228,11 +228,11 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 delta.changes.len()
             )
         }
-        DaemonEvent::RepoAdded(info) => {
-            format!("[repo]     {}: added", info.name)
+        DaemonEvent::RepoTracked(info) => {
+            format!("[repo]     {}: tracked", info.name)
         }
-        DaemonEvent::RepoRemoved { path, .. } => {
-            format!("[repo]     {}: removed", repo_name(path))
+        DaemonEvent::RepoUntracked { path, .. } => {
+            format!("[repo]     {}: untracked", repo_name(path))
         }
         DaemonEvent::CommandStarted { repo, description, .. } => {
             format!("[command]  {}: started \"{}\"", repo_name(repo), description)
@@ -790,8 +790,8 @@ mod tests {
         }
 
         #[test]
-        fn repo_added() {
-            let event = DaemonEvent::RepoAdded(Box::new(flotilla_protocol::snapshot::RepoInfo {
+        fn repo_tracked() {
+            let event = DaemonEvent::RepoTracked(Box::new(flotilla_protocol::snapshot::RepoInfo {
                 identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/added-repo".into() },
                 name: "added-repo".into(),
                 path: PathBuf::from("/tmp/added-repo"),
@@ -803,19 +803,19 @@ mod tests {
             let line = format_event_human(&event);
             assert!(line.contains("[repo]"), "should have repo tag");
             assert!(line.contains("added-repo"), "should show repo name");
-            assert!(line.contains("added"), "should say added");
+            assert!(line.contains("tracked"), "should say tracked");
         }
 
         #[test]
-        fn repo_removed() {
-            let event = DaemonEvent::RepoRemoved {
+        fn repo_untracked() {
+            let event = DaemonEvent::RepoUntracked {
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/old-repo".into() },
                 path: PathBuf::from("/tmp/old-repo"),
             };
             let line = format_event_human(&event);
             assert!(line.contains("[repo]"), "should have repo tag");
             assert!(line.contains("old-repo"), "should extract name");
-            assert!(line.contains("removed"), "should say removed");
+            assert!(line.contains("untracked"), "should say untracked");
         }
 
         #[test]
@@ -892,18 +892,18 @@ mod tests {
         }
 
         #[test]
-        fn repo_added() {
-            let result = CommandResult::RepoAdded { path: PathBuf::from("/tmp/my-repo") };
+        fn repo_tracked() {
+            let result = CommandResult::RepoTracked { path: PathBuf::from("/tmp/my-repo"), resolved_from: None };
             let output = format_command_result(&result);
-            assert!(output.contains("repo added"), "should say repo added");
+            assert!(output.contains("repo tracked"), "should say repo tracked");
             assert!(output.contains("/tmp/my-repo"), "should include path");
         }
 
         #[test]
-        fn repo_removed() {
-            let result = CommandResult::RepoRemoved { path: PathBuf::from("/tmp/old-repo") };
+        fn repo_untracked() {
+            let result = CommandResult::RepoUntracked { path: PathBuf::from("/tmp/old-repo") };
             let output = format_command_result(&result);
-            assert!(output.contains("repo removed"), "should say repo removed");
+            assert!(output.contains("repo untracked"), "should say repo untracked");
             assert!(output.contains("/tmp/old-repo"), "should include path");
         }
 

@@ -201,7 +201,7 @@ fn extract_command_repo_identity(command: &Command) -> Option<RepoIdentity> {
     match &command.action {
         CommandAction::Checkout { repo: RepoSelector::Identity(identity), .. } => Some(identity.clone()),
         CommandAction::PrepareTerminalForCheckout { .. } => None,
-        CommandAction::RemoveRepo { repo: RepoSelector::Identity(identity) } => Some(identity.clone()),
+        CommandAction::UntrackRepo { repo: RepoSelector::Identity(identity) } => Some(identity.clone()),
         CommandAction::Refresh { repo: Some(RepoSelector::Identity(identity)) } => Some(identity.clone()),
         _ => None,
     }

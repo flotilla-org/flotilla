@@ -428,7 +428,7 @@ async fn build_generate_branch_name_plan(
 }
 /// Execute a `Command` against the given repo context.
 ///
-/// Commands that are handled at the daemon level (AddRepo, RemoveRepo, Refresh)
+/// Commands that are handled at the daemon level (TrackRepoPath, UntrackRepo, Refresh)
 /// should not reach this function — the caller should handle them directly.
 pub async fn execute(
     action: CommandAction,
@@ -673,8 +673,8 @@ pub async fn execute(
 
         // These are handled at the daemon level (InProcessDaemon / SocketDaemon),
         // not by the per-repo executor. If they reach here, it's a routing bug.
-        CommandAction::AddRepo { .. }
-        | CommandAction::RemoveRepo { .. }
+        CommandAction::TrackRepoPath { .. }
+        | CommandAction::UntrackRepo { .. }
         | CommandAction::Refresh { .. }
         | CommandAction::SetIssueViewport { .. }
         | CommandAction::FetchMoreIssues { .. }
@@ -2434,8 +2434,8 @@ mod tests {
         let runner = runner_ok();
 
         let daemon_commands = vec![
-            CommandAction::AddRepo { path: PathBuf::from("/repo") },
-            CommandAction::RemoveRepo { repo: RepoSelector::Path(PathBuf::from("/repo")) },
+            CommandAction::TrackRepoPath { path: PathBuf::from("/repo") },
+            CommandAction::UntrackRepo { repo: RepoSelector::Path(PathBuf::from("/repo")) },
             CommandAction::Refresh { repo: None },
             CommandAction::SetIssueViewport { repo: PathBuf::from("/repo"), visible_count: 10 },
             CommandAction::FetchMoreIssues { repo: PathBuf::from("/repo"), desired_count: 20 },

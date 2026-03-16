@@ -366,7 +366,7 @@ mod tests {
             requester_host: HostName::new("workstation"),
             responder_host: HostName::new("feta"),
             remaining_hops: 7,
-            result: Box::new(CommandResult::RepoAdded { path: PathBuf::from("/srv/repo") }),
+            result: Box::new(CommandResult::RepoTracked { path: PathBuf::from("/srv/repo"), resolved_from: None }),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
@@ -376,7 +376,7 @@ mod tests {
                 assert_eq!(requester_host, HostName::new("workstation"));
                 assert_eq!(responder_host, HostName::new("feta"));
                 assert_eq!(remaining_hops, 7);
-                assert!(matches!(*result, CommandResult::RepoAdded { .. }));
+                assert!(matches!(*result, CommandResult::RepoTracked { .. }));
             }
             other => panic!("expected CommandResponse, got {:?}", other),
         }

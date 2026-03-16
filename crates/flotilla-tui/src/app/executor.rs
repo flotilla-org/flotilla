@@ -75,11 +75,11 @@ fn reset_loading_mode(app: &mut App) {
 pub fn handle_result(result: CommandResult, app: &mut App) {
     match result {
         CommandResult::Ok => {}
-        CommandResult::RepoAdded { path } => {
-            info!(path = %path.display(), "added repo");
+        CommandResult::RepoTracked { path, .. } => {
+            info!(path = %path.display(), "tracked repo");
         }
-        CommandResult::RepoRemoved { path } => {
-            info!(path = %path.display(), "removed repo");
+        CommandResult::RepoUntracked { path } => {
+            info!(path = %path.display(), "untracked repo");
         }
         CommandResult::Refreshed { repos } => {
             info!(count = repos.len(), "refresh completed");
