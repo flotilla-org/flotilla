@@ -29,7 +29,7 @@ use tui_input::Input;
 use ui_state::PendingStatus;
 pub use ui_state::{BranchInputKind, DirEntry, RepoUiState, RepoViewLayout, TabId, UiMode, UiState};
 
-use crate::theme::Theme;
+use crate::{keymap::Keymap, theme::Theme};
 
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +255,7 @@ pub struct App {
     pub model: TuiModel,
     pub ui: UiState,
     pub theme: Theme,
+    pub keymap: Keymap,
     pub proto_commands: CommandQueue,
     pub in_flight: HashMap<u64, InFlightCommand>,
     pub pending_cancel: Option<u64>,
@@ -272,12 +273,14 @@ impl App {
             RepoViewLayoutConfig::Right => RepoViewLayout::Right,
             RepoViewLayoutConfig::Below => RepoViewLayout::Below,
         };
+        let keymap = Keymap::from_config(&loaded_config.ui.keys);
         Self {
             daemon,
             config,
             model,
             ui,
             theme,
+            keymap,
             proto_commands: Default::default(),
             in_flight: HashMap::new(),
             pending_cancel: None,

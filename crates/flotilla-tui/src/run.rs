@@ -34,7 +34,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     events.attach_daemon(daemon_rx);
 
     // Initial draw before entering the event loop
-    terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, f))?;
+    terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, &app.keymap, f))?;
 
     loop {
         // ── Wait for the first event (blocking) ──
@@ -239,7 +239,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
 
         // ── Draw once ──
-        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, f))?;
+        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, &app.keymap, f))?;
 
         if app.should_quit {
             break;

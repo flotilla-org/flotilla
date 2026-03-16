@@ -22,6 +22,7 @@ use crate::{
         BranchInputKind, InFlightCommand, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiHostState, TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
+    keymap::Keymap,
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
     shimmer::{shimmer_spans, Shimmer},
     status_bar::{
@@ -91,7 +92,14 @@ fn resolve_auto_preview_position(area: Rect) -> ResolvedPreviewPosition {
     }
 }
 
-pub fn render(model: &TuiModel, ui: &mut UiState, in_flight: &HashMap<u64, InFlightCommand>, theme: &Theme, frame: &mut Frame) {
+pub fn render(
+    model: &TuiModel,
+    ui: &mut UiState,
+    in_flight: &HashMap<u64, InFlightCommand>,
+    theme: &Theme,
+    keymap: &Keymap,
+    frame: &mut Frame,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
@@ -104,7 +112,7 @@ pub fn render(model: &TuiModel, ui: &mut UiState, in_flight: &HashMap<u64, InFli
     render_input_popup(ui, theme, frame);
     render_delete_confirm(model, ui, theme, frame);
     render_close_confirm(model, ui, theme, frame);
-    render_help(model, ui, theme, frame);
+    render_help(ui, theme, keymap, frame);
     render_file_picker(ui, theme, frame);
 }
 
@@ -1074,7 +1082,7 @@ fn render_close_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &m
     frame.render_widget(paragraph, area);
 }
 
-fn render_help(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
+fn render_help(ui: &mut UiState, theme: &Theme, keymap: &Keymap, frame: &mut Frame) {
     if !matches!(ui.mode, UiMode::Help) {
         return;
     }
@@ -1082,8 +1090,7 @@ fn render_help(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Fr
     let area = ui_helpers::popup_area(frame.area(), 60, 85);
     frame.render_widget(Clear, area);
 
-    let labels = model.active_labels();
-    let help_text = vec![
+    let mut help_text = vec![
         Line::from(Span::styled("Item Icons", Style::default().bold())),
         Line::from("  ●  Checkout with workspace    ○  Checkout (no workspace)"),
         Line::from("  ▶  Running session            ◆  Idle session"),
@@ -1096,44 +1103,24 @@ fn render_help(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Fr
         Line::from("  PR: ✓ merged  ✗ closed"),
         Line::from("  Git: ? untracked  M modified  ↑ ahead  ↓ behind"),
         Line::from(""),
-        Line::from(Span::styled("Navigation", Style::default().bold())),
-        Line::from("  j/k or ↑/↓      Navigate list"),
-        Line::from("  Click            Select item"),
-        Line::from("  Scroll wheel     Navigate list"),
-        Line::from(""),
-        Line::from(Span::styled("Actions", Style::default().bold())),
-        Line::from("  Enter            Open workspace (switch/create as needed)"),
-        Line::from("  Double-click     Same as Enter"),
-        Line::from("  .                Action menu (all available actions)"),
-        Line::from("  Right-click      Action menu"),
-        Line::from(format!("  n                New branch (enter name, creates {})", labels.checkouts.noun)),
-        Line::from(format!("  d                Remove {} (with safety check)", labels.checkouts.noun)),
-        Line::from(format!("  p                Show {} in browser", labels.change_requests.abbr)),
-        Line::from("  l                Cycle layout (auto/zoom/right/below)"),
-        Line::from("  r                Refresh data"),
-        Line::from("  K                Toggle status bar key ribbons"),
-        Line::from("  Status bar       Click ribbons to trigger actions"),
-        Line::from(""),
-        Line::from(Span::styled("Multi-select (issues)", Style::default().bold())),
-        Line::from("  Space            Toggle selection on current item"),
-        Line::from("  Enter            Generate branch name for all selected"),
-        Line::from("  Esc              Clear selection"),
-        Line::from(""),
-        Line::from(Span::styled("Repos", Style::default().bold())),
-        Line::from("  [ / ]            Switch repo tab"),
-        Line::from("  { / }            Move repo tab left/right"),
-        Line::from("  Drag tab         Reorder tabs"),
-        Line::from("  a                Add repository"),
-        Line::from(""),
-        Line::from(Span::styled("General", Style::default().bold())),
-        Line::from("  D                Toggle correlation debug panel"),
-        Line::from(vec![
-            Span::styled("  T", Style::default().bold()),
-            Span::raw(format!("                Cycle theme (current: {})", theme.name)),
-        ]),
-        Line::from("  ?                Toggle this help"),
-        Line::from("  q / Esc          Quit"),
     ];
+
+    // Dynamic sections from keymap
+    for section in keymap.help_sections() {
+        help_text.push(Line::from(Span::styled(section.title, Style::default().bold())));
+        for binding in &section.bindings {
+            help_text.push(Line::from(format!("  {:18}{}", binding.key_display, binding.description)));
+        }
+        help_text.push(Line::from(""));
+    }
+
+    // Mouse hints (not configurable)
+    help_text.push(Line::from(Span::styled("Mouse", Style::default().bold())));
+    help_text.push(Line::from("  Click            Select item"));
+    help_text.push(Line::from("  Double-click     Open workspace"));
+    help_text.push(Line::from("  Right-click      Action menu"));
+    help_text.push(Line::from("  Scroll wheel     Navigate list"));
+    help_text.push(Line::from("  Drag tab         Reorder tabs"));
 
     let total_lines = help_text.len() as u16;
     let inner_height = area.height.saturating_sub(2); // borders

@@ -9,6 +9,7 @@ use flotilla_protocol::{
 pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
 use flotilla_tui::{
     app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState},
+    keymap::Keymap,
     theme::Theme,
     ui,
 };
@@ -136,9 +137,10 @@ impl TestHarness {
         let backend = TestBackend::new(self.width, self.height);
         let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
+        let keymap = Keymap::defaults();
         terminal
             .draw(|frame| {
-                ui::render(&self.model, &mut self.ui, &self.in_flight, &theme, frame);
+                ui::render(&self.model, &mut self.ui, &self.in_flight, &theme, &keymap, frame);
             })
             .expect("failed to draw test frame");
         terminal.backend().buffer().clone()
