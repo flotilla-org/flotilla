@@ -16,8 +16,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDetailResponse, RepoInfo,
-    RepoProvidersResponse, RepoSummary, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse, TopologyRoute,
+    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDelta, RepoDetailResponse,
+    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -175,7 +175,7 @@ fn inject_issues_from_entries(
     providers
 }
 
-/// Build a proto Snapshot by injecting issues, re-correlating, and patching issue metadata.
+/// Build a proto RepoSnapshot by injecting issues, re-correlating, and patching issue metadata.
 struct SnapshotBuildContext<'a> {
     repo_identity: flotilla_protocol::RepoIdentity,
     path: &'a Path,
@@ -190,8 +190,8 @@ struct SnapshotBuildContext<'a> {
     host_name: &'a HostName,
 }
 
-/// Build a proto Snapshot, optionally merging peer provider data before correlation.
-fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: Option<&[(HostName, ProviderData)]>) -> Snapshot {
+/// Build a proto RepoSnapshot, optionally merging peer provider data before correlation.
+fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: Option<&[(HostName, ProviderData)]>) -> RepoSnapshot {
     let SnapshotBuildContext { repo_identity, path, seq, local_providers, errors, provider_health, cache, search_results, host_name } = ctx;
     let local_providers = normalize_local_provider_hosts(inject_issues(local_providers, cache, search_results), host_name);
 
@@ -221,13 +221,13 @@ fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: O
 /// - The serialized delta is larger than the serialized full snapshot
 ///
 /// Otherwise sends a delta.
-fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
+fn choose_event(snapshot: RepoSnapshot, delta: DeltaEntry) -> DaemonEvent {
     // First broadcast or empty delta → always send full
     if delta.prev_seq == 0 || delta.changes.is_empty() {
-        return DaemonEvent::SnapshotFull(Box::new(snapshot));
+        return DaemonEvent::RepoSnapshot(Box::new(snapshot));
     }
 
-    let snapshot_delta = flotilla_protocol::SnapshotDelta {
+    let snapshot_delta = RepoDelta {
         seq: delta.seq,
         prev_seq: delta.prev_seq,
         repo_identity: snapshot.repo_identity.clone(),
@@ -246,11 +246,11 @@ fn choose_event(snapshot: Snapshot, delta: DeltaEntry) -> DaemonEvent {
     match (delta_size, full_size) {
         (Ok(d), Ok(f)) if d < f => {
             debug!(delta_bytes = d, full_bytes = f, "delta smaller than full, sending delta");
-            DaemonEvent::SnapshotDelta(Box::new(snapshot_delta))
+            DaemonEvent::RepoDelta(Box::new(snapshot_delta))
         }
         _ => {
             debug!("sending full snapshot (delta not smaller)");
-            DaemonEvent::SnapshotFull(Box::new(snapshot))
+            DaemonEvent::RepoSnapshot(Box::new(snapshot))
         }
     }
 }
@@ -871,7 +871,7 @@ impl InProcessDaemon {
     ///
     /// For each repo whose background refresh has produced a new snapshot,
     /// update internal state, increment the sequence number, and broadcast
-    /// a `DaemonEvent::SnapshotFull` or `DaemonEvent::SnapshotDelta`.
+    /// a `DaemonEvent::RepoSnapshot` or `DaemonEvent::RepoDelta`.
     ///
     /// Called automatically by the background poll loop spawned in `new()`.
     async fn poll_snapshots(&self) {
@@ -1454,7 +1454,7 @@ impl DaemonHandle for InProcessDaemon {
         self.event_tx.subscribe()
     }
 
-    async fn get_state(&self, repo: &Path) -> Result<Snapshot, String> {
+    async fn get_state(&self, repo: &Path) -> Result<RepoSnapshot, String> {
         let identity = self.tracked_repo_identity_for_path(repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
@@ -1932,7 +1932,7 @@ impl DaemonHandle for InProcessDaemon {
                         let issue_snapshot = snapshot();
                         // Replay delta entries (each carries pre-correlated work_items)
                         for entry in state.delta_log.iter().skip(start_idx) {
-                            events.push(DaemonEvent::SnapshotDelta(Box::new(flotilla_protocol::SnapshotDelta {
+                            events.push(DaemonEvent::RepoDelta(Box::new(RepoDelta {
                                 seq: entry.seq,
                                 prev_seq: entry.prev_seq,
                                 repo_identity: state.identity.clone(),
@@ -1948,12 +1948,12 @@ impl DaemonHandle for InProcessDaemon {
                         // Client is up to date — no replay needed
                     } else {
                         // Seq not in delta log — send full snapshot
-                        events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
+                        events.push(DaemonEvent::RepoSnapshot(Box::new(snapshot())));
                     }
                 }
                 None => {
                     // Client has never seen this repo — send full snapshot
-                    events.push(DaemonEvent::SnapshotFull(Box::new(snapshot())));
+                    events.push(DaemonEvent::RepoSnapshot(Box::new(snapshot())));
                 }
             }
         }
@@ -2344,7 +2344,7 @@ mod tests {
     #[test]
     fn choose_event_uses_delta_for_non_initial_changes() {
         let repo = PathBuf::from("/tmp/repo");
-        let snapshot = Snapshot {
+        let snapshot = RepoSnapshot {
             seq: 2,
             repo_identity: fallback_repo_identity(&repo),
             repo: repo.clone(),
@@ -2359,7 +2359,7 @@ mod tests {
         };
 
         let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![], work_items: vec![] };
-        assert!(matches!(choose_event(snapshot.clone(), initial), DaemonEvent::SnapshotFull(_)));
+        assert!(matches!(choose_event(snapshot.clone(), initial), DaemonEvent::RepoSnapshot(_)));
 
         let non_empty = DeltaEntry {
             seq: 2,
@@ -2367,12 +2367,12 @@ mod tests {
             changes: vec![flotilla_protocol::Change::Branch { key: "feature/x".into(), op: flotilla_protocol::EntryOp::Removed }],
             work_items: vec![],
         };
-        assert!(matches!(choose_event(snapshot, non_empty), DaemonEvent::SnapshotDelta(_)));
+        assert!(matches!(choose_event(snapshot, non_empty), DaemonEvent::RepoDelta(_)));
     }
 
     #[test]
     fn choose_event_falls_back_to_full_when_delta_is_larger() {
-        let snapshot = Snapshot {
+        let snapshot = RepoSnapshot {
             seq: 3,
             repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
             repo: PathBuf::from("/tmp/repo"),
@@ -2393,7 +2393,7 @@ mod tests {
             work_items: vec![],
         };
 
-        assert!(matches!(choose_event(snapshot, delta), DaemonEvent::SnapshotFull(_)));
+        assert!(matches!(choose_event(snapshot, delta), DaemonEvent::RepoSnapshot(_)));
     }
 
     #[test]
@@ -2445,7 +2445,7 @@ mod tests {
 
     #[test]
     fn choose_event_sends_full_when_delta_has_empty_changes() {
-        let snapshot = Snapshot {
+        let snapshot = RepoSnapshot {
             seq: 2,
             repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
             repo: PathBuf::from("/tmp/repo"),
@@ -2461,7 +2461,7 @@ mod tests {
 
         // prev_seq > 0 but changes is empty — should still send full
         let delta = DeltaEntry { seq: 2, prev_seq: 1, changes: vec![], work_items: vec![] };
-        assert!(matches!(choose_event(snapshot, delta), DaemonEvent::SnapshotFull(_)));
+        assert!(matches!(choose_event(snapshot, delta), DaemonEvent::RepoSnapshot(_)));
     }
 
     // --- build_repo_snapshot_with_peers ---

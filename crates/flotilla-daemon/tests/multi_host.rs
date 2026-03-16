@@ -288,8 +288,8 @@ async fn daemon_snapshot_has_correct_host_attribution() {
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             match rx.recv().await {
-                Ok(flotilla_protocol::DaemonEvent::SnapshotFull(snap)) => return *snap,
-                Ok(flotilla_protocol::DaemonEvent::SnapshotDelta(_)) => {
+                Ok(flotilla_protocol::DaemonEvent::RepoSnapshot(snap)) => return *snap,
+                Ok(flotilla_protocol::DaemonEvent::RepoDelta(_)) => {
                     // Get full state instead
                     return daemon.get_state(&repo).await.expect("get_state");
                 }

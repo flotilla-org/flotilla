@@ -49,7 +49,9 @@ pub use query::{
     UnmetRequirementInfo,
 };
 use serde::{Deserialize, Serialize};
-pub use snapshot::{CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, Snapshot, WorkItem, WorkItemIdentity, WorkItemKind};
+pub use snapshot::{
+    CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, RepoSnapshot, WorkItem, WorkItemIdentity, WorkItemKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
@@ -62,26 +64,69 @@ pub struct ReplayCursor {
     pub seq: u64,
 }
 
+/// Typed client-to-daemon RPC requests.
+///
+/// On the wire, the tagged enum payload is encoded under `params`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "params", rename_all = "snake_case")]
+pub enum Request {
+    ListRepos,
+    GetState { repo: std::path::PathBuf },
+    Execute { command: Command },
+    Cancel { command_id: u64 },
+    Refresh { repo: std::path::PathBuf },
+    AddRepo { path: std::path::PathBuf },
+    RemoveRepo { path: std::path::PathBuf },
+    ReplaySince { last_seen: Vec<ReplayCursor> },
+    GetStatus,
+    GetRepoDetail { slug: String },
+    GetRepoProviders { slug: String },
+    GetRepoWork { slug: String },
+    ListHosts,
+    GetHostStatus { host: String },
+    GetHostProviders { host: String },
+    GetTopology,
+}
+
+/// Typed daemon RPC success payloads.
+///
+/// On the wire, the tagged enum payload is encoded under `data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum Response {
+    ListRepos(Vec<RepoInfo>),
+    GetState(Box<RepoSnapshot>),
+    Execute { command_id: u64 },
+    Cancel,
+    Refresh,
+    AddRepo,
+    RemoveRepo,
+    ReplaySince(Vec<DaemonEvent>),
+    GetStatus(StatusResponse),
+    GetRepoDetail(RepoDetailResponse),
+    GetRepoProviders(RepoProvidersResponse),
+    GetRepoWork(RepoWorkResponse),
+    ListHosts(HostListResponse),
+    GetHostStatus(HostStatusResponse),
+    GetHostProviders(HostProvidersResponse),
+    GetTopology(TopologyResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ResponseResult {
+    Ok { response: Box<Response> },
+    Err { message: String },
+}
+
 /// Top-level message envelope for the JSON protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Message {
     #[serde(rename = "request")]
-    Request {
-        id: u64,
-        method: String,
-        #[serde(default)]
-        params: serde_json::Value,
-    },
+    Request { id: u64, request: Request },
     #[serde(rename = "response")]
-    Response {
-        id: u64,
-        ok: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        data: Option<serde_json::Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
+    Response { id: u64, response: Box<ResponseResult> },
     #[serde(rename = "event")]
     Event { event: Box<DaemonEvent> },
     #[serde(rename = "hello")]
@@ -95,47 +140,15 @@ pub enum Message {
     Peer(Box<PeerWireMessage>),
 }
 
-/// Parsed response from the wire — before type-specific deserialization.
-#[derive(Debug)]
-pub struct RawResponse {
-    pub ok: bool,
-    pub data: Option<serde_json::Value>,
-    pub error: Option<String>,
-}
-
-impl RawResponse {
-    /// Parse the data payload into the expected type.
-    pub fn parse<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
-        if !self.ok {
-            return Err(self.error.unwrap_or_else(|| "unknown error".into()));
-        }
-        let data = self.data.ok_or("response missing data field")?;
-        serde_json::from_value(data).map_err(|e| format!("failed to parse response: {e}"))
-    }
-
-    /// Parse a response with no data payload (refresh, add_repo, remove_repo).
-    pub fn parse_empty(self) -> Result<(), String> {
-        if !self.ok {
-            return Err(self.error.unwrap_or_else(|| "unknown error".into()));
-        }
-        Ok(())
-    }
-}
-
 impl Message {
-    /// Build a success response with a serializable payload.
-    pub fn ok_response<T: serde::Serialize>(id: u64, data: &T) -> Self {
-        Message::Response { id, ok: true, data: Some(serde_json::to_value(data).expect("response data must be serializable")), error: None }
-    }
-
-    /// Build a success response with no payload.
-    pub fn empty_ok_response(id: u64) -> Self {
-        Message::Response { id, ok: true, data: None, error: None }
+    /// Build a success response.
+    pub fn ok_response(id: u64, response: Response) -> Self {
+        Message::Response { id, response: Box::new(ResponseResult::Ok { response: Box::new(response) }) }
     }
 
     /// Build an error response.
     pub fn error_response(id: u64, message: impl Into<String>) -> Self {
-        Message::Response { id, ok: false, data: None, error: Some(message.into()) }
+        Message::Response { id, response: Box::new(ResponseResult::Err { message: message.into() }) }
     }
 }
 
@@ -145,11 +158,11 @@ impl Message {
 pub enum DaemonEvent {
     /// Full snapshot — sent on initial connect, after seq gaps, or when delta
     /// would be larger than the full snapshot.
-    #[serde(rename = "snapshot_full")]
-    SnapshotFull(Box<Snapshot>),
+    #[serde(rename = "repo_snapshot")]
+    RepoSnapshot(Box<RepoSnapshot>),
     /// Incremental delta — sent when only a subset of data changed.
-    #[serde(rename = "snapshot_delta")]
-    SnapshotDelta(Box<SnapshotDelta>),
+    #[serde(rename = "repo_delta")]
+    RepoDelta(Box<RepoDelta>),
     #[serde(rename = "repo_added")]
     RepoAdded(Box<RepoInfo>),
     #[serde(rename = "repo_removed")]
@@ -192,7 +205,7 @@ pub enum PeerConnectionState {
 
 /// A delta update for a repo snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotDelta {
+pub struct RepoDelta {
     pub seq: u64,
     pub prev_seq: u64,
     pub repo_identity: RepoIdentity,
@@ -216,16 +229,19 @@ mod tests {
         HostPath::new(HostName::new("test-host"), PathBuf::from(path))
     }
 
+    fn sample_command() -> Command {
+        Command { host: None, context_repo: None, action: CommandAction::AddRepo { path: PathBuf::from("/tmp/my-repo") } }
+    }
+
     #[test]
     fn message_request_roundtrip() {
-        let msg = Message::Request { id: 42, method: "subscribe".to_string(), params: serde_json::json!({"repo": "/tmp/my-repo"}) };
+        let msg = Message::Request { id: 42, request: Request::GetState { repo: PathBuf::from("/tmp/my-repo") } };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
-            Message::Request { id, method, params } => {
+            Message::Request { id, request } => {
                 assert_eq!(id, 42);
-                assert_eq!(method, "subscribe");
-                assert_eq!(params["repo"], "/tmp/my-repo");
+                assert_eq!(request, Request::GetState { repo: PathBuf::from("/tmp/my-repo") });
             }
             other => panic!("expected Request, got {:?}", other),
         }
@@ -233,42 +249,86 @@ mod tests {
 
     #[test]
     fn message_response_roundtrip() {
-        // ok=true with data
-        let msg = Message::Response { id: 1, ok: true, data: Some(serde_json::json!({"count": 42})), error: None };
+        let msg = Message::Response { id: 1, response: Box::new(ResponseResult::Ok { response: Box::new(Response::ListRepos(vec![])) }) };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
-            Message::Response { id, ok, data, error } => {
+            Message::Response { id, response } => {
                 assert_eq!(id, 1);
-                assert!(ok);
-                assert_eq!(data.unwrap()["count"], 42);
-                assert!(error.is_none());
+                match *response {
+                    ResponseResult::Ok { response } => match *response {
+                        Response::ListRepos(repos) => assert!(repos.is_empty()),
+                        other => panic!("expected list repos response, got {:?}", other),
+                    },
+                    other => panic!("expected list repos response, got {:?}", other),
+                }
             }
             other => panic!("expected Response, got {:?}", other),
         }
-        // error=None should not appear in JSON
-        assert!(!json.contains("error"));
 
-        // ok=false with error
-        let msg = Message::Response { id: 2, ok: false, data: None, error: Some("not found".to_string()) };
+        let msg = Message::Response {
+            id: 2,
+            response: Box::new(ResponseResult::Ok { response: Box::new(Response::Execute { command_id: 99 }) }),
+        };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
-            Message::Response { id, ok, data, error } => {
+            Message::Response { id, response } => {
                 assert_eq!(id, 2);
-                assert!(!ok);
-                assert!(data.is_none());
-                assert_eq!(error.as_deref(), Some("not found"));
+                match *response {
+                    ResponseResult::Ok { response } => match *response {
+                        Response::Execute { command_id } => assert_eq!(command_id, 99),
+                        other => panic!("expected execute response, got {:?}", other),
+                    },
+                    other => panic!("expected execute response, got {:?}", other),
+                }
             }
             other => panic!("expected Response, got {:?}", other),
         }
-        // data=None should not appear in JSON
-        assert!(!json.contains("data"));
+
+        let msg = Message::Response { id: 3, response: Box::new(ResponseResult::Err { message: "not found".to_string() }) };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Response { id, response } => {
+                assert_eq!(id, 3);
+                match *response {
+                    ResponseResult::Err { message } => assert_eq!(message, "not found"),
+                    other => panic!("expected error response, got {:?}", other),
+                }
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn message_request_roundtrip_covers_unit_and_command_variants() {
+        let list_repos = Message::Request { id: 7, request: Request::ListRepos };
+        let json = serde_json::to_string(&list_repos).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Request { id, request } => {
+                assert_eq!(id, 7);
+                assert_eq!(request, Request::ListRepos);
+            }
+            other => panic!("expected Request, got {:?}", other),
+        }
+
+        let execute = Message::Request { id: 9, request: Request::Execute { command: sample_command() } };
+        let json = serde_json::to_string(&execute).expect("serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            Message::Request { id, request } => {
+                assert_eq!(id, 9);
+                assert_eq!(request, Request::Execute { command: sample_command() });
+            }
+            other => panic!("expected Request, got {:?}", other),
+        }
     }
 
     #[test]
     fn message_event_snapshot_roundtrip() {
-        let snapshot = Snapshot {
+        let snapshot = RepoSnapshot {
             seq: 7,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() },
             repo: PathBuf::from("/tmp/my-repo"),
@@ -299,12 +359,12 @@ mod tests {
             issue_has_more: false,
             issue_search_results: None,
         };
-        let msg = Message::Event { event: Box::new(DaemonEvent::SnapshotFull(Box::new(snapshot))) };
+        let msg = Message::Event { event: Box::new(DaemonEvent::RepoSnapshot(Box::new(snapshot))) };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
             Message::Event { event } => match *event {
-                DaemonEvent::SnapshotFull(snap) => {
+                DaemonEvent::RepoSnapshot(snap) => {
                     let snap = *snap;
                     assert_eq!(snap.seq, 7);
                     assert_eq!(snap.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() });
@@ -317,7 +377,7 @@ mod tests {
                     assert_eq!(snap.errors.len(), 1);
                     assert_eq!(snap.errors[0].category, "github");
                 }
-                other => panic!("expected Snapshot event, got {:?}", other),
+                other => panic!("expected RepoSnapshot event, got {:?}", other),
             },
             other => panic!("expected Event, got {:?}", other),
         }
@@ -325,7 +385,7 @@ mod tests {
 
     #[test]
     fn snapshot_delta_event_roundtrip() {
-        let delta = SnapshotDelta {
+        let delta = RepoDelta {
             seq: 3,
             prev_seq: 2,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() },
@@ -339,12 +399,12 @@ mod tests {
             issue_has_more: true,
             issue_search_results: None,
         };
-        let msg = Message::Event { event: Box::new(DaemonEvent::SnapshotDelta(Box::new(delta))) };
+        let msg = Message::Event { event: Box::new(DaemonEvent::RepoDelta(Box::new(delta))) };
         let json = serde_json::to_string(&msg).expect("serialize");
         let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
             Message::Event { event } => match *event {
-                DaemonEvent::SnapshotDelta(d) => {
+                DaemonEvent::RepoDelta(d) => {
                     assert_eq!(d.seq, 3);
                     assert_eq!(d.prev_seq, 2);
                     assert_eq!(d.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() });
@@ -354,7 +414,7 @@ mod tests {
                     assert!(d.issue_has_more);
                     assert!(d.issue_search_results.is_none());
                 }
-                other => panic!("expected SnapshotDelta, got {:?}", other),
+                other => panic!("expected RepoDelta, got {:?}", other),
             },
             other => panic!("expected Event, got {:?}", other),
         }
@@ -362,30 +422,32 @@ mod tests {
 
     #[test]
     fn ok_response_builds_with_serialized_data() {
-        let data = serde_json::json!({"count": 42, "name": "test"});
-        let msg = Message::ok_response(7, &data);
+        let msg = Message::ok_response(7, Response::Execute { command_id: 42 });
         match msg {
-            Message::Response { id, ok, data, error } => {
+            Message::Response { id, response } => {
                 assert_eq!(id, 7);
-                assert!(ok);
-                let d = data.expect("should have data");
-                assert_eq!(d["count"], 42);
-                assert_eq!(d["name"], "test");
-                assert!(error.is_none());
+                match *response {
+                    ResponseResult::Ok { response } => match *response {
+                        Response::Execute { command_id } => assert_eq!(command_id, 42),
+                        other => panic!("expected execute response, got {:?}", other),
+                    },
+                    other => panic!("expected execute response, got {:?}", other),
+                }
             }
             other => panic!("expected Response, got {:?}", other),
         }
     }
 
     #[test]
-    fn empty_ok_response_builds_with_no_data() {
-        let msg = Message::empty_ok_response(99);
+    fn ok_response_builds_with_unit_variant() {
+        let msg = Message::ok_response(99, Response::Refresh);
         match msg {
-            Message::Response { id, ok, data, error } => {
+            Message::Response { id, response } => {
                 assert_eq!(id, 99);
-                assert!(ok);
-                assert!(data.is_none());
-                assert!(error.is_none());
+                match *response {
+                    ResponseResult::Ok { response } => assert!(matches!(*response, Response::Refresh)),
+                    other => panic!("expected refresh response, got {:?}", other),
+                }
             }
             other => panic!("expected Response, got {:?}", other),
         }
@@ -395,11 +457,12 @@ mod tests {
     fn error_response_builds_with_error_message() {
         let msg = Message::error_response(5, "something went wrong");
         match msg {
-            Message::Response { id, ok, data, error } => {
+            Message::Response { id, response } => {
                 assert_eq!(id, 5);
-                assert!(!ok);
-                assert!(data.is_none());
-                assert_eq!(error.as_deref(), Some("something went wrong"));
+                match *response {
+                    ResponseResult::Err { message } => assert_eq!(message, "something went wrong"),
+                    other => panic!("expected error response, got {:?}", other),
+                }
             }
             other => panic!("expected Response, got {:?}", other),
         }
@@ -459,7 +522,7 @@ mod tests {
 
     #[test]
     fn snapshot_delta_roundtrip_preserves_repo_identity() {
-        let delta = SnapshotDelta {
+        let delta = RepoDelta {
             seq: 2,
             prev_seq: 1,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
@@ -472,7 +535,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&delta).expect("serialize");
-        let decoded: SnapshotDelta = serde_json::from_str(&json).expect("deserialize");
+        let decoded: RepoDelta = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
         assert_eq!(decoded.repo, PathBuf::from("/tmp/repo"));
     }

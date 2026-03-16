@@ -14,9 +14,9 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError,
-    RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoWorkResponse, Snapshot, SnapshotDelta,
-    StatusResponse, TopologyResponse, WorkItem,
+    Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError, RepoDelta,
+    RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, StatusResponse,
+    TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
@@ -44,7 +44,7 @@ impl DaemonHandle for StubDaemon {
         self.tx.subscribe()
     }
 
-    async fn get_state(&self, _repo: &Path) -> Result<Snapshot, String> {
+    async fn get_state(&self, _repo: &Path) -> Result<RepoSnapshot, String> {
         Err("stub".into())
     }
 
@@ -126,8 +126,8 @@ pub(crate) fn provider_error(category: &str, provider: &str, message: &str) -> P
     ProviderError { category: category.into(), provider: provider.into(), message: message.into() }
 }
 
-pub(crate) fn snapshot(repo: &Path) -> Snapshot {
-    Snapshot {
+pub(crate) fn snapshot(repo: &Path) -> RepoSnapshot {
+    RepoSnapshot {
         seq: 1,
         repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.display().to_string() },
         repo: repo.to_path_buf(),
@@ -142,8 +142,8 @@ pub(crate) fn snapshot(repo: &Path) -> Snapshot {
     }
 }
 
-pub(crate) fn delta(repo: &Path, changes: Vec<Change>) -> SnapshotDelta {
-    SnapshotDelta {
+pub(crate) fn delta(repo: &Path, changes: Vec<Change>) -> RepoDelta {
+    RepoDelta {
         seq: 2,
         prev_seq: 1,
         repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.display().to_string() },

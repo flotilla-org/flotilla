@@ -74,7 +74,7 @@ async fn socket_roundtrip() {
     client.refresh(&repo).await.expect("refresh");
     let event = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("timeout waiting for event").expect("recv");
     // The refresh should produce a snapshot event (full or delta)
-    assert!(matches!(event, DaemonEvent::SnapshotFull(_) | DaemonEvent::SnapshotDelta(_)), "expected snapshot event, got {:?}", event);
+    assert!(matches!(event, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_)), "expected snapshot event, got {:?}", event);
 
     // replay_since with current seq — should return empty (up to date)
     let snapshot = client.get_state(&repo).await.expect("get_state");
@@ -86,7 +86,7 @@ async fn socket_roundtrip() {
     let last_seen = HashMap::from([(snapshot.repo_identity, 999999)]);
     let replay = client.replay_since(&last_seen).await.expect("replay_since");
     assert_eq!(replay.len(), 1, "should get one full snapshot");
-    assert!(matches!(&replay[0], DaemonEvent::SnapshotFull(snap) if snap.repo == repo), "expected SnapshotFull, got {:?}", replay[0]);
+    assert!(matches!(&replay[0], DaemonEvent::RepoSnapshot(snap) if snap.repo == repo), "expected RepoSnapshot, got {:?}", replay[0]);
 
     // Clean up
     server_handle.abort();

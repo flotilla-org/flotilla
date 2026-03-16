@@ -216,10 +216,10 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandResult) ->
 pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> String {
     use flotilla_protocol::{DaemonEvent, PeerConnectionState};
     match event {
-        DaemonEvent::SnapshotFull(snap) => {
+        DaemonEvent::RepoSnapshot(snap) => {
             format!("[snapshot] {}: full snapshot (seq {}, {} work items)", repo_name(&snap.repo), snap.seq, snap.work_items.len())
         }
-        DaemonEvent::SnapshotDelta(delta) => {
+        DaemonEvent::RepoDelta(delta) => {
             format!(
                 "[delta]    {}: delta seq {}\u{2192}{} ({} changes)",
                 repo_name(&delta.repo),
@@ -259,8 +259,8 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
 /// Extract the (repo_identity, seq) from a snapshot event, if present.
 fn event_seq(event: &DaemonEvent) -> Option<(&RepoIdentity, u64)> {
     match event {
-        DaemonEvent::SnapshotFull(snap) => Some((&snap.repo_identity, snap.seq)),
-        DaemonEvent::SnapshotDelta(delta) => Some((&delta.repo_identity, delta.seq)),
+        DaemonEvent::RepoSnapshot(snap) => Some((&snap.repo_identity, snap.seq)),
+        DaemonEvent::RepoDelta(delta) => Some((&delta.repo_identity, delta.seq)),
         _ => None,
     }
 }
@@ -717,16 +717,16 @@ mod tests {
     mod watch_human {
         use std::path::PathBuf;
 
-        use flotilla_protocol::{commands::CommandResult, snapshot::Snapshot, DaemonEvent, HostName, PeerConnectionState, SnapshotDelta};
+        use flotilla_protocol::{commands::CommandResult, DaemonEvent, HostName, PeerConnectionState, RepoDelta, RepoSnapshot};
 
         use crate::cli::format_event_human;
 
-        fn dummy_snapshot(seq: u64, repo: &str, work_item_count: usize) -> Snapshot {
+        fn dummy_snapshot(seq: u64, repo: &str, work_item_count: usize) -> RepoSnapshot {
             use std::collections::HashMap;
 
             use flotilla_protocol::snapshot::{WorkItem, WorkItemIdentity, WorkItemKind};
 
-            Snapshot {
+            RepoSnapshot {
                 seq,
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.into() },
                 repo: PathBuf::from(repo),
@@ -763,7 +763,7 @@ mod tests {
 
         #[test]
         fn snapshot_full() {
-            let event = DaemonEvent::SnapshotFull(Box::new(dummy_snapshot(42, "/tmp/my-repo", 5)));
+            let event = DaemonEvent::RepoSnapshot(Box::new(dummy_snapshot(42, "/tmp/my-repo", 5)));
             let line = format_event_human(&event);
             assert!(line.contains("[snapshot]"), "should have snapshot tag");
             assert!(line.contains("my-repo"), "should extract repo name from path");
@@ -773,7 +773,7 @@ mod tests {
 
         #[test]
         fn snapshot_delta() {
-            let event = DaemonEvent::SnapshotDelta(Box::new(SnapshotDelta {
+            let event = DaemonEvent::RepoDelta(Box::new(RepoDelta {
                 seq: 42,
                 prev_seq: 41,
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },

@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use async_trait::async_trait;
 use flotilla_protocol::{
     Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse,
+    RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, StatusResponse, TopologyResponse,
 };
 use tokio::sync::broadcast;
 
@@ -15,7 +15,7 @@ pub trait DaemonHandle: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent>;
 
     /// Get full current state for a repo.
-    async fn get_state(&self, repo: &Path) -> Result<Snapshot, String>;
+    async fn get_state(&self, repo: &Path) -> Result<RepoSnapshot, String>;
 
     /// List all tracked repos.
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String>;
@@ -40,10 +40,10 @@ pub trait DaemonHandle: Send + Sync {
     /// Get replay events for repos based on last-seen sequence numbers.
     ///
     /// For each repo in `last_seen`, checks the delta log:
-    /// - If replayable: returns `SnapshotDelta` events for each missing entry
-    /// - If not replayable (seq too old or unknown): returns `SnapshotFull`
+    /// - If replayable: returns `RepoDelta` events for each missing entry
+    /// - If not replayable (seq too old or unknown): returns `RepoSnapshot`
     ///
-    /// Repos not in `last_seen` get a `SnapshotFull`.
+    /// Repos not in `last_seen` get a `RepoSnapshot`.
     async fn replay_since(&self, last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String>;
 
     /// High-level status: repos, health, counts.

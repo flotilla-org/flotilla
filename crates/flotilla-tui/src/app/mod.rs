@@ -21,8 +21,8 @@ use flotilla_core::{
     data::{self, GroupEntry, SectionLabels},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandResult, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoIdentity, RepoInfo,
-    RepoLabels, RepoSelector, Snapshot, SnapshotDelta, StepStatus, WorkItem, WorkItemIdentity,
+    Command, CommandAction, CommandResult, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoDelta,
+    RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
 use tui_input::Input;
@@ -115,7 +115,7 @@ pub struct TuiModel {
     /// Key: (repo_identity, provider_category, provider_name)
     pub provider_statuses: HashMap<(RepoIdentity, String, String), ProviderStatus>,
     pub status_message: Option<String>,
-    /// The daemon's hostname, set from the first Snapshot received.
+    /// The daemon's hostname, set from the first RepoSnapshot received.
     pub my_host: Option<HostName>,
     /// Status of configured remote peer hosts.
     pub peer_hosts: Vec<PeerHostStatus>,
@@ -385,8 +385,8 @@ impl App {
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
-            DaemonEvent::SnapshotFull(snap) => self.apply_snapshot(*snap),
-            DaemonEvent::SnapshotDelta(delta) => self.apply_delta(*delta),
+            DaemonEvent::RepoSnapshot(snap) => self.apply_snapshot(*snap),
+            DaemonEvent::RepoDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoAdded(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoRemoved { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
             DaemonEvent::CommandStarted { command_id, repo_identity, repo, description, .. } => {
@@ -473,7 +473,7 @@ impl App {
         }
     }
 
-    fn apply_snapshot(&mut self, snap: Snapshot) {
+    fn apply_snapshot(&mut self, snap: RepoSnapshot) {
         if self.model.my_host.is_none() {
             self.model.my_host = Some(snap.host_name.clone());
         }
@@ -544,7 +544,7 @@ impl App {
         }
     }
 
-    fn apply_delta(&mut self, delta: SnapshotDelta) {
+    fn apply_delta(&mut self, delta: RepoDelta) {
         let repo_identity = delta.repo_identity.clone();
         let path = delta.repo;
         let mut status_message_update = None;

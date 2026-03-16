@@ -56,7 +56,7 @@ pub struct RepoInfo {
 
 /// A complete snapshot for one repo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Snapshot {
+pub struct RepoSnapshot {
     pub seq: u64,
     pub repo_identity: RepoIdentity,
     pub repo: PathBuf,
@@ -199,8 +199,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_roundtrip_covers_empty_and_populated() {
-        let empty = Snapshot {
+    fn repo_snapshot_roundtrip_covers_empty_and_populated() {
+        let empty = RepoSnapshot {
             seq: 0,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/empty".into() },
             repo: PathBuf::from("/repos/empty"),
@@ -214,12 +214,12 @@ mod tests {
             issue_search_results: None,
         };
         let json = serde_json::to_string(&empty).expect("serialize");
-        let decoded_empty: Snapshot = serde_json::from_str(&json).expect("deserialize");
+        let decoded_empty: RepoSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded_empty.seq, 0);
         assert_eq!(decoded_empty.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/empty".into() });
         assert!(decoded_empty.work_items.is_empty());
 
-        let populated = Snapshot {
+        let populated = RepoSnapshot {
             seq: 42,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/project".into() },
             repo: PathBuf::from("/repos/project"),
@@ -266,7 +266,7 @@ mod tests {
             issue_search_results: None,
         };
         let json = serde_json::to_string(&populated).expect("serialize");
-        let decoded_populated: Snapshot = serde_json::from_str(&json).expect("deserialize");
+        let decoded_populated: RepoSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded_populated.seq, 42);
         assert_eq!(decoded_populated.work_items.len(), 2);
         assert_eq!(decoded_populated.work_items[0].kind, WorkItemKind::Checkout);

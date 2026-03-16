@@ -17,8 +17,10 @@ pub async fn write_message_line(writer: &mut (impl AsyncWrite + Unpin), msg: &Me
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
-    use crate::HostName;
+    use crate::{HostName, Message, Request};
 
     #[tokio::test]
     async fn write_message_line_produces_valid_json_line() {
@@ -41,16 +43,16 @@ mod tests {
 
     #[tokio::test]
     async fn write_message_line_request() {
-        let msg = Message::Request { id: 42, method: "subscribe".into(), params: serde_json::json!({}) };
+        let msg = Message::Request { id: 42, request: Request::GetState { repo: PathBuf::from("/tmp/my-repo") } };
         let mut buf = Vec::new();
         write_message_line(&mut buf, &msg).await.expect("write should succeed");
 
         let output = String::from_utf8(buf).expect("valid utf-8");
         let parsed: Message = serde_json::from_str(output.trim_end()).expect("valid JSON");
         match parsed {
-            Message::Request { id, method, .. } => {
+            Message::Request { id, request } => {
                 assert_eq!(id, 42);
-                assert_eq!(method, "subscribe");
+                assert_eq!(request, Request::GetState { repo: PathBuf::from("/tmp/my-repo") });
             }
             other => panic!("expected Request, got {other:?}"),
         }

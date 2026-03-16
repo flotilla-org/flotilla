@@ -11,8 +11,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, Message, RawResponse, ReplayCursor,
-    RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoWorkResponse, Snapshot, StatusResponse, TopologyResponse,
+    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, Message, ReplayCursor, RepoDetailResponse,
+    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, Request, Response, ResponseResult, StatusResponse,
+    TopologyResponse,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -56,7 +57,7 @@ impl Drop for SpawnLockGuard {
 
 pub struct SocketDaemon {
     writer: Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     next_id: Arc<AtomicU64>,
     /// Local snapshot seq per repo, for gap detection.
@@ -75,7 +76,7 @@ impl SocketDaemon {
         let (read_half, write_half) = stream.into_split();
 
         let (event_tx, _) = broadcast::channel(256);
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -113,11 +114,10 @@ impl SocketDaemon {
                         };
 
                         match msg {
-                            Message::Response { id, ok, data, error } => {
-                                let raw = RawResponse { ok, data, error };
+                            Message::Response { id, response } => {
                                 let mut map = reader_pending.lock().await;
                                 if let Some(tx) = map.remove(&id) {
-                                    let _ = tx.send(raw);
+                                    let _ = tx.send(*response);
                                 } else {
                                     warn!(%id, "received response for unknown request id");
                                 }
@@ -150,7 +150,7 @@ impl SocketDaemon {
                         error!("daemon connection closed (EOF)");
                         let mut map = reader_pending.lock().await;
                         for (_, tx) in map.drain() {
-                            let _ = tx.send(RawResponse { ok: false, data: None, error: Some("daemon connection closed".into()) });
+                            let _ = tx.send(ResponseResult::Err { message: "daemon connection closed".into() });
                         }
                         break;
                     }
@@ -158,7 +158,7 @@ impl SocketDaemon {
                         error!(err = %e, "error reading from daemon socket");
                         let mut map = reader_pending.lock().await;
                         for (_, tx) in map.drain() {
-                            let _ = tx.send(RawResponse { ok: false, data: None, error: Some(format!("daemon read error: {e}")) });
+                            let _ = tx.send(ResponseResult::Err { message: format!("daemon read error: {e}") });
                         }
                         break;
                     }
@@ -170,8 +170,8 @@ impl SocketDaemon {
     }
 
     /// Send a request to the daemon and wait for the matching response.
-    async fn request(&self, method: &str, params: serde_json::Value) -> Result<RawResponse, String> {
-        send_request(&self.writer, &self.pending, &self.next_id, method, params).await
+    async fn request(&self, request: Request) -> Result<ResponseResult, String> {
+        send_request(&self.writer, &self.pending, &self.next_id, request).await
     }
 }
 
@@ -342,11 +342,10 @@ pub async fn connect_or_spawn(
 /// background recovery task can use it.
 async fn send_request(
     writer: &Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
-    pending: &Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>,
+    pending: &Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>,
     next_id: &AtomicU64,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<RawResponse, String> {
+    request: Request,
+) -> Result<ResponseResult, String> {
     let id = next_id.fetch_add(1, Ordering::Relaxed);
 
     let (tx, rx) = oneshot::channel();
@@ -356,7 +355,7 @@ async fn send_request(
         map.insert(id, tx);
     }
 
-    let msg = Message::Request { id, method: method.to_string(), params };
+    let msg = Message::Request { id, request };
 
     let write_result = async {
         let mut w = writer.lock().await;
@@ -386,6 +385,13 @@ fn encode_replay_cursors(last_seen: &HashMap<RepoIdentity, u64>) -> Vec<ReplayCu
     last_seen.iter().map(|(repo_identity, &seq)| ReplayCursor { repo_identity: repo_identity.clone(), seq }).collect()
 }
 
+fn into_success_response(result: ResponseResult) -> Result<Response, String> {
+    match result {
+        ResponseResult::Ok { response } => Ok(*response),
+        ResponseResult::Err { message } => Err(message),
+    }
+}
+
 /// Handle a daemon event in the background reader: update local seq tracking,
 /// forward to TUI subscribers, and spawn gap recovery if needed.
 ///
@@ -398,18 +404,18 @@ fn handle_event(
     recovering: &Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
     event_tx: &broadcast::Sender<DaemonEvent>,
     writer: &Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>>,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     next_id: &Arc<AtomicU64>,
 ) {
     match &event {
-        DaemonEvent::SnapshotFull(snap) => {
+        DaemonEvent::RepoSnapshot(snap) => {
             debug!(repo_identity = %snap.repo_identity, repo = %snap.repo.display(), seq = snap.seq, "received full snapshot");
             // Sync lock: update seq before dispatching event so a
             // quickly-following delta sees the correct local seq.
             local_seqs.write().unwrap().insert(snap.repo_identity.clone(), snap.seq);
             let _ = event_tx.send(event);
         }
-        DaemonEvent::SnapshotDelta(delta) => {
+        DaemonEvent::RepoDelta(delta) => {
             let repo = delta.repo.clone();
             let repo_identity = delta.repo_identity.clone();
             let prev_seq = delta.prev_seq;
@@ -461,7 +467,7 @@ fn handle_event(
                         let recovered_seq = local_seqs.read().unwrap().get(&repo_identity).copied();
                         for buffered_event in buffered {
                             let dominated = match &buffered_event {
-                                DaemonEvent::SnapshotDelta(d) => recovered_seq.is_some_and(|rs| d.seq <= rs),
+                                DaemonEvent::RepoDelta(d) => recovered_seq.is_some_and(|rs| d.seq <= rs),
                                 _ => false,
                             };
                             if dominated {
@@ -495,7 +501,7 @@ async fn recover_from_gap(
     local_seqs: &SeqMap,
     event_tx: &broadcast::Sender<DaemonEvent>,
     writer: &Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
-    pending: &Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>,
+    pending: &Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>,
     next_id: &AtomicU64,
 ) {
     let last_seen = {
@@ -504,11 +510,11 @@ async fn recover_from_gap(
     };
 
     let last_seen = encode_replay_cursors(&last_seen);
-    let resp = send_request(writer, pending, next_id, "replay_since", serde_json::json!({ "last_seen": last_seen })).await;
+    let resp = send_request(writer, pending, next_id, Request::ReplaySince { last_seen }).await;
 
     match resp {
-        Ok(raw) => match raw.parse::<Vec<DaemonEvent>>() {
-            Ok(events) => {
+        Ok(result) => match into_success_response(result) {
+            Ok(Response::ReplaySince(events)) => {
                 debug!(event_count = events.len(), "gap recovery: got replay events");
                 // Update seqs monotonically — a live event may have advanced
                 // a repo's seq while this replay was in flight.
@@ -516,13 +522,13 @@ async fn recover_from_gap(
                     let mut seqs = local_seqs.write().unwrap();
                     for event in &events {
                         match event {
-                            DaemonEvent::SnapshotFull(snap) => {
+                            DaemonEvent::RepoSnapshot(snap) => {
                                 let current = seqs.get(&snap.repo_identity).copied().unwrap_or(0);
                                 if snap.seq >= current {
                                     seqs.insert(snap.repo_identity.clone(), snap.seq);
                                 }
                             }
-                            DaemonEvent::SnapshotDelta(delta) => {
+                            DaemonEvent::RepoDelta(delta) => {
                                 let current = seqs.get(&delta.repo_identity).copied().unwrap_or(0);
                                 if delta.seq >= current {
                                     seqs.insert(delta.repo_identity.clone(), delta.seq);
@@ -536,8 +542,11 @@ async fn recover_from_gap(
                     let _ = event_tx.send(event);
                 }
             }
+            Ok(other) => {
+                error!(response = ?other, "gap recovery: unexpected replay_since response");
+            }
             Err(e) => {
-                error!(err = %e, "gap recovery: failed to parse replay events");
+                error!(err = %e, "gap recovery: replay_since returned error response");
             }
         },
         Err(e) => {
@@ -552,47 +561,63 @@ impl DaemonHandle for SocketDaemon {
         self.event_tx.subscribe()
     }
 
-    async fn get_state(&self, repo: &Path) -> Result<Snapshot, String> {
+    async fn get_state(&self, repo: &Path) -> Result<RepoSnapshot, String> {
         // Always RPC to server — local state only tracks seqs for gap detection,
         // not full snapshots (work_items can't be materialized client-side).
-        let resp = self.request("get_state", serde_json::json!({ "repo": repo })).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetState { repo: repo.to_path_buf() }).await?)? {
+            Response::GetState(snapshot) => Ok(*snapshot),
+            other => Err(format!("unexpected response for get_state: {other:?}")),
+        }
     }
 
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-        let resp = self.request("list_repos", serde_json::json!({})).await?;
-        resp.parse::<Vec<RepoInfo>>()
+        match into_success_response(self.request(Request::ListRepos).await?)? {
+            Response::ListRepos(repos) => Ok(repos),
+            other => Err(format!("unexpected response for list_repos: {other:?}")),
+        }
     }
 
     async fn execute(&self, command: Command) -> Result<u64, String> {
-        let resp = self.request("execute", serde_json::json!({ "command": command })).await?;
-        resp.parse::<u64>()
+        match into_success_response(self.request(Request::Execute { command }).await?)? {
+            Response::Execute { command_id } => Ok(command_id),
+            other => Err(format!("unexpected response for execute: {other:?}")),
+        }
     }
 
     async fn cancel(&self, command_id: u64) -> Result<(), String> {
-        let resp = self.request("cancel", serde_json::json!({ "command_id": command_id })).await?;
-        resp.parse_empty()
+        match into_success_response(self.request(Request::Cancel { command_id }).await?)? {
+            Response::Cancel => Ok(()),
+            other => Err(format!("unexpected response for cancel: {other:?}")),
+        }
     }
 
     async fn refresh(&self, repo: &Path) -> Result<(), String> {
-        let resp = self.request("refresh", serde_json::json!({ "repo": repo })).await?;
-        resp.parse_empty()
+        match into_success_response(self.request(Request::Refresh { repo: repo.to_path_buf() }).await?)? {
+            Response::Refresh => Ok(()),
+            other => Err(format!("unexpected response for refresh: {other:?}")),
+        }
     }
 
     async fn add_repo(&self, path: &Path) -> Result<(), String> {
-        let resp = self.request("add_repo", serde_json::json!({ "path": path })).await?;
-        resp.parse_empty()
+        match into_success_response(self.request(Request::AddRepo { path: path.to_path_buf() }).await?)? {
+            Response::AddRepo => Ok(()),
+            other => Err(format!("unexpected response for add_repo: {other:?}")),
+        }
     }
 
     async fn remove_repo(&self, path: &Path) -> Result<(), String> {
-        let resp = self.request("remove_repo", serde_json::json!({ "path": path })).await?;
-        resp.parse_empty()
+        match into_success_response(self.request(Request::RemoveRepo { path: path.to_path_buf() }).await?)? {
+            Response::RemoveRepo => Ok(()),
+            other => Err(format!("unexpected response for remove_repo: {other:?}")),
+        }
     }
 
     async fn replay_since(&self, last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
         let last_seen = encode_replay_cursors(last_seen);
-        let resp = self.request("replay_since", serde_json::json!({ "last_seen": last_seen })).await?;
-        let events: Vec<DaemonEvent> = resp.parse()?;
+        let events = match into_success_response(self.request(Request::ReplaySince { last_seen }).await?)? {
+            Response::ReplaySince(events) => events,
+            other => return Err(format!("unexpected response for replay_since: {other:?}")),
+        };
 
         // Seed local_seqs from replay events so the background reader
         // doesn't trigger spurious gap recovery for the first live delta.
@@ -602,8 +627,8 @@ impl DaemonHandle for SocketDaemon {
             let mut seqs = self.local_seqs.write().unwrap();
             for event in &events {
                 let (identity, seq) = match event {
-                    DaemonEvent::SnapshotFull(snap) => (snap.repo_identity.clone(), snap.seq),
-                    DaemonEvent::SnapshotDelta(delta) => (delta.repo_identity.clone(), delta.seq),
+                    DaemonEvent::RepoSnapshot(snap) => (snap.repo_identity.clone(), snap.seq),
+                    DaemonEvent::RepoDelta(delta) => (delta.repo_identity.clone(), delta.seq),
                     _ => continue,
                 };
                 seqs.entry(identity).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
@@ -614,55 +639,71 @@ impl DaemonHandle for SocketDaemon {
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {
-        let resp = self.request("get_status", serde_json::json!({})).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetStatus).await?)? {
+            Response::GetStatus(status) => Ok(status),
+            other => Err(format!("unexpected response for get_status: {other:?}")),
+        }
     }
 
     async fn get_repo_detail(&self, slug: &str) -> Result<RepoDetailResponse, String> {
-        let resp = self.request("get_repo_detail", serde_json::json!({ "slug": slug })).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetRepoDetail { slug: slug.to_string() }).await?)? {
+            Response::GetRepoDetail(detail) => Ok(detail),
+            other => Err(format!("unexpected response for get_repo_detail: {other:?}")),
+        }
     }
 
     async fn get_repo_providers(&self, slug: &str) -> Result<RepoProvidersResponse, String> {
-        let resp = self.request("get_repo_providers", serde_json::json!({ "slug": slug })).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetRepoProviders { slug: slug.to_string() }).await?)? {
+            Response::GetRepoProviders(providers) => Ok(providers),
+            other => Err(format!("unexpected response for get_repo_providers: {other:?}")),
+        }
     }
 
     async fn get_repo_work(&self, slug: &str) -> Result<RepoWorkResponse, String> {
-        let resp = self.request("get_repo_work", serde_json::json!({ "slug": slug })).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetRepoWork { slug: slug.to_string() }).await?)? {
+            Response::GetRepoWork(work) => Ok(work),
+            other => Err(format!("unexpected response for get_repo_work: {other:?}")),
+        }
     }
 
     async fn list_hosts(&self) -> Result<HostListResponse, String> {
-        let resp = self.request("list_hosts", serde_json::json!({})).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::ListHosts).await?)? {
+            Response::ListHosts(hosts) => Ok(hosts),
+            other => Err(format!("unexpected response for list_hosts: {other:?}")),
+        }
     }
 
     async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String> {
-        let resp = self.request("get_host_status", serde_json::json!({ "host": host })).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetHostStatus { host: host.to_string() }).await?)? {
+            Response::GetHostStatus(status) => Ok(status),
+            other => Err(format!("unexpected response for get_host_status: {other:?}")),
+        }
     }
 
     async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String> {
-        let resp = self.request("get_host_providers", serde_json::json!({ "host": host })).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetHostProviders { host: host.to_string() }).await?)? {
+            Response::GetHostProviders(providers) => Ok(providers),
+            other => Err(format!("unexpected response for get_host_providers: {other:?}")),
+        }
     }
 
     async fn get_topology(&self) -> Result<TopologyResponse, String> {
-        let resp = self.request("get_topology", serde_json::json!({})).await?;
-        resp.parse()
+        match into_success_response(self.request(Request::GetTopology).await?)? {
+            Response::GetTopology(topology) => Ok(topology),
+            other => Err(format!("unexpected response for get_topology: {other:?}")),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{RepoIdentity, Snapshot, SnapshotDelta};
+    use flotilla_protocol::{HostName, RepoDelta, RepoIdentity, RepoSnapshot};
     use tokio::net::{unix::OwnedReadHalf, UnixStream};
 
     use super::*;
 
     type SharedWriter = Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>;
-    type SharedPending = Arc<Mutex<HashMap<u64, oneshot::Sender<RawResponse>>>>;
+    type SharedPending = Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>;
     type RequestLines = tokio::io::Lines<BufReader<UnixStream>>;
 
     struct RequestHarness {
@@ -676,8 +717,8 @@ mod tests {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
     }
 
-    fn make_snapshot(repo: &Path, seq: u64) -> Snapshot {
-        Snapshot {
+    fn make_snapshot(repo: &Path, seq: u64) -> RepoSnapshot {
+        RepoSnapshot {
             seq,
             repo_identity: repo_identity(),
             repo: repo.to_path_buf(),
@@ -692,8 +733,8 @@ mod tests {
         }
     }
 
-    fn make_delta(repo: &Path, prev_seq: u64, seq: u64) -> SnapshotDelta {
-        SnapshotDelta {
+    fn make_delta(repo: &Path, prev_seq: u64, seq: u64) -> RepoDelta {
+        RepoDelta {
             seq,
             prev_seq,
             repo_identity: repo_identity(),
@@ -734,10 +775,10 @@ mod tests {
         (Arc::new(Mutex::new(BufWriter::new(write_half))), Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicU64::new(1)), server_read)
     }
 
-    async fn read_request(lines: &mut RequestLines) -> (u64, String, serde_json::Value) {
+    async fn read_request(lines: &mut RequestLines) -> (u64, Request) {
         let line = lines.next_line().await.expect("read request line").expect("line missing");
         match serde_json::from_str::<Message>(&line).expect("parse request") {
-            Message::Request { id, method, params } => (id, method, params),
+            Message::Request { id, request } => (id, request),
             other => panic!("expected request, got {other:?}"),
         }
     }
@@ -749,20 +790,19 @@ mod tests {
         let request_writer = Arc::clone(&harness.writer);
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
-        let request_task = tokio::spawn(async move {
-            send_request(&request_writer, &request_pending, &request_next_id, "list_repos", serde_json::json!({"x": 1})).await
-        });
+        let request_task =
+            tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::ListRepos).await });
 
-        let (id, method, params) = read_request(&mut harness.lines).await;
-        assert_eq!(method, "list_repos");
-        assert_eq!(params["x"], 1);
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert_eq!(request, Request::ListRepos);
 
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender should exist");
-        tx.send(RawResponse { ok: true, data: Some(serde_json::json!({"ok": true})), error: None }).expect("send response");
+        tx.send(ResponseResult::Ok { response: Box::new(Response::ListRepos(vec![])) }).expect("send response");
 
-        let raw = request_task.await.expect("join").expect("send_request");
-        assert!(raw.ok);
-        assert_eq!(raw.data.unwrap()["ok"], true);
+        let response = request_task.await.expect("join").expect("send_request");
+        assert!(
+            matches!(response, ResponseResult::Ok { response } if matches!(&*response, Response::ListRepos(repos) if repos.is_empty()))
+        );
     }
 
     #[tokio::test]
@@ -772,12 +812,11 @@ mod tests {
         let request_writer = Arc::clone(&harness.writer);
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
-        let task = tokio::spawn(async move {
-            send_request(&request_writer, &request_pending, &request_next_id, "never_replied", serde_json::json!({})).await
-        });
+        let task =
+            tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetTopology).await });
 
-        let (id, method, _) = read_request(&mut harness.lines).await;
-        assert_eq!(method, "never_replied");
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert_eq!(request, Request::GetTopology);
 
         harness.pending.lock().await.remove(&id);
         let err = task.await.expect("join").expect_err("dropping sender should cancel request");
@@ -788,9 +827,7 @@ mod tests {
     async fn send_request_cleans_pending_on_write_error() {
         let (writer, pending, next_id) = broken_request_harness();
 
-        let err = send_request(&writer, &pending, &next_id, "broken_pipe", serde_json::json!({}))
-            .await
-            .expect_err("closed peer should fail writes");
+        let err = send_request(&writer, &pending, &next_id, Request::GetTopology).await.expect_err("closed peer should fail writes");
 
         assert!(err.contains("failed to"));
         assert!(pending.lock().await.is_empty());
@@ -803,12 +840,10 @@ mod tests {
         let request_writer = Arc::clone(&harness.writer);
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
-        let task = tokio::spawn(async move {
-            send_request(&request_writer, &request_pending, &request_next_id, "cancelled", serde_json::json!({})).await
-        });
+        let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetStatus).await });
 
-        let (id, method, _) = read_request(&mut harness.lines).await;
-        assert_eq!(method, "cancelled");
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert_eq!(request, Request::GetStatus);
 
         harness.pending.lock().await.remove(&id);
 
@@ -824,13 +859,11 @@ mod tests {
         let request_writer = Arc::clone(&harness.writer);
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
-        let task = tokio::spawn(async move {
-            send_request(&request_writer, &request_pending, &request_next_id, "timeout", serde_json::json!({})).await
-        });
+        let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::ListHosts).await });
 
-        let (id, method, _) = read_request(&mut harness.lines).await;
+        let (id, request) = read_request(&mut harness.lines).await;
         assert_eq!(id, 1);
-        assert_eq!(method, "timeout");
+        assert_eq!(request, Request::ListHosts);
 
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
@@ -849,7 +882,7 @@ mod tests {
         let (writer, pending, next_id, _server) = event_harness();
 
         handle_event(
-            DaemonEvent::SnapshotFull(Box::new(make_snapshot(&repo, 10))),
+            DaemonEvent::RepoSnapshot(Box::new(make_snapshot(&repo, 10))),
             &local_seqs,
             &recovering,
             &event_tx,
@@ -858,7 +891,7 @@ mod tests {
             &next_id,
         );
         handle_event(
-            DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 10, 11))),
+            DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 10, 11))),
             &local_seqs,
             &recovering,
             &event_tx,
@@ -868,9 +901,9 @@ mod tests {
         );
 
         let first = event_rx.recv().await.expect("event");
-        assert!(matches!(first, DaemonEvent::SnapshotFull(_)));
+        assert!(matches!(first, DaemonEvent::RepoSnapshot(_)));
         let second = event_rx.recv().await.expect("event");
-        assert!(matches!(second, DaemonEvent::SnapshotDelta(_)));
+        assert!(matches!(second, DaemonEvent::RepoDelta(_)));
         assert_eq!(local_seqs.read().unwrap().get(&repo_identity()), Some(&11));
     }
 
@@ -885,7 +918,7 @@ mod tests {
         let (writer, pending, next_id, _server) = event_harness();
 
         handle_event(
-            DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 99, 100))),
+            DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 99, 100))),
             &local_seqs,
             &recovering,
             &event_tx,
@@ -917,17 +950,16 @@ mod tests {
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
-        let (id, method, _) = read_request(&mut harness.lines).await;
-        assert_eq!(method, "replay_since");
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert!(matches!(request, Request::ReplaySince { .. }));
 
-        let replay_events = vec![DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 3, 4)))];
+        let replay_events = vec![DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 3, 4)))];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender for replay");
-        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize replay events")), error: None })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Box::new(Response::ReplaySince(replay_events)) }).expect("send replay response");
         recover_task.await.expect("join recover");
 
         let event = event_rx.recv().await.expect("forwarded replay event");
-        assert!(matches!(event, DaemonEvent::SnapshotDelta(_)));
+        assert!(matches!(event, DaemonEvent::RepoDelta(_)));
         assert_eq!(local_seqs.read().unwrap().get(&repo_identity()), Some(&4));
     }
 
@@ -974,7 +1006,7 @@ mod tests {
 
         // Delta for a repo we have no local seq for — should start recovery.
         handle_event(
-            DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 0, 1))),
+            DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 0, 1))),
             &local_seqs,
             &recovering,
             &event_tx,
@@ -1001,7 +1033,7 @@ mod tests {
 
         // Delta with prev_seq=10 but local is 5 — gap.
         handle_event(
-            DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 10, 11))),
+            DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 10, 11))),
             &local_seqs,
             &recovering,
             &event_tx,
@@ -1196,15 +1228,16 @@ mod tests {
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
-        let (id, method, _) = read_request(&mut harness.lines).await;
-        assert_eq!(method, "replay_since");
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert!(matches!(request, Request::ReplaySince { .. }));
 
-        // Respond with ok: true but data that cannot be parsed as Vec<DaemonEvent>.
+        // Respond with the wrong success variant.
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(RawResponse { ok: true, data: Some(serde_json::json!({"not": "a vec"})), error: None }).expect("send bad response");
+        tx.send(ResponseResult::Ok { response: Box::new(Response::ListHosts(HostListResponse { hosts: vec![] })) })
+            .expect("send bad response");
 
         // Should complete without panic.
-        recover_task.await.expect("recover_from_gap should not panic on parse error");
+        recover_task.await.expect("recover_from_gap should not panic on unexpected response variant");
         // Local seqs should remain unchanged.
         assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&3));
     }
@@ -1244,18 +1277,18 @@ mod tests {
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
-        let (id, method, _) = read_request(&mut harness.lines).await;
-        assert_eq!(method, "replay_since");
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert!(matches!(request, Request::ReplaySince { .. }));
 
-        // Respond with ok: false (server-side error).
+        // Respond with a protocol error.
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(RawResponse { ok: false, data: None, error: Some("internal error".into()) }).expect("send error response");
+        tx.send(ResponseResult::Err { message: "internal error".into() }).expect("send error response");
 
         recover_task.await.expect("recover_from_gap should not panic on error response");
         assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&7));
     }
 
-    // --- recover_from_gap: replay with SnapshotFull updates seqs ---
+    // --- recover_from_gap: replay with RepoSnapshot updates seqs ---
 
     #[tokio::test]
     async fn recover_from_gap_applies_full_snapshot_seqs() {
@@ -1275,19 +1308,18 @@ mod tests {
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
-        let (id, method, _) = read_request(&mut harness.lines).await;
-        assert_eq!(method, "replay_since");
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert!(matches!(request, Request::ReplaySince { .. }));
 
         // Respond with a full snapshot event.
-        let replay_events = vec![DaemonEvent::SnapshotFull(Box::new(make_snapshot(&repo, 10)))];
+        let replay_events = vec![DaemonEvent::RepoSnapshot(Box::new(make_snapshot(&repo, 10)))];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Box::new(Response::ReplaySince(replay_events)) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
         let event = event_rx.recv().await.expect("forwarded replay event");
-        assert!(matches!(event, DaemonEvent::SnapshotFull(_)));
+        assert!(matches!(event, DaemonEvent::RepoSnapshot(_)));
         assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&10));
     }
 
@@ -1314,13 +1346,13 @@ mod tests {
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
-        let (id, _method, _) = read_request(&mut harness.lines).await;
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert!(matches!(request, Request::ReplaySince { .. }));
 
         // Replay returns events with seq=10, which is behind the live update of 20.
-        let replay_events = vec![DaemonEvent::SnapshotDelta(Box::new(make_delta(&repo, 3, 10)))];
+        let replay_events = vec![DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 3, 10)))];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Box::new(Response::ReplaySince(replay_events)) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
@@ -1348,7 +1380,8 @@ mod tests {
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
-        let (id, _method, _) = read_request(&mut harness.lines).await;
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert!(matches!(request, Request::ReplaySince { .. }));
 
         // Replay includes a non-snapshot event — it should still be forwarded.
         let replay_events = vec![DaemonEvent::CommandStarted {
@@ -1359,8 +1392,7 @@ mod tests {
             description: "replayed".into(),
         }];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Box::new(Response::ReplaySince(replay_events)) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
@@ -1389,13 +1421,13 @@ mod tests {
             recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
         });
 
-        let (id, _method, _) = read_request(&mut harness.lines).await;
+        let (id, request) = read_request(&mut harness.lines).await;
+        assert!(matches!(request, Request::ReplaySince { .. }));
 
         // Respond with empty event list.
         let replay_events: Vec<DaemonEvent> = vec![];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(RawResponse { ok: true, data: Some(serde_json::to_value(replay_events).expect("serialize")), error: None })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Box::new(Response::ReplaySince(replay_events)) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
@@ -1405,54 +1437,21 @@ mod tests {
         assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&repo_identity()), Some(&5));
     }
 
-    // --- RawResponse parse error paths ---
+    // --- ResponseResult helper paths ---
 
     #[test]
-    fn raw_response_parse_returns_error_when_not_ok() {
-        let resp = RawResponse { ok: false, data: None, error: Some("something broke".into()) };
-        let err = resp.parse::<Vec<String>>().expect_err("should fail");
+    fn into_success_response_returns_error_for_protocol_error() {
+        let err = into_success_response(ResponseResult::Err { message: "something broke".into() }).expect_err("should fail");
         assert!(err.contains("something broke"));
     }
 
     #[test]
-    fn raw_response_parse_returns_unknown_error_when_not_ok_and_no_error() {
-        let resp = RawResponse { ok: false, data: None, error: None };
-        let err = resp.parse::<Vec<String>>().expect_err("should fail");
-        assert!(err.contains("unknown error"));
-    }
-
-    #[test]
-    fn raw_response_parse_returns_error_when_data_missing() {
-        let resp = RawResponse { ok: true, data: None, error: None };
-        let err = resp.parse::<Vec<String>>().expect_err("should fail");
-        assert!(err.contains("missing data"));
-    }
-
-    #[test]
-    fn raw_response_parse_returns_error_when_data_wrong_type() {
-        let resp = RawResponse { ok: true, data: Some(serde_json::json!(42)), error: None };
-        let err = resp.parse::<Vec<String>>().expect_err("should fail");
-        assert!(err.contains("failed to parse"));
-    }
-
-    #[test]
-    fn raw_response_parse_empty_returns_error_when_not_ok() {
-        let resp = RawResponse { ok: false, data: None, error: Some("refused".into()) };
-        let err = resp.parse_empty().expect_err("should fail");
-        assert!(err.contains("refused"));
-    }
-
-    #[test]
-    fn raw_response_parse_empty_returns_unknown_error_when_not_ok_and_no_error() {
-        let resp = RawResponse { ok: false, data: None, error: None };
-        let err = resp.parse_empty().expect_err("should fail");
-        assert!(err.contains("unknown error"));
-    }
-
-    #[test]
-    fn raw_response_parse_empty_succeeds_when_ok() {
-        let resp = RawResponse { ok: true, data: None, error: None };
-        resp.parse_empty().expect("should succeed");
+    fn into_success_response_returns_response_for_success() {
+        let response = into_success_response(ResponseResult::Ok {
+            response: Box::new(Response::GetTopology(TopologyResponse { local_host: HostName::new("local"), routes: vec![] })),
+        })
+        .expect("should succeed");
+        assert!(matches!(response, Response::GetTopology(TopologyResponse { routes, .. }) if routes.is_empty()));
     }
 }
 

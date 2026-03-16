@@ -336,15 +336,15 @@ async fn daemon_broadcasts_snapshots() {
     let event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     match event {
-        DaemonEvent::SnapshotFull(snap) => {
+        DaemonEvent::RepoSnapshot(snap) => {
             assert_eq!(snap.repo, repo);
             assert!(snap.seq > 0);
         }
-        DaemonEvent::SnapshotDelta(delta) => {
+        DaemonEvent::RepoDelta(delta) => {
             assert_eq!(delta.repo, repo);
             assert!(delta.seq > 0);
         }
-        other => panic!("expected SnapshotFull or SnapshotDelta, got {:?}", other),
+        other => panic!("expected RepoSnapshot or RepoDelta, got {:?}", other),
     }
 }
 
@@ -365,7 +365,7 @@ async fn execute_broadcasts_lifecycle_events() {
     let command_id = daemon.execute(command).await.expect("execute should return a command id");
 
     // Collect CommandStarted and CommandFinished events, skipping any
-    // Snapshot events that arrive from the background refresh loop.
+    // Repo snapshot events that arrive from the background refresh loop.
     let timeout = std::time::Duration::from_secs(10);
     let mut got_started = false;
     let mut got_finished = false;
@@ -451,8 +451,8 @@ async fn archive_session_can_be_cancelled_while_provider_call_is_in_flight() {
 
     let refresh_event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
     match refresh_event {
-        DaemonEvent::SnapshotFull(snap) => assert!(snap.providers.sessions.contains_key("sess-1"), "refresh should expose sess-1"),
-        DaemonEvent::SnapshotDelta(delta) => {
+        DaemonEvent::RepoSnapshot(snap) => assert!(snap.providers.sessions.contains_key("sess-1"), "refresh should expose sess-1"),
+        DaemonEvent::RepoDelta(delta) => {
             assert!(delta.work_items.iter().any(|item| item.session_key.as_deref() == Some("sess-1")), "refresh should expose sess-1")
         }
         other => panic!("expected snapshot event, got {other:?}"),
@@ -561,10 +561,10 @@ async fn replay_since_returns_full_snapshot_for_unknown_seq() {
 
     assert_eq!(events.len(), 1, "should get exactly one event");
     match &events[0] {
-        DaemonEvent::SnapshotFull(snap) => {
+        DaemonEvent::RepoSnapshot(snap) => {
             assert_eq!(snap.repo, repo);
         }
-        other => panic!("expected SnapshotFull, got {:?}", other),
+        other => panic!("expected RepoSnapshot, got {:?}", other),
     }
 }
 
@@ -581,10 +581,10 @@ async fn replay_since_returns_full_snapshot_for_new_repo() {
 
     assert_eq!(events.len(), 1, "should get one event per tracked repo");
     match &events[0] {
-        DaemonEvent::SnapshotFull(snap) => {
+        DaemonEvent::RepoSnapshot(snap) => {
             assert_eq!(snap.repo, repo);
         }
-        other => panic!("expected SnapshotFull, got {:?}", other),
+        other => panic!("expected RepoSnapshot, got {:?}", other),
     }
 }
 
@@ -598,8 +598,8 @@ async fn replay_since_returns_empty_when_up_to_date() {
     let event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let current_seq = match event {
-        DaemonEvent::SnapshotFull(snap) => snap.seq,
-        DaemonEvent::SnapshotDelta(delta) => delta.seq,
+        DaemonEvent::RepoSnapshot(snap) => snap.seq,
+        DaemonEvent::RepoDelta(delta) => delta.seq,
         other => panic!("expected snapshot event, got {:?}", other),
     };
 
@@ -649,10 +649,10 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
     let snap = events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::SnapshotFull(s) if s.repo == repo => Some(s),
+            DaemonEvent::RepoSnapshot(s) if s.repo == repo => Some(s),
             _ => None,
         })
-        .expect("should have a SnapshotFull for our repo");
+        .expect("should have a RepoSnapshot for our repo");
 
     // Peer checkout must be present, attributed to its real host (not local)
     assert!(
@@ -807,8 +807,8 @@ async fn removing_preferred_root_emits_snapshot_for_new_preferred_path() {
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::SnapshotFull(snapshot)) => break Some(snapshot.repo),
-                Ok(DaemonEvent::SnapshotDelta(delta)) => break Some(delta.repo),
+                Ok(DaemonEvent::RepoSnapshot(snapshot)) => break Some(snapshot.repo),
+                Ok(DaemonEvent::RepoDelta(delta)) => break Some(delta.repo),
                 Ok(_) => {}
                 Err(_) => break None,
             }
@@ -1387,24 +1387,24 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
 
     // --- Assert ---
     // Collect snapshot events until we see one containing issue "42".
-    // The daemon may send a SnapshotFull or a SnapshotDelta depending on
+    // The daemon may send a RepoSnapshot or a RepoDelta depending on
     // whether the delta is smaller than the full snapshot. We accept either.
     let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::SnapshotFull(snap)) if snap.repo == repo => {
+                Ok(DaemonEvent::RepoSnapshot(snap)) if snap.repo == repo => {
                     if snap.providers.issues.contains_key("42") {
                         return *snap;
                     }
                 }
-                Ok(DaemonEvent::SnapshotDelta(ref delta)) if delta.repo == repo => {
+                Ok(DaemonEvent::RepoDelta(ref delta)) if delta.repo == repo => {
                     // Check if the delta contains an Issue change for "42"
                     let has_issue_42 = delta.changes.iter().any(|c| matches!(c, Change::Issue { key, .. } if key == "42"));
                     if has_issue_42 {
                         // Use replay_since to get the full snapshot with the issue
                         let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
                         for event in events {
-                            if let DaemonEvent::SnapshotFull(snap) = event {
+                            if let DaemonEvent::RepoSnapshot(snap) = event {
                                 if snap.repo == repo && snap.providers.issues.contains_key("42") {
                                     return *snap;
                                 }

@@ -535,7 +535,7 @@ fn checkout_sort_tier(path: &Path, repo_root: &Path) -> u8 {
 /// Sort work items into sections and build table entries.
 ///
 /// Accepts protocol `WorkItem` (flat, serializable) so this function can be
-/// used both in-process (core side) and in the TUI after receiving a Snapshot.
+/// used both in-process (core side) and in the TUI after receiving a repo snapshot.
 pub fn group_work_items(
     work_items: &[flotilla_protocol::WorkItem],
     providers: &ProviderData,

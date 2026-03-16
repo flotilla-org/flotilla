@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime};
 use flotilla_protocol::{
     Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message,
-    PeerConnectionState, PeerDataMessage, PeerWireMessage, ReplayCursor, RepoIdentity, RepoSelector, RoutedPeerMessage, PROTOCOL_VERSION,
+    PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepoSelector, Request, Response, RoutedPeerMessage,
+    PROTOCOL_VERSION,
 };
 use futures::future::join_all;
 use tokio::{
@@ -785,8 +786,8 @@ fn spawn_peer_networking_runtime(
                 }
                 event = event_rx.recv() => {
                     let repo_path = match event {
-                        Ok(DaemonEvent::SnapshotFull(snapshot)) => Some(snapshot.repo.clone()),
-                        Ok(DaemonEvent::SnapshotDelta(delta)) => Some(delta.repo.clone()),
+                        Ok(DaemonEvent::RepoSnapshot(snapshot)) => Some(snapshot.repo.clone()),
+                        Ok(DaemonEvent::RepoDelta(delta)) => Some(delta.repo.clone()),
                         Ok(_) => None,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!(skipped = n, "outbound peer event subscriber lagged");
@@ -1507,7 +1508,7 @@ async fn handle_client(
     };
 
     match first_msg {
-        Message::Request { id, method, params } => {
+        Message::Request { id, request } => {
             let count = client_count.fetch_add(1, Ordering::SeqCst) + 1;
             info!(%count, "client connected");
             client_notify.notify_one();
@@ -1538,7 +1539,7 @@ async fn handle_client(
                 pending_remote_cancels: &pending_remote_cancels,
                 next_remote_command_id: &next_remote_command_id,
             };
-            let first_response = dispatch_request(&dispatch_ctx, id, &method, params).await;
+            let first_response = dispatch_request(&dispatch_ctx, id, request).await;
             if write_message(&writer, &first_response).await.is_ok() {
                 loop {
                     tokio::select! {
@@ -1553,8 +1554,8 @@ async fn handle_client(
                                         }
                                     };
                                     match msg {
-                                        Message::Request { id, method, params } => {
-                                            let response = dispatch_request(&dispatch_ctx, id, &method, params).await;
+                                        Message::Request { id, request } => {
+                                            let response = dispatch_request(&dispatch_ctx, id, request).await;
                                             if write_message(&writer, &response).await.is_err() {
                                                 break;
                                             }
@@ -1711,35 +1712,19 @@ async fn handle_client(
 }
 
 /// Dispatch a request to the appropriate `DaemonHandle` method.
-async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, params: serde_json::Value) -> Message {
-    match method {
-        "list_repos" => match ctx.daemon.list_repos().await {
-            Ok(repos) => Message::ok_response(id, &repos),
+async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) -> Message {
+    match request {
+        Request::ListRepos => match ctx.daemon.list_repos().await {
+            Ok(repos) => Message::ok_response(id, Response::ListRepos(repos)),
             Err(e) => Message::error_response(id, e),
         },
 
-        "get_state" => {
-            let repo = match extract_repo_path(&params) {
-                Ok(p) => p,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.get_state(&repo).await {
-                Ok(snapshot) => Message::ok_response(id, &snapshot),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::GetState { repo } => match ctx.daemon.get_state(&repo).await {
+            Ok(snapshot) => Message::ok_response(id, Response::GetState(Box::new(snapshot))),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        "execute" => {
-            let command: Command = match params
-                .get("command")
-                .cloned()
-                .ok_or_else(|| "missing 'command' field".to_string())
-                .and_then(|v| serde_json::from_value(v).map_err(|e| format!("invalid command: {e}")))
-            {
-                Ok(cmd) => cmd,
-                Err(e) => return Message::error_response(id, e),
-            };
-
+        Request::Execute { command } => {
             let target_host = command.host.clone().unwrap_or_else(|| ctx.daemon.host_name().clone());
             if target_host != *ctx.daemon.host_name() {
                 let request_id = {
@@ -1768,7 +1753,7 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
                 };
 
                 match send_result {
-                    Ok(()) => Message::ok_response(id, &command_id),
+                    Ok(()) => Message::ok_response(id, Response::Execute { command_id }),
                     Err(e) => {
                         ctx.pending_remote_commands.lock().await.remove(&request_id);
                         Message::error_response(id, e)
@@ -1776,17 +1761,13 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
                 }
             } else {
                 match ctx.daemon.execute(command).await {
-                    Ok(command_id) => Message::ok_response(id, &command_id),
+                    Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
                     Err(e) => Message::error_response(id, e),
                 }
             }
         }
 
-        "cancel" => {
-            let command_id: u64 = match params.get("command_id").and_then(|v| v.as_u64()) {
-                Some(id) => id,
-                None => return Message::error_response(id, "missing or invalid 'command_id'".to_string()),
-            };
+        Request::Cancel { command_id } => {
             let remote = {
                 let pending = ctx.pending_remote_commands.lock().await;
                 pending
@@ -1817,7 +1798,7 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
                     return Message::error_response(id, e);
                 }
                 match tokio::time::timeout(Duration::from_secs(5), rx).await {
-                    Ok(Ok(Ok(()))) => Message::empty_ok_response(id),
+                    Ok(Ok(Ok(()))) => Message::ok_response(id, Response::Cancel),
                     Ok(Ok(Err(message))) => Message::error_response(id, message),
                     Ok(Err(_)) => Message::error_response(id, "remote cancel response channel closed".to_string()),
                     Err(_) => {
@@ -1827,148 +1808,75 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, method: &str, para
                 }
             } else {
                 match ctx.daemon.cancel(command_id).await {
-                    Ok(()) => Message::empty_ok_response(id),
+                    Ok(()) => Message::ok_response(id, Response::Cancel),
                     Err(e) => Message::error_response(id, e),
                 }
             }
         }
 
-        "refresh" => {
-            let repo = match extract_repo_path(&params) {
-                Ok(p) => p,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.refresh(&repo).await {
-                Ok(()) => Message::empty_ok_response(id),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::Refresh { repo } => match ctx.daemon.refresh(&repo).await {
+            Ok(()) => Message::ok_response(id, Response::Refresh),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        "add_repo" => {
-            let path = match extract_path_param(&params, "path") {
-                Ok(p) => p,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.add_repo(&path).await {
-                Ok(()) => Message::empty_ok_response(id),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::AddRepo { path } => match ctx.daemon.add_repo(&path).await {
+            Ok(()) => Message::ok_response(id, Response::AddRepo),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        "remove_repo" => {
-            let path = match extract_path_param(&params, "path") {
-                Ok(p) => p,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.remove_repo(&path).await {
-                Ok(()) => Message::empty_ok_response(id),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::RemoveRepo { path } => match ctx.daemon.remove_repo(&path).await {
+            Ok(()) => Message::ok_response(id, Response::RemoveRepo),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        "replay_since" => {
-            let last_seen = params
-                .get("last_seen")
-                .cloned()
-                .and_then(|v| serde_json::from_value::<Vec<ReplayCursor>>(v).ok())
-                .map(|entries| entries.into_iter().map(|entry| (entry.repo_identity, entry.seq)).collect())
-                .unwrap_or_else(|| {
-                    warn!("replay_since: failed to parse last_seen, returning full snapshots");
-                    std::collections::HashMap::new()
-                });
+        Request::ReplaySince { last_seen } => {
+            let last_seen = last_seen.into_iter().map(|entry| (entry.repo_identity, entry.seq)).collect();
             match ctx.daemon.replay_since(&last_seen).await {
-                Ok(events) => Message::ok_response(id, &events),
+                Ok(events) => Message::ok_response(id, Response::ReplaySince(events)),
                 Err(e) => Message::error_response(id, e),
             }
         }
 
-        "get_status" => match ctx.daemon.get_status().await {
-            Ok(status) => Message::ok_response(id, &status),
+        Request::GetStatus => match ctx.daemon.get_status().await {
+            Ok(status) => Message::ok_response(id, Response::GetStatus(status)),
             Err(e) => Message::error_response(id, e),
         },
 
-        "get_repo_detail" => {
-            let slug = match extract_str_param(&params, "slug") {
-                Ok(s) => s,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.get_repo_detail(&slug).await {
-                Ok(detail) => Message::ok_response(id, &detail),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
-
-        "get_repo_providers" => {
-            let slug = match extract_str_param(&params, "slug") {
-                Ok(s) => s,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.get_repo_providers(&slug).await {
-                Ok(providers) => Message::ok_response(id, &providers),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
-
-        "get_repo_work" => {
-            let slug = match extract_str_param(&params, "slug") {
-                Ok(s) => s,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.get_repo_work(&slug).await {
-                Ok(work) => Message::ok_response(id, &work),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
-
-        "list_hosts" => match ctx.daemon.list_hosts().await {
-            Ok(hosts) => Message::ok_response(id, &hosts),
+        Request::GetRepoDetail { slug } => match ctx.daemon.get_repo_detail(&slug).await {
+            Ok(detail) => Message::ok_response(id, Response::GetRepoDetail(detail)),
             Err(e) => Message::error_response(id, e),
         },
 
-        "get_host_status" => {
-            let host = match extract_str_param(&params, "host") {
-                Ok(s) => s,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.get_host_status(&host).await {
-                Ok(status) => Message::ok_response(id, &status),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
-
-        "get_host_providers" => {
-            let host = match extract_str_param(&params, "host") {
-                Ok(s) => s,
-                Err(e) => return Message::error_response(id, e),
-            };
-            match ctx.daemon.get_host_providers(&host).await {
-                Ok(providers) => Message::ok_response(id, &providers),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
-
-        "get_topology" => match ctx.daemon.get_topology().await {
-            Ok(topology) => Message::ok_response(id, &topology),
+        Request::GetRepoProviders { slug } => match ctx.daemon.get_repo_providers(&slug).await {
+            Ok(providers) => Message::ok_response(id, Response::GetRepoProviders(providers)),
             Err(e) => Message::error_response(id, e),
         },
 
-        unknown => Message::error_response(id, format!("unknown method: {unknown}")),
+        Request::GetRepoWork { slug } => match ctx.daemon.get_repo_work(&slug).await {
+            Ok(work) => Message::ok_response(id, Response::GetRepoWork(work)),
+            Err(e) => Message::error_response(id, e),
+        },
+
+        Request::ListHosts => match ctx.daemon.list_hosts().await {
+            Ok(hosts) => Message::ok_response(id, Response::ListHosts(hosts)),
+            Err(e) => Message::error_response(id, e),
+        },
+
+        Request::GetHostStatus { host } => match ctx.daemon.get_host_status(&host).await {
+            Ok(status) => Message::ok_response(id, Response::GetHostStatus(status)),
+            Err(e) => Message::error_response(id, e),
+        },
+
+        Request::GetHostProviders { host } => match ctx.daemon.get_host_providers(&host).await {
+            Ok(providers) => Message::ok_response(id, Response::GetHostProviders(providers)),
+            Err(e) => Message::error_response(id, e),
+        },
+
+        Request::GetTopology => match ctx.daemon.get_topology().await {
+            Ok(topology) => Message::ok_response(id, Response::GetTopology(topology)),
+            Err(e) => Message::error_response(id, e),
+        },
     }
-}
-
-/// Extract the "repo" field from params as a PathBuf.
-fn extract_repo_path(params: &serde_json::Value) -> Result<PathBuf, String> {
-    extract_path_param(params, "repo")
-}
-
-/// Extract a named path field from params as a PathBuf.
-fn extract_path_param(params: &serde_json::Value, field: &str) -> Result<PathBuf, String> {
-    params.get(field).and_then(|v| v.as_str()).map(PathBuf::from).ok_or_else(|| format!("missing '{field}' parameter"))
-}
-
-/// Extract a named string field from params.
-fn extract_str_param(params: &serde_json::Value, field: &str) -> Result<String, String> {
-    params.get(field).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| format!("missing '{field}' parameter"))
 }
 
 #[cfg(test)]
@@ -1979,7 +1887,8 @@ mod tests {
     use flotilla_core::providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote};
     use flotilla_protocol::{
         Checkout, CheckoutTarget, Command, CommandAction, CommandPeerEvent, CommandResult, DaemonEvent, HostName, HostPath, PeerDataKind,
-        PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoInfo, RepoSelector, RoutedPeerMessage, VectorClock,
+        PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage,
+        VectorClock,
     };
     use indexmap::IndexMap;
 
@@ -2029,13 +1938,29 @@ mod tests {
         }
     }
 
-    fn assert_ok_empty_response(msg: Message, expected_id: u64) {
+    fn ok_response(msg: Message, expected_id: u64) -> Response {
         match msg {
-            Message::Response { id, ok, data, error } => {
+            Message::Response { id, response } => {
                 assert_eq!(id, expected_id);
-                assert!(ok);
-                assert!(data.is_none());
-                assert!(error.is_none());
+                match *response {
+                    ResponseResult::Ok { response } => *response,
+                    ResponseResult::Err { message } => panic!("expected ok response, got error: {message}"),
+                }
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    fn assert_error_response(msg: Message, expected_id: u64, needle: &str) {
+        match msg {
+            Message::Response { id, response } => {
+                assert_eq!(id, expected_id);
+                match *response {
+                    ResponseResult::Err { message } => {
+                        assert!(message.contains(needle), "unexpected error payload: {message}");
+                    }
+                    other => panic!("expected error response, got {:?}", other),
+                }
             }
             other => panic!("expected response, got {other:?}"),
         }
@@ -2064,7 +1989,7 @@ mod tests {
         )
     }
 
-    async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, method: &str, params: serde_json::Value) -> Message {
+    async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, request: Request) -> Message {
         let (peer_manager, pending_remote_commands, pending_remote_cancels, next_remote_command_id) = empty_routing_state();
         let ctx = DispatchContext {
             daemon,
@@ -2073,7 +1998,7 @@ mod tests {
             pending_remote_cancels: &pending_remote_cancels,
             next_remote_command_id: &next_remote_command_id,
         };
-        dispatch_request(&ctx, id, method, params).await
+        dispatch_request(&ctx, id, request).await
     }
 
     fn checkout(branch: &str) -> Checkout {
@@ -2125,61 +2050,27 @@ mod tests {
         let (_read_half, write_half) = a.into_split();
         let writer = tokio::sync::Mutex::new(BufWriter::new(write_half));
 
-        let msg = Message::empty_ok_response(9);
+        let msg = Message::ok_response(9, Response::Refresh);
         write_message(&writer, &msg).await.expect("write_message");
 
         let mut lines = BufReader::new(b).lines();
         let line = lines.next_line().await.expect("read line").expect("line");
         let parsed: Message = serde_json::from_str(&line).expect("parse line as message");
         match parsed {
-            Message::Response { id, ok, .. } => {
+            Message::Response { id, response } => {
                 assert_eq!(id, 9);
-                assert!(ok);
+                assert!(matches!(*response, ResponseResult::Ok { response } if matches!(*response, Response::Refresh)));
             }
             other => panic!("expected response, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn extract_path_param_requires_string_field() {
-        let params = serde_json::json!({});
-        let err = extract_path_param(&params, "repo").expect_err("missing field should error");
-        assert!(err.contains("missing 'repo' parameter"));
-
-        let params = serde_json::json!({ "repo": 42 });
-        let err = extract_path_param(&params, "repo").expect_err("non-string field should error");
-        assert!(err.contains("missing 'repo' parameter"));
-
-        let params = serde_json::json!({ "repo": "/tmp/project" });
-        let path = extract_path_param(&params, "repo").expect("valid path string");
-        assert_eq!(path, PathBuf::from("/tmp/project"));
     }
 
     #[tokio::test]
-    async fn dispatch_request_handles_unknown_and_missing_params() {
+    async fn dispatch_request_handles_error_response_for_untracked_repo() {
         let (_tmp, daemon) = empty_daemon().await;
 
-        let unknown = dispatch_request_test(&daemon, 1, "not_a_method", serde_json::json!({})).await;
-        match unknown {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 1);
-                assert!(!ok);
-                assert!(data.is_none());
-                assert!(error.unwrap_or_default().contains("unknown method"), "unexpected error payload");
-            }
-            other => panic!("expected response, got {other:?}"),
-        }
-
-        let missing_repo = dispatch_request_test(&daemon, 2, "get_state", serde_json::json!({})).await;
-        match missing_repo {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 2);
-                assert!(!ok);
-                assert!(data.is_none());
-                assert!(error.unwrap_or_default().contains("missing 'repo' parameter"), "unexpected error payload");
-            }
-            other => panic!("expected response, got {other:?}"),
-        }
+        let missing_repo = dispatch_request_test(&daemon, 2, Request::GetState { repo: PathBuf::from("/tmp/missing") }).await;
+        assert_error_response(missing_repo, 2, "repo not tracked");
     }
 
     #[tokio::test]
@@ -2188,39 +2079,30 @@ mod tests {
         let repo_path = tmp.path().join("repo-a");
         std::fs::create_dir_all(&repo_path).unwrap();
 
-        let add = dispatch_request_test(&daemon, 10, "add_repo", serde_json::json!({ "path": repo_path })).await;
-        assert_ok_empty_response(add, 10);
+        let add = dispatch_request_test(&daemon, 10, Request::AddRepo { path: repo_path.clone() }).await;
+        assert!(matches!(ok_response(add, 10), Response::AddRepo));
 
-        let list = dispatch_request_test(&daemon, 11, "list_repos", serde_json::json!({})).await;
-        let listed: Vec<RepoInfo> = match list {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 11);
-                assert!(ok, "list_repos should be ok: {error:?}");
-                serde_json::from_value(data.expect("list data")).expect("parse repo list")
-            }
-            other => panic!("expected response, got {other:?}"),
+        let list = dispatch_request_test(&daemon, 11, Request::ListRepos).await;
+        let listed = match ok_response(list, 11) {
+            Response::ListRepos(repos) => repos,
+            other => panic!("expected list repos response, got {:?}", other),
         };
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, repo_path);
 
-        let remove = dispatch_request_test(&daemon, 12, "remove_repo", serde_json::json!({ "path": listed[0].path })).await;
-        assert_ok_empty_response(remove, 12);
+        let remove = dispatch_request_test(&daemon, 12, Request::RemoveRepo { path: listed[0].path.clone() }).await;
+        assert!(matches!(ok_response(remove, 12), Response::RemoveRepo));
     }
 
     #[tokio::test]
-    async fn dispatch_replay_since_with_bad_payload_degrades_to_empty_last_seen() {
+    async fn dispatch_replay_since_with_empty_last_seen_returns_no_events() {
         let (_tmp, daemon) = empty_daemon().await;
 
-        let replay = dispatch_request_test(&daemon, 30, "replay_since", serde_json::json!({ "last_seen": "invalid-shape" })).await;
-        match replay {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 30);
-                assert!(ok, "replay_since should still succeed: {error:?}");
-                let events: Vec<DaemonEvent> = serde_json::from_value(data.expect("replay events data")).expect("events");
-                assert!(events.is_empty());
-            }
-            other => panic!("expected response, got {other:?}"),
-        }
+        let replay = dispatch_request_test(&daemon, 30, Request::ReplaySince { last_seen: vec![] }).await;
+        match ok_response(replay, 30) {
+            Response::ReplaySince(events) => assert!(events.is_empty()),
+            other => panic!("expected replay response, got {:?}", other),
+        };
     }
 
     #[tokio::test]
@@ -2237,53 +2119,31 @@ mod tests {
             }])
             .await;
 
-        let hosts = dispatch_request_test(&daemon, 40, "list_hosts", serde_json::json!({})).await;
-        match hosts {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 40);
-                assert!(ok, "list_hosts should be ok: {error:?}");
-                let parsed: flotilla_protocol::HostListResponse =
-                    serde_json::from_value(data.expect("host list data")).expect("parse host list");
-                assert!(parsed.hosts.iter().any(|entry| entry.host == HostName::local()));
-            }
-            other => panic!("expected response, got {other:?}"),
+        let hosts = dispatch_request_test(&daemon, 40, Request::ListHosts).await;
+        match ok_response(hosts, 40) {
+            Response::ListHosts(parsed) => assert!(parsed.hosts.iter().any(|entry| entry.host == HostName::local())),
+            other => panic!("expected host list response, got {:?}", other),
         }
 
-        let status = dispatch_request_test(&daemon, 41, "get_host_status", serde_json::json!({ "host": local_host })).await;
-        match status {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 41);
-                assert!(ok, "get_host_status should be ok: {error:?}");
-                let parsed: flotilla_protocol::HostStatusResponse =
-                    serde_json::from_value(data.expect("host status data")).expect("parse host status");
-                assert!(parsed.is_local);
-            }
-            other => panic!("expected response, got {other:?}"),
+        let status = dispatch_request_test(&daemon, 41, Request::GetHostStatus { host: local_host }).await;
+        match ok_response(status, 41) {
+            Response::GetHostStatus(parsed) => assert!(parsed.is_local),
+            other => panic!("expected host status response, got {:?}", other),
         }
 
-        let providers = dispatch_request_test(&daemon, 42, "get_host_providers", serde_json::json!({ "host": daemon.host_name() })).await;
-        match providers {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 42);
-                assert!(ok, "get_host_providers should be ok: {error:?}");
-                let parsed: flotilla_protocol::HostProvidersResponse =
-                    serde_json::from_value(data.expect("host providers data")).expect("parse host providers");
-                assert_eq!(parsed.summary.host_name, *daemon.host_name());
-            }
-            other => panic!("expected response, got {other:?}"),
+        let providers = dispatch_request_test(&daemon, 42, Request::GetHostProviders { host: daemon.host_name().to_string() }).await;
+        match ok_response(providers, 42) {
+            Response::GetHostProviders(parsed) => assert_eq!(parsed.summary.host_name, *daemon.host_name()),
+            other => panic!("expected host providers response, got {:?}", other),
         }
 
-        let topology = dispatch_request_test(&daemon, 43, "get_topology", serde_json::json!({})).await;
-        match topology {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 43);
-                assert!(ok, "get_topology should be ok: {error:?}");
-                let parsed: flotilla_protocol::TopologyResponse =
-                    serde_json::from_value(data.expect("topology data")).expect("parse topology");
+        let topology = dispatch_request_test(&daemon, 43, Request::GetTopology).await;
+        match ok_response(topology, 43) {
+            Response::GetTopology(parsed) => {
                 assert_eq!(parsed.routes.len(), 1);
                 assert_eq!(parsed.routes[0].next_hop, HostName::new("relay"));
             }
-            other => panic!("expected response, got {other:?}"),
+            other => panic!("expected topology response, got {:?}", other),
         }
     }
 
@@ -2339,27 +2199,14 @@ mod tests {
             next_remote_command_id: &next_remote_command_id,
         };
 
-        let response = dispatch_request(
-            &ctx,
-            40,
-            "execute",
-            serde_json::json!({
-                "command": Command {
-                    host: Some(HostName::new("feta")),
-                    context_repo: None,
-                    action: CommandAction::Refresh { repo: None },
-                }
-            }),
-        )
+        let response = dispatch_request(&ctx, 40, Request::Execute {
+            command: Command { host: Some(HostName::new("feta")), context_repo: None, action: CommandAction::Refresh { repo: None } },
+        })
         .await;
 
-        let command_id = match response {
-            Message::Response { id, ok, data, error } => {
-                assert_eq!(id, 40);
-                assert!(ok, "remote execute should succeed: {error:?}");
-                serde_json::from_value::<u64>(data.expect("command id")).expect("parse command id")
-            }
-            other => panic!("expected response, got {other:?}"),
+        let command_id = match ok_response(response, 40) {
+            Response::Execute { command_id } => command_id,
+            other => panic!("expected execute response, got {:?}", other),
         };
 
         assert!(command_id >= (1 << 62));
@@ -2412,7 +2259,7 @@ mod tests {
                 pending_remote_cancels: &pending_remote_cancels_for_task,
                 next_remote_command_id: &next_remote_command_id_for_task,
             };
-            dispatch_request(&ctx, 41, "cancel", serde_json::json!({ "command_id": 1u64 << 62 })).await
+            dispatch_request(&ctx, 41, Request::Cancel { command_id: 1u64 << 62 }).await
         });
 
         let cancel_id = tokio::time::timeout(StdDuration::from_secs(2), async {
@@ -2448,7 +2295,7 @@ mod tests {
 
         complete_remote_cancel(&pending_remote_cancels, cancel_id, None).await;
 
-        assert_ok_empty_response(response.await.expect("cancel task"), 41);
+        assert!(matches!(ok_response(response.await.expect("cancel task"), 41), Response::Cancel));
     }
 
     #[test]
@@ -3524,7 +3371,7 @@ mod tests {
         let stale_key = HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only");
         let remaining_key = HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only");
         match event {
-            DaemonEvent::SnapshotFull(snapshot) => {
+            DaemonEvent::RepoSnapshot(snapshot) => {
                 assert_eq!(snapshot.repo, synthetic);
                 assert!(
                     !snapshot.providers.checkouts.contains_key(&stale_key),
@@ -3532,7 +3379,7 @@ mod tests {
                 );
                 assert_eq!(snapshot.providers.checkouts[&remaining_key].branch, "feature-b");
             }
-            DaemonEvent::SnapshotDelta(delta) => {
+            DaemonEvent::RepoDelta(delta) => {
                 assert_eq!(delta.repo, synthetic);
                 assert!(
                     delta.changes.iter().any(|change| matches!(
@@ -3540,7 +3387,7 @@ mod tests {
                         flotilla_protocol::Change::Checkout {
                             key,
                             op: flotilla_protocol::EntryOp::Removed
-                        } if key == &stale_key
+                        } if *key == stale_key
                     )),
                     "first delta after disconnect should remove stale peer-a checkout"
                 );
