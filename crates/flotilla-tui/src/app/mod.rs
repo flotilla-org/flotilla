@@ -21,7 +21,7 @@ use flotilla_core::{
     data::{self, GroupEntry, SectionLabels},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandResult, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoDelta,
+    Command, CommandAction, CommandResult, DaemonEvent, HostName, HostSummary, PeerConnectionState, ProviderData, ProviderError, RepoDelta,
     RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
@@ -60,11 +60,13 @@ impl From<PeerConnectionState> for PeerStatus {
     }
 }
 
-/// Status of a configured remote peer host, for display in the config view.
+/// Combined host state for display in the TUI.
 #[derive(Debug, Clone)]
-pub struct PeerHostStatus {
-    pub name: HostName,
+pub struct TuiHostState {
+    pub host_name: HostName,
+    pub is_local: bool,
     pub status: PeerStatus,
+    pub summary: HostSummary,
 }
 
 #[derive(Default)]
@@ -115,10 +117,8 @@ pub struct TuiModel {
     /// Key: (repo_identity, provider_category, provider_name)
     pub provider_statuses: HashMap<(RepoIdentity, String, String), ProviderStatus>,
     pub status_message: Option<String>,
-    /// The daemon's hostname, set from the first RepoSnapshot received.
-    pub my_host: Option<HostName>,
-    /// Status of configured remote peer hosts.
-    pub peer_hosts: Vec<PeerHostStatus>,
+    /// All known hosts — local + peers — indexed by hostname.
+    pub hosts: HashMap<HostName, TuiHostState>,
 }
 
 impl TuiModel {
@@ -143,15 +143,7 @@ impl TuiModel {
                 issue_initial_requested: false,
             });
         }
-        Self {
-            repos,
-            repo_order: order,
-            active_repo: 0,
-            provider_statuses: HashMap::new(),
-            status_message: None,
-            my_host: None,
-            peer_hosts: Vec::new(),
-        }
+        Self { repos, repo_order: order, active_repo: 0, provider_statuses: HashMap::new(), status_message: None, hosts: HashMap::new() }
     }
 
     pub fn active(&self) -> &TuiRepoModel {
@@ -173,6 +165,20 @@ impl TuiModel {
     pub fn repo_name(path: &Path) -> String {
         path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string())
     }
+
+    pub fn my_host(&self) -> Option<&HostName> {
+        self.hosts.values().find(|h| h.is_local).map(|h| &h.host_name)
+    }
+
+    pub fn peer_host_names(&self) -> Vec<HostName> {
+        let mut peers: Vec<_> = self.hosts.values().filter(|h| !h.is_local).map(|h| h.host_name.clone()).collect();
+        peers.sort();
+        peers
+    }
+
+    pub fn home_dir_for_host(&self, host: &HostName) -> Option<&std::path::Path> {
+        self.hosts.get(host).and_then(|h| h.summary.system.home_dir.as_deref())
+    }
 }
 
 /// A command that has been dispatched to the daemon and is awaiting completion.
@@ -192,15 +198,15 @@ fn error_status_item(message: &str) -> VisibleStatusItem {
     VisibleStatusItem { id: 0, text: format!("ERROR {}", message) }
 }
 
-fn peer_status_item(index: usize, peer: &PeerHostStatus) -> Option<VisibleStatusItem> {
-    let label = match peer.status {
+fn peer_status_item(index: usize, host: &TuiHostState) -> Option<VisibleStatusItem> {
+    let label = match host.status {
         PeerStatus::Disconnected => "HOST DOWN",
         PeerStatus::Connecting => "HOST CONNECTING",
         PeerStatus::Reconnecting => "HOST RECONNECTING",
         PeerStatus::Connected => return None,
         PeerStatus::Rejected => "HOST REJECTED",
     };
-    Some(VisibleStatusItem { id: index + 1, text: format!("{label} {}", peer.name) })
+    Some(VisibleStatusItem { id: index + 1, text: format!("{label} {}", host.host_name) })
 }
 
 pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<VisibleStatusItem> {
@@ -210,8 +216,10 @@ pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<Visib
         items.push(error_status_item(message));
     }
 
-    for (index, peer) in model.peer_hosts.iter().enumerate() {
-        if let Some(item) = peer_status_item(index, peer) {
+    let mut peers: Vec<_> = model.hosts.values().filter(|h| !h.is_local).collect();
+    peers.sort_by(|a, b| a.host_name.cmp(&b.host_name));
+    for (index, host) in peers.iter().enumerate() {
+        if let Some(item) = peer_status_item(index, host) {
             items.push(item);
         }
     }
@@ -353,7 +361,7 @@ impl App {
     }
 
     fn item_execution_host(&self, item: &WorkItem) -> Option<HostName> {
-        match self.model.my_host.as_ref() {
+        match self.model.my_host() {
             Some(my_host) if item.host != *my_host => Some(item.host.clone()),
             _ => None,
         }
@@ -402,7 +410,7 @@ impl App {
                     };
                     // Auto-create workspace for local checkouts. Remote checkouts
                     // go through the PrepareTerminal → TerminalPrepared flow instead.
-                    let is_local = self.model.my_host.as_ref().is_some_and(|my| *my == host);
+                    let is_local = self.model.my_host().is_some_and(|my| *my == host);
                     let auto_workspace = match (&result, is_local) {
                         (CommandResult::CheckoutCreated { branch, path }, true) => Some((path.clone(), branch.clone())),
                         _ => None,
@@ -460,29 +468,26 @@ impl App {
                 let peer_status = PeerStatus::from(status);
                 let clear_target =
                     matches!(peer_status, PeerStatus::Disconnected | PeerStatus::Rejected) && self.ui.target_host.as_ref() == Some(&host);
-                if let Some(existing) = self.model.peer_hosts.iter_mut().find(|p| p.name == host) {
-                    existing.status = peer_status;
-                } else {
-                    self.model.peer_hosts.push(PeerHostStatus { name: host, status: peer_status });
+                if let Some(entry) = self.model.hosts.get_mut(&host) {
+                    entry.status = peer_status;
                 }
                 if clear_target {
                     self.ui.target_host = None;
                 }
-                self.model.peer_hosts.sort_by(|a, b| a.name.cmp(&b.name));
             }
-            DaemonEvent::HostSnapshot(_snap) => {
-                // HostSnapshot events are consumed by future TUI host panels.
-                // For now, no additional processing is needed — peer status
-                // is already handled by PeerStatusChanged events.
+            DaemonEvent::HostSnapshot(snap) => {
+                let status = PeerStatus::from(snap.connection_status);
+                self.model.hosts.insert(snap.host_name.clone(), TuiHostState {
+                    host_name: snap.host_name,
+                    is_local: snap.is_local,
+                    status,
+                    summary: snap.summary,
+                });
             }
         }
     }
 
     fn apply_snapshot(&mut self, snap: RepoSnapshot) {
-        if self.model.my_host.is_none() {
-            self.model.my_host = Some(snap.host_name.clone());
-        }
-
         let repo_identity = snap.repo_identity.clone();
         let path = snap.repo.clone();
         let rm = match self.model.repos.get_mut(&repo_identity) {
@@ -743,6 +748,36 @@ mod tests {
 
     use super::*;
 
+    fn insert_local_host(model: &mut TuiModel, name: &str) {
+        let host_name = HostName::new(name);
+        model.hosts.insert(host_name.clone(), TuiHostState {
+            host_name: host_name.clone(),
+            is_local: true,
+            status: PeerStatus::Connected,
+            summary: HostSummary {
+                host_name,
+                system: flotilla_protocol::SystemInfo::default(),
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+            },
+        });
+    }
+
+    fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
+        let host_name = HostName::new(name);
+        model.hosts.insert(host_name.clone(), TuiHostState {
+            host_name: host_name.clone(),
+            is_local: false,
+            status,
+            summary: HostSummary {
+                host_name,
+                system: flotilla_protocol::SystemInfo::default(),
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+            },
+        });
+    }
+
     // -- CommandQueue --
 
     #[test]
@@ -961,7 +996,7 @@ mod tests {
     fn visible_status_items_use_shared_error_and_peer_labels() {
         let mut app = stub_app();
         app.set_status_message(Some("boom".into()));
-        app.model.peer_hosts = vec![PeerHostStatus { name: flotilla_protocol::HostName::new("host-a"), status: PeerStatus::Disconnected }];
+        insert_peer_host(&mut app.model, "host-a", PeerStatus::Disconnected);
 
         assert_eq!(app.visible_status_items(), vec![VisibleStatusItem { id: 0, text: "ERROR boom".into() }, VisibleStatusItem {
             id: 1,
@@ -1261,12 +1296,12 @@ mod tests {
     fn peer_disconnect_clears_selected_target_host() {
         let mut app = stub_app();
         app.ui.target_host = Some(HostName::new("alpha"));
-        app.model.peer_hosts = vec![PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected }];
+        insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
 
         app.handle_daemon_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Disconnected });
 
         assert_eq!(app.ui.target_host, None);
-        assert_eq!(app.model.peer_hosts[0].status, PeerStatus::Disconnected);
+        assert_eq!(app.model.hosts.get(&HostName::new("alpha")).unwrap().status, PeerStatus::Disconnected);
     }
 
     // -- Convenience accessors --
@@ -1503,7 +1538,7 @@ mod tests {
     #[test]
     fn local_checkout_created_queues_workspace_creation() {
         let mut app = stub_app();
-        app.model.my_host = Some(HostName::new("my-desktop"));
+        insert_local_host(&mut app.model, "my-desktop");
         let repo_identity = app.model.repo_order[0].clone();
         let repo_path = app.model.repos[&repo_identity].path.clone();
         let checkout_path = PathBuf::from("/tmp/repo/wt-feat");
@@ -1533,7 +1568,7 @@ mod tests {
     #[test]
     fn remote_checkout_created_does_not_queue_workspace() {
         let mut app = stub_app();
-        app.model.my_host = Some(HostName::new("my-desktop"));
+        insert_local_host(&mut app.model, "my-desktop");
         let repo_identity = app.model.repo_order[0].clone();
         let repo_path = app.model.repos[&repo_identity].path.clone();
 
@@ -1552,5 +1587,41 @@ mod tests {
         });
 
         assert!(app.proto_commands.take_next().is_none(), "remote checkout should not auto-create local workspace");
+    }
+
+    // -- TuiHostState / hosts map --
+
+    #[test]
+    fn host_snapshot_event_populates_hosts_map() {
+        let mut app = stub_app();
+        app.handle_daemon_event(DaemonEvent::HostSnapshot(Box::new(flotilla_protocol::HostSnapshot {
+            seq: 1,
+            host_name: HostName::new("desktop"),
+            is_local: true,
+            connection_status: PeerConnectionState::Connected,
+            summary: HostSummary {
+                host_name: HostName::new("desktop"),
+                system: flotilla_protocol::SystemInfo::default(),
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+            },
+        })));
+        assert_eq!(app.model.my_host(), Some(&HostName::new("desktop")));
+        assert!(app.model.hosts.get(&HostName::new("desktop")).unwrap().is_local);
+    }
+
+    #[test]
+    fn my_host_returns_none_before_host_snapshot() {
+        let app = stub_app();
+        assert!(app.model.my_host().is_none());
+    }
+
+    #[test]
+    fn peer_host_names_returns_sorted_non_local() {
+        let mut app = stub_app();
+        insert_local_host(&mut app.model, "local");
+        insert_peer_host(&mut app.model, "beta", PeerStatus::Connected);
+        insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
+        assert_eq!(app.model.peer_host_names(), vec![HostName::new("alpha"), HostName::new("beta")]);
     }
 }

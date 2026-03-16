@@ -262,7 +262,7 @@ impl App {
             }
             Action::CycleHost => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    let peer_hosts = self.model.peer_hosts.iter().map(|peer| peer.name.clone()).collect::<Vec<_>>();
+                    let peer_hosts = self.model.peer_host_names();
                     self.ui.cycle_target_host(&peer_hosts);
                 }
             }
@@ -507,9 +507,9 @@ impl App {
             return;
         };
 
-        let my_host = &self.model.my_host;
+        let my_host = self.model.my_host().cloned();
         for &intent in Intent::enter_priority() {
-            if intent.is_available(&item) && intent.is_allowed_for_host(&item, my_host) {
+            if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_host) {
                 self.resolve_and_push(intent, &item);
                 return;
             }
@@ -549,7 +549,8 @@ impl App {
         let Some(item) = self.selected_work_item().cloned() else {
             return;
         };
-        if intent.is_available(&item) && intent.is_allowed_for_host(&item, &self.model.my_host) {
+        let my_host = self.model.my_host().cloned();
+        if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_host) {
             self.resolve_and_push(intent, &item);
         }
     }
@@ -557,7 +558,8 @@ impl App {
     fn resolve_and_push(&mut self, intent: Intent, item: &WorkItem) {
         // Safety net: block filesystem operations on remote items even if
         // the caller somehow bypassed the menu/availability filter.
-        if !intent.is_allowed_for_host(item, &self.model.my_host) {
+        let my_host = self.model.my_host().cloned();
+        if !intent.is_allowed_for_host(item, &my_host) {
             tracing::warn!(?intent, host = %item.host, "blocked intent on remote item");
             self.model.status_message = Some("Cannot perform this action on a remote item".to_string());
             return;
@@ -604,11 +606,11 @@ impl App {
             return;
         };
 
-        let my_host = &self.model.my_host;
+        let my_host = self.model.my_host().cloned();
         let items: Vec<Intent> = Intent::all_in_menu_order()
             .iter()
             .copied()
-            .filter(|a| a.is_available(&item) && a.is_allowed_for_host(&item, my_host) && a.resolve(&item, self).is_some())
+            .filter(|a| a.is_available(&item) && a.is_allowed_for_host(&item, &my_host) && a.resolve(&item, self).is_some())
             .collect();
 
         if items.is_empty() {
@@ -719,7 +721,7 @@ mod tests {
             test_support::{
                 checkout_item, dir_entry, enter_file_picker, key, setup_selectable_table as setup_table, stub_app, stub_app_with_repos,
             },
-            PeerHostStatus, PeerStatus,
+            PeerStatus, TuiHostState,
         },
         status_bar::{StatusBarAction, StatusBarTarget},
     };
@@ -727,6 +729,22 @@ mod tests {
     fn hp(path: &str) -> HostPath {
         HostPath::new(HostName::local(), PathBuf::from(path))
     }
+
+    fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
+        let host_name = HostName::new(name);
+        model.hosts.insert(host_name.clone(), TuiHostState {
+            host_name: host_name.clone(),
+            is_local: false,
+            status: PeerStatus::Connected,
+            summary: flotilla_protocol::HostSummary {
+                host_name,
+                system: flotilla_protocol::SystemInfo::default(),
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+            },
+        });
+    }
+
     use tui_input::Input;
 
     fn make_work_item(id: &str) -> flotilla_protocol::WorkItem {
@@ -1210,10 +1228,8 @@ mod tests {
     #[test]
     fn normal_h_cycles_target_host_through_known_peers() {
         let mut app = stub_app();
-        app.model.peer_hosts = vec![PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected }, PeerHostStatus {
-            name: HostName::new("beta"),
-            status: PeerStatus::Connected,
-        }];
+        insert_peer_host(&mut app.model, "alpha");
+        insert_peer_host(&mut app.model, "beta");
 
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.ui.target_host, Some(HostName::new("alpha")));
@@ -1280,7 +1296,7 @@ mod tests {
     #[test]
     fn clicking_host_status_target_cycles_target_host() {
         let mut app = stub_app();
-        app.model.peer_hosts = vec![PeerHostStatus { name: HostName::new("alpha"), status: PeerStatus::Connected }];
+        insert_peer_host(&mut app.model, "alpha");
         app.ui.layout.status_bar.key_targets =
             vec![StatusBarTarget::new(Rect::new(0, 29, 16, 1), StatusBarAction::key(KeyCode::Char('h')))];
 

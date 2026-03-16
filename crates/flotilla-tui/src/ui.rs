@@ -16,7 +16,7 @@ use crate::{
     app::{
         collect_visible_status_items,
         ui_state::{PendingAction, PendingStatus},
-        BranchInputKind, InFlightCommand, PeerHostStatus, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiModel, UiMode, UiState,
+        BranchInputKind, InFlightCommand, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiHostState, TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
@@ -1191,18 +1191,15 @@ fn render_config_screen(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    if model.peer_hosts.is_empty() {
-        render_global_status(model, theme, frame, chunks[0]);
-    } else {
-        // Split left panel: providers on top, hosts below.
-        let host_height = (model.peer_hosts.len() as u16 + 2).min(8);
-        let left_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(host_height)])
-            .split(chunks[0]);
-        render_global_status(model, theme, frame, left_chunks[0]);
-        render_hosts_status(theme, frame, left_chunks[1], &model.peer_hosts);
-    }
+    let host_count = model.hosts.len();
+    let host_height = (host_count as u16 + 2).min(8);
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(host_height)])
+        .split(chunks[0]);
+    render_global_status(model, theme, frame, left_chunks[0]);
+    render_hosts_status(model, theme, frame, left_chunks[1]);
+
     render_event_log(ui, theme, frame, chunks[1]);
 }
 
@@ -1264,23 +1261,77 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
     frame.render_widget(table, area);
 }
 
-fn render_hosts_status(theme: &Theme, frame: &mut Frame, area: Rect, hosts: &[PeerHostStatus]) {
-    let items: Vec<ListItem> = hosts
-        .iter()
-        .map(|h| {
-            let (icon, style) = match h.status {
-                PeerStatus::Connected => ("\u{25cf}", Style::default().fg(theme.status_ok)),
-                PeerStatus::Disconnected => ("\u{25cb}", Style::default().fg(theme.error)),
-                PeerStatus::Connecting => ("\u{25d0}", Style::default().fg(theme.warning)),
-                PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(theme.warning)),
-                PeerStatus::Rejected => ("\u{2717}", Style::default().fg(theme.error)),
-            };
-            ListItem::new(Line::from(vec![Span::styled(format!("{icon} "), style), Span::raw(h.name.as_str())]))
-        })
-        .collect();
+fn render_hosts_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area: Rect) {
+    // Sort: local first, then peers alphabetically
+    let mut hosts: Vec<&TuiHostState> = model.hosts.values().collect();
+    hosts.sort_by(|a, b| match (a.is_local, b.is_local) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.host_name.cmp(&b.host_name),
+    });
 
-    let list = List::new(items).block(Block::bordered().style(theme.block_style()).title(" Hosts "));
-    frame.render_widget(list, area);
+    let rows: Vec<Row> =
+        hosts
+            .iter()
+            .map(|h| {
+                let (icon, icon_style) = match h.status {
+                    PeerStatus::Connected => ("\u{25cf}", Style::default().fg(theme.status_ok)),
+                    PeerStatus::Disconnected => ("\u{25cb}", Style::default().fg(theme.error)),
+                    PeerStatus::Connecting => ("\u{25d0}", Style::default().fg(theme.warning)),
+                    PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(theme.warning)),
+                    PeerStatus::Rejected => ("\u{2717}", Style::default().fg(theme.error)),
+                };
+
+                let name = if h.is_local { format!("{} (local)", h.host_name) } else { h.host_name.to_string() };
+
+                let sys = &h.summary.system;
+                let os_arch = match (sys.os.as_deref(), sys.arch.as_deref()) {
+                    (Some(os), Some(arch)) => format!("{os}/{arch}"),
+                    (Some(os), None) => os.to_string(),
+                    _ => "\u{2014}".to_string(),
+                };
+                let cpus = sys.cpu_count.map_or("\u{2014}".to_string(), |c| format!("{c} CPUs"));
+                let mem = sys.memory_total_mb.map_or("\u{2014}".to_string(), |m| {
+                    if m >= 1024 {
+                        format!("{} GB", m / 1024)
+                    } else {
+                        format!("{m} MB")
+                    }
+                });
+
+                let providers: String = h
+                    .summary
+                    .providers
+                    .iter()
+                    .map(|p| {
+                        let check = if p.healthy { "\u{2713}" } else { "\u{2717}" };
+                        format!("{} {check}", p.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+
+                Row::new(vec![
+                    Cell::from(Span::styled(format!("{icon} "), icon_style)),
+                    Cell::from(name),
+                    Cell::from(os_arch),
+                    Cell::from(cpus),
+                    Cell::from(mem),
+                    Cell::from(providers),
+                ])
+            })
+            .collect();
+
+    let widths = [
+        Constraint::Length(2),
+        Constraint::Min(12),
+        Constraint::Length(14),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Fill(1),
+    ];
+
+    let table = Table::new(rows, widths).block(Block::bordered().style(theme.block_style()).title(" Hosts "));
+    frame.render_widget(table, area);
 }
 
 fn render_event_log(ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
