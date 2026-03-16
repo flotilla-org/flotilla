@@ -621,18 +621,17 @@ impl DaemonHandle for SocketDaemon {
 
         // Seed local_seqs from replay events so the background reader
         // doesn't trigger spurious gap recovery for the first live delta.
+        // Use monotonic update: a live event processed between subscribe and
+        // replay_since may have already advanced the seq further.
         {
             let mut seqs = self.local_seqs.write().unwrap();
             for event in &events {
-                match event {
-                    DaemonEvent::RepoSnapshot(snap) => {
-                        seqs.insert(snap.repo_identity.clone(), snap.seq);
-                    }
-                    DaemonEvent::RepoDelta(delta) => {
-                        seqs.insert(delta.repo_identity.clone(), delta.seq);
-                    }
-                    _ => {}
-                }
+                let (identity, seq) = match event {
+                    DaemonEvent::RepoSnapshot(snap) => (snap.repo_identity.clone(), snap.seq),
+                    DaemonEvent::RepoDelta(delta) => (delta.repo_identity.clone(), delta.seq),
+                    _ => continue,
+                };
+                seqs.entry(identity).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
             }
         }
 
