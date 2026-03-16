@@ -714,6 +714,111 @@ async fn replay_since_includes_non_config_backed_known_hosts() {
     );
 }
 
+#[tokio::test]
+async fn publish_peer_summary_normalizes_host_name() {
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
+
+    let mut rx = daemon.subscribe();
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    let peer_host = HostName::new("remote-host");
+    let _ = daemon
+        .publish_peer_summary(&peer_host, HostSummary {
+            host_name: HostName::new("spoofed-host"),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+        })
+        .await;
+
+    let replay = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
+    let snapshot = replay
+        .iter()
+        .find_map(|event| match event {
+            DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_host => Some(snap),
+            _ => None,
+        })
+        .expect("remote host snapshot");
+    assert_eq!(snapshot.host_name, peer_host);
+    assert_eq!(snapshot.summary.host_name, peer_host);
+}
+
+#[tokio::test]
+async fn replay_since_includes_overlay_only_hosts() {
+    let (_temp, repo, daemon, _identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
+    let mut rx = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    let overlay_host = HostName::new("overlay-only");
+    let mut peer_data = ProviderData::default();
+    peer_data.checkouts.insert(HostPath::new(overlay_host.clone(), "/srv/overlay/repo"), Checkout {
+        branch: "overlay-branch".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+    });
+
+    daemon.set_peer_providers(&repo, vec![(overlay_host.clone(), peer_data)], 0).await;
+    let _ = recv_event(&mut rx).await;
+
+    let events = daemon.replay_since(&HashMap::new()).await.expect("host replay");
+    assert!(
+        events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == overlay_host)),
+        "hosts known only through remote overlay data should replay"
+    );
+}
+
+#[tokio::test]
+async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
+    let (_temp, repo, daemon, _identity) = daemon_for_git_repo("git@github.com:owner/repo.git").await;
+    let mut rx = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    let transient_host = HostName::new("transient");
+    let mut peer_data = ProviderData::default();
+    peer_data.checkouts.insert(HostPath::new(transient_host.clone(), "/srv/transient/repo"), Checkout {
+        branch: "transient-branch".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+    });
+
+    let _ = daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Connected).await;
+    daemon.set_peer_host_summaries(HashMap::from([(transient_host.clone(), sample_remote_host_summary("transient"))])).await;
+    daemon.set_peer_providers(&repo, vec![(transient_host.clone(), peer_data)], 0).await;
+    let _ = recv_event(&mut rx).await;
+
+    let hosts = daemon.list_hosts().await.expect("list hosts");
+    assert!(hosts.hosts.iter().any(|entry| entry.host == transient_host), "transient host should be visible while backed by state");
+
+    let _ = daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Disconnected).await;
+    daemon.set_peer_host_summaries(HashMap::new()).await;
+    daemon.set_peer_providers(&repo, vec![], 1).await;
+    let _ = recv_event(&mut rx).await;
+
+    let hosts = daemon.list_hosts().await.expect("list hosts");
+    assert!(
+        !hosts.hosts.iter().any(|entry| entry.host == transient_host),
+        "stale non-configured host should be pruned once summary, connection, and overlay data are gone"
+    );
+
+    let replay = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
+    assert!(
+        !replay.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == transient_host)),
+        "pruned hosts should not keep replaying"
+    );
+}
+
 /// replay_since must include peer provider data, just like get_state and live
 /// broadcasts. A late-subscribing or reconnecting client should see the same
 /// merged view (local + peer checkouts with correct host attribution) as a

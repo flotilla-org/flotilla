@@ -532,6 +532,35 @@ fn update_host_summary(
     Some(build_host_snapshot(local_host, host_name, state))
 }
 
+fn clear_host_summary(local_host: &HostName, hosts: &mut HashMap<HostName, HostState>, host_name: &HostName) -> Option<HostSnapshot> {
+    if host_name == local_host {
+        return None;
+    }
+    let Some(state) = hosts.get_mut(host_name) else {
+        return None;
+    };
+    if state.summary.is_none() {
+        return None;
+    }
+    state.summary = None;
+    state.seq += 1;
+    Some(build_host_snapshot(local_host, host_name, state))
+}
+
+fn should_retain_host_state(
+    local_host: &HostName,
+    configured: &HashSet<HostName>,
+    remote_counts: &HashMap<HostName, crate::host_queries::HostCounts>,
+    host_name: &HostName,
+    state: &HostState,
+) -> bool {
+    host_name == local_host
+        || configured.contains(host_name)
+        || state.connection_status != PeerConnectionState::Disconnected
+        || state.summary.is_some()
+        || remote_counts.contains_key(host_name)
+}
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -713,17 +742,29 @@ impl InProcessDaemon {
         *configured = peers.iter().cloned().collect();
         drop(configured);
 
-        let mut hosts = self.hosts.write().await;
-        for peer in peers {
-            ensure_remote_host_state(&mut hosts, &peer);
-        }
+        self.sync_host_membership().await;
     }
 
     pub async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>) {
+        let mut normalized = HashMap::new();
+        for (host_name, mut summary) in summaries {
+            summary.host_name = host_name.clone();
+            normalized.insert(host_name, summary);
+        }
+
         let mut hosts = self.hosts.write().await;
-        for (host_name, summary) in summaries {
+        let host_names: Vec<_> = hosts.keys().cloned().collect();
+        for host_name in host_names {
+            if !normalized.contains_key(&host_name) {
+                let _ = clear_host_summary(&self.host_name, &mut hosts, &host_name);
+            }
+        }
+        for (host_name, summary) in normalized {
             let _ = update_host_summary(&self.host_name, &mut hosts, &host_name, summary);
         }
+        drop(hosts);
+
+        self.sync_host_membership().await;
     }
 
     pub async fn publish_peer_connection_status(
@@ -739,10 +780,13 @@ impl InProcessDaemon {
             self.send_event(DaemonEvent::PeerStatusChanged { host: host.clone(), status });
             self.send_event(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
         }
+        self.sync_host_membership().await;
         snapshot
     }
 
     pub async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary) -> Option<HostSnapshot> {
+        let mut summary = summary;
+        summary.host_name = host.clone();
         let snapshot = {
             let mut hosts = self.hosts.write().await;
             update_host_summary(&self.host_name, &mut hosts, host, summary)
@@ -751,6 +795,20 @@ impl InProcessDaemon {
             self.send_event(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
         }
         snapshot
+    }
+
+    async fn sync_host_membership(&self) {
+        let configured = self.configured_peer_names.read().await.clone();
+        let remote_counts = self.remote_host_counts().await;
+        let mut hosts = self.hosts.write().await;
+
+        for host_name in configured.iter().chain(remote_counts.keys()) {
+            if host_name != &self.host_name {
+                ensure_remote_host_state(&mut hosts, host_name);
+            }
+        }
+
+        hosts.retain(|host_name, state| should_retain_host_state(&self.host_name, &configured, &remote_counts, host_name, state));
     }
 
     pub async fn set_topology_routes(&self, mut routes: Vec<TopologyRoute>) {
@@ -964,8 +1022,13 @@ impl InProcessDaemon {
         }
         {
             let mut pp = self.peer_providers.write().await;
-            pp.insert(identity.clone(), peers);
+            if peers.is_empty() {
+                pp.remove(&identity);
+            } else {
+                pp.insert(identity.clone(), peers);
+            }
         }
+        self.sync_host_membership().await;
         self.broadcast_snapshot_inner(repo_path, false).await;
     }
 
@@ -1553,11 +1616,13 @@ impl InProcessDaemon {
             }
             DaemonEvent::HostSnapshot(snap) => {
                 if let Ok(mut hosts) = self.hosts.try_write() {
+                    let mut summary = snap.summary.clone();
+                    summary.host_name = snap.host_name.clone();
                     let should_store = hosts.get(&snap.host_name).map(|state| state.seq <= snap.seq).unwrap_or(true);
                     if should_store {
                         hosts.insert(snap.host_name.clone(), HostState {
                             connection_status: snap.connection_status.clone(),
-                            summary: Some(snap.summary.clone()),
+                            summary: Some(summary),
                             seq: snap.seq,
                         });
                     }
