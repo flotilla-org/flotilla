@@ -98,6 +98,24 @@ async fn socket_roundtrip() {
     let repo_events: Vec<_> = replay.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_))).collect();
     assert!(repo_events.is_empty(), "should have no repo events when up to date, got {} events", repo_events.len());
 
+    let host_replay = client.replay_since(&HashMap::new()).await.expect("replay_since");
+    let local_host_seq = host_replay
+        .iter()
+        .find_map(|event| match event {
+            DaemonEvent::HostSnapshot(snap) if snap.host_name == HostName::local() => Some(snap.seq),
+            _ => None,
+        })
+        .expect("expected local host snapshot");
+    let replay = client
+        .replay_since(&HashMap::from([(StreamKey::Host { host_name: HostName::local() }, local_host_seq)]))
+        .await
+        .expect("replay_since");
+    let host_events: Vec<_> = replay
+        .iter()
+        .filter(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == HostName::local()))
+        .collect();
+    assert!(host_events.is_empty(), "should have no host events when the local host cursor is current");
+
     // replay_since with bogus seq — should return full snapshot
     let last_seen = HashMap::from([(StreamKey::Repo { identity: snapshot.repo_identity }, 999999)]);
     let replay = client.replay_since(&last_seen).await.expect("replay_since");

@@ -618,6 +618,102 @@ async fn replay_since_returns_empty_when_up_to_date() {
     assert!(repo_events.is_empty(), "should have no repo events when up to date");
 }
 
+#[tokio::test]
+async fn replay_since_returns_no_host_event_when_host_cursor_is_current() {
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
+
+    let mut rx = daemon.subscribe();
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    daemon.set_configured_peer_names(vec![HostName::new("alpha")]).await;
+    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Connected });
+    daemon.set_peer_host_summaries(HashMap::from([(HostName::new("alpha"), sample_remote_host_summary("alpha"))])).await;
+
+    let events = daemon.replay_since(&HashMap::new()).await.expect("initial host replay");
+    let local_host = daemon.host_name().clone();
+    let local_seq = events
+        .iter()
+        .find_map(|event| match event {
+            DaemonEvent::HostSnapshot(snap) if snap.host_name == local_host => Some(snap.seq),
+            _ => None,
+        })
+        .expect("initial replay should include local host snapshot");
+
+    let events = daemon
+        .replay_since(&HashMap::from([(StreamKey::Host { host_name: local_host.clone() }, local_seq)]))
+        .await
+        .expect("host replay with current cursor");
+
+    assert!(
+        !events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == local_host)),
+        "current host cursor should suppress replay for that host"
+    );
+}
+
+#[tokio::test]
+async fn replay_since_returns_only_stale_host_snapshots() {
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
+
+    let mut rx = daemon.subscribe();
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    daemon.set_configured_peer_names(vec![HostName::new("alpha"), HostName::new("beta")]).await;
+    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Connected });
+    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("beta"), status: PeerConnectionState::Disconnected });
+    daemon.set_peer_host_summaries(HashMap::from([
+        (HostName::new("alpha"), sample_remote_host_summary("alpha")),
+        (HostName::new("beta"), sample_remote_host_summary("beta")),
+    ]))
+    .await;
+
+    let events = daemon.replay_since(&HashMap::new()).await.expect("initial host replay");
+    let mut host_seqs = HashMap::new();
+    for event in &events {
+        if let DaemonEvent::HostSnapshot(snap) = event {
+            host_seqs.insert(snap.host_name.clone(), snap.seq);
+        }
+    }
+
+    let local_host = daemon.host_name().clone();
+    let alpha = HostName::new("alpha");
+    let beta = HostName::new("beta");
+    let last_seen = HashMap::from([
+        (StreamKey::Host { host_name: local_host.clone() }, *host_seqs.get(&local_host).expect("local host seq")),
+        (StreamKey::Host { host_name: alpha.clone() }, *host_seqs.get(&alpha).expect("alpha seq")),
+        (StreamKey::Host { host_name: beta.clone() }, 0),
+    ]);
+
+    let events = daemon.replay_since(&last_seen).await.expect("host replay with mixed cursors");
+    let replayed_hosts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            DaemonEvent::HostSnapshot(snap) => Some(snap.host_name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(replayed_hosts, vec![beta], "only stale hosts should replay");
+}
+
+#[tokio::test]
+async fn replay_since_includes_non_config_backed_known_hosts() {
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
+
+    let mut rx = daemon.subscribe();
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    let peer_host = HostName::new("inbound-only");
+    daemon.send_event(DaemonEvent::PeerStatusChanged { host: peer_host.clone(), status: PeerConnectionState::Connected });
+    daemon.set_peer_host_summaries(HashMap::from([(peer_host.clone(), sample_remote_host_summary("inbound-only"))])).await;
+
+    let events = daemon.replay_since(&HashMap::new()).await.expect("host replay");
+
+    assert!(
+        events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_host)),
+        "known non-config-backed hosts should still replay"
+    );
+}
+
 /// replay_since must include peer provider data, just like get_state and live
 /// broadcasts. A late-subscribing or reconnecting client should see the same
 /// merged view (local + peer checkouts with correct host attribution) as a

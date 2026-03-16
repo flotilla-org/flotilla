@@ -468,6 +468,70 @@ struct ActiveCommand {
     token: CancellationToken,
 }
 
+#[derive(Debug, Clone)]
+struct HostState {
+    connection_status: PeerConnectionState,
+    summary: Option<HostSummary>,
+    seq: u64,
+}
+
+fn default_host_summary(host_name: &HostName) -> HostSummary {
+    HostSummary {
+        host_name: host_name.clone(),
+        system: SystemInfo::default(),
+        inventory: ToolInventory::default(),
+        providers: vec![],
+    }
+}
+
+fn ensure_remote_host_state<'a>(hosts: &'a mut HashMap<HostName, HostState>, host_name: &HostName) -> &'a mut HostState {
+    hosts.entry(host_name.clone()).or_insert_with(|| HostState {
+        connection_status: PeerConnectionState::Disconnected,
+        summary: None,
+        seq: 1,
+    })
+}
+
+fn build_host_snapshot(local_host: &HostName, host_name: &HostName, state: &HostState) -> HostSnapshot {
+    HostSnapshot {
+        seq: state.seq,
+        host_name: host_name.clone(),
+        is_local: *host_name == *local_host,
+        connection_status: state.connection_status.clone(),
+        summary: state.summary.clone().unwrap_or_else(|| default_host_summary(host_name)),
+    }
+}
+
+fn update_host_status(
+    local_host: &HostName,
+    hosts: &mut HashMap<HostName, HostState>,
+    host_name: &HostName,
+    status: PeerConnectionState,
+) -> Option<HostSnapshot> {
+    let state = ensure_remote_host_state(hosts, host_name);
+    if state.connection_status == status {
+        return None;
+    }
+    state.connection_status = status;
+    state.seq += 1;
+    Some(build_host_snapshot(local_host, host_name, state))
+}
+
+fn update_host_summary(
+    local_host: &HostName,
+    hosts: &mut HashMap<HostName, HostState>,
+    host_name: &HostName,
+    summary: HostSummary,
+) -> Option<HostSnapshot> {
+    let state = ensure_remote_host_state(hosts, host_name);
+    if state.summary.as_ref() == Some(&summary) {
+        return None;
+    }
+    state.summary = Some(summary);
+    state.seq += 1;
+    Some(build_host_snapshot(local_host, host_name, state))
+}
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -493,15 +557,11 @@ pub struct InProcessDaemon {
     // repos/repo_order; add_repo intentionally takes it last while already
     // holding those write locks.
     path_identities: RwLock<HashMap<PathBuf, flotilla_protocol::RepoIdentity>>,
-    /// Current peer connection status, updated via `set_peer_status()` and
-    /// replayed to late-subscribing clients via `replay_since()`.
-    peer_status: RwLock<HashMap<HostName, PeerConnectionState>>,
+    /// Authoritative host replay/query state keyed by host name.
+    hosts: RwLock<HashMap<HostName, HostState>>,
     /// Config-backed peer host names from `hosts.toml`, mirrored in by the
     /// server/peer wiring so daemon queries can include disconnected peers.
     configured_peer_names: RwLock<HashSet<HostName>>,
-    /// Remote host summaries replicated from peers and mirrored in by the
-    /// server/peer wiring.
-    peer_host_summaries: RwLock<HashMap<HostName, HostSummary>>,
     /// Current routing view mirrored in from the peer manager.
     topology_routes: RwLock<Vec<TopologyRoute>>,
     /// Host-level environment assertions, computed once at startup and
@@ -517,8 +577,6 @@ pub struct InProcessDaemon {
     session_id: uuid::Uuid,
     /// Static local host summary published to peers.
     local_host_summary: HostSummary,
-    /// Monotonic sequence counter for host-level events (HostSnapshot).
-    host_seq: AtomicU64,
 }
 
 impl InProcessDaemon {
@@ -587,21 +645,22 @@ impl InProcessDaemon {
             event_tx,
             config,
             next_command_id: AtomicU64::new(1),
-            host_name,
+            host_name: host_name.clone(),
             follower,
             peer_providers: RwLock::new(HashMap::new()),
             peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
-            peer_status: RwLock::new(HashMap::new()),
+            hosts: RwLock::new(HashMap::from([(
+                host_name.clone(),
+                HostState { connection_status: PeerConnectionState::Connected, summary: Some(local_host_summary.clone()), seq: 1 },
+            )])),
             configured_peer_names: RwLock::new(HashSet::new()),
-            peer_host_summaries: RwLock::new(HashMap::new()),
             topology_routes: RwLock::new(Vec::new()),
             host_bag,
             discovery,
             active_command: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4(),
             local_host_summary,
-            host_seq: AtomicU64::new(0),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -639,24 +698,59 @@ impl InProcessDaemon {
         &self.local_host_summary
     }
 
-    /// Allocate the next host-level sequence number for HostSnapshot events.
-    pub fn next_host_seq(&self) -> u64 {
-        self.host_seq.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
     /// Returns the current connection status for a peer host.
     pub async fn peer_connection_status(&self, host: &HostName) -> PeerConnectionState {
-        self.peer_status.read().await.get(host).cloned().unwrap_or(PeerConnectionState::Disconnected)
+        self.hosts
+            .read()
+            .await
+            .get(host)
+            .map(|state| state.connection_status.clone())
+            .unwrap_or(PeerConnectionState::Disconnected)
     }
 
     pub async fn set_configured_peer_names(&self, peers: Vec<HostName>) {
         let mut configured = self.configured_peer_names.write().await;
-        *configured = peers.into_iter().collect();
+        *configured = peers.iter().cloned().collect();
+        drop(configured);
+
+        let mut hosts = self.hosts.write().await;
+        for peer in peers {
+            ensure_remote_host_state(&mut hosts, &peer);
+        }
     }
 
     pub async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>) {
-        let mut stored = self.peer_host_summaries.write().await;
-        *stored = summaries;
+        let mut hosts = self.hosts.write().await;
+        for (host_name, summary) in summaries {
+            let _ = update_host_summary(&self.host_name, &mut hosts, &host_name, summary);
+        }
+    }
+
+    pub async fn publish_peer_connection_status(
+        &self,
+        host: &HostName,
+        status: PeerConnectionState,
+    ) -> Option<HostSnapshot> {
+        let snapshot = {
+            let mut hosts = self.hosts.write().await;
+            update_host_status(&self.host_name, &mut hosts, host, status.clone())
+        };
+        if let Some(snapshot) = snapshot.as_ref() {
+            self.send_event(DaemonEvent::PeerStatusChanged { host: host.clone(), status });
+            self.send_event(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
+        }
+        snapshot
+    }
+
+    pub async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary) -> Option<HostSnapshot> {
+        let snapshot = {
+            let mut hosts = self.hosts.write().await;
+            update_host_summary(&self.host_name, &mut hosts, host, summary)
+        };
+        if let Some(snapshot) = snapshot.as_ref() {
+            self.send_event(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
+        }
+        snapshot
     }
 
     pub async fn set_topology_routes(&self, mut routes: Vec<TopologyRoute>) {
@@ -1448,15 +1542,28 @@ impl InProcessDaemon {
 
     /// Send an arbitrary event to all subscribers.
     ///
-    /// If the event is a `PeerStatusChanged`, also records the status so
-    /// `replay_since` can include it for late-subscribing clients.
+    /// Mirrors host events into daemon-owned host state so replay/query paths
+    /// can use a single authoritative source of truth.
     pub fn send_event(&self, event: DaemonEvent) {
-        if let DaemonEvent::PeerStatusChanged { ref host, ref status } = event {
-            // Use try_write to avoid blocking; if contended, the replay
-            // will use a slightly stale value — acceptable for display.
-            if let Ok(mut map) = self.peer_status.try_write() {
-                map.insert(host.clone(), status.clone());
+        match &event {
+            DaemonEvent::PeerStatusChanged { host, status } => {
+                if let Ok(mut hosts) = self.hosts.try_write() {
+                    let _ = update_host_status(&self.host_name, &mut hosts, host, status.clone());
+                }
             }
+            DaemonEvent::HostSnapshot(snap) => {
+                if let Ok(mut hosts) = self.hosts.try_write() {
+                    let should_store = hosts.get(&snap.host_name).map(|state| state.seq <= snap.seq).unwrap_or(true);
+                    if should_store {
+                        hosts.insert(snap.host_name.clone(), HostState {
+                            connection_status: snap.connection_status.clone(),
+                            summary: Some(snap.summary.clone()),
+                            seq: snap.seq,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
         let _ = self.event_tx.send(event);
     }
@@ -2017,53 +2124,13 @@ impl DaemonHandle for InProcessDaemon {
         let peer_overlay = self.peer_providers.read().await;
         let mut events = Vec::new();
 
-        // Emit HostSnapshot events first so the TUI knows about hosts before
-        // receiving repo data with host-attributed work items.
-        // Use the same "known hosts" union as host_queries::known_hosts so that
-        // late-subscribing clients see the same hosts as list_hosts returns.
-        // Read (don't advance) the current host_seq — replay is idempotent.
-        let current_host_seq = self.host_seq.load(Ordering::Relaxed);
-        let peer_status = self.peer_status.read().await;
-        let peer_summaries = self.peer_host_summaries.read().await;
-        let configured_peers = self.configured_peer_names.read().await;
-        let remote_counts = self.remote_host_counts().await;
-
-        let mut all_hosts: HashSet<HostName> = HashSet::from([self.host_name.clone()]);
-        all_hosts.extend(configured_peers.iter().cloned());
-        all_hosts.extend(peer_status.keys().cloned());
-        all_hosts.extend(peer_summaries.keys().cloned());
-        all_hosts.extend(remote_counts.keys().cloned());
-
-        for host_name in &all_hosts {
-            let is_local = *host_name == self.host_name;
-            let connection_status = if is_local {
-                PeerConnectionState::Connected
-            } else {
-                peer_status.get(host_name).cloned().unwrap_or(PeerConnectionState::Disconnected)
-            };
-            let summary = if is_local {
-                self.local_host_summary.clone()
-            } else {
-                peer_summaries.get(host_name).cloned().unwrap_or_else(|| HostSummary {
-                    host_name: host_name.clone(),
-                    system: SystemInfo::default(),
-                    inventory: ToolInventory::default(),
-                    providers: vec![],
-                })
-            };
-            events.push(DaemonEvent::HostSnapshot(Box::new(HostSnapshot {
-                seq: current_host_seq,
-                host_name: host_name.clone(),
-                is_local,
-                connection_status,
-                summary,
-            })));
+        for (host_name, state) in self.hosts.read().await.iter() {
+            let stream_key = StreamKey::Host { host_name: host_name.clone() };
+            let up_to_date = last_seen.get(&stream_key).is_some_and(|seq| *seq == state.seq);
+            if !up_to_date {
+                events.push(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(&self.host_name, host_name, state))));
+            }
         }
-
-        // Drop locks before the repo snapshot iteration (which may need remote_host_counts again)
-        drop(peer_status);
-        drop(peer_summaries);
-        drop(configured_peers);
 
         // Emit repo events
         for identity in order.iter() {
@@ -2285,8 +2352,12 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn list_hosts(&self) -> Result<HostListResponse, String> {
         let configured = self.configured_peer_names.read().await.clone();
-        let statuses = self.peer_status.read().await.clone();
-        let summaries = self.peer_host_summaries.read().await.clone();
+        let hosts = self.hosts.read().await.clone();
+        let statuses = hosts.iter().map(|(host, state)| (host.clone(), state.connection_status.clone())).collect();
+        let summaries = hosts
+            .iter()
+            .filter_map(|(host, state)| state.summary.clone().map(|summary| (host.clone(), summary)))
+            .collect();
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
 
@@ -2310,8 +2381,12 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String> {
         let configured = self.configured_peer_names.read().await.clone();
-        let statuses = self.peer_status.read().await.clone();
-        let summaries = self.peer_host_summaries.read().await.clone();
+        let hosts = self.hosts.read().await.clone();
+        let statuses = hosts.iter().map(|(host, state)| (host.clone(), state.connection_status.clone())).collect();
+        let summaries = hosts
+            .iter()
+            .filter_map(|(host, state)| state.summary.clone().map(|summary| (host.clone(), summary)))
+            .collect();
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
         let known_hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts);
@@ -2332,8 +2407,12 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String> {
         let configured = self.configured_peer_names.read().await.clone();
-        let statuses = self.peer_status.read().await.clone();
-        let summaries = self.peer_host_summaries.read().await.clone();
+        let hosts = self.hosts.read().await.clone();
+        let statuses = hosts.iter().map(|(host, state)| (host.clone(), state.connection_status.clone())).collect();
+        let summaries = hosts
+            .iter()
+            .filter_map(|(host, state)| state.summary.clone().map(|summary| (host.clone(), summary)))
+            .collect();
         let remote_counts = self.remote_host_counts().await;
         let known_hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts);
         let resolved =
