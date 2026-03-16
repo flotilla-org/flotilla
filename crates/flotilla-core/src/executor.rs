@@ -9,7 +9,8 @@ use std::{
 };
 
 use flotilla_protocol::{
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
+    AttachableSetId, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId,
+    PreparedTerminalCommand,
 };
 use tracing::{debug, error, info, warn};
 
@@ -406,6 +407,61 @@ fn persist_workspace_binding(
     }
 }
 
+fn persist_workspace_binding_for_set(
+    attachable_store: &SharedAttachableStore,
+    provider_name: &str,
+    workspace_ref: &str,
+    set_id: &AttachableSetId,
+    target_host: &HostName,
+    checkout_path: &Path,
+) {
+    let Ok(mut store) = attachable_store.lock() else {
+        warn!("attachable store lock poisoned while persisting workspace binding");
+        return;
+    };
+    if !store.registry().sets.contains_key(set_id) {
+        store.insert_set(flotilla_protocol::AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(target_host.clone()),
+            checkout: Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+            template_identity: None,
+            members: Vec::new(),
+        });
+    }
+    let changed_binding = store.replace_binding(ProviderBinding {
+        provider_category: "workspace_manager".into(),
+        provider_name: provider_name.to_string(),
+        object_kind: BindingObjectKind::AttachableSet,
+        object_id: set_id.to_string(),
+        external_ref: workspace_ref.to_string(),
+    });
+    if changed_binding {
+        if let Err(err) = store.save() {
+            warn!(err = %err, "failed to persist attachable registry after workspace binding update");
+        }
+    }
+}
+
+fn resolve_attachable_set_for_checkout(
+    providers_data: &ProviderData,
+    target_host: &HostName,
+    checkout_path: &Path,
+) -> Option<AttachableSetId> {
+    let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
+    providers_data
+        .attachable_sets
+        .values()
+        .find(|set| set.checkout.as_ref() == Some(&checkout))
+        .map(|set| set.id.clone())
+        .or_else(|| {
+            providers_data
+                .managed_terminals
+                .values()
+                .find(|terminal| terminal.working_directory == checkout_path && terminal.attachable_set_id.is_some())
+                .and_then(|terminal| terminal.attachable_set_id.clone())
+        })
+}
+
 fn preferred_workspace_manager(registry: &ProviderRegistry) -> Option<(&str, &Arc<dyn WorkspaceManager>)> {
     registry.workspace_managers.preferred_with_desc().map(|(desc, provider)| (desc.implementation.as_str(), provider))
 }
@@ -500,8 +556,8 @@ pub async fn execute(
             CommandResult::Ok
         }
 
-        CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, commands } => {
-            if let Some((_, ws_mgr)) = preferred_workspace_manager(registry) {
+        CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
+            if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
                 let wrapped = match wrap_remote_attach_commands(&target_host, &checkout_path, &commands, config_base) {
                     Ok(commands) => commands,
                     Err(message) => return CommandResult::Error { message },
@@ -514,10 +570,17 @@ pub async fn execute(
                 let mut config = workspace_config(&repo.root, &remote_name, &working_dir, "claude", config_base);
                 config.resolved_commands = Some(wrapped.into_iter().map(|cmd| (cmd.role, cmd.command)).collect());
                 match ws_mgr.create_workspace(&config).await {
-                    Ok((_ws_ref, _workspace)) => {
-                        // Remote attachable-set ids are not protocol-visible yet, so the
-                        // local presentation host cannot persist an authoritative binding
-                        // to the remote set at this layer.
+                    Ok((ws_ref, _workspace)) => {
+                        if let Some(set_id) = attachable_set_id.as_ref() {
+                            persist_workspace_binding_for_set(
+                                attachable_store,
+                                provider_name,
+                                &ws_ref,
+                                set_id,
+                                &target_host,
+                                &checkout_path,
+                            );
+                        }
                     }
                     Err(e) => return CommandResult::Error { message: e },
                 }
@@ -569,12 +632,14 @@ pub async fn execute(
         CommandAction::PrepareTerminalForCheckout { checkout_path, commands: requested_commands } => {
             let host_key = HostPath::new(local_host.clone(), checkout_path.clone());
             if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
+                let attachable_set_id = resolve_attachable_set_for_checkout(providers_data, local_host, &checkout_path);
                 match prepare_terminal_commands(&repo.root, &co.branch, &checkout_path, registry, config_base, &requested_commands).await {
                     Ok(commands) => CommandResult::TerminalPrepared {
                         repo_identity: repo.identity.clone(),
                         target_host: local_host.clone(),
                         branch: co.branch,
                         checkout_path,
+                        attachable_set_id,
                         commands,
                     },
                     Err(message) => CommandResult::Error { message },
@@ -1637,12 +1702,48 @@ mod tests {
         .await;
 
         match result {
-            CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, commands } => {
+            CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
                 assert_eq!(repo_identity, flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
                 assert_eq!(target_host, HostName::local());
                 assert_eq!(branch, "feat");
                 assert_eq!(checkout_path, path);
+                assert_eq!(attachable_set_id, None);
                 assert_eq!(commands, vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }]);
+            }
+            other => panic!("expected TerminalPrepared, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present() {
+        let registry = empty_registry();
+        let mut data = empty_data();
+        let path = PathBuf::from("/repo/wt-feat");
+        let set_id = flotilla_protocol::AttachableSetId::new("set-remote");
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+        data.attachable_sets.insert(
+            set_id.clone(),
+            flotilla_protocol::AttachableSet {
+                id: set_id.clone(),
+                host_affinity: Some(local_host()),
+                checkout: Some(HostPath::new(local_host(), path.clone())),
+                template_identity: None,
+                members: vec![],
+            },
+        );
+        let runner = runner_ok();
+
+        let result = run_execute(
+            CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] },
+            &registry,
+            &data,
+            &runner,
+        )
+        .await;
+
+        match result {
+            CommandResult::TerminalPrepared { attachable_set_id, .. } => {
+                assert_eq!(attachable_set_id, Some(set_id));
             }
             other => panic!("expected TerminalPrepared, got {other:?}"),
         }
@@ -1673,6 +1774,7 @@ mod tests {
                 target_host: HostName::new("desktop"),
                 branch: "feat".into(),
                 checkout_path: PathBuf::from("/remote/feat"),
+                attachable_set_id: None,
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
             },
             &repo,
@@ -1724,6 +1826,7 @@ mod tests {
                 target_host: HostName::new("desktop"),
                 branch: "feat".into(),
                 checkout_path: PathBuf::from("/remote/feat"),
+                attachable_set_id: None,
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
             },
             &repo,
@@ -1740,6 +1843,55 @@ mod tests {
         let created = workspace_manager.created_configs.lock().await;
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].name, "feat@desktop", "workspace name should be branch@host");
+    }
+
+    #[tokio::test]
+    async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_binding() {
+        let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
+        let mut registry = empty_registry();
+        registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
+        let runner = runner_ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachable_store = test_attachable_store(temp.path());
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("create repo root");
+        std::fs::write(
+            temp.path().join("hosts.toml"),
+            "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
+        )
+        .expect("write hosts config");
+
+        let repo = RepoExecutionContext {
+            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            root: repo_root,
+        };
+        let set_id = flotilla_protocol::AttachableSetId::new("set-remote");
+        let result = execute(
+            CommandAction::CreateWorkspaceFromPreparedTerminal {
+                target_host: HostName::new("desktop"),
+                branch: "feat".into(),
+                checkout_path: PathBuf::from("/remote/feat"),
+                attachable_set_id: Some(set_id.clone()),
+                commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
+            },
+            &repo,
+            &registry,
+            &empty_data(),
+            &runner,
+            temp.path(),
+            &attachable_store,
+            &local_host(),
+        )
+        .await;
+
+        assert_ok(result);
+        let store = AttachableStore::with_base(temp.path());
+        let object_id = store
+            .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
+            .expect("workspace binding should exist");
+        assert_eq!(object_id, set_id.as_str());
+        let set = store.registry().sets.get(&set_id).expect("set should exist");
+        assert_eq!(set.checkout, Some(HostPath::new(HostName::new("desktop"), PathBuf::from("/remote/feat"))));
     }
 
     #[tokio::test]
@@ -1819,6 +1971,7 @@ mod tests {
                 target_host: HostName::new("desktop"),
                 branch: "feat".into(),
                 checkout_path: PathBuf::from("/remote/feat"),
+                attachable_set_id: None,
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
             },
             &repo,

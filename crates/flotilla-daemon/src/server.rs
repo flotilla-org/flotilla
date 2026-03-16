@@ -2549,12 +2549,14 @@ mod tests {
                                     target_host,
                                     branch,
                                     checkout_path: returned_path,
+                                    attachable_set_id,
                                     commands,
                                 } => {
                                     assert_eq!(result_identity, &repo_identity);
                                     assert_eq!(target_host, daemon.host_name());
                                     assert_eq!(branch, "feat-remote");
                                     assert_eq!(returned_path, &checkout_path);
+                                    assert_eq!(attachable_set_id, &None);
                                     assert!(!commands.is_empty(), "prepared terminal should include commands");
                                 }
                                 other => panic!("expected TerminalPrepared finish event, got {other:?}"),
@@ -2578,12 +2580,14 @@ mod tests {
                             target_host,
                             branch,
                             checkout_path: returned_path,
+                            attachable_set_id,
                             commands,
                         } => {
                             assert_eq!(result_identity, &repo_identity);
                             assert_eq!(target_host, daemon.host_name());
                             assert_eq!(branch, "feat-remote");
                             assert_eq!(returned_path, &checkout_path);
+                            assert_eq!(attachable_set_id, &None);
                             assert!(!commands.is_empty(), "prepared terminal should include commands");
                         }
                         other => panic!("expected TerminalPrepared response, got {other:?}"),

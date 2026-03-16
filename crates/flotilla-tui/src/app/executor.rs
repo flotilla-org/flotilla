@@ -90,12 +90,13 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
         CommandResult::CheckoutRemoved { branch } => {
             info!(%branch, "removed checkout");
         }
-        CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, commands } => {
+        CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
             if app.repo_path_for_identity(&repo_identity).is_some() {
                 app.proto_commands.push(app.repo_command_for_identity(repo_identity, CommandAction::CreateWorkspaceFromPreparedTerminal {
                     target_host,
                     branch,
                     checkout_path,
+                    attachable_set_id,
                     commands,
                 }));
             } else {
@@ -145,6 +146,7 @@ mod tests {
                 target_host: HostName::new("remote-a"),
                 branch: "feat-x".into(),
                 checkout_path: PathBuf::from("/remote/feat-x"),
+                attachable_set_id: Some(flotilla_protocol::AttachableSetId::new("set-1")),
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
             },
             &mut app,
@@ -152,11 +154,12 @@ mod tests {
 
         let (cmd, _) = app.proto_commands.take_next().expect("queued workspace creation");
         match cmd.action {
-            CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, commands } => {
+            CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
                 assert_eq!(cmd.host, None);
                 assert_eq!(target_host, HostName::new("remote-a"));
                 assert_eq!(branch, "feat-x");
                 assert_eq!(checkout_path, PathBuf::from("/remote/feat-x"));
+                assert_eq!(attachable_set_id, Some(flotilla_protocol::AttachableSetId::new("set-1")));
                 assert_eq!(commands, vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }]);
             }
             other => panic!("expected CreateWorkspaceFromPreparedTerminal, got {other:?}"),
@@ -174,6 +177,7 @@ mod tests {
                 target_host: HostName::new("remote-a"),
                 branch: "feat-x".into(),
                 checkout_path: PathBuf::from("/remote/feat-x"),
+                attachable_set_id: None,
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
             },
             &mut app,
