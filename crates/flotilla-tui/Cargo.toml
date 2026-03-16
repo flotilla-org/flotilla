@@ -22,6 +22,7 @@ image = "0.25.9"
 unicode-width = "0.2.2"
 dirs = "6"
 catppuccin = { version = "2", features = ["ratatui"] }
+crokey = "1.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 time = { version = "0.3.47", features = ["local-offset"] }
