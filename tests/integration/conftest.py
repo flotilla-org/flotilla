@@ -18,7 +18,7 @@ def docker_exec(
     return subprocess.run(
         [
             "docker", "compose", "-f", COMPOSE_FILE,
-            "exec", "-T", service, "bash", "-c", cmd,
+            "exec", "-T", "-u", "flotilla", service, "bash", "-c", cmd,
         ],
         capture_output=True,
         text=True,
