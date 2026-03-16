@@ -458,32 +458,21 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
             provider_name: "workspace".to_string(),
             kind: CorItemKind::Workspace,
             title: ws.name.clone(),
-            correlation_keys: ws
-                .attachable_set_id
-                .as_ref()
-                .map(|id| vec![CorrelationKey::AttachableSet(id.clone())])
-                .unwrap_or_else(|| ws.correlation_keys.clone()),
+            correlation_keys: ws.attachable_set_id.as_ref().map(|id| vec![CorrelationKey::AttachableSet(id.clone())]).unwrap_or_default(),
             source_key: ProviderItemKey::Workspace(ws_ref.clone()),
         });
     }
 
-    let local_host = flotilla_protocol::HostName::local();
     for (key, terminal) in &providers.managed_terminals {
-        let keys = terminal.attachable_set_id.as_ref().map(|id| vec![CorrelationKey::AttachableSet(id.clone())]).unwrap_or_else(|| {
-            let mut keys = vec![CorrelationKey::Branch(terminal.id.checkout.clone())];
-            if !terminal.working_directory.as_os_str().is_empty() {
-                keys.push(CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
-                    local_host.clone(),
-                    terminal.working_directory.clone(),
-                )));
-            }
-            keys
-        });
         items.push(CorrelatedItem {
             provider_name: "terminal".to_string(),
             kind: CorItemKind::ManagedTerminal,
             title: format!("{} ({})", terminal.id, terminal.role),
-            correlation_keys: keys,
+            correlation_keys: terminal
+                .attachable_set_id
+                .as_ref()
+                .map(|id| vec![CorrelationKey::AttachableSet(id.clone())])
+                .unwrap_or_default(),
             source_key: ProviderItemKey::ManagedTerminal(key.clone()),
         });
     }
@@ -1546,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn correlate_workspace_linked_to_checkout() {
+    fn correlate_workspace_without_attachable_set_is_not_linked_to_checkout() {
         let mut providers = new_providers();
         let co_path = hp("/tmp/feat-ws");
         providers.checkouts.insert(co_path.clone(), make_checkout("feat-ws", "/tmp/feat-ws", false));
@@ -1557,7 +1546,7 @@ mod tests {
 
         let (items, _) = correlate(&providers);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].workspace_refs(), &["ws-1".to_string()]);
+        assert!(items[0].workspace_refs().is_empty());
     }
 
     #[test]
@@ -2008,11 +1997,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn correlate_terminal_ids_populated_when_managed_terminal_shares_branch() {
+    fn correlate_terminal_ids_populated_when_managed_terminal_shares_attachable_set() {
         let mut providers = new_providers();
 
         let co_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), "/tmp/feat-term");
+        let set_id = flotilla_protocol::AttachableSetId::new("set-term");
         providers.checkouts.insert(co_path.clone(), make_checkout("feat-term", "/tmp/feat-term", false));
+        providers.attachable_sets.insert(set_id.clone(), make_attachable_set("set-term", "/tmp/feat-term"));
 
         let terminal_id = flotilla_protocol::ManagedTerminalId { checkout: "feat-term".to_string(), role: "dev".to_string(), index: 0 };
         let terminal_key = terminal_id.to_string();
@@ -2023,18 +2014,73 @@ mod tests {
             working_directory: PathBuf::from("/tmp/feat-term"),
             status: flotilla_protocol::TerminalStatus::Running,
             attachable_id: None,
-            attachable_set_id: None,
+            attachable_set_id: Some(set_id.clone()),
         });
 
         let (items, _) = correlate(&providers);
 
-        // Should merge into a single checkout work item
+        // Should merge into a single attachable-set work item
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind(), WorkItemKind::Checkout);
+        assert_eq!(items[0].kind(), WorkItemKind::AttachableSet);
+        assert_eq!(items[0].attachable_set_id(), Some(&set_id));
 
         let terminal_ids = items[0].terminal_ids();
         assert!(!terminal_ids.is_empty(), "terminal_ids should be non-empty after correlation");
         assert_eq!(terminal_ids[0], terminal_id);
+    }
+
+    #[test]
+    fn workspace_only_joins_checkout_through_attachable_set() {
+        let mut providers = new_providers();
+
+        let remote_checkout = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("feta"), "/remote/feat-set");
+        let local_checkout = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("kiwi"), "/Users/robert/dev/project");
+        let set_id = flotilla_protocol::AttachableSetId::new("set-remote");
+
+        let mut remote_checkout_data = make_checkout("feat-set", "/remote/feat-set", false);
+        remote_checkout_data.correlation_keys = vec![
+            CorrelationKey::Branch("feat-set".to_string()),
+            CorrelationKey::CheckoutPath(remote_checkout.clone()),
+        ];
+        providers.checkouts.insert(remote_checkout.clone(), remote_checkout_data);
+
+        let mut local_checkout_data = make_checkout("feat-set", "/Users/robert/dev/project", false);
+        local_checkout_data.correlation_keys = vec![
+            CorrelationKey::Branch("feat-set".to_string()),
+            CorrelationKey::CheckoutPath(local_checkout.clone()),
+        ];
+        providers.checkouts.insert(local_checkout.clone(), local_checkout_data);
+        providers.attachable_sets.insert(
+            set_id.clone(),
+            flotilla_protocol::AttachableSet {
+                id: set_id.clone(),
+                host_affinity: Some(flotilla_protocol::HostName::new("feta")),
+                checkout: Some(remote_checkout.clone()),
+                template_identity: None,
+                members: vec![],
+            },
+        );
+        providers.workspaces.insert("ws-1".to_string(), Workspace {
+            name: "feat-set@feta".to_string(),
+            directories: vec![PathBuf::from("/Users/robert/dev/project")],
+            correlation_keys: vec![CorrelationKey::CheckoutPath(local_checkout.clone())],
+            attachable_set_id: Some(set_id.clone()),
+        });
+
+        let (items, _) = correlate(&providers);
+
+        assert_eq!(items.len(), 2);
+        let set_item = items.iter().find(|item| item.attachable_set_id() == Some(&set_id)).expect("attachable set item");
+        assert_eq!(set_item.kind(), WorkItemKind::AttachableSet);
+        assert_eq!(set_item.checkout_key(), Some(&remote_checkout));
+        assert_eq!(set_item.workspace_refs(), &["ws-1".to_string()]);
+
+        let local_checkout_item = items
+            .iter()
+            .find(|item| item.kind() == WorkItemKind::Checkout && item.checkout_key() == Some(&local_checkout))
+            .expect("local checkout item");
+        assert!(local_checkout_item.workspace_refs().is_empty(), "workspace should not correlate directly to local checkout");
+        assert_eq!(local_checkout_item.attachable_set_id(), None);
     }
 
     #[test]
