@@ -28,15 +28,6 @@ pub trait DaemonHandle: Send + Sync {
     /// `CommandResult::Cancelled` once cancellation takes effect.
     async fn cancel(&self, command_id: u64) -> Result<(), String>;
 
-    /// Trigger an immediate refresh for a repo.
-    async fn refresh(&self, repo: &RepoSelector) -> Result<(), String>;
-
-    /// Add a repo to tracking.
-    async fn add_repo(&self, path: &RepoSelector) -> Result<(), String>;
-
-    /// Remove a repo from tracking.
-    async fn remove_repo(&self, path: &RepoSelector) -> Result<(), String>;
-
     /// Get replay events for repos based on last-seen sequence numbers.
     ///
     /// For each repo in `last_seen`, checks the delta log:

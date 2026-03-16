@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use flotilla_core::{
     config::ConfigStore,
-    daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::discovery::test_support::{fake_discovery, init_git_repo},
 };

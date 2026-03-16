@@ -605,39 +605,6 @@ impl DaemonHandle for SocketDaemon {
         }
     }
 
-    async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        let repo_path = match repo {
-            flotilla_protocol::RepoSelector::Path(p) => p.clone(),
-            other => return Err(format!("refresh requires a path selector, got: {other:?}")),
-        };
-        match into_success_response(self.request(Request::Refresh { repo: repo_path }).await?)? {
-            Response::Refresh => Ok(()),
-            other => Err(format!("unexpected response for refresh: {other:?}")),
-        }
-    }
-
-    async fn add_repo(&self, selector: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        let path = match selector {
-            flotilla_protocol::RepoSelector::Path(p) => p.clone(),
-            other => return Err(format!("add_repo requires a path selector, got: {other:?}")),
-        };
-        match into_success_response(self.request(Request::AddRepo { path }).await?)? {
-            Response::AddRepo => Ok(()),
-            other => Err(format!("unexpected response for add_repo: {other:?}")),
-        }
-    }
-
-    async fn remove_repo(&self, selector: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        let path = match selector {
-            flotilla_protocol::RepoSelector::Path(p) => p.clone(),
-            other => return Err(format!("remove_repo requires a path selector, got: {other:?}")),
-        };
-        match into_success_response(self.request(Request::RemoveRepo { path }).await?)? {
-            Response::RemoveRepo => Ok(()),
-            other => Err(format!("unexpected response for remove_repo: {other:?}")),
-        }
-    }
-
     async fn replay_since(&self, last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
         let last_seen = encode_replay_cursors(last_seen);
         let events = match into_success_response(self.request(Request::ReplaySince { last_seen }).await?)? {

@@ -60,18 +60,6 @@ impl DaemonHandle for StubDaemon {
         Ok(())
     }
 
-    async fn refresh(&self, _repo: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn add_repo(&self, _selector: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn remove_repo(&self, _selector: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        Ok(())
-    }
-
     async fn replay_since(&self, _last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
         Ok(vec![])
     }

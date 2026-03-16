@@ -1448,6 +1448,187 @@ impl InProcessDaemon {
     }
 }
 
+/// Non-trait methods that are called directly on the concrete `InProcessDaemon`
+/// type by the daemon server peer-overlay code and by the `execute()` implementation.
+impl InProcessDaemon {
+    pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<(), String> {
+        let repo = self.resolve_repo_selector(repo).await?;
+        let (prev_count, registry, identity) = {
+            let identity =
+                self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+            let repos = self.repos.read().await;
+            let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+            for root in &state.roots {
+                if root.is_local {
+                    root.model.refresh_handle.trigger_refresh();
+                }
+            }
+            (state.issue_cache.len(), state.registry(), identity)
+        };
+
+        if prev_count > 0 {
+            // Fetch page 1 before resetting, so failures don't wipe the UI.
+            let first_page =
+                if let Some(t) = registry.issue_trackers.preferred() { t.list_issues_page(&repo, 1, 50).await.ok() } else { None };
+
+            if first_page.is_some() {
+                {
+                    let mut repos = self.repos.write().await;
+                    if let Some(state) = repos.get_mut(&identity) {
+                        state.issue_cache.reset();
+                        if let Some(page) = first_page {
+                            state.issue_cache.merge_page(page);
+                        }
+                    }
+                }
+                self.ensure_issues_cached(&repo, prev_count).await;
+                {
+                    let mut repos = self.repos.write().await;
+                    if let Some(state) = repos.get_mut(&identity) {
+                        state.issue_cache.mark_refreshed(now_iso8601());
+                    }
+                }
+                self.broadcast_snapshot(&repo).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn add_repo(&self, path: &Path) -> Result<(), String> {
+        let path = path.to_path_buf();
+
+        // Check if already tracked (under read lock for fast path)
+        {
+            let identities = self.path_identities.read().await;
+            if identities.contains_key(&path) {
+                return Ok(());
+            }
+        }
+
+        // Create the model outside the lock (spawns provider detection and refresh)
+        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
+            &self.host_bag,
+            &path,
+            &self.discovery.repo_detectors,
+            &self.discovery.factories,
+            &self.config,
+            Arc::clone(&self.discovery.runner),
+            &*self.discovery.env,
+        )
+        .await;
+        if !unmet.is_empty() {
+            debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
+        }
+        let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+        let slug = repo_slug.clone();
+        let mut model = RepoModel::new(path.clone(), registry, repo_slug);
+        model.data.loading = true;
+        let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
+
+        let repo_info = RepoInfo {
+            identity: identity.clone(),
+            path: path.clone(),
+            name: repo_name(&path),
+            labels: root.model.labels.clone(),
+            provider_names: provider_names_from_registry(&root.model.registry),
+            provider_health: crate::convert::health_to_proto(&root.model.data.provider_health),
+            loading: true,
+        };
+
+        // Insert under write lock — re-check to avoid TOCTOU duplicate
+        let mut added_new_identity = false;
+        let mut preferred_changed = false;
+        let already_tracked = self.path_identities.read().await.contains_key(&path);
+        if already_tracked {
+            return Ok(());
+        }
+        {
+            let mut repos = self.repos.write().await;
+            let mut order = self.repo_order.write().await;
+            if let Some(state) = repos.get_mut(&identity) {
+                preferred_changed = state.add_root(root);
+            } else {
+                repos.insert(identity.clone(), RepoState::new(identity.clone(), root));
+                order.push(identity.clone());
+                added_new_identity = true;
+            }
+            self.path_identities.write().await.insert(path.clone(), identity.clone());
+        }
+
+        // Persist to config
+        self.config.save_repo(&path);
+        let tab_order = {
+            let repos = self.repos.read().await;
+            let order = self.repo_order.read().await;
+            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
+        };
+        self.config.save_tab_order(&tab_order);
+
+        info!(repo = %path.display(), "added repo");
+        if added_new_identity {
+            let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
+        } else if preferred_changed {
+            self.broadcast_snapshot_inner(&path, false).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn remove_repo(&self, path: &Path) -> Result<(), String> {
+        let path = path.to_path_buf();
+        let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
+
+        let mut removed_identity = false;
+        let mut new_preferred_path = None;
+        {
+            let mut repos = self.repos.write().await;
+            let mut order = self.repo_order.write().await;
+            let Some(state) = repos.get_mut(&repo_identity) else {
+                return Err(format!("repo not tracked: {}", path.display()));
+            };
+            let previous_preferred = state.preferred_path().to_path_buf();
+            if !state.remove_root(&path) {
+                return Err(format!("repo not tracked: {}", path.display()));
+            }
+            if state.roots.is_empty() {
+                repos.remove(&repo_identity);
+                order.retain(|repo| repo != &repo_identity);
+                removed_identity = true;
+            } else if previous_preferred == path {
+                new_preferred_path = Some(state.preferred_path().to_path_buf());
+            }
+        }
+
+        // Remove from identity map and peer overlay
+        self.path_identities.write().await.remove(&path);
+        if removed_identity {
+            let mut pp = self.peer_providers.write().await;
+            pp.remove(&repo_identity);
+            drop(pp);
+            self.peer_overlay_versions.write().await.remove(&repo_identity);
+        }
+
+        // Persist to config
+        self.config.remove_repo(&path);
+        let tab_order = {
+            let repos = self.repos.read().await;
+            let order = self.repo_order.read().await;
+            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
+        };
+        self.config.save_tab_order(&tab_order);
+
+        info!(repo = %path.display(), "removed repo");
+        if removed_identity {
+            let _ = self.event_tx.send(DaemonEvent::RepoUntracked { repo_identity, path });
+        } else if let Some(preferred_path) = new_preferred_path {
+            self.broadcast_snapshot_inner(&preferred_path, false).await;
+        }
+
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl DaemonHandle for InProcessDaemon {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
@@ -1557,7 +1738,7 @@ impl DaemonHandle for InProcessDaemon {
                     repo: path.clone(),
                     description,
                 });
-                let result = match self.add_repo(&flotilla_protocol::RepoSelector::Path(path.clone())).await {
+                let result = match self.add_repo(path).await {
                     Ok(()) => flotilla_protocol::CommandResult::RepoTracked { path: path.clone(), resolved_from: None },
                     Err(message) => flotilla_protocol::CommandResult::Error { message },
                 };
@@ -1582,7 +1763,7 @@ impl DaemonHandle for InProcessDaemon {
                     repo: repo_path.clone(),
                     description,
                 });
-                let result = match self.remove_repo(&flotilla_protocol::RepoSelector::Path(repo_path.clone())).await {
+                let result = match self.remove_repo(&repo_path).await {
                     Ok(()) => flotilla_protocol::CommandResult::RepoUntracked { path: repo_path.clone() },
                     Err(message) => flotilla_protocol::CommandResult::Error { message },
                 };
@@ -1772,133 +1953,6 @@ impl DaemonHandle for InProcessDaemon {
         }
     }
 
-    async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        let repo = self.resolve_repo_selector(repo).await?;
-        let (prev_count, registry, identity) = {
-            let identity =
-                self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            let repos = self.repos.read().await;
-            let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            for root in &state.roots {
-                if root.is_local {
-                    root.model.refresh_handle.trigger_refresh();
-                }
-            }
-            (state.issue_cache.len(), state.registry(), identity)
-        };
-
-        if prev_count > 0 {
-            // Fetch page 1 before resetting, so failures don't wipe the UI.
-            let first_page =
-                if let Some(t) = registry.issue_trackers.preferred() { t.list_issues_page(&repo, 1, 50).await.ok() } else { None };
-
-            if first_page.is_some() {
-                {
-                    let mut repos = self.repos.write().await;
-                    if let Some(state) = repos.get_mut(&identity) {
-                        state.issue_cache.reset();
-                        if let Some(page) = first_page {
-                            state.issue_cache.merge_page(page);
-                        }
-                    }
-                }
-                self.ensure_issues_cached(&repo, prev_count).await;
-                {
-                    let mut repos = self.repos.write().await;
-                    if let Some(state) = repos.get_mut(&identity) {
-                        state.issue_cache.mark_refreshed(now_iso8601());
-                    }
-                }
-                self.broadcast_snapshot(&repo).await;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn add_repo(&self, selector: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        let path = match selector {
-            flotilla_protocol::RepoSelector::Path(p) => p.clone(),
-            other => return Err(format!("add_repo requires a path selector, got: {other:?}")),
-        };
-
-        // Check if already tracked (under read lock for fast path)
-        {
-            let identities = self.path_identities.read().await;
-            if identities.contains_key(&path) {
-                return Ok(());
-            }
-        }
-
-        // Create the model outside the lock (spawns provider detection and refresh)
-        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
-            &self.host_bag,
-            &path,
-            &self.discovery.repo_detectors,
-            &self.discovery.factories,
-            &self.config,
-            Arc::clone(&self.discovery.runner),
-            &*self.discovery.env,
-        )
-        .await;
-        if !unmet.is_empty() {
-            debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
-        }
-        let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
-        let slug = repo_slug.clone();
-        let mut model = RepoModel::new(path.clone(), registry, repo_slug);
-        model.data.loading = true;
-        let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
-
-        let repo_info = RepoInfo {
-            identity: identity.clone(),
-            path: path.clone(),
-            name: repo_name(&path),
-            labels: root.model.labels.clone(),
-            provider_names: provider_names_from_registry(&root.model.registry),
-            provider_health: crate::convert::health_to_proto(&root.model.data.provider_health),
-            loading: true,
-        };
-
-        // Insert under write lock — re-check to avoid TOCTOU duplicate
-        let mut added_new_identity = false;
-        let mut preferred_changed = false;
-        let already_tracked = self.path_identities.read().await.contains_key(&path);
-        if already_tracked {
-            return Ok(());
-        }
-        {
-            let mut repos = self.repos.write().await;
-            let mut order = self.repo_order.write().await;
-            if let Some(state) = repos.get_mut(&identity) {
-                preferred_changed = state.add_root(root);
-            } else {
-                repos.insert(identity.clone(), RepoState::new(identity.clone(), root));
-                order.push(identity.clone());
-                added_new_identity = true;
-            }
-            self.path_identities.write().await.insert(path.clone(), identity.clone());
-        }
-
-        // Persist to config
-        self.config.save_repo(&path);
-        let tab_order = {
-            let repos = self.repos.read().await;
-            let order = self.repo_order.read().await;
-            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
-        };
-        self.config.save_tab_order(&tab_order);
-
-        info!(repo = %path.display(), "added repo");
-        if added_new_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
-        } else if preferred_changed {
-            self.broadcast_snapshot_inner(&path, false).await;
-        }
-
-        Ok(())
-    }
-
     async fn replay_since(&self, last_seen: &HashMap<flotilla_protocol::RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
@@ -1975,59 +2029,6 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         Ok(events)
-    }
-
-    async fn remove_repo(&self, selector: &flotilla_protocol::RepoSelector) -> Result<(), String> {
-        let path = self.resolve_repo_selector(selector).await?;
-        let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
-
-        let mut removed_identity = false;
-        let mut new_preferred_path = None;
-        {
-            let mut repos = self.repos.write().await;
-            let mut order = self.repo_order.write().await;
-            let Some(state) = repos.get_mut(&repo_identity) else {
-                return Err(format!("repo not tracked: {}", path.display()));
-            };
-            let previous_preferred = state.preferred_path().to_path_buf();
-            if !state.remove_root(&path) {
-                return Err(format!("repo not tracked: {}", path.display()));
-            }
-            if state.roots.is_empty() {
-                repos.remove(&repo_identity);
-                order.retain(|repo| repo != &repo_identity);
-                removed_identity = true;
-            } else if previous_preferred == path {
-                new_preferred_path = Some(state.preferred_path().to_path_buf());
-            }
-        }
-
-        // Remove from identity map and peer overlay
-        self.path_identities.write().await.remove(&path);
-        if removed_identity {
-            let mut pp = self.peer_providers.write().await;
-            pp.remove(&repo_identity);
-            drop(pp);
-            self.peer_overlay_versions.write().await.remove(&repo_identity);
-        }
-
-        // Persist to config
-        self.config.remove_repo(&path);
-        let tab_order = {
-            let repos = self.repos.read().await;
-            let order = self.repo_order.read().await;
-            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
-        };
-        self.config.save_tab_order(&tab_order);
-
-        info!(repo = %path.display(), "removed repo");
-        if removed_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoUntracked { repo_identity, path });
-        } else if let Some(preferred_path) = new_preferred_path {
-            self.broadcast_snapshot_inner(&preferred_path, false).await;
-        }
-
-        Ok(())
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {

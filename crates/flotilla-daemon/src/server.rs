@@ -925,7 +925,7 @@ async fn rebuild_peer_overlays(
                     path = %synthetic_path.display(),
                     "removing virtual repo — no peers remaining"
                 );
-                if let Err(e) = daemon.remove_repo(&flotilla_protocol::RepoSelector::Path(synthetic_path)).await {
+                if let Err(e) = daemon.remove_repo(&synthetic_path).await {
                     warn!(
                         repo = %repo_id,
                         err = %e,
@@ -1241,7 +1241,7 @@ async fn disconnect_peer_and_rebuild(
                     path = %path.display(),
                     "removing virtual repo — no peers remaining"
                 );
-                if let Err(e) = daemon.remove_repo(&flotilla_protocol::RepoSelector::Path(path.clone())).await {
+                if let Err(e) = daemon.remove_repo(path).await {
                     warn!(
                         repo = %identity,
                         err = %e,
@@ -1814,20 +1814,41 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
             }
         }
 
-        Request::Refresh { repo } => match ctx.daemon.refresh(&flotilla_protocol::RepoSelector::Path(repo)).await {
-            Ok(()) => Message::ok_response(id, Response::Refresh),
-            Err(e) => Message::error_response(id, e),
-        },
+        Request::Refresh { repo } => {
+            let command = Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) },
+            };
+            match ctx.daemon.execute(command).await {
+                Ok(_) => Message::ok_response(id, Response::Refresh),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
 
-        Request::AddRepo { path } => match ctx.daemon.add_repo(&flotilla_protocol::RepoSelector::Path(path)).await {
-            Ok(()) => Message::ok_response(id, Response::AddRepo),
-            Err(e) => Message::error_response(id, e),
-        },
+        Request::AddRepo { path } => {
+            let command = Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::TrackRepoPath { path },
+            };
+            match ctx.daemon.execute(command).await {
+                Ok(_) => Message::ok_response(id, Response::AddRepo),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
 
-        Request::RemoveRepo { path } => match ctx.daemon.remove_repo(&flotilla_protocol::RepoSelector::Path(path)).await {
-            Ok(()) => Message::ok_response(id, Response::RemoveRepo),
-            Err(e) => Message::error_response(id, e),
-        },
+        Request::RemoveRepo { path } => {
+            let command = Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) },
+            };
+            match ctx.daemon.execute(command).await {
+                Ok(_) => Message::ok_response(id, Response::RemoveRepo),
+                Err(e) => Message::error_response(id, e),
+            }
+        }
 
         Request::ReplaySince { last_seen } => {
             let last_seen = last_seen.into_iter().map(|entry| (entry.repo_identity, entry.seq)).collect();

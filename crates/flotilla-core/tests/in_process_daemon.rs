@@ -762,7 +762,7 @@ async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     assert_eq!(repos[0].identity, identity_a);
     assert_eq!(repos[0].path, repo_a, "first tracked root should remain the deterministic preferred path");
 
-    daemon.remove_repo(&RepoSelector::Path(repo_a.clone())).await.expect("remove preferred root");
+    daemon.remove_repo(&repo_a).await.expect("remove preferred root");
     let repos = daemon.list_repos().await.expect("list_repos after removing preferred root");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].identity, identity_b);
@@ -783,7 +783,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
         .add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), ProviderData::default())
         .await
         .expect("add virtual repo");
-    daemon.add_repo(&RepoSelector::Path(local_repo.clone())).await.expect("add local repo");
+    daemon.add_repo(&local_repo).await.expect("add local repo");
 
     let repos = daemon.list_repos().await.expect("list repos");
     assert_eq!(repos.len(), 1);
@@ -802,7 +802,7 @@ async fn removing_preferred_root_emits_snapshot_for_new_preferred_path() {
     daemon.refresh(&RepoSelector::Path(repo_a.clone())).await.expect("refresh first repo");
     let _ = recv_event(&mut rx).await;
 
-    daemon.remove_repo(&RepoSelector::Path(repo_a.clone())).await.expect("remove preferred root");
+    daemon.remove_repo(&repo_a).await.expect("remove preferred root");
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

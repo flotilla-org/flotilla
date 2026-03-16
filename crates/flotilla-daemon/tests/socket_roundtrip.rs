@@ -71,10 +71,26 @@ async fn socket_roundtrip() {
     let mut rx = client.subscribe();
 
     // refresh — should succeed (triggers a re-scan)
-    client.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh");
-    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("timeout waiting for event").expect("recv");
-    // The refresh should produce a snapshot event (full or delta)
-    assert!(matches!(event, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_)), "expected snapshot event, got {:?}", event);
+    client
+        .execute(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) } })
+        .await
+        .expect("refresh");
+    // Wait for a snapshot or delta event (skip command lifecycle events)
+    let snapshot_event = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("recv");
+            if matches!(event, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_)) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for snapshot event");
+    assert!(
+        matches!(snapshot_event, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_)),
+        "expected snapshot event, got {:?}",
+        snapshot_event
+    );
 
     // replay_since with current seq — should return empty (up to date)
     let snapshot = client.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
