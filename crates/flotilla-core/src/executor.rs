@@ -404,6 +404,10 @@ fn persist_workspace_binding(
     }
 }
 
+fn preferred_workspace_manager(registry: &ProviderRegistry) -> Option<(&str, &Arc<dyn WorkspaceManager>)> {
+    registry.workspace_managers.preferred_with_desc().map(|(desc, provider)| (desc.implementation.as_str(), provider))
+}
+
 async fn build_archive_session_plan(
     session_id: String,
     registry: Arc<ProviderRegistry>,
@@ -476,11 +480,7 @@ pub async fn execute(
                 return CommandResult::Error { message: format!("checkout not found: {}", checkout_path.display()) };
             }
             info!(%label, "entering workspace");
-            if let Some((provider_name, ws_mgr)) = registry
-                .workspace_managers
-                .preferred_name()
-                .and_then(|name| registry.workspace_managers.preferred().map(|provider| (name.to_string(), provider)))
-            {
+            if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
                 if select_existing_workspace(ws_mgr.as_ref(), &checkout_path).await {
                     return CommandResult::Ok;
                 }
@@ -490,7 +490,7 @@ pub async fn execute(
                 }
                 match ws_mgr.create_workspace(&config).await {
                     Ok((ws_ref, _workspace)) => {
-                        persist_workspace_binding(attachable_store, &provider_name, &ws_ref, local_host, &checkout_path);
+                        persist_workspace_binding(attachable_store, provider_name, &ws_ref, local_host, &checkout_path);
                     }
                     Err(e) => return CommandResult::Error { message: e },
                 }
@@ -499,11 +499,7 @@ pub async fn execute(
         }
 
         CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, commands } => {
-            if let Some((_provider_name, ws_mgr)) = registry
-                .workspace_managers
-                .preferred_name()
-                .and_then(|name| registry.workspace_managers.preferred().map(|provider| (name.to_string(), provider)))
-            {
+            if let Some((_, ws_mgr)) = preferred_workspace_manager(registry) {
                 let wrapped = match wrap_remote_attach_commands(&target_host, &checkout_path, &commands, config_base) {
                     Ok(commands) => commands,
                     Err(message) => return CommandResult::Error { message },
@@ -703,11 +699,7 @@ pub async fn execute(
             };
             if let Some(path) = wt_path {
                 let name = branch.as_deref().unwrap_or("session");
-                if let Some((provider_name, ws_mgr)) = registry
-                    .workspace_managers
-                    .preferred_name()
-                    .and_then(|name| registry.workspace_managers.preferred().map(|provider| (name.to_string(), provider)))
-                {
+                if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
                     let mut config = workspace_config(&repo.root, name, &path, &teleport_cmd, config_base);
                     if let Some(tp) = registry.terminal_pools.preferred() {
                         resolve_terminal_pool(&mut config, tp.as_ref()).await;
@@ -717,7 +709,7 @@ pub async fn execute(
                     // to the wrong session.
                     match ws_mgr.create_workspace(&config).await {
                         Ok((ws_ref, _workspace)) => {
-                            persist_workspace_binding(attachable_store, &provider_name, &ws_ref, local_host, &path);
+                            persist_workspace_binding(attachable_store, provider_name, &ws_ref, local_host, &path);
                         }
                         Err(e) => return CommandResult::Error { message: e },
                     }
