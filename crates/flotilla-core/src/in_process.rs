@@ -601,7 +601,7 @@ impl InProcessDaemon {
             active_command: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4(),
             local_host_summary,
-            host_seq: AtomicU64::new(1),
+            host_seq: AtomicU64::new(0),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
