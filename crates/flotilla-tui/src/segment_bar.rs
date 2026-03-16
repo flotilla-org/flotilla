@@ -17,17 +17,6 @@ pub struct SegmentItem {
     pub style_override: Option<Style>,
 }
 
-impl SegmentItem {
-    /// Resolve the visual emphasis: override wins, then active/dragging, then inactive.
-    fn resolve_style(&self, theme: &Theme) -> Style {
-        if let Some(ov) = self.style_override {
-            ov
-        } else {
-            theme.tab_style(self.active, self.dragging)
-        }
-    }
-}
-
 /// Bundles rendered spans with their computed display width.
 pub struct RenderedItem {
     pub spans: Vec<Span<'static>>,
@@ -116,7 +105,8 @@ pub struct ThemedTabBarStyle<'a> {
 
 impl BarStyle for ThemedTabBarStyle<'_> {
     fn render_item(&self, item: &SegmentItem) -> RenderedItem {
-        let style = item.resolve_style(self.theme);
+        // Precedence: override > active+dragging > active > inactive.
+        let style = if let Some(ov) = item.style_override { ov } else { self.theme.tab_style(item.active, item.dragging) };
         let label = self.site.transform_label(&item.label);
 
         let mut spans = Vec::new();
@@ -194,6 +184,12 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::*;
+    use crate::theme::{BarKind, TextTransform};
+
+    /// Find the first span whose content contains `needle`.
+    fn find_span<'a>(rendered: &'a RenderedItem, needle: &str) -> &'a Span<'a> {
+        rendered.spans.iter().find(|s| s.content.contains(needle)).unwrap_or_else(|| panic!("no span containing {needle:?}"))
+    }
 
     #[test]
     fn rendered_item_from_span() {
@@ -306,10 +302,20 @@ mod tests {
     }
 
     #[test]
+    fn tab_style_key_hint_inherits_dragging_underline() {
+        let theme = crate::theme::Theme::classic();
+        let style = ThemedTabBarStyle { theme: &theme, site: &theme.tab_bar };
+        let item = SegmentItem { label: "open".into(), key_hint: Some("ENT".into()), active: true, dragging: true, style_override: None };
+        let rendered = style.render_item(&item);
+        let key_span = find_span(&rendered, "ENT");
+        assert!(key_span.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(key_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn tab_style_applies_label_transform() {
         let theme = crate::theme::Theme::classic();
-        let site =
-            crate::theme::BarSiteStyle { kind: crate::theme::BarKind::Pipe, label_transform: crate::theme::TextTransform::Uppercase };
+        let site = BarSiteStyle { kind: BarKind::Pipe, label_transform: TextTransform::Uppercase };
         let style = ThemedTabBarStyle { theme: &theme, site: &site };
         let item = SegmentItem { label: "hello".into(), key_hint: None, active: false, dragging: false, style_override: None };
         let rendered = style.render_item(&item);
@@ -372,8 +378,7 @@ mod tests {
         let style = ThemedRibbonStyle { theme: &theme, site: &theme.tab_bar };
         let item = SegmentItem { label: "repo".into(), key_hint: None, active: true, dragging: false, style_override: None };
         let rendered = style.render_item(&item);
-        // The label span (middle) should use tab_active as bg
-        let label_span = &rendered.spans[1];
+        let label_span = find_span(&rendered, "repo");
         assert_eq!(label_span.style.bg, Some(theme.tab_active));
         assert!(label_span.style.add_modifier.contains(Modifier::BOLD));
     }
@@ -384,7 +389,7 @@ mod tests {
         let style = ThemedRibbonStyle { theme: &theme, site: &theme.tab_bar };
         let item = SegmentItem { label: "repo".into(), key_hint: None, active: true, dragging: true, style_override: None };
         let rendered = style.render_item(&item);
-        let label_span = &rendered.spans[1];
+        let label_span = find_span(&rendered, "repo");
         assert!(label_span.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
@@ -400,11 +405,12 @@ mod tests {
             style_override: Some(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         };
         let rendered = style.render_item(&item);
-        let label_span = &rendered.spans[1];
+        let label_span = find_span(&rendered, "logo");
         assert_eq!(label_span.style.fg, Some(Color::Black));
         assert_eq!(label_span.style.bg, Some(Color::Cyan));
         // Left chevron transitions to override bg
-        assert_eq!(rendered.spans[0].style.bg, Some(Color::Cyan));
+        let chevron_span = find_span(&rendered, CHEVRON);
+        assert_eq!(chevron_span.style.bg, Some(Color::Cyan));
     }
 
     #[test]
