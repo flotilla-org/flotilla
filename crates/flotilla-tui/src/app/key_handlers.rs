@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
@@ -9,51 +9,31 @@ use super::{
     ui_state::{FocusTarget, PendingActionContext},
     App, BranchInputKind, ClearDispatch, Intent, UiMode,
 };
-use crate::{status_bar::StatusBarAction, theme};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action {
-    SelectNext,
-    SelectPrev,
-    Confirm,
-    Dismiss,
-    Quit,
-    Refresh,
-    PrevTab,
-    NextTab,
-    MoveTabLeft,
-    MoveTabRight,
-    ToggleHelp,
-    ToggleMultiSelect,
-    ToggleProviders,
-    ToggleDebug,
-    CycleHost,
-    CycleLayout,
-    CycleTheme,
-    OpenActionMenu,
-    OpenBranchInput,
-    OpenIssueSearch,
-    OpenFilePicker,
-    Dispatch(Intent),
-}
+use crate::{
+    keymap::{Action, ModeId},
+    status_bar::StatusBarAction,
+    theme,
+};
 
 impl App {
     // ── Key handling ──
 
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let focus = self.ui.mode.focus_target();
-        let in_work_item_table = matches!(focus, FocusTarget::WorkItemTable);
-        let allows_tab_switch = matches!(focus, FocusTarget::WorkItemTable | FocusTarget::EventLog);
+        let mode_id = ModeId::from(&self.ui.mode);
 
-        match self.ui.mode {
-            UiMode::BranchInput { kind: BranchInputKind::Manual, .. } | UiMode::IssueSearch { .. } => {
+        // Text input modes: only Esc and Enter are intercepted.
+        // All other keys pass through to tui_input in handle_key.
+        match mode_id {
+            ModeId::BranchInput | ModeId::IssueSearch => {
                 return match key.code {
                     KeyCode::Esc => Some(Action::Dismiss),
                     KeyCode::Enter => Some(Action::Confirm),
                     _ => None,
                 };
             }
-            UiMode::FilePicker { .. } => {
+            // FilePicker has both a text input and a navigation list.
+            // Only intercept navigation keys; everything else goes to tui_input.
+            ModeId::FilePicker => {
                 return match key.code {
                     KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
                     KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
@@ -65,38 +45,7 @@ impl App {
             _ => {}
         }
 
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
-            KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
-            KeyCode::Enter => Some(Action::Confirm),
-            KeyCode::Esc => Some(Action::Dismiss),
-            KeyCode::Char('q') => match self.ui.mode {
-                UiMode::Normal => Some(Action::Quit),
-                UiMode::Help | UiMode::Config | UiMode::ActionMenu { .. } | UiMode::DeleteConfirm { .. } | UiMode::CloseConfirm { .. } => {
-                    Some(Action::Dismiss)
-                }
-                UiMode::BranchInput { .. } | UiMode::IssueSearch { .. } | UiMode::FilePicker { .. } => None,
-            },
-            KeyCode::Char('r') if in_work_item_table => Some(Action::Refresh),
-            KeyCode::Char('[') if allows_tab_switch => Some(Action::PrevTab),
-            KeyCode::Char(']') if allows_tab_switch => Some(Action::NextTab),
-            KeyCode::Char('{') if in_work_item_table => Some(Action::MoveTabLeft),
-            KeyCode::Char('}') if in_work_item_table => Some(Action::MoveTabRight),
-            KeyCode::Char('?') => Some(Action::ToggleHelp),
-            KeyCode::Char(' ') if in_work_item_table => Some(Action::ToggleMultiSelect),
-            KeyCode::Char('h') if in_work_item_table => Some(Action::CycleHost),
-            KeyCode::Char('l') if in_work_item_table => Some(Action::CycleLayout),
-            KeyCode::Char('T') if in_work_item_table => Some(Action::CycleTheme),
-            KeyCode::Char('.') if in_work_item_table => Some(Action::OpenActionMenu),
-            KeyCode::Char('n') if in_work_item_table => Some(Action::OpenBranchInput),
-            KeyCode::Char('/') if in_work_item_table => Some(Action::OpenIssueSearch),
-            KeyCode::Char('a') if in_work_item_table => Some(Action::OpenFilePicker),
-            KeyCode::Char('c') if in_work_item_table => Some(Action::ToggleProviders),
-            KeyCode::Char('D') if in_work_item_table => Some(Action::ToggleDebug),
-            KeyCode::Char('d') if in_work_item_table => Some(Action::Dispatch(Intent::RemoveCheckout)),
-            KeyCode::Char('p') if in_work_item_table => Some(Action::Dispatch(Intent::OpenChangeRequest)),
-            _ => None,
-        }
+        self.keymap.resolve(mode_id, crokey::KeyCombination::from(key))
     }
 
     fn dispatch_action(&mut self, action: Action) {
@@ -263,6 +212,9 @@ impl App {
                     self.ui.show_debug = !self.ui.show_debug;
                 }
             }
+            Action::ToggleStatusBarKeys => {
+                self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
+            }
             Action::CycleHost => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     let peer_hosts = self.model.peer_hosts.iter().map(|peer| peer.name.clone()).collect::<Vec<_>>();
@@ -348,29 +300,17 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Char('K')
-            && key.modifiers.contains(KeyModifiers::SHIFT)
-            && !matches!(
-                self.ui.mode,
-                UiMode::BranchInput { kind: BranchInputKind::Manual, .. } | UiMode::IssueSearch { .. } | UiMode::FilePicker { .. }
-            )
-        {
-            self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
-            return;
-        }
-
         if let Some(action) = self.resolve_action(key) {
             self.dispatch_action(action);
             return;
         }
 
+        // Unresolved keys in text input modes pass through to tui_input
         match self.ui.mode {
-            UiMode::DeleteConfirm { .. } => self.handle_delete_confirm_key(key),
-            UiMode::CloseConfirm { .. } => self.handle_close_confirm_key(key),
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
             UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
             UiMode::IssueSearch { .. } => self.handle_issue_search_key(key),
-            UiMode::Help | UiMode::Config | UiMode::ActionMenu { .. } | UiMode::Normal => {}
+            _ => {}
         }
     }
 
@@ -635,56 +575,6 @@ impl App {
     fn handle_issue_search_key(&mut self, key: KeyEvent) {
         if let UiMode::IssueSearch { ref mut input } = self.ui.mode {
             input.handle_event(&crossterm::event::Event::Key(key));
-        }
-    }
-
-    fn handle_delete_confirm_key(&mut self, key: KeyEvent) {
-        let loading = matches!(self.ui.mode, UiMode::DeleteConfirm { loading: true, .. });
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
-                if !loading {
-                    // Extract branch from CheckoutStatus and send RemoveCheckout
-                    if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, ref identity, .. } = self.ui.mode {
-                        let ctx = PendingActionContext {
-                            identity: identity.clone(),
-                            description: format!("Remove {}", info.branch),
-                            repo_identity: self.model.active_repo_identity().clone(),
-                        };
-                        self.proto_commands.push_with_context(
-                            self.command(CommandAction::RemoveCheckout {
-                                checkout: CheckoutSelector::Query(info.branch.clone()),
-                                terminal_keys: terminal_keys.clone(),
-                            }),
-                            Some(ctx),
-                        );
-                    }
-                    self.ui.mode = UiMode::Normal;
-                }
-            }
-            KeyCode::Esc | KeyCode::Char('n') => {
-                self.ui.mode = UiMode::Normal;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_close_confirm_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
-                if let UiMode::CloseConfirm { ref id, ref identity, ref command, .. } = self.ui.mode {
-                    let ctx = PendingActionContext {
-                        identity: identity.clone(),
-                        description: format!("Close {}", id),
-                        repo_identity: self.model.active_repo_identity().clone(),
-                    };
-                    self.proto_commands.push_with_context(command.clone(), Some(ctx));
-                }
-                self.ui.mode = UiMode::Normal;
-            }
-            KeyCode::Esc | KeyCode::Char('n') => {
-                self.ui.mode = UiMode::Normal;
-            }
-            _ => {}
         }
     }
 
