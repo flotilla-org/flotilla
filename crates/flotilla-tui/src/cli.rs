@@ -266,6 +266,9 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             };
             format!("[host]     {}: {} (seq {})", snap.host_name, state, snap.seq)
         }
+        DaemonEvent::HostRemoved { host, seq } => {
+            format!("[host]     {host}: removed (seq {seq})")
+        }
     }
 }
 
@@ -275,6 +278,7 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
         DaemonEvent::RepoSnapshot(snap) => Some((StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq)),
         DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
         DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { host_name: snap.host_name.clone() }, snap.seq)),
+        DaemonEvent::HostRemoved { host, seq } => Some((StreamKey::Host { host_name: host.clone() }, *seq)),
         _ => None,
     }
 }

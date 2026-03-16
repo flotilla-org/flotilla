@@ -56,7 +56,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
@@ -206,6 +206,9 @@ pub enum DaemonEvent {
     /// a host's summary or connection status changes.
     #[serde(rename = "host_snapshot")]
     HostSnapshot(Box<HostSnapshot>),
+    /// Host stream tombstone — sent when a previously visible host disappears.
+    #[serde(rename = "host_removed")]
+    HostRemoved { host: HostName, seq: u64 },
 }
 
 /// Peer connection state as seen by the TUI.
@@ -596,6 +599,12 @@ mod tests {
     }
 
     #[test]
+    fn daemon_event_host_removed_roundtrip() {
+        let event = DaemonEvent::HostRemoved { host: HostName::new("desktop"), seq: 2 };
+        test_helpers::assert_json_roundtrip(&event);
+    }
+
+    #[test]
     fn replay_cursor_with_stream_key_host_roundtrip() {
         let cursor = ReplayCursor { stream: StreamKey::Host { host_name: HostName::new("laptop") }, seq: 42 };
         test_helpers::assert_roundtrip(&cursor);
@@ -603,7 +612,7 @@ mod tests {
 
     #[test]
     fn message_hello_roundtrip() {
-        let msg = Message::Hello { protocol_version: 2, host_name: HostName::new("desktop"), session_id: uuid::Uuid::nil() };
+        let msg = Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("desktop"), session_id: uuid::Uuid::nil() };
 
         test_helpers::assert_json_roundtrip(&msg);
     }

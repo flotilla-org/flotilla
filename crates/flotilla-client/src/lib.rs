@@ -502,6 +502,10 @@ fn handle_event(
             local_seqs.write().unwrap().remove(&StreamKey::Repo { identity: repo_identity.clone() });
             let _ = event_tx.send(event);
         }
+        DaemonEvent::HostRemoved { host, seq } => {
+            local_seqs.write().unwrap().insert(StreamKey::Host { host_name: host.clone() }, *seq);
+            let _ = event_tx.send(event);
+        }
         DaemonEvent::HostSnapshot(snap) => {
             let stream_key = StreamKey::Host { host_name: snap.host_name.clone() };
             local_seqs.write().unwrap().insert(stream_key, snap.seq);
@@ -563,6 +567,13 @@ async fn recover_from_gap(
                                 let current = seqs.get(&key).copied().unwrap_or(0);
                                 if snap.seq >= current {
                                     seqs.insert(key, snap.seq);
+                                }
+                            }
+                            DaemonEvent::HostRemoved { host, seq } => {
+                                let key = StreamKey::Host { host_name: host.clone() };
+                                let current = seqs.get(&key).copied().unwrap_or(0);
+                                if *seq >= current {
+                                    seqs.insert(key, *seq);
                                 }
                             }
                             _ => {}
@@ -644,6 +655,7 @@ impl DaemonHandle for SocketDaemon {
                     DaemonEvent::RepoSnapshot(snap) => (StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq),
                     DaemonEvent::RepoDelta(delta) => (StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq),
                     DaemonEvent::HostSnapshot(snap) => (StreamKey::Host { host_name: snap.host_name.clone() }, snap.seq),
+                    DaemonEvent::HostRemoved { host, seq } => (StreamKey::Host { host_name: host.clone() }, *seq),
                     _ => continue,
                 };
                 seqs.entry(stream_key).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
@@ -1197,6 +1209,29 @@ mod tests {
 
         let event = event_rx.try_recv().expect("should receive PeerStatusChanged");
         assert!(matches!(event, DaemonEvent::PeerStatusChanged { .. }));
+    }
+
+    #[tokio::test]
+    async fn handle_event_forwards_host_removed_and_tracks_seq() {
+        let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (writer, pending, next_id, _server) = event_harness();
+        let host = flotilla_protocol::HostName::new("peer-1");
+
+        handle_event(
+            DaemonEvent::HostRemoved { host: host.clone(), seq: 9 },
+            &local_seqs,
+            &recovering,
+            &event_tx,
+            &writer,
+            &pending,
+            &next_id,
+        );
+
+        let event = event_rx.try_recv().expect("should receive HostRemoved");
+        assert!(matches!(event, DaemonEvent::HostRemoved { seq: 9, .. }));
+        assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&StreamKey::Host { host_name: host }).copied(), Some(9));
     }
 
     // --- RepoRemoved evicts seq and forwards ---
