@@ -1495,14 +1495,56 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    pub async fn add_repo(&self, path: &Path) -> Result<(), String> {
-        let path = path.to_path_buf();
+    /// Resolve a path that might be a git worktree to the main repo root.
+    ///
+    /// Returns `(resolved_path, Some(original_path))` if normalization changed
+    /// the path, or `(original_path, None)` if no change was needed.
+    async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
+        use crate::providers::ChannelLabel;
+        let label = ChannelLabel::Command("git-rev-parse".into());
+        let result = self.discovery.runner.run("git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], path, &label).await;
+        match result {
+            Ok(output) => {
+                let git_common_dir = PathBuf::from(output.trim());
+                // The common dir is `<repo_root>/.git` — the repo root is its parent.
+                if let Some(repo_root) = git_common_dir.parent() {
+                    let repo_root = repo_root.to_path_buf();
+                    // Compare canonicalized paths to handle symlinks (e.g. /var -> /private/var on macOS)
+                    let canonical_root = std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
+                    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                    if canonical_root != canonical_path {
+                        debug!(
+                            worktree = %path.display(),
+                            repo_root = %canonical_root.display(),
+                            "normalized worktree path to main repo root"
+                        );
+                        return (canonical_root, Some(path.to_path_buf()));
+                    }
+                    // Even if paths match, prefer the canonical form
+                    return (canonical_root, None);
+                }
+                (path.to_path_buf(), None)
+            }
+            Err(_) => {
+                // Not a git repo or git not available — use the path as-is
+                (path.to_path_buf(), None)
+            }
+        }
+    }
+
+    /// Add a repo to tracking, returning `(tracked_path, resolved_from)`.
+    ///
+    /// If `path` is a git worktree, the main repo root is resolved via
+    /// `git rev-parse --path-format=absolute --git-common-dir` and tracked
+    /// instead. `resolved_from` is `Some(original_path)` in that case.
+    pub async fn add_repo(&self, path: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
+        let (path, resolved_from) = self.normalize_repo_path(path).await;
 
         // Check if already tracked (under read lock for fast path)
         {
             let identities = self.path_identities.read().await;
             if identities.contains_key(&path) {
-                return Ok(());
+                return Ok((path, resolved_from));
             }
         }
 
@@ -1541,7 +1583,7 @@ impl InProcessDaemon {
         let mut preferred_changed = false;
         let already_tracked = self.path_identities.read().await.contains_key(&path);
         if already_tracked {
-            return Ok(());
+            return Ok((path, resolved_from));
         }
         {
             let mut repos = self.repos.write().await;
@@ -1572,7 +1614,7 @@ impl InProcessDaemon {
             self.broadcast_snapshot_inner(&path, false).await;
         }
 
-        Ok(())
+        Ok((path, resolved_from))
     }
 
     pub async fn remove_repo(&self, path: &Path) -> Result<(), String> {
@@ -1739,7 +1781,9 @@ impl DaemonHandle for InProcessDaemon {
                     description,
                 });
                 let result = match self.add_repo(path).await {
-                    Ok(()) => flotilla_protocol::CommandResult::RepoTracked { path: path.clone(), resolved_from: None },
+                    Ok((tracked_path, resolved_from)) => {
+                        flotilla_protocol::CommandResult::RepoTracked { path: tracked_path, resolved_from }
+                    }
                     Err(message) => flotilla_protocol::CommandResult::Error { message },
                 };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -2068,10 +2112,8 @@ impl DaemonHandle for InProcessDaemon {
     async fn get_repo_detail(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
         let repos = self.repos.read().await;
-        let identity = self
-            .tracked_repo_identity_for_path(&repo_path)
-            .await
-            .ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()
@@ -2104,10 +2146,8 @@ impl DaemonHandle for InProcessDaemon {
     async fn get_repo_providers(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
         let repos = self.repos.read().await;
-        let identity = self
-            .tracked_repo_identity_for_path(&repo_path)
-            .await
-            .ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()
@@ -2160,10 +2200,8 @@ impl DaemonHandle for InProcessDaemon {
     async fn get_repo_work(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
         let repos = self.repos.read().await;
-        let identity = self
-            .tracked_repo_identity_for_path(&repo_path)
-            .await
-            .ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
         let peer_overlay = {
             let pp = self.peer_providers.read().await;
             pp.get(&identity).cloned()

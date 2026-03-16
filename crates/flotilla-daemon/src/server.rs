@@ -1815,11 +1815,8 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
         }
 
         Request::Refresh { repo } => {
-            let command = Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) },
-            };
+            let command =
+                Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) } };
             match ctx.daemon.execute(command).await {
                 Ok(_) => Message::ok_response(id, Response::Refresh),
                 Err(e) => Message::error_response(id, e),
@@ -1827,11 +1824,7 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
         }
 
         Request::AddRepo { path } => {
-            let command = Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::TrackRepoPath { path },
-            };
+            let command = Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
             match ctx.daemon.execute(command).await {
                 Ok(_) => Message::ok_response(id, Response::AddRepo),
                 Err(e) => Message::error_response(id, e),
@@ -1839,11 +1832,7 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
         }
 
         Request::RemoveRepo { path } => {
-            let command = Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) },
-            };
+            let command = Command { host: None, context_repo: None, action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) } };
             match ctx.daemon.execute(command).await {
                 Ok(_) => Message::ok_response(id, Response::RemoveRepo),
                 Err(e) => Message::error_response(id, e),
@@ -3036,7 +3025,8 @@ mod tests {
             handle_remote_restart_if_needed(&peer_manager, &daemon, &HostName::new("peer-a"), Some(old_session_id)).await;
 
         assert_eq!(current_session_id, Some(new_session_id), "current session id should update to the reconnected peer session");
-        let snapshot = daemon.get_state(&flotilla_protocol::RepoSelector::Path(synthetic.clone())).await.expect("remote-only repo should remain");
+        let snapshot =
+            daemon.get_state(&flotilla_protocol::RepoSelector::Path(synthetic.clone())).await.expect("remote-only repo should remain");
         assert!(
             !snapshot.providers.checkouts.contains_key(&HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only")),
             "restart cleanup should remove stale peer-a checkout"

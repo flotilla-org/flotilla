@@ -783,15 +783,18 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
         .add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), ProviderData::default())
         .await
         .expect("add virtual repo");
-    daemon.add_repo(&local_repo).await.expect("add local repo");
+    let (tracked_path, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
+    // Path may be canonicalized (e.g. /var -> /private/var on macOS)
+    let canonical_repo = std::fs::canonicalize(&local_repo).unwrap_or_else(|_| local_repo.clone());
 
     let repos = daemon.list_repos().await.expect("list repos");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].identity, identity);
-    assert_eq!(repos[0].path, local_repo, "local clone should become the preferred executable path");
-    assert_eq!(daemon.preferred_local_path_for_identity(&identity).await, Some(local_repo.clone()));
-    assert!(daemon.get_local_providers(&local_repo).await.is_some(), "local providers should now resolve for the identity");
-    assert_eq!(daemon.tracked_repo_paths().await, vec![local_repo]);
+    assert_eq!(repos[0].path, canonical_repo, "local clone should become the preferred executable path");
+    assert_eq!(tracked_path, canonical_repo);
+    assert_eq!(daemon.preferred_local_path_for_identity(&identity).await, Some(canonical_repo.clone()));
+    assert!(daemon.get_local_providers(&canonical_repo).await.is_some(), "local providers should now resolve for the identity");
+    assert_eq!(daemon.tracked_repo_paths().await, vec![canonical_repo]);
 }
 
 #[tokio::test]

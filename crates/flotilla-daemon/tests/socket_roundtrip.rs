@@ -72,7 +72,11 @@ async fn socket_roundtrip() {
 
     // refresh — should succeed (triggers a re-scan)
     client
-        .execute(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) } })
+        .execute(Command {
+            host: None,
+            context_repo: None,
+            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
+        })
         .await
         .expect("refresh");
     // Wait for a snapshot or delta event (skip command lifecycle events)
