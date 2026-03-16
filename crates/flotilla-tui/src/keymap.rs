@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crokey::KeyCombination;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use flotilla_core::config::KeysConfig;
 
 use crate::app::intent::Intent;
 
@@ -288,6 +289,56 @@ impl Keymap {
 
         Keymap { shared, modes }
     }
+
+    /// Build a keymap from defaults, then apply user overrides from `KeysConfig`.
+    ///
+    /// Invalid key strings or action names are logged as warnings and skipped.
+    pub fn from_config(config: &KeysConfig) -> Self {
+        let mut keymap = Self::defaults();
+
+        let mode_configs: &[(&HashMap<String, String>, ModeId)] = &[
+            (&config.normal, ModeId::Normal),
+            (&config.help, ModeId::Help),
+            (&config.config, ModeId::Config),
+            (&config.action_menu, ModeId::ActionMenu),
+            (&config.delete_confirm, ModeId::DeleteConfirm),
+            (&config.close_confirm, ModeId::CloseConfirm),
+        ];
+
+        // Apply shared overrides
+        for (key_str, action_str) in &config.shared {
+            match Self::parse_binding(key_str, action_str) {
+                Some((combo, action)) => {
+                    keymap.shared.insert(combo, action);
+                }
+                None => {
+                    tracing::warn!(key = %key_str, action = %action_str, "skipping invalid shared key binding");
+                }
+            }
+        }
+
+        // Apply per-mode overrides
+        for (entries, mode) in mode_configs {
+            for (key_str, action_str) in *entries {
+                match Self::parse_binding(key_str, action_str) {
+                    Some((combo, action)) => {
+                        keymap.modes.entry(*mode).or_default().insert(combo, action);
+                    }
+                    None => {
+                        tracing::warn!(key = %key_str, action = %action_str, ?mode, "skipping invalid key binding");
+                    }
+                }
+            }
+        }
+
+        keymap
+    }
+
+    fn parse_binding(key_str: &str, action_str: &str) -> Option<(KeyCombination, Action)> {
+        let combo: KeyCombination = key_str.parse().ok()?;
+        let action = Action::from_config_str(action_str)?;
+        Some((combo, action))
+    }
 }
 
 #[cfg(test)]
@@ -525,5 +576,53 @@ mod tests {
         assert_eq!(km.resolve(ModeId::FilePicker, crokey::key!(k)), Some(Action::SelectPrev));
         assert_eq!(km.resolve(ModeId::FilePicker, crokey::key!(enter)), Some(Action::Confirm));
         assert_eq!(km.resolve(ModeId::FilePicker, crokey::key!(esc)), Some(Action::Dismiss));
+    }
+
+    // ── from_config tests ──
+
+    #[test]
+    fn from_config_overrides_shared_binding() {
+        let mut keys = KeysConfig::default();
+        keys.shared.insert("g".into(), "select_next".into());
+        let keymap = Keymap::from_config(&keys);
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('g'), KeyModifiers::NONE)), Some(Action::SelectNext));
+        // original 'j' still works
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('j'), KeyModifiers::NONE)), Some(Action::SelectNext));
+    }
+
+    #[test]
+    fn from_config_overrides_mode_binding() {
+        let mut keys = KeysConfig::default();
+        keys.normal.insert("x".into(), "quit".into());
+        let keymap = Keymap::from_config(&keys);
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('x'), KeyModifiers::NONE)), Some(Action::Quit));
+        // original 'q' still works
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+    }
+
+    #[test]
+    fn from_config_skips_invalid_key_string() {
+        let mut keys = KeysConfig::default();
+        keys.shared.insert("NOT_A_VALID_KEY!!!".into(), "quit".into());
+        let keymap = Keymap::from_config(&keys);
+        // defaults still work despite invalid override
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+    }
+
+    #[test]
+    fn from_config_skips_invalid_action_name() {
+        let mut keys = KeysConfig::default();
+        keys.shared.insert("g".into(), "nonexistent_action".into());
+        let keymap = Keymap::from_config(&keys);
+        // 'g' was not bound by default, and the invalid override is skipped
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('g'), KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn from_config_empty_uses_defaults() {
+        let keys = KeysConfig::default();
+        let keymap = Keymap::from_config(&keys);
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('j'), KeyModifiers::NONE)), Some(Action::SelectNext));
+        assert_eq!(keymap.resolve(ModeId::Normal, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
     }
 }
