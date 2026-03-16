@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::types::{
-    Attachable, AttachableId, AttachableKind, AttachableSet, AttachableSetId, BindingObjectKind, ProviderBinding, TerminalPurpose,
+    Attachable, AttachableId, AttachableKind, AttachableSet, AttachableSetId, BindingObjectKind, ProviderBinding, TerminalAttachable,
+    TerminalPurpose,
 };
 use crate::config::flotilla_config_dir;
 
@@ -104,11 +105,12 @@ impl AttachableStore {
             let old_set_id = self.registry.attachables.get(&attachable_id).map(|existing| existing.set_id.clone());
             if let Some(existing) = self.registry.attachables.get_mut(&attachable_id) {
                 existing.set_id = set_id.clone();
-                existing.kind = AttachableKind::Terminal;
-                existing.terminal_purpose = Some(terminal_purpose);
-                existing.command = command.into();
-                existing.working_directory = working_directory;
-                existing.status = status;
+                existing.kind = AttachableKind::Terminal(TerminalAttachable {
+                    purpose: terminal_purpose,
+                    command: command.into(),
+                    working_directory,
+                    status,
+                });
             }
             if let Some(old_set_id) = old_set_id.filter(|old| old != set_id) {
                 self.remove_member_link(&old_set_id, &attachable_id);
@@ -121,11 +123,12 @@ impl AttachableStore {
         self.insert_attachable(Attachable {
             id: id.clone(),
             set_id: set_id.clone(),
-            kind: AttachableKind::Terminal,
-            terminal_purpose: Some(terminal_purpose),
-            command: command.into(),
-            working_directory,
-            status,
+            kind: AttachableKind::Terminal(TerminalAttachable {
+                purpose: terminal_purpose,
+                command: command.into(),
+                working_directory,
+                status,
+            }),
         });
         self.ensure_member_link(set_id, &id);
         self.replace_binding(ProviderBinding {
@@ -222,7 +225,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::attachable::types::TerminalPurpose;
+    use crate::attachable::types::{TerminalAttachable, TerminalPurpose};
 
     #[test]
     fn opaque_ids_roundtrip_as_strings() {
@@ -269,11 +272,12 @@ mod tests {
         store.insert_attachable(Attachable {
             id: attachable_id.clone(),
             set_id: set_id.clone(),
-            kind: AttachableKind::Terminal,
-            terminal_purpose: Some(TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 }),
-            command: "claude".into(),
-            working_directory: PathBuf::from("/repo/wt-feat"),
-            status: TerminalStatus::Running,
+            kind: AttachableKind::Terminal(TerminalAttachable {
+                purpose: TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+                command: "claude".into(),
+                working_directory: PathBuf::from("/repo/wt-feat"),
+                status: TerminalStatus::Running,
+            }),
         });
         store.replace_binding(ProviderBinding {
             provider_category: "terminal_pool".into(),
@@ -332,8 +336,15 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(store.registry.attachables.len(), 1);
         let attachable = store.registry.attachables.get(&first).expect("attachable");
-        assert_eq!(attachable.command, "codex");
-        assert_eq!(attachable.status, TerminalStatus::Disconnected);
+        assert_eq!(
+            attachable.kind,
+            AttachableKind::Terminal(TerminalAttachable {
+                purpose: TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+                command: "codex".into(),
+                working_directory: PathBuf::from("/repo/wt-feat"),
+                status: TerminalStatus::Disconnected,
+            })
+        );
     }
 
     #[test]
@@ -403,7 +414,12 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(store.registry.attachables.len(), 2);
-        assert_eq!(store.registry.attachables.get(&second).and_then(|a| a.terminal_purpose.as_ref()).map(|p| p.index), Some(0));
+        assert_eq!(
+            store.registry.attachables.get(&second).and_then(|a| match &a.kind {
+                AttachableKind::Terminal(terminal) => Some(terminal.purpose.index),
+            }),
+            Some(0)
+        );
     }
 
     #[test]

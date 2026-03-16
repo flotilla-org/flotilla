@@ -543,6 +543,7 @@ impl InProcessDaemon {
             if path_identities.contains_key(&path) {
                 continue;
             }
+            let attachable_store = discovery.shared_attachable_store(&config);
             let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discovery::discover_providers(
                 &host_bag,
                 &path,
@@ -550,6 +551,7 @@ impl InProcessDaemon {
                 &discovery.factories,
                 &config,
                 Arc::clone(&discovery.runner),
+                attachable_store,
                 &*discovery.env,
             )
             .await;
@@ -1570,6 +1572,7 @@ impl InProcessDaemon {
             &self.discovery.factories,
             &self.config,
             Arc::clone(&self.discovery.runner),
+            self.discovery.shared_attachable_store(&self.config),
             &*self.discovery.env,
         )
         .await;

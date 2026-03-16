@@ -28,12 +28,13 @@ impl Factory for ClaudeCodingAgentFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::CloudAgent, "claude", "Claude", "S", "Sessions", "session")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         if env.find_binary("claude").is_some() {
             let http = Arc::new(ReqwestHttpClient::new());
@@ -58,12 +59,13 @@ impl Factory for ClaudeApiAiUtilityFactory {
         ProviderDescriptor::labeled(ProviderCategory::AiUtility, "claude", "api", "Claude API", "", "", "")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
         if let Some(api_key) = env.find_env_var("ANTHROPIC_API_KEY") {
             let http = Arc::new(ReqwestHttpClient::new());
@@ -88,12 +90,13 @@ impl Factory for ClaudeCliAiUtilityFactory {
         ProviderDescriptor::labeled(ProviderCategory::AiUtility, "claude", "cli", "Claude CLI", "", "", "")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
         if let Some(path) = env.find_binary("claude") {
             let claude_bin = path.to_string_lossy().to_string();

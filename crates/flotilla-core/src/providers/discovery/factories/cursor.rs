@@ -27,12 +27,13 @@ impl Factory for CursorCodingAgentFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::CloudAgent, "cursor", "Cursor", "S", "Sessions", "session")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         let mut unmet = vec![];
         if env.find_binary("agent").is_none() {

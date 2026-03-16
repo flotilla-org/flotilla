@@ -25,7 +25,7 @@ impl std::fmt::Display for AttachableId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttachableKind {
-    Terminal,
+    Terminal(TerminalAttachable),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +33,15 @@ pub struct TerminalPurpose {
     pub checkout: String,
     pub role: String,
     pub index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalAttachable {
+    pub purpose: TerminalPurpose,
+    #[serde(default)]
+    pub command: String,
+    pub working_directory: PathBuf,
+    pub status: TerminalStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,12 +62,6 @@ pub struct Attachable {
     pub id: AttachableId,
     pub set_id: AttachableSetId,
     pub kind: AttachableKind,
-    #[serde(default)]
-    pub terminal_purpose: Option<TerminalPurpose>,
-    #[serde(default)]
-    pub command: String,
-    pub working_directory: PathBuf,
-    pub status: TerminalStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

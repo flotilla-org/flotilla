@@ -23,12 +23,13 @@ impl Factory for PassthroughTerminalPoolFactory {
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "passthrough")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         Ok(Arc::new(PassthroughTerminalPool))
     }

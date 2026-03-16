@@ -23,12 +23,13 @@ impl Factory for TmuxWorkspaceManagerFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::WorkspaceManager, "tmux", "tmux Workspaces", "", "", "")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("TMUX").is_some() {
             Ok(Arc::new(TmuxWorkspaceManager::new(runner)))

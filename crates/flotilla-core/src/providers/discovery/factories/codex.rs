@@ -27,12 +27,13 @@ impl Factory for CodexCodingAgentFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::CloudAgent, "codex", "Codex", "S", "Sessions", "session")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         if env.has_auth("codex") {
             let http = Arc::new(ReqwestHttpClient::new());

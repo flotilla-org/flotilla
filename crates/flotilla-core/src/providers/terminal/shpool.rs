@@ -459,7 +459,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        attachable::{AttachableStore, BindingObjectKind, SharedAttachableStore},
+        attachable::{AttachableKind, AttachableStore, BindingObjectKind, SharedAttachableStore},
         providers::testing::MockRunner,
     };
 
@@ -664,7 +664,12 @@ mod tests {
             .expect("binding should exist");
         let attachable =
             store.registry().attachables.values().find(|attachable| attachable.id.0 == attachable_id).expect("attachable should exist");
-        assert_eq!(attachable.working_directory, PathBuf::from("/home/dev/project"));
+        assert_eq!(
+            match &attachable.kind {
+                AttachableKind::Terminal(terminal) => terminal.working_directory.clone(),
+            },
+            PathBuf::from("/home/dev/project")
+        );
     }
 
     #[test]

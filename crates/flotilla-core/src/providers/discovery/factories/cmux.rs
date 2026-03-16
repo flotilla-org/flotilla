@@ -34,12 +34,13 @@ impl Factory for CmuxInsideFactory {
         cmux_descriptor()
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("CMUX_SOCKET_PATH").is_some() {
             Ok(Arc::new(CmuxWorkspaceManager::new(runner)))
@@ -61,12 +62,13 @@ impl Factory for CmuxBinaryFallbackFactory {
         cmux_descriptor()
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         if env.find_binary("cmux").is_some() {
             Ok(Arc::new(CmuxWorkspaceManager::new(runner)))

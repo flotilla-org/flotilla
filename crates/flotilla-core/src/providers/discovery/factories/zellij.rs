@@ -23,12 +23,13 @@ impl Factory for ZellijWorkspaceManagerFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::WorkspaceManager, "zellij", "zellij Workspaces", "", "", "")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("ZELLIJ").is_none() {
             return Err(vec![UnmetRequirement::MissingEnvVar("ZELLIJ".into())]);

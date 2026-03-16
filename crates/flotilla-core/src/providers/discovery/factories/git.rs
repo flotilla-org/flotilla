@@ -27,12 +27,13 @@ impl Factory for GitVcsFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::Vcs, "git", "Git", "", "", "")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
         if env.find_vcs_checkout(VcsKind::Git).is_some() {
             Ok(Arc::new(GitVcs::new(runner)))
@@ -56,12 +57,13 @@ impl Factory for WtCheckoutManagerFactory {
         ProviderDescriptor::labeled(ProviderCategory::CheckoutManager, "git", "wt", "wt", "CO", "Checkouts", "checkout")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         if env.find_binary("wt").is_some() {
             Ok(Arc::new(WtCheckoutManager::new(runner)))
@@ -85,12 +87,13 @@ impl Factory for GitCheckoutManagerFactory {
         ProviderDescriptor::labeled(ProviderCategory::CheckoutManager, "git", "git", "git worktrees", "WT", "Checkouts", "worktree")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
         config: &ConfigStore,
         repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         if env.find_binary("git").is_some() {
             let checkout_config = config.resolve_checkout_config(repo_root);

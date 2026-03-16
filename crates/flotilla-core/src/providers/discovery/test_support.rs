@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use async_trait::async_trait;
@@ -183,6 +183,7 @@ fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandR
         ))],
         repo_detectors: super::detectors::default_repo_detectors(),
         factories,
+        attachable_store: OnceLock::new(),
     }
 }
 // ---------------------------------------------------------------------------
@@ -379,12 +380,13 @@ impl Factory for FakeIssueTrackerFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::IssueTracker, "fake-issues", "Fake Issues", "#", "Issues", "issue")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -408,12 +410,13 @@ impl Factory for FakeCheckoutManagerFactory {
         )
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -430,12 +433,13 @@ impl Factory for FakeChangeRequestFactory {
         ProviderDescriptor::labeled_simple(ProviderCategory::ChangeRequest, "fake-cr", "Fake PRs", "PR", "Pull Requests", "pull request")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -485,6 +489,7 @@ pub fn fake_discovery_with_providers(
             workspace_managers: vec![],
             terminal_pools: vec![],
         },
+        attachable_store: OnceLock::new(),
     }
 }
 

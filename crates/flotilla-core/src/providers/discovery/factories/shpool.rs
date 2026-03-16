@@ -5,7 +5,6 @@ use std::{path::Path, sync::Arc};
 use async_trait::async_trait;
 
 use crate::{
-    attachable::AttachableStore,
     config::{flotilla_config_dir, ConfigStore},
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
@@ -24,17 +23,17 @@ impl Factory for ShpoolTerminalPoolFactory {
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "shpool")
     }
 
-    async fn probe(
+    async fn probe_with_services(
         &self,
         env: &EnvironmentBag,
-        config: &ConfigStore,
+        _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
+        attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if env.find_binary("shpool").is_some() {
             let socket_path = flotilla_config_dir().join("shpool/shpool.socket");
-            let store = Arc::new(std::sync::Mutex::new(AttachableStore::with_base(config.base_path())));
-            let pool = ShpoolTerminalPool::create(runner, socket_path, store).await;
+            let pool = ShpoolTerminalPool::create(runner, socket_path, attachable_store).await;
             Ok(Arc::new(pool))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("shpool".into())])
