@@ -377,18 +377,10 @@ async fn select_existing_workspace(ws_mgr: &dyn WorkspaceManager, checkout_path:
     false
 }
 
-fn persist_workspace_binding(
-    config_base: &Path,
-    provider_name: &str,
-    workspace_ref: &str,
-    target_host: &HostName,
-    checkout_path: &Path,
-) {
+fn persist_workspace_binding(config_base: &Path, provider_name: &str, workspace_ref: &str, target_host: &HostName, checkout_path: &Path) {
     let mut store = AttachableStore::with_base(config_base);
-    let set_id = store.ensure_terminal_set(
-        Some(target_host.clone()),
-        Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
-    );
+    let set_id =
+        store.ensure_terminal_set(Some(target_host.clone()), Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())));
     store.replace_binding(ProviderBinding {
         provider_category: "workspace_manager".into(),
         provider_name: provider_name.to_string(),
@@ -1113,17 +1105,19 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
 
     use super::*;
-    use crate::attachable::AttachableStore;
-    use crate::providers::{
-        ai_utility::AiUtility,
-        change_request::ChangeRequestTracker,
-        coding_agent::CloudAgentService,
-        discovery::{ProviderCategory, ProviderDescriptor},
-        issue_tracker::IssueTracker,
-        testing::MockRunner,
-        types::*,
-        vcs::CheckoutManager,
-        workspace::WorkspaceManager,
+    use crate::{
+        attachable::AttachableStore,
+        providers::{
+            ai_utility::AiUtility,
+            change_request::ChangeRequestTracker,
+            coding_agent::CloudAgentService,
+            discovery::{ProviderCategory, ProviderDescriptor},
+            issue_tracker::IssueTracker,
+            testing::MockRunner,
+            types::*,
+            vcs::CheckoutManager,
+            workspace::WorkspaceManager,
+        },
     };
 
     fn desc(name: &str) -> ProviderDescriptor {
@@ -1587,12 +1581,7 @@ mod tests {
         let object_id = store
             .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
             .expect("workspace binding should exist");
-        let set = store
-            .registry()
-            .sets
-            .values()
-            .find(|set| set.id.0 == object_id)
-            .expect("set should exist");
+        let set = store.registry().sets.values().find(|set| set.id.0 == object_id).expect("set should exist");
         assert_eq!(set.checkout, Some(HostPath::new(local_host(), checkout_path)));
     }
 
@@ -1890,12 +1879,7 @@ mod tests {
         let object_id = store
             .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
             .expect("workspace binding should exist");
-        let set = store
-            .registry()
-            .sets
-            .values()
-            .find(|set| set.id.0 == object_id)
-            .expect("set should exist");
+        let set = store.registry().sets.values().find(|set| set.id.0 == object_id).expect("set should exist");
         assert_eq!(set.checkout, Some(HostPath::new(local_host(), PathBuf::from("/repo/wt-feat"))));
     }
     // -----------------------------------------------------------------------

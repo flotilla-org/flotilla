@@ -362,11 +362,7 @@ impl ShpoolTerminalPool {
             "terminal_pool",
             "shpool",
             session_name,
-            TerminalPurpose {
-                checkout: terminal.id.checkout.clone(),
-                role: terminal.id.role.clone(),
-                index: terminal.id.index,
-            },
+            TerminalPurpose { checkout: terminal.id.checkout.clone(), role: terminal.id.role.clone(), index: terminal.id.index },
             terminal.command.clone(),
             checkout_path,
             terminal.status.clone(),
@@ -462,8 +458,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::attachable::{BindingObjectKind, SharedAttachableStore, AttachableStore};
-    use crate::providers::testing::MockRunner;
+    use crate::{
+        attachable::{AttachableStore, BindingObjectKind, SharedAttachableStore},
+        providers::testing::MockRunner,
+    };
 
     /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
     fn test_store(dir: &tempfile::TempDir) -> SharedAttachableStore {
@@ -649,12 +647,8 @@ mod tests {
         let store = store.lock().expect("lock store");
         assert_eq!(store.registry().sets.len(), 1);
         assert_eq!(store.registry().attachables.len(), 2);
-        assert!(store
-            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0")
-            .is_some());
-        assert!(store
-            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/agent/0")
-            .is_some());
+        assert!(store.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0").is_some());
+        assert!(store.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/agent/0").is_some());
     }
 
     #[tokio::test]
@@ -668,12 +662,8 @@ mod tests {
         let attachable_id = store
             .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0")
             .expect("binding should exist");
-        let attachable = store
-            .registry()
-            .attachables
-            .values()
-            .find(|attachable| attachable.id.0 == attachable_id)
-            .expect("attachable should exist");
+        let attachable =
+            store.registry().attachables.values().find(|attachable| attachable.id.0 == attachable_id).expect("attachable should exist");
         assert_eq!(attachable.working_directory, PathBuf::from("/home/dev/project"));
     }
 

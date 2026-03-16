@@ -79,23 +79,12 @@ impl AttachableStore {
     }
 
     pub fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
-        if let Some(existing) = self
-            .registry
-            .sets
-            .values()
-            .find(|set| set.host_affinity == host_affinity && set.checkout == checkout)
-        {
+        if let Some(existing) = self.registry.sets.values().find(|set| set.host_affinity == host_affinity && set.checkout == checkout) {
             return existing.id.clone();
         }
 
         let id = self.allocate_set_id();
-        self.insert_set(AttachableSet {
-            id: id.clone(),
-            host_affinity,
-            checkout,
-            template_identity: None,
-            members: Vec::new(),
-        });
+        self.insert_set(AttachableSet { id: id.clone(), host_affinity, checkout, template_identity: None, members: Vec::new() });
         id
     }
 
@@ -309,17 +298,15 @@ mod tests {
             reloaded.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0"),
             Some("att-1")
         );
-        assert_eq!(
-            reloaded.lookup_binding("workspace_manager", "tmux", BindingObjectKind::AttachableSet, "workspace:7"),
-            Some("set-1")
-        );
+        assert_eq!(reloaded.lookup_binding("workspace_manager", "tmux", BindingObjectKind::AttachableSet, "workspace:7"), Some("set-1"));
     }
 
     #[test]
     fn ensure_terminal_attachable_reuses_existing_binding() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = AttachableStore::with_base(dir.path());
-        let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+        let set_id =
+            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
 
         let first = store.ensure_terminal_attachable(
             &set_id,
@@ -390,7 +377,8 @@ mod tests {
     fn ensure_terminal_attachable_uses_binding_as_primary_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = AttachableStore::with_base(dir.path());
-        let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+        let set_id =
+            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
 
         let first = store.ensure_terminal_attachable(
             &set_id,
@@ -415,10 +403,7 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(store.registry.attachables.len(), 2);
-        assert_eq!(
-            store.registry.attachables.get(&second).and_then(|a| a.terminal_purpose.as_ref()).map(|p| p.index),
-            Some(0)
-        );
+        assert_eq!(store.registry.attachables.get(&second).and_then(|a| a.terminal_purpose.as_ref()).map(|p| p.index), Some(0));
     }
 
     #[test]
@@ -478,10 +463,8 @@ mod tests {
         store.save().expect("save registry");
 
         let mut reloaded = AttachableStore::with_base(dir.path());
-        let same_set_id = reloaded.ensure_terminal_set(
-            Some(HostName::new("desktop")),
-            Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")),
-        );
+        let same_set_id =
+            reloaded.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
         let same_attachable_id = reloaded.ensure_terminal_attachable(
             &same_set_id,
             "terminal_pool",
@@ -501,7 +484,8 @@ mod tests {
     fn provider_local_state_is_not_identity_source() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = AttachableStore::with_base(dir.path());
-        let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+        let set_id =
+            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
         let attachable_id = store.ensure_terminal_attachable(
             &set_id,
             "terminal_pool",
