@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
-use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent, HostName, RepoSelector};
+use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent, HostName, RepoSelector, StreamKey};
 use tokio::time::Instant;
 
 #[tokio::test]
@@ -91,17 +91,19 @@ async fn socket_roundtrip() {
     .await
     .expect("timeout waiting for snapshot event");
 
-    // replay_since with current seq — should return empty (up to date)
+    // replay_since with current seq — should return no repo events (up to date), but may include HostSnapshots
     let snapshot = client.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
-    let last_seen = HashMap::from([(snapshot.repo_identity.clone(), snapshot.seq)]);
+    let last_seen = HashMap::from([(StreamKey::Repo { identity: snapshot.repo_identity.clone() }, snapshot.seq)]);
     let replay = client.replay_since(&last_seen).await.expect("replay_since");
-    assert!(replay.is_empty(), "should be empty when up to date, got {} events", replay.len());
+    let repo_events: Vec<_> = replay.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_))).collect();
+    assert!(repo_events.is_empty(), "should have no repo events when up to date, got {} events", repo_events.len());
 
     // replay_since with bogus seq — should return full snapshot
-    let last_seen = HashMap::from([(snapshot.repo_identity, 999999)]);
+    let last_seen = HashMap::from([(StreamKey::Repo { identity: snapshot.repo_identity }, 999999)]);
     let replay = client.replay_since(&last_seen).await.expect("replay_since");
-    assert_eq!(replay.len(), 1, "should get one full snapshot");
-    assert!(matches!(&replay[0], DaemonEvent::RepoSnapshot(snap) if snap.repo == repo), "expected RepoSnapshot, got {:?}", replay[0]);
+    let repo_snapshots: Vec<_> = replay.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_))).collect();
+    assert_eq!(repo_snapshots.len(), 1, "should get one full repo snapshot");
+    assert!(matches!(repo_snapshots[0], DaemonEvent::RepoSnapshot(snap) if snap.repo == repo), "expected RepoSnapshot for our repo");
 
     // Clean up
     server_handle.abort();

@@ -11,9 +11,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime};
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message,
-    PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepoSelector, Request, Response, RoutedPeerMessage,
-    PROTOCOL_VERSION,
+    Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, HostSnapshot, HostSummary,
+    Message, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepoSelector, Request, Response, RoutedPeerMessage,
+    SystemInfo, ToolInventory, PROTOCOL_VERSION,
 };
 use futures::future::join_all;
 use tokio::{
@@ -112,7 +112,19 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
     info!(host = %host_name, %peer_count, "initialized PeerManager");
 
     for peer_host in peer_manager.configured_peer_names() {
-        daemon.send_event(DaemonEvent::PeerStatusChanged { host: peer_host, status: PeerConnectionState::Disconnected });
+        daemon.send_event(DaemonEvent::PeerStatusChanged { host: peer_host.clone(), status: PeerConnectionState::Disconnected });
+        daemon.send_event(DaemonEvent::HostSnapshot(Box::new(HostSnapshot {
+            seq: daemon.next_host_seq(),
+            host_name: peer_host.clone(),
+            is_local: false,
+            connection_status: PeerConnectionState::Disconnected,
+            summary: HostSummary {
+                host_name: peer_host,
+                system: SystemInfo::default(),
+                inventory: ToolInventory::default(),
+                providers: vec![],
+            },
+        })));
     }
 
     Ok(Arc::new(Mutex::new(peer_manager)))
@@ -131,6 +143,26 @@ async fn sync_peer_query_state(peer_manager: &Arc<Mutex<PeerManager>>, daemon: &
     daemon.set_configured_peer_names(configured).await;
     daemon.set_peer_host_summaries(summaries).await;
     daemon.set_topology_routes(routes).await;
+}
+
+/// Build a `HostSnapshot` event for a peer, looking up its summary from the peer manager.
+async fn host_snapshot_for_peer(
+    daemon: &Arc<InProcessDaemon>,
+    peer_manager: &Arc<Mutex<PeerManager>>,
+    host_name: &HostName,
+    status: PeerConnectionState,
+) -> HostSnapshot {
+    let summary = {
+        let pm = peer_manager.lock().await;
+        pm.get_peer_host_summaries().get(host_name).cloned()
+    };
+    let summary = summary.unwrap_or_else(|| HostSummary {
+        host_name: host_name.clone(),
+        system: SystemInfo::default(),
+        inventory: ToolInventory::default(),
+        providers: vec![],
+    });
+    HostSnapshot { seq: daemon.next_host_seq(), host_name: host_name.clone(), is_local: false, connection_status: status, summary }
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
@@ -464,11 +496,17 @@ fn spawn_peer_networking_runtime(
 
             for name in &peer_names {
                 peer_daemon.send_event(DaemonEvent::PeerStatusChanged { host: name.clone(), status: PeerConnectionState::Connecting });
+                peer_daemon.send_event(DaemonEvent::HostSnapshot(Box::new(
+                    host_snapshot_for_peer(&peer_daemon, &peer_manager_task, name, PeerConnectionState::Connecting).await,
+                )));
             }
             for name in &peer_names {
                 let status =
                     if initial_rx_map.contains_key(name) { PeerConnectionState::Connected } else { PeerConnectionState::Disconnected };
-                peer_daemon.send_event(DaemonEvent::PeerStatusChanged { host: name.clone(), status });
+                peer_daemon.send_event(DaemonEvent::PeerStatusChanged { host: name.clone(), status: status.clone() });
+                peer_daemon.send_event(DaemonEvent::HostSnapshot(Box::new(
+                    host_snapshot_for_peer(&peer_daemon, &peer_manager_task, name, status).await,
+                )));
             }
             sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
 
@@ -512,6 +550,9 @@ fn spawn_peer_networking_runtime(
                                 host: peer_name.clone(),
                                 status: PeerConnectionState::Disconnected,
                             });
+                            daemon_for_cleanup.send_event(DaemonEvent::HostSnapshot(Box::new(
+                                host_snapshot_for_peer(&daemon_for_cleanup, &pm, &peer_name, PeerConnectionState::Disconnected).await,
+                            )));
                         }
                     }
 
@@ -530,6 +571,9 @@ fn spawn_peer_networking_runtime(
                             host: peer_name.clone(),
                             status: PeerConnectionState::Reconnecting,
                         });
+                        daemon_for_cleanup.send_event(DaemonEvent::HostSnapshot(Box::new(
+                            host_snapshot_for_peer(&daemon_for_cleanup, &pm, &peer_name, PeerConnectionState::Reconnecting).await,
+                        )));
                         let delay = SshTransport::backoff_delay(attempt);
                         info!(peer = %peer_name, %attempt, delay_secs = delay.as_secs(), "reconnecting after backoff");
                         tokio::time::sleep(delay).await;
@@ -549,6 +593,9 @@ fn spawn_peer_networking_runtime(
                                     host: peer_name.clone(),
                                     status: PeerConnectionState::Connected,
                                 });
+                                daemon_for_cleanup.send_event(DaemonEvent::HostSnapshot(Box::new(
+                                    host_snapshot_for_peer(&daemon_for_cleanup, &pm, &peer_name, PeerConnectionState::Connected).await,
+                                )));
                                 let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
                                 attempt = 1;
                                 let sender = {
@@ -575,6 +622,10 @@ fn spawn_peer_networking_runtime(
                                         host: peer_name.clone(),
                                         status: PeerConnectionState::Disconnected,
                                     });
+                                    daemon_for_cleanup.send_event(DaemonEvent::HostSnapshot(Box::new(
+                                        host_snapshot_for_peer(&daemon_for_cleanup, &pm, &peer_name, PeerConnectionState::Disconnected)
+                                            .await,
+                                    )));
                                 }
                             }
                             Err(e) => {
@@ -605,6 +656,18 @@ fn spawn_peer_networking_runtime(
 
                         if let PeerWireMessage::Data(msg) = &env.msg {
                             relay_peer_data(&peer_manager_task, &origin, msg).await;
+                        }
+
+                        // When a peer sends its HostSummary, emit a HostSnapshot event
+                        if let PeerWireMessage::HostSummary(summary) = &env.msg {
+                            let status = peer_daemon.peer_connection_status(&origin).await;
+                            peer_daemon.send_event(DaemonEvent::HostSnapshot(Box::new(HostSnapshot {
+                                seq: peer_daemon.next_host_seq(),
+                                host_name: origin.clone(),
+                                is_local: false,
+                                connection_status: status,
+                                summary: summary.clone(),
+                            })));
                         }
 
                         {
@@ -1653,6 +1716,9 @@ async fn handle_client(
             }
             sync_peer_query_state(&peer_manager, &daemon).await;
             daemon.send_event(DaemonEvent::PeerStatusChanged { host: host_name.clone(), status: PeerConnectionState::Connected });
+            daemon.send_event(DaemonEvent::HostSnapshot(Box::new(
+                host_snapshot_for_peer(&daemon, &peer_manager, &host_name, PeerConnectionState::Connected).await,
+            )));
             let _ = peer_connected_tx.send(PeerConnectedNotice { peer: host_name.clone(), generation });
 
             loop {
@@ -1701,7 +1767,10 @@ async fn handle_client(
 
             let plan = disconnect_peer_and_rebuild(&peer_manager, &daemon, &host_name, generation).await;
             if plan.was_active {
-                daemon.send_event(DaemonEvent::PeerStatusChanged { host: host_name, status: PeerConnectionState::Disconnected });
+                daemon.send_event(DaemonEvent::PeerStatusChanged { host: host_name.clone(), status: PeerConnectionState::Disconnected });
+                daemon.send_event(DaemonEvent::HostSnapshot(Box::new(
+                    host_snapshot_for_peer(&daemon, &peer_manager, &host_name, PeerConnectionState::Disconnected).await,
+                )));
             }
             relay_task.abort();
         }
@@ -1840,7 +1909,7 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
         }
 
         Request::ReplaySince { last_seen } => {
-            let last_seen = last_seen.into_iter().map(|entry| (entry.repo_identity, entry.seq)).collect();
+            let last_seen = last_seen.into_iter().map(|entry| (entry.stream, entry.seq)).collect();
             match ctx.daemon.replay_since(&last_seen).await {
                 Ok(events) => Message::ok_response(id, Response::ReplaySince(events)),
                 Err(e) => Message::error_response(id, e),
@@ -2105,12 +2174,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_replay_since_with_empty_last_seen_returns_no_events() {
+    async fn dispatch_replay_since_with_empty_last_seen_returns_only_host_snapshots() {
         let (_tmp, daemon) = empty_daemon().await;
 
         let replay = dispatch_request_test(&daemon, 30, Request::ReplaySince { last_seen: vec![] }).await;
         match ok_response(replay, 30) {
-            Response::ReplaySince(events) => assert!(events.is_empty()),
+            Response::ReplaySince(events) => {
+                // With no repos, we should only get the local HostSnapshot
+                let repo_events: Vec<_> =
+                    events.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_))).collect();
+                assert!(repo_events.is_empty(), "should have no repo events");
+                let host_events: Vec<_> = events.iter().filter(|e| matches!(e, DaemonEvent::HostSnapshot(_))).collect();
+                assert!(!host_events.is_empty(), "should have at least one HostSnapshot for local host");
+            }
             other => panic!("expected replay response, got {:?}", other),
         };
     }
@@ -2678,10 +2754,12 @@ mod tests {
         let mut statuses: Vec<(HostName, PeerConnectionState)> = events
             .into_iter()
             .filter_map(|event| match event {
-                DaemonEvent::PeerStatusChanged { host, status } => Some((host, status)),
+                DaemonEvent::HostSnapshot(snap) => Some((snap.host_name.clone(), snap.connection_status.clone())),
                 _ => None,
             })
             .collect();
+        // Filter out the local host entry — we only care about configured peers
+        statuses.retain(|(host, _)| host != server.daemon.host_name());
         statuses.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(statuses, vec![
@@ -2758,17 +2836,21 @@ mod tests {
         }
 
         let mut daemon_events = daemon_events;
-        let connected_event = tokio::time::timeout(Duration::from_secs(2), daemon_events.recv())
-            .await
-            .expect("timeout waiting for peer status")
-            .expect("peer status event");
-        match connected_event {
-            DaemonEvent::PeerStatusChanged { host, status } => {
-                assert_eq!(host, HostName::new("remote-host"));
-                assert_eq!(status, PeerConnectionState::Connected);
+
+        // Wait for the PeerStatusChanged(Connected) event, draining any HostSnapshot events
+        let connected_event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match daemon_events.recv().await.expect("recv") {
+                    DaemonEvent::PeerStatusChanged { host, status } => break (host, status),
+                    DaemonEvent::HostSnapshot(_) => continue,
+                    other => panic!("expected peer status or host snapshot event, got {other:?}"),
+                }
             }
-            other => panic!("expected peer status event, got {other:?}"),
-        }
+        })
+        .await
+        .expect("timeout waiting for peer status");
+        assert_eq!(connected_event.0, HostName::new("remote-host"));
+        assert_eq!(connected_event.1, PeerConnectionState::Connected);
 
         // Send a peer message from the client side
         let peer_msg = test_peer_msg("remote-host");
@@ -2798,17 +2880,20 @@ mod tests {
         drop(writer);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
-        let disconnected_event = tokio::time::timeout(Duration::from_secs(2), daemon_events.recv())
-            .await
-            .expect("timeout waiting for peer disconnect")
-            .expect("peer disconnect event");
-        match disconnected_event {
-            DaemonEvent::PeerStatusChanged { host, status } => {
-                assert_eq!(host, HostName::new("remote-host"));
-                assert_eq!(status, PeerConnectionState::Disconnected);
+        // Wait for the PeerStatusChanged(Disconnected) event, draining any HostSnapshot events
+        let disconnected_event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match daemon_events.recv().await.expect("recv") {
+                    DaemonEvent::PeerStatusChanged { host, status } => break (host, status),
+                    DaemonEvent::HostSnapshot(_) => continue,
+                    other => panic!("expected peer disconnect or host snapshot event, got {other:?}"),
+                }
             }
-            other => panic!("expected peer disconnect event, got {other:?}"),
-        }
+        })
+        .await
+        .expect("timeout waiting for peer disconnect");
+        assert_eq!(disconnected_event.0, HostName::new("remote-host"));
+        assert_eq!(disconnected_event.1, PeerConnectionState::Disconnected);
 
         let pm = peer_manager.lock().await;
         assert!(pm.current_generation(&HostName::new("remote-host")).is_none(), "peer should be disconnected after socket close");

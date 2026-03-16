@@ -23,7 +23,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     let daemon_rx = app.daemon.subscribe();
 
     // Get initial state via replay_since (works for both in-process and socket).
-    let replay_events = app.daemon.replay_since(&std::collections::HashMap::new()).await.unwrap_or_default();
+    let replay_events =
+        app.daemon.replay_since(&std::collections::HashMap::<flotilla_protocol::StreamKey, u64>::new()).await.unwrap_or_default();
     for event in replay_events {
         app.handle_daemon_event(event);
     }

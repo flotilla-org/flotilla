@@ -4,7 +4,7 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     output::OutputFormat, Command, CommandResult, DaemonEvent, HostProvidersResponse, HostStatusResponse, PeerConnectionState,
-    RepoDetailResponse, RepoIdentity, RepoProvidersResponse, RepoWorkResponse, StatusResponse, TopologyResponse,
+    RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -256,14 +256,25 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             };
             format!("[peer]     {host}: {state}")
         }
+        DaemonEvent::HostSnapshot(snap) => {
+            let state = match &snap.connection_status {
+                PeerConnectionState::Connected => "connected",
+                PeerConnectionState::Disconnected => "disconnected",
+                PeerConnectionState::Connecting => "connecting",
+                PeerConnectionState::Reconnecting => "reconnecting",
+                PeerConnectionState::Rejected { .. } => "rejected",
+            };
+            format!("[host]     {}: {} (seq {})", snap.host_name, state, snap.seq)
+        }
     }
 }
 
-/// Extract the (repo_identity, seq) from a snapshot event, if present.
-fn event_seq(event: &DaemonEvent) -> Option<(&RepoIdentity, u64)> {
+/// Extract the (stream_key, seq) from a snapshot/delta event, if present.
+fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
     match event {
-        DaemonEvent::RepoSnapshot(snap) => Some((&snap.repo_identity, snap.seq)),
-        DaemonEvent::RepoDelta(delta) => Some((&delta.repo_identity, delta.seq)),
+        DaemonEvent::RepoSnapshot(snap) => Some((StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq)),
+        DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
+        DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { host_name: snap.host_name.clone() }, snap.seq)),
         _ => None,
     }
 }
@@ -449,12 +460,12 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
     // Replay current state so the user sees an initial snapshot for every
     // tracked repo, matching how the TUI bootstraps.  Track the seq per repo
     // so we can skip duplicate events that the broadcast buffer may also deliver.
-    let mut replay_seqs: HashMap<RepoIdentity, u64> = HashMap::new();
+    let mut replay_seqs: HashMap<StreamKey, u64> = HashMap::new();
     match daemon.replay_since(&HashMap::new()).await {
         Ok(events) => {
             for event in &events {
-                if let Some((identity, seq)) = event_seq(event) {
-                    replay_seqs.entry(identity.clone()).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
+                if let Some((stream_key, seq)) = event_stream_seq(event) {
+                    replay_seqs.entry(stream_key).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
                 }
                 let line = match format {
                     OutputFormat::Human => format_event_human(event),
@@ -476,8 +487,8 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
         match rx.recv().await {
             Ok(event) => {
                 // Skip events already covered by replay to avoid duplicates.
-                if let Some((identity, seq)) = event_seq(&event) {
-                    if let Some(&replay_seq) = replay_seqs.get(identity) {
+                if let Some((stream_key, seq)) = event_stream_seq(&event) {
+                    if let Some(&replay_seq) = replay_seqs.get(&stream_key) {
                         if seq <= replay_seq {
                             continue;
                         }

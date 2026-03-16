@@ -10,7 +10,7 @@ pub mod query;
 pub mod snapshot;
 
 pub use host::{HostName, HostPath, RepoIdentity};
-pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSummary, SystemInfo, ToolInventory};
+pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, SystemInfo, ToolInventory};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 
 #[cfg(test)]
@@ -58,9 +58,20 @@ pub struct ConfigLabel(pub String);
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Key for identifying an event stream in replay cursors.
+/// Each stream has its own independent sequence counter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum StreamKey {
+    #[serde(rename = "repo")]
+    Repo { identity: RepoIdentity },
+    #[serde(rename = "host")]
+    Host { host_name: HostName },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayCursor {
-    pub repo_identity: RepoIdentity,
+    pub stream: StreamKey,
     pub seq: u64,
 }
 
@@ -191,6 +202,10 @@ pub enum DaemonEvent {
     /// A peer host's connection status changed.
     #[serde(rename = "peer_status")]
     PeerStatusChanged { host: HostName, status: PeerConnectionState },
+    /// Full host snapshot — sent on initial connect/replay and when
+    /// a host's summary or connection status changes.
+    #[serde(rename = "host_snapshot")]
+    HostSnapshot(Box<HostSnapshot>),
 }
 
 /// Peer connection state as seen by the TUI.
@@ -542,7 +557,47 @@ mod tests {
 
     #[test]
     fn replay_cursor_roundtrip_preserves_repo_identity() {
-        let cursor = ReplayCursor { repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }, seq: 42 };
+        let cursor = ReplayCursor {
+            stream: StreamKey::Repo { identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() } },
+            seq: 42,
+        };
+        test_helpers::assert_roundtrip(&cursor);
+    }
+
+    #[test]
+    fn stream_key_repo_roundtrip() {
+        let key = StreamKey::Repo { identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() } };
+        test_helpers::assert_roundtrip(&key);
+    }
+
+    #[test]
+    fn stream_key_host_roundtrip() {
+        let key = StreamKey::Host { host_name: HostName::new("desktop") };
+        test_helpers::assert_roundtrip(&key);
+    }
+
+    #[test]
+    fn daemon_event_host_snapshot_roundtrip() {
+        let event = DaemonEvent::HostSnapshot(Box::new(HostSnapshot {
+            seq: 1,
+            host_name: HostName::new("desktop"),
+            is_local: true,
+            connection_status: PeerConnectionState::Connected,
+            summary: HostSummary {
+                host_name: HostName::new("desktop"),
+                system: SystemInfo::default(),
+                inventory: ToolInventory::default(),
+                providers: vec![],
+            },
+        }));
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(decoded, DaemonEvent::HostSnapshot(_)));
+    }
+
+    #[test]
+    fn replay_cursor_with_stream_key_host_roundtrip() {
+        let cursor = ReplayCursor { stream: StreamKey::Host { host_name: HostName::new("laptop") }, seq: 42 };
         test_helpers::assert_roundtrip(&cursor);
     }
 

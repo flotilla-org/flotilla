@@ -1,8 +1,11 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use crossterm::event::KeyCode;
 use flotilla_core::data::{GroupEntry, SectionHeader};
-use flotilla_protocol::{ProviderData, WorkItem};
+use flotilla_protocol::{HostName, ProviderData, WorkItem};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -16,7 +19,7 @@ use crate::{
     app::{
         collect_visible_status_items,
         ui_state::{PendingAction, PendingStatus},
-        BranchInputKind, InFlightCommand, PeerHostStatus, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiModel, UiMode, UiState,
+        BranchInputKind, InFlightCommand, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiHostState, TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
@@ -546,6 +549,21 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame
     // Build rows from active repo (immutable borrows)
     let rm = model.active();
     let rui = active_rui(model, ui);
+
+    // Precompute per-host repo root from main checkouts so remote worktree
+    // paths get the same sibling/child indentation as local ones.
+    let local_repo_root = model.active_repo_root().clone();
+    let mut host_repo_roots: HashMap<HostName, PathBuf> = HashMap::new();
+    for entry in &rui.table_view.table_entries {
+        if let GroupEntry::Item(item) = entry {
+            if item.is_main_checkout {
+                if let Some(co) = item.checkout_key() {
+                    host_repo_roots.insert(co.host.clone(), co.path.clone());
+                }
+            }
+        }
+    }
+
     let mut prev_source: Option<String> = None;
     let rows: Vec<Row> = rui
         .table_view
@@ -562,8 +580,21 @@ fn render_unified_table(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame
                 }
                 GroupEntry::Item(item) => {
                     let pending = rui.pending_actions.get(&item.identity);
+                    // Look up home_dir from the checkout's host summary. Only fall
+                    // back to dirs::home_dir() for local-host items — using the local
+                    // home for a remote host would incorrectly shorten unrelated paths.
+                    let is_local_item = item
+                        .checkout_key()
+                        .is_none_or(|co| model.my_host().is_some_and(|my| *my == co.host) || !model.hosts.contains_key(&co.host));
+                    let local_home = if is_local_item { dirs::home_dir() } else { None };
+                    let home_dir = item
+                        .checkout_key()
+                        .and_then(|co| model.hosts.get(&co.host))
+                        .and_then(|h| h.summary.system.home_dir.as_deref())
+                        .or(local_home.as_deref());
+                    let repo_root = item.checkout_key().and_then(|co| host_repo_roots.get(&co.host)).unwrap_or(&local_repo_root);
                     let mut row =
-                        build_item_row(item, &rm.providers, &col_widths, model.active_repo_root(), prev_source.as_deref(), pending, theme);
+                        build_item_row(item, &rm.providers, &col_widths, repo_root, prev_source.as_deref(), pending, theme, home_dir);
                     prev_source = item.source.clone();
                     if is_multi_selected {
                         row = row.style(Style::default().bg(theme.multi_select_bg));
@@ -629,6 +660,7 @@ fn build_header_row(_header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_item_row<'a>(
     item: &WorkItem,
     providers: &ProviderData,
@@ -637,6 +669,7 @@ fn build_item_row<'a>(
     prev_source: Option<&str>,
     pending: Option<&PendingAction>,
     theme: &Theme,
+    home_dir: Option<&Path>,
 ) -> Row<'a> {
     let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
     let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status, theme);
@@ -652,7 +685,7 @@ fn build_item_row<'a>(
     let branch_width = col_widths.get(4).copied().unwrap_or(25) as usize;
 
     let path_display = if let Some(p) = item.checkout_key() {
-        ui_helpers::shorten_path(&p.path, repo_root, path_width)
+        ui_helpers::shorten_path(&p.path, repo_root, path_width, home_dir)
     } else if let Some(ref ses_key) = item.session_key {
         ses_key.clone()
     } else {
@@ -1191,18 +1224,15 @@ fn render_config_screen(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    if model.peer_hosts.is_empty() {
-        render_global_status(model, theme, frame, chunks[0]);
-    } else {
-        // Split left panel: providers on top, hosts below.
-        let host_height = (model.peer_hosts.len() as u16 + 2).min(8);
-        let left_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(host_height)])
-            .split(chunks[0]);
-        render_global_status(model, theme, frame, left_chunks[0]);
-        render_hosts_status(theme, frame, left_chunks[1], &model.peer_hosts);
-    }
+    let host_count = model.hosts.len();
+    let host_height = (host_count as u16 + 2).min(8);
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(host_height)])
+        .split(chunks[0]);
+    render_global_status(model, theme, frame, left_chunks[0]);
+    render_hosts_status(model, theme, frame, left_chunks[1]);
+
     render_event_log(ui, theme, frame, chunks[1]);
 }
 
@@ -1264,23 +1294,77 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
     frame.render_widget(table, area);
 }
 
-fn render_hosts_status(theme: &Theme, frame: &mut Frame, area: Rect, hosts: &[PeerHostStatus]) {
-    let items: Vec<ListItem> = hosts
-        .iter()
-        .map(|h| {
-            let (icon, style) = match h.status {
-                PeerStatus::Connected => ("\u{25cf}", Style::default().fg(theme.status_ok)),
-                PeerStatus::Disconnected => ("\u{25cb}", Style::default().fg(theme.error)),
-                PeerStatus::Connecting => ("\u{25d0}", Style::default().fg(theme.warning)),
-                PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(theme.warning)),
-                PeerStatus::Rejected => ("\u{2717}", Style::default().fg(theme.error)),
-            };
-            ListItem::new(Line::from(vec![Span::styled(format!("{icon} "), style), Span::raw(h.name.as_str())]))
-        })
-        .collect();
+fn render_hosts_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area: Rect) {
+    // Sort: local first, then peers alphabetically
+    let mut hosts: Vec<&TuiHostState> = model.hosts.values().collect();
+    hosts.sort_by(|a, b| match (a.is_local, b.is_local) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.host_name.cmp(&b.host_name),
+    });
 
-    let list = List::new(items).block(Block::bordered().style(theme.block_style()).title(" Hosts "));
-    frame.render_widget(list, area);
+    let rows: Vec<Row> =
+        hosts
+            .iter()
+            .map(|h| {
+                let (icon, icon_style) = match h.status {
+                    PeerStatus::Connected => ("\u{25cf}", Style::default().fg(theme.status_ok)),
+                    PeerStatus::Disconnected => ("\u{25cb}", Style::default().fg(theme.error)),
+                    PeerStatus::Connecting => ("\u{25d0}", Style::default().fg(theme.warning)),
+                    PeerStatus::Reconnecting => ("\u{25d0}", Style::default().fg(theme.warning)),
+                    PeerStatus::Rejected => ("\u{2717}", Style::default().fg(theme.error)),
+                };
+
+                let name = if h.is_local { format!("{} (local)", h.host_name) } else { h.host_name.to_string() };
+
+                let sys = &h.summary.system;
+                let os_arch = match (sys.os.as_deref(), sys.arch.as_deref()) {
+                    (Some(os), Some(arch)) => format!("{os}/{arch}"),
+                    (Some(os), None) => os.to_string(),
+                    _ => "\u{2014}".to_string(),
+                };
+                let cpus = sys.cpu_count.map_or("\u{2014}".to_string(), |c| format!("{c} CPUs"));
+                let mem = sys.memory_total_mb.map_or("\u{2014}".to_string(), |m| {
+                    if m >= 1024 {
+                        format!("{} GB", m / 1024)
+                    } else {
+                        format!("{m} MB")
+                    }
+                });
+
+                let providers: String = h
+                    .summary
+                    .providers
+                    .iter()
+                    .map(|p| {
+                        let check = if p.healthy { "\u{2713}" } else { "\u{2717}" };
+                        format!("{} {check}", p.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+
+                Row::new(vec![
+                    Cell::from(Span::styled(format!("{icon} "), icon_style)),
+                    Cell::from(name),
+                    Cell::from(os_arch),
+                    Cell::from(cpus),
+                    Cell::from(mem),
+                    Cell::from(providers),
+                ])
+            })
+            .collect();
+
+    let widths = [
+        Constraint::Length(2),
+        Constraint::Min(12),
+        Constraint::Length(14),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Fill(1),
+    ];
+
+    let table = Table::new(rows, widths).block(Block::bordered().style(theme.block_style()).title(" Hosts "));
+    frame.render_widget(table, area);
 }
 
 fn render_event_log(ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {

@@ -14,7 +14,7 @@ pub struct HostSummary {
     pub providers: Vec<HostProviderStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SystemInfo {
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
@@ -67,6 +67,16 @@ pub struct HostProviderStatus {
     pub healthy: bool,
 }
 
+/// Full snapshot of one host's state — system info, inventory, provider health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSnapshot {
+    pub seq: u64,
+    pub host_name: HostName,
+    pub is_local: bool,
+    pub connection_status: crate::PeerConnectionState,
+    pub summary: HostSummary,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +99,30 @@ mod tests {
         };
 
         assert_roundtrip(&summary);
+    }
+
+    #[test]
+    fn host_snapshot_roundtrips() {
+        let snapshot = HostSnapshot {
+            seq: 1,
+            host_name: HostName::new("desktop"),
+            is_local: true,
+            connection_status: crate::PeerConnectionState::Connected,
+            summary: HostSummary {
+                host_name: HostName::new("desktop"),
+                system: SystemInfo {
+                    home_dir: Some(PathBuf::from("/home/dev")),
+                    os: Some("linux".into()),
+                    arch: Some("aarch64".into()),
+                    cpu_count: Some(8),
+                    memory_total_mb: Some(16384),
+                    environment: HostEnvironment::Unknown,
+                },
+                inventory: ToolInventory::default(),
+                providers: vec![],
+            },
+        };
+        assert_roundtrip(&snapshot);
     }
 
     #[test]

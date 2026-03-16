@@ -16,8 +16,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDelta, RepoDetailResponse,
-    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute,
+    HostSnapshot, HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDelta,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey,
+    SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -516,6 +517,8 @@ pub struct InProcessDaemon {
     session_id: uuid::Uuid,
     /// Static local host summary published to peers.
     local_host_summary: HostSummary,
+    /// Monotonic sequence counter for host-level events (HostSnapshot).
+    host_seq: AtomicU64,
 }
 
 impl InProcessDaemon {
@@ -598,6 +601,7 @@ impl InProcessDaemon {
             active_command: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4(),
             local_host_summary,
+            host_seq: AtomicU64::new(0),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -633,6 +637,16 @@ impl InProcessDaemon {
 
     pub fn local_host_summary(&self) -> &HostSummary {
         &self.local_host_summary
+    }
+
+    /// Allocate the next host-level sequence number for HostSnapshot events.
+    pub fn next_host_seq(&self) -> u64 {
+        self.host_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Returns the current connection status for a peer host.
+    pub async fn peer_connection_status(&self, host: &HostName) -> PeerConnectionState {
+        self.peer_status.read().await.get(host).cloned().unwrap_or(PeerConnectionState::Disconnected)
     }
 
     pub async fn set_configured_peer_names(&self, peers: Vec<HostName>) {
@@ -1997,12 +2011,61 @@ impl DaemonHandle for InProcessDaemon {
         }
     }
 
-    async fn replay_since(&self, last_seen: &HashMap<flotilla_protocol::RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
+    async fn replay_since(&self, last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String> {
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
         let peer_overlay = self.peer_providers.read().await;
         let mut events = Vec::new();
 
+        // Emit HostSnapshot events first so the TUI knows about hosts before
+        // receiving repo data with host-attributed work items.
+        // Use the same "known hosts" union as host_queries::known_hosts so that
+        // late-subscribing clients see the same hosts as list_hosts returns.
+        // Read (don't advance) the current host_seq — replay is idempotent.
+        let current_host_seq = self.host_seq.load(Ordering::Relaxed);
+        let peer_status = self.peer_status.read().await;
+        let peer_summaries = self.peer_host_summaries.read().await;
+        let configured_peers = self.configured_peer_names.read().await;
+        let remote_counts = self.remote_host_counts().await;
+
+        let mut all_hosts: HashSet<HostName> = HashSet::from([self.host_name.clone()]);
+        all_hosts.extend(configured_peers.iter().cloned());
+        all_hosts.extend(peer_status.keys().cloned());
+        all_hosts.extend(peer_summaries.keys().cloned());
+        all_hosts.extend(remote_counts.keys().cloned());
+
+        for host_name in &all_hosts {
+            let is_local = *host_name == self.host_name;
+            let connection_status = if is_local {
+                PeerConnectionState::Connected
+            } else {
+                peer_status.get(host_name).cloned().unwrap_or(PeerConnectionState::Disconnected)
+            };
+            let summary = if is_local {
+                self.local_host_summary.clone()
+            } else {
+                peer_summaries.get(host_name).cloned().unwrap_or_else(|| HostSummary {
+                    host_name: host_name.clone(),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                })
+            };
+            events.push(DaemonEvent::HostSnapshot(Box::new(HostSnapshot {
+                seq: current_host_seq,
+                host_name: host_name.clone(),
+                is_local,
+                connection_status,
+                summary,
+            })));
+        }
+
+        // Drop locks before the repo snapshot iteration (which may need remote_host_counts again)
+        drop(peer_status);
+        drop(peer_summaries);
+        drop(configured_peers);
+
+        // Emit repo events
         for identity in order.iter() {
             let Some(state) = repos.get(identity) else {
                 continue;
@@ -2030,7 +2093,8 @@ impl DaemonHandle for InProcessDaemon {
                 )
             };
 
-            match last_seen.get(&state.identity) {
+            let repo_stream_key = StreamKey::Repo { identity: state.identity.clone() };
+            match last_seen.get(&repo_stream_key) {
                 Some(&client_seq) => {
                     // Try to find the client's seq in the delta log and replay from there
                     let replay_start = state.delta_log.iter().position(|entry| entry.prev_seq == client_seq);
@@ -2064,12 +2128,6 @@ impl DaemonHandle for InProcessDaemon {
                     events.push(DaemonEvent::RepoSnapshot(Box::new(snapshot())));
                 }
             }
-        }
-
-        // Include current peer status so late-subscribing clients see it
-        let peer_status = self.peer_status.read().await;
-        for (host, status) in peer_status.iter() {
-            events.push(DaemonEvent::PeerStatusChanged { host: host.clone(), status: status.clone() });
         }
 
         Ok(events)

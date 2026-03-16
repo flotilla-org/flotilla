@@ -239,10 +239,25 @@ mod tests {
     use super::*;
     use crate::app::{
         test_support::{bare_item, checkout_item, pr_item, remote_branch_item, session_item, stub_app},
-        TuiRepoModel,
+        PeerStatus, TuiHostState, TuiRepoModel,
     };
 
     // ── Helpers ──
+
+    fn insert_local_host(model: &mut super::super::TuiModel, name: &str) {
+        let host_name = HostName::new(name);
+        model.hosts.insert(host_name.clone(), TuiHostState {
+            host_name: host_name.clone(),
+            is_local: true,
+            status: PeerStatus::Connected,
+            summary: flotilla_protocol::HostSummary {
+                host_name,
+                system: flotilla_protocol::SystemInfo::default(),
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+            },
+        });
+    }
 
     fn default_labels() -> RepoLabels {
         RepoLabels::default()
@@ -603,7 +618,7 @@ mod tests {
     #[test]
     fn resolve_create_workspace_on_remote_checkout_prepares_remote_terminal() {
         let mut app = stub_app();
-        app.model.my_host = Some(HostName::local());
+        insert_local_host(&mut app.model, &HostName::local().to_string());
         let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
         item.host = HostName::new("remote-a");
         item.checkout =
@@ -771,7 +786,7 @@ mod tests {
     #[test]
     fn resolve_open_pr() {
         let mut app = stub_app();
-        app.model.my_host = Some(HostName::local());
+        insert_local_host(&mut app.model, &HostName::local().to_string());
         app.ui.target_host = Some(HostName::new("remote-a"));
         let mut item = pr_item("123");
         item.host = HostName::new("remote-b");
@@ -987,7 +1002,7 @@ mod tests {
         };
         app.model.repo_order[0] = remote_identity.clone();
         app.model.repos.insert(remote_identity, model);
-        app.model.my_host = Some(HostName::local());
+        insert_local_host(&mut app.model, &HostName::local().to_string());
         app
     }
 

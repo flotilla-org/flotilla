@@ -27,7 +27,7 @@ use flotilla_core::{
 use flotilla_protocol::{
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, CorrelationKey, DaemonEvent,
     HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, PeerConnectionState, ProviderData, RepoIdentity,
-    RepoSelector, SystemInfo, ToolInventory, TopologyRoute,
+    RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute,
 };
 use tokio::sync::Notify;
 
@@ -556,11 +556,13 @@ async fn replay_since_returns_full_snapshot_for_unknown_seq() {
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     // Request replay with a seq that won't be in the delta log
-    let last_seen = HashMap::from([(identity, 999999)]);
+    let last_seen = HashMap::from([(StreamKey::Repo { identity }, 999999)]);
     let events = daemon.replay_since(&last_seen).await.expect("replay_since");
 
-    assert_eq!(events.len(), 1, "should get exactly one event");
-    match &events[0] {
+    // Should get one RepoSnapshot + at least one HostSnapshot (local host)
+    let repo_events: Vec<_> = events.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_))).collect();
+    assert_eq!(repo_events.len(), 1, "should get exactly one repo snapshot");
+    match &repo_events[0] {
         DaemonEvent::RepoSnapshot(snap) => {
             assert_eq!(snap.repo, repo);
         }
@@ -579,13 +581,18 @@ async fn replay_since_returns_full_snapshot_for_new_repo() {
     // Request replay with empty last_seen (new client)
     let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
 
-    assert_eq!(events.len(), 1, "should get one event per tracked repo");
-    match &events[0] {
+    // Should get one RepoSnapshot + at least one HostSnapshot (local host)
+    let repo_events: Vec<_> = events.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_))).collect();
+    assert_eq!(repo_events.len(), 1, "should get one repo snapshot per tracked repo");
+    match &repo_events[0] {
         DaemonEvent::RepoSnapshot(snap) => {
             assert_eq!(snap.repo, repo);
         }
         other => panic!("expected RepoSnapshot, got {:?}", other),
     }
+    // Verify local host snapshot is present
+    let host_events: Vec<_> = events.iter().filter(|e| matches!(e, DaemonEvent::HostSnapshot(_))).collect();
+    assert!(!host_events.is_empty(), "should include at least one HostSnapshot for local host");
 }
 
 #[tokio::test]
@@ -603,11 +610,12 @@ async fn replay_since_returns_empty_when_up_to_date() {
         other => panic!("expected snapshot event, got {:?}", other),
     };
 
-    // Request replay at current seq — should return nothing
-    let last_seen = HashMap::from([(identity, current_seq)]);
+    // Request replay at current seq — should return no repo events (still get HostSnapshots)
+    let last_seen = HashMap::from([(StreamKey::Repo { identity }, current_seq)]);
     let events = daemon.replay_since(&last_seen).await.expect("replay_since");
 
-    assert!(events.is_empty(), "should be empty when up to date");
+    let repo_events: Vec<_> = events.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_))).collect();
+    assert!(repo_events.is_empty(), "should have no repo events when up to date");
 }
 
 /// replay_since must include peer provider data, just like get_state and live

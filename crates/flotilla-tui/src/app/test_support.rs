@@ -15,7 +15,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError, RepoDelta,
-    RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, StatusResponse,
+    RepoDetailResponse, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, StatusResponse, StreamKey,
     TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
@@ -60,7 +60,7 @@ impl DaemonHandle for StubDaemon {
         Ok(())
     }
 
-    async fn replay_since(&self, _last_seen: &HashMap<RepoIdentity, u64>) -> Result<Vec<DaemonEvent>, String> {
+    async fn replay_since(&self, _last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String> {
         Ok(vec![])
     }
 
