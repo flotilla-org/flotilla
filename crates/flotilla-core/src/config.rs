@@ -103,12 +103,37 @@ pub fn default_checkout_path() -> String {
     "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}".to_string()
 }
 
+/// Raw key binding overrides from config.toml.
+///
+/// Keys are key combo strings (parsed by `crokey` in the TUI crate).
+/// Values are action names (parsed by `Action::from_config_str`).
+/// Empty maps mean "use defaults".
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct KeysConfig {
+    #[serde(default)]
+    pub shared: HashMap<String, String>,
+    #[serde(default)]
+    pub normal: HashMap<String, String>,
+    #[serde(default)]
+    pub help: HashMap<String, String>,
+    #[serde(default)]
+    pub config: HashMap<String, String>,
+    #[serde(default)]
+    pub action_menu: HashMap<String, String>,
+    #[serde(default)]
+    pub delete_confirm: HashMap<String, String>,
+    #[serde(default)]
+    pub close_confirm: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct UiConfig {
     #[serde(default)]
     pub preview: PreviewConfig,
     #[serde(default)]
     pub theme: Option<String>,
+    #[serde(default)]
+    pub keys: KeysConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -953,6 +978,29 @@ host_name = "my-desktop"
         // No [ssh] section — defaults to multiplex=true
         assert!(config.ssh.multiplex);
         assert!(config.resolved_ssh_multiplex("desktop"));
+    }
+
+    #[test]
+    fn keys_config_deserializes_from_toml() {
+        let toml = r#"
+[ui.keys.shared]
+"ctrl-r" = "refresh"
+"g" = "select_next"
+
+[ui.keys.normal]
+"x" = "quit"
+"#;
+        let config: FlotillaConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.keys.shared.get("ctrl-r"), Some(&"refresh".to_string()));
+        assert_eq!(config.ui.keys.shared.get("g"), Some(&"select_next".to_string()));
+        assert_eq!(config.ui.keys.normal.get("x"), Some(&"quit".to_string()));
+    }
+
+    #[test]
+    fn keys_config_defaults_to_empty() {
+        let config: FlotillaConfig = toml::from_str("").unwrap();
+        assert!(config.ui.keys.shared.is_empty());
+        assert!(config.ui.keys.normal.is_empty());
     }
 
     #[test]
