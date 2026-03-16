@@ -49,7 +49,9 @@ pub use query::{
     UnmetRequirementInfo,
 };
 use serde::{Deserialize, Serialize};
-pub use snapshot::{CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, RepoSnapshot, WorkItem, WorkItemIdentity, WorkItemKind};
+pub use snapshot::{
+    CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, RepoSnapshot, WorkItem, WorkItemIdentity, WorkItemKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
@@ -222,11 +224,7 @@ mod tests {
     }
 
     fn sample_command() -> Command {
-        Command {
-            host: None,
-            context_repo: None,
-            action: CommandAction::AddRepo { path: PathBuf::from("/tmp/my-repo") },
-        }
+        Command { host: None, context_repo: None, action: CommandAction::AddRepo { path: PathBuf::from("/tmp/my-repo") } }
     }
 
     #[test]

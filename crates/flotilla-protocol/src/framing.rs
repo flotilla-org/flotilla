@@ -17,9 +17,9 @@ pub async fn write_message_line(writer: &mut (impl AsyncWrite + Unpin), msg: &Me
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
 
+    use super::*;
     use crate::{HostName, Request};
 
     #[tokio::test]

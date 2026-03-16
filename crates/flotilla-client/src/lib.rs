@@ -11,9 +11,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, Message, ReplayCursor,
-    RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, Request, Response,
-    ResponseResult, StatusResponse, TopologyResponse,
+    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, Message, ReplayCursor, RepoDetailResponse,
+    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, Request, Response, ResponseResult, StatusResponse,
+    TopologyResponse,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -698,7 +698,7 @@ impl DaemonHandle for SocketDaemon {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{HostName, RepoIdentity, RepoDelta, RepoSnapshot};
+    use flotilla_protocol::{HostName, RepoDelta, RepoIdentity, RepoSnapshot};
     use tokio::net::{unix::OwnedReadHalf, UnixStream};
 
     use super::*;
@@ -791,7 +791,8 @@ mod tests {
         let request_writer = Arc::clone(&harness.writer);
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
-        let request_task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::ListRepos).await });
+        let request_task =
+            tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::ListRepos).await });
 
         let (id, request) = read_request(&mut harness.lines).await;
         assert_eq!(request, Request::ListRepos);
@@ -810,7 +811,8 @@ mod tests {
         let request_writer = Arc::clone(&harness.writer);
         let request_pending = Arc::clone(&harness.pending);
         let request_next_id = Arc::clone(&harness.next_id);
-        let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetTopology).await });
+        let task =
+            tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetTopology).await });
 
         let (id, request) = read_request(&mut harness.lines).await;
         assert_eq!(request, Request::GetTopology);
@@ -824,9 +826,7 @@ mod tests {
     async fn send_request_cleans_pending_on_write_error() {
         let (writer, pending, next_id) = broken_request_harness();
 
-        let err = send_request(&writer, &pending, &next_id, Request::GetTopology)
-            .await
-            .expect_err("closed peer should fail writes");
+        let err = send_request(&writer, &pending, &next_id, Request::GetTopology).await.expect_err("closed peer should fail writes");
 
         assert!(err.contains("failed to"));
         assert!(pending.lock().await.is_empty());
@@ -954,8 +954,7 @@ mod tests {
 
         let replay_events = vec![DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 3, 4)))];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender for replay");
-        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) }).expect("send replay response");
         recover_task.await.expect("join recover");
 
         let event = event_rx.recv().await.expect("forwarded replay event");
@@ -1313,8 +1312,7 @@ mod tests {
         // Respond with a full snapshot event.
         let replay_events = vec![DaemonEvent::RepoSnapshot(Box::new(make_snapshot(&repo, 10)))];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
@@ -1352,8 +1350,7 @@ mod tests {
         // Replay returns events with seq=10, which is behind the live update of 20.
         let replay_events = vec![DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 3, 10)))];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
@@ -1393,8 +1390,7 @@ mod tests {
             description: "replayed".into(),
         }];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
@@ -1429,8 +1425,7 @@ mod tests {
         // Respond with empty event list.
         let replay_events: Vec<DaemonEvent> = vec![];
         let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) })
-            .expect("send replay response");
+        tx.send(ResponseResult::Ok { response: Response::ReplaySince(replay_events) }).expect("send replay response");
 
         recover_task.await.expect("join recover");
 
@@ -1453,7 +1448,7 @@ mod tests {
         let response = into_success_response(ResponseResult::Ok {
             response: Response::GetTopology(TopologyResponse { local_host: HostName::new("local"), routes: vec![] }),
         })
-            .expect("should succeed");
+        .expect("should succeed");
         assert!(matches!(response, Response::GetTopology(TopologyResponse { routes, .. }) if routes.is_empty()));
     }
 }

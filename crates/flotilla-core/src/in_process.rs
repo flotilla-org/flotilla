@@ -16,8 +16,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDetailResponse, RepoInfo,
-    RepoDelta, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute,
+    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDelta, RepoDetailResponse,
+    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;

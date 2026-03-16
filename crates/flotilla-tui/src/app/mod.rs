@@ -21,8 +21,8 @@ use flotilla_core::{
     data::{self, GroupEntry, SectionLabels},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandResult, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoIdentity, RepoInfo,
-    RepoDelta, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
+    Command, CommandAction, CommandResult, DaemonEvent, HostName, PeerConnectionState, ProviderData, ProviderError, RepoDelta,
+    RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
 use tui_input::Input;

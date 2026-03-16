@@ -14,9 +14,9 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError,
-    RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse,
-    StatusResponse, TopologyResponse, WorkItem,
+    Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError, RepoDelta,
+    RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, StatusResponse,
+    TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;

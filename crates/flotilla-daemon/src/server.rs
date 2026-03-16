@@ -1719,12 +1719,10 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
             Err(e) => Message::error_response(id, e),
         },
 
-        Request::GetState { repo } => {
-            match ctx.daemon.get_state(&repo).await {
-                Ok(snapshot) => Message::ok_response(id, Response::GetState(snapshot)),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::GetState { repo } => match ctx.daemon.get_state(&repo).await {
+            Ok(snapshot) => Message::ok_response(id, Response::GetState(snapshot)),
+            Err(e) => Message::error_response(id, e),
+        },
 
         Request::Execute { command } => {
             let target_host = command.host.clone().unwrap_or_else(|| ctx.daemon.host_name().clone());
@@ -1816,26 +1814,20 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
             }
         }
 
-        Request::Refresh { repo } => {
-            match ctx.daemon.refresh(&repo).await {
-                Ok(()) => Message::ok_response(id, Response::Refresh),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::Refresh { repo } => match ctx.daemon.refresh(&repo).await {
+            Ok(()) => Message::ok_response(id, Response::Refresh),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        Request::AddRepo { path } => {
-            match ctx.daemon.add_repo(&path).await {
-                Ok(()) => Message::ok_response(id, Response::AddRepo),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::AddRepo { path } => match ctx.daemon.add_repo(&path).await {
+            Ok(()) => Message::ok_response(id, Response::AddRepo),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        Request::RemoveRepo { path } => {
-            match ctx.daemon.remove_repo(&path).await {
-                Ok(()) => Message::ok_response(id, Response::RemoveRepo),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::RemoveRepo { path } => match ctx.daemon.remove_repo(&path).await {
+            Ok(()) => Message::ok_response(id, Response::RemoveRepo),
+            Err(e) => Message::error_response(id, e),
+        },
 
         Request::ReplaySince { last_seen } => {
             let last_seen = last_seen.into_iter().map(|entry| (entry.repo_identity, entry.seq)).collect();
@@ -1850,45 +1842,35 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
             Err(e) => Message::error_response(id, e),
         },
 
-        Request::GetRepoDetail { slug } => {
-            match ctx.daemon.get_repo_detail(&slug).await {
-                Ok(detail) => Message::ok_response(id, Response::GetRepoDetail(detail)),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::GetRepoDetail { slug } => match ctx.daemon.get_repo_detail(&slug).await {
+            Ok(detail) => Message::ok_response(id, Response::GetRepoDetail(detail)),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        Request::GetRepoProviders { slug } => {
-            match ctx.daemon.get_repo_providers(&slug).await {
-                Ok(providers) => Message::ok_response(id, Response::GetRepoProviders(providers)),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::GetRepoProviders { slug } => match ctx.daemon.get_repo_providers(&slug).await {
+            Ok(providers) => Message::ok_response(id, Response::GetRepoProviders(providers)),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        Request::GetRepoWork { slug } => {
-            match ctx.daemon.get_repo_work(&slug).await {
-                Ok(work) => Message::ok_response(id, Response::GetRepoWork(work)),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::GetRepoWork { slug } => match ctx.daemon.get_repo_work(&slug).await {
+            Ok(work) => Message::ok_response(id, Response::GetRepoWork(work)),
+            Err(e) => Message::error_response(id, e),
+        },
 
         Request::ListHosts => match ctx.daemon.list_hosts().await {
             Ok(hosts) => Message::ok_response(id, Response::ListHosts(hosts)),
             Err(e) => Message::error_response(id, e),
         },
 
-        Request::GetHostStatus { host } => {
-            match ctx.daemon.get_host_status(&host).await {
-                Ok(status) => Message::ok_response(id, Response::GetHostStatus(status)),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::GetHostStatus { host } => match ctx.daemon.get_host_status(&host).await {
+            Ok(status) => Message::ok_response(id, Response::GetHostStatus(status)),
+            Err(e) => Message::error_response(id, e),
+        },
 
-        Request::GetHostProviders { host } => {
-            match ctx.daemon.get_host_providers(&host).await {
-                Ok(providers) => Message::ok_response(id, Response::GetHostProviders(providers)),
-                Err(e) => Message::error_response(id, e),
-            }
-        }
+        Request::GetHostProviders { host } => match ctx.daemon.get_host_providers(&host).await {
+            Ok(providers) => Message::ok_response(id, Response::GetHostProviders(providers)),
+            Err(e) => Message::error_response(id, e),
+        },
 
         Request::GetTopology => match ctx.daemon.get_topology().await {
             Ok(topology) => Message::ok_response(id, Response::GetTopology(topology)),
@@ -2217,17 +2199,9 @@ mod tests {
             next_remote_command_id: &next_remote_command_id,
         };
 
-        let response = dispatch_request(
-            &ctx,
-            40,
-            Request::Execute {
-                command: Command {
-                    host: Some(HostName::new("feta")),
-                    context_repo: None,
-                    action: CommandAction::Refresh { repo: None },
-                },
-            },
-        )
+        let response = dispatch_request(&ctx, 40, Request::Execute {
+            command: Command { host: Some(HostName::new("feta")), context_repo: None, action: CommandAction::Refresh { repo: None } },
+        })
         .await;
 
         let command_id = match ok_response(response, 40) {
