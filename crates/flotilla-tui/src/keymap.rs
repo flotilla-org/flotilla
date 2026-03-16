@@ -383,20 +383,18 @@ impl Keymap {
     /// Collects effective bindings (mode-specific + shared fallback), groups them
     /// by action, and organises into display sections with combined key names.
     pub fn help_sections(&self) -> Vec<HelpSection> {
-        // Collect all effective bindings for Normal mode: mode-specific first, then shared fallback.
-        let mut action_keys: HashMap<Action, Vec<String>> = HashMap::new();
-
-        // Add shared bindings first (they serve as fallback).
-        for (key, action) in &self.shared {
-            action_keys.entry(*action).or_default().push(key.to_string());
+        // Build the effective Normal-mode binding map: start with shared, overlay
+        // mode-specific. This mirrors resolve() semantics so the help screen
+        // accurately reflects what each key does in Normal mode.
+        let mut effective: HashMap<KeyCombination, Action> = self.shared.clone();
+        if let Some(normal_bindings) = self.modes.get(&ModeId::Normal) {
+            effective.extend(normal_bindings);
         }
 
-        // Normal mode-specific bindings override shared for the same key, but we
-        // collect by action so we just add them (they may introduce new actions).
-        if let Some(normal_bindings) = self.modes.get(&ModeId::Normal) {
-            for (key, action) in normal_bindings {
-                action_keys.entry(*action).or_default().push(key.to_string());
-            }
+        // Invert: group keys by action for display.
+        let mut action_keys: HashMap<Action, Vec<String>> = HashMap::new();
+        for (key, action) in &effective {
+            action_keys.entry(*action).or_default().push(key.to_string());
         }
 
         // Sort keys within each action for stable display order.

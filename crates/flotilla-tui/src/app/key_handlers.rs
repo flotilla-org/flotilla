@@ -32,7 +32,9 @@ impl App {
                 };
             }
             // FilePicker has both a text input and a navigation list.
-            // Only intercept navigation keys; everything else goes to tui_input.
+            // Hardcoded rather than routed through the keymap because shared
+            // bindings (e.g. `?` → ToggleHelp) would intercept keys the user
+            // intends to type into the path field.
             ModeId::FilePicker => {
                 return match key.code {
                     KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
