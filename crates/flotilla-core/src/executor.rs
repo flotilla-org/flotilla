@@ -14,6 +14,7 @@ use flotilla_protocol::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    attachable::{AttachableStore, BindingObjectKind, ProviderBinding},
     data,
     provider_data::ProviderData,
     providers::{
@@ -376,6 +377,28 @@ async fn select_existing_workspace(ws_mgr: &dyn WorkspaceManager, checkout_path:
     false
 }
 
+fn persist_workspace_binding(
+    config_base: &Path,
+    provider_name: &str,
+    workspace_ref: &str,
+    target_host: &HostName,
+    checkout_path: &Path,
+) {
+    let mut store = AttachableStore::with_base(config_base);
+    let set_id = store.ensure_terminal_set(
+        Some(target_host.clone()),
+        Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+    );
+    store.replace_binding(ProviderBinding {
+        provider_category: "workspace_manager".into(),
+        provider_name: provider_name.to_string(),
+        object_kind: BindingObjectKind::AttachableSet,
+        object_id: set_id.to_string(),
+        external_ref: workspace_ref.to_string(),
+    });
+    let _ = store.save();
+}
+
 async fn build_archive_session_plan(
     session_id: String,
     registry: Arc<ProviderRegistry>,
@@ -446,7 +469,11 @@ pub async fn execute(
                 return CommandResult::Error { message: format!("checkout not found: {}", checkout_path.display()) };
             }
             info!(%label, "entering workspace");
-            if let Some(ws_mgr) = registry.workspace_managers.preferred() {
+            if let Some((provider_name, ws_mgr)) = registry
+                .workspace_managers
+                .preferred_name()
+                .and_then(|name| registry.workspace_managers.preferred().map(|provider| (name.to_string(), provider)))
+            {
                 if select_existing_workspace(ws_mgr.as_ref(), &checkout_path).await {
                     return CommandResult::Ok;
                 }
@@ -454,15 +481,22 @@ pub async fn execute(
                 if let Some(tp) = registry.terminal_pools.preferred() {
                     resolve_terminal_pool(&mut config, tp.as_ref()).await;
                 }
-                if let Err(e) = ws_mgr.create_workspace(&config).await {
-                    return CommandResult::Error { message: e };
+                match ws_mgr.create_workspace(&config).await {
+                    Ok((ws_ref, _workspace)) => {
+                        persist_workspace_binding(config_base, &provider_name, &ws_ref, local_host, &checkout_path);
+                    }
+                    Err(e) => return CommandResult::Error { message: e },
                 }
             }
             CommandResult::Ok
         }
 
         CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, commands } => {
-            if let Some(ws_mgr) = registry.workspace_managers.preferred() {
+            if let Some((_provider_name, ws_mgr)) = registry
+                .workspace_managers
+                .preferred_name()
+                .and_then(|name| registry.workspace_managers.preferred().map(|provider| (name.to_string(), provider)))
+            {
                 let wrapped = match wrap_remote_attach_commands(&target_host, &checkout_path, &commands, config_base) {
                     Ok(commands) => commands,
                     Err(message) => return CommandResult::Error { message },
@@ -474,8 +508,13 @@ pub async fn execute(
                 let remote_name = format!("{}@{}", branch, target_host);
                 let mut config = workspace_config(&repo.root, &remote_name, &working_dir, "claude", config_base);
                 config.resolved_commands = Some(wrapped.into_iter().map(|cmd| (cmd.role, cmd.command)).collect());
-                if let Err(e) = ws_mgr.create_workspace(&config).await {
-                    return CommandResult::Error { message: e };
+                match ws_mgr.create_workspace(&config).await {
+                    Ok((_ws_ref, _workspace)) => {
+                        // Remote attachable-set ids are not protocol-visible yet, so the
+                        // local presentation host cannot persist an authoritative binding
+                        // to the remote set at this layer.
+                    }
+                    Err(e) => return CommandResult::Error { message: e },
                 }
             }
             CommandResult::Ok
@@ -657,7 +696,11 @@ pub async fn execute(
             };
             if let Some(path) = wt_path {
                 let name = branch.as_deref().unwrap_or("session");
-                if let Some(ws_mgr) = registry.workspace_managers.preferred() {
+                if let Some((provider_name, ws_mgr)) = registry
+                    .workspace_managers
+                    .preferred_name()
+                    .and_then(|name| registry.workspace_managers.preferred().map(|provider| (name.to_string(), provider)))
+                {
                     let mut config = workspace_config(&repo.root, name, &path, &teleport_cmd, config_base);
                     if let Some(tp) = registry.terminal_pools.preferred() {
                         resolve_terminal_pool(&mut config, tp.as_ref()).await;
@@ -665,8 +708,11 @@ pub async fn execute(
                     // Teleport always creates a new workspace — the attach command is
                     // session-specific, so reusing an existing workspace would attach
                     // to the wrong session.
-                    if let Err(e) = ws_mgr.create_workspace(&config).await {
-                        return CommandResult::Error { message: e };
+                    match ws_mgr.create_workspace(&config).await {
+                        Ok((ws_ref, _workspace)) => {
+                            persist_workspace_binding(config_base, &provider_name, &ws_ref, local_host, &path);
+                        }
+                        Err(e) => return CommandResult::Error { message: e },
                     }
                 }
                 CommandResult::Ok
@@ -1067,6 +1113,7 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
 
     use super::*;
+    use crate::attachable::AttachableStore;
     use crate::providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
@@ -1510,6 +1557,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_workspace_for_checkout_persists_workspace_binding() {
+        let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
+        let mut registry = empty_registry();
+        registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
+        let mut data = empty_data();
+        let checkout_path = PathBuf::from("/repo/wt-feat");
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+        let runner = runner_ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = RepoExecutionContext {
+            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            root: repo_root(),
+        };
+
+        let result = execute(
+            CommandAction::CreateWorkspaceForCheckout { checkout_path: checkout_path.clone(), label: "feat".into() },
+            &repo,
+            &registry,
+            &data,
+            &runner,
+            temp.path(),
+            &local_host(),
+        )
+        .await;
+
+        assert_ok(result);
+        let store = AttachableStore::with_base(temp.path());
+        let object_id = store
+            .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
+            .expect("workspace binding should exist");
+        let set = store
+            .registry()
+            .sets
+            .values()
+            .find(|set| set.id.0 == object_id)
+            .expect("set should exist");
+        assert_eq!(set.checkout, Some(HostPath::new(local_host(), checkout_path)));
+    }
+
+    #[tokio::test]
     async fn create_workspace_for_checkout_ws_manager_fails() {
         let mut registry = empty_registry();
         registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws creation failed")));
@@ -1765,6 +1852,51 @@ mod tests {
         let calls = ws_mgr.calls.lock().await;
         assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "teleport should always create a new workspace, got: {calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("select_workspace")), "teleport should NOT select existing workspace, got: {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn teleport_session_persists_workspace_binding() {
+        let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
+        let mut registry = empty_registry();
+        registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
+        registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
+        let mut data = empty_data();
+        data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+        data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+        let runner = runner_ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = RepoExecutionContext {
+            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            root: repo_root(),
+        };
+
+        let result = execute(
+            CommandAction::TeleportSession {
+                session_id: "sess-1".into(),
+                branch: Some("feat".into()),
+                checkout_key: Some(PathBuf::from("/repo/wt-feat")),
+            },
+            &repo,
+            &registry,
+            &data,
+            &runner,
+            temp.path(),
+            &local_host(),
+        )
+        .await;
+
+        assert_ok(result);
+        let store = AttachableStore::with_base(temp.path());
+        let object_id = store
+            .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
+            .expect("workspace binding should exist");
+        let set = store
+            .registry()
+            .sets
+            .values()
+            .find(|set| set.id.0 == object_id)
+            .expect("set should exist");
+        assert_eq!(set.checkout, Some(HostPath::new(local_host(), PathBuf::from("/repo/wt-feat"))));
     }
     // -----------------------------------------------------------------------
     // Tests: SelectWorkspace

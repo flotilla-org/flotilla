@@ -4,15 +4,19 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{ManagedTerminal, ManagedTerminalId, TerminalStatus};
+use flotilla_protocol::{HostName, HostPath, ManagedTerminal, ManagedTerminalId, TerminalStatus};
 
 use super::TerminalPool;
-use crate::providers::{run, CommandRunner};
+use crate::{
+    attachable::{SharedAttachableStore, TerminalPurpose},
+    providers::{run, CommandRunner},
+};
 
 pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
     socket_path: PathBuf,
     config_path: PathBuf,
+    attachable_store: SharedAttachableStore,
 }
 
 /// Shpool config content managed by flotilla.
@@ -26,7 +30,7 @@ const FLOTILLA_SHPOOL_CONFIG: &str = include_str!("shpool_config.toml");
 impl ShpoolTerminalPool {
     /// Create a new ShpoolTerminalPool, cleaning up stale sockets and
     /// spawning the daemon with flotilla's managed config.
-    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
+    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: PathBuf, attachable_store: SharedAttachableStore) -> Self {
         let config_path = socket_path.parent().unwrap_or(Path::new(".")).join("config.toml");
         let config_stale = Self::config_needs_update(&config_path);
         Self::clean_stale_socket(&socket_path);
@@ -52,15 +56,15 @@ impl ShpoolTerminalPool {
             Self::write_config(&config_path);
         }
         Self::start_daemon(&socket_path, &config_path).await;
-        Self { runner, socket_path, config_path }
+        Self { runner, socket_path, config_path, attachable_store }
     }
 
     /// Sync constructor for tests — skips daemon lifecycle.
     #[cfg(test)]
-    pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
+    pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf, attachable_store: SharedAttachableStore) -> Self {
         let config_path = socket_path.parent().unwrap_or(Path::new(".")).join("config.toml");
         Self::write_config(&config_path);
-        Self { runner, socket_path, config_path }
+        Self { runner, socket_path, config_path, attachable_store }
     }
 
     /// Check if a process is alive. Returns true for both "alive and ours"
@@ -337,6 +341,38 @@ impl ShpoolTerminalPool {
 
         Ok(terminals)
     }
+
+    fn synthetic_checkout_path(id: &ManagedTerminalId) -> PathBuf {
+        PathBuf::from(format!(".flotilla/attachable/{}", id.checkout))
+    }
+
+    fn register_attachable(&self, terminal: &ManagedTerminal, session_name: &str) {
+        let host = HostName::local();
+        let checkout_path = if terminal.working_directory.as_os_str().is_empty() {
+            Self::synthetic_checkout_path(&terminal.id)
+        } else {
+            terminal.working_directory.clone()
+        };
+
+        let set_checkout = HostPath::new(host.clone(), checkout_path.clone());
+        let mut store = self.attachable_store.lock().expect("attachable store lock poisoned");
+        let set_id = store.ensure_terminal_set(Some(host), Some(set_checkout));
+        store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            session_name,
+            TerminalPurpose {
+                checkout: terminal.id.checkout.clone(),
+                role: terminal.id.role.clone(),
+                index: terminal.id.index,
+            },
+            terminal.command.clone(),
+            checkout_path,
+            terminal.status.clone(),
+        );
+        let _ = store.save();
+    }
 }
 
 #[async_trait]
@@ -347,7 +383,14 @@ impl TerminalPool for ShpoolTerminalPool {
         let result = run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "list", "--json"], Path::new("/"));
 
         match result {
-            Ok(json) => Self::parse_list_json(&json),
+            Ok(json) => {
+                let terminals = Self::parse_list_json(&json)?;
+                for terminal in &terminals {
+                    let session_name = format!("flotilla/{}", terminal.id);
+                    self.register_attachable(terminal, &session_name);
+                }
+                Ok(terminals)
+            }
             Err(e) => {
                 tracing::debug!(err = %e, "shpool list failed (daemon may not be running)");
                 Ok(vec![])
@@ -366,6 +409,16 @@ impl TerminalPool for ShpoolTerminalPool {
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
         let cwd_str = cwd.display().to_string();
+        self.register_attachable(
+            &ManagedTerminal {
+                id: id.clone(),
+                role: id.role.clone(),
+                command: command.to_string(),
+                working_directory: cwd.to_path_buf(),
+                status: TerminalStatus::Running,
+            },
+            &session_name,
+        );
         fn sq(s: &str) -> String {
             format!("'{}'", s.replace('\'', "'\\''"))
         }
@@ -409,14 +462,21 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::attachable::{BindingObjectKind, SharedAttachableStore, AttachableStore};
     use crate::providers::testing::MockRunner;
 
     /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
-    fn test_pool(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir) {
+    fn test_store(dir: &tempfile::TempDir) -> SharedAttachableStore {
+        Arc::new(std::sync::Mutex::new(AttachableStore::with_base(dir.path())))
+    }
+
+    /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
+    fn test_pool(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, SharedAttachableStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("create tempdir for shpool test");
         let socket_path = dir.path().join("shpool.socket");
-        let pool = ShpoolTerminalPool::new(runner, socket_path);
-        (pool, dir)
+        let store = test_store(&dir);
+        let pool = ShpoolTerminalPool::new(runner, socket_path, Arc::clone(&store));
+        (pool, store, dir)
     }
 
     #[test]
@@ -525,14 +585,14 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_running_is_noop() {
-        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
         assert!(pool.ensure_running(&id, "bash", Path::new("/home/dev")).await.is_ok());
     }
 
     #[tokio::test]
     async fn attach_command_includes_cmd_dir_and_config() {
-        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
         let cmd = pool.attach_command(&id, "bash", Path::new("/home/dev")).await.unwrap();
         assert!(cmd.contains("shpool"));
@@ -549,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_command_empty_cmd_omits_cmd_flag() {
-        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
         let cmd = pool.attach_command(&id, "", Path::new("/home/dev")).await.unwrap();
         assert!(cmd.contains("shpool"));
@@ -561,9 +621,60 @@ mod tests {
 
     #[tokio::test]
     async fn list_terminals_returns_empty_when_daemon_not_running() {
-        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![Err("connection refused".into())])));
+        let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Err("connection refused".into())])));
         let terminals = pool.list_terminals().await.unwrap();
         assert!(terminals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_terminals_registers_attachable_bindings() {
+        let json = r#"{
+            "sessions": [
+                {
+                    "name": "flotilla/my-feature/shell/0",
+                    "started_at_unix_ms": 1709900000000,
+                    "status": "Attached"
+                },
+                {
+                    "name": "flotilla/my-feature/agent/0",
+                    "started_at_unix_ms": 1709900001000,
+                    "status": "Disconnected"
+                }
+            ]
+        }"#;
+        let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(json.into())])));
+        let terminals = pool.list_terminals().await.expect("list terminals");
+        assert_eq!(terminals.len(), 2);
+
+        let store = store.lock().expect("lock store");
+        assert_eq!(store.registry().sets.len(), 1);
+        assert_eq!(store.registry().attachables.len(), 2);
+        assert!(store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0")
+            .is_some());
+        assert!(store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/agent/0")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn attach_command_registers_attachable_binding_with_real_cwd() {
+        let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
+
+        pool.attach_command(&id, "bash", Path::new("/home/dev/project")).await.expect("attach command");
+
+        let store = store.lock().expect("lock store");
+        let attachable_id = store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0")
+            .expect("binding should exist");
+        let attachable = store
+            .registry()
+            .attachables
+            .values()
+            .find(|attachable| attachable.id.0 == attachable_id)
+            .expect("attachable should exist");
+        assert_eq!(attachable.working_directory, PathBuf::from("/home/dev/project"));
     }
 
     #[test]
@@ -716,7 +827,7 @@ mod tests {
     async fn test_pool_async(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("create tempdir for shpool test");
         let socket_path = dir.path().join("shpool.socket");
-        let pool = ShpoolTerminalPool::create(runner, socket_path).await;
+        let pool = ShpoolTerminalPool::create(runner, socket_path, test_store(&dir)).await;
         (pool, dir)
     }
 
