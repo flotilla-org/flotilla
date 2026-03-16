@@ -8,7 +8,7 @@ use flotilla_protocol::{HostName, HostPath, ManagedTerminal, ManagedTerminalId, 
 
 use super::TerminalPool;
 use crate::{
-    attachable::{SharedAttachableStore, TerminalPurpose},
+    attachable::{AttachableStore, SharedAttachableStore, TerminalPurpose},
     providers::{run, CommandRunner},
 };
 
@@ -354,7 +354,7 @@ impl ShpoolTerminalPool {
         PathBuf::from(format!(".flotilla/attachable/{}", id.checkout))
     }
 
-    fn register_attachable(&self, terminal: &ManagedTerminal, session_name: &str) {
+    fn register_attachable(store: &mut AttachableStore, terminal: &ManagedTerminal, session_name: &str) -> bool {
         // TODO(#360): prune stale attachables/bindings when sessions disappear so
         // the registry does not grow unbounded over time.
         let host = HostName::local();
@@ -365,10 +365,6 @@ impl ShpoolTerminalPool {
         };
 
         let set_checkout = HostPath::new(host.clone(), checkout_path.clone());
-        let Ok(mut store) = self.attachable_store.lock() else {
-            tracing::warn!("attachable store lock poisoned while registering shpool terminal");
-            return;
-        };
         let (set_id, changed_set) = store.ensure_terminal_set_with_change(Some(host), Some(set_checkout));
         let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
             &set_id,
@@ -380,11 +376,7 @@ impl ShpoolTerminalPool {
             checkout_path,
             terminal.status.clone(),
         );
-        if changed_set || changed_attachable {
-            if let Err(err) = store.save() {
-                tracing::warn!(err = %err, session = %session_name, "failed to persist attachable registry after shpool update");
-            }
-        }
+        changed_set || changed_attachable
     }
 }
 
@@ -398,9 +390,19 @@ impl TerminalPool for ShpoolTerminalPool {
         match result {
             Ok(json) => {
                 let terminals = Self::parse_list_json(&json)?;
+                let Ok(mut store) = self.attachable_store.lock() else {
+                    tracing::warn!("attachable store lock poisoned while registering shpool terminals");
+                    return Ok(terminals);
+                };
+                let mut any_changed = false;
                 for terminal in &terminals {
                     let session_name = format!("flotilla/{}", terminal.id);
-                    self.register_attachable(terminal, &session_name);
+                    any_changed |= Self::register_attachable(&mut store, terminal, &session_name);
+                }
+                if any_changed {
+                    if let Err(err) = store.save() {
+                        tracing::warn!(err = %err, "failed to persist attachable registry after shpool refresh");
+                    }
                 }
                 Ok(terminals)
             }
