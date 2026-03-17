@@ -412,6 +412,16 @@ fn parse_repo_command(args: &[String]) -> Result<RepoCommand, String> {
                     },
                 }));
             }
+            if args.len() == 3 && args[1] == "prepare-terminal" {
+                return Ok(RepoCommand::Control(Command {
+                    host: None,
+                    context_repo: Some(RepoSelector::Query(slug.into())),
+                    action: CommandAction::PrepareTerminalForCheckout {
+                        checkout_path: PathBuf::from(&args[2]),
+                        commands: vec![],
+                    },
+                }));
+            }
             if args.len() == 4 && args[1] == "checkout" && args[2] == "--fresh" {
                 return Ok(RepoCommand::Control(Command {
                     host: None,
@@ -538,9 +548,12 @@ async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use flotilla_protocol::Command;
     use flotilla_protocol::{CheckoutSelector, CommandAction, RepoSelector};
 
-    use super::{parse_host_command, try_parse_cli_from, HostCommand, HostQueryCommand, SubCommand};
+    use super::{parse_host_command, parse_repo_command, try_parse_cli_from, HostCommand, HostQueryCommand, RepoCommand, SubCommand};
 
     #[test]
     fn parse_host_command_list() {
@@ -642,6 +655,36 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(SubCommand::Repo { args, json: true }) if args == vec!["owner/repo"]
+        ));
+    }
+
+    #[test]
+    fn parse_repo_prepare_terminal_command() {
+        let parsed = parse_repo_command(&["owner/repo".into(), "prepare-terminal".into(), "/tmp/repo.feat-x".into()])
+            .expect("prepare-terminal should parse");
+        assert!(matches!(
+            parsed,
+            RepoCommand::Control(Command {
+                host: None,
+                context_repo: Some(RepoSelector::Query(ref repo)),
+                action: CommandAction::PrepareTerminalForCheckout { checkout_path, ref commands },
+            }) if repo == "owner/repo" && checkout_path == Path::new("/tmp/repo.feat-x") && commands.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parse_host_repo_prepare_terminal_preserves_context() {
+        let parsed = parse_host_command(
+            &["alpha".into(), "repo".into(), "owner/repo".into(), "prepare-terminal".into(), "/tmp/repo.feat-x".into()],
+        )
+        .expect("host repo prepare-terminal should parse");
+        assert!(matches!(
+            parsed,
+            HostCommand::Control(Command {
+                host: Some(ref host),
+                context_repo: Some(RepoSelector::Query(ref repo)),
+                action: CommandAction::PrepareTerminalForCheckout { checkout_path, ref commands },
+            }) if host.as_str() == "alpha" && repo == "owner/repo" && checkout_path == Path::new("/tmp/repo.feat-x") && commands.is_empty()
         ));
     }
 }

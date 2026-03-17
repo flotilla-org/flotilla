@@ -4,7 +4,7 @@ All tests run commands on node-a (the "user's desktop") and validate
 that multi-host peering with node-b works via the CLI JSON output.
 """
 
-from conftest import docker_exec, flotilla_json
+from conftest import docker_exec, flotilla_json, wait_for
 
 
 def test_both_daemons_running(topology):
@@ -87,3 +87,46 @@ def test_peer_repo_visible_via_host_status(topology):
     """node-b's tracked repo is visible from node-a via host status."""
     result = flotilla_json(topology["node-a"], "host node-b status")
     assert result["repo_count"] >= 1
+
+
+def test_remote_prepare_terminal_returns_attachable_set_id(topology):
+    """Remote prepare-terminal returns a Flotilla-owned attachable set id."""
+    checkout = flotilla_json(
+        topology["node-b"],
+        "repo /home/flotilla/repo checkout --fresh feat-prepare",
+    )
+    assert checkout["status"] == "checkout_created"
+    checkout_path = checkout["path"]
+
+    def checkout_visible_on_node_a():
+        result = flotilla_json(topology["node-a"], "repo /home/flotilla/repo work")
+        return any(
+            item.get("branch") == "feat-prepare" and item.get("host") == "node-b"
+            for item in result.get("work_items", [])
+        )
+
+    wait_for(
+        checkout_visible_on_node_a,
+        "node-a sees node-b checkout feat-prepare",
+        timeout=30,
+        interval=1.0,
+    )
+
+    prepared = flotilla_json(
+        topology["node-a"],
+        f"host node-b repo /home/flotilla/repo prepare-terminal {checkout_path}",
+        timeout=60,
+    )
+    assert prepared["status"] == "terminal_prepared"
+    assert prepared.get("attachable_set_id"), (
+        "remote prepare-terminal should include attachable_set_id"
+    )
+
+    registry = docker_exec(
+        topology["node-b"],
+        "test -f ~/.config/flotilla/attachables/registry.json && cat ~/.config/flotilla/attachables/registry.json",
+    )
+    assert registry.returncode == 0, (
+        "remote prepare-terminal should create attachables registry\n"
+        f"stdout: {registry.stdout}\nstderr: {registry.stderr}"
+    )
