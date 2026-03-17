@@ -34,7 +34,7 @@ impl App {
             ModeId::CommandPalette => {
                 return match key.code {
                     KeyCode::Esc => Some(Action::Dismiss),
-                    KeyCode::Enter | KeyCode::Tab => Some(Action::Confirm),
+                    KeyCode::Enter => Some(Action::Confirm),
                     KeyCode::Up => Some(Action::SelectPrev),
                     KeyCode::Down => Some(Action::SelectNext),
                     _ => None,
@@ -219,7 +219,20 @@ impl App {
                 }
                 FocusTarget::CommandPalette => {
                     if let UiMode::CommandPalette { ref input, ref entries, selected, .. } = self.ui.mode {
-                        let filtered = crate::palette::filter_entries(entries, input.value());
+                        let text = input.value().to_string();
+
+                        // "search <terms>" — apply filter directly
+                        if let Some(query) = text.strip_prefix("search ") {
+                            let query = query.trim().to_string();
+                            self.ui.mode = UiMode::Normal;
+                            if !query.is_empty() {
+                                self.active_ui_mut().active_search_query = Some(query);
+                            }
+                            return;
+                        }
+
+                        // Otherwise dispatch the selected entry's action
+                        let filtered = crate::palette::filter_entries(entries, &text);
                         if let Some(entry) = filtered.get(selected) {
                             let action = entry.action;
                             self.ui.mode = UiMode::Normal;
@@ -377,11 +390,25 @@ impl App {
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
             UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
             UiMode::IssueSearch { .. } => self.handle_issue_search_key(key),
-            UiMode::CommandPalette { ref mut input, ref mut selected, ref mut scroll_top, .. } => {
+            UiMode::CommandPalette { ref mut input, ref entries, ref mut selected, ref mut scroll_top, .. } => {
+                // Tab / Right arrow: fill selected command name into input
+                if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
+                    let filtered = crate::palette::filter_entries(entries, input.value());
+                    if let Some(entry) = filtered.get(*selected) {
+                        let filled = format!("{} ", entry.name);
+                        *input = Input::from(filled.as_str());
+                        *selected = 0;
+                        *scroll_top = 0;
+                    }
+                    return;
+                }
+
                 input.handle_event(&crossterm::event::Event::Key(key));
-                // Typing / when input is empty opens search directly
+                // // shortcut: typing / when input is empty fills "search "
                 if input.value() == "/" {
-                    self.ui.mode = UiMode::IssueSearch { input: Input::default() };
+                    *input = Input::from("search ");
+                    *selected = 0;
+                    *scroll_top = 0;
                     return;
                 }
                 *selected = 0;
@@ -1973,12 +2000,54 @@ mod tests {
     // ── command palette key handling ────────────────────────────────
 
     #[test]
-    fn double_slash_opens_issue_search() {
+    fn double_slash_fills_search() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('/')));
         assert!(matches!(app.ui.mode, UiMode::CommandPalette { .. }));
         app.handle_key(key(KeyCode::Char('/')));
-        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+        if let UiMode::CommandPalette { ref input, .. } = app.ui.mode {
+            assert_eq!(input.value(), "search ");
+        } else {
+            panic!("expected CommandPalette");
+        }
+    }
+
+    #[test]
+    fn command_palette_tab_fills_command_name() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        // First entry is "search" — Tab should fill it
+        app.handle_key(key(KeyCode::Tab));
+        if let UiMode::CommandPalette { ref input, selected, .. } = app.ui.mode {
+            assert_eq!(input.value(), "search ");
+            assert_eq!(selected, 0);
+        } else {
+            panic!("expected CommandPalette");
+        }
+    }
+
+    #[test]
+    fn command_palette_search_with_args_applies_filter() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "search auth".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.active_ui().active_search_query.as_deref(), Some("auth"));
+    }
+
+    #[test]
+    fn command_palette_search_empty_term_clears() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "search ".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.active_ui().active_search_query, None);
     }
 
     #[test]
