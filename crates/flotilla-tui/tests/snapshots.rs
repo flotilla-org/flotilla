@@ -408,6 +408,27 @@ fn delete_confirm_with_many_uncommitted_files() {
 }
 
 #[test]
+fn delete_confirm_remote_host() {
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::DeleteConfirm {
+        info: Some(flotilla_protocol::CheckoutStatus {
+            branch: "feat-remote".into(),
+            change_request_status: Some("MERGED".into()),
+            merge_commit_sha: Some("def5678".into()),
+            unpushed_commits: vec![],
+            has_uncommitted: false,
+            uncommitted_files: vec![],
+            base_detection_warning: None,
+        }),
+        loading: false,
+        terminal_keys: vec![],
+        identity: WorkItemIdentity::Checkout(HostPath::new(HostName::new("feta"), PathBuf::from("/home/dev/my-project/feat-remote"))),
+        remote_host: Some(HostName::new("feta")),
+    });
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn providers_overlay() {
     let mut harness = TestHarness::single_repo("my-project")
         .with_provider_names("my-project", vec![

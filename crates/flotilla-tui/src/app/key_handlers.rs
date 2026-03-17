@@ -1452,6 +1452,31 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirm_routes_to_remote_host_when_set() {
+        let mut app = stub_app();
+        let hostname = HostName::new("feta");
+        app.ui.mode = UiMode::DeleteConfirm {
+            info: Some(CheckoutStatus {
+                branch: "feat/x".into(),
+                change_request_status: None,
+                merge_commit_sha: None,
+                unpushed_commits: vec![],
+                has_uncommitted: false,
+                uncommitted_files: vec![],
+                base_detection_warning: None,
+            }),
+            loading: false,
+            terminal_keys: vec![],
+            identity: WorkItemIdentity::Session("test".into()),
+            remote_host: Some(hostname.clone()),
+        };
+        app.handle_key(key(KeyCode::Char('y')));
+        let (cmd, _) = app.proto_commands.take_next().expect("command");
+        assert_eq!(cmd.host, Some(hostname));
+        assert!(matches!(cmd.action, CommandAction::RemoveCheckout { .. }));
+    }
+
+    #[test]
     fn delete_confirm_ignores_while_loading() {
         let mut app = stub_app();
         app.ui.mode = UiMode::DeleteConfirm {
