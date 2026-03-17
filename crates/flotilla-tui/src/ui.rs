@@ -375,7 +375,11 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
             };
 
             let task = active_task(model, in_flight).map(|(description, spinner_index)| TaskSection::new(&description, spinner_index));
-            StatusBarContent { status, keys: normal_mode_key_chips(), task, mode_indicators: normal_mode_indicators(ui) }
+            let mut keys = normal_mode_key_chips();
+            if rui.active_search_query.is_some() {
+                keys.insert(0, key_chip("esc", "Clear", KeyCode::Esc));
+            }
+            StatusBarContent { status, keys, task, mode_indicators: normal_mode_indicators(ui) }
         }
         UiMode::Config => StatusBarContent {
             status: StatusSection::plain("FLOTILLA"),

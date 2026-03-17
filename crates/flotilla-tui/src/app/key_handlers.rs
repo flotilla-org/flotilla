@@ -408,6 +408,12 @@ impl App {
                     return;
                 }
 
+                // Backspace on empty input closes the palette
+                if matches!(key.code, KeyCode::Backspace) && input.value().is_empty() {
+                    self.ui.mode = UiMode::Normal;
+                    return;
+                }
+
                 input.handle_event(&crossterm::event::Event::Key(key));
                 // // shortcut: typing / when input is empty fills "search "
                 if input.value() == "/" {
