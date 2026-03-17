@@ -2,8 +2,15 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
-use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{output::OutputFormat, CheckoutSelector, CheckoutTarget, Command, CommandAction, HostName, RepoSelector};
+use flotilla_core::{
+    agents::{self, AgentEntry, AgentStateStoreApi},
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+};
+use flotilla_protocol::{
+    output::OutputFormat, AttachableId, CheckoutSelector, CheckoutTarget, Command, CommandAction, HostName, RepoSelector,
+};
 use flotilla_tui::{app, event_log, theme};
 use tracing::info;
 
@@ -98,6 +105,13 @@ enum SubCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Receive agent hook events (called by agent hook systems)
+    Hook {
+        /// Agent harness name (e.g. claude-code, codex, gemini)
+        harness: String,
+        /// Event type (e.g. session-start, stop, notification)
+        event_type: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -151,6 +165,7 @@ async fn main() -> Result<()> {
         }
         Some(SubCommand::Host { args, json }) => run_host(&cli, args, OutputFormat::from_json_flag(*json)).await,
         Some(SubCommand::Topology { json }) => run_topology_command(&cli, OutputFormat::from_json_flag(*json)).await,
+        Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, harness, event_type).await,
         None => run_tui(cli).await,
     }
 }
@@ -541,6 +556,74 @@ async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
     flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
+    use std::io::Read;
+
+    // 1. Resolve harness parser
+    let (harness_enum, parser) = agents::parser_for_harness(harness).map_err(|e| color_eyre::eyre::eyre!("unknown harness: {e}"))?;
+
+    // 2. Read native payload from stdin
+    let mut payload = Vec::new();
+    std::io::stdin().read_to_end(&mut payload).map_err(|e| color_eyre::eyre::eyre!("failed to read stdin: {e}"))?;
+
+    // 3. Parse the event
+    let parsed = parser.parse_event(event_type, &payload).map_err(|e| color_eyre::eyre::eyre!("parse error: {e}"))?;
+
+    // 4. Resolve attachable_id: from env or via session_id lookup/allocation
+    let config_dir = cli.config_dir();
+    let store = agents::AgentStateStore::with_base(&config_dir);
+    let attachable_id = resolve_attachable_id(&store, parsed.session_id.as_deref())?;
+
+    // 5. Build and apply the event
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let event = agents::AgentHookEvent {
+        attachable_id: attachable_id.clone(),
+        harness: harness_enum,
+        event_type: parsed.event_type.clone(),
+        session_id: parsed.session_id,
+        model: parsed.model,
+        cwd: parsed.cwd,
+    };
+
+    // 6. Update the store
+    let mut store = agents::AgentStateStore::with_base(&config_dir);
+    if event.event_type == agents::AgentEventType::Ended {
+        store.remove(&event.attachable_id);
+    } else {
+        let existing = store.get(&event.attachable_id);
+        let entry = AgentEntry {
+            harness: event.harness.clone(),
+            status: event.event_type.to_status(),
+            model: event.model.clone().or_else(|| existing.and_then(|e| e.model.clone())),
+            session_title: existing.and_then(|e| e.session_title.clone()),
+            session_id: event.session_id.clone(),
+            last_event_epoch_secs: now,
+        };
+        store.upsert(event.attachable_id.clone(), entry);
+    }
+    store.save().map_err(|e| color_eyre::eyre::eyre!("failed to save agent state: {e}"))?;
+
+    // TODO(#391): also send event to daemon via socket for live refresh
+    Ok(())
+}
+
+/// Resolve the attachable ID for a hook event.
+/// Priority: FLOTILLA_ATTACHABLE_ID env var > session_id lookup > allocate new.
+fn resolve_attachable_id(store: &agents::AgentStateStore, session_id: Option<&str>) -> Result<AttachableId> {
+    // Fast path: managed terminal with env var
+    if let Ok(id) = std::env::var("FLOTILLA_ATTACHABLE_ID") {
+        return Ok(AttachableId::new(id));
+    }
+    // Lookup by session_id
+    if let Some(sid) = session_id {
+        if let Some(id) = store.lookup_by_session_id(sid) {
+            return Ok(id.clone());
+        }
+    }
+    // Allocate a new one
+    Ok(agents::allocate_attachable_id())
 }
 
 #[cfg(test)]
