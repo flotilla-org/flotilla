@@ -107,6 +107,46 @@ enum SubCommand {
         /// Event type (e.g. session-start, stop, notification)
         event_type: String,
     },
+    /// Install or uninstall agent hook configuration
+    Hooks {
+        #[command(subcommand)]
+        command: HooksSubCommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum HooksSubCommand {
+    /// Install hooks for an agent harness
+    Install {
+        /// Agent harness (e.g. claude-code)
+        harness: String,
+        /// Install to user settings (~/.claude/settings.json)
+        #[arg(long)]
+        user: bool,
+        /// Install to project settings (.claude/settings.json, committed)
+        #[arg(long)]
+        project: bool,
+        /// Install to local project settings (.claude/settings.local.json, gitignored)
+        #[arg(long)]
+        local: bool,
+        /// Show plugin marketplace install instructions instead
+        #[arg(long)]
+        plugin: bool,
+    },
+    /// Remove hooks for an agent harness
+    Uninstall {
+        /// Agent harness (e.g. claude-code)
+        harness: String,
+        /// Remove from user settings
+        #[arg(long)]
+        user: bool,
+        /// Remove from project settings
+        #[arg(long)]
+        project: bool,
+        /// Remove from local project settings
+        #[arg(long)]
+        local: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -161,6 +201,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Host { args, json }) => run_host(&cli, args, OutputFormat::from_json_flag(*json)).await,
         Some(SubCommand::Topology { json }) => run_topology_command(&cli, OutputFormat::from_json_flag(*json)).await,
         Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, harness, event_type).await,
+        Some(SubCommand::Hooks { command }) => run_hooks_command(command).await,
         None => run_tui(cli).await,
     }
 }
@@ -623,6 +664,138 @@ async fn send_hook_event(socket_path: &std::path::Path, event: AgentHookEvent) -
         },
         other => Err(color_eyre::eyre::eyre!("unexpected response: {other:?}")),
     }
+}
+
+async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
+    match command {
+        HooksSubCommand::Install { harness, user, project, local, plugin } => {
+            if harness != "claude-code" {
+                return Err(color_eyre::eyre::eyre!("unknown harness: {harness}. Supported: claude-code"));
+            }
+
+            if *plugin {
+                println!("To install flotilla hooks as a Claude Code plugin:");
+                println!();
+                println!("  1. Add the marketplace:");
+                println!("     /plugin marketplace add rjwittams/flotilla-marketplace");
+                println!();
+                println!("  2. Install the plugin:");
+                println!("     /plugin install flotilla-hooks@flotilla-marketplace");
+                return Ok(());
+            }
+
+            let scope = resolve_settings_scope(*user, *project, *local)?;
+            let path = scope.path();
+
+            install_claude_code_hooks(&path)?;
+            println!("Installed flotilla hooks for claude-code in {}", path.display());
+            Ok(())
+        }
+        HooksSubCommand::Uninstall { harness, user, project, local } => {
+            if harness != "claude-code" {
+                return Err(color_eyre::eyre::eyre!("unknown harness: {harness}. Supported: claude-code"));
+            }
+
+            let scope = resolve_settings_scope(*user, *project, *local)?;
+            let path = scope.path();
+
+            uninstall_claude_code_hooks(&path)?;
+            println!("Removed flotilla hooks for claude-code from {}", path.display());
+            Ok(())
+        }
+    }
+}
+
+enum SettingsScope {
+    User,
+    Project,
+    Local,
+}
+
+impl SettingsScope {
+    fn path(&self) -> PathBuf {
+        match self {
+            SettingsScope::User => {
+                std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("~")).join(".claude/settings.json")
+            }
+            SettingsScope::Project => PathBuf::from(".claude/settings.json"),
+            SettingsScope::Local => PathBuf::from(".claude/settings.local.json"),
+        }
+    }
+}
+
+fn resolve_settings_scope(user: bool, project: bool, local: bool) -> Result<SettingsScope> {
+    match (user, project, local) {
+        (true, false, false) => Ok(SettingsScope::User),
+        (false, true, false) => Ok(SettingsScope::Project),
+        (false, false, true) => Ok(SettingsScope::Local),
+        (false, false, false) => Ok(SettingsScope::User), // default
+        _ => Err(color_eyre::eyre::eyre!("specify at most one of --user, --project, --local")),
+    }
+}
+
+fn claude_code_hook_entries() -> serde_json::Value {
+    serde_json::json!({
+        "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code session-start"}]}],
+        "SessionEnd": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code session-end"}]}],
+        "UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code user-prompt-submit"}]}],
+        "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code stop"}]}],
+        "Notification": [{"matcher": "permission_prompt", "hooks": [{"type": "command", "command": "flotilla hook claude-code notification"}]}]
+    })
+}
+
+fn install_claude_code_hooks(path: &std::path::Path) -> Result<()> {
+    let mut settings: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(path).map_err(|e| color_eyre::eyre::eyre!("failed to read {}: {e}", path.display()))?;
+        serde_json::from_str(&content).map_err(|e| color_eyre::eyre::eyre!("failed to parse {}: {e}", path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let hooks = settings.as_object_mut().expect("settings is object").entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let new_entries = claude_code_hook_entries();
+    for (event, matchers) in new_entries.as_object().expect("entries is object") {
+        let event_hooks = hooks.as_object_mut().expect("hooks is object").entry(event).or_insert_with(|| serde_json::json!([]));
+        let existing_arr = event_hooks.as_array().expect("event hooks is array");
+        // Check if flotilla hooks are already present
+        let already_installed = existing_arr.iter().any(|m| m.to_string().contains("flotilla hook claude-code"));
+        if !already_installed {
+            let arr = event_hooks.as_array_mut().expect("array");
+            for entry in matchers.as_array().expect("matchers array") {
+                arr.push(entry.clone());
+            }
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| color_eyre::eyre::eyre!("failed to create directory: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(&settings).expect("serialize");
+    std::fs::write(path, json).map_err(|e| color_eyre::eyre::eyre!("failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| color_eyre::eyre::eyre!("failed to read {}: {e}", path.display()))?;
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| color_eyre::eyre::eyre!("failed to parse {}: {e}", path.display()))?;
+
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_event, matchers) in hooks.iter_mut() {
+            if let Some(arr) = matchers.as_array_mut() {
+                arr.retain(|m| !m.to_string().contains("flotilla hook claude-code"));
+            }
+        }
+        // Remove empty event arrays
+        hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
+    }
+
+    let json = serde_json::to_string_pretty(&settings).expect("serialize");
+    std::fs::write(path, json).map_err(|e| color_eyre::eyre::eyre!("failed to write {}: {e}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
