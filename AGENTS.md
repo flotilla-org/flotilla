@@ -12,6 +12,12 @@ Use the sandbox-safe command when `CODEX_SANDBOX` is set or socket-bind tests ar
 The `flotilla-core` integration test above intentionally depends on shared discovery test helpers behind the `test-support` feature.
 If you say a change matches CI locally, it should have been checked against these exact commands rather than close approximations.
 
+## Python / Integration Tests
+
+Use `uv` for all Python operations — never bare `python` or `pip`. Examples:
+- `cd tests/integration && uv run pytest test_hub_spoke_topology.py -v`
+- `uv run python -c "from conftest import docker_exec; print('OK')"`
+
 ## Testing Philosophy
 
 - Prefer behavior tests that exercise domain logic through injected collaborators rather than real filesystem, socket, process, or multi-host orchestration.
