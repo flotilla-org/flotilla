@@ -27,8 +27,8 @@ expression: output
 │                       │n                 New branch input                                    │                       │
 │                       │d                 Remove checkout                                     │                       │
 │                       │p                 Open change request in browser                      │                       │
-│                       │/                 Search issues                                       │                       │
 │                       │a                 Open file picker                                    │                       │
+│                       │l                 Cycle layout                                        │                       │
 │                       └──────────────────────────────────────────────────────────────────────┘                       │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
 HELP                         <j> DOWN  <k> UP  <esc> CLOSE  <?> CLOSE 

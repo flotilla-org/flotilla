@@ -39,6 +39,7 @@ pub enum Action {
     OpenBranchInput,
     OpenIssueSearch,
     OpenFilePicker,
+    OpenCommandPalette,
     Dispatch(Intent),
 }
 
@@ -80,6 +81,7 @@ impl Action {
             "open_branch_input" => Action::OpenBranchInput,
             "open_issue_search" => Action::OpenIssueSearch,
             "open_file_picker" => Action::OpenFilePicker,
+            "open_command_palette" => Action::OpenCommandPalette,
             // Intent-wrapping actions
             "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
             "create_workspace" => Action::Dispatch(Intent::CreateWorkspace),
@@ -124,6 +126,7 @@ impl Action {
             Action::OpenBranchInput => "open_branch_input",
             Action::OpenIssueSearch => "open_issue_search",
             Action::OpenFilePicker => "open_file_picker",
+            Action::OpenCommandPalette => "open_command_palette",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "switch_to_workspace",
                 Intent::CreateWorkspace => "create_workspace",
@@ -165,6 +168,7 @@ impl Action {
             Action::OpenBranchInput => "New branch input",
             Action::OpenIssueSearch => "Search issues",
             Action::OpenFilePicker => "Open file picker",
+            Action::OpenCommandPalette => "Open command palette",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",
                 Intent::CreateWorkspace => "Create workspace",
@@ -212,6 +216,7 @@ pub enum ModeId {
     FilePicker,
     BranchInput,
     IssueSearch,
+    CommandPalette,
 }
 
 impl From<&UiMode> for ModeId {
@@ -226,6 +231,7 @@ impl From<&UiMode> for ModeId {
             UiMode::DeleteConfirm { .. } => ModeId::DeleteConfirm,
             UiMode::CloseConfirm { .. } => ModeId::CloseConfirm,
             UiMode::IssueSearch { .. } => ModeId::IssueSearch,
+            UiMode::CommandPalette { .. } => ModeId::CommandPalette,
         }
     }
 }
@@ -287,7 +293,7 @@ impl Keymap {
             normal.insert(kc(KeyCode::Char('T'), KeyModifiers::SHIFT), Action::CycleTheme);
             normal.insert(kc(KeyCode::Char('.'), KeyModifiers::NONE), Action::OpenActionMenu);
             normal.insert(crokey::key!(n), Action::OpenBranchInput);
-            normal.insert(kc(KeyCode::Char('/'), KeyModifiers::NONE), Action::OpenIssueSearch);
+            normal.insert(kc(KeyCode::Char('/'), KeyModifiers::NONE), Action::OpenCommandPalette);
             normal.insert(crokey::key!(a), Action::OpenFilePicker);
             normal.insert(crokey::key!(c), Action::ToggleProviders);
             normal.insert(kc(KeyCode::Char('D'), KeyModifiers::SHIFT), Action::ToggleDebug);
@@ -330,6 +336,10 @@ impl Keymap {
             close_confirm.insert(crokey::key!(n), Action::Dismiss);
             close_confirm.insert(crokey::key!(q), Action::Dismiss);
         }
+
+        // ── CommandPalette mode ──
+        // Keys are hardcoded in resolve_action (text input mode).
+        modes.entry(ModeId::CommandPalette).or_default();
 
         Keymap { shared, modes }
     }
@@ -484,6 +494,7 @@ mod tests {
             Action::OpenBranchInput,
             Action::OpenIssueSearch,
             Action::OpenFilePicker,
+            Action::OpenCommandPalette,
         ];
         for action in actions {
             let s = action.as_config_str();
@@ -550,6 +561,7 @@ mod tests {
             Action::OpenBranchInput,
             Action::OpenIssueSearch,
             Action::OpenFilePicker,
+            Action::OpenCommandPalette,
             Action::Dispatch(Intent::SwitchToWorkspace),
             Action::Dispatch(Intent::CreateWorkspace),
             Action::Dispatch(Intent::RemoveCheckout),
@@ -602,7 +614,7 @@ mod tests {
         assert_eq!(km.resolve(ModeId::Normal, kc(KeyCode::Char('T'), KeyModifiers::SHIFT)), Some(Action::CycleTheme));
         assert_eq!(km.resolve(ModeId::Normal, kc(KeyCode::Char('.'), KeyModifiers::NONE)), Some(Action::OpenActionMenu));
         assert_eq!(km.resolve(ModeId::Normal, crokey::key!(n)), Some(Action::OpenBranchInput));
-        assert_eq!(km.resolve(ModeId::Normal, kc(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::OpenIssueSearch));
+        assert_eq!(km.resolve(ModeId::Normal, kc(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::OpenCommandPalette));
         assert_eq!(km.resolve(ModeId::Normal, crokey::key!(a)), Some(Action::OpenFilePicker));
         assert_eq!(km.resolve(ModeId::Normal, crokey::key!(c)), Some(Action::ToggleProviders));
         assert_eq!(km.resolve(ModeId::Normal, kc(KeyCode::Char('D'), KeyModifiers::SHIFT)), Some(Action::ToggleDebug));

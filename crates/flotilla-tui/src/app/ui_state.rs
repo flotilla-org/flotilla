@@ -65,6 +65,12 @@ pub enum UiMode {
     IssueSearch {
         input: Input,
     },
+    CommandPalette {
+        input: Input,
+        entries: Vec<crate::palette::PaletteEntry>,
+        selected: usize,
+        scroll_top: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +84,7 @@ pub enum FocusTarget {
     FilePickerList,
     DeleteConfirmDialog,
     CloseConfirmDialog,
+    CommandPalette,
 }
 
 impl UiMode {
@@ -96,6 +103,7 @@ impl UiMode {
             UiMode::DeleteConfirm { .. } => FocusTarget::DeleteConfirmDialog,
             UiMode::CloseConfirm { .. } => FocusTarget::CloseConfirmDialog,
             UiMode::IssueSearch { .. } => FocusTarget::IssueSearchInput,
+            UiMode::CommandPalette { .. } => FocusTarget::CommandPalette,
         }
     }
 }
@@ -370,6 +378,7 @@ mod tests {
                 false,
             ),
             (UiMode::IssueSearch { input: Input::default() }, false),
+            (UiMode::CommandPalette { input: Input::default(), entries: vec![], selected: 0, scroll_top: 0 }, false),
         ];
         for (mode, expected) in &cases {
             assert_eq!(mode.is_config(), *expected, "failed for mode variant");
@@ -417,6 +426,7 @@ mod tests {
                 FocusTarget::CloseConfirmDialog,
             ),
             (UiMode::IssueSearch { input: Input::default() }, FocusTarget::IssueSearchInput),
+            (UiMode::CommandPalette { input: Input::default(), entries: vec![], selected: 0, scroll_top: 0 }, FocusTarget::CommandPalette),
         ];
 
         for (mode, expected) in cases {

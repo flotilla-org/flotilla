@@ -446,6 +446,9 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
             task: None,
             mode_indicators: vec![],
         },
+        UiMode::CommandPalette { .. } => {
+            StatusBarContent { status: StatusSection::plain(""), keys: vec![], task: None, mode_indicators: vec![] }
+        }
     }
 }
 

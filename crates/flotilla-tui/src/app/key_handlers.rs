@@ -31,6 +31,15 @@ impl App {
                     _ => None,
                 };
             }
+            ModeId::CommandPalette => {
+                return match key.code {
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter | KeyCode::Tab => Some(Action::Confirm),
+                    KeyCode::Up => Some(Action::SelectPrev),
+                    KeyCode::Down => Some(Action::SelectNext),
+                    _ => None,
+                };
+            }
             // FilePicker has both a text input and a navigation list.
             // Hardcoded rather than routed through the keymap because shared
             // bindings (e.g. `?` → ToggleHelp) would intercept keys the user
@@ -74,6 +83,20 @@ impl App {
                     }
                 }
                 FocusTarget::FilePickerList => self.file_picker_select_next(),
+                FocusTarget::CommandPalette => {
+                    if let UiMode::CommandPalette { ref input, ref entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
+                        let count = crate::palette::filter_entries(entries, input.value()).len();
+                        if count > 0 {
+                            *selected = (*selected + 1) % count;
+                            let max_visible = 8usize;
+                            if *selected >= *scroll_top + max_visible {
+                                *scroll_top = selected.saturating_sub(max_visible - 1);
+                            } else if *selected < *scroll_top {
+                                *scroll_top = *selected;
+                            }
+                        }
+                    }
+                }
                 FocusTarget::BranchInput
                 | FocusTarget::IssueSearchInput
                 | FocusTarget::DeleteConfirmDialog
@@ -97,6 +120,20 @@ impl App {
                     }
                 }
                 FocusTarget::FilePickerList => self.file_picker_select_prev(),
+                FocusTarget::CommandPalette => {
+                    if let UiMode::CommandPalette { ref input, ref entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
+                        let count = crate::palette::filter_entries(entries, input.value()).len();
+                        if count > 0 {
+                            *selected = if *selected == 0 { count - 1 } else { *selected - 1 };
+                            let max_visible = 8usize;
+                            if *selected >= *scroll_top + max_visible {
+                                *scroll_top = selected.saturating_sub(max_visible - 1);
+                            } else if *selected < *scroll_top {
+                                *scroll_top = *selected;
+                            }
+                        }
+                    }
+                }
                 FocusTarget::BranchInput
                 | FocusTarget::IssueSearchInput
                 | FocusTarget::DeleteConfirmDialog
@@ -177,6 +214,18 @@ impl App {
                             repo_identity: self.model.active_repo_identity().clone(),
                         };
                         self.proto_commands.push_with_context(command.clone(), Some(ctx));
+                    }
+                    self.ui.mode = UiMode::Normal;
+                }
+                FocusTarget::CommandPalette => {
+                    if let UiMode::CommandPalette { ref input, ref entries, selected, .. } = self.ui.mode {
+                        let filtered = crate::palette::filter_entries(entries, input.value());
+                        if let Some(entry) = filtered.get(selected) {
+                            let action = entry.action;
+                            self.ui.mode = UiMode::Normal;
+                            self.dispatch_action(action);
+                            return;
+                        }
                     }
                     self.ui.mode = UiMode::Normal;
                 }
@@ -261,6 +310,16 @@ impl App {
                     self.open_file_picker_from_active_repo_parent();
                 }
             }
+            Action::OpenCommandPalette => {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
+                    self.ui.mode = UiMode::CommandPalette {
+                        input: Input::default(),
+                        entries: crate::palette::all_entries(),
+                        selected: 0,
+                        scroll_top: 0,
+                    };
+                }
+            }
             Action::Dismiss => match self.ui.mode.focus_target() {
                 FocusTarget::WorkItemTable => {
                     // Cancellation takes priority over other dismiss actions while a command is running.
@@ -287,7 +346,8 @@ impl App {
                 | FocusTarget::BranchInput
                 | FocusTarget::FilePickerList
                 | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog => {
+                | FocusTarget::CloseConfirmDialog
+                | FocusTarget::CommandPalette => {
                     self.ui.mode = UiMode::Normal;
                 }
                 FocusTarget::IssueSearchInput => {
@@ -317,6 +377,16 @@ impl App {
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
             UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
             UiMode::IssueSearch { .. } => self.handle_issue_search_key(key),
+            UiMode::CommandPalette { ref mut input, ref mut selected, ref mut scroll_top, .. } => {
+                input.handle_event(&crossterm::event::Event::Key(key));
+                // Typing / when input is empty opens search directly
+                if input.value() == "/" {
+                    self.ui.mode = UiMode::IssueSearch { input: Input::default() };
+                    return;
+                }
+                *selected = 0;
+                *scroll_top = 0;
+            }
             _ => {}
         }
     }
@@ -341,7 +411,8 @@ impl App {
             | UiMode::DeleteConfirm { .. }
             | UiMode::CloseConfirm { .. }
             | UiMode::BranchInput { .. }
-            | UiMode::IssueSearch { .. } => {
+            | UiMode::IssueSearch { .. }
+            | UiMode::CommandPalette { .. } => {
                 return;
             }
             UiMode::Config | UiMode::Normal => {}
@@ -1111,10 +1182,10 @@ mod tests {
     }
 
     #[test]
-    fn normal_slash_enters_issue_search() {
+    fn normal_slash_opens_command_palette() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('/')));
-        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+        assert!(matches!(app.ui.mode, UiMode::CommandPalette { .. }));
     }
 
     #[test]
@@ -1173,14 +1244,14 @@ mod tests {
     }
 
     #[test]
-    fn clicking_search_status_target_enters_issue_search_mode() {
+    fn clicking_search_status_target_opens_command_palette() {
         let mut app = stub_app();
         app.ui.layout.status_bar.key_targets =
             vec![StatusBarTarget::new(Rect::new(10, 29, 12, 1), StatusBarAction::key(KeyCode::Char('/')))];
 
         app.handle_mouse(left_click(12, 29));
 
-        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+        assert!(matches!(app.ui.mode, UiMode::CommandPalette { .. }));
     }
 
     #[test]
