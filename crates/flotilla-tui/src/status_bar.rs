@@ -353,7 +353,8 @@ mod tests {
             mode_indicators: vec![ModeIndicator::new("□", "zoom", StatusBarAction::key(KeyCode::Char('l')))],
         });
 
-        // Mode indicators should survive even if keys are shed
+        // Mode indicators survive even when keys are shed
         assert_eq!(model.mode_indicators.len(), 1);
+        assert!(model.visible_keys.len() < 2, "at least one key should have been shed");
     }
 }

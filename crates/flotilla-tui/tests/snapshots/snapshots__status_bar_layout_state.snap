@@ -31,4 +31,4 @@ expression: output
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                             <ENT> OPEN  <.> MENU  </> SEARCH  <n> NEW  <?> HELP    ▤ below  @local
+                             <ENT> OPEN  <.> MENU  </> SEARCH  <n> NEW  <?> HELP    ▤ below   @local

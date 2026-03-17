@@ -31,4 +31,4 @@ expression: output
 │                                                                      │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
-ERROR Remote host unreachable × <ENT> OPEN    ◫ auto  @local
+ERROR Remote host unreachable × <ENT> OPEN    ◫ auto   @local

@@ -311,9 +311,7 @@ fn render_status_bar(
     let label_style = Style::default().fg(theme.muted).bg(theme.bar_bg);
     for indicator in &status_model.mode_indicators {
         let indicator_start = x;
-        if !indicator.icon.is_empty() {
-            spans.push(Span::styled(format!(" {}", indicator.icon), icon_style));
-        }
+        spans.push(Span::styled(format!(" {}", indicator.icon), icon_style));
         spans.push(Span::styled(format!(" {} ", indicator.label), label_style));
         let indicator_width = indicator.width();
         ui.layout.status_bar.key_targets.push(StatusBarTarget::new(
