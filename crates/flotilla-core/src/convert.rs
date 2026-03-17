@@ -86,6 +86,7 @@ pub fn correlation_result_to_work_item(item: &CorrelationResult, groups: &[Corre
         debug_group,
         source: item.source().map(|s| s.to_string()),
         terminal_keys: item.terminal_ids().to_vec(),
+        attachable_set_id: item.attachable_set_id().cloned(),
     }
 }
 
@@ -95,6 +96,7 @@ fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
     for ci in &group.items {
         let kind_label = match ci.kind {
             CorItemKind::Checkout => "Checkout",
+            CorItemKind::AttachableSet => "AttachableSet",
             CorItemKind::ChangeRequest => "CR",
             CorItemKind::CloudSession => "Session",
             CorItemKind::Workspace => "Workspace",
@@ -304,6 +306,8 @@ mod tests {
     fn convert_correlated_checkout() {
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/repos/my-project/wt-1"), is_main_checkout: false }),
+            checkout_ref: Some(CheckoutRef { key: hp("/repos/my-project/wt-1"), is_main_checkout: false }),
+            attachable_set_id: None,
             branch: Some("feature-login".to_string()),
             description: "Implement login flow".to_string(),
             linked_change_request: Some("PR#55".to_string()),
@@ -311,6 +315,7 @@ mod tests {
             linked_issues: vec!["GH-10".to_string(), "LIN-20".to_string()],
             workspace_refs: vec!["cmux-1".to_string()],
             correlation_group_idx: 0,
+            host: Some(test_host()),
             source: None,
             terminal_ids: vec![],
         });
@@ -363,6 +368,8 @@ mod tests {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/repos/proj/wt"), is_main_checkout: false }),
+            checkout_ref: Some(CheckoutRef { key: hp("/repos/proj/wt"), is_main_checkout: false }),
+            attachable_set_id: None,
             branch: Some("feat".to_string()),
             description: "Feature".to_string(),
             linked_change_request: None,
@@ -370,6 +377,7 @@ mod tests {
             linked_issues: vec![],
             workspace_refs: vec![],
             correlation_group_idx: 0,
+            host: Some(test_host()),
             source: Some(hostname.clone()),
             terminal_ids: vec![],
         });
@@ -381,6 +389,8 @@ mod tests {
     fn convert_correlated_session_has_provider_source() {
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Session("sess-1".to_string()),
+            checkout_ref: None,
+            attachable_set_id: None,
             branch: None,
             description: "My session".to_string(),
             linked_change_request: None,
@@ -388,6 +398,7 @@ mod tests {
             linked_issues: vec![],
             workspace_refs: vec![],
             correlation_group_idx: 0,
+            host: None,
             source: Some("Claude".to_string()),
             terminal_ids: vec![],
         });
@@ -423,6 +434,11 @@ mod tests {
                 key: HostPath::new(remote_host.clone(), PathBuf::from("/repos/proj")),
                 is_main_checkout: false,
             }),
+            checkout_ref: Some(CheckoutRef {
+                key: HostPath::new(remote_host.clone(), PathBuf::from("/repos/proj")),
+                is_main_checkout: false,
+            }),
+            attachable_set_id: None,
             branch: Some("feat".to_string()),
             description: "Feature".to_string(),
             linked_change_request: None,
@@ -431,6 +447,7 @@ mod tests {
             workspace_refs: vec![],
             terminal_ids: vec![],
             correlation_group_idx: 0,
+            host: Some(remote_host.clone()),
             source: None,
         });
         let local = HostName::new("local-machine");

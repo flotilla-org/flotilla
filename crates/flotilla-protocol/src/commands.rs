@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::RepoIdentity;
+use crate::{AttachableSetId, RepoIdentity};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoSelector {
@@ -52,6 +52,8 @@ pub enum CommandAction {
         target_host: crate::HostName,
         branch: String,
         checkout_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachable_set_id: Option<AttachableSetId>,
         commands: Vec<PreparedTerminalCommand>,
     },
     SelectWorkspace {
@@ -190,6 +192,8 @@ pub enum CommandResult {
         target_host: crate::HostName,
         branch: String,
         checkout_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachable_set_id: Option<AttachableSetId>,
         commands: Vec<PreparedTerminalCommand>,
     },
     BranchNameGenerated {
@@ -228,7 +232,7 @@ pub struct CheckoutStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_helpers::assert_json_roundtrip, HostName, RepoIdentity};
+    use crate::{test_helpers::assert_json_roundtrip, AttachableSetId, HostName, RepoIdentity};
 
     fn repo_identity() -> RepoIdentity {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
@@ -250,6 +254,7 @@ mod tests {
                     target_host: HostName::new("desktop"),
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
+                    attachable_set_id: Some(AttachableSetId::new("set-1")),
                     commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
                 },
             },
@@ -382,6 +387,7 @@ mod tests {
                 target_host: HostName::new("desktop"),
                 branch: "feat-x".into(),
                 checkout_path: PathBuf::from("/remote/repo/feat-x"),
+                attachable_set_id: Some(AttachableSetId::new("set-1")),
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
             },
             CommandResult::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
@@ -473,6 +479,7 @@ mod tests {
                     target_host: HostName::new("desktop"),
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
+                    attachable_set_id: None,
                     commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
                 },
             },

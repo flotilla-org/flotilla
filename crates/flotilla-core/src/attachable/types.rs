@@ -1,47 +1,8 @@
 use std::path::PathBuf;
 
-use flotilla_protocol::{HostName, HostPath, TerminalStatus};
+use flotilla_protocol::TerminalStatus;
+pub use flotilla_protocol::{AttachableId, AttachableSet, AttachableSetId};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AttachableSetId(String);
-
-impl AttachableSetId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for AttachableSetId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AttachableId(String);
-
-impl AttachableId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for AttachableId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttachableContent {
@@ -62,19 +23,6 @@ pub struct TerminalAttachable {
     pub command: String,
     pub working_directory: PathBuf,
     pub status: TerminalStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachableSet {
-    pub id: AttachableSetId,
-    #[serde(default)]
-    pub host_affinity: Option<HostName>,
-    #[serde(default)]
-    pub checkout: Option<HostPath>,
-    #[serde(default)]
-    pub template_identity: Option<String>,
-    #[serde(default)]
-    pub members: Vec<AttachableId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

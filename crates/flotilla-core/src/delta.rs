@@ -55,6 +55,9 @@ pub fn diff_provider_data(prev: &ProviderData, curr: &ProviderData) -> Vec<Chang
     for (key, op) in diff_indexmap(&prev.workspaces, &curr.workspaces) {
         changes.push(Change::Workspace { key, op });
     }
+    for (key, op) in diff_indexmap(&prev.attachable_sets, &curr.attachable_sets) {
+        changes.push(Change::AttachableSet { key, op });
+    }
     for (key, op) in diff_indexmap(&prev.branches, &curr.branches) {
         changes.push(Change::Branch { key, op });
     }
@@ -86,6 +89,7 @@ pub fn apply_changes(pd: &mut ProviderData, changes: Vec<Change>) {
             Change::Issue { key, op } => apply_op(&mut pd.issues, key, op),
             Change::Session { key, op } => apply_op(&mut pd.sessions, key, op),
             Change::Workspace { key, op } => apply_op(&mut pd.workspaces, key, op),
+            Change::AttachableSet { key, op } => apply_op(&mut pd.attachable_sets, key, op),
             Change::Branch { key, op } => apply_op(&mut pd.branches, key, op),
             // WorkItem and ProviderHealth are snapshot-level, not ProviderData-level.
             // They'll be handled at a higher layer.
@@ -184,7 +188,7 @@ mod tests {
     }
 
     fn workspace(name: &str) -> Workspace {
-        Workspace { name: name.into(), directories: vec![], correlation_keys: vec![] }
+        Workspace { name: name.into(), directories: vec![], correlation_keys: vec![], attachable_set_id: None }
     }
 
     // --- diff_indexmap tests ---
@@ -353,6 +357,7 @@ mod tests {
             debug_group: vec![],
             source: None,
             terminal_keys: vec![],
+            attachable_set_id: None,
         }
     }
 

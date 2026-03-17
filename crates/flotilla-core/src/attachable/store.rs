@@ -27,77 +27,116 @@ pub struct AttachableRegistry {
     pub bindings: Vec<ProviderBinding>,
 }
 
-pub struct AttachableStore {
-    path: PathBuf,
-    registry: AttachableRegistry,
-    binding_index: HashMap<BindingKey, String>,
-}
-
-pub type SharedAttachableStore = Arc<Mutex<AttachableStore>>;
-
-impl AttachableStore {
-    pub fn new() -> Self {
-        Self::with_path(flotilla_config_dir().join("attachables").join("registry.json"))
-    }
-
-    pub fn with_base(base: impl AsRef<Path>) -> Self {
-        Self::with_path(base.as_ref().join("attachables").join("registry.json"))
-    }
-
-    pub fn with_path(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let registry = match Self::load_registry(&path) {
-            Ok(registry) => registry,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), err = %err, "failed to load attachable registry, starting empty");
-                AttachableRegistry::default()
-            }
-        };
-        let binding_index = Self::build_binding_index(&registry);
-        Self { path, registry, binding_index }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn binding_count(&self) -> usize {
-        self.registry.bindings.len()
-    }
-
-    pub fn registry(&self) -> &AttachableRegistry {
-        &self.registry
-    }
-
-    pub fn allocate_set_id(&self) -> AttachableSetId {
-        AttachableSetId::new(Uuid::new_v4().to_string())
-    }
-
-    pub fn allocate_attachable_id(&self) -> AttachableId {
-        AttachableId::new(Uuid::new_v4().to_string())
-    }
-
-    pub fn insert_set(&mut self, set: AttachableSet) {
-        self.registry.sets.insert(set.id.clone(), set);
-    }
-
-    pub fn insert_attachable(&mut self, attachable: Attachable) {
-        self.registry.attachables.insert(attachable.id.clone(), attachable);
-    }
-
-    pub fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
-        self.ensure_terminal_set_with_change(host_affinity, checkout).0
-    }
-
+pub trait AttachableStoreApi: Send + Sync {
+    fn binding_count(&self) -> usize;
+    fn registry(&self) -> &AttachableRegistry;
+    fn allocate_set_id(&self) -> AttachableSetId;
+    fn allocate_attachable_id(&self) -> AttachableId;
+    fn insert_set(&mut self, set: AttachableSet);
+    fn insert_attachable(&mut self, attachable: Attachable);
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId;
     #[allow(clippy::too_many_arguments)]
-    pub fn ensure_terminal_attachable(
+    fn ensure_terminal_attachable(
         &mut self,
         set_id: &AttachableSetId,
         provider_category: &str,
         provider_name: &str,
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
-        command: impl Into<String>,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> AttachableId;
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool);
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_terminal_attachable_with_change(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> (AttachableId, bool);
+    fn replace_binding(&mut self, binding: ProviderBinding) -> bool;
+    fn lookup_binding(
+        &self,
+        provider_category: &str,
+        provider_name: &str,
+        object_kind: BindingObjectKind,
+        external_ref: &str,
+    ) -> Option<&str>;
+    fn save(&self) -> Result<(), String>;
+}
+
+pub type SharedAttachableStore = Arc<Mutex<Box<dyn AttachableStoreApi>>>;
+
+pub fn shared_attachable_store<S>(store: S) -> SharedAttachableStore
+where
+    S: AttachableStoreApi + 'static,
+{
+    Arc::new(Mutex::new(Box::new(store)))
+}
+
+pub fn shared_file_backed_attachable_store(base: impl AsRef<Path>) -> SharedAttachableStore {
+    shared_attachable_store(AttachableStore::with_base(base))
+}
+
+pub fn shared_in_memory_attachable_store() -> SharedAttachableStore {
+    shared_attachable_store(InMemoryAttachableStore::new())
+}
+
+#[derive(Debug, Clone, Default)]
+struct AttachableStoreState {
+    registry: AttachableRegistry,
+    binding_index: HashMap<BindingKey, String>,
+}
+
+impl AttachableStoreState {
+    fn from_registry(registry: AttachableRegistry) -> Self {
+        let binding_index = Self::build_binding_index(&registry);
+        Self { registry, binding_index }
+    }
+
+    fn binding_count(&self) -> usize {
+        self.registry.bindings.len()
+    }
+
+    fn registry(&self) -> &AttachableRegistry {
+        &self.registry
+    }
+
+    fn allocate_set_id(&self) -> AttachableSetId {
+        AttachableSetId::new(Uuid::new_v4().to_string())
+    }
+
+    fn allocate_attachable_id(&self) -> AttachableId {
+        AttachableId::new(Uuid::new_v4().to_string())
+    }
+
+    fn insert_set(&mut self, set: AttachableSet) {
+        self.registry.sets.insert(set.id.clone(), set);
+    }
+
+    fn insert_attachable(&mut self, attachable: Attachable) {
+        self.registry.attachables.insert(attachable.id.clone(), attachable);
+    }
+
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+        self.ensure_terminal_set_with_change(host_affinity, checkout).0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_terminal_attachable(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
         working_directory: PathBuf,
         status: TerminalStatus,
     ) -> AttachableId {
@@ -114,11 +153,7 @@ impl AttachableStore {
         .0
     }
 
-    pub fn ensure_terminal_set_with_change(
-        &mut self,
-        host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
-    ) -> (AttachableSetId, bool) {
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
         if let Some(existing) = self.registry.sets.values().find(|set| set.host_affinity == host_affinity && set.checkout == checkout) {
             return (existing.id.clone(), false);
         }
@@ -129,20 +164,20 @@ impl AttachableStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn ensure_terminal_attachable_with_change(
+    fn ensure_terminal_attachable_with_change(
         &mut self,
         set_id: &AttachableSetId,
         provider_category: &str,
         provider_name: &str,
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
-        command: impl Into<String>,
+        command: &str,
         working_directory: PathBuf,
         status: TerminalStatus,
     ) -> (AttachableId, bool) {
         let new_content = AttachableContent::Terminal(TerminalAttachable {
             purpose: terminal_purpose,
-            command: command.into(),
+            command: command.to_string(),
             working_directory,
             status,
         });
@@ -181,7 +216,7 @@ impl AttachableStore {
         (id, changed)
     }
 
-    pub fn replace_binding(&mut self, binding: ProviderBinding) -> bool {
+    fn replace_binding(&mut self, binding: ProviderBinding) -> bool {
         if self.registry.bindings.iter().any(|existing| existing == &binding) {
             return false;
         }
@@ -197,7 +232,7 @@ impl AttachableStore {
         true
     }
 
-    pub fn lookup_binding(
+    fn lookup_binding(
         &self,
         provider_category: &str,
         provider_name: &str,
@@ -206,24 +241,6 @@ impl AttachableStore {
     ) -> Option<&str> {
         let key = Self::binding_key(provider_category, provider_name, &object_kind, external_ref);
         self.binding_index.get(&key).map(String::as_str)
-    }
-
-    pub fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("failed to create attachable dir: {e}"))?;
-        }
-        let json = serde_json::to_string_pretty(&self.registry).map_err(|e| format!("failed to serialize attachable registry: {e}"))?;
-        std::fs::write(&self.path, json).map_err(|e| format!("failed to write attachable registry: {e}"))?;
-        Ok(())
-    }
-
-    fn load_registry(path: &Path) -> Result<AttachableRegistry, String> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AttachableRegistry::default()),
-            Err(e) => return Err(format!("failed to read attachable registry: {e}")),
-        };
-        serde_json::from_str(&contents).map_err(|e| format!("failed to parse attachable registry: {e}"))
     }
 
     fn build_binding_index(registry: &AttachableRegistry) -> HashMap<BindingKey, String> {
@@ -263,9 +280,368 @@ impl AttachableStore {
     }
 }
 
+pub struct AttachableStore {
+    path: PathBuf,
+    state: AttachableStoreState,
+}
+
+impl AttachableStore {
+    pub fn new() -> Self {
+        Self::with_path(flotilla_config_dir().join("attachables").join("registry.json"))
+    }
+
+    pub fn with_base(base: impl AsRef<Path>) -> Self {
+        Self::with_path(base.as_ref().join("attachables").join("registry.json"))
+    }
+
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let registry = match Self::load_registry(&path) {
+            Ok(registry) => registry,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), err = %err, "failed to load attachable registry, starting empty");
+                AttachableRegistry::default()
+            }
+        };
+        Self { path, state: AttachableStoreState::from_registry(registry) }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn binding_count(&self) -> usize {
+        self.state.binding_count()
+    }
+
+    pub fn registry(&self) -> &AttachableRegistry {
+        self.state.registry()
+    }
+
+    pub fn allocate_set_id(&self) -> AttachableSetId {
+        self.state.allocate_set_id()
+    }
+
+    pub fn allocate_attachable_id(&self) -> AttachableId {
+        self.state.allocate_attachable_id()
+    }
+
+    pub fn insert_set(&mut self, set: AttachableSet) {
+        self.state.insert_set(set);
+    }
+
+    pub fn insert_attachable(&mut self, attachable: Attachable) {
+        self.state.insert_attachable(attachable);
+    }
+
+    pub fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+        self.state.ensure_terminal_set(host_affinity, checkout)
+    }
+
+    pub fn ensure_terminal_set_with_change(
+        &mut self,
+        host_affinity: Option<HostName>,
+        checkout: Option<HostPath>,
+    ) -> (AttachableSetId, bool) {
+        self.state.ensure_terminal_set_with_change(host_affinity, checkout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_terminal_attachable(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> AttachableId {
+        self.state.ensure_terminal_attachable(
+            set_id,
+            provider_category,
+            provider_name,
+            external_ref,
+            terminal_purpose,
+            command,
+            working_directory,
+            status,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_terminal_attachable_with_change(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> (AttachableId, bool) {
+        self.state.ensure_terminal_attachable_with_change(
+            set_id,
+            provider_category,
+            provider_name,
+            external_ref,
+            terminal_purpose,
+            command,
+            working_directory,
+            status,
+        )
+    }
+
+    pub fn replace_binding(&mut self, binding: ProviderBinding) -> bool {
+        self.state.replace_binding(binding)
+    }
+
+    pub fn lookup_binding(
+        &self,
+        provider_category: &str,
+        provider_name: &str,
+        object_kind: BindingObjectKind,
+        external_ref: &str,
+    ) -> Option<&str> {
+        self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("failed to create attachable dir: {e}"))?;
+        }
+        let json =
+            serde_json::to_string_pretty(self.state.registry()).map_err(|e| format!("failed to serialize attachable registry: {e}"))?;
+        std::fs::write(&self.path, json).map_err(|e| format!("failed to write attachable registry: {e}"))?;
+        Ok(())
+    }
+
+    fn load_registry(path: &Path) -> Result<AttachableRegistry, String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AttachableRegistry::default()),
+            Err(e) => return Err(format!("failed to read attachable registry: {e}")),
+        };
+        serde_json::from_str(&contents).map_err(|e| format!("failed to parse attachable registry: {e}"))
+    }
+}
+
 impl Default for AttachableStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl AttachableStoreApi for AttachableStore {
+    fn binding_count(&self) -> usize {
+        self.state.binding_count()
+    }
+
+    fn registry(&self) -> &AttachableRegistry {
+        self.state.registry()
+    }
+
+    fn allocate_set_id(&self) -> AttachableSetId {
+        self.state.allocate_set_id()
+    }
+
+    fn allocate_attachable_id(&self) -> AttachableId {
+        self.state.allocate_attachable_id()
+    }
+
+    fn insert_set(&mut self, set: AttachableSet) {
+        self.state.insert_set(set);
+    }
+
+    fn insert_attachable(&mut self, attachable: Attachable) {
+        self.state.insert_attachable(attachable);
+    }
+
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+        self.state.ensure_terminal_set(host_affinity, checkout)
+    }
+
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
+        self.state.ensure_terminal_set_with_change(host_affinity, checkout)
+    }
+
+    fn ensure_terminal_attachable(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> AttachableId {
+        self.state.ensure_terminal_attachable(
+            set_id,
+            provider_category,
+            provider_name,
+            external_ref,
+            terminal_purpose,
+            command,
+            working_directory,
+            status,
+        )
+    }
+
+    fn ensure_terminal_attachable_with_change(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> (AttachableId, bool) {
+        self.state.ensure_terminal_attachable_with_change(
+            set_id,
+            provider_category,
+            provider_name,
+            external_ref,
+            terminal_purpose,
+            command,
+            working_directory,
+            status,
+        )
+    }
+
+    fn replace_binding(&mut self, binding: ProviderBinding) -> bool {
+        self.state.replace_binding(binding)
+    }
+
+    fn lookup_binding(
+        &self,
+        provider_category: &str,
+        provider_name: &str,
+        object_kind: BindingObjectKind,
+        external_ref: &str,
+    ) -> Option<&str> {
+        self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
+    }
+
+    fn save(&self) -> Result<(), String> {
+        AttachableStore::save(self)
+    }
+}
+
+#[derive(Default)]
+pub struct InMemoryAttachableStore {
+    state: AttachableStoreState,
+}
+
+impl InMemoryAttachableStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_registry(registry: AttachableRegistry) -> Self {
+        Self { state: AttachableStoreState::from_registry(registry) }
+    }
+}
+
+impl AttachableStoreApi for InMemoryAttachableStore {
+    fn binding_count(&self) -> usize {
+        self.state.binding_count()
+    }
+
+    fn registry(&self) -> &AttachableRegistry {
+        self.state.registry()
+    }
+
+    fn allocate_set_id(&self) -> AttachableSetId {
+        self.state.allocate_set_id()
+    }
+
+    fn allocate_attachable_id(&self) -> AttachableId {
+        self.state.allocate_attachable_id()
+    }
+
+    fn insert_set(&mut self, set: AttachableSet) {
+        self.state.insert_set(set);
+    }
+
+    fn insert_attachable(&mut self, attachable: Attachable) {
+        self.state.insert_attachable(attachable);
+    }
+
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+        self.state.ensure_terminal_set(host_affinity, checkout)
+    }
+
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
+        self.state.ensure_terminal_set_with_change(host_affinity, checkout)
+    }
+
+    fn ensure_terminal_attachable(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> AttachableId {
+        self.state.ensure_terminal_attachable(
+            set_id,
+            provider_category,
+            provider_name,
+            external_ref,
+            terminal_purpose,
+            command,
+            working_directory,
+            status,
+        )
+    }
+
+    fn ensure_terminal_attachable_with_change(
+        &mut self,
+        set_id: &AttachableSetId,
+        provider_category: &str,
+        provider_name: &str,
+        external_ref: &str,
+        terminal_purpose: TerminalPurpose,
+        command: &str,
+        working_directory: PathBuf,
+        status: TerminalStatus,
+    ) -> (AttachableId, bool) {
+        self.state.ensure_terminal_attachable_with_change(
+            set_id,
+            provider_category,
+            provider_name,
+            external_ref,
+            terminal_purpose,
+            command,
+            working_directory,
+            status,
+        )
+    }
+
+    fn replace_binding(&mut self, binding: ProviderBinding) -> bool {
+        self.state.replace_binding(binding)
+    }
+
+    fn lookup_binding(
+        &self,
+        provider_category: &str,
+        provider_name: &str,
+        object_kind: BindingObjectKind,
+        external_ref: &str,
+    ) -> Option<&str> {
+        self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
+    }
+
+    fn save(&self) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -275,6 +651,171 @@ mod tests {
 
     use super::*;
     use crate::attachable::types::{TerminalAttachable, TerminalPurpose};
+
+    fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl AttachableStoreApi) {
+        let set_id =
+            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+
+        let first = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/0",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "claude",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+        let second = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/0",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "codex",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Disconnected,
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(store.registry().attachables.len(), 1);
+        let attachable = store.registry().attachables.get(&first).expect("attachable");
+        assert_eq!(
+            attachable.content,
+            AttachableContent::Terminal(TerminalAttachable {
+                purpose: TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+                command: "codex".into(),
+                working_directory: PathBuf::from("/repo/wt-feat"),
+                status: TerminalStatus::Disconnected,
+            })
+        );
+    }
+
+    fn contract_ensure_terminal_set_groups_members_by_host_and_checkout(store: &mut impl AttachableStoreApi) {
+        let host = HostName::new("desktop");
+        let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
+
+        let set_a = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
+        let set_b = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
+        assert_eq!(set_a, set_b);
+
+        let shell = store.ensure_terminal_attachable(
+            &set_a,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/0",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "claude",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+        let agent = store.ensure_terminal_attachable(
+            &set_a,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/agent/0",
+            TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
+            "codex",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+
+        let set = store.registry().sets.get(&set_a).expect("set");
+        assert_eq!(set.members, vec![shell, agent]);
+        assert_eq!(store.registry().sets.len(), 1);
+    }
+
+    fn contract_ensure_terminal_attachable_uses_binding_as_primary_identity(store: &mut impl AttachableStoreApi) {
+        let set_id =
+            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+
+        let first = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/0",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "claude",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+        let second = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/1",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "claude",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+
+        assert_ne!(first, second);
+        assert_eq!(store.registry().attachables.len(), 2);
+        assert_eq!(
+            store.registry().attachables.get(&second).map(|a| match &a.content {
+                AttachableContent::Terminal(terminal) => terminal.purpose.index,
+            }),
+            Some(0)
+        );
+    }
+
+    fn contract_replacing_binding_is_deterministic(store: &mut impl AttachableStoreApi) {
+        store.replace_binding(ProviderBinding {
+            provider_category: "workspace_manager".into(),
+            provider_name: "cmux".into(),
+            object_kind: BindingObjectKind::AttachableSet,
+            object_id: "set-old".into(),
+            external_ref: "workspace:1".into(),
+        });
+        store.replace_binding(ProviderBinding {
+            provider_category: "workspace_manager".into(),
+            provider_name: "cmux".into(),
+            object_kind: BindingObjectKind::AttachableSet,
+            object_id: "set-new".into(),
+            external_ref: "workspace:1".into(),
+        });
+
+        assert_eq!(store.lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "workspace:1"), Some("set-new"));
+        assert_eq!(store.binding_count(), 1);
+    }
+
+    fn contract_roundtrip_preserves_stable_ids(
+        mut store: impl AttachableStoreApi,
+        reload: impl FnOnce(AttachableRegistry) -> Box<dyn AttachableStoreApi>,
+    ) {
+        let host = HostName::new("desktop");
+        let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
+        let set_id = store.ensure_terminal_set(Some(host), Some(checkout));
+        let attachable_id = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/0",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "claude",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+        store.save().expect("save registry");
+
+        let mut reloaded = reload(store.registry().clone());
+        let same_set_id =
+            reloaded.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+        let same_attachable_id = reloaded.ensure_terminal_attachable(
+            &same_set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/0",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "claude",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+
+        assert_eq!(same_set_id, set_id);
+        assert_eq!(same_attachable_id, attachable_id);
+    }
 
     #[test]
     fn opaque_ids_roundtrip_as_strings() {
@@ -355,120 +896,39 @@ mod tests {
     }
 
     #[test]
-    fn ensure_terminal_attachable_reuses_existing_binding() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = AttachableStore::with_base(dir.path());
-        let set_id =
-            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
-
-        let first = store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/shell/0",
-            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-            "claude",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Running,
-        );
-        let second = store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/shell/0",
-            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-            "codex",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Disconnected,
-        );
-
-        assert_eq!(first, second);
-        assert_eq!(store.registry.attachables.len(), 1);
-        let attachable = store.registry.attachables.get(&first).expect("attachable");
-        assert_eq!(
-            attachable.content,
-            AttachableContent::Terminal(TerminalAttachable {
-                purpose: TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-                command: "codex".into(),
-                working_directory: PathBuf::from("/repo/wt-feat"),
-                status: TerminalStatus::Disconnected,
-            })
-        );
+    fn file_backed_contract_ensure_terminal_attachable_reuses_existing_binding() {
+        contract_ensure_terminal_attachable_reuses_existing_binding(&mut AttachableStore::with_base(
+            tempfile::tempdir().expect("tempdir").path(),
+        ));
     }
 
     #[test]
-    fn ensure_terminal_set_groups_members_by_host_and_checkout() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = AttachableStore::with_base(dir.path());
-        let host = HostName::new("desktop");
-        let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
-
-        let set_a = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
-        let set_b = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
-        assert_eq!(set_a, set_b);
-
-        let shell = store.ensure_terminal_attachable(
-            &set_a,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/shell/0",
-            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-            "claude",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Running,
-        );
-        let agent = store.ensure_terminal_attachable(
-            &set_a,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/agent/0",
-            TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
-            "codex",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Running,
-        );
-
-        let set = store.registry.sets.get(&set_a).expect("set");
-        assert_eq!(set.members, vec![shell, agent]);
-        assert_eq!(store.registry.sets.len(), 1);
+    fn in_memory_contract_ensure_terminal_attachable_reuses_existing_binding() {
+        contract_ensure_terminal_attachable_reuses_existing_binding(&mut InMemoryAttachableStore::new());
     }
 
     #[test]
-    fn ensure_terminal_attachable_uses_binding_as_primary_identity() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = AttachableStore::with_base(dir.path());
-        let set_id =
-            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+    fn file_backed_contract_ensure_terminal_set_groups_members_by_host_and_checkout() {
+        contract_ensure_terminal_set_groups_members_by_host_and_checkout(&mut AttachableStore::with_base(
+            tempfile::tempdir().expect("tempdir").path(),
+        ));
+    }
 
-        let first = store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/shell/0",
-            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-            "claude",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Running,
-        );
-        let second = store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/shell/1",
-            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-            "claude",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Running,
-        );
+    #[test]
+    fn in_memory_contract_ensure_terminal_set_groups_members_by_host_and_checkout() {
+        contract_ensure_terminal_set_groups_members_by_host_and_checkout(&mut InMemoryAttachableStore::new());
+    }
 
-        assert_ne!(first, second);
-        assert_eq!(store.registry.attachables.len(), 2);
-        assert_eq!(
-            store.registry.attachables.get(&second).map(|a| match &a.content {
-                AttachableContent::Terminal(terminal) => terminal.purpose.index,
-            }),
-            Some(0)
-        );
+    #[test]
+    fn file_backed_contract_ensure_terminal_attachable_uses_binding_as_primary_identity() {
+        contract_ensure_terminal_attachable_uses_binding_as_primary_identity(&mut AttachableStore::with_base(
+            tempfile::tempdir().expect("tempdir").path(),
+        ));
+    }
+
+    #[test]
+    fn in_memory_contract_ensure_terminal_attachable_uses_binding_as_primary_identity() {
+        contract_ensure_terminal_attachable_uses_binding_as_primary_identity(&mut InMemoryAttachableStore::new());
     }
 
     #[test]
@@ -485,69 +945,34 @@ mod tests {
     }
 
     #[test]
-    fn replacing_binding_is_deterministic() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = AttachableStore::with_base(dir.path());
-
-        store.replace_binding(ProviderBinding {
-            provider_category: "workspace_manager".into(),
-            provider_name: "cmux".into(),
-            object_kind: BindingObjectKind::AttachableSet,
-            object_id: "set-old".into(),
-            external_ref: "workspace:1".into(),
-        });
-        store.replace_binding(ProviderBinding {
-            provider_category: "workspace_manager".into(),
-            provider_name: "cmux".into(),
-            object_kind: BindingObjectKind::AttachableSet,
-            object_id: "set-new".into(),
-            external_ref: "workspace:1".into(),
-        });
-
-        assert_eq!(store.lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "workspace:1"), Some("set-new"));
-        assert_eq!(store.binding_count(), 1);
+    fn file_backed_contract_replacing_binding_is_deterministic() {
+        contract_replacing_binding_is_deterministic(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     }
 
     #[test]
-    fn save_load_preserves_stable_ids() {
+    fn in_memory_contract_replacing_binding_is_deterministic() {
+        contract_replacing_binding_is_deterministic(&mut InMemoryAttachableStore::new());
+    }
+
+    #[test]
+    fn file_backed_contract_roundtrip_preserves_stable_ids() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = AttachableStore::with_base(dir.path());
-        let host = HostName::new("desktop");
-        let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
-        let set_id = store.ensure_terminal_set(Some(host), Some(checkout));
-        let attachable_id = store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/shell/0",
-            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-            "claude",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Running,
-        );
-        store.save().expect("save registry");
+        contract_roundtrip_preserves_stable_ids(AttachableStore::with_base(dir.path()), |_| {
+            Box::new(AttachableStore::with_base(dir.path()))
+        });
+    }
 
-        let mut reloaded = AttachableStore::with_base(dir.path());
-        let same_set_id =
-            reloaded.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
-        let same_attachable_id = reloaded.ensure_terminal_attachable(
-            &same_set_id,
-            "terminal_pool",
-            "shpool",
-            "flotilla/feat/shell/0",
-            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-            "claude",
-            PathBuf::from("/repo/wt-feat"),
-            TerminalStatus::Running,
-        );
-
-        assert_eq!(same_set_id, set_id);
-        assert_eq!(same_attachable_id, attachable_id);
+    #[test]
+    fn in_memory_contract_roundtrip_preserves_stable_ids() {
+        contract_roundtrip_preserves_stable_ids(InMemoryAttachableStore::new(), |registry| {
+            Box::new(InMemoryAttachableStore::from_registry(registry))
+        });
     }
 
     #[test]
     fn provider_local_state_is_not_identity_source() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("attachables").join("registry.json");
         let mut store = AttachableStore::with_base(dir.path());
         let set_id =
             store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
@@ -563,7 +988,7 @@ mod tests {
         );
         store.save().expect("save registry");
 
-        std::fs::remove_file(store.path()).expect("remove persisted registry");
+        std::fs::remove_file(path).expect("remove persisted registry");
 
         let store = AttachableStore::with_base(dir.path());
         assert_ne!(

@@ -601,6 +601,7 @@ mod tests {
             debug_group: Vec::new(),
             source: None,
             terminal_keys: Vec::new(),
+            attachable_set_id: None,
         };
         table_view.table_entries.push(GroupEntry::Item(Box::new(item_a)));
         table_view.selectable_indices.push(0);

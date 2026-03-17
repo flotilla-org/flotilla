@@ -595,6 +595,7 @@ mod tests {
             debug_group: vec![],
             source: None,
             terminal_keys: vec![],
+            attachable_set_id: None,
         }
     }
 
@@ -768,6 +769,7 @@ mod tests {
                         debug_group: vec![],
                         source: None,
                         terminal_keys: vec![],
+                        attachable_set_id: None,
                     })
                     .collect(),
                 providers: Default::default(),

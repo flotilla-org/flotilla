@@ -32,6 +32,8 @@ mod tests {
             command: "$SHELL".into(),
             working_directory: PathBuf::from(format!("/home/dev/{name}")),
             status: TerminalStatus::Running,
+            attachable_id: None,
+            attachable_set_id: None,
         }
     }
 

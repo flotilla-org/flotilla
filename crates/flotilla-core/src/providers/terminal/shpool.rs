@@ -1,6 +1,7 @@
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -8,7 +9,10 @@ use flotilla_protocol::{HostName, HostPath, ManagedTerminal, ManagedTerminalId, 
 
 use super::TerminalPool;
 use crate::{
-    attachable::{AttachableStore, SharedAttachableStore, TerminalPurpose},
+    attachable::{
+        terminal_session_binding_ref, AttachableContent, AttachableId, AttachableStoreApi, BindingObjectKind, SharedAttachableStore,
+        TerminalPurpose,
+    },
     providers::{run, CommandRunner},
 };
 
@@ -17,6 +21,7 @@ pub struct ShpoolTerminalPool {
     socket_path: PathBuf,
     config_path: PathBuf,
     attachable_store: SharedAttachableStore,
+    missed_scans: Mutex<HashMap<String, u32>>,
 }
 
 /// Shpool config content managed by flotilla.
@@ -26,6 +31,7 @@ pub struct ShpoolTerminalPool {
 /// Note: `forward_env` only takes effect when creating new sessions,
 /// not when reattaching to existing ones (shpool limitation).
 const FLOTILLA_SHPOOL_CONFIG: &str = include_str!("shpool_config.toml");
+const MAX_MISSED_SHPOOL_SCANS_BEFORE_REAP: u32 = 1;
 
 impl ShpoolTerminalPool {
     /// Create a new ShpoolTerminalPool, cleaning up stale sockets and
@@ -56,7 +62,7 @@ impl ShpoolTerminalPool {
             Self::write_config(&config_path);
         }
         Self::start_daemon(&socket_path, &config_path).await;
-        Self { runner, socket_path, config_path, attachable_store }
+        Self { runner, socket_path, config_path, attachable_store, missed_scans: Mutex::new(HashMap::new()) }
     }
 
     /// Sync constructor for tests — skips daemon lifecycle.
@@ -64,7 +70,7 @@ impl ShpoolTerminalPool {
     pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf, attachable_store: SharedAttachableStore) -> Self {
         let config_path = socket_path.parent().unwrap_or(Path::new(".")).join("config.toml");
         Self::write_config(&config_path);
-        Self { runner, socket_path, config_path, attachable_store }
+        Self { runner, socket_path, config_path, attachable_store, missed_scans: Mutex::new(HashMap::new()) }
     }
 
     /// Check if a process is alive. Returns true for both "alive and ours"
@@ -342,41 +348,138 @@ impl ShpoolTerminalPool {
                 command: String::new(),            // shpool doesn't report the original command
                 working_directory: PathBuf::new(), // populated separately if needed
                 status,
+                attachable_id: None,
+                attachable_set_id: None,
             });
         }
 
         Ok(terminals)
     }
 
-    fn synthetic_checkout_path(id: &ManagedTerminalId) -> PathBuf {
-        // Fallback only when shpool does not report a working directory. This will
-        // not currently join to workspace bindings, which use a real checkout path.
-        PathBuf::from(format!(".flotilla/attachable/{}", id.checkout))
+    fn persist_expected_attachable(store: &mut dyn AttachableStoreApi, id: &ManagedTerminalId, command: &str, cwd: &Path) -> bool {
+        let host = HostName::local();
+        let checkout_path = cwd.to_path_buf();
+        let set_checkout = HostPath::new(host.clone(), checkout_path.clone());
+        let (set_id, changed_set) = store.ensure_terminal_set_with_change(Some(host), Some(set_checkout));
+        let session_name = terminal_session_binding_ref(id);
+        let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            &session_name,
+            TerminalPurpose { checkout: id.checkout.clone(), role: id.role.clone(), index: id.index },
+            command,
+            checkout_path,
+            TerminalStatus::Disconnected,
+        );
+        changed_set || changed_attachable
     }
 
-    fn register_attachable(store: &mut AttachableStore, terminal: &ManagedTerminal, session_name: &str) -> bool {
+    fn reconcile_known_attachable(store: &mut dyn AttachableStoreApi, terminal: &ManagedTerminal, session_name: &str) -> bool {
         // TODO(#360): prune stale attachables/bindings when sessions disappear so
         // the registry does not grow unbounded over time.
-        let host = HostName::local();
-        let checkout_path = if terminal.working_directory.as_os_str().is_empty() {
-            Self::synthetic_checkout_path(&terminal.id)
+        let Some(attachable_id) = store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, session_name)
+            .map(|id| AttachableId::new(id.to_string()))
+        else {
+            tracing::debug!(session = session_name, "ignoring unknown shpool session without persisted binding");
+            return false;
+        };
+        let (set_id, persisted_working_directory) = {
+            let Some(existing) = store.registry().attachables.get(&attachable_id) else {
+                tracing::warn!(session = session_name, attachable_id = %attachable_id, "shpool binding points to missing attachable");
+                return false;
+            };
+            let persisted_working_directory = match &existing.content {
+                AttachableContent::Terminal(existing_terminal) => existing_terminal.working_directory.clone(),
+            };
+            (existing.set_id.clone(), persisted_working_directory)
+        };
+        let working_directory = if terminal.working_directory.as_os_str().is_empty() {
+            persisted_working_directory
         } else {
             terminal.working_directory.clone()
         };
-
-        let set_checkout = HostPath::new(host.clone(), checkout_path.clone());
-        let (set_id, changed_set) = store.ensure_terminal_set_with_change(Some(host), Some(set_checkout));
         let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
             &set_id,
             "terminal_pool",
             "shpool",
             session_name,
             TerminalPurpose { checkout: terminal.id.checkout.clone(), role: terminal.id.role.clone(), index: terminal.id.index },
-            terminal.command.clone(),
-            checkout_path,
+            &terminal.command,
+            working_directory,
             terminal.status.clone(),
         );
-        changed_set || changed_attachable
+        changed_attachable
+    }
+
+    fn disconnected_known_terminals(
+        store: &mut dyn AttachableStoreApi,
+        observed_sessions: &HashSet<String>,
+        missed_scans: &mut HashMap<String, u32>,
+    ) -> (Vec<ManagedTerminal>, bool) {
+        let known_bindings: Vec<(String, AttachableId)> = store
+            .registry()
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.provider_category == "terminal_pool"
+                    && binding.provider_name == "shpool"
+                    && binding.object_kind == BindingObjectKind::Attachable
+                    && !observed_sessions.contains(&binding.external_ref)
+            })
+            .map(|binding| (binding.external_ref.clone(), AttachableId::new(binding.object_id.clone())))
+            .collect();
+
+        let mut terminals = Vec::new();
+        let mut any_changed = false;
+
+        for (session_name, attachable_id) in known_bindings {
+            let miss_count = missed_scans.entry(session_name.clone()).or_insert(0);
+            *miss_count += 1;
+            if *miss_count > MAX_MISSED_SHPOOL_SCANS_BEFORE_REAP {
+                missed_scans.remove(&session_name);
+                continue;
+            }
+
+            let Some((set_id, purpose, command, working_directory)) = ({
+                store.registry().attachables.get(&attachable_id).map(|attachable| match &attachable.content {
+                    AttachableContent::Terminal(existing_terminal) => (
+                        attachable.set_id.clone(),
+                        existing_terminal.purpose.clone(),
+                        existing_terminal.command.clone(),
+                        existing_terminal.working_directory.clone(),
+                    ),
+                })
+            }) else {
+                tracing::warn!(session = session_name, attachable_id = %attachable_id, "shpool binding points to missing attachable");
+                continue;
+            };
+
+            let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
+                &set_id,
+                "terminal_pool",
+                "shpool",
+                &session_name,
+                purpose.clone(),
+                &command,
+                working_directory.clone(),
+                TerminalStatus::Disconnected,
+            );
+            any_changed |= changed_attachable;
+
+            terminals.push(ManagedTerminal {
+                id: ManagedTerminalId { checkout: purpose.checkout, role: purpose.role.clone(), index: purpose.index },
+                role: purpose.role,
+                command,
+                working_directory,
+                status: TerminalStatus::Disconnected,
+                attachable_id: Some(attachable_id),
+                attachable_set_id: Some(set_id),
+            });
+        }
+
+        (terminals, any_changed)
     }
 }
 
@@ -389,16 +492,27 @@ impl TerminalPool for ShpoolTerminalPool {
 
         match result {
             Ok(json) => {
-                let terminals = Self::parse_list_json(&json)?;
+                let mut terminals = Self::parse_list_json(&json)?;
                 let Ok(mut store) = self.attachable_store.lock() else {
                     tracing::warn!("attachable store lock poisoned while registering shpool terminals");
                     return Ok(terminals);
                 };
+                let Ok(mut missed_scans) = self.missed_scans.lock() else {
+                    tracing::warn!("shpool missed-scan state lock poisoned while registering terminals");
+                    return Ok(terminals);
+                };
                 let mut any_changed = false;
+                let observed_sessions: HashSet<String> =
+                    terminals.iter().map(|terminal| terminal_session_binding_ref(&terminal.id)).collect();
                 for terminal in &terminals {
-                    let session_name = format!("flotilla/{}", terminal.id);
-                    any_changed |= Self::register_attachable(&mut store, terminal, &session_name);
+                    let session_name = terminal_session_binding_ref(&terminal.id);
+                    missed_scans.remove(&session_name);
+                    any_changed |= Self::reconcile_known_attachable(store.as_mut(), terminal, &session_name);
                 }
+                let (missing_terminals, missing_changed) =
+                    Self::disconnected_known_terminals(store.as_mut(), &observed_sessions, &mut missed_scans);
+                terminals.extend(missing_terminals);
+                any_changed |= missing_changed;
                 if any_changed {
                     if let Err(err) = store.save() {
                         tracing::warn!(err = %err, "failed to persist attachable registry after shpool refresh");
@@ -420,7 +534,7 @@ impl TerminalPool for ShpoolTerminalPool {
     }
 
     async fn attach_command(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<String, String> {
-        let session_name = format!("flotilla/{id}");
+        let session_name = terminal_session_binding_ref(id);
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
         let cwd_str = cwd.display().to_string();
@@ -451,10 +565,21 @@ impl TerminalPool for ShpoolTerminalPool {
             sq(&cwd_str),
             sq(&session_name),
         ))
+        .inspect(|_| {
+            let Ok(mut store) = self.attachable_store.lock() else {
+                tracing::warn!("attachable store lock poisoned while persisting expected shpool attachable");
+                return;
+            };
+            if Self::persist_expected_attachable(store.as_mut(), id, command, cwd) {
+                if let Err(err) = store.save() {
+                    tracing::warn!(err = %err, "failed to persist attachable registry after shpool attach command");
+                }
+            }
+        })
     }
 
     async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
-        let session_name = format!("flotilla/{id}");
+        let session_name = terminal_session_binding_ref(id);
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
         run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "kill", &session_name], Path::new("/"))
@@ -468,13 +593,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        attachable::{AttachableStore, BindingObjectKind, SharedAttachableStore},
+        attachable::{BindingObjectKind, SharedAttachableStore},
         providers::testing::MockRunner,
     };
 
     /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
     fn test_store(dir: &tempfile::TempDir) -> SharedAttachableStore {
-        Arc::new(std::sync::Mutex::new(AttachableStore::with_base(dir.path())))
+        crate::attachable::shared_file_backed_attachable_store(dir.path())
     }
 
     /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
@@ -634,7 +759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_terminals_registers_attachable_bindings() {
+    async fn list_terminals_updates_existing_attachable_bindings() {
         let json = r#"{
             "sessions": [
                 {
@@ -650,6 +775,14 @@ mod tests {
             ]
         }"#;
         let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(json.into())])));
+
+        let shell_id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
+        let agent_id = ManagedTerminalId { checkout: "my-feature".into(), role: "agent".into(), index: 0 };
+        let cwd = Path::new("/home/dev/project");
+
+        pool.attach_command(&shell_id, "bash", cwd).await.expect("seed shell binding");
+        pool.attach_command(&agent_id, "claude", cwd).await.expect("seed agent binding");
+
         let terminals = pool.list_terminals().await.expect("list terminals");
         assert_eq!(terminals.len(), 2);
 
@@ -658,10 +791,128 @@ mod tests {
         assert_eq!(store.registry().attachables.len(), 2);
         assert!(store.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0").is_some());
         assert!(store.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/agent/0").is_some());
+        let shell_attachable_id = store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0")
+            .expect("shell binding");
+        let shell_attachable =
+            store.registry().attachables.get(&flotilla_protocol::AttachableId::new(shell_attachable_id)).expect("shell attachable");
+        let agent_attachable_id = store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/agent/0")
+            .expect("agent binding");
+        let agent_attachable =
+            store.registry().attachables.get(&flotilla_protocol::AttachableId::new(agent_attachable_id)).expect("agent attachable");
+        let crate::attachable::AttachableContent::Terminal(shell_terminal) = &shell_attachable.content;
+        let crate::attachable::AttachableContent::Terminal(agent_terminal) = &agent_attachable.content;
+        assert_eq!(
+            shell_terminal.working_directory.as_path(),
+            cwd,
+            "known terminal binding should stay anchored to the real checkout path"
+        );
+        assert_eq!(shell_terminal.status, TerminalStatus::Running, "scan should update the known terminal status");
+        assert_eq!(
+            agent_terminal.status,
+            TerminalStatus::Disconnected,
+            "scan should reconcile disconnected known terminals without creating new identity"
+        );
     }
 
     #[tokio::test]
-    async fn attach_command_does_not_register_attachable_binding() {
+    async fn unknown_shpool_sessions_do_not_create_attachable_identity() {
+        let json = r#"{
+            "sessions": [
+                {
+                    "name": "flotilla/my-feature/shell/0",
+                    "started_at_unix_ms": 1709900000000,
+                    "status": "Attached"
+                }
+            ]
+        }"#;
+        let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(json.into())])));
+
+        let terminals = pool.list_terminals().await.expect("list terminals");
+
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].id.checkout, "my-feature");
+
+        let store = store.lock().expect("lock store");
+        assert!(store.registry().sets.is_empty(), "unknown scanned sessions should not mint attachable sets");
+        assert!(store.registry().attachables.is_empty(), "unknown scanned sessions should not mint attachables");
+        assert!(
+            store.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0").is_none(),
+            "unknown scanned sessions should not create provider bindings"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_shpool_sessions_stay_visible_during_grace_period() {
+        let running = r#"{
+            "sessions": [
+                {
+                    "name": "flotilla/my-feature/shell/0",
+                    "started_at_unix_ms": 1709900000000,
+                    "status": "Attached"
+                }
+            ]
+        }"#;
+        let empty = r#"{"sessions": []}"#;
+        let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(running.into()), Ok(empty.into())])));
+        let id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
+
+        pool.attach_command(&id, "bash", Path::new("/home/dev/project")).await.expect("seed binding");
+
+        let first_scan = pool.list_terminals().await.expect("first scan");
+        assert_eq!(first_scan.len(), 1);
+        assert_eq!(first_scan[0].status, TerminalStatus::Running);
+
+        let second_scan = pool.list_terminals().await.expect("second scan");
+        assert_eq!(second_scan.len(), 1, "known session should remain visible during the grace period");
+        assert_eq!(second_scan[0].id, id);
+        assert_eq!(second_scan[0].status, TerminalStatus::Disconnected);
+
+        let store = store.lock().expect("lock store");
+        let attachable_id = store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0")
+            .expect("known binding should remain persisted");
+        let attachable = store.registry().attachables.get(&flotilla_protocol::AttachableId::new(attachable_id)).expect("attachable");
+        let crate::attachable::AttachableContent::Terminal(terminal) = &attachable.content;
+        assert_eq!(terminal.status, TerminalStatus::Disconnected, "missing known session should update persisted liveness");
+    }
+
+    #[tokio::test]
+    async fn disconnected_shpool_sessions_are_reaped_after_grace_period() {
+        let running = r#"{
+            "sessions": [
+                {
+                    "name": "flotilla/my-feature/shell/0",
+                    "started_at_unix_ms": 1709900000000,
+                    "status": "Attached"
+                }
+            ]
+        }"#;
+        let empty = r#"{"sessions": []}"#;
+        let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(running.into()), Ok(empty.into()), Ok(empty.into())])));
+        let id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
+
+        pool.attach_command(&id, "bash", Path::new("/home/dev/project")).await.expect("seed binding");
+
+        let _ = pool.list_terminals().await.expect("first scan");
+        let second_scan = pool.list_terminals().await.expect("second scan");
+        assert_eq!(second_scan.len(), 1, "first miss should stay within the grace period");
+
+        let third_scan = pool.list_terminals().await.expect("third scan");
+        assert!(third_scan.is_empty(), "known session should be reaped from provider output after exceeding the grace period");
+
+        let store = store.lock().expect("lock store");
+        let attachable_id = store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0")
+            .expect("reaped session should retain persisted identity");
+        let attachable = store.registry().attachables.get(&flotilla_protocol::AttachableId::new(attachable_id)).expect("attachable");
+        let crate::attachable::AttachableContent::Terminal(terminal) = &attachable.content;
+        assert_eq!(terminal.status, TerminalStatus::Disconnected, "reaping should only remove live presence, not persisted identity");
+    }
+
+    #[tokio::test]
+    async fn attach_command_registers_expected_attachable_binding() {
         let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
@@ -671,10 +922,13 @@ mod tests {
         assert!(command.contains("flotilla/feat/shell/0"));
 
         let store = store.lock().expect("lock store");
-        assert!(
-            store.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0").is_none(),
-            "attach_command should not register a running attachable before the provider confirms it exists"
-        );
+        let attachable_id = store
+            .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0")
+            .expect("attach command should persist the expected session binding");
+        let attachable = store.registry().attachables.get(&flotilla_protocol::AttachableId::new(attachable_id)).expect("attachable");
+        let crate::attachable::AttachableContent::Terminal(terminal) = &attachable.content;
+        assert_eq!(store.registry().sets.len(), 1);
+        assert_eq!(terminal.working_directory.as_path(), Path::new("/home/dev/project"));
     }
 
     #[test]

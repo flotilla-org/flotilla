@@ -23,6 +23,7 @@ pub fn bare_item() -> WorkItem {
         debug_group: Vec::new(),
         source: None,
         terminal_keys: Vec::new(),
+        attachable_set_id: None,
     }
 }
 
@@ -43,6 +44,7 @@ pub fn issue_item(id: impl Into<String>) -> WorkItem {
         debug_group: Vec::new(),
         source: None,
         terminal_keys: Vec::new(),
+        attachable_set_id: None,
     }
 }
 
@@ -63,6 +65,7 @@ pub fn checkout_item(branch: &str, path: &str, is_main: bool) -> WorkItem {
         debug_group: Vec::new(),
         source: None,
         terminal_keys: Vec::new(),
+        attachable_set_id: None,
     }
 }
 
@@ -82,6 +85,7 @@ pub fn pr_item(pr_id: &str) -> WorkItem {
         debug_group: Vec::new(),
         source: None,
         terminal_keys: Vec::new(),
+        attachable_set_id: None,
     }
 }
 
@@ -101,6 +105,7 @@ pub fn session_item(session_id: &str) -> WorkItem {
         debug_group: Vec::new(),
         source: None,
         terminal_keys: Vec::new(),
+        attachable_set_id: None,
     }
 }
 
@@ -120,6 +125,7 @@ pub fn remote_branch_item(branch: &str) -> WorkItem {
         debug_group: Vec::new(),
         source: None,
         terminal_keys: Vec::new(),
+        attachable_set_id: None,
     }
 }
 

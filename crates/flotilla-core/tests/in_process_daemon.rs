@@ -7,6 +7,9 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::{
+    attachable::{
+        shared_in_memory_attachable_store, terminal_session_binding_ref, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose,
+    },
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
@@ -16,18 +19,19 @@ use flotilla_core::{
         coding_agent::CloudAgentService,
         discovery::{
             test_support::{
-                fake_discovery, fake_discovery_with_providers, git_process_discovery, init_git_repo_with_remote, FakeCheckoutManager,
-                FakeIssueTracker,
+                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, git_process_discovery,
+                init_git_repo_with_remote, FakeCheckoutManager, FakeDiscoveryProviders, FakeIssueTracker, FakeTerminalPool,
+                FakeWorkspaceManager,
             },
             DiscoveryRuntime, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement,
         },
-        types::{ChangeRequest, CloudAgentSession, RepoCriteria, SessionStatus},
+        types::{ChangeRequest, CloudAgentSession, RepoCriteria, SessionStatus, Workspace},
     },
 };
 use flotilla_protocol::{
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, CorrelationKey, DaemonEvent,
-    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, PeerConnectionState, ProviderData, RepoIdentity,
-    RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute,
+    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, ManagedTerminal, ManagedTerminalId, PeerConnectionState,
+    ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, TerminalStatus, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use tokio::sync::Notify;
 
@@ -220,6 +224,15 @@ async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
+    (temp, repo, daemon)
+}
+
+async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     (temp, repo, daemon)
 }
 
@@ -1258,6 +1271,192 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
         !snapshot.providers.checkouts.contains_key(&ghost_checkout),
         "peer path must not appear as a local checkout after poll + repeated peer updates"
     );
+}
+
+#[tokio::test]
+async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspace_is_bound() {
+    let remote_host = HostName::new("feta");
+    let remote_checkout = HostPath::new(remote_host.clone(), "/home/robert/dev/flotilla.terminal-stuff");
+    let set_id = AttachableSetId::new("set-remote");
+    let workspace_ref = "workspace:9".to_string();
+    let workspace_manager = Arc::new(FakeWorkspaceManager::new());
+    let attachable_store = shared_in_memory_attachable_store();
+
+    workspace_manager
+        .add_workspaces(vec![(workspace_ref.clone(), Workspace {
+            name: "attachable-correlation@feta".into(),
+            directories: vec![PathBuf::from("/Users/robert/dev/flotilla")],
+            correlation_keys: vec![],
+            attachable_set_id: None,
+        })])
+        .await;
+
+    {
+        let mut store = attachable_store.lock().expect("lock attachable store");
+        store.insert_set(AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(remote_host.clone()),
+            checkout: Some(remote_checkout.clone()),
+            template_identity: None,
+            members: vec![],
+        });
+        store.replace_binding(ProviderBinding {
+            provider_category: "workspace_manager".into(),
+            provider_name: "fake-workspaces".into(),
+            object_kind: flotilla_core::attachable::BindingObjectKind::AttachableSet,
+            object_id: set_id.to_string(),
+            external_ref: workspace_ref.clone(),
+        });
+    }
+
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_workspace_manager(workspace_manager).with_attachable_store(Arc::clone(&attachable_store)),
+    );
+    let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let mut rx = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    let mut peer_data = ProviderData::default();
+    peer_data.checkouts.insert(remote_checkout.clone(), Checkout {
+        branch: "attachable-correlation".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![
+            CorrelationKey::Branch("attachable-correlation".into()),
+            CorrelationKey::CheckoutPath(remote_checkout.clone()),
+        ],
+        association_keys: vec![],
+    });
+    daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
+    let _ = recv_event(&mut rx).await;
+
+    let (local_providers, _) = daemon.get_local_providers(&repo).await.expect("local providers");
+    let local_set = local_providers.attachable_sets.get(&set_id).expect("projected attachable set");
+    assert_eq!(local_set.host_affinity.as_ref(), Some(&remote_host));
+    assert_eq!(local_set.checkout.as_ref(), Some(&remote_checkout));
+    assert_eq!(
+        local_providers.workspaces.get(&workspace_ref).and_then(|workspace| workspace.attachable_set_id.as_ref()),
+        Some(&set_id),
+        "workspace projection should retain the remote attachable set id"
+    );
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("merged state");
+    let merged_set = snapshot.providers.attachable_sets.get(&set_id).expect("merged attachable set");
+    assert_eq!(merged_set.host_affinity.as_ref(), Some(&remote_host));
+    assert_eq!(merged_set.checkout.as_ref(), Some(&remote_checkout));
+
+    let set_item =
+        snapshot.work_items.iter().find(|item| item.attachable_set_id.as_ref() == Some(&set_id)).expect("attachable set work item");
+    assert_eq!(set_item.host, remote_host);
+    assert_eq!(set_item.checkout.as_ref().map(|checkout| &checkout.key), Some(&remote_checkout));
+    assert_eq!(set_item.workspace_refs, vec![workspace_ref]);
+}
+
+#[tokio::test]
+async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_checkout_item() {
+    let remote_host = HostName::new("feta");
+    let remote_checkout = HostPath::new(remote_host.clone(), "/home/robert/dev/flotilla.issue-356-watch");
+    let set_id = AttachableSetId::new("set-issue-356-watch");
+    let workspace_ref = "workspace:10".to_string();
+    let terminal_id = ManagedTerminalId { checkout: "issue-356-watch".into(), role: "main".into(), index: 0 };
+    let workspace_manager = Arc::new(FakeWorkspaceManager::new());
+    let terminal_pool = Arc::new(FakeTerminalPool::new());
+    let attachable_store = shared_in_memory_attachable_store();
+
+    workspace_manager
+        .add_workspaces(vec![(workspace_ref.clone(), Workspace {
+            name: "issue-356-watch@feta".into(),
+            directories: vec![PathBuf::from("/Users/robert/dev/flotilla")],
+            correlation_keys: vec![],
+            attachable_set_id: None,
+        })])
+        .await;
+    terminal_pool
+        .add_terminals(vec![ManagedTerminal {
+            id: terminal_id.clone(),
+            role: "main".into(),
+            command: "bash".into(),
+            working_directory: PathBuf::from("/Users/robert/dev/flotilla"),
+            status: TerminalStatus::Running,
+            attachable_id: None,
+            attachable_set_id: None,
+        }])
+        .await;
+
+    {
+        let mut store = attachable_store.lock().expect("lock attachable store");
+        store.insert_set(AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(remote_host.clone()),
+            checkout: Some(remote_checkout.clone()),
+            template_identity: None,
+            members: vec![],
+        });
+        store.replace_binding(ProviderBinding {
+            provider_category: "workspace_manager".into(),
+            provider_name: "fake-workspaces".into(),
+            object_kind: flotilla_core::attachable::BindingObjectKind::AttachableSet,
+            object_id: set_id.to_string(),
+            external_ref: workspace_ref.clone(),
+        });
+        store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "fake-terminals",
+            &terminal_session_binding_ref(&terminal_id),
+            TerminalPurpose { checkout: terminal_id.checkout.clone(), role: terminal_id.role.clone(), index: terminal_id.index },
+            "bash",
+            PathBuf::from("/Users/robert/dev/flotilla"),
+            TerminalStatus::Running,
+        );
+    }
+
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new()
+            .with_workspace_manager(workspace_manager)
+            .with_terminal_pool(terminal_pool)
+            .with_attachable_store(Arc::clone(&attachable_store)),
+    );
+    let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let mut rx = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    let mut peer_data = ProviderData::default();
+    peer_data.checkouts.insert(remote_checkout.clone(), Checkout {
+        branch: "issue-356-watch".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![CorrelationKey::Branch("issue-356-watch".into()), CorrelationKey::CheckoutPath(remote_checkout.clone())],
+        association_keys: vec![],
+    });
+    daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
+    let _ = recv_event(&mut rx).await;
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("merged state");
+    let projected_terminal = snapshot.providers.managed_terminals.get(&terminal_id.to_string()).expect("projected terminal");
+    assert_eq!(projected_terminal.attachable_set_id.as_ref(), Some(&set_id));
+    assert_eq!(
+        snapshot.providers.workspaces.get(&workspace_ref).and_then(|workspace| workspace.attachable_set_id.as_ref()),
+        Some(&set_id),
+        "workspace projection should retain the shared attachable set id"
+    );
+
+    let matching_items: Vec<_> = snapshot.work_items.iter().filter(|item| item.attachable_set_id.as_ref() == Some(&set_id)).collect();
+    assert_eq!(matching_items.len(), 1, "shared attachable identity should produce one correlated work item");
+    let item = matching_items[0];
+    assert_eq!(item.kind, WorkItemKind::Checkout, "checkout should remain the primary anchor when present");
+    assert_eq!(item.host, remote_host);
+    assert_eq!(item.checkout.as_ref().map(|checkout| &checkout.key), Some(&remote_checkout));
+    assert_eq!(item.workspace_refs, vec![workspace_ref]);
+    assert_eq!(item.terminal_keys, vec![terminal_id]);
 }
 
 #[tokio::test]

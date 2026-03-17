@@ -12,6 +12,7 @@ use tokio::{
 };
 
 use crate::{
+    attachable::{terminal_session_binding_ref, BindingObjectKind, SharedAttachableStore},
     data::{self, CorrelationResult, RefreshError},
     provider_data::ProviderData,
     providers::{correlation::CorrelatedGroup, registry::ProviderRegistry, types::RepoCriteria},
@@ -46,7 +47,13 @@ pub struct RepoRefreshHandle {
 }
 
 impl RepoRefreshHandle {
-    pub fn spawn(repo_root: PathBuf, registry: Arc<ProviderRegistry>, criteria: RepoCriteria, interval: Duration) -> Self {
+    pub fn spawn(
+        repo_root: PathBuf,
+        registry: Arc<ProviderRegistry>,
+        criteria: RepoCriteria,
+        attachable_store: SharedAttachableStore,
+        interval: Duration,
+    ) -> Self {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(RefreshSnapshot::default()));
         let refresh_trigger = Arc::new(Notify::new());
         let trigger = refresh_trigger.clone();
@@ -62,7 +69,7 @@ impl RepoRefreshHandle {
 
                 // Fetch all provider data
                 let mut provider_data = ProviderData::default();
-                let errors = refresh_providers(&mut provider_data, &repo_root, &registry, &criteria).await;
+                let errors = refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, &attachable_store).await;
                 let provider_health = compute_provider_health(&registry, &errors);
 
                 // Correlate
@@ -150,6 +157,7 @@ async fn refresh_providers(
     repo_root: &Path,
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
+    attachable_store: &SharedAttachableStore,
 ) -> Vec<RefreshError> {
     let mut errors = Vec::new();
 
@@ -236,6 +244,7 @@ async fn refresh_providers(
 
     pd.managed_terminals = managed_terminals.into_iter().map(|t| (t.id.to_string(), t)).collect();
     collect_errors(&mut errors, "terminals", tp_errors);
+    project_attachable_data(pd, registry, attachable_store);
     {
         use flotilla_protocol::delta::{Branch, BranchStatus};
         let remote = branches;
@@ -251,6 +260,50 @@ async fn refresh_providers(
     }
 
     errors
+}
+
+fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, attachable_store: &SharedAttachableStore) {
+    let terminal_provider = registry.terminal_pools.preferred_with_desc().map(|(desc, _)| desc.implementation.clone());
+    let workspace_provider = registry.workspace_managers.preferred_with_desc().map(|(desc, _)| desc.implementation.clone());
+    let Ok(store) = attachable_store.lock() else {
+        tracing::warn!("attachable store lock poisoned while projecting provider data");
+        return;
+    };
+
+    let mut referenced_sets = std::collections::HashSet::new();
+
+    if let Some(provider_name) = terminal_provider.as_deref() {
+        for terminal in pd.managed_terminals.values_mut() {
+            let session_name = terminal_session_binding_ref(&terminal.id);
+            let Some(attachable_id) = store.lookup_binding("terminal_pool", provider_name, BindingObjectKind::Attachable, &session_name)
+            else {
+                continue;
+            };
+            let attachable_id = flotilla_protocol::AttachableId::new(attachable_id.to_string());
+            terminal.attachable_id = Some(attachable_id.clone());
+            if let Some(attachable) = store.registry().attachables.get(&attachable_id) {
+                terminal.attachable_set_id = Some(attachable.set_id.clone());
+                referenced_sets.insert(attachable.set_id.clone());
+            }
+        }
+    }
+
+    if let Some(provider_name) = workspace_provider.as_deref() {
+        for (ws_ref, workspace) in &mut pd.workspaces {
+            let Some(set_id) = store.lookup_binding("workspace_manager", provider_name, BindingObjectKind::AttachableSet, ws_ref.as_str())
+            else {
+                continue;
+            };
+            let set_id = flotilla_protocol::AttachableSetId::new(set_id.to_string());
+            workspace.attachable_set_id = Some(set_id.clone());
+            referenced_sets.insert(set_id);
+        }
+    }
+
+    let mut referenced_set_ids: Vec<_> = referenced_sets.into_iter().collect();
+    referenced_set_ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    pd.attachable_sets =
+        referenced_set_ids.into_iter().filter_map(|set_id| store.registry().sets.get(&set_id).cloned().map(|set| (set_id, set))).collect();
 }
 
 fn compute_provider_health(registry: &ProviderRegistry, errors: &[RefreshError]) -> HashMap<(&'static str, String), bool> {
@@ -311,6 +364,7 @@ mod tests {
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::{ProviderCategory, ProviderDescriptor},
+        terminal::TerminalPool,
         types::*,
         vcs::{CheckoutManager, Vcs},
         workspace::WorkspaceManager,
@@ -494,6 +548,35 @@ mod tests {
         }
     }
 
+    struct MockTerminalPool {
+        result: Result<Vec<flotilla_protocol::ManagedTerminal>, String>,
+    }
+
+    impl MockTerminalPool {
+        fn ok(terminals: Vec<flotilla_protocol::ManagedTerminal>) -> Self {
+            Self { result: Ok(terminals) }
+        }
+    }
+
+    #[async_trait]
+    impl TerminalPool for MockTerminalPool {
+        async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
+            self.result.clone()
+        }
+
+        async fn ensure_running(&self, _id: &flotilla_protocol::ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn attach_command(&self, _id: &flotilla_protocol::ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<String, String> {
+            Ok("mock attach".into())
+        }
+
+        async fn kill_terminal(&self, _id: &flotilla_protocol::ManagedTerminalId) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     fn repo_root() -> PathBuf {
         PathBuf::from("/tmp/test-repo")
     }
@@ -542,7 +625,11 @@ mod tests {
     }
 
     fn make_workspace(name: &str) -> Workspace {
-        Workspace { name: name.to_string(), directories: vec![], correlation_keys: vec![] }
+        Workspace { name: name.to_string(), directories: vec![], correlation_keys: vec![], attachable_set_id: None }
+    }
+
+    fn test_attachable_store() -> SharedAttachableStore {
+        crate::attachable::shared_in_memory_attachable_store()
     }
 
     fn refresh_error(category: &'static str) -> RefreshError {
@@ -614,7 +701,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_empty_registry_produces_empty_data() {
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &ProviderRegistry::new(), &criteria()).await;
+        let errors = refresh_providers(&mut pd, &repo_root(), &ProviderRegistry::new(), &criteria(), &test_attachable_store()).await;
 
         assert!(errors.is_empty());
         assert!(pd.checkouts.is_empty());
@@ -654,7 +741,7 @@ mod tests {
         );
 
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
+        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store()).await;
 
         assert!(errors.is_empty());
         assert_eq!(pd.checkouts.len(), 1);
@@ -666,13 +753,68 @@ mod tests {
         assert_eq!(pd.branches.get("shared").unwrap().status, BranchStatus::Merged);
     }
 
+    #[test]
+    fn project_attachable_data_populates_sets_and_ids() {
+        let mut registry = ProviderRegistry::new();
+        registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::ok(vec![])));
+        registry.terminal_pools.insert("shpool", desc("shpool"), Arc::new(MockTerminalPool::ok(vec![])));
+
+        let store_dir = tempfile::tempdir().expect("tempdir");
+        let attachable_store = crate::attachable::shared_file_backed_attachable_store(store_dir.path());
+        let set_id = {
+            let mut store = attachable_store.lock().expect("lock store");
+            let set_id = store.ensure_terminal_set(
+                Some(flotilla_protocol::HostName::local()),
+                Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat"))),
+            );
+            let _attachable_id = store.ensure_terminal_attachable(
+                &set_id,
+                "terminal_pool",
+                "shpool",
+                "flotilla/feat/dev/0",
+                crate::attachable::TerminalPurpose { checkout: "feat".into(), role: "dev".into(), index: 0 },
+                "bash",
+                PathBuf::from("/tmp/wt-feat"),
+                flotilla_protocol::TerminalStatus::Running,
+            );
+            store.replace_binding(crate::attachable::ProviderBinding {
+                provider_category: "workspace_manager".into(),
+                provider_name: "cmux".into(),
+                object_kind: crate::attachable::BindingObjectKind::AttachableSet,
+                object_id: set_id.to_string(),
+                external_ref: "ws-1".into(),
+            });
+            set_id
+        };
+
+        let mut pd = ProviderData::default();
+        pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
+        pd.managed_terminals.insert("feat/dev/0".into(), flotilla_protocol::ManagedTerminal {
+            id: flotilla_protocol::ManagedTerminalId { checkout: "feat".into(), role: "dev".into(), index: 0 },
+            role: "dev".into(),
+            command: "bash".into(),
+            working_directory: PathBuf::from("/tmp/wt-feat"),
+            status: flotilla_protocol::TerminalStatus::Running,
+            attachable_id: None,
+            attachable_set_id: None,
+        });
+
+        project_attachable_data(&mut pd, &registry, &attachable_store);
+
+        assert_eq!(pd.attachable_sets.len(), 1);
+        assert!(pd.attachable_sets.contains_key(&set_id));
+        assert_eq!(pd.workspaces.get("ws-1").and_then(|ws| ws.attachable_set_id.as_ref()), Some(&set_id));
+        assert_eq!(pd.managed_terminals["feat/dev/0"].attachable_set_id.as_ref(), Some(&set_id));
+        assert!(pd.managed_terminals["feat/dev/0"].attachable_id.is_some());
+    }
+
     #[tokio::test]
     async fn refresh_reports_checkout_errors() {
         let mut registry = ProviderRegistry::new();
         registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("checkout failed")));
 
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
+        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store()).await;
 
         assert!(errors.iter().any(|e| e.category == "checkouts"));
         assert!(pd.checkouts.is_empty());
@@ -692,7 +834,7 @@ mod tests {
         registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail")));
 
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria()).await;
+        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store()).await;
 
         let categories: HashSet<&str> = errors.iter().map(|e| e.category).collect();
         for expected in ["PRs", "merged", "sessions", "branches", "workspaces"] {
@@ -708,7 +850,13 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_produces_initial_snapshot() {
-        let handle = RepoRefreshHandle::spawn(repo_root(), Arc::new(ProviderRegistry::new()), criteria(), Duration::from_secs(3600));
+        let handle = RepoRefreshHandle::spawn(
+            repo_root(),
+            Arc::new(ProviderRegistry::new()),
+            criteria(),
+            test_attachable_store(),
+            Duration::from_secs(3600),
+        );
 
         let mut rx = handle.snapshot_rx.clone();
         let snapshot = wait_for_snapshot(&mut rx).await;
@@ -722,7 +870,8 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.cloud_agents.insert("claude", desc("MockCA"), Arc::new(MockCloudAgent::failing("agent offline")));
 
-        let handle = RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), Duration::from_secs(3600));
+        let handle =
+            RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), test_attachable_store(), Duration::from_secs(3600));
 
         let mut rx = handle.snapshot_rx.clone();
         let snapshot = wait_for_snapshot(&mut rx).await;
@@ -732,7 +881,13 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_refresh_produces_another_snapshot() {
-        let handle = RepoRefreshHandle::spawn(repo_root(), Arc::new(ProviderRegistry::new()), criteria(), Duration::from_secs(3600));
+        let handle = RepoRefreshHandle::spawn(
+            repo_root(),
+            Arc::new(ProviderRegistry::new()),
+            criteria(),
+            test_attachable_store(),
+            Duration::from_secs(3600),
+        );
 
         let mut rx = handle.snapshot_rx.clone();
         wait_for_snapshot(&mut rx).await;
@@ -762,7 +917,8 @@ mod tests {
         registry.cloud_agents.insert("claude", desc("Claude"), Arc::new(MockCloudAgent::ok_named("Claude", vec![])));
         registry.cloud_agents.insert("cursor", desc("Cursor"), Arc::new(MockCloudAgent::failing_named("Cursor", "auth failed")));
 
-        let handle = RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), Duration::from_secs(3600));
+        let handle =
+            RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), test_attachable_store(), Duration::from_secs(3600));
 
         let mut rx = handle.snapshot_rx.clone();
         let snapshot = wait_for_snapshot(&mut rx).await;

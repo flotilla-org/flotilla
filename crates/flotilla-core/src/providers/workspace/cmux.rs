@@ -62,14 +62,7 @@ impl CmuxWorkspaceManager {
                     .map(|arr| arr.iter().filter_map(|v| v.as_str().map(PathBuf::from)).collect())
                     .unwrap_or_default();
 
-                let correlation_keys: Vec<CorrelationKey> = directories
-                    .iter()
-                    .map(|d| {
-                        CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), d.clone()))
-                    })
-                    .collect();
-
-                Some((ws_ref, Workspace { name, directories, correlation_keys }))
+                Some((ws_ref, Workspace { name, directories, correlation_keys: vec![], attachable_set_id: None }))
             })
             .collect())
     }
@@ -212,13 +205,8 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         }
 
         let directories = vec![config.working_directory.clone()];
-        let correlation_keys = directories
-            .iter()
-            .map(|d| CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), d.clone())))
-            .collect();
-
         info!(workspace = %config.name, %ws_ref, "cmux: workspace ready");
-        Ok((ws_ref, Workspace { name: config.name.clone(), directories, correlation_keys }))
+        Ok((ws_ref, Workspace { name: config.name.clone(), directories, correlation_keys: vec![], attachable_set_id: None }))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
@@ -257,7 +245,7 @@ mod tests {
         assert_eq!(ws_ref, "workspace:10");
         assert_eq!(ws.name, "Main");
         assert_eq!(ws.directories, vec![PathBuf::from("/tmp/repo"), PathBuf::from("/tmp/repo2")]);
-        assert_eq!(ws.correlation_keys.len(), 2);
+        assert!(ws.correlation_keys.is_empty());
     }
 
     #[tokio::test]
@@ -272,14 +260,8 @@ mod tests {
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[0].0, "workspace:10");
         assert_eq!(workspaces[1].0, "workspace:11");
-        assert_eq!(workspaces[0].1.correlation_keys, vec![CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
-            flotilla_protocol::HostName::local(),
-            "/tmp/repo-a"
-        ))]);
-        assert_eq!(workspaces[1].1.correlation_keys, vec![CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
-            flotilla_protocol::HostName::local(),
-            "/tmp/repo-b"
-        ))]);
+        assert!(workspaces[0].1.correlation_keys.is_empty());
+        assert!(workspaces[1].1.correlation_keys.is_empty());
     }
 
     #[tokio::test]

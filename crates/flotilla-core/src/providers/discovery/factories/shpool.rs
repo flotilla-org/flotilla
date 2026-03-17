@@ -47,7 +47,6 @@ mod tests {
 
     use super::ShpoolTerminalPoolFactory;
     use crate::{
-        attachable::AttachableStore,
         config::ConfigStore,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
@@ -58,7 +57,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let attachable_store = Arc::new(std::sync::Mutex::new(AttachableStore::with_base(config.base_path())));
+        let attachable_store = crate::attachable::shared_file_backed_attachable_store(config.base_path());
         let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, attachable_store).await;
         assert!(result.is_ok());
     }
@@ -69,7 +68,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let attachable_store = Arc::new(std::sync::Mutex::new(AttachableStore::with_base(config.base_path())));
+        let attachable_store = crate::attachable::shared_file_backed_attachable_store(config.base_path());
         let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, attachable_store).await;
         let unmet = result.err().expect("should fail without shpool binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("shpool".into())));

@@ -12,16 +12,19 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, RepoIdentity};
+use flotilla_protocol::{
+    ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId,
+    RepoIdentity, TerminalStatus, Workspace,
+};
 use tokio::sync::Mutex as TokioMutex;
 
 use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 use crate::{
-    attachable::{AttachableStore, SharedAttachableStore},
+    attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
     providers::{
-        change_request::ChangeRequestTracker, discovery::EnvVars, issue_tracker::IssueTracker, vcs::CheckoutManager, ChannelLabel,
-        CommandOutput, CommandRunner,
+        change_request::ChangeRequestTracker, discovery::EnvVars, issue_tracker::IssueTracker, terminal::TerminalPool,
+        vcs::CheckoutManager, workspace::WorkspaceManager, ChannelLabel, CommandOutput, CommandRunner,
     },
 };
 
@@ -93,7 +96,53 @@ pub fn init_git_repo_with_remote(path: &Path, remote: &str) -> RepoIdentity {
 }
 
 pub fn test_attachable_store(config: &ConfigStore) -> SharedAttachableStore {
-    Arc::new(Mutex::new(AttachableStore::with_base(config.base_path())))
+    shared_file_backed_attachable_store(config.base_path())
+}
+
+#[derive(Default)]
+pub struct FakeDiscoveryProviders {
+    pub checkout_manager: Option<Arc<dyn CheckoutManager>>,
+    pub change_request: Option<Arc<dyn ChangeRequestTracker>>,
+    pub issue_tracker: Option<Arc<dyn IssueTracker>>,
+    pub workspace_manager: Option<Arc<dyn WorkspaceManager>>,
+    pub terminal_pool: Option<Arc<dyn TerminalPool>>,
+    pub attachable_store: Option<SharedAttachableStore>,
+}
+
+impl FakeDiscoveryProviders {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_checkout_manager(mut self, provider: Arc<dyn CheckoutManager>) -> Self {
+        self.checkout_manager = Some(provider);
+        self
+    }
+
+    pub fn with_change_request(mut self, provider: Arc<dyn ChangeRequestTracker>) -> Self {
+        self.change_request = Some(provider);
+        self
+    }
+
+    pub fn with_issue_tracker(mut self, provider: Arc<dyn IssueTracker>) -> Self {
+        self.issue_tracker = Some(provider);
+        self
+    }
+
+    pub fn with_workspace_manager(mut self, provider: Arc<dyn WorkspaceManager>) -> Self {
+        self.workspace_manager = Some(provider);
+        self
+    }
+
+    pub fn with_terminal_pool(mut self, provider: Arc<dyn TerminalPool>) -> Self {
+        self.terminal_pool = Some(provider);
+        self
+    }
+
+    pub fn with_attachable_store(mut self, store: SharedAttachableStore) -> Self {
+        self.attachable_store = Some(store);
+        self
+    }
 }
 
 impl DiscoveryMockRunnerBuilder {
@@ -322,6 +371,106 @@ pub struct FakeChangeRequest {
     pub merged_branches: Arc<TokioMutex<Vec<String>>>,
 }
 
+pub struct FakeWorkspaceManager {
+    pub workspaces: Arc<TokioMutex<Vec<(String, Workspace)>>>,
+    pub selected: Arc<TokioMutex<Vec<String>>>,
+}
+
+impl Default for FakeWorkspaceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeWorkspaceManager {
+    pub fn new() -> Self {
+        Self { workspaces: Arc::new(TokioMutex::new(Vec::new())), selected: Arc::new(TokioMutex::new(Vec::new())) }
+    }
+
+    pub async fn add_workspaces(&self, workspaces: Vec<(String, Workspace)>) {
+        self.workspaces.lock().await.extend(workspaces);
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkspaceManager for FakeWorkspaceManager {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+        Ok(self.workspaces.lock().await.clone())
+    }
+
+    async fn create_workspace(&self, config: &crate::providers::types::WorkspaceConfig) -> Result<(String, Workspace), String> {
+        let mut store = self.workspaces.lock().await;
+        let ws_ref = format!("workspace:{}", store.len() + 1);
+        let workspace = Workspace {
+            name: config.name.clone(),
+            directories: vec![config.working_directory.clone()],
+            correlation_keys: vec![],
+            attachable_set_id: None,
+        };
+        store.push((ws_ref.clone(), workspace.clone()));
+        Ok((ws_ref, workspace))
+    }
+
+    async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        self.selected.lock().await.push(ws_ref.to_string());
+        Ok(())
+    }
+}
+
+pub struct FakeTerminalPool {
+    pub terminals: Arc<TokioMutex<Vec<ManagedTerminal>>>,
+    pub killed: Arc<TokioMutex<Vec<ManagedTerminalId>>>,
+}
+
+impl Default for FakeTerminalPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeTerminalPool {
+    pub fn new() -> Self {
+        Self { terminals: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
+    }
+
+    pub async fn add_terminals(&self, terminals: Vec<ManagedTerminal>) {
+        self.terminals.lock().await.extend(terminals);
+    }
+}
+
+#[async_trait::async_trait]
+impl TerminalPool for FakeTerminalPool {
+    async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
+        Ok(self.terminals.lock().await.clone())
+    }
+
+    async fn ensure_running(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<(), String> {
+        let mut terminals = self.terminals.lock().await;
+        if terminals.iter().any(|terminal| &terminal.id == id) {
+            return Ok(());
+        }
+        terminals.push(ManagedTerminal {
+            id: id.clone(),
+            role: id.role.clone(),
+            command: command.to_string(),
+            working_directory: cwd.to_path_buf(),
+            status: TerminalStatus::Running,
+            attachable_id: None,
+            attachable_set_id: None,
+        });
+        Ok(())
+    }
+
+    async fn attach_command(&self, id: &ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<String, String> {
+        Ok(format!("attach {id}"))
+    }
+
+    async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
+        self.killed.lock().await.push(id.clone());
+        Ok(())
+    }
+}
+
 impl Default for FakeChangeRequest {
     fn default() -> Self {
         Self::new()
@@ -450,6 +599,64 @@ impl Factory for FakeChangeRequestFactory {
     }
 }
 
+pub struct FakeWorkspaceManagerFactory(pub Arc<dyn WorkspaceManager>);
+
+#[async_trait::async_trait]
+impl Factory for FakeWorkspaceManagerFactory {
+    type Output = dyn WorkspaceManager;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::labeled_simple(
+            ProviderCategory::WorkspaceManager,
+            "fake-workspaces",
+            "Fake Workspaces",
+            "WS",
+            "Workspaces",
+            "workspace",
+        )
+    }
+
+    async fn probe(
+        &self,
+        _env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &Path,
+        _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
+    ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
+        Ok(Arc::clone(&self.0))
+    }
+}
+
+pub struct FakeTerminalPoolFactory(pub Arc<dyn TerminalPool>);
+
+#[async_trait::async_trait]
+impl Factory for FakeTerminalPoolFactory {
+    type Output = dyn TerminalPool;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::labeled_simple(
+            ProviderCategory::TerminalPool,
+            "fake-terminals",
+            "Fake Terminals",
+            "TP",
+            "Terminals",
+            "terminal",
+        )
+    }
+
+    async fn probe(
+        &self,
+        _env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &Path,
+        _runner: Arc<dyn CommandRunner>,
+        _attachable_store: crate::attachable::SharedAttachableStore,
+    ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
+        Ok(Arc::clone(&self.0))
+    }
+}
+
 /// Build a `DiscoveryRuntime` with fake providers injected.
 ///
 /// The returned runtime has no host/repo detectors (environment assertions
@@ -461,22 +668,63 @@ pub fn fake_discovery_with_providers(
     change_request: Option<Arc<dyn ChangeRequestTracker>>,
     issue_tracker: Option<Arc<dyn IssueTracker>>,
 ) -> DiscoveryRuntime {
+    fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new()
+            .with_checkout_manager_opt(checkout_manager)
+            .with_change_request_opt(change_request)
+            .with_issue_tracker_opt(issue_tracker),
+    )
+}
+
+impl FakeDiscoveryProviders {
+    fn with_checkout_manager_opt(mut self, provider: Option<Arc<dyn CheckoutManager>>) -> Self {
+        self.checkout_manager = provider;
+        self
+    }
+
+    fn with_change_request_opt(mut self, provider: Option<Arc<dyn ChangeRequestTracker>>) -> Self {
+        self.change_request = provider;
+        self
+    }
+
+    fn with_issue_tracker_opt(mut self, provider: Option<Arc<dyn IssueTracker>>) -> Self {
+        self.issue_tracker = provider;
+        self
+    }
+}
+
+pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> DiscoveryRuntime {
     let runner: Arc<dyn CommandRunner> =
         Arc::new(DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build());
 
     let mut checkout_managers: Vec<Box<super::CheckoutManagerFactory>> = Vec::new();
-    if let Some(cm) = checkout_manager {
+    if let Some(cm) = providers.checkout_manager {
         checkout_managers.push(Box::new(FakeCheckoutManagerFactory(cm)));
     }
 
     let mut change_request_factories: Vec<Box<super::ChangeRequestFactory>> = Vec::new();
-    if let Some(cr) = change_request {
+    if let Some(cr) = providers.change_request {
         change_request_factories.push(Box::new(FakeChangeRequestFactory(cr)));
     }
 
     let mut issue_tracker_factories: Vec<Box<super::IssueTrackerFactory>> = Vec::new();
-    if let Some(it) = issue_tracker {
+    if let Some(it) = providers.issue_tracker {
         issue_tracker_factories.push(Box::new(FakeIssueTrackerFactory(it)));
+    }
+
+    let mut workspace_manager_factories: Vec<Box<super::WorkspaceManagerFactory>> = Vec::new();
+    if let Some(ws) = providers.workspace_manager {
+        workspace_manager_factories.push(Box::new(FakeWorkspaceManagerFactory(ws)));
+    }
+
+    let mut terminal_pool_factories: Vec<Box<super::TerminalPoolFactory>> = Vec::new();
+    if let Some(pool) = providers.terminal_pool {
+        terminal_pool_factories.push(Box::new(FakeTerminalPoolFactory(pool)));
+    }
+
+    let attachable_store = std::sync::OnceLock::new();
+    if let Some(store) = providers.attachable_store {
+        let _ = attachable_store.set(store);
     }
 
     DiscoveryRuntime {
@@ -491,10 +739,10 @@ pub fn fake_discovery_with_providers(
             issue_trackers: issue_tracker_factories,
             cloud_agents: vec![],
             ai_utilities: vec![],
-            workspace_managers: vec![],
-            terminal_pools: vec![],
+            workspace_managers: workspace_manager_factories,
+            terminal_pools: terminal_pool_factories,
         },
-        attachable_store: OnceLock::new(),
+        attachable_store,
     }
 }
 

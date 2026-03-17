@@ -184,18 +184,12 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
             .into_iter()
             .map(|name| {
                 let mut directories = Vec::new();
-                let mut correlation_keys = Vec::new();
-
                 if let Some(tab) = state.tabs.get(name) {
                     let path = PathBuf::from(&tab.working_directory);
-                    correlation_keys.push(CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
-                        flotilla_protocol::HostName::local(),
-                        path.clone(),
-                    )));
                     directories.push(path);
                 }
 
-                (name.to_string(), Workspace { name: name.to_string(), directories, correlation_keys })
+                (name.to_string(), Workspace { name: name.to_string(), directories, correlation_keys: vec![], attachable_set_id: None })
             })
             .collect();
 
@@ -283,13 +277,8 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         }
 
         let directories = vec![config.working_directory.clone()];
-        let correlation_keys = directories
-            .iter()
-            .map(|d| CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), d.clone())))
-            .collect();
-
         info!(workspace = %config.name, "zellij: workspace ready");
-        Ok((config.name.clone(), Workspace { name: config.name.clone(), directories, correlation_keys }))
+        Ok((config.name.clone(), Workspace { name: config.name.clone(), directories, correlation_keys: vec![], attachable_set_id: None }))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {

@@ -12,6 +12,22 @@
 
 ---
 
+## Next Slice Note
+
+The follow-on correlation slice should treat `AttachableSet` as a replicated
+and correlated item in `ProviderData`, not as something read directly from the
+local `AttachableStore`.
+
+Boundary for reviewers:
+- `AttachableStore` remains the local authority for ids and bindings
+- refresh/executor code projects a correlation-ready subset into provider data
+- correlation reads only merged `ProviderData`
+- `AttachableSet` becomes the primary correlation anchor when present
+- terminals remain associated resources of a set in this slice
+- branch/path heuristics remain fallback only for incomplete data
+
+---
+
 ## File Map
 
 | File | Action | Responsibility |

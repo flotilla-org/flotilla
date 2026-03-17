@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::HostPath;
+use crate::{HostName, HostPath};
 
 /// Identity keys — safe for union-find grouping. Items sharing a
 /// CorrelationKey are the same work unit.
@@ -11,6 +11,7 @@ use crate::HostPath;
 pub enum CorrelationKey {
     Branch(String),
     CheckoutPath(HostPath),
+    AttachableSet(AttachableSetId),
     ChangeRequestRef(String, String), // (provider_name, CR id)
     SessionRef(String, String),       // (provider_name, session_id)
 }
@@ -143,6 +144,59 @@ impl std::fmt::Display for ManagedTerminalId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AttachableSetId(String);
+
+impl AttachableSetId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AttachableSetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AttachableId(String);
+
+impl AttachableId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AttachableId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachableSet {
+    pub id: AttachableSetId,
+    #[serde(default)]
+    pub host_affinity: Option<HostName>,
+    #[serde(default)]
+    pub checkout: Option<HostPath>,
+    #[serde(default)]
+    pub template_identity: Option<String>,
+    #[serde(default)]
+    pub members: Vec<AttachableId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalStatus {
     Running,
@@ -157,6 +211,10 @@ pub struct ManagedTerminal {
     pub command: String,
     pub working_directory: PathBuf,
     pub status: TerminalStatus,
+    #[serde(default)]
+    pub attachable_id: Option<AttachableId>,
+    #[serde(default)]
+    pub attachable_set_id: Option<AttachableSetId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +222,8 @@ pub struct Workspace {
     pub name: String,
     pub directories: Vec<PathBuf>,
     pub correlation_keys: Vec<CorrelationKey>,
+    #[serde(default)]
+    pub attachable_set_id: Option<AttachableSetId>,
 }
 
 /// All raw provider data for a single repo, keyed for lookup.
@@ -177,6 +237,7 @@ pub struct ProviderData {
     pub branches: IndexMap<String, crate::delta::Branch>,
     pub workspaces: IndexMap<String, Workspace>,
     pub managed_terminals: IndexMap<String, ManagedTerminal>,
+    pub attachable_sets: IndexMap<AttachableSetId, AttachableSet>,
 }
 
 #[cfg(test)]
@@ -193,6 +254,7 @@ mod tests {
         let correlation_cases = vec![
             CorrelationKey::Branch("main".into()),
             CorrelationKey::CheckoutPath(hp("/x")),
+            CorrelationKey::AttachableSet(AttachableSetId::new("set-1")),
             CorrelationKey::ChangeRequestRef("gh".into(), "1".into()),
             CorrelationKey::SessionRef("cl".into(), "s".into()),
         ];
@@ -336,8 +398,9 @@ mod tests {
                 name: "dev-session".into(),
                 directories: vec![PathBuf::from("/repos/proj/wt-1"), PathBuf::from("/repos/proj/wt-2")],
                 correlation_keys: vec![CorrelationKey::CheckoutPath(hp("/repos/proj/wt-1"))],
+                attachable_set_id: None,
             },
-            Workspace { name: "n".into(), directories: vec![], correlation_keys: vec![] },
+            Workspace { name: "n".into(), directories: vec![], correlation_keys: vec![], attachable_set_id: None },
         ];
         for case in &workspace_cases {
             assert_roundtrip(case);
@@ -357,6 +420,8 @@ mod tests {
             command: "$SHELL".into(),
             working_directory: PathBuf::from("/Users/dev/project"),
             status: TerminalStatus::Running,
+            attachable_id: None,
+            attachable_set_id: None,
         };
         assert_roundtrip(&terminal);
 
@@ -377,6 +442,7 @@ mod tests {
         assert!(pd.branches.is_empty());
         assert!(pd.workspaces.is_empty());
         assert!(pd.managed_terminals.is_empty());
+        assert!(pd.attachable_sets.is_empty());
     }
 
     #[test]

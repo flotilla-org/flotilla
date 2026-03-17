@@ -97,6 +97,9 @@ fn merge_local_provider_data(base: &mut ProviderData, other: &ProviderData) {
     for (name, workspace) in &other.workspaces {
         base.workspaces.entry(name.clone()).or_insert_with(|| workspace.clone());
     }
+    for (id, set) in &other.attachable_sets {
+        base.attachable_sets.entry(id.clone()).or_insert_with(|| set.clone());
+    }
     for (key, cr) in &other.change_requests {
         base.change_requests.entry(key.clone()).or_insert_with(|| cr.clone());
     }
@@ -647,7 +650,7 @@ impl InProcessDaemon {
                 &discovery.factories,
                 &config,
                 Arc::clone(&discovery.runner),
-                attachable_store,
+                Arc::clone(&attachable_store),
                 &*discovery.env,
             )
             .await;
@@ -657,7 +660,7 @@ impl InProcessDaemon {
 
             let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
             let slug = repo_slug.clone();
-            let mut model = RepoModel::new(path.clone(), registry, repo_slug);
+            let mut model = RepoModel::new(path.clone(), registry, repo_slug, attachable_store);
             model.data.loading = true;
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
@@ -1836,7 +1839,7 @@ impl InProcessDaemon {
         }
         let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
         let slug = repo_slug.clone();
-        let mut model = RepoModel::new(path.clone(), registry, repo_slug);
+        let mut model = RepoModel::new(path.clone(), registry, repo_slug, self.discovery.shared_attachable_store(&self.config));
         model.data.loading = true;
         let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
@@ -2927,6 +2930,82 @@ mod tests {
             2,
             "should have exactly 2 checkouts (1 local + 1 peer), got {}",
             second_snap.providers.checkouts.len()
+        );
+    }
+
+    #[test]
+    fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_workspace_binding() {
+        let cache = IssueCache::new();
+        let local_host = HostName::new("kiwi");
+        let remote_host = HostName::new("feta");
+        let remote_checkout = HostPath::new(remote_host.clone(), PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"));
+        let set_id = flotilla_protocol::AttachableSetId::new("set-remote");
+
+        let mut local_providers = ProviderData::default();
+        local_providers.workspaces.insert("workspace:9".into(), flotilla_protocol::Workspace {
+            name: "attachable-correlation@feta".into(),
+            directories: vec![PathBuf::from("/Users/robert/dev/flotilla")],
+            correlation_keys: vec![],
+            attachable_set_id: Some(set_id.clone()),
+        });
+        local_providers.attachable_sets.insert(set_id.clone(), flotilla_protocol::AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(remote_host.clone()),
+            checkout: Some(remote_checkout.clone()),
+            template_identity: None,
+            members: vec![],
+        });
+
+        let mut peer_data = ProviderData::default();
+        peer_data.checkouts.insert(remote_checkout.clone(), Checkout {
+            branch: "attachable-correlation".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![
+                CorrelationKey::Branch("attachable-correlation".into()),
+                CorrelationKey::CheckoutPath(remote_checkout.clone()),
+            ],
+            association_keys: vec![],
+        });
+
+        let peers = vec![(remote_host.clone(), peer_data)];
+        let default_snap = RefreshSnapshot::default();
+        let snapshot = build_repo_snapshot_with_peers(
+            SnapshotBuildContext {
+                repo_identity: fallback_repo_identity(Path::new("/Users/robert/dev/flotilla")),
+                path: Path::new("/Users/robert/dev/flotilla"),
+                seq: 1,
+                local_providers: &local_providers,
+                errors: &default_snap.errors,
+                provider_health: &default_snap.provider_health,
+                cache: &cache,
+                search_results: &None,
+                host_name: &local_host,
+            },
+            Some(&peers),
+        );
+
+        let set = snapshot.providers.attachable_sets.get(&set_id).expect("attachable set should remain projected");
+        assert_eq!(set.host_affinity.as_ref(), Some(&remote_host), "remote attachable set host affinity should stay on feta");
+        assert_eq!(set.checkout.as_ref(), Some(&remote_checkout), "remote attachable set checkout should stay on feta");
+
+        let set_item =
+            snapshot.work_items.iter().find(|item| item.attachable_set_id.as_ref() == Some(&set_id)).expect("work item for attachable set");
+        assert_eq!(set_item.host, remote_host, "correlated work item should be anchored to feta");
+        assert_eq!(
+            set_item.checkout.as_ref().map(|checkout| &checkout.key),
+            Some(&remote_checkout),
+            "correlated work item should point at the remote checkout"
+        );
+        assert_eq!(set_item.workspace_refs, vec!["workspace:9".to_string()]);
+
+        let ghost_checkout = HostPath::new(local_host, PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"));
+        assert!(
+            !snapshot.providers.checkouts.contains_key(&ghost_checkout),
+            "remote checkout path must not be duplicated under the local host"
         );
     }
 

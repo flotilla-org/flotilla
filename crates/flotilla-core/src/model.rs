@@ -8,6 +8,7 @@ use std::{
 pub use flotilla_protocol::{CategoryLabels, RepoLabels};
 
 use crate::{
+    attachable::SharedAttachableStore,
     data::DataStore,
     providers::{
         registry::{ProviderRegistry, ProviderSet},
@@ -70,11 +71,11 @@ pub struct RepoModel {
 }
 
 impl RepoModel {
-    pub fn new(repo_root: PathBuf, registry: ProviderRegistry, repo_slug: Option<String>) -> Self {
+    pub fn new(repo_root: PathBuf, registry: ProviderRegistry, repo_slug: Option<String>, attachable_store: SharedAttachableStore) -> Self {
         let labels = labels_from_registry(&registry);
         let registry = Arc::new(registry);
         let criteria = RepoCriteria { repo_slug };
-        let refresh_handle = RepoRefreshHandle::spawn(repo_root, registry.clone(), criteria, Duration::from_secs(10));
+        let refresh_handle = RepoRefreshHandle::spawn(repo_root, registry.clone(), criteria, attachable_store, Duration::from_secs(10));
         Self { registry, data: DataStore::default(), labels, refresh_handle }
     }
 
@@ -409,7 +410,12 @@ mod tests {
     #[tokio::test]
     async fn repo_model_new_initializes_state_and_uses_registry_data() {
         let reg = full_registry();
-        let model = RepoModel::new(PathBuf::from("/tmp/test-repo"), reg, Some("owner/repo".to_string()));
+        let model = RepoModel::new(
+            PathBuf::from("/tmp/test-repo"),
+            reg,
+            Some("owner/repo".to_string()),
+            crate::attachable::shared_file_backed_attachable_store("/tmp"),
+        );
 
         assert_eq!(model.labels.checkouts.section, "Checkouts");
         assert_eq!(model.labels.change_requests.section, "Pull Requests");
@@ -429,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn repo_model_new_with_empty_registry_uses_default_labels() {
         let reg = ProviderRegistry::new();
-        let model = RepoModel::new(PathBuf::from("/tmp/empty"), reg, None);
+        let model = RepoModel::new(PathBuf::from("/tmp/empty"), reg, None, crate::attachable::shared_file_backed_attachable_store("/tmp"));
         assert_eq!(model.labels.checkouts.section, "\u{2014}");
         assert_eq!(model.labels.change_requests.section, "\u{2014}");
         model.refresh_handle.trigger_refresh();

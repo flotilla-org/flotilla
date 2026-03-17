@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ChangeRequest, Checkout, CloudAgentSession, HostPath, Issue, ProviderError, WorkItem, WorkItemIdentity, Workspace};
+use crate::{
+    AttachableSet, AttachableSetId, ChangeRequest, Checkout, CloudAgentSession, HostPath, Issue, ProviderError, WorkItem, WorkItemIdentity,
+    Workspace,
+};
 
 /// Operation on a keyed collection entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,6 +52,10 @@ pub enum Change {
     Workspace {
         key: String,
         op: EntryOp<Workspace>,
+    },
+    AttachableSet {
+        key: AttachableSetId,
+        op: EntryOp<AttachableSet>,
     },
     Branch {
         key: String,

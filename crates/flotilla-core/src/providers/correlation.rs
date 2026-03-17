@@ -10,6 +10,7 @@ use super::types::CorrelationKey;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemKind {
     Checkout,
+    AttachableSet,
     ChangeRequest,
     CloudSession,
     Workspace,
@@ -20,6 +21,7 @@ pub enum ItemKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProviderItemKey {
     Checkout(HostPath),
+    AttachableSet(flotilla_protocol::AttachableSetId),
     ChangeRequest(String),
     Session(String),
     Workspace(String),

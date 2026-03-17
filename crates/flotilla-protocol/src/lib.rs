@@ -39,9 +39,9 @@ pub use commands::{
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
-    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
-    IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId, ProviderData, SessionStatus, TerminalStatus, WorkingTreeStatus,
-    Workspace,
+    AheadBehind, AssociationKey, AttachableId, AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout,
+    CloudAgentSession, CommitInfo, CorrelationKey, Issue, IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId, ProviderData,
+    SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
     DiscoveryEntry, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap, ProviderInfo,
@@ -366,6 +366,7 @@ mod tests {
                 debug_group: vec![],
                 source: None,
                 terminal_keys: vec![],
+                attachable_set_id: None,
             }],
             providers: ProviderData::default(),
             provider_health: HashMap::from([

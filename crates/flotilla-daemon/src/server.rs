@@ -1967,9 +1967,13 @@ mod tests {
     }
 
     async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
+        empty_daemon_named("local").await
+    }
+
+    async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
         let tmp = tempfile::tempdir().unwrap();
         let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
-        let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+        let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await;
         (tmp, daemon)
     }
 
@@ -2128,7 +2132,7 @@ mod tests {
 
         let hosts = dispatch_request_test(&daemon, 40, Request::ListHosts).await;
         match ok_response(hosts, 40) {
-            Response::ListHosts(parsed) => assert!(parsed.hosts.iter().any(|entry| entry.host == HostName::local())),
+            Response::ListHosts(parsed) => assert!(parsed.hosts.iter().any(|entry| entry.host == *daemon.host_name())),
             other => panic!("expected host list response, got {:?}", other),
         }
 
@@ -2545,12 +2549,14 @@ mod tests {
                                     target_host,
                                     branch,
                                     checkout_path: returned_path,
+                                    attachable_set_id,
                                     commands,
                                 } => {
                                     assert_eq!(result_identity, &repo_identity);
                                     assert_eq!(target_host, daemon.host_name());
                                     assert_eq!(branch, "feat-remote");
                                     assert_eq!(returned_path, &checkout_path);
+                                    assert!(attachable_set_id.is_some(), "prepared terminal should include an attachable set id");
                                     assert!(!commands.is_empty(), "prepared terminal should include commands");
                                 }
                                 other => panic!("expected TerminalPrepared finish event, got {other:?}"),
@@ -2574,12 +2580,14 @@ mod tests {
                             target_host,
                             branch,
                             checkout_path: returned_path,
+                            attachable_set_id,
                             commands,
                         } => {
                             assert_eq!(result_identity, &repo_identity);
                             assert_eq!(target_host, daemon.host_name());
                             assert_eq!(branch, "feat-remote");
                             assert_eq!(returned_path, &checkout_path);
+                            assert!(attachable_set_id.is_some(), "prepared terminal response should include an attachable set id");
                             assert!(!commands.is_empty(), "prepared terminal should include commands");
                         }
                         other => panic!("expected TerminalPrepared response, got {other:?}"),
@@ -2661,6 +2669,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("config");
         std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("daemon.toml"), "host_name = \"local\"\n").unwrap();
         std::fs::write(
             base.join("hosts.toml"),
             "[hosts.udder]\nhostname = \"udder\"\ndaemon_socket = \"/tmp/udder.sock\"\n\n[hosts.feta]\nhostname = \"feta\"\ndaemon_socket = \"/tmp/feta.sock\"\n",

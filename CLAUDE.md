@@ -10,15 +10,16 @@ We are in a **no backwards compatibility** phase. Protocol types, snapshot forma
 
 ```bash
 cargo build                                    # build
-cargo test                                     # all tests
-cargo clippy                                   # lint
-cargo +nightly-2026-03-12 fmt                  # format (pinned nightly, see rustfmt.toml)
+cargo +nightly-2026-03-12 fmt --check          # CI format gate
+cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
+cargo test --workspace --locked                # CI test gate
+cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
 cargo dylint --all -- --all-targets             # custom lints (requires cargo-dylint + dylint-link)
 cargo run -- --repo-root /path                 # run with explicit repo
 cargo run                                      # run, auto-detect repo from cwd
 ```
 
-Before pushing, always run `cargo +nightly-2026-03-12 fmt`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`.
+Before pushing, run the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
 
 **Nightly toolchain:** All nightly-dependent tools (rustfmt, llvm-cov, Dylint) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
 
@@ -29,6 +30,15 @@ Package-local `flotilla-core` daemon integration coverage uses shared discovery 
 ```bash
 cargo test -p flotilla-core --locked --features test-support --test in_process_daemon
 ```
+
+## Testing Philosophy
+
+- Prefer behavior tests that run through injected collaborators over tests that depend on real filesystem state, subprocess orchestration, sockets, or live multi-host setup.
+- When a subsystem has multiple storage or transport implementations, specify the behavior once and run the same contract tests against each implementation.
+- Use in-memory implementations for most logical scenario tests when they make setup clearer and failures easier to reason about.
+- Keep real-backed implementations covered too, but verify them against the same behavioral contract instead of forcing all behavior tests through the real backing store.
+- Favor reusable test harnesses over ad hoc setup. The goal is to make new multi-step scenarios cheap to express and debug.
+- For multi-host orchestration logic, prefer `InProcessDaemon`-level tests unless the bug specifically depends on real process or transport boundaries.
 
 ## Claude Code Web (changedirection/flotilla fork)
 

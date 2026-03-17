@@ -48,6 +48,12 @@ pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &
             merged.workspaces.insert(namespaced, workspace.clone());
         }
 
+        // Merge attachable sets by opaque id. These ids are the canonical
+        // correlation surface, so they must not be host-namespaced.
+        for (id, set) in &peer_data.attachable_sets {
+            merged.attachable_sets.entry(id.clone()).or_insert_with(|| set.clone());
+        }
+
         // Service-level data (PRs, issues, sessions) comes only from leader.
         // Followers don't poll external APIs so their maps are normally empty.
         // Local entries stay authoritative; peer data only fills gaps.

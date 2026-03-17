@@ -246,6 +246,7 @@ impl Theme {
     pub fn work_item_color(&self, kind: &WorkItemKind) -> Color {
         match kind {
             WorkItemKind::Checkout => self.checkout,
+            WorkItemKind::AttachableSet => self.checkout,
             WorkItemKind::Session => self.session,
             WorkItemKind::ChangeRequest => self.change_request,
             WorkItemKind::Issue => self.issue,

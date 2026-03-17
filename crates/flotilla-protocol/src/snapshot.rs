@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     host::{HostName, HostPath, RepoIdentity},
-    provider_data::{Issue, ProviderData},
+    provider_data::{AttachableSetId, Issue, ProviderData},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +104,8 @@ pub struct WorkItem {
     pub source: Option<String>,
     #[serde(default)]
     pub terminal_keys: Vec<crate::ManagedTerminalId>,
+    #[serde(default)]
+    pub attachable_set_id: Option<AttachableSetId>,
 }
 
 impl WorkItem {
@@ -115,6 +117,7 @@ impl WorkItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkItemKind {
     Checkout,
+    AttachableSet,
     Session,
     ChangeRequest,
     RemoteBranch,
@@ -124,6 +127,7 @@ pub enum WorkItemKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkItemIdentity {
     Checkout(HostPath),
+    AttachableSet(AttachableSetId),
     ChangeRequest(String),
     Session(String),
     Issue(String),
@@ -240,6 +244,7 @@ mod tests {
                     debug_group: vec![],
                     source: None,
                     terminal_keys: vec![],
+                    attachable_set_id: None,
                 },
                 WorkItem {
                     kind: WorkItemKind::Session,
@@ -256,6 +261,7 @@ mod tests {
                     debug_group: vec![],
                     source: None,
                     terminal_keys: vec![],
+                    attachable_set_id: None,
                 },
             ],
             providers: ProviderData::default(),
@@ -292,6 +298,7 @@ mod tests {
                 debug_group: vec![],
                 source: None,
                 terminal_keys: vec![],
+                attachable_set_id: None,
             },
             WorkItem {
                 kind: WorkItemKind::Checkout,
@@ -308,6 +315,7 @@ mod tests {
                 debug_group: vec!["group info".into()],
                 source: None,
                 terminal_keys: vec![],
+                attachable_set_id: None,
             },
         ];
 
@@ -364,15 +372,40 @@ mod tests {
     }
 
     #[test]
+    fn work_item_attachable_set_id_defaults_when_missing() {
+        let json = r#"{
+            "kind": "Issue",
+            "identity": {"Issue": "X"},
+            "host": "test-host",
+            "branch": null,
+            "description": "test",
+            "checkout": null,
+            "change_request_key": null,
+            "session_key": null,
+            "issue_keys": [],
+            "workspace_refs": [],
+            "is_main_checkout": false
+        }"#;
+        let decoded: WorkItem = serde_json::from_str(json).expect("deserialize");
+        assert!(decoded.attachable_set_id.is_none());
+    }
+
+    #[test]
     fn work_item_kind_and_identity_roundtrip_all_variants() {
-        for kind in
-            [WorkItemKind::Checkout, WorkItemKind::Session, WorkItemKind::ChangeRequest, WorkItemKind::RemoteBranch, WorkItemKind::Issue]
-        {
+        for kind in [
+            WorkItemKind::Checkout,
+            WorkItemKind::AttachableSet,
+            WorkItemKind::Session,
+            WorkItemKind::ChangeRequest,
+            WorkItemKind::RemoteBranch,
+            WorkItemKind::Issue,
+        ] {
             assert_json_roundtrip(&kind);
         }
 
         let identities = vec![
             WorkItemIdentity::Checkout(hp("/path/to/wt")),
+            WorkItemIdentity::AttachableSet(AttachableSetId::new("set-1")),
             WorkItemIdentity::ChangeRequest("PR#99".into()),
             WorkItemIdentity::Session("sess-abc".into()),
             WorkItemIdentity::Issue("GH-42".into()),

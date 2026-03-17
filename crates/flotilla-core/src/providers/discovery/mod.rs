@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use futures::stream;
 
 use crate::{
-    attachable::{AttachableStore, SharedAttachableStore},
+    attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
     providers::{
         ai_utility::AiUtility,
@@ -435,7 +435,7 @@ impl DiscoveryRuntime {
     }
 
     pub fn shared_attachable_store(&self, config: &ConfigStore) -> SharedAttachableStore {
-        Arc::clone(self.attachable_store.get_or_init(|| Arc::new(std::sync::Mutex::new(AttachableStore::with_base(config.base_path())))))
+        Arc::clone(self.attachable_store.get_or_init(|| shared_file_backed_attachable_store(config.base_path())))
     }
 
     /// A runtime is considered follower-mode when no external-provider factory
@@ -899,7 +899,7 @@ mod orchestrator_tests {
     }
 
     fn test_attachable_store(config: &ConfigStore) -> SharedAttachableStore {
-        Arc::new(std::sync::Mutex::new(AttachableStore::with_base(config.base_path())))
+        shared_file_backed_attachable_store(config.base_path())
     }
 
     #[tokio::test]

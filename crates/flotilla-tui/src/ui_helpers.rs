@@ -75,6 +75,7 @@ pub fn work_item_icon(
                 ("○", theme.checkout)
             }
         }
+        WorkItemKind::AttachableSet => ("◎", theme.checkout),
         WorkItemKind::Session => match session_status {
             Some(SessionStatus::Running) => ("▶", theme.session),
             Some(SessionStatus::Idle) => ("◆", theme.session),
