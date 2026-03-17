@@ -1,0 +1,35 @@
+---
+source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 546
+expression: output
+---
+ ⚓  flotilla  | my-project | [+]
+┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
+│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+│                                                                      ││                                              │
+  search     filter items in view                                                                                 /
+  refresh    refresh active repo                                                                                  r
+  branch     create a new branch                                                                                  n
+  help       show key bindings                                                                                    ?
+  quit       exit flotilla                                                                                        q
+  layout     cycle view layout                                                                                    l
+  host       cycle target host                                                                                    h
+  theme      cycle color theme
+/
