@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod attachable;
 pub mod config;
 pub mod convert;
