@@ -73,6 +73,7 @@ pub struct CorrelatedWorkItem {
     pub host: Option<flotilla_protocol::HostName>,
     pub source: Option<String>,
     pub terminal_ids: Vec<flotilla_protocol::ManagedTerminalId>,
+    pub agent_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +191,13 @@ impl CorrelationResult {
         }
     }
 
+    pub fn agent_keys(&self) -> &[String] {
+        match self {
+            CorrelationResult::Correlated(c) => &c.agent_keys,
+            _ => &[],
+        }
+    }
+
     pub fn correlation_group_idx(&self) -> Option<usize> {
         match self {
             CorrelationResult::Correlated(c) => Some(c.correlation_group_idx),
@@ -287,6 +295,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
     let mut change_request_key: Option<String> = None;
     let mut session_key: Option<String> = None;
     let mut agent_key: Option<String> = None;
+    let mut agent_keys: Vec<String> = Vec::new();
     let mut workspace_refs: Vec<String> = Vec::new();
     let mut terminal_ids: Vec<flotilla_protocol::ManagedTerminalId> = Vec::new();
     let mut host: Option<flotilla_protocol::HostName> = None;
@@ -318,6 +327,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
                 }
             }
             (CorItemKind::Agent, ProviderItemKey::Agent(id)) => {
+                agent_keys.push(id.clone());
                 if agent_key.is_none() {
                     agent_key = Some(id.clone());
                 }
@@ -413,6 +423,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         host,
         source,
         terminal_ids,
+        agent_keys,
     }))
 }
 
@@ -864,6 +875,7 @@ mod tests {
             host: None,
             source: None,
             terminal_ids: vec![],
+            agent_keys: vec![],
         }
     }
 
