@@ -333,10 +333,10 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         }
     }
 
-    let (anchor, linked_change_request, linked_session) = if let Some(set_id) = &attachable_set_id {
-        (CorrelatedAnchor::AttachableSet(set_id.clone()), change_request_key.clone(), session_key.clone())
-    } else if let Some(co) = checkout_ref.clone() {
+    let (anchor, linked_change_request, linked_session) = if let Some(co) = checkout_ref.clone() {
         (CorrelatedAnchor::Checkout(co), change_request_key.clone(), session_key.clone())
+    } else if let Some(set_id) = &attachable_set_id {
+        (CorrelatedAnchor::AttachableSet(set_id.clone()), change_request_key.clone(), session_key.clone())
     } else if let Some(key) = change_request_key.clone() {
         (CorrelatedAnchor::ChangeRequest(key), None, session_key.clone())
     } else if let Some(key) = session_key.clone() {
@@ -2019,10 +2019,11 @@ mod tests {
 
         let (items, _) = correlate(&providers);
 
-        // Should merge into a single attachable-set work item
+        // Should merge into a single checkout work item
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind(), WorkItemKind::AttachableSet);
+        assert_eq!(items[0].kind(), WorkItemKind::Checkout);
         assert_eq!(items[0].attachable_set_id(), Some(&set_id));
+        assert_eq!(items[0].checkout_key(), Some(&co_path));
 
         let terminal_ids = items[0].terminal_ids();
         assert!(!terminal_ids.is_empty(), "terminal_ids should be non-empty after correlation");
@@ -2070,10 +2071,12 @@ mod tests {
         let (items, _) = correlate(&providers);
 
         assert_eq!(items.len(), 2);
-        let set_item = items.iter().find(|item| item.attachable_set_id() == Some(&set_id)).expect("attachable set item");
-        assert_eq!(set_item.kind(), WorkItemKind::AttachableSet);
-        assert_eq!(set_item.checkout_key(), Some(&remote_checkout));
-        assert_eq!(set_item.workspace_refs(), &["ws-1".to_string()]);
+        let remote_checkout_item = items
+            .iter()
+            .find(|item| item.kind() == WorkItemKind::Checkout && item.checkout_key() == Some(&remote_checkout))
+            .expect("remote checkout item");
+        assert_eq!(remote_checkout_item.attachable_set_id(), Some(&set_id));
+        assert_eq!(remote_checkout_item.workspace_refs(), &["ws-1".to_string()]);
 
         let local_checkout_item = items
             .iter()
@@ -2084,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn correlate_attachable_set_becomes_anchor_when_present() {
+    fn correlate_checkout_remains_anchor_when_attachable_set_present() {
         let mut providers = new_providers();
 
         let co_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), "/tmp/feat-set");
@@ -2111,7 +2114,7 @@ mod tests {
         let (items, _) = correlate(&providers);
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind(), WorkItemKind::AttachableSet);
+        assert_eq!(items[0].kind(), WorkItemKind::Checkout);
         assert_eq!(items[0].attachable_set_id(), Some(&set_id));
         assert_eq!(items[0].checkout_key(), Some(&co_path));
         assert_eq!(items[0].workspace_refs(), &["ws-1".to_string()]);
