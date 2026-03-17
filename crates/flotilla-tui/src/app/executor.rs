@@ -107,14 +107,16 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
             app.prefill_branch_input(&name, issue_ids);
         }
         CommandResult::CheckoutStatus(info) => {
-            let (terminal_keys, identity) = match &app.ui.mode {
-                UiMode::DeleteConfirm { terminal_keys, identity, .. } => (terminal_keys.clone(), identity.clone()),
+            let (terminal_keys, identity, remote_host) = match &app.ui.mode {
+                UiMode::DeleteConfirm { terminal_keys, identity, remote_host, .. } => {
+                    (terminal_keys.clone(), identity.clone(), remote_host.clone())
+                }
                 other => {
                     tracing::warn!(mode = ?std::mem::discriminant(other), "CheckoutStatus arrived outside DeleteConfirm");
-                    (vec![], WorkItemIdentity::Session(String::new()))
+                    (vec![], WorkItemIdentity::Session(String::new()), None)
                 }
             };
-            app.ui.mode = UiMode::DeleteConfirm { info: Some(info), loading: false, terminal_keys, identity };
+            app.ui.mode = UiMode::DeleteConfirm { info: Some(info), loading: false, terminal_keys, identity, remote_host };
         }
         CommandResult::Error { message } => {
             reset_loading_mode(app);

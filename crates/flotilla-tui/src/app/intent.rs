@@ -57,10 +57,10 @@ impl Intent {
     /// Whether this intent requires local filesystem access.
     ///
     /// Returns `true` for actions that operate on the local filesystem
-    /// (switch workspace, remove checkout, teleport session). These should be
-    /// hidden for work items from remote hosts.
+    /// (switch workspace, teleport session). These should be hidden for
+    /// work items from remote hosts.
     pub fn requires_local_host(&self) -> bool {
-        matches!(self, Intent::SwitchToWorkspace | Intent::RemoveCheckout | Intent::TeleportSession)
+        matches!(self, Intent::SwitchToWorkspace | Intent::TeleportSession)
     }
 
     /// Whether this intent is allowed given the item's host provenance.
@@ -119,7 +119,7 @@ impl Intent {
                 let branch = item.branch.as_ref()?.to_string();
                 let checkout_path = item.checkout_key().map(|p| p.path.clone());
                 let change_request_id = item.change_request_key.clone();
-                Some(app.repo_command(CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id }))
+                Some(app.item_host_repo_command(CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id }, item))
             }
             Intent::CreateCheckout => item.branch.as_ref().map(|branch| {
                 let target = if item.kind == WorkItemKind::RemoteBranch || item.kind == WorkItemKind::ChangeRequest {
@@ -1166,12 +1166,12 @@ mod tests {
     #[test]
     fn requires_local_host_true_for_filesystem_intents() {
         assert!(Intent::SwitchToWorkspace.requires_local_host());
-        assert!(Intent::RemoveCheckout.requires_local_host());
         assert!(Intent::TeleportSession.requires_local_host());
     }
 
     #[test]
     fn requires_local_host_false_for_non_filesystem_intents() {
+        assert!(!Intent::RemoveCheckout.requires_local_host());
         assert!(!Intent::CreateWorkspace.requires_local_host());
         assert!(!Intent::CreateCheckout.requires_local_host());
         assert!(!Intent::GenerateBranchName.requires_local_host());
@@ -1202,10 +1202,10 @@ mod tests {
 
         // Local-only filesystem intents should be blocked
         assert!(!Intent::SwitchToWorkspace.is_allowed_for_host(&item, &my_host));
-        assert!(!Intent::RemoveCheckout.is_allowed_for_host(&item, &my_host));
         assert!(!Intent::TeleportSession.is_allowed_for_host(&item, &my_host));
 
         // Remote-executable intents should remain allowed
+        assert!(Intent::RemoveCheckout.is_allowed_for_host(&item, &my_host));
         assert!(Intent::CreateWorkspace.is_allowed_for_host(&item, &my_host));
         assert!(Intent::CreateCheckout.is_allowed_for_host(&item, &my_host));
         assert!(Intent::OpenChangeRequest.is_allowed_for_host(&item, &my_host));
@@ -1245,9 +1245,11 @@ mod tests {
 
         // Local-only intents should be excluded
         assert!(!available.contains(&&Intent::SwitchToWorkspace));
-        assert!(!available.contains(&&Intent::RemoveCheckout));
         assert!(!available.contains(&&Intent::CreateCheckout));
         assert!(!available.contains(&&Intent::TeleportSession));
+
+        // RemoveCheckout is now remote-capable
+        assert!(available.contains(&&Intent::RemoveCheckout));
 
         // Remote-executable intents should remain. CreateWorkspace is not
         // available here because the item already has a workspace.

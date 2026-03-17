@@ -54,6 +54,7 @@ pub enum UiMode {
         loading: bool,
         terminal_keys: Vec<flotilla_protocol::ManagedTerminalId>,
         identity: WorkItemIdentity,
+        remote_host: Option<flotilla_protocol::HostName>,
     },
     CloseConfirm {
         id: String,
@@ -351,6 +352,7 @@ mod tests {
                     loading: false,
                     terminal_keys: vec![],
                     identity: WorkItemIdentity::Session("test".into()),
+                    remote_host: None,
                 },
                 false,
             ),
@@ -397,6 +399,7 @@ mod tests {
                     loading: false,
                     terminal_keys: vec![],
                     identity: WorkItemIdentity::Session("test".into()),
+                    remote_host: None,
                 },
                 FocusTarget::DeleteConfirmDialog,
             ),

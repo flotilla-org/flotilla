@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::data::GroupEntry;
-use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, WorkItem};
+use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, RepoSelector, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{
@@ -147,19 +147,24 @@ impl App {
                 FocusTarget::DeleteConfirmDialog => {
                     let loading = matches!(self.ui.mode, UiMode::DeleteConfirm { loading: true, .. });
                     if !loading {
-                        if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, ref identity, .. } = self.ui.mode {
+                        if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, ref identity, ref remote_host, .. } =
+                            self.ui.mode
+                        {
                             let ctx = PendingActionContext {
                                 identity: identity.clone(),
                                 description: format!("Remove {}", info.branch),
                                 repo_identity: self.model.active_repo_identity().clone(),
                             };
-                            self.proto_commands.push_with_context(
-                                self.command(CommandAction::RemoveCheckout {
-                                    checkout: CheckoutSelector::Query(info.branch.clone()),
-                                    terminal_keys: terminal_keys.clone(),
-                                }),
-                                Some(ctx),
-                            );
+                            let action = CommandAction::RemoveCheckout {
+                                checkout: CheckoutSelector::Query(info.branch.clone()),
+                                terminal_keys: terminal_keys.clone(),
+                            };
+                            let command = Command {
+                                host: remote_host.clone(),
+                                context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
+                                action,
+                            };
+                            self.proto_commands.push_with_context(command, Some(ctx));
                         }
                         self.ui.mode = UiMode::Normal;
                     }
@@ -518,6 +523,7 @@ impl App {
                         loading: true,
                         terminal_keys: item.terminal_keys.clone(),
                         identity: item.identity.clone(),
+                        remote_host: self.item_execution_host(item),
                     };
                 }
                 Intent::GenerateBranchName => {
@@ -660,6 +666,7 @@ mod tests {
             loading: false,
             terminal_keys: vec![],
             identity: WorkItemIdentity::Session("test".into()),
+            remote_host: None,
         }
     }
 
@@ -1436,6 +1443,7 @@ mod tests {
             loading: false,
             terminal_keys: vec![],
             identity: item.identity.clone(),
+            remote_host: None,
         };
         app.handle_key(key(KeyCode::Char('y')));
         let (_, ctx) = app.proto_commands.take_next().expect("should have command");
@@ -1446,8 +1454,13 @@ mod tests {
     #[test]
     fn delete_confirm_ignores_while_loading() {
         let mut app = stub_app();
-        app.ui.mode =
-            UiMode::DeleteConfirm { info: None, loading: true, terminal_keys: vec![], identity: WorkItemIdentity::Session("test".into()) };
+        app.ui.mode = UiMode::DeleteConfirm {
+            info: None,
+            loading: true,
+            terminal_keys: vec![],
+            identity: WorkItemIdentity::Session("test".into()),
+            remote_host: None,
+        };
         app.handle_key(key(KeyCode::Char('y')));
         // Should still be in DeleteConfirm mode
         assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
@@ -1718,8 +1731,13 @@ mod tests {
     #[test]
     fn delete_confirm_y_with_no_info_does_not_push_command() {
         let mut app = stub_app();
-        app.ui.mode =
-            UiMode::DeleteConfirm { info: None, loading: false, terminal_keys: vec![], identity: WorkItemIdentity::Session("test".into()) };
+        app.ui.mode = UiMode::DeleteConfirm {
+            info: None,
+            loading: false,
+            terminal_keys: vec![],
+            identity: WorkItemIdentity::Session("test".into()),
+            remote_host: None,
+        };
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(app.ui.mode, UiMode::Normal));
         // No info means no branch to extract, so no command pushed

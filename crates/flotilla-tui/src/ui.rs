@@ -973,7 +973,7 @@ fn render_input_popup(ui: &UiState, theme: &Theme, frame: &mut Frame) {
 }
 
 fn render_delete_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame) {
-    let UiMode::DeleteConfirm { ref info, loading, .. } = ui.mode else {
+    let UiMode::DeleteConfirm { ref info, loading, ref remote_host, .. } = ui.mode else {
         return;
     };
 
@@ -1056,7 +1056,10 @@ fn render_delete_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &
         lines.push(Line::from(Span::styled("y/Enter: confirm    n/Esc: cancel", Style::default().fg(theme.muted))));
     }
 
-    let title = format!(" Remove {} ", model.active_labels().checkouts.noun_capitalized());
+    let title = match remote_host {
+        Some(host) => format!(" Remove {} on {} ", model.active_labels().checkouts.noun_capitalized(), host),
+        None => format!(" Remove {} ", model.active_labels().checkouts.noun_capitalized()),
+    };
     let paragraph = Paragraph::new(lines).block(Block::bordered().style(theme.block_style()).title(title)).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
