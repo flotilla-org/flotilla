@@ -12,12 +12,13 @@ COMPOSE_FILE = str(COMPOSE_DIR / "docker-compose.yml")
 
 
 def docker_exec(
-    service: str, cmd: str, timeout: int = 30
+    service: str, cmd: str, timeout: int = 30,
+    compose_file: str = COMPOSE_FILE,
 ) -> subprocess.CompletedProcess:
     """Run a command inside a container via docker compose exec."""
     return subprocess.run(
         [
-            "docker", "compose", "-f", COMPOSE_FILE,
+            "docker", "compose", "-f", compose_file,
             "exec", "-T", "-u", "flotilla", service, "bash", "-c", cmd,
         ],
         capture_output=True,
@@ -26,9 +27,13 @@ def docker_exec(
     )
 
 
-def flotilla_json(service: str, args: str, timeout: int = 30) -> dict | list:
+def flotilla_json(
+    service: str, args: str, timeout: int = 30,
+    compose_file: str = COMPOSE_FILE,
+) -> dict | list:
     """Run a flotilla CLI command with --json and return parsed output."""
-    result = docker_exec(service, f"flotilla {args} --json", timeout=timeout)
+    result = docker_exec(service, f"flotilla {args} --json", timeout=timeout,
+                         compose_file=compose_file)
     assert result.returncode == 0, (
         f"flotilla {args} failed (rc={result.returncode}):\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
