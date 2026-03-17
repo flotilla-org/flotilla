@@ -81,6 +81,8 @@ pub enum StandaloneResult {
 }
 
 #[derive(Debug, Clone)]
+// Correlated work items are the common path; boxing the standalone arm would add
+// indirection where we pay the cost most often.
 #[allow(clippy::large_enum_variant)]
 pub enum CorrelationResult {
     Correlated(CorrelatedWorkItem),

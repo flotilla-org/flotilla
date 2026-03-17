@@ -9,3 +9,9 @@ pub use types::{
     Attachable, AttachableContent, AttachableId, AttachableSet, AttachableSetId, BindingObjectKind, ProviderBinding, TerminalAttachable,
     TerminalPurpose,
 };
+
+pub const TERMINAL_SESSION_BINDING_PREFIX: &str = "flotilla/";
+
+pub fn terminal_session_binding_ref(id: &flotilla_protocol::ManagedTerminalId) -> String {
+    format!("{TERMINAL_SESSION_BINDING_PREFIX}{id}")
+}

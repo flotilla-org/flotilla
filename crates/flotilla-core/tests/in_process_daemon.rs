@@ -7,7 +7,9 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::{
-    attachable::{shared_in_memory_attachable_store, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose},
+    attachable::{
+        shared_in_memory_attachable_store, terminal_session_binding_ref, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose,
+    },
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
@@ -1405,7 +1407,7 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
             &set_id,
             "terminal_pool",
             "fake-terminals",
-            &format!("flotilla/{terminal_id}"),
+            &terminal_session_binding_ref(&terminal_id),
             TerminalPurpose { checkout: terminal_id.checkout.clone(), role: terminal_id.role.clone(), index: terminal_id.index },
             "bash",
             PathBuf::from("/Users/robert/dev/flotilla"),

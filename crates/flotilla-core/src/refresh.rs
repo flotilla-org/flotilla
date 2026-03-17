@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use crate::{
-    attachable::{BindingObjectKind, SharedAttachableStore},
+    attachable::{terminal_session_binding_ref, BindingObjectKind, SharedAttachableStore},
     data::{self, CorrelationResult, RefreshError},
     provider_data::ProviderData,
     providers::{correlation::CorrelatedGroup, registry::ProviderRegistry, types::RepoCriteria},
@@ -274,7 +274,7 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
 
     if let Some(provider_name) = terminal_provider.as_deref() {
         for terminal in pd.managed_terminals.values_mut() {
-            let session_name = format!("flotilla/{}", terminal.id);
+            let session_name = terminal_session_binding_ref(&terminal.id);
             let Some(attachable_id) = store.lookup_binding("terminal_pool", provider_name, BindingObjectKind::Attachable, &session_name)
             else {
                 continue;
@@ -300,8 +300,10 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
         }
     }
 
+    let mut referenced_set_ids: Vec<_> = referenced_sets.into_iter().collect();
+    referenced_set_ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     pd.attachable_sets =
-        referenced_sets.into_iter().filter_map(|set_id| store.registry().sets.get(&set_id).cloned().map(|set| (set_id, set))).collect();
+        referenced_set_ids.into_iter().filter_map(|set_id| store.registry().sets.get(&set_id).cloned().map(|set| (set_id, set))).collect();
 }
 
 fn compute_provider_health(registry: &ProviderRegistry, errors: &[RefreshError]) -> HashMap<(&'static str, String), bool> {
@@ -627,8 +629,7 @@ mod tests {
     }
 
     fn test_attachable_store() -> SharedAttachableStore {
-        let dir = tempfile::tempdir().expect("tempdir");
-        crate::attachable::shared_file_backed_attachable_store(dir.path())
+        crate::attachable::shared_in_memory_attachable_store()
     }
 
     fn refresh_error(category: &'static str) -> RefreshError {

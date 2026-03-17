@@ -10,15 +10,16 @@ We are in a **no backwards compatibility** phase. Protocol types, snapshot forma
 
 ```bash
 cargo build                                    # build
-cargo test                                     # all tests
-cargo clippy                                   # lint
-cargo +nightly-2026-03-12 fmt                  # format (pinned nightly, see rustfmt.toml)
+cargo +nightly-2026-03-12 fmt --check          # CI format gate
+cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
+cargo test --workspace --locked                # CI test gate
+cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
 cargo dylint --all -- --all-targets             # custom lints (requires cargo-dylint + dylint-link)
 cargo run -- --repo-root /path                 # run with explicit repo
 cargo run                                      # run, auto-detect repo from cwd
 ```
 
-Before pushing, always run `cargo +nightly-2026-03-12 fmt`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`.
+Before pushing, run the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
 
 **Nightly toolchain:** All nightly-dependent tools (rustfmt, llvm-cov, Dylint) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
 

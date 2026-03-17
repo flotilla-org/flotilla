@@ -9,7 +9,10 @@ use flotilla_protocol::{HostName, HostPath, ManagedTerminal, ManagedTerminalId, 
 
 use super::TerminalPool;
 use crate::{
-    attachable::{AttachableContent, AttachableId, AttachableStoreApi, BindingObjectKind, SharedAttachableStore, TerminalPurpose},
+    attachable::{
+        terminal_session_binding_ref, AttachableContent, AttachableId, AttachableStoreApi, BindingObjectKind, SharedAttachableStore,
+        TerminalPurpose,
+    },
     providers::{run, CommandRunner},
 };
 
@@ -358,7 +361,7 @@ impl ShpoolTerminalPool {
         let checkout_path = cwd.to_path_buf();
         let set_checkout = HostPath::new(host.clone(), checkout_path.clone());
         let (set_id, changed_set) = store.ensure_terminal_set_with_change(Some(host), Some(set_checkout));
-        let session_name = format!("flotilla/{id}");
+        let session_name = terminal_session_binding_ref(id);
         let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
             &set_id,
             "terminal_pool",
@@ -499,9 +502,10 @@ impl TerminalPool for ShpoolTerminalPool {
                     return Ok(terminals);
                 };
                 let mut any_changed = false;
-                let observed_sessions: HashSet<String> = terminals.iter().map(|terminal| format!("flotilla/{}", terminal.id)).collect();
+                let observed_sessions: HashSet<String> =
+                    terminals.iter().map(|terminal| terminal_session_binding_ref(&terminal.id)).collect();
                 for terminal in &terminals {
-                    let session_name = format!("flotilla/{}", terminal.id);
+                    let session_name = terminal_session_binding_ref(&terminal.id);
                     missed_scans.remove(&session_name);
                     any_changed |= Self::reconcile_known_attachable(store.as_mut(), terminal, &session_name);
                 }
@@ -530,7 +534,7 @@ impl TerminalPool for ShpoolTerminalPool {
     }
 
     async fn attach_command(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<String, String> {
-        let session_name = format!("flotilla/{id}");
+        let session_name = terminal_session_binding_ref(id);
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
         let cwd_str = cwd.display().to_string();
@@ -575,7 +579,7 @@ impl TerminalPool for ShpoolTerminalPool {
     }
 
     async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
-        let session_name = format!("flotilla/{id}");
+        let session_name = terminal_session_binding_ref(id);
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
         run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "kill", &session_name], Path::new("/"))

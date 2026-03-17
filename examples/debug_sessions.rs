@@ -5,7 +5,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{
-    attachable::AttachableStore,
+    attachable::shared_file_backed_attachable_store,
     config::ConfigStore,
     convert::correlation_result_to_work_item,
     data,
@@ -32,7 +32,7 @@ async fn main() {
     let repo_dets = detectors::default_repo_detectors();
     let host_bag = discovery::run_host_detectors(&host_dets, &*runner, &ProcessEnvVars).await;
     let factories = FactoryRegistry::default_all();
-    let attachable_store = Arc::new(std::sync::Mutex::new(AttachableStore::with_base(config.base_path())));
+    let attachable_store = shared_file_backed_attachable_store(config.base_path());
 
     let result = discovery::discover_providers(
         &host_bag,

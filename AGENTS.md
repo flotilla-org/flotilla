@@ -2,12 +2,15 @@
 
 ## Test Command Defaults
 
-- Normal environment: `cargo test --workspace --locked`
+- CI parity (format): `cargo +nightly-2026-03-12 fmt --check`
+- CI parity (clippy): `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- CI parity (test): `cargo test --workspace --locked`
 - Restricted Codex sandbox (socket bind/listen blocked): `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests`
 - `flotilla-core` package-local `InProcessDaemon` integration test: `cargo test -p flotilla-core --locked --features test-support --test in_process_daemon`
 
 Use the sandbox-safe command when `CODEX_SANDBOX` is set or socket-bind tests are expected to fail with `Operation not permitted`. The repo-local `TMPDIR` avoids native build failures from crates like `aws-lc-sys` under the sandbox.
 The `flotilla-core` integration test above intentionally depends on shared discovery test helpers behind the `test-support` feature.
+If you say a change matches CI locally, it should have been checked against these exact commands rather than close approximations.
 
 ## Testing Philosophy
 
@@ -41,10 +44,9 @@ The app auto-detects git, GitHub (`gh` CLI), Claude, and terminal multiplexers f
 | Task | Command |
 |------|---------|
 | Build | `cargo build --locked` |
-| Lint (format) | `cargo fmt --check` |
-| Lint (format, repo convention) | `cargo +nightly-2026-03-12 fmt --check` |
-| Lint (clippy) | `cargo clippy --all-targets --locked -- -D warnings` |
-| Test | `cargo test --workspace --locked` |
+| CI parity (format) | `cargo +nightly-2026-03-12 fmt --check` |
+| CI parity (clippy) | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| CI parity (test) | `cargo test --workspace --locked` |
 | Test (sandbox) | `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` |
 | Run | `cargo run -- --repo-root /workspace` |
 
