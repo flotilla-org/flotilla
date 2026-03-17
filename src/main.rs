@@ -570,8 +570,8 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
     // When the daemon receives the event it handles session_id → attachable_id
     // mapping and persistence.
     let attachable_id = match std::env::var("FLOTILLA_ATTACHABLE_ID") {
-        Ok(id) => AttachableId::new(id),
-        Err(_) => agents::allocate_attachable_id(),
+        Ok(id) if !id.is_empty() => AttachableId::new(id),
+        _ => agents::allocate_attachable_id(),
     };
 
     // 5. Build the event

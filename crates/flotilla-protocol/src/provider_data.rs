@@ -191,7 +191,7 @@ impl AgentEventType {
     pub fn to_status(&self) -> Option<AgentStatus> {
         match self {
             AgentEventType::Started => Some(AgentStatus::Idle),
-            AgentEventType::Ended => Some(AgentStatus::Idle), // caller removes entry
+            AgentEventType::Ended => None, // caller should remove the entry
             AgentEventType::Active => Some(AgentStatus::Active),
             AgentEventType::Idle => Some(AgentStatus::Idle),
             AgentEventType::WaitingForPermission => Some(AgentStatus::WaitingForPermission),

@@ -193,6 +193,7 @@ mod tests {
     #[test]
     fn event_type_to_status_mappings() {
         assert_eq!(AgentEventType::Started.to_status(), Some(AgentStatus::Idle));
+        assert_eq!(AgentEventType::Ended.to_status(), None);
         assert_eq!(AgentEventType::Active.to_status(), Some(AgentStatus::Active));
         assert_eq!(AgentEventType::Idle.to_status(), Some(AgentStatus::Idle));
         assert_eq!(AgentEventType::WaitingForPermission.to_status(), Some(AgentStatus::WaitingForPermission));

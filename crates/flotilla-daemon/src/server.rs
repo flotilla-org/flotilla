@@ -1919,11 +1919,13 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
                     event.attachable_id.clone()
                 };
 
-                if event.event_type == AgentEventType::Ended {
+                let changed = if event.event_type == AgentEventType::Ended {
                     store.remove(&attachable_id);
+                    true
                 } else if let Some(status) = event.event_type.to_status() {
                     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                     let existing = store.get(&attachable_id);
+                    // TODO(#393): persist event.cwd for CliAgentProvider correlation
                     let entry = AgentEntry {
                         harness: event.harness.clone(),
                         status,
@@ -1933,10 +1935,16 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
                         last_event_epoch_secs: now,
                     };
                     store.upsert(attachable_id, entry);
-                }
-                // NoChange events skip the store
+                    true
+                } else {
+                    false // NoChange events skip the store
+                };
 
-                store.save()
+                if changed {
+                    store.save()
+                } else {
+                    Ok(())
+                }
             })();
 
             match result {
