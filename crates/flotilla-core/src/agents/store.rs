@@ -436,6 +436,11 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_session_id_lookup_absent_when_no_session_id() {
+        contract_session_id_lookup_absent_when_no_session_id(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    }
+
+    #[test]
     fn file_backed_list_agents_returns_all() {
         contract_list_agents_returns_all(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     }
