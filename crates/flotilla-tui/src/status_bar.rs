@@ -93,6 +93,28 @@ impl StatusSection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModeIndicator {
+    pub icon: String,
+    pub label: String,
+    pub action: StatusBarAction,
+}
+
+impl ModeIndicator {
+    pub fn new(icon: &str, label: &str, action: StatusBarAction) -> Self {
+        Self { icon: icon.to_string(), label: label.to_string(), action }
+    }
+
+    /// Display width: " icon label " (space, icon, space, label, space).
+    pub fn width(&self) -> usize {
+        displayed_width(&self.icon) + displayed_width(&self.label) + 3
+    }
+}
+
+fn total_mode_width(indicators: &[ModeIndicator]) -> usize {
+    indicators.iter().map(ModeIndicator::width).sum()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusBarInput {
     pub width: usize,
     pub preferred_status_width: usize,
@@ -100,14 +122,17 @@ pub struct StatusBarInput {
     pub status: StatusSection,
     pub task: Option<TaskSection>,
     pub keys: Vec<KeyChip>,
+    pub mode_indicators: Vec<ModeIndicator>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusBarModel {
     pub status_text: String,
     pub visible_keys: Vec<KeyChip>,
+    pub mode_indicators: Vec<ModeIndicator>,
     pub task_text: String,
     pub keys_start: usize,
+    pub mode_start: usize,
     pub task_start: usize,
 }
 
@@ -130,23 +155,38 @@ impl StatusBarTarget {
     }
 }
 
+/// Gap (in columns) between action key chips and mode indicators.
+const MODE_GAP: usize = 2;
+
 impl StatusBarModel {
     pub fn build(input: StatusBarInput) -> Self {
         let mut status_text = input.status.render();
         let mut task_text = input.task.as_ref().map(TaskSection::render).unwrap_or_default();
         let mut visible_keys = if input.keys_visible { input.keys.clone() } else { vec![] };
+        let mode_width = total_mode_width(&input.mode_indicators);
 
         loop {
             let keys_width = total_keys_width(&visible_keys);
             let task_width = displayed_width(&task_text);
             let status_width = displayed_width(&status_text);
             let reserved_status_width = status_width.max(input.preferred_status_width.min(input.width));
+            let gap = if keys_width > 0 && mode_width > 0 { MODE_GAP } else { 0 };
 
-            if reserved_status_width + keys_width + task_width <= input.width {
+            if reserved_status_width + keys_width + gap + mode_width + task_width <= input.width {
                 let task_start = input.width.saturating_sub(task_width);
-                let keys_start = if keys_width == 0 { task_start } else { reserved_status_width };
+                let after_keys = reserved_status_width + keys_width;
+                let mode_start = if mode_width == 0 { task_start } else { after_keys + gap };
+                let keys_start = if keys_width == 0 && mode_width == 0 { task_start } else { reserved_status_width };
 
-                return Self { status_text, visible_keys, task_text, keys_start, task_start };
+                return Self {
+                    status_text,
+                    visible_keys,
+                    mode_indicators: input.mode_indicators,
+                    task_text,
+                    keys_start,
+                    mode_start,
+                    task_start,
+                };
             }
 
             if !visible_keys.is_empty() {
@@ -162,7 +202,16 @@ impl StatusBarModel {
                 continue;
             }
 
-            return Self { status_text, visible_keys, task_text, keys_start: status_width.min(input.width), task_start: input.width };
+            let fallback_keys_start = status_width.min(input.width);
+            return Self {
+                status_text,
+                visible_keys,
+                mode_indicators: input.mode_indicators,
+                task_text,
+                keys_start: fallback_keys_start,
+                mode_start: fallback_keys_start,
+                task_start: input.width,
+            };
         }
     }
 }
@@ -214,6 +263,7 @@ mod tests {
                 KeyChip::new("/", "Search", StatusBarAction::key(KeyCode::Char('/'))),
                 KeyChip::new("q", "Quit", StatusBarAction::key(KeyCode::Char('q'))),
             ],
+            mode_indicators: vec![],
         });
 
         assert!(model.visible_keys.len() < 3);
@@ -230,6 +280,7 @@ mod tests {
             status: StatusSection::plain("Ready"),
             task: None,
             keys: vec![KeyChip::new("q", "Quit", StatusBarAction::key(KeyCode::Char('q')))],
+            mode_indicators: vec![],
         });
 
         assert!(model.visible_keys.is_empty());
@@ -245,6 +296,7 @@ mod tests {
             status: StatusSection::plain("Ready"),
             task: None,
             keys: vec![KeyChip::new("/", "Search", StatusBarAction::key(KeyCode::Char('/')))],
+            mode_indicators: vec![],
         });
 
         assert_eq!(model.keys_start, 28);
@@ -259,8 +311,50 @@ mod tests {
             status: StatusSection::plain("Ready"),
             task: Some(TaskSection::new("Generating branch name...", 0)),
             keys: vec![KeyChip::new("/", "Search", StatusBarAction::key(KeyCode::Char('/')))],
+            mode_indicators: vec![],
         });
 
         assert_eq!(model.task_start + displayed_width(&model.task_text), 80);
+    }
+
+    #[test]
+    fn mode_indicators_appear_after_keys() {
+        let model = StatusBarModel::build(StatusBarInput {
+            width: 80,
+            preferred_status_width: 28,
+            keys_visible: true,
+            status: StatusSection::plain("Ready"),
+            task: None,
+            keys: vec![KeyChip::new("/", "Search", StatusBarAction::key(KeyCode::Char('/')))],
+            mode_indicators: vec![
+                ModeIndicator::new("□", "zoom", StatusBarAction::key(KeyCode::Char('l'))),
+                ModeIndicator::new("@", "local", StatusBarAction::key(KeyCode::Char('h'))),
+            ],
+        });
+
+        // keys at 28, mode after keys + gap
+        assert_eq!(model.keys_start, 28);
+        let keys_end = model.keys_start + total_keys_width(&model.visible_keys);
+        assert_eq!(model.mode_start, keys_end + MODE_GAP);
+    }
+
+    #[test]
+    fn mode_indicators_shed_keys_first() {
+        let model = StatusBarModel::build(StatusBarInput {
+            width: 50,
+            preferred_status_width: DEFAULT_STATUS_WIDTH_BUDGET,
+            keys_visible: true,
+            status: StatusSection::plain("Ready"),
+            task: Some(TaskSection::new("Refreshing...", 0)),
+            keys: vec![
+                KeyChip::new("enter", "Open", StatusBarAction::key(KeyCode::Enter)),
+                KeyChip::new("q", "Quit", StatusBarAction::key(KeyCode::Char('q'))),
+            ],
+            mode_indicators: vec![ModeIndicator::new("□", "zoom", StatusBarAction::key(KeyCode::Char('l')))],
+        });
+
+        // Mode indicators survive even when keys are shed
+        assert_eq!(model.mode_indicators.len(), 1);
+        assert!(model.visible_keys.len() < 2, "at least one key should have been shed");
     }
 }

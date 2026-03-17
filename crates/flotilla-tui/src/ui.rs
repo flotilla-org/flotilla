@@ -26,7 +26,8 @@ use crate::{
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
     shimmer::{shimmer_spans, Shimmer},
     status_bar::{
-        KeyChip, StatusBarAction, StatusBarInput, StatusBarModel, StatusBarTarget, StatusSection, TaskSection, DEFAULT_STATUS_WIDTH_BUDGET,
+        KeyChip, ModeIndicator, StatusBarAction, StatusBarInput, StatusBarModel, StatusBarTarget, StatusSection, TaskSection,
+        DEFAULT_STATUS_WIDTH_BUDGET,
     },
     theme::{BarKind, Theme},
     ui_helpers,
@@ -240,14 +241,16 @@ fn render_status_bar(
     ui.layout.status_bar.key_targets.clear();
     ui.layout.status_bar.dismiss_targets.clear();
 
-    let (status_section, keys, task_section) = status_bar_content(model, ui, in_flight);
+    let content = status_bar_content(model, ui, in_flight);
+    let status_section = content.status.clone();
     let status_model = StatusBarModel::build(StatusBarInput {
         width: area.width as usize,
         preferred_status_width: DEFAULT_STATUS_WIDTH_BUDGET.min(area.width as usize),
         keys_visible: ui.status_bar.show_keys,
-        status: status_section.clone(),
-        task: task_section,
-        keys,
+        status: content.status,
+        task: content.task,
+        keys: content.keys,
+        mode_indicators: content.mode_indicators,
     });
 
     frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
@@ -267,11 +270,6 @@ fn render_status_bar(
                 Rect::new(area.x + status_width.saturating_sub(1) as u16, area.y, 1, 1),
                 StatusBarAction::ClearError(id),
             ));
-        } else if matches!(ui.mode, UiMode::Normal) && status_model.status_text == layout_status_text(ui) {
-            ui.layout
-                .status_bar
-                .key_targets
-                .push(StatusBarTarget::new(Rect::new(area.x, area.y, status_width as u16, 1), StatusBarAction::key(KeyCode::Char('l'))));
         }
         x += status_width;
     }
@@ -303,6 +301,26 @@ fn render_status_bar(
         x += rendered.width;
     }
 
+    // ── Mode indicators (compact, after keys) ──
+    if x < status_model.mode_start {
+        spans.push(Span::styled(" ".repeat(status_model.mode_start - x), Style::default().fg(theme.text).bg(theme.bar_bg)));
+        x = status_model.mode_start;
+    }
+
+    let icon_style = Style::default().fg(theme.key_hint).bg(theme.bar_bg);
+    let label_style = Style::default().fg(theme.muted).bg(theme.bar_bg);
+    for indicator in &status_model.mode_indicators {
+        let indicator_start = x;
+        spans.push(Span::styled(format!(" {}", indicator.icon), icon_style));
+        spans.push(Span::styled(format!(" {} ", indicator.label), label_style));
+        let indicator_width = indicator.width();
+        ui.layout.status_bar.key_targets.push(StatusBarTarget::new(
+            Rect::new(area.x + indicator_start as u16, area.y, indicator_width as u16, 1),
+            indicator.action.clone(),
+        ));
+        x += indicator_width;
+    }
+
     if x < status_model.task_start {
         spans.push(Span::styled(" ".repeat(status_model.task_start - x), Style::default().fg(theme.text).bg(theme.bar_bg)));
         x = status_model.task_start;
@@ -324,11 +342,14 @@ fn render_status_bar(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn status_bar_content(
-    model: &TuiModel,
-    ui: &UiState,
-    in_flight: &HashMap<u64, InFlightCommand>,
-) -> (StatusSection, Vec<KeyChip>, Option<TaskSection>) {
+struct StatusBarContent {
+    status: StatusSection,
+    keys: Vec<KeyChip>,
+    task: Option<TaskSection>,
+    mode_indicators: Vec<ModeIndicator>,
+}
+
+fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, InFlightCommand>) -> StatusBarContent {
     let visible_error = collect_visible_status_items(model, ui).into_iter().next();
 
     match &ui.mode {
@@ -343,77 +364,88 @@ fn status_bar_content(
             } else if !rui.multi_selected.is_empty() {
                 StatusSection::plain(&format!("{} SELECTED", rui.multi_selected.len()))
             } else {
-                StatusSection::plain(layout_status_text(ui))
+                StatusSection::plain("")
             };
 
             let task = active_task(model, in_flight).map(|(description, spinner_index)| TaskSection::new(&description, spinner_index));
-            (status, normal_mode_key_chips(ui), task)
+            StatusBarContent { status, keys: normal_mode_key_chips(), task, mode_indicators: normal_mode_indicators(ui) }
         }
-        UiMode::Config => (
-            StatusSection::plain("FLOTILLA"),
-            vec![
+        UiMode::Config => StatusBarContent {
+            status: StatusSection::plain("FLOTILLA"),
+            keys: vec![
                 key_chip("j", "Down", KeyCode::Char('j')),
                 key_chip("k", "Up", KeyCode::Char('k')),
                 key_chip("[", "Prev", KeyCode::Char('[')),
                 key_chip("]", "Next", KeyCode::Char(']')),
                 key_chip("q", "Quit", KeyCode::Char('q')),
             ],
-            None,
-        ),
-        UiMode::BranchInput { kind: BranchInputKind::Generating, .. } => {
-            (StatusSection::plain("NEW BRANCH"), vec![], Some(TaskSection::new("Generating branch name...", 0)))
-        }
-        UiMode::BranchInput { kind: BranchInputKind::Manual, .. } => (
-            StatusSection::plain("NEW BRANCH"),
-            vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("esc", "Cancel", KeyCode::Esc)],
-            None,
-        ),
-        UiMode::ActionMenu { .. } => (
-            StatusSection::plain("ACTIONS"),
-            vec![
+            task: None,
+            mode_indicators: vec![],
+        },
+        UiMode::BranchInput { kind: BranchInputKind::Generating, .. } => StatusBarContent {
+            status: StatusSection::plain("NEW BRANCH"),
+            keys: vec![],
+            task: Some(TaskSection::new("Generating branch name...", 0)),
+            mode_indicators: vec![],
+        },
+        UiMode::BranchInput { kind: BranchInputKind::Manual, .. } => StatusBarContent {
+            status: StatusSection::plain("NEW BRANCH"),
+            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("esc", "Cancel", KeyCode::Esc)],
+            task: None,
+            mode_indicators: vec![],
+        },
+        UiMode::ActionMenu { .. } => StatusBarContent {
+            status: StatusSection::plain("ACTIONS"),
+            keys: vec![
                 key_chip("j", "Down", KeyCode::Char('j')),
                 key_chip("k", "Up", KeyCode::Char('k')),
                 key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
                 key_chip("esc", "Close", KeyCode::Esc),
             ],
-            None,
-        ),
-        UiMode::IssueSearch { input } => (
-            StatusSection::plain(&format!("SEARCH {}", input.value())),
-            vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("esc", "Cancel", KeyCode::Esc)],
-            None,
-        ),
-        UiMode::FilePicker { .. } => (
-            StatusSection::plain("ADD REPO"),
-            vec![
+            task: None,
+            mode_indicators: vec![],
+        },
+        UiMode::IssueSearch { input } => StatusBarContent {
+            status: StatusSection::plain(&format!("SEARCH {}", input.value())),
+            keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("esc", "Cancel", KeyCode::Esc)],
+            task: None,
+            mode_indicators: vec![],
+        },
+        UiMode::FilePicker { .. } => StatusBarContent {
+            status: StatusSection::plain("ADD REPO"),
+            keys: vec![
                 key_chip("j", "Down", KeyCode::Char('j')),
                 key_chip("k", "Up", KeyCode::Char('k')),
                 key_chip("tab", "Complete", KeyCode::Tab),
                 key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
                 key_chip("esc", "Cancel", KeyCode::Esc),
             ],
-            None,
-        ),
-        UiMode::DeleteConfirm { .. } => (
-            StatusSection::plain("CONFIRM DELETE"),
-            vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
-            None,
-        ),
-        UiMode::CloseConfirm { .. } => (
-            StatusSection::plain("CONFIRM CLOSE"),
-            vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
-            None,
-        ),
-        UiMode::Help => (
-            StatusSection::plain("HELP"),
-            vec![
+            task: None,
+            mode_indicators: vec![],
+        },
+        UiMode::DeleteConfirm { .. } => StatusBarContent {
+            status: StatusSection::plain("CONFIRM DELETE"),
+            keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
+            task: None,
+            mode_indicators: vec![],
+        },
+        UiMode::CloseConfirm { .. } => StatusBarContent {
+            status: StatusSection::plain("CONFIRM CLOSE"),
+            keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
+            task: None,
+            mode_indicators: vec![],
+        },
+        UiMode::Help => StatusBarContent {
+            status: StatusSection::plain("HELP"),
+            keys: vec![
                 key_chip("j", "Down", KeyCode::Char('j')),
                 key_chip("k", "Up", KeyCode::Char('k')),
                 key_chip("esc", "Close", KeyCode::Esc),
                 key_chip("?", "Close", KeyCode::Char('?')),
             ],
-            None,
-        ),
+            task: None,
+            mode_indicators: vec![],
+        },
     }
 }
 
@@ -432,23 +464,40 @@ fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> O
     Some((description, 0))
 }
 
-fn normal_mode_key_chips(ui: &UiState) -> Vec<KeyChip> {
+fn normal_mode_key_chips() -> Vec<KeyChip> {
     vec![
         key_chip(ENTER_KEY_GLYPH, "Open", KeyCode::Enter),
         key_chip(".", "Menu", KeyCode::Char('.')),
         key_chip("/", "Search", KeyCode::Char('/')),
-        key_chip("h", &target_host_key_label(ui), KeyCode::Char('h')),
         key_chip("n", "New", KeyCode::Char('n')),
         key_chip("?", "Help", KeyCode::Char('?')),
         key_chip("q", "Quit", KeyCode::Char('q')),
     ]
 }
 
-fn target_host_key_label(ui: &UiState) -> String {
-    match ui.target_host.as_ref() {
-        Some(host) => format!("Host {host}"),
-        None => "Host Local".into(),
-    }
+fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
+    let layout_icon = match ui.view_layout {
+        RepoViewLayout::Auto => "◫",
+        RepoViewLayout::Zoom => "□",
+        RepoViewLayout::Right => "▥",
+        RepoViewLayout::Below => "▤",
+    };
+    let layout_label = match ui.view_layout {
+        RepoViewLayout::Auto => "auto",
+        RepoViewLayout::Zoom => "zoom",
+        RepoViewLayout::Right => "right",
+        RepoViewLayout::Below => "below",
+    };
+
+    let host_label = match ui.target_host.as_ref() {
+        Some(host) => format!("@{host}"),
+        None => "@local".into(),
+    };
+
+    vec![
+        ModeIndicator::new(layout_icon, layout_label, StatusBarAction::key(KeyCode::Char('l'))),
+        ModeIndicator::new("", &host_label, StatusBarAction::key(KeyCode::Char('h'))),
+    ]
 }
 
 fn key_chip(key: &str, label: &str, code: KeyCode) -> KeyChip {
@@ -1147,15 +1196,6 @@ fn render_help(ui: &mut UiState, theme: &Theme, keymap: &Keymap, frame: &mut Fra
     frame.render_widget(paragraph, area);
 }
 
-fn layout_status_text(ui: &UiState) -> &'static str {
-    match ui.view_layout {
-        RepoViewLayout::Auto => "LAYOUT AUTO",
-        RepoViewLayout::Zoom => "LAYOUT ZOOM",
-        RepoViewLayout::Right => "LAYOUT RIGHT",
-        RepoViewLayout::Below => "LAYOUT BELOW",
-    }
-}
-
 fn render_file_picker(ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
     let UiMode::FilePicker { ref input, ref dir_entries, selected } = ui.mode else {
         return;
@@ -1488,23 +1528,42 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_key_chips_show_local_target_host_by_default() {
+    fn normal_mode_indicators_show_local_host_by_default() {
         let ui = UiState::new(&[]);
+        let indicators = normal_mode_indicators(&ui);
 
-        let host_chip =
-            normal_mode_key_chips(&ui).into_iter().find(|chip| chip.action == StatusBarAction::key(KeyCode::Char('h'))).expect("host chip");
-
-        assert_eq!(host_chip.label, "Host Local");
+        let host = indicators.iter().find(|i| i.action == StatusBarAction::key(KeyCode::Char('h'))).expect("host indicator");
+        assert_eq!(host.label, "@local");
     }
 
     #[test]
-    fn normal_mode_key_chips_show_selected_remote_target_host() {
+    fn normal_mode_indicators_show_selected_remote_host() {
         let mut ui = UiState::new(&[]);
         ui.target_host = Some(HostName::new("alpha"));
+        let indicators = normal_mode_indicators(&ui);
 
-        let host_chip =
-            normal_mode_key_chips(&ui).into_iter().find(|chip| chip.action == StatusBarAction::key(KeyCode::Char('h'))).expect("host chip");
+        let host = indicators.iter().find(|i| i.action == StatusBarAction::key(KeyCode::Char('h'))).expect("host indicator");
+        assert_eq!(host.label, "@alpha");
+    }
 
-        assert_eq!(host_chip.label, "Host alpha");
+    #[test]
+    fn normal_mode_indicators_show_layout() {
+        let mut ui = UiState::new(&[]);
+        let indicators = normal_mode_indicators(&ui);
+        let layout = indicators.iter().find(|i| i.action == StatusBarAction::key(KeyCode::Char('l'))).expect("layout indicator");
+        assert_eq!(layout.icon, "◫");
+        assert_eq!(layout.label, "auto");
+
+        ui.view_layout = RepoViewLayout::Zoom;
+        let indicators = normal_mode_indicators(&ui);
+        let layout = indicators.iter().find(|i| i.action == StatusBarAction::key(KeyCode::Char('l'))).expect("layout indicator");
+        assert_eq!(layout.icon, "□");
+        assert_eq!(layout.label, "zoom");
+    }
+
+    #[test]
+    fn normal_mode_key_chips_exclude_host() {
+        let chips = normal_mode_key_chips();
+        assert!(chips.iter().all(|c| c.action != StatusBarAction::key(KeyCode::Char('h'))));
     }
 }
