@@ -1086,6 +1086,7 @@ dependencies = [
  "flotilla-tui",
  "libc",
  "ratatui",
+ "serde_json",
  "tokio",
  "tracing",
 ]

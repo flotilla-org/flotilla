@@ -1876,6 +1876,18 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
             Ok(topology) => Message::ok_response(id, Response::GetTopology(topology)),
             Err(e) => Message::error_response(id, e),
         },
+
+        Request::AgentHook { event } => {
+            tracing::info!(
+                harness = ?event.harness,
+                event_type = ?event.event_type,
+                attachable_id = %event.attachable_id,
+                session_id = ?event.session_id,
+                "received agent hook event"
+            );
+            // TODO(#391): update AgentStateStore and trigger refresh
+            Message::ok_response(id, Response::AgentHook)
+        }
     }
 }
 

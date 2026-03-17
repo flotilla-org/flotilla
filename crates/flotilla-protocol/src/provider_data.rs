@@ -174,6 +174,49 @@ pub struct RemoteAccessPoint {
     pub correlation_keys: Vec<CorrelationKey>,
 }
 
+/// Normalized event types across all harnesses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentEventType {
+    Started,
+    Ended,
+    Active,
+    Idle,
+    WaitingForPermission,
+    /// The event was informational and should not change agent status.
+    NoChange,
+}
+
+impl AgentEventType {
+    /// Returns the agent status this event implies, or None for NoChange.
+    pub fn to_status(&self) -> Option<AgentStatus> {
+        match self {
+            AgentEventType::Started => Some(AgentStatus::Idle),
+            AgentEventType::Ended => Some(AgentStatus::Idle), // caller removes entry
+            AgentEventType::Active => Some(AgentStatus::Active),
+            AgentEventType::Idle => Some(AgentStatus::Idle),
+            AgentEventType::WaitingForPermission => Some(AgentStatus::WaitingForPermission),
+            AgentEventType::NoChange => None,
+        }
+    }
+}
+
+/// A normalized agent hook event sent from the hook CLI to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHookEvent {
+    /// Which terminal this agent lives in (from env or allocated).
+    pub attachable_id: AttachableId,
+    /// Which harness produced this event.
+    pub harness: AgentHarness,
+    /// What happened.
+    pub event_type: AgentEventType,
+    /// The agent's native session ID (if available).
+    pub session_id: Option<String>,
+    /// Model being used (if reported).
+    pub model: Option<String>,
+    /// Current working directory (if reported).
+    pub cwd: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudAgentSession {
     pub title: String,

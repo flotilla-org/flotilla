@@ -39,10 +39,10 @@ pub use commands::{
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
-    Agent, AgentContext, AgentHarness, AgentStatus, AheadBehind, AssociationKey, AttachableId, AttachableSet, AttachableSetId,
-    ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue, IssueChangeset, IssuePage,
-    ManagedTerminal, ManagedTerminalId, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus, TerminalStatus,
-    WorkingTreeStatus, Workspace,
+    Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AheadBehind, AssociationKey, AttachableId,
+    AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
+    IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus,
+    TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
     DiscoveryEntry, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap, ProviderInfo,
@@ -98,6 +98,7 @@ pub enum Request {
     GetHostStatus { host: String },
     GetHostProviders { host: String },
     GetTopology,
+    AgentHook { event: AgentHookEvent },
 }
 
 /// Typed daemon RPC success payloads.
@@ -122,6 +123,7 @@ pub enum Response {
     GetHostStatus(HostStatusResponse),
     GetHostProviders(HostProvidersResponse),
     GetTopology(TopologyResponse),
+    AgentHook,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,14 +2,9 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
-use flotilla_core::{
-    agents::{self, AgentEntry, AgentStateStoreApi},
-    config::ConfigStore,
-    daemon::DaemonHandle,
-    in_process::InProcessDaemon,
-};
+use flotilla_core::{agents, config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
-    output::OutputFormat, AttachableId, CheckoutSelector, CheckoutTarget, Command, CommandAction, HostName, RepoSelector,
+    output::OutputFormat, AgentHookEvent, AttachableId, CheckoutSelector, CheckoutTarget, Command, CommandAction, HostName, RepoSelector,
 };
 use flotilla_tui::{app, event_log, theme};
 use tracing::info;
@@ -558,7 +553,7 @@ async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
     flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
+async fn run_hook(_cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
     use std::io::Read;
 
     // 1. Resolve harness parser
@@ -571,65 +566,64 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
     // 3. Parse the event
     let parsed = parser.parse_event(event_type, &payload).map_err(|e| color_eyre::eyre::eyre!("parse error: {e}"))?;
 
-    // 4. Resolve attachable_id: from env or via session_id lookup/allocation
-    let config_dir = cli.config_dir();
-    let store = agents::AgentStateStore::with_base(&config_dir);
-    let attachable_id = resolve_attachable_id(&store, parsed.session_id.as_deref())?;
+    // 4. Resolve attachable_id from env, or allocate a fresh one.
+    // When the daemon receives the event it handles session_id → attachable_id
+    // mapping and persistence.
+    let attachable_id = match std::env::var("FLOTILLA_ATTACHABLE_ID") {
+        Ok(id) => AttachableId::new(id),
+        Err(_) => agents::allocate_attachable_id(),
+    };
 
-    // 5. Build and apply the event
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let event = agents::AgentHookEvent {
-        attachable_id: attachable_id.clone(),
+    // 5. Build the event
+    let event = AgentHookEvent {
+        attachable_id,
         harness: harness_enum,
-        event_type: parsed.event_type.clone(),
+        event_type: parsed.event_type,
         session_id: parsed.session_id,
         model: parsed.model,
         cwd: parsed.cwd,
     };
 
-    // 6. Update the store
-    // NOTE: This file-based approach has a known race condition when multiple
-    // hook processes run concurrently — the last writer wins. The proper fix
-    // is routing events through the daemon process (which owns the state as
-    // a single actor). See TODO at end of this function.
-    let mut store = agents::AgentStateStore::with_base(&config_dir);
-    if event.event_type == agents::AgentEventType::Ended {
-        store.remove(&event.attachable_id);
-        store.save().map_err(|e| color_eyre::eyre::eyre!("failed to save agent state: {e}"))?;
-    } else if let Some(status) = event.event_type.to_status() {
-        let existing = store.get(&event.attachable_id);
-        let entry = AgentEntry {
-            harness: event.harness.clone(),
-            status,
-            model: event.model.clone().or_else(|| existing.and_then(|e| e.model.clone())),
-            session_title: existing.and_then(|e| e.session_title.clone()),
-            session_id: event.session_id.clone(),
-            last_event_epoch_secs: now,
-        };
-        store.upsert(event.attachable_id.clone(), entry);
-        store.save().map_err(|e| color_eyre::eyre::eyre!("failed to save agent state: {e}"))?;
-    }
-    // NoChange events (e.g. non-permission notifications) skip the store
+    // 6. Send to daemon via socket. The daemon owns agent state as a single
+    // actor — no file-level races between concurrent hook processes.
+    let socket_path = std::env::var("FLOTILLA_DAEMON_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| flotilla_core::config::flotilla_config_dir().join("flotilla.sock"));
 
-    // TODO(#391): also send event to daemon via socket for live refresh
-    Ok(())
+    send_hook_event(&socket_path, event).await
 }
 
-/// Resolve the attachable ID for a hook event.
-/// Priority: FLOTILLA_ATTACHABLE_ID env var > session_id lookup > allocate new.
-fn resolve_attachable_id(store: &agents::AgentStateStore, session_id: Option<&str>) -> Result<AttachableId> {
-    // Fast path: managed terminal with env var
-    if let Ok(id) = std::env::var("FLOTILLA_ATTACHABLE_ID") {
-        return Ok(AttachableId::new(id));
+/// One-shot client: connect to daemon, send an AgentHook request, read one response, exit.
+async fn send_hook_event(socket_path: &std::path::Path, event: AgentHookEvent) -> Result<()> {
+    use flotilla_protocol::{framing, Message, Request, ResponseResult};
+    use tokio::{
+        io::{AsyncBufReadExt, BufReader},
+        net::UnixStream,
+    };
+
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("failed to connect to daemon at {}: {e}", socket_path.display()))?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    // Send request
+    let msg = Message::Request { id: 1, request: Request::AgentHook { event } };
+    framing::write_message_line(&mut writer, &msg).await.map_err(|e| color_eyre::eyre::eyre!("write error: {e}"))?;
+
+    // Read response
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await.map_err(|e| color_eyre::eyre::eyre!("read error: {e}"))?;
+
+    let response: Message = serde_json::from_str(line.trim()).map_err(|e| color_eyre::eyre::eyre!("parse response: {e}"))?;
+    match response {
+        Message::Response { response, .. } => match *response {
+            ResponseResult::Ok { .. } => Ok(()),
+            ResponseResult::Err { message } => Err(color_eyre::eyre::eyre!("daemon error: {message}")),
+        },
+        other => Err(color_eyre::eyre::eyre!("unexpected response: {other:?}")),
     }
-    // Lookup by session_id
-    if let Some(sid) = session_id {
-        if let Some(id) = store.lookup_by_session_id(sid) {
-            return Ok(id.clone());
-        }
-    }
-    // Allocate a new one
-    Ok(agents::allocate_attachable_id())
 }
 
 #[cfg(test)]
