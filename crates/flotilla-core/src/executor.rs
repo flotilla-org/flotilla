@@ -193,10 +193,7 @@ async fn build_create_checkout_plan(
     steps.push(Step {
         description: "Create workspace".to_string(),
         host: StepHost::Local,
-        action: StepAction::CreateWorkspaceForCheckout {
-            checkout_path: Arc::clone(&checkout_path_slot),
-            label: branch.clone(),
-        },
+        action: StepAction::CreateWorkspaceForCheckout { checkout_path: Arc::clone(&checkout_path_slot), label: branch.clone() },
     });
 
     ExecutionPlan::Steps(StepPlan::new(steps))
@@ -3017,9 +3014,10 @@ mod tests {
 
     #[tokio::test]
     async fn checkout_plan_end_to_end_creates_workspace() {
-        use crate::step::run_step_plan;
         use tokio::sync::broadcast;
         use tokio_util::sync::CancellationToken;
+
+        use crate::step::run_step_plan;
 
         let ws_mgr = Arc::new(MockWorkspaceManager::succeeding());
         let mut registry = ProviderRegistry::new();
@@ -3046,13 +3044,7 @@ mod tests {
         .await;
 
         let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
-        let resolver = ExecutorStepResolver {
-            repo,
-            registry,
-            config_base: cb,
-            attachable_store: attachable,
-            local_host: lh.clone(),
-        };
+        let resolver = ExecutorStepResolver { repo, registry, config_base: cb, attachable_store: attachable, local_host: lh.clone() };
 
         let result = match plan {
             ExecutionPlan::Steps(step_plan) => {
@@ -3063,10 +3055,7 @@ mod tests {
 
         assert!(matches!(result, CommandResult::CheckoutCreated { .. }));
         let calls = ws_mgr.calls.lock().await;
-        assert!(
-            calls.iter().any(|c| c.starts_with("create_workspace")),
-            "should create workspace, got: {calls:?}"
-        );
+        assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "should create workspace, got: {calls:?}");
     }
 
     #[tokio::test]
