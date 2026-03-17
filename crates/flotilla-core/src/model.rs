@@ -103,20 +103,18 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{
-        providers::{
-            ai_utility::AiUtility,
-            change_request::ChangeRequestTracker,
-            coding_agent::CloudAgentService,
-            discovery::{ProviderCategory, ProviderDescriptor},
-            issue_tracker::IssueTracker,
-            types::{
-                AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
-                WorkspaceConfig,
-            },
-            vcs::{CheckoutManager, Vcs},
-            workspace::WorkspaceManager,
+    use crate::providers::{
+        ai_utility::AiUtility,
+        change_request::ChangeRequestTracker,
+        coding_agent::CloudAgentService,
+        discovery::{ProviderCategory, ProviderDescriptor},
+        issue_tracker::IssueTracker,
+        types::{
+            AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
+            WorkspaceConfig,
         },
+        vcs::{CheckoutManager, Vcs},
+        workspace::WorkspaceManager,
     };
 
     fn named_desc(category: ProviderCategory, name: &str) -> ProviderDescriptor {
@@ -437,8 +435,7 @@ mod tests {
     #[tokio::test]
     async fn repo_model_new_with_empty_registry_uses_default_labels() {
         let reg = ProviderRegistry::new();
-        let model =
-            RepoModel::new(PathBuf::from("/tmp/empty"), reg, None, crate::attachable::shared_file_backed_attachable_store("/tmp"));
+        let model = RepoModel::new(PathBuf::from("/tmp/empty"), reg, None, crate::attachable::shared_file_backed_attachable_store("/tmp"));
         assert_eq!(model.labels.checkouts.section, "\u{2014}");
         assert_eq!(model.labels.change_requests.section, "\u{2014}");
         model.refresh_handle.trigger_refresh();

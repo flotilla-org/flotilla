@@ -392,8 +392,11 @@ impl ShpoolTerminalPool {
             };
             (existing.set_id.clone(), persisted_working_directory)
         };
-        let working_directory =
-            if terminal.working_directory.as_os_str().is_empty() { persisted_working_directory } else { terminal.working_directory.clone() };
+        let working_directory = if terminal.working_directory.as_os_str().is_empty() {
+            persisted_working_directory
+        } else {
+            terminal.working_directory.clone()
+        };
         let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
             &set_id,
             "terminal_pool",
@@ -787,14 +790,20 @@ mod tests {
         let shell_attachable_id = store
             .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/shell/0")
             .expect("shell binding");
-        let shell_attachable = store.registry().attachables.get(&flotilla_protocol::AttachableId::new(shell_attachable_id)).expect("shell attachable");
+        let shell_attachable =
+            store.registry().attachables.get(&flotilla_protocol::AttachableId::new(shell_attachable_id)).expect("shell attachable");
         let agent_attachable_id = store
             .lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/my-feature/agent/0")
             .expect("agent binding");
-        let agent_attachable = store.registry().attachables.get(&flotilla_protocol::AttachableId::new(agent_attachable_id)).expect("agent attachable");
+        let agent_attachable =
+            store.registry().attachables.get(&flotilla_protocol::AttachableId::new(agent_attachable_id)).expect("agent attachable");
         let crate::attachable::AttachableContent::Terminal(shell_terminal) = &shell_attachable.content;
         let crate::attachable::AttachableContent::Terminal(agent_terminal) = &agent_attachable.content;
-        assert_eq!(shell_terminal.working_directory.as_path(), cwd, "known terminal binding should stay anchored to the real checkout path");
+        assert_eq!(
+            shell_terminal.working_directory.as_path(),
+            cwd,
+            "known terminal binding should stay anchored to the real checkout path"
+        );
         assert_eq!(shell_terminal.status, TerminalStatus::Running, "scan should update the known terminal status");
         assert_eq!(
             agent_terminal.status,
@@ -877,8 +886,7 @@ mod tests {
             ]
         }"#;
         let empty = r#"{"sessions": []}"#;
-        let (pool, store, _dir) =
-            test_pool(Arc::new(MockRunner::new(vec![Ok(running.into()), Ok(empty.into()), Ok(empty.into())])));
+        let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(running.into()), Ok(empty.into()), Ok(empty.into())])));
         let id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
 
         pool.attach_command(&id, "bash", Path::new("/home/dev/project")).await.expect("seed binding");
@@ -888,10 +896,7 @@ mod tests {
         assert_eq!(second_scan.len(), 1, "first miss should stay within the grace period");
 
         let third_scan = pool.list_terminals().await.expect("third scan");
-        assert!(
-            third_scan.is_empty(),
-            "known session should be reaped from provider output after exceeding the grace period"
-        );
+        assert!(third_scan.is_empty(), "known session should be reaped from provider output after exceeding the grace period");
 
         let store = store.lock().expect("lock store");
         let attachable_id = store

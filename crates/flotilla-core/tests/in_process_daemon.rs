@@ -28,9 +28,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, CorrelationKey, DaemonEvent,
-    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, ManagedTerminal, ManagedTerminalId,
-    PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, TerminalStatus, ToolInventory, TopologyRoute,
-    WorkItemKind,
+    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, ManagedTerminal, ManagedTerminalId, PeerConnectionState,
+    ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, TerminalStatus, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use tokio::sync::Notify;
 
@@ -1282,15 +1281,12 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     let attachable_store = shared_in_memory_attachable_store();
 
     workspace_manager
-        .add_workspaces(vec![(
-            workspace_ref.clone(),
-            Workspace {
-                name: "attachable-correlation@feta".into(),
-                directories: vec![PathBuf::from("/Users/robert/dev/flotilla")],
-                correlation_keys: vec![],
-                attachable_set_id: None,
-            },
-        )])
+        .add_workspaces(vec![(workspace_ref.clone(), Workspace {
+            name: "attachable-correlation@feta".into(),
+            directories: vec![PathBuf::from("/Users/robert/dev/flotilla")],
+            correlation_keys: vec![],
+            attachable_set_id: None,
+        })])
         .await;
 
     {
@@ -1312,9 +1308,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     }
 
     let discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new()
-            .with_workspace_manager(workspace_manager)
-            .with_attachable_store(Arc::clone(&attachable_store)),
+        FakeDiscoveryProviders::new().with_workspace_manager(workspace_manager).with_attachable_store(Arc::clone(&attachable_store)),
     );
     let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     let mut rx = daemon.subscribe();
@@ -1353,11 +1347,8 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     assert_eq!(merged_set.host_affinity.as_ref(), Some(&remote_host));
     assert_eq!(merged_set.checkout.as_ref(), Some(&remote_checkout));
 
-    let set_item = snapshot
-        .work_items
-        .iter()
-        .find(|item| item.attachable_set_id.as_ref() == Some(&set_id))
-        .expect("attachable set work item");
+    let set_item =
+        snapshot.work_items.iter().find(|item| item.attachable_set_id.as_ref() == Some(&set_id)).expect("attachable set work item");
     assert_eq!(set_item.host, remote_host);
     assert_eq!(set_item.checkout.as_ref().map(|checkout| &checkout.key), Some(&remote_checkout));
     assert_eq!(set_item.workspace_refs, vec![workspace_ref]);
@@ -1375,15 +1366,12 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
     let attachable_store = shared_in_memory_attachable_store();
 
     workspace_manager
-        .add_workspaces(vec![(
-            workspace_ref.clone(),
-            Workspace {
-                name: "issue-356-watch@feta".into(),
-                directories: vec![PathBuf::from("/Users/robert/dev/flotilla")],
-                correlation_keys: vec![],
-                attachable_set_id: None,
-            },
-        )])
+        .add_workspaces(vec![(workspace_ref.clone(), Workspace {
+            name: "issue-356-watch@feta".into(),
+            directories: vec![PathBuf::from("/Users/robert/dev/flotilla")],
+            correlation_keys: vec![],
+            attachable_set_id: None,
+        })])
         .await;
     terminal_pool
         .add_terminals(vec![ManagedTerminal {
@@ -1444,21 +1432,14 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
         remote_ahead_behind: None,
         working_tree: None,
         last_commit: None,
-        correlation_keys: vec![
-            CorrelationKey::Branch("issue-356-watch".into()),
-            CorrelationKey::CheckoutPath(remote_checkout.clone()),
-        ],
+        correlation_keys: vec![CorrelationKey::Branch("issue-356-watch".into()), CorrelationKey::CheckoutPath(remote_checkout.clone())],
         association_keys: vec![],
     });
     daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("merged state");
-    let projected_terminal = snapshot
-        .providers
-        .managed_terminals
-        .get(&terminal_id.to_string())
-        .expect("projected terminal");
+    let projected_terminal = snapshot.providers.managed_terminals.get(&terminal_id.to_string()).expect("projected terminal");
     assert_eq!(projected_terminal.attachable_set_id.as_ref(), Some(&set_id));
     assert_eq!(
         snapshot.providers.workspaces.get(&workspace_ref).and_then(|workspace| workspace.attachable_set_id.as_ref()),

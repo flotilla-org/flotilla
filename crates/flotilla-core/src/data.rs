@@ -2039,28 +2039,21 @@ mod tests {
         let set_id = flotilla_protocol::AttachableSetId::new("set-remote");
 
         let mut remote_checkout_data = make_checkout("feat-set", "/remote/feat-set", false);
-        remote_checkout_data.correlation_keys = vec![
-            CorrelationKey::Branch("feat-set".to_string()),
-            CorrelationKey::CheckoutPath(remote_checkout.clone()),
-        ];
+        remote_checkout_data.correlation_keys =
+            vec![CorrelationKey::Branch("feat-set".to_string()), CorrelationKey::CheckoutPath(remote_checkout.clone())];
         providers.checkouts.insert(remote_checkout.clone(), remote_checkout_data);
 
         let mut local_checkout_data = make_checkout("feat-set", "/Users/robert/dev/project", false);
-        local_checkout_data.correlation_keys = vec![
-            CorrelationKey::Branch("feat-set".to_string()),
-            CorrelationKey::CheckoutPath(local_checkout.clone()),
-        ];
+        local_checkout_data.correlation_keys =
+            vec![CorrelationKey::Branch("feat-set".to_string()), CorrelationKey::CheckoutPath(local_checkout.clone())];
         providers.checkouts.insert(local_checkout.clone(), local_checkout_data);
-        providers.attachable_sets.insert(
-            set_id.clone(),
-            flotilla_protocol::AttachableSet {
-                id: set_id.clone(),
-                host_affinity: Some(flotilla_protocol::HostName::new("feta")),
-                checkout: Some(remote_checkout.clone()),
-                template_identity: None,
-                members: vec![],
-            },
-        );
+        providers.attachable_sets.insert(set_id.clone(), flotilla_protocol::AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(flotilla_protocol::HostName::new("feta")),
+            checkout: Some(remote_checkout.clone()),
+            template_identity: None,
+            members: vec![],
+        });
         providers.workspaces.insert("ws-1".to_string(), Workspace {
             name: "feat-set@feta".to_string(),
             directories: vec![PathBuf::from("/Users/robert/dev/project")],

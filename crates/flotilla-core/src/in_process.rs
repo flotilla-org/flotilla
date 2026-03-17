@@ -2948,16 +2948,13 @@ mod tests {
             correlation_keys: vec![],
             attachable_set_id: Some(set_id.clone()),
         });
-        local_providers.attachable_sets.insert(
-            set_id.clone(),
-            flotilla_protocol::AttachableSet {
-                id: set_id.clone(),
-                host_affinity: Some(remote_host.clone()),
-                checkout: Some(remote_checkout.clone()),
-                template_identity: None,
-                members: vec![],
-            },
-        );
+        local_providers.attachable_sets.insert(set_id.clone(), flotilla_protocol::AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(remote_host.clone()),
+            checkout: Some(remote_checkout.clone()),
+            template_identity: None,
+            members: vec![],
+        });
 
         let mut peer_data = ProviderData::default();
         peer_data.checkouts.insert(remote_checkout.clone(), Checkout {
@@ -2995,11 +2992,8 @@ mod tests {
         assert_eq!(set.host_affinity.as_ref(), Some(&remote_host), "remote attachable set host affinity should stay on feta");
         assert_eq!(set.checkout.as_ref(), Some(&remote_checkout), "remote attachable set checkout should stay on feta");
 
-        let set_item = snapshot
-            .work_items
-            .iter()
-            .find(|item| item.attachable_set_id.as_ref() == Some(&set_id))
-            .expect("work item for attachable set");
+        let set_item =
+            snapshot.work_items.iter().find(|item| item.attachable_set_id.as_ref() == Some(&set_id)).expect("work item for attachable set");
         assert_eq!(set_item.host, remote_host, "correlated work item should be anchored to feta");
         assert_eq!(
             set_item.checkout.as_ref().map(|checkout| &checkout.key),

@@ -12,8 +12,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, RepoIdentity};
-use flotilla_protocol::{ManagedTerminal, ManagedTerminalId, TerminalStatus, Workspace};
+use flotilla_protocol::{
+    ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId,
+    RepoIdentity, TerminalStatus, Workspace,
+};
 use tokio::sync::Mutex as TokioMutex;
 
 use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement};
@@ -21,8 +23,8 @@ use crate::{
     attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
     providers::{
-        change_request::ChangeRequestTracker, discovery::EnvVars, issue_tracker::IssueTracker, vcs::CheckoutManager, ChannelLabel,
-        terminal::TerminalPool, workspace::WorkspaceManager, CommandOutput, CommandRunner,
+        change_request::ChangeRequestTracker, discovery::EnvVars, issue_tracker::IssueTracker, terminal::TerminalPool,
+        vcs::CheckoutManager, workspace::WorkspaceManager, ChannelLabel, CommandOutput, CommandRunner,
     },
 };
 

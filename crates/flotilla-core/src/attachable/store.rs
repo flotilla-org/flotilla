@@ -47,11 +47,7 @@ pub trait AttachableStoreApi: Send + Sync {
         working_directory: PathBuf,
         status: TerminalStatus,
     ) -> AttachableId;
-    fn ensure_terminal_set_with_change(
-        &mut self,
-        host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
-    ) -> (AttachableSetId, bool);
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool);
     #[allow(clippy::too_many_arguments)]
     fn ensure_terminal_attachable_with_change(
         &mut self,
@@ -157,11 +153,7 @@ impl AttachableStoreState {
         .0
     }
 
-    fn ensure_terminal_set_with_change(
-        &mut self,
-        host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
-    ) -> (AttachableSetId, bool) {
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
         if let Some(existing) = self.registry.sets.values().find(|set| set.host_affinity == host_affinity && set.checkout == checkout) {
             return (existing.id.clone(), false);
         }
@@ -471,11 +463,7 @@ impl AttachableStoreApi for AttachableStore {
         self.state.ensure_terminal_set(host_affinity, checkout)
     }
 
-    fn ensure_terminal_set_with_change(
-        &mut self,
-        host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
-    ) -> (AttachableSetId, bool) {
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
         self.state.ensure_terminal_set_with_change(host_affinity, checkout)
     }
 
@@ -588,11 +576,7 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         self.state.ensure_terminal_set(host_affinity, checkout)
     }
 
-    fn ensure_terminal_set_with_change(
-        &mut self,
-        host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
-    ) -> (AttachableSetId, bool) {
+    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
         self.state.ensure_terminal_set_with_change(host_affinity, checkout)
     }
 
@@ -913,7 +897,9 @@ mod tests {
 
     #[test]
     fn file_backed_contract_ensure_terminal_attachable_reuses_existing_binding() {
-        contract_ensure_terminal_attachable_reuses_existing_binding(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_ensure_terminal_attachable_reuses_existing_binding(&mut AttachableStore::with_base(
+            tempfile::tempdir().expect("tempdir").path(),
+        ));
     }
 
     #[test]
@@ -923,9 +909,9 @@ mod tests {
 
     #[test]
     fn file_backed_contract_ensure_terminal_set_groups_members_by_host_and_checkout() {
-        contract_ensure_terminal_set_groups_members_by_host_and_checkout(
-            &mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()),
-        );
+        contract_ensure_terminal_set_groups_members_by_host_and_checkout(&mut AttachableStore::with_base(
+            tempfile::tempdir().expect("tempdir").path(),
+        ));
     }
 
     #[test]
@@ -935,9 +921,9 @@ mod tests {
 
     #[test]
     fn file_backed_contract_ensure_terminal_attachable_uses_binding_as_primary_identity() {
-        contract_ensure_terminal_attachable_uses_binding_as_primary_identity(
-            &mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()),
-        );
+        contract_ensure_terminal_attachable_uses_binding_as_primary_identity(&mut AttachableStore::with_base(
+            tempfile::tempdir().expect("tempdir").path(),
+        ));
     }
 
     #[test]

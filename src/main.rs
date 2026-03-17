@@ -416,10 +416,7 @@ fn parse_repo_command(args: &[String]) -> Result<RepoCommand, String> {
                 return Ok(RepoCommand::Control(Command {
                     host: None,
                     context_repo: Some(RepoSelector::Query(slug.into())),
-                    action: CommandAction::PrepareTerminalForCheckout {
-                        checkout_path: PathBuf::from(&args[2]),
-                        commands: vec![],
-                    },
+                    action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from(&args[2]), commands: vec![] },
                 }));
             }
             if args.len() == 4 && args[1] == "checkout" && args[2] == "--fresh" {
@@ -550,8 +547,7 @@ async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
 mod tests {
     use std::path::Path;
 
-    use flotilla_protocol::Command;
-    use flotilla_protocol::{CheckoutSelector, CommandAction, RepoSelector};
+    use flotilla_protocol::{CheckoutSelector, Command, CommandAction, RepoSelector};
 
     use super::{parse_host_command, parse_repo_command, try_parse_cli_from, HostCommand, HostQueryCommand, RepoCommand, SubCommand};
 
@@ -674,10 +670,9 @@ mod tests {
 
     #[test]
     fn parse_host_repo_prepare_terminal_preserves_context() {
-        let parsed = parse_host_command(
-            &["alpha".into(), "repo".into(), "owner/repo".into(), "prepare-terminal".into(), "/tmp/repo.feat-x".into()],
-        )
-        .expect("host repo prepare-terminal should parse");
+        let parsed =
+            parse_host_command(&["alpha".into(), "repo".into(), "owner/repo".into(), "prepare-terminal".into(), "/tmp/repo.feat-x".into()])
+                .expect("host repo prepare-terminal should parse");
         assert!(matches!(
             parsed,
             HostCommand::Control(Command {

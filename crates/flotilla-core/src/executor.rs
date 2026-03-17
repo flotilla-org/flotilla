@@ -1725,10 +1725,12 @@ mod tests {
         let attachable_store = test_attachable_store(temp.path());
         {
             let mut store = attachable_store.lock().expect("store lock");
-            let ensured_set_id =
-                store.ensure_terminal_set(Some(local_host()), Some(HostPath::new(local_host(), path.clone())));
+            let ensured_set_id = store.ensure_terminal_set(Some(local_host()), Some(HostPath::new(local_host(), path.clone())));
             store.save().expect("save attachable store");
-            assert_eq!(store.registry().sets.get(&ensured_set_id).and_then(|set| set.checkout.clone()), Some(HostPath::new(local_host(), path.clone())));
+            assert_eq!(
+                store.registry().sets.get(&ensured_set_id).and_then(|set| set.checkout.clone()),
+                Some(HostPath::new(local_host(), path.clone()))
+            );
         }
 
         let repo = RepoExecutionContext {
