@@ -68,6 +68,10 @@ pub async fn build_plan(
     config_base: PathBuf,
     attachable_store: SharedAttachableStore,
     local_host: HostName,
+    // TODO(multi-host): When a command is forwarded from another host, this carries
+    // the requester's hostname so plan builders can stamp `StepHost::Remote(originator)`
+    // on steps that need to run back on the presentation host (e.g. workspace creation
+    // after a remote checkout). Passed by `execute_forwarded_command` in server.rs.
     _originating_host: Option<HostName>,
 ) -> ExecutionPlan {
     let Command { action, .. } = cmd;
@@ -154,12 +158,13 @@ async fn build_create_checkout_plan(
             action: StepAction::Closure(Box::new(move |_prior| {
                 Box::pin(async move {
                     validate_checkout_target(&repo_root, &branch, intent, &*runner).await?;
-                    // Skip if checkout already exists
-                    if existing.is_some() {
+                    // If checkout already exists, emit CheckoutCreated so the workspace
+                    // step can find the path in prior outcomes.
+                    if let Some(path) = existing {
                         if matches!(intent, CheckoutIntent::FreshBranch) {
                             return Err(format!("branch already exists: {branch}"));
                         }
-                        return Ok(StepOutcome::Skipped);
+                        return Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch, path }));
                     }
                     let cm = registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
                     let (path, _checkout) = cm.create_checkout(&repo_root, &branch, create_branch).await?;
@@ -1567,6 +1572,10 @@ mod tests {
 
     fn fresh_checkout_action(branch: &str) -> CommandAction {
         CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::FreshBranch(branch.to_string()), issue_ids: vec![] }
+    }
+
+    fn existing_branch_checkout_action(branch: &str) -> CommandAction {
+        CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::Branch(branch.to_string()), issue_ids: vec![] }
     }
 
     fn remove_checkout_action(branch: &str, terminal_keys: Vec<ManagedTerminalId>) -> CommandAction {
@@ -3058,6 +3067,58 @@ mod tests {
 
         let calls = ws_mgr.calls.lock().await;
         assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "should create workspace from prior outcome: {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
+        use tokio::sync::broadcast;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::step::run_step_plan;
+
+        let ws_mgr = Arc::new(MockWorkspaceManager::succeeding());
+        let mut registry = ProviderRegistry::new();
+        // No checkout manager needed — checkout already exists
+        registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
+        let registry = Arc::new(registry);
+        // validate_checkout_target needs 2 responses: local ref check (Ok), remote ref check
+        let runner = Arc::new(MockRunner::new(vec![Ok("".into()), Err("missing".into())]));
+        let mut data = empty_data();
+        data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+        let cb = config_base();
+        let attachable = test_attachable_store(&cb);
+        let lh = local_host();
+        let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
+
+        let plan = build_plan(
+            local_command(existing_branch_checkout_action("feat-x")),
+            RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+            Arc::clone(&registry),
+            Arc::new(data),
+            runner,
+            cb.clone(),
+            attachable.clone(),
+            lh.clone(),
+            None,
+        )
+        .await;
+
+        let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
+        let resolver = ExecutorStepResolver { repo, registry, config_base: cb, attachable_store: attachable, local_host: lh.clone() };
+
+        let result = match plan {
+            ExecutionPlan::Steps(step_plan) => {
+                run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await
+            }
+            _ => panic!("expected steps"),
+        };
+
+        assert!(
+            matches!(result, CommandResult::CheckoutCreated { ref branch, .. } if branch == "feat-x"),
+            "should return CheckoutCreated for pre-existing checkout, got: {result:?}"
+        );
+        let calls = ws_mgr.calls.lock().await;
+        assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "should create workspace for pre-existing checkout: {calls:?}");
     }
 
     #[tokio::test]
