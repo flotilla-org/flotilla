@@ -1,0 +1,40 @@
+# 3-node hub-spoke topology: workstation (leader) + 2 followers.
+#
+# Build order matters: flotilla-base must be built first since role
+# Dockerfiles use FROM flotilla-base.  The test fixture runs:
+#   docker compose -f docker-compose.hub-spoke.yml build flotilla-base
+#   docker compose -f docker-compose.hub-spoke.yml up -d --build --force-recreate
+services:
+  flotilla-base:
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/base/Dockerfile
+      target: full
+    image: flotilla-base
+
+  workstation:
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/workstation/Dockerfile
+    hostname: workstation
+    volumes:
+      - shared-keys:/shared-keys
+
+  homelab-1:
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/follower-codex/Dockerfile
+    hostname: homelab-1
+    volumes:
+      - shared-keys:/shared-keys
+
+  homelab-2:
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/follower-gemini/Dockerfile
+    hostname: homelab-2
+    volumes:
+      - shared-keys:/shared-keys
+
+volumes:
+  shared-keys:
