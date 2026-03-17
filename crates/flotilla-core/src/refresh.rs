@@ -568,7 +568,13 @@ mod tests {
             Ok(())
         }
 
-        async fn attach_command(&self, _id: &flotilla_protocol::ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<String, String> {
+        async fn attach_command(
+            &self,
+            _id: &flotilla_protocol::ManagedTerminalId,
+            _command: &str,
+            _cwd: &Path,
+            _env_vars: &crate::providers::terminal::TerminalEnvVars,
+        ) -> Result<String, String> {
             Ok("mock attach".into())
         }
 

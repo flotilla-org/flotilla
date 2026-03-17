@@ -533,7 +533,13 @@ impl TerminalPool for ShpoolTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<String, String> {
+    async fn attach_command(
+        &self,
+        id: &ManagedTerminalId,
+        command: &str,
+        cwd: &Path,
+        env_vars: &super::TerminalEnvVars,
+    ) -> Result<String, String> {
         let session_name = terminal_session_binding_ref(id);
         let socket_path_str = self.socket_path.display().to_string();
         let config_path_str = self.config_path.display().to_string();
@@ -547,7 +553,13 @@ impl TerminalPool for ShpoolTerminalPool {
         // in an interactive login shell to get the full user environment (PATH,
         // node, direnv, aliases, etc). Empty commands omit --cmd, letting shpool
         // use the user's default shell.
-        let cmd_part = if command.is_empty() {
+        let env_prefix = if env_vars.is_empty() {
+            String::new()
+        } else {
+            let pairs: Vec<String> = env_vars.iter().map(|(k, v)| format!("{k}={}", sq(v))).collect();
+            format!("env {} ", pairs.join(" "))
+        };
+        let cmd_part = if command.is_empty() && env_vars.is_empty() {
             String::new()
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -555,7 +567,9 @@ impl TerminalPool for ShpoolTerminalPool {
             // → ["/bin/zsh", "-lic", "claude"]
             // Interactive login shell resolves aliases and has full PATH.
             let escaped_cmd = command.replace('\'', "'\\''");
-            format!(" --cmd {}", sq(&format!("{shell} -lic '{escaped_cmd}'")))
+            let inner =
+                if command.is_empty() { format!("{env_prefix}{shell}") } else { format!("{env_prefix}{shell} -lic '{escaped_cmd}'") };
+            format!(" --cmd {}", sq(&inner))
         };
         Ok(format!(
             "shpool --socket {} -c {} attach{} --dir {} {}",
@@ -726,7 +740,7 @@ mod tests {
     async fn attach_command_includes_cmd_dir_and_config() {
         let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
-        let cmd = pool.attach_command(&id, "bash", Path::new("/home/dev")).await.unwrap();
+        let cmd = pool.attach_command(&id, "bash", Path::new("/home/dev"), &vec![]).await.unwrap();
         assert!(cmd.contains("shpool"));
         assert!(cmd.contains("attach"));
         assert!(cmd.contains("--cmd"));
@@ -743,12 +757,38 @@ mod tests {
     async fn attach_command_empty_cmd_omits_cmd_flag() {
         let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
-        let cmd = pool.attach_command(&id, "", Path::new("/home/dev")).await.unwrap();
+        let cmd = pool.attach_command(&id, "", Path::new("/home/dev"), &vec![]).await.unwrap();
         assert!(cmd.contains("shpool"));
         assert!(cmd.contains("attach"));
         assert!(!cmd.contains("--cmd"));
         assert!(cmd.contains("--dir"));
         assert!(cmd.contains("-c"));
+    }
+
+    #[tokio::test]
+    async fn attach_command_injects_env_vars_into_cmd() {
+        let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "agent".into(), index: 0 };
+        let env = vec![
+            ("FLOTILLA_ATTACHABLE_ID".to_string(), "att-uuid-123".to_string()),
+            ("FLOTILLA_DAEMON_SOCKET".to_string(), "/tmp/flotilla.sock".to_string()),
+        ];
+        let cmd = pool.attach_command(&id, "claude", Path::new("/home/dev"), &env).await.unwrap();
+        assert!(cmd.contains("--cmd"), "should have --cmd: {cmd}");
+        assert!(cmd.contains("FLOTILLA_ATTACHABLE_ID"), "should contain attachable id env: {cmd}");
+        assert!(cmd.contains("att-uuid-123"), "should contain attachable id value: {cmd}");
+        assert!(cmd.contains("FLOTILLA_DAEMON_SOCKET"), "should contain socket env: {cmd}");
+        assert!(cmd.contains("claude"), "should contain original command: {cmd}");
+    }
+
+    #[tokio::test]
+    async fn attach_command_env_vars_with_empty_command_still_generates_cmd() {
+        let (pool, _store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
+        let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "att-1".to_string())];
+        let cmd = pool.attach_command(&id, "", Path::new("/home/dev"), &env).await.unwrap();
+        assert!(cmd.contains("--cmd"), "env vars with empty command should still produce --cmd: {cmd}");
+        assert!(cmd.contains("FLOTILLA_ATTACHABLE_ID"), "should contain env var: {cmd}");
     }
 
     #[tokio::test]
@@ -780,8 +820,8 @@ mod tests {
         let agent_id = ManagedTerminalId { checkout: "my-feature".into(), role: "agent".into(), index: 0 };
         let cwd = Path::new("/home/dev/project");
 
-        pool.attach_command(&shell_id, "bash", cwd).await.expect("seed shell binding");
-        pool.attach_command(&agent_id, "claude", cwd).await.expect("seed agent binding");
+        pool.attach_command(&shell_id, "bash", cwd, &vec![]).await.expect("seed shell binding");
+        pool.attach_command(&agent_id, "claude", cwd, &vec![]).await.expect("seed agent binding");
 
         let terminals = pool.list_terminals().await.expect("list terminals");
         assert_eq!(terminals.len(), 2);
@@ -858,7 +898,7 @@ mod tests {
         let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(running.into()), Ok(empty.into())])));
         let id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
 
-        pool.attach_command(&id, "bash", Path::new("/home/dev/project")).await.expect("seed binding");
+        pool.attach_command(&id, "bash", Path::new("/home/dev/project"), &vec![]).await.expect("seed binding");
 
         let first_scan = pool.list_terminals().await.expect("first scan");
         assert_eq!(first_scan.len(), 1);
@@ -893,7 +933,7 @@ mod tests {
         let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![Ok(running.into()), Ok(empty.into()), Ok(empty.into())])));
         let id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
 
-        pool.attach_command(&id, "bash", Path::new("/home/dev/project")).await.expect("seed binding");
+        pool.attach_command(&id, "bash", Path::new("/home/dev/project"), &vec![]).await.expect("seed binding");
 
         let _ = pool.list_terminals().await.expect("first scan");
         let second_scan = pool.list_terminals().await.expect("second scan");
@@ -916,7 +956,7 @@ mod tests {
         let (pool, store, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
-        let command = pool.attach_command(&id, "bash", Path::new("/home/dev/project")).await.expect("attach command");
+        let command = pool.attach_command(&id, "bash", Path::new("/home/dev/project"), &vec![]).await.expect("attach command");
 
         assert!(command.contains(" attach"));
         assert!(command.contains("flotilla/feat/shell/0"));

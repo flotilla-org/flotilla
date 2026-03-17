@@ -939,7 +939,9 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
                 warn!(%id, err = %e, "failed to ensure terminal");
                 continue;
             }
-            match terminal_pool.attach_command(&id, &entry.command, &config.working_directory).await {
+            // TODO(#390): populate with FLOTILLA_ATTACHABLE_ID and FLOTILLA_DAEMON_SOCKET
+            let env_vars = vec![];
+            match terminal_pool.attach_command(&id, &entry.command, &config.working_directory, &env_vars).await {
                 Ok(cmd) => {
                     debug!(%id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
                     resolved.push((entry.role.clone(), cmd));
@@ -976,7 +978,8 @@ async fn prepare_terminal_commands(
                 if let Err(e) = tp.ensure_running(&id, &cmd.command, checkout_path).await {
                     warn!(%id, err = %e, "failed to ensure terminal");
                 }
-                match tp.attach_command(&id, &cmd.command, checkout_path).await {
+                // TODO(#390): populate with FLOTILLA_ATTACHABLE_ID and FLOTILLA_DAEMON_SOCKET
+                match tp.attach_command(&id, &cmd.command, checkout_path, &vec![]).await {
                     Ok(attach_cmd) => resolved.push(PreparedTerminalCommand { role: cmd.role.clone(), command: attach_cmd }),
                     Err(e) => {
                         warn!(%id, err = %e, "failed to get attach command, using original");
@@ -2287,7 +2290,13 @@ mod tests {
         async fn ensure_running(&self, _id: &ManagedTerminalId, _cmd: &str, _cwd: &Path) -> Result<(), String> {
             Ok(())
         }
-        async fn attach_command(&self, _id: &ManagedTerminalId, _cmd: &str, _cwd: &Path) -> Result<String, String> {
+        async fn attach_command(
+            &self,
+            _id: &ManagedTerminalId,
+            _cmd: &str,
+            _cwd: &Path,
+            _env_vars: &crate::providers::terminal::TerminalEnvVars,
+        ) -> Result<String, String> {
             Ok(String::new())
         }
         async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {

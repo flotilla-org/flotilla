@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use flotilla_protocol::{ManagedTerminal, ManagedTerminalId};
 
-use super::TerminalPool;
+use super::{TerminalEnvVars, TerminalPool};
 
 pub struct PassthroughTerminalPool;
 
@@ -15,13 +15,28 @@ impl TerminalPool for PassthroughTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(&self, _id: &ManagedTerminalId, command: &str, _cwd: &std::path::Path) -> Result<String, String> {
-        Ok(command.to_string())
+    async fn attach_command(
+        &self,
+        _id: &ManagedTerminalId,
+        command: &str,
+        _cwd: &std::path::Path,
+        env_vars: &TerminalEnvVars,
+    ) -> Result<String, String> {
+        if env_vars.is_empty() {
+            Ok(command.to_string())
+        } else {
+            let prefix: Vec<String> = env_vars.iter().map(|(k, v)| format!("{k}={}", shell_escape(v))).collect();
+            Ok(format!("env {} {command}", prefix.join(" ")))
+        }
     }
 
     async fn kill_terminal(&self, _id: &ManagedTerminalId) -> Result<(), String> {
         Ok(())
     }
+}
+
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -46,7 +61,22 @@ mod tests {
     async fn passthrough_attach_command_passes_through() {
         let pool = PassthroughTerminalPool;
         let id = ManagedTerminalId { checkout: "test".into(), role: "shell".into(), index: 0 };
-        let result = pool.attach_command(&id, "bash", "/tmp".as_ref()).await.unwrap();
+        let result = pool.attach_command(&id, "bash", "/tmp".as_ref(), &vec![]).await.unwrap();
         assert_eq!(result, "bash");
+    }
+
+    #[tokio::test]
+    async fn passthrough_attach_command_injects_env_vars() {
+        let pool = PassthroughTerminalPool;
+        let id = ManagedTerminalId { checkout: "test".into(), role: "shell".into(), index: 0 };
+        let env = vec![
+            ("FLOTILLA_ATTACHABLE_ID".to_string(), "att-123".to_string()),
+            ("FLOTILLA_DAEMON_SOCKET".to_string(), "/tmp/flotilla.sock".to_string()),
+        ];
+        let result = pool.attach_command(&id, "bash", "/tmp".as_ref(), &env).await.unwrap();
+        assert!(result.starts_with("env "));
+        assert!(result.contains("FLOTILLA_ATTACHABLE_ID='att-123'"));
+        assert!(result.contains("FLOTILLA_DAEMON_SOCKET='/tmp/flotilla.sock'"));
+        assert!(result.ends_with("bash"));
     }
 }

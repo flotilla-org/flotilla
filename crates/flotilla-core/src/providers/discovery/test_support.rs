@@ -461,7 +461,13 @@ impl TerminalPool for FakeTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(&self, id: &ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<String, String> {
+    async fn attach_command(
+        &self,
+        id: &ManagedTerminalId,
+        _command: &str,
+        _cwd: &Path,
+        _env_vars: &super::super::terminal::TerminalEnvVars,
+    ) -> Result<String, String> {
         Ok(format!("attach {id}"))
     }
 
