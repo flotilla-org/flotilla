@@ -310,6 +310,22 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
         .filter(|(_, set)| set.checkout.as_ref().is_some_and(|co| checkout_paths.contains(co)))
         .map(|(id, set)| (id.clone(), set.clone()))
         .collect();
+
+    // Strip attachable_set_id from terminals whose set exists in the local
+    // store but was not projected (orphaned local set — checkout deleted).
+    // Sets with remote-host affinity are left alone: they arrive via peer
+    // merge and the terminal's reference enables cross-host correlation.
+    let local_host = flotilla_protocol::HostName::local();
+    for terminal in pd.managed_terminals.values_mut() {
+        if let Some(set_id) = &terminal.attachable_set_id {
+            if !pd.attachable_sets.contains_key(set_id) {
+                let is_local_set = store.registry().sets.get(set_id).is_some_and(|s| s.host_affinity.as_ref() == Some(&local_host));
+                if is_local_set {
+                    terminal.attachable_set_id = None;
+                }
+            }
+        }
+    }
 }
 
 fn project_agent_data(pd: &mut ProviderData, agent_state_store: &crate::agents::SharedAgentStateStore) {
