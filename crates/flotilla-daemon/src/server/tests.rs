@@ -175,21 +175,10 @@ fn empty_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc
 }
 
 async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, request: Request) -> Message {
-    let (peer_manager, pending_remote_commands, forwarded_commands, pending_remote_cancels, next_remote_command_id) = empty_routing_state();
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
-    let remote_command_router = make_remote_command_router(
-        daemon,
-        &peer_manager,
-        &pending_remote_commands,
-        &forwarded_commands,
-        &pending_remote_cancels,
-        &next_remote_command_id,
-    );
-    let request_dispatcher = RequestDispatcher::new(daemon, &remote_command_router, &agent_state_store);
-    request_dispatcher.dispatch(id, request).await
+    dispatch_request_with_state(daemon, &flotilla_core::agents::shared_in_memory_agent_state_store(), id, request).await
 }
 
-async fn dispatch_request_with_agent_store(
+async fn dispatch_request_with_state(
     daemon: &Arc<InProcessDaemon>,
     agent_state_store: &flotilla_core::agents::SharedAgentStateStore,
     id: u64,
@@ -206,6 +195,15 @@ async fn dispatch_request_with_agent_store(
     );
     let request_dispatcher = RequestDispatcher::new(daemon, &remote_command_router, agent_state_store);
     request_dispatcher.dispatch(id, request).await
+}
+
+async fn dispatch_request_with_agent_store(
+    daemon: &Arc<InProcessDaemon>,
+    agent_state_store: &flotilla_core::agents::SharedAgentStateStore,
+    id: u64,
+    request: Request,
+) -> Message {
+    dispatch_request_with_state(daemon, agent_state_store, id, request).await
 }
 
 fn checkout(branch: &str) -> Checkout {
@@ -372,26 +370,26 @@ async fn dispatch_repo_query_methods_round_trip() {
 
     let repo_name = repo.file_name().expect("repo file name").to_string_lossy().to_string();
 
-    let status = dispatch_request_test(&daemon, 44, Request::GetStatus).await;
-    match ok_response(status, 44) {
+    let status = dispatch_request_test(&daemon, 1, Request::GetStatus).await;
+    match ok_response(status, 1) {
         Response::GetStatus(parsed) => assert!(parsed.repos.iter().any(|entry| entry.path == repo)),
         other => panic!("expected status response, got {:?}", other),
     }
 
-    let detail = dispatch_request_test(&daemon, 45, Request::GetRepoDetail { slug: repo_name.clone() }).await;
-    match ok_response(detail, 45) {
+    let detail = dispatch_request_test(&daemon, 2, Request::GetRepoDetail { slug: repo_name.clone() }).await;
+    match ok_response(detail, 2) {
         Response::GetRepoDetail(parsed) => assert_eq!(parsed.path, repo),
         other => panic!("expected repo detail response, got {:?}", other),
     }
 
-    let providers = dispatch_request_test(&daemon, 46, Request::GetRepoProviders { slug: repo_name.clone() }).await;
-    match ok_response(providers, 46) {
+    let providers = dispatch_request_test(&daemon, 3, Request::GetRepoProviders { slug: repo_name.clone() }).await;
+    match ok_response(providers, 3) {
         Response::GetRepoProviders(parsed) => assert_eq!(parsed.path, repo),
         other => panic!("expected repo providers response, got {:?}", other),
     }
 
-    let work = dispatch_request_test(&daemon, 47, Request::GetRepoWork { slug: repo_name }).await;
-    match ok_response(work, 47) {
+    let work = dispatch_request_test(&daemon, 4, Request::GetRepoWork { slug: repo_name }).await;
+    match ok_response(work, 4) {
         Response::GetRepoWork(parsed) => assert_eq!(parsed.path, repo),
         other => panic!("expected repo work response, got {:?}", other),
     }

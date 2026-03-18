@@ -2781,6 +2781,8 @@ fn wrap_remote_attach_commands_disables_multiplex_when_control_dir_creation_fail
         "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
     )
     .expect("write hosts config");
+    // `wrap_remote_attach_commands` creates `<config_base>/ssh/<host>` for its control socket.
+    // A plain file at `<config_base>/ssh` makes `create_dir_all` fail and forces the no-multiplex fallback.
     std::fs::write(temp.path().join("ssh"), "not-a-directory").expect("create conflicting ssh file");
 
     let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
