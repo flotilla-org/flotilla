@@ -197,15 +197,6 @@ async fn dispatch_request_with_state(
     request_dispatcher.dispatch(id, request).await
 }
 
-async fn dispatch_request_with_agent_store(
-    daemon: &Arc<InProcessDaemon>,
-    agent_state_store: &flotilla_core::agents::SharedAgentStateStore,
-    id: u64,
-    request: Request,
-) -> Message {
-    dispatch_request_with_state(daemon, agent_state_store, id, request).await
-}
-
 fn checkout(branch: &str) -> Checkout {
     Checkout {
         branch: branch.to_string(),
@@ -415,7 +406,7 @@ async fn dispatch_agent_hook_started_updates_existing_session_entry() {
         });
     }
 
-    let response = dispatch_request_with_agent_store(&daemon, &agent_state_store, 90, Request::AgentHook {
+    let response = dispatch_request_with_state(&daemon, &agent_state_store, 5, Request::AgentHook {
         event: AgentHookEvent {
             attachable_id: incoming_id.clone(),
             harness: AgentHarness::ClaudeCode,
@@ -427,7 +418,7 @@ async fn dispatch_agent_hook_started_updates_existing_session_entry() {
     })
     .await;
 
-    assert!(matches!(ok_response(response, 90), Response::AgentHook));
+    assert!(matches!(ok_response(response, 5), Response::AgentHook));
     let store = agent_state_store.lock().expect("lock agent state store");
     assert_eq!(store.lookup_by_session_id(&session_id), Some(&existing_id));
     let entry = store.get(&existing_id).expect("existing entry should be updated");
@@ -455,7 +446,7 @@ async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
         });
     }
 
-    let response = dispatch_request_with_agent_store(&daemon, &agent_state_store, 91, Request::AgentHook {
+    let response = dispatch_request_with_state(&daemon, &agent_state_store, 6, Request::AgentHook {
         event: AgentHookEvent {
             attachable_id: AttachableId::new("att-ended"),
             harness: AgentHarness::ClaudeCode,
@@ -467,7 +458,7 @@ async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
     })
     .await;
 
-    assert!(matches!(ok_response(response, 91), Response::AgentHook));
+    assert!(matches!(ok_response(response, 6), Response::AgentHook));
     let store = agent_state_store.lock().expect("lock agent state store");
     assert!(store.lookup_by_session_id(&session_id).is_none());
     assert!(store.get(&existing_id).is_none(), "ended event should remove existing session-mapped entry");
@@ -479,7 +470,7 @@ async fn dispatch_agent_hook_no_change_event_is_ok_without_creating_entry() {
     let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
     let attachable_id = AttachableId::new("att-no-change");
 
-    let response = dispatch_request_with_agent_store(&daemon, &agent_state_store, 92, Request::AgentHook {
+    let response = dispatch_request_with_state(&daemon, &agent_state_store, 7, Request::AgentHook {
         event: AgentHookEvent {
             attachable_id: attachable_id.clone(),
             harness: AgentHarness::ClaudeCode,
@@ -491,7 +482,7 @@ async fn dispatch_agent_hook_no_change_event_is_ok_without_creating_entry() {
     })
     .await;
 
-    assert!(matches!(ok_response(response, 92), Response::AgentHook));
+    assert!(matches!(ok_response(response, 7), Response::AgentHook));
     let store = agent_state_store.lock().expect("lock agent state store");
     assert!(store.get(&attachable_id).is_none(), "no-change event should not create a new entry");
 }
