@@ -1,5 +1,5 @@
 [package]
-name = "flotilla-session"
+name = "bollard"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true

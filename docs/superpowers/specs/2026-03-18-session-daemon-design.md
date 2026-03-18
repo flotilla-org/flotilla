@@ -70,8 +70,8 @@ The daemon runtime root contains one directory per session. A session directory 
 
 Example shape:
 
-- `$XDG_RUNTIME_DIR/flotilla-sessions/<session-id>/socket`
-- `$XDG_RUNTIME_DIR/flotilla-sessions/<session-id>/meta.json`
+- `$XDG_RUNTIME_DIR/bollards/<session-id>/socket`
+- `$XDG_RUNTIME_DIR/bollards/<session-id>/meta.json`
 - optional future files such as `pid`, `log`, or engine-specific artifacts
 
 This layout keeps session artifacts together and narrows creation races to the initial session directory allocation. Discovery becomes filesystem-first: enumerate session directories, probe their sockets, ignore broken entries, and reap stale sessions conservatively.

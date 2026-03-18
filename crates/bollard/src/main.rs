@@ -1,9 +1,9 @@
-use flotilla_session::{cli, server::SessionService};
+use bollard::{cli, server::SessionService};
 
 fn main() {
     let cli = cli::parse();
     let service = if let Some(root) = cli.runtime_root.clone() {
-        SessionService::new(flotilla_session::runtime::RuntimeLayout::new(root))
+        SessionService::new(bollard::runtime::RuntimeLayout::new(root))
     } else {
         SessionService::discover()
     };

@@ -1,4 +1,4 @@
-use flotilla_session::vt::{passthrough::PassthroughVtEngine, VtEngine};
+use bollard::vt::{passthrough::PassthroughVtEngine, VtEngine};
 
 #[test]
 fn passthrough_engine_accepts_bytes_and_reports_no_replay_support() {

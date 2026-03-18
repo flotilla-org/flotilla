@@ -4,7 +4,7 @@
 
 **Goal:** Build the first usable Rust session-daemon terminal backend and make flotilla prefer it over shpool for basic persistent terminal sessions.
 
-**Architecture:** Add a new sibling workspace crate, provisionally named `flotilla-session`, that owns session directories, CLI commands, a private daemon socket protocol, PTY lifecycle, and a `passthrough` `VtEngine`. Integrate it into `flotilla-core` through a new `TerminalPool` adapter and provider-discovery factory, keeping the existing executor flow unchanged and leaving replay-capable VT engines for later plans.
+**Architecture:** Add a new sibling workspace crate, provisionally named `bollard`, that owns session directories, CLI commands, a private daemon socket protocol, PTY lifecycle, and a `passthrough` `VtEngine`. Integrate it into `flotilla-core` through a new `TerminalPool` adapter and provider-discovery factory, keeping the existing executor flow unchanged and leaving replay-capable VT engines for later plans.
 
 **Tech Stack:** Rust, Tokio, Unix sockets/PTTY support, `flotilla-core` provider discovery, attachable-store persistence, targeted crate tests, sandbox-safe cargo test commands
 
@@ -29,19 +29,19 @@ Follow-on plans should cover:
 
 ### New crate
 
-- Create: `crates/flotilla-session/Cargo.toml`
-- Create: `crates/flotilla-session/src/lib.rs`
-- Create: `crates/flotilla-session/src/main.rs`
-- Create: `crates/flotilla-session/src/cli.rs`
-- Create: `crates/flotilla-session/src/runtime.rs`
-- Create: `crates/flotilla-session/src/session.rs`
-- Create: `crates/flotilla-session/src/server.rs`
-- Create: `crates/flotilla-session/src/protocol.rs`
-- Create: `crates/flotilla-session/src/vt/mod.rs`
-- Create: `crates/flotilla-session/src/vt/passthrough.rs`
-- Create: `crates/flotilla-session/tests/cli.rs`
-- Create: `crates/flotilla-session/tests/runtime.rs`
-- Create: `crates/flotilla-session/tests/lifecycle.rs`
+- Create: `crates/bollard/Cargo.toml`
+- Create: `crates/bollard/src/lib.rs`
+- Create: `crates/bollard/src/main.rs`
+- Create: `crates/bollard/src/cli.rs`
+- Create: `crates/bollard/src/runtime.rs`
+- Create: `crates/bollard/src/session.rs`
+- Create: `crates/bollard/src/server.rs`
+- Create: `crates/bollard/src/protocol.rs`
+- Create: `crates/bollard/src/vt/mod.rs`
+- Create: `crates/bollard/src/vt/passthrough.rs`
+- Create: `crates/bollard/tests/cli.rs`
+- Create: `crates/bollard/tests/runtime.rs`
+- Create: `crates/bollard/tests/lifecycle.rs`
 
 ### Existing workspace / discovery
 
@@ -71,30 +71,30 @@ Follow-on plans should cover:
 
 **Files:**
 - Modify: `Cargo.toml`
-- Create: `crates/flotilla-session/Cargo.toml`
-- Create: `crates/flotilla-session/src/lib.rs`
-- Create: `crates/flotilla-session/src/main.rs`
-- Create: `crates/flotilla-session/src/cli.rs`
-- Test: `crates/flotilla-session/tests/cli.rs`
+- Create: `crates/bollard/Cargo.toml`
+- Create: `crates/bollard/src/lib.rs`
+- Create: `crates/bollard/src/main.rs`
+- Create: `crates/bollard/src/cli.rs`
+- Test: `crates/bollard/tests/cli.rs`
 
 - [ ] **Step 1: Write the failing CLI smoke tests**
-  - Add tests that exercise `flotilla-session --help`, `flotilla-session create --help`, and `flotilla-session list --help`.
+  - Add tests that exercise `bollard --help`, `bollard create --help`, and `bollard list --help`.
   - Assert the crate exposes the expected top-level commands: `attach`, `create`, `list`, `kill`.
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
 
-Run: `cargo test -p flotilla-session --locked cli`
+Run: `cargo test -p bollard --locked cli`
 Expected: FAIL because the crate does not exist yet.
 
 - [ ] **Step 3: Add the workspace member and minimal binary crate**
-  - Add `crates/flotilla-session` to the workspace members in `Cargo.toml`.
+  - Add `crates/bollard` to the workspace members in `Cargo.toml`.
   - Create a standalone package with its own binary entrypoint.
   - Keep it fully separate from `crates/flotilla-daemon`; do not extend the existing multi-host daemon crate.
   - Add clap-based command parsing for `attach`, `create`, `list`, and `kill`.
 
 - [ ] **Step 4: Run the focused tests to verify they pass**
 
-Run: `cargo test -p flotilla-session --locked cli`
+Run: `cargo test -p bollard --locked cli`
 Expected: PASS
 
 ## Chunk 2: Runtime root and session identity
@@ -102,9 +102,9 @@ Expected: PASS
 ### Task 2: Implement session directory allocation and opaque session IDs
 
 **Files:**
-- Create: `crates/flotilla-session/src/runtime.rs`
-- Possibly create: `crates/flotilla-session/src/session.rs`
-- Test: `crates/flotilla-session/tests/runtime.rs`
+- Create: `crates/bollard/src/runtime.rs`
+- Possibly create: `crates/bollard/src/session.rs`
+- Test: `crates/bollard/tests/runtime.rs`
 
 - [ ] **Step 1: Write the failing runtime tests**
   - Add tests for runtime-root selection and fallback behavior.
@@ -113,7 +113,7 @@ Expected: PASS
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
 
-Run: `cargo test -p flotilla-session --locked runtime`
+Run: `cargo test -p bollard --locked runtime`
 Expected: FAIL because runtime selection and ID allocation are not implemented.
 
 - [ ] **Step 3: Implement the minimal runtime layer**
@@ -124,7 +124,7 @@ Expected: FAIL because runtime selection and ID allocation are not implemented.
 
 - [ ] **Step 4: Run the focused tests to verify they pass**
 
-Run: `cargo test -p flotilla-session --locked runtime`
+Run: `cargo test -p bollard --locked runtime`
 Expected: PASS
 
 ## Chunk 3: VT engine contract with passthrough phase-1 implementation
@@ -132,10 +132,10 @@ Expected: PASS
 ### Task 3: Introduce the phase-1 `VtEngine` seam
 
 **Files:**
-- Create: `crates/flotilla-session/src/vt/mod.rs`
-- Create: `crates/flotilla-session/src/vt/passthrough.rs`
-- Possibly modify: `crates/flotilla-session/src/session.rs`
-- Test: `crates/flotilla-session/tests/runtime.rs`
+- Create: `crates/bollard/src/vt/mod.rs`
+- Create: `crates/bollard/src/vt/passthrough.rs`
+- Possibly modify: `crates/bollard/src/session.rs`
+- Test: `crates/bollard/tests/runtime.rs`
 
 - [ ] **Step 1: Write the failing engine contract tests**
   - Add tests that `PassthroughVtEngine` accepts output bytes and reports replay as unsupported.
@@ -143,7 +143,7 @@ Expected: PASS
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
 
-Run: `cargo test -p flotilla-session --locked passthrough`
+Run: `cargo test -p bollard --locked passthrough`
 Expected: FAIL because the trait and implementation do not exist.
 
 - [ ] **Step 3: Implement the trait and passthrough engine**
@@ -153,7 +153,7 @@ Expected: FAIL because the trait and implementation do not exist.
 
 - [ ] **Step 4: Run the focused tests to verify they pass**
 
-Run: `cargo test -p flotilla-session --locked passthrough`
+Run: `cargo test -p bollard --locked passthrough`
 Expected: PASS
 
 ## Chunk 4: Session lifecycle daemon and CLI behavior
@@ -161,11 +161,11 @@ Expected: PASS
 ### Task 4: Implement create/list/kill around per-session directories
 
 **Files:**
-- Create: `crates/flotilla-session/src/server.rs`
-- Create: `crates/flotilla-session/src/protocol.rs`
-- Modify: `crates/flotilla-session/src/cli.rs`
-- Modify: `crates/flotilla-session/src/main.rs`
-- Test: `crates/flotilla-session/tests/lifecycle.rs`
+- Create: `crates/bollard/src/server.rs`
+- Create: `crates/bollard/src/protocol.rs`
+- Modify: `crates/bollard/src/cli.rs`
+- Modify: `crates/bollard/src/main.rs`
+- Test: `crates/bollard/tests/lifecycle.rs`
 
 - [ ] **Step 1: Write the failing lifecycle tests**
   - Add tests for:
@@ -176,7 +176,7 @@ Expected: PASS
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
 
-Run: `cargo test -p flotilla-session --locked lifecycle -- create`
+Run: `cargo test -p bollard --locked lifecycle -- create`
 Expected: FAIL because the lifecycle commands are still stubs.
 
 - [ ] **Step 3: Implement the lifecycle primitives**
@@ -186,17 +186,17 @@ Expected: FAIL because the lifecycle commands are still stubs.
 
 - [ ] **Step 4: Run the focused tests to verify they pass**
 
-Run: `cargo test -p flotilla-session --locked lifecycle -- create`
+Run: `cargo test -p bollard --locked lifecycle -- create`
 Expected: PASS
 
 ### Task 5: Implement PTY-backed attach with disconnect-preserves-session semantics
 
 **Files:**
-- Modify: `crates/flotilla-session/src/session.rs`
-- Modify: `crates/flotilla-session/src/server.rs`
-- Modify: `crates/flotilla-session/src/protocol.rs`
-- Modify: `crates/flotilla-session/src/cli.rs`
-- Test: `crates/flotilla-session/tests/lifecycle.rs`
+- Modify: `crates/bollard/src/session.rs`
+- Modify: `crates/bollard/src/server.rs`
+- Modify: `crates/bollard/src/protocol.rs`
+- Modify: `crates/bollard/src/cli.rs`
+- Test: `crates/bollard/tests/lifecycle.rs`
 
 - [ ] **Step 1: Write the failing attach tests**
   - Add tests showing:
@@ -207,7 +207,7 @@ Expected: PASS
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
 
-Run: `cargo test -p flotilla-session --locked lifecycle -- attach`
+Run: `cargo test -p bollard --locked lifecycle -- attach`
 Expected: FAIL because attach/reuse/disconnect semantics are not implemented.
 
 - [ ] **Step 3: Implement the minimal PTY lifecycle**
@@ -218,7 +218,7 @@ Expected: FAIL because attach/reuse/disconnect semantics are not implemented.
 
 - [ ] **Step 4: Run the focused tests to verify they pass**
 
-Run: `cargo test -p flotilla-session --locked lifecycle -- attach`
+Run: `cargo test -p bollard --locked lifecycle -- attach`
 Expected: PASS
 
 ## Chunk 5: Discovery and preferred provider integration
@@ -242,7 +242,7 @@ Run: `cargo test -p flotilla-core --locked session_factory`
 Expected: FAIL because no detector or session factory exists.
 
 - [ ] **Step 3: Implement discovery and priority**
-  - Detect the `flotilla-session` binary in host detection.
+  - Detect the `bollard` binary in host detection.
   - Add a new terminal-pool factory and register it before shpool in terminal-pool priority order.
   - Keep shpool and passthrough as valid fallback options.
 
@@ -266,7 +266,7 @@ Expected: PASS
 
 - [ ] **Step 1: Write the failing provider tests**
   - Add tests for:
-    - `attach_command()` returning a `flotilla-session attach ...` command
+    - `attach_command()` returning a `bollard attach ...` command
     - `list_terminals()` mapping CLI output into `ManagedTerminal`
     - `kill_terminal()` calling the CLI kill path
     - persisted attachable bindings using an opaque daemon session handle rather than assuming shpool-style semantic names
@@ -292,13 +292,13 @@ Expected: PASS
 ### Task 8: Prove phase-1 behavior through crate-local and repo-level verification
 
 **Files:**
-- Test: `crates/flotilla-session/tests/lifecycle.rs`
+- Test: `crates/bollard/tests/lifecycle.rs`
 - Test: `crates/flotilla-core/src/providers/terminal/session.rs`
 - Possibly modify: `docs/superpowers/specs/2026-03-18-session-daemon-design.md`
 
 - [ ] **Step 1: Run focused session-daemon verification**
 
-Run: `cargo test -p flotilla-session --locked`
+Run: `cargo test -p bollard --locked`
 Expected: PASS
 
 - [ ] **Step 2: Run focused flotilla-core verification**
@@ -314,7 +314,7 @@ Expected: PASS, or explicit surfacing of unrelated pre-existing failures
 - [ ] **Step 4: Commit the phase-1 implementation checkpoint**
 
 ```bash
-git add Cargo.toml crates/flotilla-session crates/flotilla-core docs/superpowers/specs/2026-03-18-session-daemon-design.md docs/superpowers/plans/2026-03-18-session-daemon-phase1.md
+git add Cargo.toml crates/bollard crates/flotilla-core docs/superpowers/specs/2026-03-18-session-daemon-design.md docs/superpowers/plans/2026-03-18-session-daemon-phase1.md
 git commit -m "Add phase 1 session daemon terminal backend"
 ```
 

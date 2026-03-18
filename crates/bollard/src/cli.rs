@@ -5,7 +5,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::server::SessionService;
 
 #[derive(Debug, Parser)]
-#[command(name = "flotilla-session", version)]
+#[command(name = "bollard", version)]
 pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,

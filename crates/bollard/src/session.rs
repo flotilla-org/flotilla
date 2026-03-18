@@ -303,7 +303,7 @@ pub fn run_session_daemon(_root: &Path, _id: &str) -> Result<(), String> {
 }
 
 fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<(), String> {
-    let exe = std::env::var_os("CARGO_BIN_EXE_flotilla-session")
+    let exe = std::env::var_os("CARGO_BIN_EXE_bollard")
         .map(PathBuf::from)
         .map(Ok)
         .unwrap_or_else(|| std::env::current_exe().map_err(|err| format!("resolve current exe: {err}")))?;

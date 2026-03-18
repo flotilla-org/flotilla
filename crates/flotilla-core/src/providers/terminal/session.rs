@@ -24,8 +24,8 @@ struct SessionInfo {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 enum SessionStatus {
-    Running,
-    Disconnected,
+    Attached,
+    Detached,
 }
 
 pub struct SessionTerminalPool {
@@ -102,8 +102,8 @@ impl SessionTerminalPool {
         let command = session.cmd.unwrap_or(persisted_command);
         let working_directory = session.cwd.unwrap_or(persisted_working_directory);
         let status = match session.status {
-            SessionStatus::Running => TerminalStatus::Running,
-            SessionStatus::Disconnected => TerminalStatus::Disconnected,
+            SessionStatus::Attached => TerminalStatus::Running,
+            SessionStatus::Detached => TerminalStatus::Disconnected,
         };
         let (_, _) = store.ensure_terminal_attachable_with_change(
             &set_id,
@@ -165,7 +165,7 @@ impl SessionTerminalPool {
 #[async_trait]
 impl TerminalPool for SessionTerminalPool {
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
-        let output = run!(self.runner, &self.binary, &["list"], Path::new("/"))?;
+        let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
         let sessions = Self::parse_list_output(&output)?;
         let Ok(mut store) = self.attachable_store.lock() else {
             return Ok(vec![]);
@@ -189,7 +189,7 @@ impl TerminalPool for SessionTerminalPool {
         let output = run!(
             self.runner,
             &self.binary,
-            &["create", "--name", &requested_name, "--cwd", &_cwd.display().to_string(), "--cmd", _command],
+            &["create", "--json", &requested_name, "--cwd", &_cwd.display().to_string(), "--cmd", _command],
             Path::new("/")
         )?;
         let session: SessionInfo = serde_json::from_str(&output).map_err(|err| format!("parse create session output: {err}"))?;
@@ -219,8 +219,7 @@ impl TerminalPool for SessionTerminalPool {
             .ok()
             .and_then(|store| Self::find_persisted_session_id(store.as_ref(), id))
             .unwrap_or_else(|| terminal_session_binding_ref(id));
-        let mut parts =
-            vec![self.binary.clone(), "attach".into(), "--name".into(), sq(&session_id), "--cwd".into(), sq(&cwd.display().to_string())];
+        let mut parts = vec![self.binary.clone(), "attach".into(), sq(&session_id), "--cwd".into(), sq(&cwd.display().to_string())];
         if !command.is_empty() || !env_vars.is_empty() {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             let env_prefix = if env_vars.is_empty() {
@@ -292,19 +291,19 @@ mod tests {
 
     #[tokio::test]
     async fn attach_command_wraps_cli_with_name_and_cwd() {
-        let pool = SessionTerminalPool::new(Arc::new(MockRunner::new(vec![])), "flotilla-session", shared_in_memory_attachable_store());
+        let pool = SessionTerminalPool::new(Arc::new(MockRunner::new(vec![])), "bollard", shared_in_memory_attachable_store());
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
         let command = pool.attach_command(&id, "bash", Path::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert!(command.contains("flotilla-session attach"));
-        assert!(command.contains("--name 'flotilla/feat/shell/0'"));
+        assert!(command.contains("bollard attach"));
+        assert!(command.contains("'flotilla/feat/shell/0'"));
         assert!(command.contains("--cwd '/repo'"));
     }
 
     #[tokio::test]
     async fn list_terminals_maps_json_output() {
-        let json = r#"[{"id":"session-123","name":"flotilla/feat/shell/0","cwd":"/repo","cmd":"bash","status":"Running"}]"#;
+        let json = r#"[{"id":"session-123","name":"flotilla/feat/shell/0","cwd":"/repo","cmd":"bash","status":"Attached"}]"#;
         let store = shared_in_memory_attachable_store();
         {
             let mut store_guard = store.lock().expect("store");
@@ -317,7 +316,7 @@ mod tests {
                 TerminalStatus::Disconnected,
             );
         }
-        let pool = SessionTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into())])), "flotilla-session", store);
+        let pool = SessionTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into())])), "bollard", store);
 
         let terminals = pool.list_terminals().await.expect("list terminals");
 
@@ -333,7 +332,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
         let pool = SessionTerminalPool::new(
             Arc::clone(&runner) as Arc<dyn CommandRunner>,
-            "flotilla-session",
+            "bollard",
             shared_in_memory_attachable_store(),
         );
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
@@ -341,16 +340,16 @@ mod tests {
         pool.kill_terminal(&id).await.expect("kill terminal");
 
         let calls = runner.calls.lock().expect("calls");
-        assert_eq!(calls[0].0, "flotilla-session");
+        assert_eq!(calls[0].0, "bollard");
         assert_eq!(calls[0].1, vec!["kill".to_string(), "flotilla/feat/shell/0".to_string()]);
     }
 
     #[tokio::test]
     async fn ensure_running_persists_created_session_handle() {
-        let json = r#"{ "id":"session-123", "name":"flotilla/feat/shell/0", "cwd":"/repo", "cmd":"bash", "status":"Disconnected" }"#;
+        let json = r#"{ "id":"session-123", "name":"flotilla/feat/shell/0", "cwd":"/repo", "cmd":"bash", "status":"Detached" }"#;
         let store = shared_in_memory_attachable_store();
         let runner = Arc::new(MockRunner::new(vec![Ok(json.into())]));
-        let pool = SessionTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "flotilla-session", store.clone());
+        let pool = SessionTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "bollard", store.clone());
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
         pool.ensure_running(&id, "bash", Path::new("/repo")).await.expect("ensure running");

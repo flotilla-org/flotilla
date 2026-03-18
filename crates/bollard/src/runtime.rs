@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SESSION_ROOT_DIR: &str = "flotilla-sessions";
+const SESSION_ROOT_DIR: &str = "bollard";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -31,7 +31,7 @@ impl RuntimeLayout {
     pub fn discover() -> Self {
         Self {
             root: discover_runtime_root(
-                env::var_os("FLOTILLA_SESSION_RUNTIME_DIR"),
+                env::var_os("BOLLARD_RUNTIME_DIR"),
                 env::var_os("XDG_RUNTIME_DIR"),
                 env::var_os("TMPDIR"),
                 env::temp_dir(),
@@ -152,6 +152,6 @@ mod tests {
     fn discover_runtime_root_prefers_xdg_before_tmpdir() {
         let root =
             discover_runtime_root(None, Some(OsString::from("/xdg/runtime")), Some(OsString::from("/tmpdir")), PathBuf::from("/tmp"));
-        assert_eq!(root, PathBuf::from("/xdg/runtime/flotilla-sessions"));
+        assert_eq!(root, PathBuf::from("/xdg/runtime/bollard"));
     }
 }
