@@ -156,8 +156,8 @@ impl Theme {
             text: p.text.into(),
             subtext: p.subtext0.into(),
             // Shimmer
-            shimmer_base: p.yellow.into(),
-            shimmer_highlight: p.rosewater.into(),
+            shimmer_base: p.peach.into(),
+            shimmer_highlight: p.yellow.into(),
             // Bar chrome
             bar_bg: p.crust.into(),
             key_hint: p.peach.into(),
