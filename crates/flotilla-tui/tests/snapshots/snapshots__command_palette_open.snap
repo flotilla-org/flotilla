@@ -23,12 +23,12 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
-/ for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> HELP  <q> QUIT                ◫ auto   @local
+/                            <ENT> RUN  <TAB> FILL  <ESC> CLOSE                                   ◫ auto   @local
+  search     filter items in view                                                                                 /
+  refresh    refresh active repo                                                                                  r
+  branch     create a new branch                                                                                  n
+  help       show key bindings                                                                                    ?
+  quit       exit flotilla                                                                                        q
+  layout     cycle view layout                                                                                    l
+  host       cycle target host                                                                                    h
+  theme      cycle color theme

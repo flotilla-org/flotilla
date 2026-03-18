@@ -23,12 +23,5 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
-/ for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> HELP  <q> QUIT                ◫ auto   @local
+/he                          <ENT> RUN  <TAB> FILL  <ESC> CLOSE                                   ◫ auto   @local
+  help  show key bindings                                                                                         ?

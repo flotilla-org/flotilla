@@ -174,8 +174,8 @@ impl StatusBarModel {
 
             if reserved_status_width + keys_width + gap + mode_width + task_width <= input.width {
                 let task_start = input.width.saturating_sub(task_width);
-                let after_keys = reserved_status_width + keys_width;
-                let mode_start = if mode_width == 0 { task_start } else { after_keys + gap };
+                // Mode indicators are right-aligned, just left of the task section
+                let mode_start = if mode_width == 0 { task_start } else { task_start.saturating_sub(mode_width) };
                 let keys_start = if keys_width == 0 && mode_width == 0 { task_start } else { reserved_status_width };
 
                 return Self {
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_indicators_appear_after_keys() {
+    fn mode_indicators_are_right_aligned() {
         let model = StatusBarModel::build(StatusBarInput {
             width: 80,
             preferred_status_width: 28,
@@ -332,10 +332,36 @@ mod tests {
             ],
         });
 
-        // keys at 28, mode after keys + gap
-        assert_eq!(model.keys_start, 28);
-        let keys_end = model.keys_start + total_keys_width(&model.visible_keys);
-        assert_eq!(model.mode_start, keys_end + MODE_GAP);
+        // Mode indicators right-aligned at end (no task, so task_start = 80)
+        let mode_width = total_mode_width(&model.mode_indicators);
+        assert_eq!(model.mode_start, 80 - mode_width);
+    }
+
+    #[test]
+    fn mode_indicators_stable_with_different_key_counts() {
+        let make = |keys: Vec<KeyChip>| {
+            StatusBarModel::build(StatusBarInput {
+                width: 80,
+                preferred_status_width: 28,
+                keys_visible: true,
+                status: StatusSection::plain("Ready"),
+                task: None,
+                keys,
+                mode_indicators: vec![
+                    ModeIndicator::new("□", "zoom", StatusBarAction::key(KeyCode::Char('l'))),
+                    ModeIndicator::new("@", "local", StatusBarAction::key(KeyCode::Char('h'))),
+                ],
+            })
+        };
+
+        let with_few = make(vec![KeyChip::new("q", "Quit", StatusBarAction::key(KeyCode::Char('q')))]);
+        let with_many = make(vec![
+            KeyChip::new("esc", "Clear", StatusBarAction::key(KeyCode::Esc)),
+            KeyChip::new("q", "Quit", StatusBarAction::key(KeyCode::Char('q'))),
+            KeyChip::new("?", "Help", StatusBarAction::key(KeyCode::Char('?'))),
+        ]);
+
+        assert_eq!(with_few.mode_start, with_many.mode_start, "mode indicators should stay in same position");
     }
 
     #[test]

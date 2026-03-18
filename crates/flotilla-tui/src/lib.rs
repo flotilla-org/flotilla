@@ -3,6 +3,7 @@ pub mod cli;
 pub mod event;
 pub mod event_log;
 pub mod keymap;
+pub mod palette;
 pub mod run;
 pub use flotilla_client as socket;
 pub mod segment_bar;

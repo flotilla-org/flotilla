@@ -509,3 +509,39 @@ fn theme_switching_changes_output() {
         "Themes should produce different colours: classic={classic_fg:?} vs catppuccin={catppuccin_fg:?}"
     );
 }
+
+#[test]
+fn command_palette_open() {
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::CommandPalette {
+        input: Input::default(),
+        entries: flotilla_tui::palette::all_entries(),
+        selected: 0,
+        scroll_top: 0,
+    });
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn command_palette_filtered() {
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::CommandPalette {
+        input: Input::from("he"),
+        entries: flotilla_tui::palette::all_entries(),
+        selected: 0,
+        scroll_top: 0,
+    });
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn command_palette_selection() {
+    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::CommandPalette {
+        input: Input::default(),
+        entries: flotilla_tui::palette::all_entries(),
+        selected: 3,
+        scroll_top: 0,
+    });
+    let output = harness.render_to_string();
+    insta::assert_snapshot!(output);
+}

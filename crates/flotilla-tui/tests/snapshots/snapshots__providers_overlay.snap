@@ -31,4 +31,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
-PROVIDERS                    <ENT> OPEN  <.> MENU  </> SEARCH  <n> NEW  <?> HELP    ◫ auto   @local
+PROVIDERS                    <ENT> OPEN  <.> MENU  <n> NEW  <?> HELP  <q> QUIT                ◫ auto   @local

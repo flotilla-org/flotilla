@@ -101,14 +101,23 @@ pub fn render(
     keymap: &Keymap,
     frame: &mut Frame,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-        .split(frame.area());
+    let constraints = vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)];
+    let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
 
     render_tab_bar(model, ui, theme, frame, chunks[0]);
     render_content(model, ui, theme, frame, chunks[1]);
-    render_status_bar(model, ui, in_flight, theme, frame, chunks[2]);
+
+    // When the palette is active, move the status bar to the top of the overlay so the
+    // input sits above the results instead of being pinned to the bottom of the screen.
+    let status_bar_area = if matches!(ui.mode, UiMode::CommandPalette { .. }) {
+        let palette_height = crate::palette::MAX_PALETTE_ROWS as u16;
+        let overlay_y = chunks[2].y.saturating_sub(palette_height);
+        Rect::new(chunks[2].x, overlay_y, chunks[2].width, 1)
+    } else {
+        chunks[2]
+    };
+    render_status_bar(model, ui, in_flight, theme, frame, status_bar_area);
+    render_command_palette(ui, theme, frame, status_bar_area);
     render_action_menu(model, ui, theme, frame);
     render_input_popup(ui, theme, frame);
     render_delete_confirm(model, ui, theme, frame);
@@ -364,11 +373,15 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
             } else if !rui.multi_selected.is_empty() {
                 StatusSection::plain(&format!("{} SELECTED", rui.multi_selected.len()))
             } else {
-                StatusSection::plain("")
+                StatusSection::plain("/ for commands")
             };
 
             let task = active_task(model, in_flight).map(|(description, spinner_index)| TaskSection::new(&description, spinner_index));
-            StatusBarContent { status, keys: normal_mode_key_chips(), task, mode_indicators: normal_mode_indicators(ui) }
+            let mut keys = normal_mode_key_chips();
+            if rui.active_search_query.is_some() {
+                keys.insert(0, key_chip("ESC", "Clear", KeyCode::Esc));
+            }
+            StatusBarContent { status, keys, task, mode_indicators: normal_mode_indicators(ui) }
         }
         UiMode::Config => StatusBarContent {
             status: StatusSection::plain("FLOTILLA"),
@@ -390,7 +403,7 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
         },
         UiMode::BranchInput { kind: BranchInputKind::Manual, .. } => StatusBarContent {
             status: StatusSection::plain("NEW BRANCH"),
-            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("esc", "Cancel", KeyCode::Esc)],
+            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
             task: None,
             mode_indicators: vec![],
         },
@@ -400,14 +413,14 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
                 key_chip("j", "Down", KeyCode::Char('j')),
                 key_chip("k", "Up", KeyCode::Char('k')),
                 key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
-                key_chip("esc", "Close", KeyCode::Esc),
+                key_chip("ESC", "Close", KeyCode::Esc),
             ],
             task: None,
             mode_indicators: vec![],
         },
         UiMode::IssueSearch { input } => StatusBarContent {
             status: StatusSection::plain(&format!("SEARCH {}", input.value())),
-            keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("esc", "Cancel", KeyCode::Esc)],
+            keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
             task: None,
             mode_indicators: vec![],
         },
@@ -418,7 +431,7 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
                 key_chip("k", "Up", KeyCode::Char('k')),
                 key_chip("tab", "Complete", KeyCode::Tab),
                 key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
-                key_chip("esc", "Cancel", KeyCode::Esc),
+                key_chip("ESC", "Cancel", KeyCode::Esc),
             ],
             task: None,
             mode_indicators: vec![],
@@ -440,12 +453,25 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
             keys: vec![
                 key_chip("j", "Down", KeyCode::Char('j')),
                 key_chip("k", "Up", KeyCode::Char('k')),
-                key_chip("esc", "Close", KeyCode::Esc),
+                key_chip("ESC", "Close", KeyCode::Esc),
                 key_chip("?", "Close", KeyCode::Char('?')),
             ],
             task: None,
             mode_indicators: vec![],
         },
+        UiMode::CommandPalette { ref input, .. } => {
+            let status_text = format!("/{}", input.value());
+            StatusBarContent {
+                status: StatusSection::plain(&status_text),
+                keys: vec![
+                    key_chip(ENTER_KEY_GLYPH, "Run", KeyCode::Enter),
+                    key_chip("TAB", "Fill", KeyCode::Tab),
+                    key_chip("ESC", "Close", KeyCode::Esc),
+                ],
+                task: None,
+                mode_indicators: normal_mode_indicators(ui),
+            }
+        }
     }
 }
 
@@ -468,7 +494,6 @@ fn normal_mode_key_chips() -> Vec<KeyChip> {
     vec![
         key_chip(ENTER_KEY_GLYPH, "Open", KeyCode::Enter),
         key_chip(".", "Menu", KeyCode::Char('.')),
-        key_chip("/", "Search", KeyCode::Char('/')),
         key_chip("n", "New", KeyCode::Char('n')),
         key_chip("?", "Help", KeyCode::Char('?')),
         key_chip("q", "Quit", KeyCode::Char('q')),
@@ -1252,6 +1277,56 @@ fn render_file_picker(ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
         state.select(Some(selected));
     }
     frame.render_stateful_widget(list, chunks[1], &mut state);
+}
+
+fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, status_bar_area: Rect) {
+    let UiMode::CommandPalette { ref input, entries, selected, scroll_top } = ui.mode else {
+        return;
+    };
+
+    let filtered: Vec<&crate::palette::PaletteEntry> = crate::palette::filter_entries(entries, input.value());
+    let palette_height = crate::palette::MAX_PALETTE_ROWS as u16;
+
+    // Overlay area: fixed height, sits directly below the status bar (which has been
+    // moved to the top of the overlay by the caller).
+    let area = Rect::new(status_bar_area.x, status_bar_area.y + 1, status_bar_area.width, palette_height);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
+
+    let name_width = filtered.iter().map(|e| e.name.len()).max().unwrap_or(0).min(20);
+    let hint_width: u16 = 7;
+
+    for (i, entry) in filtered.iter().skip(scroll_top).take(crate::palette::MAX_PALETTE_ROWS).enumerate() {
+        let row_y = area.y + i as u16;
+        let is_selected = scroll_top + i == selected;
+
+        let row_style = if is_selected {
+            Style::default().bg(theme.action_highlight).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(theme.bar_bg)
+        };
+
+        let row_area = Rect::new(area.x, row_y, area.width, 1);
+        frame.render_widget(Block::default().style(row_style), row_area);
+
+        let name_span = Span::styled(format!("  {:<width$}", entry.name, width = name_width), row_style.fg(theme.text));
+        let desc_span = Span::styled(format!("  {}", entry.description), row_style.fg(theme.muted));
+
+        let line = Line::from(vec![name_span, desc_span]);
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x, row_y, area.width.saturating_sub(hint_width), 1));
+
+        let hint_text = entry.key_hint.unwrap_or("");
+        if !hint_text.is_empty() {
+            let hint_span = Span::styled(format!(" {} ", hint_text), row_style.fg(theme.key_hint));
+            let hint_x = area.x + area.width.saturating_sub(hint_width);
+            frame.render_widget(Paragraph::new(Line::from(hint_span)), Rect::new(hint_x, row_y, hint_width, 1));
+        }
+    }
+
+    // Cursor on the status bar row
+    let cursor_x = status_bar_area.x + 1 + input.visual_cursor() as u16;
+    frame.set_cursor_position((cursor_x, status_bar_area.y));
 }
 
 fn render_config_screen(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {

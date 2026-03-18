@@ -31,6 +31,15 @@ impl App {
                     _ => None,
                 };
             }
+            ModeId::CommandPalette => {
+                return match key.code {
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter => Some(Action::Confirm),
+                    KeyCode::Up => Some(Action::SelectPrev),
+                    KeyCode::Down => Some(Action::SelectNext),
+                    _ => None,
+                };
+            }
             // FilePicker has both a text input and a navigation list.
             // Hardcoded rather than routed through the keymap because shared
             // bindings (e.g. `?` → ToggleHelp) would intercept keys the user
@@ -74,6 +83,20 @@ impl App {
                     }
                 }
                 FocusTarget::FilePickerList => self.file_picker_select_next(),
+                FocusTarget::CommandPalette => {
+                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
+                        let count = crate::palette::filter_entries(entries, input.value()).len();
+                        if count > 0 {
+                            *selected = (*selected + 1) % count;
+                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
+                            if *selected >= *scroll_top + max_visible {
+                                *scroll_top = selected.saturating_sub(max_visible - 1);
+                            } else if *selected < *scroll_top {
+                                *scroll_top = *selected;
+                            }
+                        }
+                    }
+                }
                 FocusTarget::BranchInput
                 | FocusTarget::IssueSearchInput
                 | FocusTarget::DeleteConfirmDialog
@@ -97,6 +120,20 @@ impl App {
                     }
                 }
                 FocusTarget::FilePickerList => self.file_picker_select_prev(),
+                FocusTarget::CommandPalette => {
+                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
+                        let count = crate::palette::filter_entries(entries, input.value()).len();
+                        if count > 0 {
+                            *selected = if *selected == 0 { count - 1 } else { *selected - 1 };
+                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
+                            if *selected >= *scroll_top + max_visible {
+                                *scroll_top = selected.saturating_sub(max_visible - 1);
+                            } else if *selected < *scroll_top {
+                                *scroll_top = *selected;
+                            }
+                        }
+                    }
+                }
                 FocusTarget::BranchInput
                 | FocusTarget::IssueSearchInput
                 | FocusTarget::DeleteConfirmDialog
@@ -177,6 +214,38 @@ impl App {
                             repo_identity: self.model.active_repo_identity().clone(),
                         };
                         self.proto_commands.push_with_context(command.clone(), Some(ctx));
+                    }
+                    self.ui.mode = UiMode::Normal;
+                }
+                FocusTarget::CommandPalette => {
+                    if let UiMode::CommandPalette { ref input, entries, selected, .. } = self.ui.mode {
+                        let text = input.value().to_string();
+
+                        // "search <terms>" — apply filter directly, empty clears
+                        if let Some(query) = text.strip_prefix("search ") {
+                            let query = query.trim().to_string();
+                            self.ui.mode = UiMode::Normal;
+                            if query.is_empty() {
+                                self.clear_active_issue_search(crate::app::ClearDispatch::Always);
+                            } else {
+                                let repo = self.model.active_repo_root().clone();
+                                self.proto_commands.push(self.command(CommandAction::SearchIssues {
+                                    repo: flotilla_protocol::RepoSelector::Path(repo),
+                                    query: query.clone(),
+                                }));
+                                self.active_ui_mut().active_search_query = Some(query);
+                            }
+                            return;
+                        }
+
+                        // Otherwise dispatch the selected entry's action
+                        let filtered = crate::palette::filter_entries(entries, &text);
+                        if let Some(entry) = filtered.get(selected) {
+                            let action = entry.action;
+                            self.ui.mode = UiMode::Normal;
+                            self.dispatch_action(action);
+                            return;
+                        }
                     }
                     self.ui.mode = UiMode::Normal;
                 }
@@ -261,6 +330,16 @@ impl App {
                     self.open_file_picker_from_active_repo_parent();
                 }
             }
+            Action::OpenCommandPalette => {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
+                    self.ui.mode = UiMode::CommandPalette {
+                        input: Input::default(),
+                        entries: crate::palette::all_entries(),
+                        selected: 0,
+                        scroll_top: 0,
+                    };
+                }
+            }
             Action::Dismiss => match self.ui.mode.focus_target() {
                 FocusTarget::WorkItemTable => {
                     // Cancellation takes priority over other dismiss actions while a command is running.
@@ -287,7 +366,8 @@ impl App {
                 | FocusTarget::BranchInput
                 | FocusTarget::FilePickerList
                 | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog => {
+                | FocusTarget::CloseConfirmDialog
+                | FocusTarget::CommandPalette => {
                     self.ui.mode = UiMode::Normal;
                 }
                 FocusTarget::IssueSearchInput => {
@@ -317,6 +397,36 @@ impl App {
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
             UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
             UiMode::IssueSearch { .. } => self.handle_issue_search_key(key),
+            UiMode::CommandPalette { ref mut input, entries, ref mut selected, ref mut scroll_top, .. } => {
+                // Tab / Right arrow: fill selected command name into input
+                if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
+                    let filtered = crate::palette::filter_entries(entries, input.value());
+                    if let Some(entry) = filtered.get(*selected) {
+                        let filled = format!("{} ", entry.name);
+                        *input = Input::from(filled.as_str());
+                        *selected = 0;
+                        *scroll_top = 0;
+                    }
+                    return;
+                }
+
+                // Backspace on empty input closes the palette
+                if matches!(key.code, KeyCode::Backspace) && input.value().is_empty() {
+                    self.ui.mode = UiMode::Normal;
+                    return;
+                }
+
+                input.handle_event(&crossterm::event::Event::Key(key));
+                // Shortcut: typing / when input is empty fills "search "
+                if input.value() == "/" {
+                    *input = Input::from("search ");
+                    *selected = 0;
+                    *scroll_top = 0;
+                    return;
+                }
+                *selected = 0;
+                *scroll_top = 0;
+            }
             _ => {}
         }
     }
@@ -341,7 +451,8 @@ impl App {
             | UiMode::DeleteConfirm { .. }
             | UiMode::CloseConfirm { .. }
             | UiMode::BranchInput { .. }
-            | UiMode::IssueSearch { .. } => {
+            | UiMode::IssueSearch { .. }
+            | UiMode::CommandPalette { .. } => {
                 return;
             }
             UiMode::Config | UiMode::Normal => {}
@@ -1111,10 +1222,10 @@ mod tests {
     }
 
     #[test]
-    fn normal_slash_enters_issue_search() {
+    fn normal_slash_opens_command_palette() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('/')));
-        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+        assert!(matches!(app.ui.mode, UiMode::CommandPalette { .. }));
     }
 
     #[test]
@@ -1173,14 +1284,14 @@ mod tests {
     }
 
     #[test]
-    fn clicking_search_status_target_enters_issue_search_mode() {
+    fn clicking_search_status_target_opens_command_palette() {
         let mut app = stub_app();
         app.ui.layout.status_bar.key_targets =
             vec![StatusBarTarget::new(Rect::new(10, 29, 12, 1), StatusBarAction::key(KeyCode::Char('/')))];
 
         app.handle_mouse(left_click(12, 29));
 
-        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+        assert!(matches!(app.ui.mode, UiMode::CommandPalette { .. }));
     }
 
     #[test]
@@ -1897,5 +2008,118 @@ mod tests {
 
         let (command, _) = app.proto_commands.take_next().expect("should have command");
         assert_eq!(command, expected);
+    }
+
+    // ── command palette key handling ────────────────────────────────
+
+    #[test]
+    fn double_slash_fills_search() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(matches!(app.ui.mode, UiMode::CommandPalette { .. }));
+        app.handle_key(key(KeyCode::Char('/')));
+        if let UiMode::CommandPalette { ref input, .. } = app.ui.mode {
+            assert_eq!(input.value(), "search ");
+        } else {
+            panic!("expected CommandPalette");
+        }
+    }
+
+    #[test]
+    fn command_palette_tab_fills_command_name() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        // First entry is "search" — Tab should fill it
+        app.handle_key(key(KeyCode::Tab));
+        if let UiMode::CommandPalette { ref input, selected, .. } = app.ui.mode {
+            assert_eq!(input.value(), "search ");
+            assert_eq!(selected, 0);
+        } else {
+            panic!("expected CommandPalette");
+        }
+    }
+
+    #[test]
+    fn command_palette_search_with_args_applies_filter() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "search auth".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.active_ui().active_search_query.as_deref(), Some("auth"));
+    }
+
+    #[test]
+    fn command_palette_search_empty_term_clears() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "search ".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.active_ui().active_search_query, None);
+    }
+
+    #[test]
+    fn command_palette_enter_dispatches_action() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        // First entry is "search" which dispatches OpenIssueSearch
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.ui.mode, UiMode::IssueSearch { .. }));
+    }
+
+    #[test]
+    fn command_palette_esc_dismisses() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(matches!(app.ui.mode, UiMode::CommandPalette { .. }));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.ui.mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn command_palette_arrow_navigation_wraps() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        // Down from 0 → 1
+        app.handle_key(key(KeyCode::Down));
+        if let UiMode::CommandPalette { selected, .. } = app.ui.mode {
+            assert_eq!(selected, 1);
+        } else {
+            panic!("expected CommandPalette");
+        }
+        // Up from 1 → 0
+        app.handle_key(key(KeyCode::Up));
+        if let UiMode::CommandPalette { selected, .. } = app.ui.mode {
+            assert_eq!(selected, 0);
+        } else {
+            panic!("expected CommandPalette");
+        }
+        // Up from 0 → wraps to last
+        app.handle_key(key(KeyCode::Up));
+        if let UiMode::CommandPalette { selected, entries, ref input, .. } = &app.ui.mode {
+            assert_eq!(*selected, crate::palette::filter_entries(entries, input.value()).len() - 1);
+        } else {
+            panic!("expected CommandPalette");
+        }
+    }
+
+    #[test]
+    fn command_palette_typing_resets_selection() {
+        let mut app = stub_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        // Now type a char — selection resets
+        app.handle_key(key(KeyCode::Char('h')));
+        if let UiMode::CommandPalette { selected, .. } = app.ui.mode {
+            assert_eq!(selected, 0);
+        } else {
+            panic!("expected CommandPalette");
+        }
     }
 }

@@ -1,6 +1,5 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 322
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
@@ -32,4 +31,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
-SEARCH auth timeout          <ENT> APPLY  <esc> CANCEL 
+SEARCH auth timeout          <ENT> APPLY  <ESC> CANCEL 
