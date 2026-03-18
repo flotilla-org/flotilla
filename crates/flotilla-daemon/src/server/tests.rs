@@ -10,15 +10,17 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::{
+    agents::AgentEntry,
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
 };
 use flotilla_protocol::{
-    Checkout, CheckoutTarget, Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName,
-    HostPath, HostSummary, Message, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity,
-    RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage, StreamKey, VectorClock, PROTOCOL_VERSION,
+    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
+    CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, HostPath, HostSummary, Message,
+    PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, Request, Response,
+    ResponseResult, RoutedPeerMessage, StreamKey, VectorClock, PROTOCOL_VERSION,
 };
 use indexmap::IndexMap;
 use tokio::{
@@ -173,8 +175,16 @@ fn empty_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc
 }
 
 async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, request: Request) -> Message {
+    dispatch_request_with_state(daemon, &flotilla_core::agents::shared_in_memory_agent_state_store(), id, request).await
+}
+
+async fn dispatch_request_with_state(
+    daemon: &Arc<InProcessDaemon>,
+    agent_state_store: &flotilla_core::agents::SharedAgentStateStore,
+    id: u64,
+    request: Request,
+) -> Message {
     let (peer_manager, pending_remote_commands, forwarded_commands, pending_remote_cancels, next_remote_command_id) = empty_routing_state();
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
     let remote_command_router = make_remote_command_router(
         daemon,
         &peer_manager,
@@ -183,7 +193,7 @@ async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, request: 
         &pending_remote_cancels,
         &next_remote_command_id,
     );
-    let request_dispatcher = RequestDispatcher::new(daemon, &remote_command_router, &agent_state_store);
+    let request_dispatcher = RequestDispatcher::new(daemon, &remote_command_router, agent_state_store);
     request_dispatcher.dispatch(id, request).await
 }
 
@@ -338,6 +348,143 @@ async fn dispatch_host_query_methods_round_trip() {
         }
         other => panic!("expected topology response, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn dispatch_repo_query_methods_round_trip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+
+    let repo_name = repo.file_name().expect("repo file name").to_string_lossy().to_string();
+
+    let status = dispatch_request_test(&daemon, 1, Request::GetStatus).await;
+    match ok_response(status, 1) {
+        Response::GetStatus(parsed) => assert!(parsed.repos.iter().any(|entry| entry.path == repo)),
+        other => panic!("expected status response, got {:?}", other),
+    }
+
+    let detail = dispatch_request_test(&daemon, 2, Request::GetRepoDetail { slug: repo_name.clone() }).await;
+    match ok_response(detail, 2) {
+        Response::GetRepoDetail(parsed) => assert_eq!(parsed.path, repo),
+        other => panic!("expected repo detail response, got {:?}", other),
+    }
+
+    let providers = dispatch_request_test(&daemon, 3, Request::GetRepoProviders { slug: repo_name.clone() }).await;
+    match ok_response(providers, 3) {
+        Response::GetRepoProviders(parsed) => assert_eq!(parsed.path, repo),
+        other => panic!("expected repo providers response, got {:?}", other),
+    }
+
+    let work = dispatch_request_test(&daemon, 4, Request::GetRepoWork { slug: repo_name }).await;
+    match ok_response(work, 4) {
+        Response::GetRepoWork(parsed) => assert_eq!(parsed.path, repo),
+        other => panic!("expected repo work response, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_agent_hook_started_updates_existing_session_entry() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let existing_id = AttachableId::new("att-existing");
+    let incoming_id = AttachableId::new("att-new");
+    let session_id = "sess-123".to_string();
+
+    {
+        let mut store = agent_state_store.lock().expect("lock agent state store");
+        store.upsert(existing_id.clone(), AgentEntry {
+            harness: AgentHarness::ClaudeCode,
+            status: AgentStatus::Idle,
+            model: Some("old-model".into()),
+            session_title: Some("Existing".into()),
+            session_id: Some(session_id.clone()),
+            last_event_epoch_secs: 1,
+        });
+    }
+
+    let response = dispatch_request_with_state(&daemon, &agent_state_store, 5, Request::AgentHook {
+        event: AgentHookEvent {
+            attachable_id: incoming_id.clone(),
+            harness: AgentHarness::ClaudeCode,
+            event_type: AgentEventType::Active,
+            session_id: Some(session_id.clone()),
+            model: Some("new-model".into()),
+            cwd: None,
+        },
+    })
+    .await;
+
+    assert!(matches!(ok_response(response, 5), Response::AgentHook));
+    let store = agent_state_store.lock().expect("lock agent state store");
+    assert_eq!(store.lookup_by_session_id(&session_id), Some(&existing_id));
+    let entry = store.get(&existing_id).expect("existing entry should be updated");
+    assert_eq!(entry.status, AgentStatus::Active);
+    assert_eq!(entry.model.as_deref(), Some("new-model"));
+    assert!(store.get(&incoming_id).is_none(), "session remap should update the existing attachable id");
+}
+
+#[tokio::test]
+async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let existing_id = AttachableId::new("att-existing");
+    let session_id = "sess-456".to_string();
+
+    {
+        let mut store = agent_state_store.lock().expect("lock agent state store");
+        store.upsert(existing_id.clone(), AgentEntry {
+            harness: AgentHarness::ClaudeCode,
+            status: AgentStatus::Active,
+            model: Some("opus".into()),
+            session_title: Some("Existing".into()),
+            session_id: Some(session_id.clone()),
+            last_event_epoch_secs: 1,
+        });
+    }
+
+    let response = dispatch_request_with_state(&daemon, &agent_state_store, 6, Request::AgentHook {
+        event: AgentHookEvent {
+            attachable_id: AttachableId::new("att-ended"),
+            harness: AgentHarness::ClaudeCode,
+            event_type: AgentEventType::Ended,
+            session_id: Some(session_id.clone()),
+            model: None,
+            cwd: None,
+        },
+    })
+    .await;
+
+    assert!(matches!(ok_response(response, 6), Response::AgentHook));
+    let store = agent_state_store.lock().expect("lock agent state store");
+    assert!(store.lookup_by_session_id(&session_id).is_none());
+    assert!(store.get(&existing_id).is_none(), "ended event should remove existing session-mapped entry");
+}
+
+#[tokio::test]
+async fn dispatch_agent_hook_no_change_event_is_ok_without_creating_entry() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let attachable_id = AttachableId::new("att-no-change");
+
+    let response = dispatch_request_with_state(&daemon, &agent_state_store, 7, Request::AgentHook {
+        event: AgentHookEvent {
+            attachable_id: attachable_id.clone(),
+            harness: AgentHarness::ClaudeCode,
+            event_type: AgentEventType::NoChange,
+            session_id: Some("sess-no-change".into()),
+            model: None,
+            cwd: None,
+        },
+    })
+    .await;
+
+    assert!(matches!(ok_response(response, 7), Response::AgentHook));
+    let store = agent_state_store.lock().expect("lock agent state store");
+    assert!(store.get(&attachable_id).is_none(), "no-change event should not create a new entry");
 }
 
 #[tokio::test]
