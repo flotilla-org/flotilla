@@ -36,7 +36,7 @@ fn desc(name: &str) -> ProviderDescriptor {
 use async_trait::async_trait;
 use flotilla_protocol::{
     CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId,
-    PreparedTerminalCommand, RepoSelector,
+    PreparedTerminalCommand, RepoSelector, TerminalStatus,
 };
 
 fn hp(path: &str) -> HostPath {
@@ -1838,6 +1838,58 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
     assert_ok(plan_result);
     let plan_killed = plan_pool.killed.lock().await;
     assert_eq!(plan_killed.as_slice(), &[terminal_id]);
+}
+
+#[tokio::test]
+async fn remove_checkout_cascades_attachable_set_deletion() {
+    let config_base = config_base();
+    let attachable_store = crate::attachable::shared_in_memory_attachable_store();
+    let host = local_host();
+
+    // Pre-populate the store with a set and members
+    {
+        let mut store = attachable_store.lock().expect("lock store");
+        let checkout_path = HostPath::new(host.clone(), "/repo/wt-feat-x");
+        let set_id = store.ensure_terminal_set(Some(host.clone()), Some(checkout_path));
+        store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat-x/shell/0",
+            crate::attachable::TerminalPurpose { checkout: "feat-x".into(), role: "shell".into(), index: 0 },
+            "bash",
+            PathBuf::from("/repo/wt-feat-x"),
+            TerminalStatus::Running,
+        );
+    }
+
+    let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+    let mut registry = empty_registry();
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
+    let mut data = empty_data();
+    data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+
+    let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
+    let runner = runner_ok();
+    let result =
+        execute(remove_checkout_action("feat-x", vec![]), &repo, &registry, &data, &runner, &config_base, &attachable_store, None, &host)
+            .await;
+
+    assert_checkout_removed_branch(result, "feat-x");
+
+    // Verify set and members were removed from store
+    {
+        let store = attachable_store.lock().expect("lock store");
+        assert!(store.registry().sets.is_empty(), "set should be removed");
+        assert!(store.registry().attachables.is_empty(), "attachables should be removed");
+        assert!(store.registry().bindings.is_empty(), "bindings should be removed");
+    }
+
+    // Verify terminal was killed via cascade
+    let killed = mock_pool.killed.lock().await;
+    assert_eq!(killed.len(), 1, "cascade should kill the terminal");
+    assert_eq!(killed[0].checkout, "feat-x");
 }
 
 #[tokio::test]

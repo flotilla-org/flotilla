@@ -17,6 +17,11 @@ use crate::config::flotilla_config_dir;
 
 type BindingKey = (String, String, BindingObjectKind, String);
 
+#[derive(Debug)]
+pub struct RemovedSetInfo {
+    pub member_binding_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachableRegistry {
     #[serde(default)]
@@ -68,6 +73,8 @@ pub trait AttachableStoreApi: Send + Sync {
         object_kind: BindingObjectKind,
         external_ref: &str,
     ) -> Option<&str>;
+    fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo>;
+    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId>;
     fn save(&self) -> Result<(), String>;
 }
 
@@ -278,6 +285,40 @@ impl AttachableStoreState {
         }
         false
     }
+
+    fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo> {
+        let set = self.registry.sets.swap_remove(id)?;
+
+        let mut member_binding_refs = Vec::new();
+        let mut removed_object_ids: Vec<String> = vec![id.to_string()];
+
+        for member_id in &set.members {
+            self.registry.attachables.swap_remove(member_id);
+            removed_object_ids.push(member_id.to_string());
+
+            // Collect terminal_pool binding external refs for this member
+            for binding in &self.registry.bindings {
+                if binding.object_kind == BindingObjectKind::Attachable
+                    && binding.object_id == member_id.to_string()
+                    && binding.provider_category == "terminal_pool"
+                {
+                    member_binding_refs.push(binding.external_ref.clone());
+                }
+            }
+        }
+
+        // Remove all bindings referencing the set ID or any member ID
+        self.registry.bindings.retain(|binding| !removed_object_ids.contains(&binding.object_id));
+
+        // Rebuild the binding index
+        self.binding_index = Self::build_binding_index(&self.registry);
+
+        Some(RemovedSetInfo { member_binding_refs })
+    }
+
+    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
+        self.registry.sets.values().filter(|set| set.checkout.as_ref() == Some(checkout)).map(|set| set.id.clone()).collect()
+    }
 }
 
 pub struct AttachableStore {
@@ -408,6 +449,14 @@ impl AttachableStore {
         self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
     }
 
+    pub fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo> {
+        self.state.remove_set(id)
+    }
+
+    pub fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout)
+    }
+
     pub fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create attachable dir: {e}"))?;
@@ -527,6 +576,14 @@ impl AttachableStoreApi for AttachableStore {
         self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
     }
 
+    fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo> {
+        self.state.remove_set(id)
+    }
+
+    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout)
+    }
+
     fn save(&self) -> Result<(), String> {
         AttachableStore::save(self)
     }
@@ -638,6 +695,14 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         external_ref: &str,
     ) -> Option<&str> {
         self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
+    }
+
+    fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo> {
+        self.state.remove_set(id)
+    }
+
+    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout)
     }
 
     fn save(&self) -> Result<(), String> {
@@ -996,5 +1061,113 @@ mod tests {
             Some(attachable_id.as_str())
         );
         assert!(store.registry().attachables.is_empty());
+    }
+
+    fn contract_remove_set_deletes_set_and_members_and_bindings(store: &mut impl AttachableStoreApi) {
+        let host = HostName::new("desktop");
+        let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
+        let set_id = store.ensure_terminal_set(Some(host), Some(checkout));
+
+        let _shell = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/shell/0",
+            TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "bash",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+        let _agent = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "flotilla/feat/agent/0",
+            TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
+            "claude",
+            PathBuf::from("/repo/wt-feat"),
+            TerminalStatus::Running,
+        );
+
+        store.replace_binding(ProviderBinding {
+            provider_category: "workspace_manager".into(),
+            provider_name: "cmux".into(),
+            object_kind: BindingObjectKind::AttachableSet,
+            object_id: set_id.to_string(),
+            external_ref: "workspace:1".into(),
+        });
+
+        let removed = store.remove_set(&set_id);
+        assert!(removed.is_some());
+        let removed = removed.expect("should return removed set info");
+        assert_eq!(removed.member_binding_refs.len(), 2);
+        assert!(removed.member_binding_refs.contains(&"flotilla/feat/shell/0".to_string()));
+        assert!(removed.member_binding_refs.contains(&"flotilla/feat/agent/0".to_string()));
+        assert!(store.registry().sets.is_empty());
+        assert!(store.registry().attachables.is_empty());
+        assert!(store.registry().bindings.is_empty());
+    }
+
+    fn contract_remove_set_returns_none_for_unknown_id(store: &mut impl AttachableStoreApi) {
+        let unknown = AttachableSetId::new("nonexistent");
+        assert!(store.remove_set(&unknown).is_none());
+    }
+
+    #[test]
+    fn file_backed_contract_remove_set_deletes_set_and_members_and_bindings() {
+        contract_remove_set_deletes_set_and_members_and_bindings(&mut AttachableStore::with_base(
+            tempfile::tempdir().expect("tempdir").path(),
+        ));
+    }
+
+    #[test]
+    fn in_memory_contract_remove_set_deletes_set_and_members_and_bindings() {
+        contract_remove_set_deletes_set_and_members_and_bindings(&mut InMemoryAttachableStore::new());
+    }
+
+    #[test]
+    fn file_backed_contract_remove_set_returns_none_for_unknown_id() {
+        contract_remove_set_returns_none_for_unknown_id(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    }
+
+    #[test]
+    fn in_memory_contract_remove_set_returns_none_for_unknown_id() {
+        contract_remove_set_returns_none_for_unknown_id(&mut InMemoryAttachableStore::new());
+    }
+
+    fn contract_sets_for_checkout_returns_matching_sets(store: &mut impl AttachableStoreApi) {
+        let host = HostName::new("desktop");
+        let checkout_a = HostPath::new(host.clone(), "/repo/wt-feat");
+        let checkout_b = HostPath::new(host.clone(), "/repo/wt-main");
+        let set_a = store.ensure_terminal_set(Some(host.clone()), Some(checkout_a.clone()));
+        let _set_b = store.ensure_terminal_set(Some(host.clone()), Some(checkout_b.clone()));
+        let found = store.sets_for_checkout(&checkout_a);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0], set_a);
+    }
+
+    fn contract_sets_for_checkout_returns_empty_for_unknown(store: &mut impl AttachableStoreApi) {
+        let unknown = HostPath::new(HostName::new("desktop"), "/repo/nonexistent");
+        assert!(store.sets_for_checkout(&unknown).is_empty());
+    }
+
+    #[test]
+    fn file_backed_contract_sets_for_checkout_returns_matching_sets() {
+        contract_sets_for_checkout_returns_matching_sets(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    }
+
+    #[test]
+    fn in_memory_contract_sets_for_checkout_returns_matching_sets() {
+        contract_sets_for_checkout_returns_matching_sets(&mut InMemoryAttachableStore::new());
+    }
+
+    #[test]
+    fn file_backed_contract_sets_for_checkout_returns_empty_for_unknown() {
+        contract_sets_for_checkout_returns_empty_for_unknown(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    }
+
+    #[test]
+    fn in_memory_contract_sets_for_checkout_returns_empty_for_unknown() {
+        contract_sets_for_checkout_returns_empty_for_unknown(&mut InMemoryAttachableStore::new());
     }
 }

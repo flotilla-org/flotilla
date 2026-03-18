@@ -1331,13 +1331,23 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
         ],
         association_keys: vec![],
     });
+    // The remote host projects sets matching its own checkouts, so
+    // peer data includes the attachable set (simulating what the
+    // remote refresh cycle would produce).
+    peer_data.attachable_sets.insert(set_id.clone(), AttachableSet {
+        id: set_id.clone(),
+        host_affinity: Some(remote_host.clone()),
+        checkout: Some(remote_checkout.clone()),
+        template_identity: None,
+        members: vec![],
+    });
     daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
 
+    // Local providers no longer project sets whose checkout lives on a
+    // remote host — the set arrives via peer data merge instead.
     let (local_providers, _) = daemon.get_local_providers(&repo).await.expect("local providers");
-    let local_set = local_providers.attachable_sets.get(&set_id).expect("projected attachable set");
-    assert_eq!(local_set.host_affinity.as_ref(), Some(&remote_host));
-    assert_eq!(local_set.checkout.as_ref(), Some(&remote_checkout));
+    assert!(local_providers.attachable_sets.get(&set_id).is_none(), "remote-checkout set should not appear in local projection");
     assert_eq!(
         local_providers.workspaces.get(&workspace_ref).and_then(|workspace| workspace.attachable_set_id.as_ref()),
         Some(&set_id),
@@ -1436,6 +1446,16 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
         last_commit: None,
         correlation_keys: vec![CorrelationKey::Branch("issue-356-watch".into()), CorrelationKey::CheckoutPath(remote_checkout.clone())],
         association_keys: vec![],
+    });
+    // The remote host projects sets matching its own checkouts, so
+    // peer data includes the attachable set (simulating what the
+    // remote refresh cycle would produce).
+    peer_data.attachable_sets.insert(set_id.clone(), AttachableSet {
+        id: set_id.clone(),
+        host_affinity: Some(remote_host.clone()),
+        checkout: Some(remote_checkout.clone()),
+        template_identity: None,
+        members: vec![],
     });
     daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
@@ -1936,4 +1956,107 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
     let fetched: Vec<Vec<String>> = issue_tracker.fetched_by_id.lock().await.clone();
     assert!(!fetched.is_empty(), "fetch_issues_by_id should have been called");
     assert!(fetched.iter().any(|ids| ids.contains(&"42".to_string())), "fetch_issues_by_id should have been called with id '42'");
+}
+
+#[tokio::test]
+async fn attachable_set_cascade_deletes_on_checkout_removal() {
+    // --- Arrange ---
+    // Create a checkout manager with a branch that will be removed.
+    let checkout_manager = Arc::new(FakeCheckoutManager::new());
+    let checkout_path = PathBuf::from("/tmp/repo/wt-feat-lifecycle");
+    let host_path = flotilla_protocol::HostPath::new(HostName::local(), checkout_path.clone());
+    checkout_manager
+        .add_checkouts(vec![(checkout_path, Checkout {
+            branch: "feat-lifecycle".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::Branch("feat-lifecycle".into()), CorrelationKey::CheckoutPath(host_path.clone())],
+            association_keys: vec![],
+        })])
+        .await;
+
+    // Create an attachable store with a set anchored to the checkout.
+    let attachable_store = shared_in_memory_attachable_store();
+    let set_id = {
+        let mut store = attachable_store.lock().expect("lock attachable store");
+        let set_id = store.ensure_terminal_set(Some(HostName::local()), Some(host_path.clone()));
+        store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "fake-terminals",
+            "flotilla/feat-lifecycle/shell/0",
+            TerminalPurpose { checkout: "feat-lifecycle".into(), role: "shell".into(), index: 0 },
+            "bash",
+            PathBuf::from("/tmp/repo/wt-feat-lifecycle"),
+            flotilla_protocol::TerminalStatus::Running,
+        );
+        set_id
+    };
+
+    let terminal_pool = Arc::new(FakeTerminalPool::new());
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new()
+            .with_checkout_manager(checkout_manager.clone() as Arc<dyn flotilla_core::providers::vcs::CheckoutManager>)
+            .with_terminal_pool(terminal_pool)
+            .with_attachable_store(Arc::clone(&attachable_store)),
+    );
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config = Arc::new(flotilla_core::config::ConfigStore::with_base(temp.path().join("config")));
+    let daemon = flotilla_core::in_process::InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    let mut rx = daemon.subscribe();
+
+    // --- Act: initial refresh ---
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+
+    // Verify the attachable set appears in the repo snapshot.
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
+    assert!(snapshot.providers.attachable_sets.contains_key(&set_id), "attachable set should appear in repo snapshot after refresh");
+
+    // --- Act: remove checkout ---
+    let command = Command {
+        host: None,
+        context_repo: None,
+        action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-lifecycle".into()), terminal_keys: vec![] },
+    };
+    let command_id = daemon.execute(command).await.expect("execute RemoveCheckout should succeed");
+
+    // Wait for the command to finish.
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for RemoveCheckout to finish");
+
+    assert!(!matches!(result, CommandResult::Error { .. }), "RemoveCheckout should succeed, got: {result:?}");
+
+    // --- Assert: set removed from store ---
+    {
+        let store = attachable_store.lock().expect("lock attachable store");
+        assert!(store.registry().sets.is_empty(), "attachable set should be cascade-deleted from store");
+        assert!(store.registry().attachables.is_empty(), "attachable members should be cascade-deleted from store");
+        assert!(store.registry().bindings.is_empty(), "attachable bindings should be cascade-deleted from store");
+    }
+
+    // --- Assert: set no longer in snapshot after refresh ---
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("post-removal refresh");
+    // Drain events until we get a snapshot/delta.
+    let _ = recv_event(&mut rx).await;
+
+    let snapshot_after = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state after removal");
+    assert!(
+        !snapshot_after.providers.attachable_sets.contains_key(&set_id),
+        "attachable set should not appear in snapshot after checkout removal"
+    );
 }

@@ -110,6 +110,7 @@ struct RemoveCheckoutFlow<'a> {
     providers_data: &'a ProviderData,
     runner: &'a dyn CommandRunner,
     local_host: &'a HostName,
+    attachable_store: &'a SharedAttachableStore,
 }
 
 impl<'a> RemoveCheckoutFlow<'a> {
@@ -117,9 +118,19 @@ impl<'a> RemoveCheckoutFlow<'a> {
         resolve_checkout_branch(self.checkout, self.providers_data, self.local_host)
     }
 
+    fn deleted_checkout_paths(&self, branch: &str) -> Vec<HostPath> {
+        self.providers_data
+            .checkouts
+            .iter()
+            .filter(|(hp, co)| co.branch == branch && hp.host == *self.local_host)
+            .map(|(hp, _)| hp.clone())
+            .collect()
+    }
+
     async fn remove_branch(&self, branch: &str) -> Result<(), String> {
         let checkout_service = CheckoutService::new(self.registry, self.runner);
-        checkout_service.remove_checkout(self.repo_root, branch, self.terminal_keys).await
+        let deleted_paths = self.deleted_checkout_paths(branch);
+        checkout_service.remove_checkout(self.repo_root, branch, self.terminal_keys, &deleted_paths, self.attachable_store).await
     }
 
     async fn execute(&self) -> CommandResult {
@@ -195,9 +206,13 @@ pub async fn build_plan(
                 providers_data: providers_data.as_ref(),
                 runner: runner.as_ref(),
                 local_host: &local_host,
+                attachable_store: &attachable_store,
             };
             match remove_flow.resolve_branch() {
-                Ok(branch) => build_remove_checkout_plan(branch, terminal_keys, repo.root, registry, runner),
+                Ok(branch) => {
+                    let deleted_paths = remove_flow.deleted_checkout_paths(&branch);
+                    build_remove_checkout_plan(branch, terminal_keys, repo.root, registry, runner, deleted_paths, attachable_store.clone())
+                }
                 Err(message) => ExecutionPlan::Immediate(CommandResult::Error { message }),
             }
         }
@@ -492,6 +507,8 @@ fn build_remove_checkout_plan(
     repo_root: PathBuf,
     registry: Arc<ProviderRegistry>,
     runner: Arc<dyn CommandRunner>,
+    deleted_checkout_paths: Vec<HostPath>,
+    attachable_store: SharedAttachableStore,
 ) -> ExecutionPlan {
     ExecutionPlan::Steps(StepPlan::new(vec![Step {
         description: format!("Remove checkout for branch {branch}"),
@@ -499,7 +516,7 @@ fn build_remove_checkout_plan(
         action: StepAction::Closure(Box::new(move |_prior| {
             Box::pin(async move {
                 let checkout_service = CheckoutService::new(registry.as_ref(), runner.as_ref());
-                checkout_service.remove_checkout(&repo_root, &branch, &terminal_keys).await?;
+                checkout_service.remove_checkout(&repo_root, &branch, &terminal_keys, &deleted_checkout_paths, &attachable_store).await?;
                 Ok(StepOutcome::Completed)
             })
         })),
@@ -714,6 +731,7 @@ pub async fn execute(
                 providers_data,
                 runner,
                 local_host,
+                attachable_store,
             }
             .execute()
             .await

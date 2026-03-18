@@ -980,6 +980,23 @@ fn render_preview_content(model: &TuiModel, ui: &UiState, theme: &Theme, frame: 
             }
         }
 
+        if let Some(ref set_id) = item.attachable_set_id {
+            lines.push(format!("Set: {}", set_id));
+        }
+
+        if !item.terminal_keys.is_empty() {
+            for key in &item.terminal_keys {
+                let key_str = key.to_string();
+                if let Some(terminal) = providers.managed_terminals.get(&key_str) {
+                    let status = format!("{:?}", terminal.status);
+                    let cmd = if terminal.command.is_empty() { String::new() } else { format!(" ({})", terminal.command) };
+                    lines.push(format!("Terminal: {} [{}]{}", key.role, status, cmd));
+                } else {
+                    lines.push(format!("Terminal: {} [?]", key.role));
+                }
+            }
+        }
+
         lines.join("\n")
     } else {
         String::new()
