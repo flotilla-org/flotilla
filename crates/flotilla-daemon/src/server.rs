@@ -1945,6 +1945,10 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
                 } else {
                     Ok(())
                 }
+                // NOTE: agent state changes are not pushed to the TUI immediately.
+                // They become visible on the next refresh cycle (~10s). A proper fix
+                // requires the log-based architecture (#256) where push events can
+                // trigger targeted view re-materialization without a full provider refresh.
             })();
 
             match result {

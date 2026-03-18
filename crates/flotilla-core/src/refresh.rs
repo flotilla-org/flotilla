@@ -316,13 +316,15 @@ fn project_agent_data(pd: &mut ProviderData, agent_state_store: &crate::agents::
         return;
     };
     for (attachable_id, entry) in store.list_agents() {
-        // Correlate via AttachableSet if the attachable is known in provider data.
-        // This transitively links the agent to the checkout/workspace that owns the terminal.
-        let correlation_keys = pd
-            .managed_terminals
-            .values()
-            .find(|t| t.attachable_id.as_ref() == Some(&attachable_id))
-            .and_then(|t| t.attachable_set_id.clone())
+        // Only include agents whose terminal is in this repo's managed_terminals.
+        // Without this check, every agent would appear in every tracked repo.
+        let matching_terminal = pd.managed_terminals.values().find(|t| t.attachable_id.as_ref() == Some(&attachable_id));
+        let Some(terminal) = matching_terminal else {
+            continue;
+        };
+        let correlation_keys = terminal
+            .attachable_set_id
+            .clone()
             .map(|set_id| vec![flotilla_protocol::CorrelationKey::AttachableSet(set_id)])
             .unwrap_or_default();
 

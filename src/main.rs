@@ -718,8 +718,22 @@ impl SettingsScope {
             SettingsScope::User => {
                 std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("~")).join(".claude/settings.json")
             }
-            SettingsScope::Project => PathBuf::from(".claude/settings.json"),
-            SettingsScope::Local => PathBuf::from(".claude/settings.local.json"),
+            SettingsScope::Project => find_repo_root().join(".claude/settings.json"),
+            SettingsScope::Local => find_repo_root().join(".claude/settings.local.json"),
+        }
+    }
+}
+
+/// Walk up from cwd to find the git repo root (directory containing .git).
+/// Falls back to cwd if no .git found.
+fn find_repo_root() -> PathBuf {
+    let mut dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    loop {
+        if dir.join(".git").exists() {
+            return dir;
+        }
+        if !dir.pop() {
+            return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         }
     }
 }
