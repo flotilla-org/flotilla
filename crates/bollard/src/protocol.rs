@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{Error, ErrorKind, Read, Write},
     path::PathBuf,
 };
 
@@ -38,23 +38,23 @@ pub enum Frame {
 }
 
 impl Frame {
-    pub fn read(reader: &mut impl Read) -> Result<Self, String> {
+    pub fn read(reader: &mut impl Read) -> std::io::Result<Self> {
         let mut header = [0u8; 5];
-        reader.read_exact(&mut header).map_err(|err| err.to_string())?;
+        reader.read_exact(&mut header)?;
         let tag = header[0];
         let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        reader.read_exact(&mut payload).map_err(|err| err.to_string())?;
+        reader.read_exact(&mut payload)?;
         Self::decode(tag, payload)
     }
 
-    pub fn write(&self, writer: &mut impl Write) -> Result<(), String> {
+    pub fn write(&self, writer: &mut impl Write) -> std::io::Result<()> {
         let (tag, payload) = self.encode();
         let mut header = [0u8; 5];
         header[0] = tag;
         header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        writer.write_all(&header).map_err(|err| err.to_string())?;
-        writer.write_all(&payload).map_err(|err| err.to_string())
+        writer.write_all(&header)?;
+        writer.write_all(&payload)
     }
 
     fn encode(&self) -> (u8, Vec<u8>) {
@@ -73,7 +73,7 @@ impl Frame {
         }
     }
 
-    fn decode(tag: u8, payload: Vec<u8>) -> Result<Self, String> {
+    fn decode(tag: u8, payload: Vec<u8>) -> std::io::Result<Self> {
         match tag {
             TAG_ATTACH_INIT => decode_size_frame(payload).map(|(cols, rows)| Frame::AttachInit { cols, rows }),
             TAG_RESIZE => decode_size_frame(payload).map(|(cols, rows)| Frame::Resize { cols, rows }),
@@ -81,14 +81,14 @@ impl Frame {
             TAG_OUTPUT => Ok(Frame::Output(payload)),
             TAG_ACK => Ok(Frame::Ack),
             TAG_BUSY => Ok(Frame::Busy),
-            _ => Err(format!("unknown frame tag {tag}")),
+            _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
     }
 }
 
-fn decode_size_frame(payload: Vec<u8>) -> Result<(u16, u16), String> {
+fn decode_size_frame(payload: Vec<u8>) -> std::io::Result<(u16, u16)> {
     if payload.len() != 4 {
-        return Err("invalid size frame".into());
+        return Err(Error::new(ErrorKind::InvalidData, "invalid size frame"));
     }
     let cols = u16::from_le_bytes([payload[0], payload[1]]);
     let rows = u16::from_le_bytes([payload[2], payload[3]]);

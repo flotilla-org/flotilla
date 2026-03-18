@@ -1,10 +1,7 @@
 use crate::{
     protocol::{SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, SessionRecord},
-    session::{
-        attach_foreground, daemon_pid_path, ensure_session_started, foreground_path, run_session_daemon, session_socket_path,
-        ForegroundAttach,
-    },
+    session::{attach_foreground, ensure_session_started, foreground_path, run_session_daemon, ForegroundAttach},
 };
 
 #[derive(Debug, Clone)]
@@ -37,11 +34,10 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         let pid_path = crate::session::daemon_pid_path(self.layout.root(), id);
-        if let Ok(pid) = std::fs::read_to_string(&pid_path).map(|value| value.trim().parse::<i32>().ok()) {
-            if let Some(pid) = pid {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
+        if let Ok(Some(pid)) = std::fs::read_to_string(&pid_path).map(|value| value.trim().parse::<i32>().ok()) {
+            // SAFETY: pid was read from our session pid file and kill only sends a signal.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
             }
         }
         self.layout.remove_session(id)
@@ -66,7 +62,10 @@ impl SessionService {
             ensure_session_started(&self.layout, name, cwd, cmd)?
         };
         let attach = attach_foreground(&self.layout, &session.id)?;
-        Ok((SessionInfo { id: session.id, name: session.name, cwd: session.cwd, cmd: session.cmd, status: SessionStatus::Attached }, attach))
+        Ok((
+            SessionInfo { id: session.id, name: session.name, cwd: session.cwd, cmd: session.cmd, status: SessionStatus::Attached },
+            attach,
+        ))
     }
 
     pub fn serve(&self, id: &str) -> Result<(), String> {
@@ -76,12 +75,6 @@ impl SessionService {
 
 fn session_info_from_record(root: &std::path::Path, record: SessionRecord) -> SessionInfo {
     let id = record.metadata.id.clone();
-    let status = if foreground_path(root, &id).exists() {
-        SessionStatus::Attached
-    } else if session_socket_path(root, &id).exists() || daemon_pid_path(root, &id).exists() {
-        SessionStatus::Detached
-    } else {
-        SessionStatus::Detached
-    };
+    let status = if foreground_path(root, &id).exists() { SessionStatus::Attached } else { SessionStatus::Detached };
     SessionInfo { id: record.metadata.id, name: record.metadata.name, cwd: record.metadata.cwd, cmd: record.metadata.cmd, status }
 }

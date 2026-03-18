@@ -95,10 +95,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
 }
 
 fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
-    let mut fields = vec![
-        session.id.clone(),
-        format_session_status(&session.status).to_string(),
-    ];
+    let mut fields = vec![session.id.clone(), format_session_status(&session.status).to_string()];
     if let Some(cwd) = &session.cwd {
         fields.push(cwd.display().to_string());
     } else if let Some(cmd) = &session.cmd {

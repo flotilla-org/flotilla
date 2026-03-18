@@ -178,8 +178,7 @@ impl TerminalPool for SessionTerminalPool {
         Ok(terminals)
     }
 
-    async fn ensure_running(&self, _id: &ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<(), String> {
-        let id = _id;
+    async fn ensure_running(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<(), String> {
         if let Ok(store) = self.attachable_store.lock() {
             if Self::find_persisted_session_id(store.as_ref(), id).is_some() {
                 return Ok(());
@@ -189,14 +188,14 @@ impl TerminalPool for SessionTerminalPool {
         let output = run!(
             self.runner,
             &self.binary,
-            &["create", "--json", &requested_name, "--cwd", &_cwd.display().to_string(), "--cmd", _command],
+            &["create", "--json", &requested_name, "--cwd", &cwd.display().to_string(), "--cmd", command],
             Path::new("/")
         )?;
         let session: SessionInfo = serde_json::from_str(&output).map_err(|err| format!("parse create session output: {err}"))?;
         let Ok(mut store) = self.attachable_store.lock() else {
             return Ok(());
         };
-        if Self::persist_attachable(store.as_mut(), id, &session.id, _command, _cwd, TerminalStatus::Disconnected) {
+        if Self::persist_attachable(store.as_mut(), id, &session.id, command, cwd, TerminalStatus::Disconnected) {
             let _ = store.save();
         }
         Ok(())
@@ -330,11 +329,7 @@ mod tests {
     #[tokio::test]
     async fn kill_terminal_calls_cli() {
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
-        let pool = SessionTerminalPool::new(
-            Arc::clone(&runner) as Arc<dyn CommandRunner>,
-            "bollard",
-            shared_in_memory_attachable_store(),
-        );
+        let pool = SessionTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "bollard", shared_in_memory_attachable_store());
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
         pool.kill_terminal(&id).await.expect("kill terminal");

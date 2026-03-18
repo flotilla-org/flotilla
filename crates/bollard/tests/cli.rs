@@ -1,5 +1,5 @@
-use clap::{CommandFactory, Parser};
 use bollard::cli::{Cli, Command};
+use clap::{CommandFactory, Parser};
 
 #[test]
 fn help_lists_expected_subcommands() {

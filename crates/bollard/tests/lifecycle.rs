@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use clap::Parser;
 use bollard::{
     cli::{self, Cli},
     protocol::SessionInfo,
@@ -8,6 +7,7 @@ use bollard::{
     server::SessionService,
     session::daemon_pid_path,
 };
+use clap::Parser;
 
 fn service_for(path: &std::path::Path) -> SessionService {
     SessionService::new(RuntimeLayout::new(path.to_path_buf()))
