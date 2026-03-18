@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use super::*;
 use crate::{
-    attachable::{AttachableStore, SharedAttachableStore},
+    attachable::{AttachableStore, BindingObjectKind, SharedAttachableStore},
     providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,

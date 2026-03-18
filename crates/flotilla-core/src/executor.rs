@@ -4,6 +4,7 @@
 //! No UI state mutation — all results are carried in the return value.
 
 mod checkout;
+mod workspace;
 
 use std::{
     path::{Path, PathBuf},
@@ -13,15 +14,18 @@ use std::{
 #[cfg(test)]
 use flotilla_protocol::CheckoutSelector;
 use flotilla_protocol::{
-    AttachableSetId, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
+    CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
 };
 use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 use self::checkout::validate_checkout_target;
-use self::checkout::{resolve_checkout_branch, write_branch_issue_links, CheckoutIntent, CheckoutService};
+use self::{
+    checkout::{resolve_checkout_branch, write_branch_issue_links, CheckoutIntent, CheckoutService},
+    workspace::WorkspaceOrchestrator,
+};
 use crate::{
-    attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
+    attachable::SharedAttachableStore,
     data,
     provider_data::ProviderData,
     providers::{
@@ -29,7 +33,6 @@ use crate::{
         run,
         terminal::TerminalPool,
         types::{CloudAgentSession, CorrelationKey, WorkspaceConfig},
-        workspace::WorkspaceManager,
         CommandRunner,
     },
     step::{Step, StepAction, StepHost, StepOutcome, StepPlan, StepResolver},
@@ -316,6 +319,7 @@ async fn build_teleport_session_plan(
         let config_base = config_base.clone();
         let attachable_store = attachable_store.clone();
         let daemon_socket_path = daemon_socket_path.clone();
+        let local_host = local_host.clone();
         steps.push(Step {
             description: "Create workspace with teleport command".to_string(),
             host: StepHost::Local,
@@ -325,23 +329,15 @@ async fn build_teleport_session_plan(
                         path_slot.lock().await.clone().ok_or_else(|| "Could not determine checkout path for teleport".to_string())?;
                     let teleport_cmd = teleport_slot.lock().await.clone().ok_or_else(|| "Attach command not resolved".to_string())?;
                     let name = branch.as_deref().unwrap_or("session");
-                    if let Some(ws_mgr) = registry.workspace_managers.preferred() {
-                        let mut config = workspace_config(&repo_root, name, &path, &teleport_cmd, &config_base);
-                        if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
-                            resolve_terminal_pool(
-                                &mut config,
-                                tp.as_ref(),
-                                &attachable_store,
-                                &tp_desc.implementation,
-                                daemon_socket_path.as_deref(),
-                            )
-                            .await;
-                        }
-                        // Teleport always creates a new workspace — the attach command is
-                        // session-specific, so reusing an existing workspace would attach
-                        // to the wrong session.
-                        ws_mgr.create_workspace(&config).await?;
-                    }
+                    let workspace_orchestrator = WorkspaceOrchestrator::new(
+                        &repo_root,
+                        registry.as_ref(),
+                        &config_base,
+                        &attachable_store,
+                        daemon_socket_path.as_deref(),
+                        &local_host,
+                    );
+                    workspace_orchestrator.create_workspace_for_teleport(&path, name, &teleport_cmd).await?;
                     Ok(StepOutcome::Completed)
                 })
             })),
@@ -376,149 +372,6 @@ fn build_remove_checkout_plan(
     }]))
 }
 
-/// Check if a workspace already exists for `checkout_path` and select it.
-/// Returns `true` if an existing workspace was found and selected, `false` otherwise.
-/// Logs warnings on errors and returns `false` so callers always fall through to create.
-async fn select_existing_workspace(ws_mgr: &dyn WorkspaceManager, checkout_path: &Path) -> bool {
-    let existing = match ws_mgr.list_workspaces().await {
-        Ok(ws) => ws,
-        Err(e) => {
-            warn!(err = %e, "failed to check existing workspaces, will create new");
-            return false;
-        }
-    };
-    for (ws_ref, ws) in &existing {
-        if ws.directories.iter().any(|d| d == checkout_path) {
-            info!(%ws_ref, path = %checkout_path.display(), "workspace already exists, selecting");
-            if let Err(e) = ws_mgr.select_workspace(ws_ref).await {
-                warn!(err = %e, %ws_ref, "failed to select existing workspace, will create new");
-                return false;
-            }
-            return true;
-        }
-    }
-    false
-}
-
-fn persist_workspace_binding(
-    attachable_store: &SharedAttachableStore,
-    provider_name: &str,
-    workspace_ref: &str,
-    target_host: &HostName,
-    checkout_path: &Path,
-) {
-    let Ok(mut store) = attachable_store.lock() else {
-        warn!("attachable store lock poisoned while persisting workspace binding");
-        return;
-    };
-    let (set_id, changed_set) = store
-        .ensure_terminal_set_with_change(Some(target_host.clone()), Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())));
-    let changed_binding = store.replace_binding(ProviderBinding {
-        provider_category: "workspace_manager".into(),
-        provider_name: provider_name.to_string(),
-        object_kind: BindingObjectKind::AttachableSet,
-        object_id: set_id.to_string(),
-        external_ref: workspace_ref.to_string(),
-    });
-    if changed_set || changed_binding {
-        if let Err(err) = store.save() {
-            warn!(err = %err, "failed to persist attachable registry after workspace binding update");
-        }
-    }
-}
-
-fn persist_workspace_binding_for_set(
-    attachable_store: &SharedAttachableStore,
-    provider_name: &str,
-    workspace_ref: &str,
-    set_id: &AttachableSetId,
-    target_host: &HostName,
-    checkout_path: &Path,
-) {
-    let Ok(mut store) = attachable_store.lock() else {
-        warn!("attachable store lock poisoned while persisting workspace binding");
-        return;
-    };
-    if !store.registry().sets.contains_key(set_id) {
-        store.insert_set(flotilla_protocol::AttachableSet {
-            id: set_id.clone(),
-            host_affinity: Some(target_host.clone()),
-            checkout: Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
-            template_identity: None,
-            members: Vec::new(),
-        });
-    }
-    let changed_binding = store.replace_binding(ProviderBinding {
-        provider_category: "workspace_manager".into(),
-        provider_name: provider_name.to_string(),
-        object_kind: BindingObjectKind::AttachableSet,
-        object_id: set_id.to_string(),
-        external_ref: workspace_ref.to_string(),
-    });
-    if changed_binding {
-        if let Err(err) = store.save() {
-            warn!(err = %err, "failed to persist attachable registry after workspace binding update");
-        }
-    }
-}
-
-fn ensure_attachable_set_for_checkout(
-    attachable_store: &SharedAttachableStore,
-    target_host: &HostName,
-    checkout_path: &Path,
-) -> Option<AttachableSetId> {
-    let Ok(mut store) = attachable_store.lock() else {
-        warn!("attachable store lock poisoned while ensuring attachable set for checkout");
-        return None;
-    };
-
-    let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
-    let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout));
-    if changed {
-        if let Err(err) = store.save() {
-            warn!(err = %err, "failed to persist attachable registry after ensuring attachable set");
-        }
-    }
-    Some(set_id)
-}
-
-fn preferred_workspace_manager(registry: &ProviderRegistry) -> Option<(&str, &Arc<dyn WorkspaceManager>)> {
-    registry.workspace_managers.preferred_with_desc().map(|(desc, provider)| (desc.implementation.as_str(), provider))
-}
-
-/// Core workspace creation logic, shared by the step resolver and the
-/// standalone `CreateWorkspaceForCheckout` command.
-#[allow(clippy::too_many_arguments)]
-async fn create_workspace_for_checkout_impl(
-    checkout_path: &Path,
-    label: &str,
-    repo: &RepoExecutionContext,
-    registry: &ProviderRegistry,
-    config_base: &Path,
-    attachable_store: &SharedAttachableStore,
-    daemon_socket_path: Option<&Path>,
-    local_host: &HostName,
-) -> Result<StepOutcome, String> {
-    if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
-        if select_existing_workspace(ws_mgr.as_ref(), checkout_path).await {
-            return Ok(StepOutcome::Completed);
-        }
-        let mut config = workspace_config(&repo.root, label, checkout_path, "claude", config_base);
-        if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
-            resolve_terminal_pool(&mut config, tp.as_ref(), attachable_store, &tp_desc.implementation, daemon_socket_path).await;
-        }
-        match ws_mgr.create_workspace(&config).await {
-            Ok((ws_ref, _workspace)) => {
-                persist_workspace_binding(attachable_store, provider_name, &ws_ref, local_host, checkout_path);
-                Ok(StepOutcome::Completed)
-            }
-            Err(e) => Err(e),
-        }
-    } else {
-        Ok(StepOutcome::Skipped)
-    }
-}
-
 /// Resolves symbolic `StepAction` variants using executor infrastructure.
 pub(crate) struct ExecutorStepResolver {
     pub repo: RepoExecutionContext,
@@ -541,17 +394,15 @@ impl StepResolver for ExecutorStepResolver {
                 });
                 match path {
                     Some(p) => {
-                        create_workspace_for_checkout_impl(
-                            &p,
-                            &label,
-                            &self.repo,
-                            &self.registry,
+                        let workspace_orchestrator = WorkspaceOrchestrator::new(
+                            &self.repo.root,
+                            self.registry.as_ref(),
                             &self.config_base,
                             &self.attachable_store,
                             self.daemon_socket_path.as_deref(),
                             &self.local_host,
-                        )
-                        .await
+                        );
+                        workspace_orchestrator.create_workspace_for_checkout(&p, &label).await
                     }
                     None => Ok(StepOutcome::Skipped),
                 }
@@ -635,61 +486,32 @@ pub async fn execute(
                 return CommandResult::Error { message: format!("checkout not found: {}", checkout_path.display()) };
             }
             info!(%label, "entering workspace");
-            match create_workspace_for_checkout_impl(
-                &checkout_path,
-                &label,
-                repo,
-                registry,
-                config_base,
-                attachable_store,
-                daemon_socket_path,
-                local_host,
-            )
-            .await
-            {
+            let workspace_orchestrator =
+                WorkspaceOrchestrator::new(&repo.root, registry, config_base, attachable_store, daemon_socket_path, local_host);
+            match workspace_orchestrator.create_workspace_for_checkout(&checkout_path, &label).await {
                 Ok(_) => CommandResult::Ok,
                 Err(e) => CommandResult::Error { message: e },
             }
         }
 
         CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
-            if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
-                let wrapped = match wrap_remote_attach_commands(&target_host, &checkout_path, &commands, config_base) {
-                    Ok(commands) => commands,
-                    Err(message) => return CommandResult::Error { message },
-                };
-                // The workspace itself is local to the presentation host, so its
-                // working directory only needs to be a valid local directory.
-                // The wrapped attach commands handle entering the remote checkout path.
-                let working_dir = local_workspace_directory(&repo.root, config_base);
-                let remote_name = format!("{}@{}", branch, target_host);
-                let mut config = workspace_config(&repo.root, &remote_name, &working_dir, "claude", config_base);
-                config.resolved_commands = Some(wrapped.into_iter().map(|cmd| (cmd.role, cmd.command)).collect());
-                match ws_mgr.create_workspace(&config).await {
-                    Ok((ws_ref, _workspace)) => {
-                        if let Some(set_id) = attachable_set_id.as_ref() {
-                            persist_workspace_binding_for_set(
-                                attachable_store,
-                                provider_name,
-                                &ws_ref,
-                                set_id,
-                                &target_host,
-                                &checkout_path,
-                            );
-                        }
-                    }
-                    Err(e) => return CommandResult::Error { message: e },
-                }
+            let workspace_orchestrator =
+                WorkspaceOrchestrator::new(&repo.root, registry, config_base, attachable_store, daemon_socket_path, local_host);
+            if let Err(message) = workspace_orchestrator
+                .create_workspace_from_prepared_terminal(&target_host, &branch, &checkout_path, attachable_set_id.as_ref(), &commands)
+                .await
+            {
+                return CommandResult::Error { message };
             }
             CommandResult::Ok
         }
 
         CommandAction::SelectWorkspace { ws_ref } => {
             info!(%ws_ref, "switching to workspace");
-            if let Some(ws_mgr) = registry.workspace_managers.preferred() {
-                if let Err(e) = ws_mgr.select_workspace(&ws_ref).await {
-                    return CommandResult::Error { message: e };
-                }
+            let workspace_orchestrator =
+                WorkspaceOrchestrator::new(&repo.root, registry, config_base, attachable_store, daemon_socket_path, local_host);
+            if let Err(message) = workspace_orchestrator.select_workspace(&ws_ref).await {
+                return CommandResult::Error { message };
             }
             CommandResult::Ok
         }
@@ -723,7 +545,9 @@ pub async fn execute(
         CommandAction::PrepareTerminalForCheckout { checkout_path, commands: requested_commands } => {
             let host_key = HostPath::new(local_host.clone(), checkout_path.clone());
             if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
-                let attachable_set_id = ensure_attachable_set_for_checkout(attachable_store, local_host, &checkout_path);
+                let workspace_orchestrator =
+                    WorkspaceOrchestrator::new(&repo.root, registry, config_base, attachable_store, daemon_socket_path, local_host);
+                let attachable_set_id = workspace_orchestrator.ensure_attachable_set_for_checkout(local_host, &checkout_path);
                 match prepare_terminal_commands(
                     &repo.root,
                     &co.branch,
@@ -834,6 +658,8 @@ pub async fn execute(
                 Ok(cmd) => cmd,
                 Err(message) => return CommandResult::Error { message },
             };
+            let workspace_orchestrator =
+                WorkspaceOrchestrator::new(&repo.root, registry, config_base, attachable_store, daemon_socket_path, local_host);
             let wt_path = if let Some(ref key) = checkout_key {
                 let host_key = flotilla_protocol::HostPath::new(local_host.clone(), key.clone());
                 providers_data.checkouts.get(&host_key).map(|_| key.clone())
@@ -849,21 +675,8 @@ pub async fn execute(
             };
             if let Some(path) = wt_path {
                 let name = branch.as_deref().unwrap_or("session");
-                if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
-                    let mut config = workspace_config(&repo.root, name, &path, &teleport_cmd, config_base);
-                    if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
-                        resolve_terminal_pool(&mut config, tp.as_ref(), attachable_store, &tp_desc.implementation, daemon_socket_path)
-                            .await;
-                    }
-                    // Teleport always creates a new workspace — the attach command is
-                    // session-specific, so reusing an existing workspace would attach
-                    // to the wrong session.
-                    match ws_mgr.create_workspace(&config).await {
-                        Ok((ws_ref, _workspace)) => {
-                            persist_workspace_binding(attachable_store, provider_name, &ws_ref, local_host, &path);
-                        }
-                        Err(e) => return CommandResult::Error { message: e },
-                    }
+                if let Err(message) = workspace_orchestrator.create_workspace_for_teleport(&path, name, &teleport_cmd).await {
+                    return CommandResult::Error { message };
                 }
                 CommandResult::Ok
             } else {
