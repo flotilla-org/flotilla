@@ -119,7 +119,7 @@ async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
 }
 
 async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await;
     (tmp, daemon)
@@ -263,7 +263,7 @@ async fn dispatch_request_handles_error_response_for_untracked_repo() {
 async fn dispatch_add_list_remove_repo_round_trip() {
     let (tmp, daemon) = empty_daemon().await;
     let repo_path = tmp.path().join("repo-a");
-    std::fs::create_dir_all(&repo_path).unwrap();
+    std::fs::create_dir_all(&repo_path).expect("create repo directory");
 
     let add = dispatch_request_test(&daemon, 10, Request::AddRepo { path: repo_path.clone() }).await;
     assert!(matches!(ok_response(add, 10), Response::AddRepo));
@@ -865,10 +865,11 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
 
 #[tokio::test]
 async fn take_peer_data_rx_returns_some_once() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
-    let mut server =
-        DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await.unwrap();
+    let mut server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
+        .await
+        .expect("create daemon server");
 
     assert!(server.take_peer_data_rx().is_some(), "first call should return Some");
     assert!(server.take_peer_data_rx().is_none(), "second call should return None");
@@ -876,21 +877,22 @@ async fn take_peer_data_rx_returns_some_once() {
 
 #[tokio::test]
 async fn daemon_server_replays_configured_hosts_as_disconnected() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
-    std::fs::create_dir_all(&base).unwrap();
-    std::fs::write(base.join("daemon.toml"), "host_name = \"local\"\n").unwrap();
+    std::fs::create_dir_all(&base).expect("create config directory");
+    std::fs::write(base.join("daemon.toml"), "host_name = \"local\"\n").expect("write daemon config");
     std::fs::write(
             base.join("hosts.toml"),
             "[hosts.udder]\nhostname = \"udder\"\ndaemon_socket = \"/tmp/udder.sock\"\n\n[hosts.feta]\nhostname = \"feta\"\ndaemon_socket = \"/tmp/feta.sock\"\n",
         )
-        .unwrap();
+        .expect("write hosts config");
 
     let config = Arc::new(ConfigStore::with_base(&base));
-    let server =
-        DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await.unwrap();
+    let server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
+        .await
+        .expect("create daemon server");
 
-    let events = server.daemon.replay_since(&HashMap::new()).await.unwrap();
+    let events = server.daemon.replay_since(&HashMap::new()).await.expect("replay events");
     let mut statuses: Vec<(HostName, PeerConnectionState)> = events
         .into_iter()
         .filter_map(|event| match event {
@@ -1434,23 +1436,24 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
 
 #[tokio::test]
 async fn peer_manager_initialized_from_config() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
-    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&base).expect("create config directory");
 
     // Write daemon config with a custom host name
-    std::fs::write(base.join("daemon.toml"), "host_name = \"test-host\"\n").unwrap();
+    std::fs::write(base.join("daemon.toml"), "host_name = \"test-host\"\n").expect("write daemon config");
 
     // Write hosts config with one peer
     std::fs::write(
         base.join("hosts.toml"),
         "[hosts.remote]\nhostname = \"10.0.0.5\"\nexpected_host_name = \"remote\"\ndaemon_socket = \"/tmp/daemon.sock\"\n",
     )
-    .unwrap();
+    .expect("write hosts config");
 
     let config = Arc::new(ConfigStore::with_base(&base));
-    let server =
-        DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await.unwrap();
+    let server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
+        .await
+        .expect("create daemon server");
 
     // PeerManager should be initialized and accessible
     let pm = server.peer_manager.lock().await;
@@ -1460,10 +1463,11 @@ async fn peer_manager_initialized_from_config() {
 
 #[tokio::test]
 async fn peer_manager_default_when_no_config() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
-    let server =
-        DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await.unwrap();
+    let server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
+        .await
+        .expect("create daemon server");
 
     // Should still have a PeerManager with no peers
     let pm = server.peer_manager.lock().await;
@@ -1472,14 +1476,14 @@ async fn peer_manager_default_when_no_config() {
 
 #[tokio::test]
 async fn daemon_server_new_returns_error_for_invalid_hosts_config() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
-    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&base).expect("create config directory");
     std::fs::write(
         base.join("hosts.toml"),
         "[hosts.remote]\nhostname = \"10.0.0.5\"\nexpected_host_name = [\ndaemon_socket = \"/tmp/daemon.sock\"\n",
     )
-    .unwrap();
+    .expect("write invalid hosts config");
 
     let config = Arc::new(ConfigStore::with_base(&base));
     let result = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await;

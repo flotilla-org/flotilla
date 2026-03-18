@@ -2544,8 +2544,8 @@ fn wrap_remote_attach_commands_uses_login_shell() {
     .expect("write hosts config");
 
     let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }];
-    let result =
-        wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path()).unwrap();
+    let result = wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path())
+        .expect("wrap remote attach commands");
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].role, "main");
@@ -2580,8 +2580,8 @@ fn wrap_remote_attach_commands_includes_multiplex_args() {
     .expect("write hosts config");
 
     let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
-    let result =
-        wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path()).unwrap();
+    let result = wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path())
+        .expect("wrap remote attach commands");
 
     // Default is multiplex=true
     assert!(result[0].command.contains("ControlMaster=auto"), "expected ControlMaster, got: {}", result[0].command);
@@ -2598,8 +2598,8 @@ fn wrap_remote_attach_commands_omits_multiplex_when_disabled() {
     .expect("write hosts config");
 
     let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
-    let result =
-        wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path()).unwrap();
+    let result = wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path())
+        .expect("wrap remote attach commands");
 
     assert!(!result[0].command.contains("ControlMaster"), "should not have ControlMaster when disabled, got: {}", result[0].command);
 }
@@ -2614,8 +2614,8 @@ fn wrap_remote_attach_commands_per_host_multiplex_override() {
     .expect("write hosts config");
 
     let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
-    let result =
-        wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path()).unwrap();
+    let result = wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path())
+        .expect("wrap remote attach commands");
 
     assert!(!result[0].command.contains("ControlMaster"), "per-host override should disable multiplex, got: {}", result[0].command);
 }
