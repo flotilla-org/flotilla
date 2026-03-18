@@ -274,8 +274,7 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
         return;
     };
 
-    let mut referenced_sets = std::collections::HashSet::new();
-
+    // Enrichment: populate attachable_id / attachable_set_id on terminals and workspaces
     if let Some(provider_name) = terminal_provider.as_deref() {
         for terminal in pd.managed_terminals.values_mut() {
             let session_name = terminal_session_binding_ref(&terminal.id);
@@ -287,7 +286,6 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
             terminal.attachable_id = Some(attachable_id.clone());
             if let Some(attachable) = store.registry().attachables.get(&attachable_id) {
                 terminal.attachable_set_id = Some(attachable.set_id.clone());
-                referenced_sets.insert(attachable.set_id.clone());
             }
         }
     }
@@ -300,14 +298,18 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
             };
             let set_id = flotilla_protocol::AttachableSetId::new(set_id.to_string());
             workspace.attachable_set_id = Some(set_id.clone());
-            referenced_sets.insert(set_id);
         }
     }
 
-    let mut referenced_set_ids: Vec<_> = referenced_sets.into_iter().collect();
-    referenced_set_ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-    pd.attachable_sets =
-        referenced_set_ids.into_iter().filter_map(|set_id| store.registry().sets.get(&set_id).cloned().map(|set| (set_id, set))).collect();
+    // Set selection: project sets whose checkout matches a repo checkout
+    let checkout_paths: std::collections::HashSet<&flotilla_protocol::HostPath> = pd.checkouts.keys().collect();
+    pd.attachable_sets = store
+        .registry()
+        .sets
+        .iter()
+        .filter(|(_, set)| set.checkout.as_ref().is_some_and(|co| checkout_paths.contains(co)))
+        .map(|(id, set)| (id.clone(), set.clone()))
+        .collect();
 }
 
 fn project_agent_data(pd: &mut ProviderData, agent_state_store: &crate::agents::SharedAgentStateStore) {
@@ -842,6 +844,19 @@ mod tests {
         };
 
         let mut pd = ProviderData::default();
+        pd.checkouts.insert(
+            flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")),
+            Checkout {
+                branch: "feat".into(),
+                is_main: false,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                correlation_keys: vec![],
+                association_keys: vec![],
+            },
+        );
         pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
         pd.managed_terminals.insert("feat/dev/0".into(), flotilla_protocol::ManagedTerminal {
             id: flotilla_protocol::ManagedTerminalId { checkout: "feat".into(), role: "dev".into(), index: 0 },
@@ -996,5 +1011,67 @@ mod tests {
         assert!(snapshot.errors.iter().any(|e| e.provider == "Cursor"));
         assert_eq!(snapshot.provider_health.get(&("cloud_agent", "Claude".to_string())), Some(&true));
         assert_eq!(snapshot.provider_health.get(&("cloud_agent", "Cursor".to_string())), Some(&false));
+    }
+
+    #[test]
+    fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
+        let store = crate::attachable::shared_in_memory_attachable_store();
+        let host = flotilla_protocol::HostName::local();
+        let checkout_a = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-feat");
+        let checkout_b = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-other");
+
+        {
+            let mut s = store.lock().expect("lock");
+            s.ensure_terminal_set(Some(host.clone()), Some(checkout_a.clone()));
+            s.ensure_terminal_set(Some(host.clone()), Some(checkout_b.clone()));
+        }
+
+        let mut pd = ProviderData::default();
+        pd.checkouts.insert(checkout_a.clone(), Checkout {
+            branch: "feat".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+        });
+
+        let registry = ProviderRegistry::new();
+        project_attachable_data(&mut pd, &registry, &store);
+
+        assert_eq!(pd.attachable_sets.len(), 1);
+        let set = pd.attachable_sets.values().next().expect("one set");
+        assert_eq!(set.checkout, Some(checkout_a));
+    }
+
+    #[test]
+    fn project_attachable_data_set_appears_without_terminal_scan() {
+        let store = crate::attachable::shared_in_memory_attachable_store();
+        let host = flotilla_protocol::HostName::local();
+        let checkout = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-feat");
+
+        {
+            let mut s = store.lock().expect("lock");
+            s.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
+        }
+
+        let mut pd = ProviderData::default();
+        pd.checkouts.insert(checkout.clone(), Checkout {
+            branch: "feat".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+        });
+
+        let registry = ProviderRegistry::new();
+        project_attachable_data(&mut pd, &registry, &store);
+
+        assert_eq!(pd.attachable_sets.len(), 1, "set should appear without terminal scan");
     }
 }

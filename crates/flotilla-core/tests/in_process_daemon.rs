@@ -1331,13 +1331,23 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
         ],
         association_keys: vec![],
     });
+    // The remote host projects sets matching its own checkouts, so
+    // peer data includes the attachable set (simulating what the
+    // remote refresh cycle would produce).
+    peer_data.attachable_sets.insert(set_id.clone(), AttachableSet {
+        id: set_id.clone(),
+        host_affinity: Some(remote_host.clone()),
+        checkout: Some(remote_checkout.clone()),
+        template_identity: None,
+        members: vec![],
+    });
     daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
 
+    // Local providers no longer project sets whose checkout lives on a
+    // remote host — the set arrives via peer data merge instead.
     let (local_providers, _) = daemon.get_local_providers(&repo).await.expect("local providers");
-    let local_set = local_providers.attachable_sets.get(&set_id).expect("projected attachable set");
-    assert_eq!(local_set.host_affinity.as_ref(), Some(&remote_host));
-    assert_eq!(local_set.checkout.as_ref(), Some(&remote_checkout));
+    assert!(local_providers.attachable_sets.get(&set_id).is_none(), "remote-checkout set should not appear in local projection");
     assert_eq!(
         local_providers.workspaces.get(&workspace_ref).and_then(|workspace| workspace.attachable_set_id.as_ref()),
         Some(&set_id),
@@ -1436,6 +1446,16 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
         last_commit: None,
         correlation_keys: vec![CorrelationKey::Branch("issue-356-watch".into()), CorrelationKey::CheckoutPath(remote_checkout.clone())],
         association_keys: vec![],
+    });
+    // The remote host projects sets matching its own checkouts, so
+    // peer data includes the attachable set (simulating what the
+    // remote refresh cycle would produce).
+    peer_data.attachable_sets.insert(set_id.clone(), AttachableSet {
+        id: set_id.clone(),
+        host_affinity: Some(remote_host.clone()),
+        checkout: Some(remote_checkout.clone()),
+        template_identity: None,
+        members: vec![],
     });
     daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
