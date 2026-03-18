@@ -1,3 +1,5 @@
+mod client_connection;
+mod peer_connection;
 mod remote_commands;
 mod request_dispatch;
 
@@ -34,6 +36,8 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 use self::remote_commands::{extract_command_repo_identity, ForwardedCommand, ForwardedCommandState, PendingRemoteCommand};
 use self::{
+    client_connection::ClientConnection,
+    peer_connection::PeerConnection,
     remote_commands::{ForwardedCommandMap, PendingRemoteCancelMap, PendingRemoteCommandMap, RemoteCommandRouter},
     request_dispatch::RequestDispatcher,
 };
@@ -1101,6 +1105,8 @@ enum ForwardResult {
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(90);
+type ConnectionLines = tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>;
+type ConnectionWriter = Arc<tokio::sync::Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>;
 
 /// Forward messages from an inbound receiver to the shared peer_data channel,
 /// with periodic keepalive pings and liveness timeout detection.
@@ -1190,7 +1196,7 @@ async fn handle_client(
 ) {
     let (read_half, write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
-    let writer = Arc::new(tokio::sync::Mutex::new(BufWriter::new(write_half)));
+    let writer: ConnectionWriter = Arc::new(tokio::sync::Mutex::new(BufWriter::new(write_half)));
     let mut lines = reader.lines();
     let first_msg = tokio::select! {
         line_result = lines.next_line() => {
@@ -1218,195 +1224,14 @@ async fn handle_client(
 
     match first_msg {
         Message::Request { id, request } => {
-            let count = client_count.fetch_add(1, Ordering::SeqCst) + 1;
-            info!(%count, "client connected");
-            client_notify.notify_one();
-
-            let event_writer = Arc::clone(&writer);
-            let mut event_rx = daemon.subscribe();
-            let event_task = tokio::spawn(async move {
-                loop {
-                    match event_rx.recv().await {
-                        Ok(event) => {
-                            let msg = Message::Event { event: Box::new(event) };
-                            if write_message(&event_writer, &msg).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(skipped = n, "event subscriber lagged");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-
-            let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store);
-            let first_response = request_dispatcher.dispatch(id, request).await;
-            if write_message(&writer, &first_response).await.is_ok() {
-                loop {
-                    tokio::select! {
-                        line_result = lines.next_line() => {
-                            match line_result {
-                                Ok(Some(line)) => {
-                                    let msg: Message = match serde_json::from_str(&line) {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            warn!(err = %e, "failed to parse message");
-                                            continue;
-                                        }
-                                    };
-                                    match msg {
-                                        Message::Request { id, request } => {
-                                            let response = request_dispatcher.dispatch(id, request).await;
-                                            if write_message(&writer, &response).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        other => {
-                                            warn!(msg = ?other, "unexpected message type from client");
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    error!(err = %e, "error reading from client");
-                                    break;
-                                }
-                            }
-                        }
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            event_task.abort();
-            let count = client_count.fetch_sub(1, Ordering::SeqCst) - 1;
-            info!(%count, "client disconnected");
-            client_notify.notify_one();
+            ClientConnection::new(daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store)
+                .run(lines, writer, id, request)
+                .await;
         }
         Message::Hello { protocol_version, host_name, session_id } => {
-            if protocol_version != PROTOCOL_VERSION {
-                warn!(
-                    peer = %host_name,
-                    expected = PROTOCOL_VERSION,
-                    got = protocol_version,
-                    "peer protocol version mismatch"
-                );
-                return;
-            }
-
-            if write_message(&writer, &Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                host_name: daemon.host_name().clone(),
-                session_id: daemon.session_id(),
-            })
-            .await
-            .is_err()
-            {
-                return;
-            }
-
-            let remote_session_id = Some(session_id);
-
-            let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(64);
-            let relay_writer = Arc::clone(&writer);
-            let relay_task = tokio::spawn(async move {
-                while let Some(msg) = outbound_rx.recv().await {
-                    if write_message(&relay_writer, &msg).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let (generation, displaced_generation) = {
-                let mut pm = peer_manager.lock().await;
-                match pm.activate_connection_with_session(
-                    host_name.clone(),
-                    Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(Some(outbound_tx.clone())) }),
-                    ConnectionMeta {
-                        direction: ConnectionDirection::Inbound,
-                        config_label: None,
-                        expected_peer: None,
-                        config_backed: false,
-                    },
-                    remote_session_id,
-                ) {
-                    ActivationResult::Accepted { generation, displaced } => (generation, displaced),
-                    ActivationResult::Rejected { reason } => {
-                        let _ = write_message(&writer, &Message::Peer(Box::new(PeerWireMessage::Goodbye { reason }))).await;
-                        relay_task.abort();
-                        return;
-                    }
-                }
-            };
-            if let Some(displaced_generation) = displaced_generation {
-                let displaced = {
-                    let mut pm = peer_manager.lock().await;
-                    pm.take_displaced_sender(&host_name, displaced_generation)
-                };
-                if let Some(displaced) = displaced {
-                    let _ = displaced.retire(GoodbyeReason::Superseded).await;
-                }
-            }
-            sync_peer_query_state(&peer_manager, &daemon).await;
-            let _ = daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Connected).await;
-            let _ = peer_connected_tx.send(PeerConnectedNotice { peer: host_name.clone(), generation });
-
-            loop {
-                tokio::select! {
-                    line_result = lines.next_line() => {
-                        match line_result {
-                            Ok(Some(line)) => {
-                                let msg: Message = match serde_json::from_str(&line) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        warn!(peer = %host_name, err = %e, "failed to parse peer message");
-                                        break;
-                                    }
-                                };
-                                match msg {
-                                    Message::Peer(peer_msg) => {
-                                        if let Err(e) = peer_data_tx.send(InboundPeerEnvelope {
-                                            msg: *peer_msg,
-                                            connection_generation: generation,
-                                            connection_peer: host_name.clone(),
-                                        }).await {
-                                            warn!(peer = %host_name, err = %e, "failed to forward inbound peer message");
-                                            break;
-                                        }
-                                    }
-                                    other => {
-                                        warn!(peer = %host_name, msg = ?other, "unexpected message type from peer");
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                error!(peer = %host_name, err = %e, "error reading from peer");
-                                break;
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let plan = disconnect_peer_and_rebuild(&peer_manager, &daemon, &host_name, generation).await;
-            if plan.was_active {
-                let _ = daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Disconnected).await;
-            }
-            relay_task.abort();
+            PeerConnection::new(daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx)
+                .run(lines, writer, protocol_version, host_name, session_id)
+                .await;
         }
         other => {
             warn!(msg = ?other, "unexpected first message type from client");
