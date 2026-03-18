@@ -245,7 +245,15 @@ impl TerminalPool for SessionTerminalPool {
             .ok()
             .and_then(|store| Self::find_persisted_session_id(store.as_ref(), id))
             .unwrap_or_else(|| terminal_session_binding_ref(id));
-        run!(self.runner, &self.binary, &["kill", &session_id], Path::new("/")).map(|_| ())
+        run!(self.runner, &self.binary, &["kill", &session_id], Path::new("/"))?;
+
+        let Ok(mut store) = self.attachable_store.lock() else {
+            return Ok(());
+        };
+        if store.remove_binding_object("terminal_pool", "session", BindingObjectKind::Attachable, &session_id) {
+            let _ = store.save();
+        }
+        Ok(())
     }
 }
 
@@ -329,14 +337,30 @@ mod tests {
     #[tokio::test]
     async fn kill_terminal_calls_cli() {
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
-        let pool = SessionTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "bollard", shared_in_memory_attachable_store());
+        let store = shared_in_memory_attachable_store();
+        {
+            let mut store_guard = store.lock().expect("store");
+            SessionTerminalPool::persist_attachable(
+                store_guard.as_mut(),
+                &ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 },
+                "session-123",
+                "bash",
+                Path::new("/repo"),
+                TerminalStatus::Disconnected,
+            );
+        }
+        let pool = SessionTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "bollard", store.clone());
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
         pool.kill_terminal(&id).await.expect("kill terminal");
 
         let calls = runner.calls.lock().expect("calls");
         assert_eq!(calls[0].0, "bollard");
-        assert_eq!(calls[0].1, vec!["kill".to_string(), "flotilla/feat/shell/0".to_string()]);
+        assert_eq!(calls[0].1, vec!["kill".to_string(), "session-123".to_string()]);
+        drop(calls);
+
+        let store = store.lock().expect("store");
+        assert!(SessionTerminalPool::find_persisted_session_id(store.as_ref(), &id).is_none());
     }
 
     #[tokio::test]

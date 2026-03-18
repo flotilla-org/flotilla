@@ -1,3 +1,5 @@
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
 use crate::{
     protocol::{SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, SessionRecord},
@@ -35,9 +37,11 @@ impl SessionService {
         }
         let pid_path = crate::session::daemon_pid_path(self.layout.root(), id);
         if let Ok(Some(pid)) = std::fs::read_to_string(&pid_path).map(|value| value.trim().parse::<i32>().ok()) {
-            // SAFETY: pid was read from our session pid file and kill only sends a signal.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+            if is_expected_bollard_process(pid) {
+                // SAFETY: the pid was verified to belong to a bollard process before signaling it.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
             }
         }
         self.layout.remove_session(id)
@@ -77,4 +81,39 @@ fn session_info_from_record(root: &std::path::Path, record: SessionRecord) -> Se
     let id = record.metadata.id.clone();
     let status = if foreground_path(root, &id).exists() { SessionStatus::Attached } else { SessionStatus::Detached };
     SessionInfo { id: record.metadata.id, name: record.metadata.name, cwd: record.metadata.cwd, cmd: record.metadata.cmd, status }
+}
+
+fn is_expected_bollard_process(pid: i32) -> bool {
+    let mut sys = System::new();
+    let sysinfo_pid = Pid::from(pid as usize);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sysinfo_pid]), true, ProcessRefreshKind::nothing());
+    sys.process(sysinfo_pid).map(|process| process.name().to_string_lossy().contains("bollard")).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, process::Command, thread, time::Duration};
+
+    use super::SessionService;
+    use crate::{runtime::RuntimeLayout, session::daemon_pid_path};
+
+    #[test]
+    fn kill_does_not_signal_unrelated_process_from_stale_pid_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::write(session_dir.join("meta.json"), r#"{"id":"alpha","name":"alpha","cwd":null,"cmd":null}"#).expect("write metadata");
+
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        fs::write(daemon_pid_path(temp.path(), "alpha"), child.id().to_string()).expect("write pid");
+
+        service.kill("alpha").expect("kill session");
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(child.try_wait().expect("try_wait").is_none(), "unrelated process should still be alive");
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
