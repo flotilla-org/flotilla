@@ -9,6 +9,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
+nix = { version = "0.31.2", features = ["fs", "poll", "process", "term"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

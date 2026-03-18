@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::{
-        fd::{AsRawFd, RawFd},
+        fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd},
         unix::{fs::PermissionsExt, net::UnixStream},
     },
     path::{Path, PathBuf},
@@ -15,6 +15,17 @@ use std::{
     },
     thread,
     time::{Duration, Instant},
+};
+
+use nix::{
+    fcntl::{fcntl, FcntlArg, OFlag},
+    poll::{poll, PollFd, PollFlags, PollTimeout},
+    pty::{forkpty, ForkptyResult},
+    sys::{
+        termios::{self, SetArg},
+        wait::{waitpid, WaitPidFlag, WaitStatus},
+    },
+    unistd::{chdir, execvp, isatty, read as nix_read, write as nix_write, Pid},
 };
 
 use crate::{
@@ -111,33 +122,22 @@ impl ForegroundAttach {
 
 struct TerminalModeGuard {
     fd: RawFd,
-    original: Option<libc::termios>,
+    original: Option<termios::Termios>,
 }
 
 impl TerminalModeGuard {
     fn activate() -> Result<Self, String> {
         let fd = std::io::stdin().as_raw_fd();
-        // SAFETY: `isatty` only queries terminal state for the live stdin fd.
-        if unsafe { libc::isatty(fd) } != 1 {
+        // SAFETY: stdin remains open for the lifetime of the guard; we only borrow its fd.
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        if !isatty(borrowed_fd).map_err(|err| format!("detect terminal stdin: {err}"))? {
             return Ok(Self { fd, original: None });
         }
 
-        let mut original =
-            libc::termios { c_iflag: 0, c_oflag: 0, c_cflag: 0, c_lflag: 0, c_line: 0, c_cc: [0; libc::NCCS], c_ispeed: 0, c_ospeed: 0 };
-        // SAFETY: `tcgetattr` initializes `original` for the live stdin tty fd.
-        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            return Err(format!("read terminal attrs: {}", std::io::Error::last_os_error()));
-        }
-
-        let mut raw = original;
-        // SAFETY: `cfmakeraw` mutates the local termios value before it is applied.
-        unsafe {
-            libc::cfmakeraw(&mut raw);
-        }
-        // SAFETY: `tcsetattr` applies the computed raw mode to the same stdin tty fd.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
-            return Err(format!("set terminal raw mode: {}", std::io::Error::last_os_error()));
-        }
+        let original = termios::tcgetattr(borrowed_fd).map_err(|err| format!("read terminal attrs: {err}"))?;
+        let mut raw = original.clone();
+        termios::cfmakeraw(&mut raw);
+        termios::tcsetattr(borrowed_fd, SetArg::TCSAFLUSH, &raw).map_err(|err| format!("set terminal raw mode: {err}"))?;
 
         Ok(Self { fd, original: Some(original) })
     }
@@ -145,11 +145,10 @@ impl TerminalModeGuard {
 
 impl Drop for TerminalModeGuard {
     fn drop(&mut self) {
-        if let Some(original) = self.original {
-            // SAFETY: restore the previously captured terminal attributes to the same fd.
-            unsafe {
-                libc::tcsetattr(self.fd, libc::TCSAFLUSH, &original);
-            }
+        if let Some(original) = self.original.as_ref() {
+            // SAFETY: stdin remains open for the lifetime of the guard; we only borrow its fd.
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+            let _ = termios::tcsetattr(borrowed_fd, SetArg::TCSAFLUSH, original);
         }
     }
 }
@@ -381,7 +380,18 @@ fn resolve_bollard_executable() -> Result<PathBuf, String> {
         }
     }
 
+    if let Some(path) = current_exe_sibling("bollard") {
+        return Ok(path);
+    }
+
     Err("unable to locate bollard executable in PATH".into())
+}
+
+fn current_exe_sibling(name: &str) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let current_dir = current_exe.parent()?;
+    let candidates = [current_dir.join(name), current_dir.parent().map(|parent| parent.join(name))?];
+    candidates.into_iter().find(|candidate| is_executable_file(candidate))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -395,28 +405,23 @@ struct PollResult {
 }
 
 fn poll_ready(listener_fd: RawFd, client_fd: Option<RawFd>, pty_fd: RawFd, timeout_ms: i32) -> Result<PollResult, String> {
-    let mut fds = vec![libc::pollfd { fd: listener_fd, events: libc::POLLIN, revents: 0 }, libc::pollfd {
-        fd: pty_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }];
+    let listener_borrowed = borrow_fd(listener_fd);
+    let pty_borrowed = borrow_fd(pty_fd);
+    let mut fds = vec![PollFd::new(listener_borrowed, PollFlags::POLLIN), PollFd::new(pty_borrowed, PollFlags::POLLIN)];
     let client_index = if let Some(fd) = client_fd {
-        fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+        fds.push(PollFd::new(borrow_fd(fd), PollFlags::POLLIN));
         Some(fds.len() - 1)
     } else {
         None
     };
 
-    // SAFETY: `poll` reads and writes the provided pollfd array for valid fds owned by this process.
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
-    if rc < 0 {
-        return Err(format!("poll daemon fds: {}", std::io::Error::last_os_error()));
-    }
+    poll(&mut fds, PollTimeout::try_from(timeout_ms).map_err(|err| format!("invalid poll timeout: {err}"))?)
+        .map_err(|err| format!("poll daemon fds: {err}"))?;
 
     Ok(PollResult {
-        listener_readable: fds[0].revents & libc::POLLIN != 0,
-        pty_readable: fds[1].revents & libc::POLLIN != 0,
-        client_readable: client_index.map(|index| fds[index].revents & libc::POLLIN != 0).unwrap_or(false),
+        listener_readable: has_pollin(&fds[0]),
+        pty_readable: has_pollin(&fds[1]),
+        client_readable: client_index.map(|index| has_pollin(&fds[index])).unwrap_or(false),
     })
 }
 
@@ -429,6 +434,15 @@ fn wait_for_socket(path: &Path) -> Result<(), String> {
         thread::sleep(Duration::from_millis(20));
     }
     Err(format!("timed out waiting for socket {}", path.display()))
+}
+
+fn has_pollin(fd: &PollFd<'_>) -> bool {
+    fd.revents().map(|flags| flags.contains(PollFlags::POLLIN)).unwrap_or(false)
+}
+
+fn borrow_fd(fd: RawFd) -> BorrowedFd<'static> {
+    // SAFETY: callers only pass live fds owned by this process, and the borrowed view is used immediately.
+    unsafe { BorrowedFd::borrow_raw(fd) }
 }
 
 fn current_terminal_size() -> (u16, u16) {
@@ -457,88 +471,62 @@ fn load_session(root: &Path, id: &str) -> Result<Option<SessionMetadata>, String
 
 #[cfg(unix)]
 fn spawn_pty_child(session: &SessionMetadata) -> Result<RawFd, String> {
-    let mut master_fd: libc::c_int = -1;
-    // SAFETY: forkpty creates a child attached to a new PTY and initializes master_fd on success.
-    let result = unsafe { libc::forkpty(&mut master_fd, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
-    if result < 0 {
-        return Err("forkpty failed".into());
-    }
-    if result == 0 {
-        if let Some(cwd) = &session.cwd {
-            let cwd_c = CString::new(cwd.as_os_str().as_encoded_bytes().to_vec()).map_err(|_| "cwd contains interior nul".to_string())?;
-            // SAFETY: chdir uses a valid nul-terminated path in the child process before exec.
-            unsafe {
-                libc::chdir(cwd_c.as_ptr());
+    // SAFETY: `forkpty` creates a child attached to a new PTY; parent receives the owned master fd.
+    let result = unsafe { forkpty(None, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
+    match result {
+        ForkptyResult::Parent { master, .. } => Ok(master.into_raw_fd()),
+        ForkptyResult::Child => {
+            if let Some(cwd) = &session.cwd {
+                let _ = chdir(cwd);
             }
-        }
-        for key in STRIP_ENV_VARS {
-            let key_c = CString::new(*key).map_err(|_| format!("invalid env key {key}"))?;
-            // SAFETY: unsetenv receives a valid nul-terminated environment variable name in the child process.
-            unsafe {
-                libc::unsetenv(key_c.as_ptr());
+            for key in STRIP_ENV_VARS {
+                // SAFETY: child process is single-threaded here, before exec, so environment mutation is safe.
+                unsafe {
+                    std::env::remove_var(key);
+                }
             }
-        }
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let shell_c = CString::new(shell.clone()).map_err(|_| "shell contains interior nul".to_string())?;
-        let arg0 = CString::new(shell).map_err(|_| "shell contains interior nul".to_string())?;
-        if let Some(cmd) = &session.cmd {
-            let dash_lc = CString::new("-lc").map_err(|_| "invalid -lc".to_string())?;
-            let cmd_c = CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?;
-            // SAFETY: execl replaces the child process image with the requested shell command; arguments are valid C strings.
-            unsafe {
-                libc::execl(shell_c.as_ptr(), arg0.as_ptr(), dash_lc.as_ptr(), cmd_c.as_ptr(), std::ptr::null::<i8>());
-                libc::_exit(127);
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let shell_c = CString::new(shell.clone()).map_err(|_| "shell contains interior nul".to_string())?;
+            let mut args = vec![shell_c.clone()];
+            if let Some(cmd) = &session.cmd {
+                args.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
+                args.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
             }
-        } else {
-            // SAFETY: execl replaces the child process image with the requested shell; arguments are valid C strings.
-            unsafe {
-                libc::execl(shell_c.as_ptr(), arg0.as_ptr(), std::ptr::null::<i8>());
-                libc::_exit(127);
-            }
+            let _ = execvp(&shell_c, &args);
+            std::process::exit(127);
         }
     }
-    Ok(master_fd)
 }
 
 #[cfg(unix)]
 fn set_nonblocking(fd: RawFd) -> Result<(), String> {
-    // SAFETY: fcntl reads the current descriptor flags for a valid PTY master fd.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err("fcntl F_GETFL failed".into());
-    }
-    // SAFETY: fcntl updates the descriptor flags for the same valid PTY master fd.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err("fcntl F_SETFL failed".into());
-    }
+    let borrowed = borrow_fd(fd);
+    let flags = fcntl(borrowed, FcntlArg::F_GETFL).map_err(|err| format!("fcntl F_GETFL failed: {err}"))?;
+    let mut oflags = OFlag::from_bits_retain(flags);
+    oflags.insert(OFlag::O_NONBLOCK);
+    fcntl(borrowed, FcntlArg::F_SETFL(oflags)).map_err(|err| format!("fcntl F_SETFL failed: {err}"))?;
     Ok(())
 }
 
 #[cfg(unix)]
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-    // SAFETY: read writes into the provided mutable buffer for a valid PTY master fd.
-    let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if rc >= 0 {
-        Ok(rc as usize)
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    nix_read(borrow_fd(fd), buf).map_err(std::io::Error::from)
 }
 
 #[cfg(unix)]
 fn write_fd_all(fd: RawFd, mut bytes: &[u8]) -> Result<(), String> {
     while !bytes.is_empty() {
-        // SAFETY: write reads from the provided byte slice for a valid PTY master fd.
-        let rc = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                thread::sleep(Duration::from_millis(5));
-                continue;
+        match nix_write(borrow_fd(fd), bytes) {
+            Ok(written) => bytes = &bytes[written..],
+            Err(err) => {
+                let err = std::io::Error::from(err);
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                return Err(format!("write pty input: {err}"));
             }
-            return Err(format!("write pty input: {err}"));
         }
-        bytes = &bytes[rc as usize..];
     }
     Ok(())
 }
@@ -557,20 +545,11 @@ fn resize_pty(fd: RawFd, cols: u16, rows: u16) -> Result<(), String> {
 
 #[cfg(unix)]
 fn child_exited() -> Result<Option<i32>, String> {
-    let mut status = 0;
-    // SAFETY: waitpid with WNOHANG queries child exit state without blocking and writes into `status`.
-    let rc = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ECHILD) {
-            return Ok(None);
-        }
-        return Err(format!("waitpid failed: {err}"));
-    }
-    if rc == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(status))
+    match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => Ok(None),
+        Ok(_) => Ok(Some(1)),
+        Err(nix::errno::Errno::ECHILD) => Ok(None),
+        Err(err) => Err(format!("waitpid failed: {err}")),
     }
 }
 
