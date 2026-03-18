@@ -221,11 +221,13 @@ impl App {
                     if let UiMode::CommandPalette { ref input, ref entries, selected, .. } = self.ui.mode {
                         let text = input.value().to_string();
 
-                        // "search <terms>" — apply filter directly
+                        // "search <terms>" — apply filter directly, empty clears
                         if let Some(query) = text.strip_prefix("search ") {
                             let query = query.trim().to_string();
                             self.ui.mode = UiMode::Normal;
-                            if !query.is_empty() {
+                            if query.is_empty() {
+                                self.clear_active_issue_search(crate::app::ClearDispatch::Always);
+                            } else {
                                 let repo = self.model.active_repo_root().clone();
                                 self.proto_commands.push(self.command(CommandAction::SearchIssues {
                                     repo: flotilla_protocol::RepoSelector::Path(repo),

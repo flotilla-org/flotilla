@@ -101,21 +101,13 @@ pub fn render(
     keymap: &Keymap,
     frame: &mut Frame,
 ) {
-    let palette_open = matches!(ui.mode, UiMode::CommandPalette { .. });
-    let constraints = if palette_open {
-        // tab bar | content | status bar (with input) | 8 completion rows
-        vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1), Constraint::Length(MAX_PALETTE_ROWS as u16)]
-    } else {
-        vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]
-    };
+    let constraints = vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)];
     let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
 
     render_tab_bar(model, ui, theme, frame, chunks[0]);
     render_content(model, ui, theme, frame, chunks[1]);
     render_status_bar(model, ui, in_flight, theme, frame, chunks[2]);
-    if palette_open {
-        render_command_palette(ui, theme, frame, chunks[3]);
-    }
+    render_command_palette(ui, theme, frame, chunks[2]);
     render_action_menu(model, ui, theme, frame);
     render_input_popup(ui, theme, frame);
     render_delete_confirm(model, ui, theme, frame);
@@ -1273,15 +1265,20 @@ fn render_file_picker(ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
 
 const MAX_PALETTE_ROWS: usize = 8;
 
-fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, status_bar_area: Rect) {
     let UiMode::CommandPalette { ref input, ref entries, selected, scroll_top } = ui.mode else {
         return;
     };
 
-    // Fill the entire completion area with background
-    frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
-
     let filtered: Vec<&crate::palette::PaletteEntry> = crate::palette::filter_entries(entries, input.value());
+    let visible_rows = filtered.len().min(MAX_PALETTE_ROWS) as u16;
+
+    // Overlay area: sits directly above the status bar, drawing over content
+    let overlay_y = status_bar_area.y.saturating_sub(visible_rows);
+    let area = Rect::new(status_bar_area.x, overlay_y, status_bar_area.width, visible_rows);
+
+    frame.render_widget(Clear, area);
+
     let name_width = filtered.iter().map(|e| e.name.len()).max().unwrap_or(0).min(20);
     let hint_width: u16 = 7;
 
@@ -1312,10 +1309,9 @@ fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, area: 
         }
     }
 
-    // Cursor on the status bar row (one row above the completion area)
-    let status_bar_y = area.y.saturating_sub(1);
-    let cursor_x = area.x + 1 + input.visual_cursor() as u16;
-    frame.set_cursor_position((cursor_x, status_bar_y));
+    // Cursor on the status bar row
+    let cursor_x = status_bar_area.x + 1 + input.visual_cursor() as u16;
+    frame.set_cursor_position((cursor_x, status_bar_area.y));
 }
 
 fn render_config_screen(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {

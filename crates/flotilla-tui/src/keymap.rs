@@ -423,6 +423,7 @@ impl Keymap {
             ("Navigation", &[Action::SelectNext, Action::SelectPrev]),
             ("Actions", &[
                 Action::Confirm,
+                Action::OpenCommandPalette,
                 Action::OpenActionMenu,
                 Action::OpenBranchInput,
                 Action::Dispatch(Intent::RemoveCheckout),
