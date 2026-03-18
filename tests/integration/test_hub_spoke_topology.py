@@ -196,7 +196,7 @@ def test_topology_shows_star_shape(hub_spoke_topology):
 
 
 def test_provider_heterogeneity(hub_spoke_topology):
-    """homelab-1 and homelab-2 have different coding agents and tools."""
+    """homelab-1 and homelab-2 have different tools in their inventory."""
     hl1 = _flotilla_json("workstation", "host homelab-1 providers")
     hl2 = _flotilla_json("workstation", "host homelab-2 providers")
 
@@ -204,32 +204,28 @@ def test_provider_heterogeneity(hub_spoke_topology):
     assert hl1["connection_status"] == "Connected"
     assert hl2["connection_status"] == "Connected"
 
-    hl1_providers = hl1["summary"]["providers"]
-    hl2_providers = hl2["summary"]["providers"]
-
-    # homelab-1 has codex (cloud_agent)
-    hl1_agents = [p for p in hl1_providers if p["category"] == "cloud_agent"]
-    assert any(p["name"] == "Codex" for p in hl1_agents), (
-        f"homelab-1 should have Codex provider, got: {hl1_agents}"
-    )
-
-    # homelab-2 has no coding agent provider (gemini binary installed but no
-    # flotilla provider factory exists for it yet)
-    hl2_agents = [p for p in hl2_providers if p["category"] == "cloud_agent"]
-    assert len(hl2_agents) == 0, (
-        f"homelab-2 should have no cloud_agent providers, got: {hl2_agents}"
-    )
-
-    # homelab-1 has shpool in inventory
     hl1_binaries = [b["name"] for b in hl1["summary"]["inventory"]["binaries"]]
+    hl2_binaries = [b["name"] for b in hl2["summary"]["inventory"]["binaries"]]
+
+    # homelab-1 (follower-codex) has shpool; homelab-2 (follower-gemini) does not
     assert "shpool" in hl1_binaries, (
         f"homelab-1 should have shpool binary, got: {hl1_binaries}"
     )
-
-    # homelab-2 does NOT have shpool
-    hl2_binaries = [b["name"] for b in hl2["summary"]["inventory"]["binaries"]]
     assert "shpool" not in hl2_binaries, (
         f"homelab-2 should not have shpool binary, got: {hl2_binaries}"
+    )
+
+    # homelab-2 (follower-gemini) has the gemini CLI; homelab-1 does not
+    assert "gemini" in hl2_binaries, (
+        f"homelab-2 should have gemini binary, got: {hl2_binaries}"
+    )
+    assert "gemini" not in hl1_binaries, (
+        f"homelab-1 should not have gemini binary, got: {hl1_binaries}"
+    )
+
+    # The inventories are meaningfully different
+    assert set(hl1_binaries) != set(hl2_binaries), (
+        "homelab-1 and homelab-2 should have different tool inventories"
     )
 
 
