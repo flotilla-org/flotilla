@@ -105,7 +105,9 @@ pub async fn build_plan(
 
         CommandAction::RemoveCheckout { checkout, terminal_keys } => {
             match resolve_checkout_branch(&checkout, &providers_data, &local_host) {
-                Ok(branch) => build_remove_checkout_plan(branch, terminal_keys, repo.root, registry),
+                Ok(branch) => {
+                    build_remove_checkout_plan(branch, terminal_keys, repo.root, registry, providers_data, attachable_store, local_host)
+                }
                 Err(message) => ExecutionPlan::Immediate(CommandResult::Error { message }),
             }
         }
@@ -355,12 +357,16 @@ async fn build_teleport_session_plan(
 ///
 /// Steps:
 /// 1. Remove the checkout via the checkout manager
-/// 2. Clean up correlated terminal sessions (best-effort)
+/// 2. Cascade-delete attachable sets owned by this checkout
+/// 3. Clean up correlated terminal sessions (best-effort)
 fn build_remove_checkout_plan(
     branch: String,
     terminal_keys: Vec<ManagedTerminalId>,
     repo_root: PathBuf,
     registry: Arc<ProviderRegistry>,
+    providers_data: Arc<ProviderData>,
+    attachable_store: SharedAttachableStore,
+    local_host: HostName,
 ) -> ExecutionPlan {
     let mut steps = Vec::new();
 
@@ -382,7 +388,64 @@ fn build_remove_checkout_plan(
         });
     }
 
-    // Step 2: Clean up terminal sessions (best-effort)
+    // Step 2: Cascade-delete attachable sets whose checkout matches the removed branch,
+    // then tear down any terminal sessions that were members of those sets.
+    {
+        let branch = branch.clone();
+        let registry = Arc::clone(&registry);
+        steps.push(Step {
+            description: "Cascade-delete attachable sets for removed checkout".to_string(),
+            host: StepHost::Local,
+            action: StepAction::Closure(Box::new(move |_prior| {
+                Box::pin(async move {
+                    let deleted_checkout_paths: Vec<HostPath> = providers_data
+                        .checkouts
+                        .iter()
+                        .filter(|(hp, co)| co.branch == branch && hp.host == local_host)
+                        .map(|(hp, _)| hp.clone())
+                        .collect();
+
+                    let mut all_session_refs = Vec::new();
+                    let mut any_removed = false;
+                    if let Ok(mut store) = attachable_store.lock() {
+                        for checkout_path in &deleted_checkout_paths {
+                            let set_ids = store.sets_for_checkout(checkout_path);
+                            for set_id in set_ids {
+                                if let Some(removed) = store.remove_set(&set_id) {
+                                    all_session_refs.extend(removed.member_binding_refs);
+                                    any_removed = true;
+                                }
+                            }
+                        }
+                        if any_removed {
+                            if let Err(e) = store.save() {
+                                warn!(err = %e, "failed to persist registry after cascade delete");
+                            }
+                        }
+                    }
+
+                    // Best-effort terminal teardown for cascade-removed sessions
+                    if let Some(tp) = registry.terminal_pools.preferred() {
+                        for session_ref in &all_session_refs {
+                            if let Some(terminal_id) = crate::attachable::parse_terminal_session_binding_ref(session_ref) {
+                                if let Err(e) = tp.kill_terminal(&terminal_id).await {
+                                    warn!(
+                                        session = %session_ref,
+                                        err = %e,
+                                        "failed to kill cascaded terminal session (best-effort)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(StepOutcome::Completed)
+                })
+            })),
+        });
+    }
+
+    // Step 3: Clean up explicitly-passed terminal sessions (best-effort)
     if !terminal_keys.is_empty() {
         let registry = Arc::clone(&registry);
         steps.push(Step {
