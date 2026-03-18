@@ -5,7 +5,7 @@ use bollard::{
     protocol::SessionInfo,
     runtime::RuntimeLayout,
     server::SessionService,
-    session::daemon_pid_path,
+    session::{daemon_pid_path, foreground_path},
 };
 use clap::Parser;
 
@@ -128,6 +128,17 @@ fn dropping_foreground_attach_keeps_session_alive_for_later_attach() {
 
     let (_session, _reattach) = service.attach(Some("alpha".into()), None, None, false).expect("reattach after disconnect");
     assert!(pid_path.exists());
+}
+
+#[test]
+fn stale_foreground_file_does_not_block_attach() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    service.create(Some("alpha".into()), None, Some("sleep 5".into())).expect("create alpha");
+    std::fs::write(foreground_path(temp.path(), "alpha"), b"999999").expect("write stale foreground marker");
+
+    let (_session, _attach) = service.attach(Some("alpha".into()), None, None, false).expect("attach with stale foreground marker");
 }
 
 #[test]
