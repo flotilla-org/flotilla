@@ -67,7 +67,7 @@ pub enum UiMode {
     },
     CommandPalette {
         input: Input,
-        entries: Vec<crate::palette::PaletteEntry>,
+        entries: &'static [crate::palette::PaletteEntry],
         selected: usize,
         scroll_top: usize,
     },
@@ -378,7 +378,7 @@ mod tests {
                 false,
             ),
             (UiMode::IssueSearch { input: Input::default() }, false),
-            (UiMode::CommandPalette { input: Input::default(), entries: vec![], selected: 0, scroll_top: 0 }, false),
+            (UiMode::CommandPalette { input: Input::default(), entries: &[], selected: 0, scroll_top: 0 }, false),
         ];
         for (mode, expected) in &cases {
             assert_eq!(mode.is_config(), *expected, "failed for mode variant");
@@ -426,7 +426,7 @@ mod tests {
                 FocusTarget::CloseConfirmDialog,
             ),
             (UiMode::IssueSearch { input: Input::default() }, FocusTarget::IssueSearchInput),
-            (UiMode::CommandPalette { input: Input::default(), entries: vec![], selected: 0, scroll_top: 0 }, FocusTarget::CommandPalette),
+            (UiMode::CommandPalette { input: Input::default(), entries: &[], selected: 0, scroll_top: 0 }, FocusTarget::CommandPalette),
         ];
 
         for (mode, expected) in cases {

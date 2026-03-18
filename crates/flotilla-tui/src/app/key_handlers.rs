@@ -84,11 +84,11 @@ impl App {
                 }
                 FocusTarget::FilePickerList => self.file_picker_select_next(),
                 FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, ref entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
+                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
                         let count = crate::palette::filter_entries(entries, input.value()).len();
                         if count > 0 {
                             *selected = (*selected + 1) % count;
-                            let max_visible = 8usize;
+                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
                             if *selected >= *scroll_top + max_visible {
                                 *scroll_top = selected.saturating_sub(max_visible - 1);
                             } else if *selected < *scroll_top {
@@ -121,11 +121,11 @@ impl App {
                 }
                 FocusTarget::FilePickerList => self.file_picker_select_prev(),
                 FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, ref entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
+                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
                         let count = crate::palette::filter_entries(entries, input.value()).len();
                         if count > 0 {
                             *selected = if *selected == 0 { count - 1 } else { *selected - 1 };
-                            let max_visible = 8usize;
+                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
                             if *selected >= *scroll_top + max_visible {
                                 *scroll_top = selected.saturating_sub(max_visible - 1);
                             } else if *selected < *scroll_top {
@@ -218,7 +218,7 @@ impl App {
                     self.ui.mode = UiMode::Normal;
                 }
                 FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, ref entries, selected, .. } = self.ui.mode {
+                    if let UiMode::CommandPalette { ref input, entries, selected, .. } = self.ui.mode {
                         let text = input.value().to_string();
 
                         // "search <terms>" — apply filter directly, empty clears
@@ -397,7 +397,7 @@ impl App {
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
             UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
             UiMode::IssueSearch { .. } => self.handle_issue_search_key(key),
-            UiMode::CommandPalette { ref mut input, ref entries, ref mut selected, ref mut scroll_top, .. } => {
+            UiMode::CommandPalette { ref mut input, entries, ref mut selected, ref mut scroll_top, .. } => {
                 // Tab / Right arrow: fill selected command name into input
                 if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
                     let filtered = crate::palette::filter_entries(entries, input.value());
@@ -417,7 +417,7 @@ impl App {
                 }
 
                 input.handle_event(&crossterm::event::Event::Key(key));
-                // // shortcut: typing / when input is empty fills "search "
+                // Shortcut: typing / when input is empty fills "search "
                 if input.value() == "/" {
                     *input = Input::from("search ");
                     *selected = 0;
@@ -2101,8 +2101,8 @@ mod tests {
         }
         // Up from 0 → wraps to last
         app.handle_key(key(KeyCode::Up));
-        if let UiMode::CommandPalette { selected, entries, .. } = &app.ui.mode {
-            assert_eq!(*selected, entries.len() - 1);
+        if let UiMode::CommandPalette { selected, entries, ref input, .. } = &app.ui.mode {
+            assert_eq!(*selected, crate::palette::filter_entries(entries, input.value()).len() - 1);
         } else {
             panic!("expected CommandPalette");
         }
