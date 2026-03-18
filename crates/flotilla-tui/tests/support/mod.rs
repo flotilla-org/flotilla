@@ -141,7 +141,8 @@ impl TestHarness {
         let keymap = Keymap::defaults();
         terminal
             .draw(|frame| {
-                ui::render(&self.model, &mut self.ui, &self.in_flight, &theme, &keymap, frame);
+                let widget_mode = self.widget_stack.last().map(|w| w.mode_id());
+                ui::render(&self.model, &mut self.ui, &self.in_flight, &theme, &keymap, frame, widget_mode);
                 let area = frame.area();
                 let ctx =
                     flotilla_tui::widgets::RenderContext { model: &self.model, theme: &theme, keymap: &keymap, in_flight: &self.in_flight };

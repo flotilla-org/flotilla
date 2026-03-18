@@ -22,7 +22,7 @@ use crate::{
         BranchInputKind, InFlightCommand, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiHostState, TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
-    keymap::Keymap,
+    keymap::{Keymap, ModeId},
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
     shimmer::{shimmer_spans, Shimmer},
     status_bar::{
@@ -100,6 +100,7 @@ pub fn render(
     theme: &Theme,
     _keymap: &Keymap,
     frame: &mut Frame,
+    active_widget_mode: Option<ModeId>,
 ) {
     let constraints = vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)];
     let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
@@ -116,9 +117,8 @@ pub fn render(
     } else {
         chunks[2]
     };
-    render_status_bar(model, ui, in_flight, theme, frame, status_bar_area);
+    render_status_bar(model, ui, in_flight, theme, frame, status_bar_area, active_widget_mode);
     render_command_palette(ui, theme, frame, status_bar_area);
-    render_action_menu(model, ui, theme, frame);
     render_input_popup(ui, theme, frame);
     render_delete_confirm(model, ui, theme, frame);
     render_close_confirm(model, ui, theme, frame);
@@ -244,12 +244,13 @@ fn render_status_bar(
     theme: &Theme,
     frame: &mut Frame,
     area: Rect,
+    active_widget_mode: Option<ModeId>,
 ) {
     ui.layout.status_bar.area = area;
     ui.layout.status_bar.key_targets.clear();
     ui.layout.status_bar.dismiss_targets.clear();
 
-    let content = status_bar_content(model, ui, in_flight);
+    let content = status_bar_content(model, ui, in_flight, active_widget_mode);
     let status_section = content.status.clone();
     let status_model = StatusBarModel::build(StatusBarInput {
         width: area.width as usize,
@@ -357,8 +358,46 @@ struct StatusBarContent {
     mode_indicators: Vec<ModeIndicator>,
 }
 
-fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, InFlightCommand>) -> StatusBarContent {
+fn status_bar_content(
+    model: &TuiModel,
+    ui: &UiState,
+    in_flight: &HashMap<u64, InFlightCommand>,
+    active_widget_mode: Option<ModeId>,
+) -> StatusBarContent {
     let visible_error = collect_visible_status_items(model, ui).into_iter().next();
+
+    // Widget stack overrides UiMode for status bar content.
+    if let Some(widget_mode) = active_widget_mode {
+        match widget_mode {
+            ModeId::Help => {
+                return StatusBarContent {
+                    status: StatusSection::plain("HELP"),
+                    keys: vec![
+                        key_chip("j", "Down", KeyCode::Char('j')),
+                        key_chip("k", "Up", KeyCode::Char('k')),
+                        key_chip("ESC", "Close", KeyCode::Esc),
+                        key_chip("?", "Close", KeyCode::Char('?')),
+                    ],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            ModeId::ActionMenu => {
+                return StatusBarContent {
+                    status: StatusSection::plain("ACTIONS"),
+                    keys: vec![
+                        key_chip("j", "Down", KeyCode::Char('j')),
+                        key_chip("k", "Up", KeyCode::Char('k')),
+                        key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
+                        key_chip("ESC", "Close", KeyCode::Esc),
+                    ],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            _ => {} // Other widget modes will be handled as they are extracted
+        }
+    }
 
     match &ui.mode {
         UiMode::Normal => {
@@ -447,17 +486,22 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
             task: None,
             mode_indicators: vec![],
         },
-        UiMode::Help => StatusBarContent {
-            status: StatusSection::plain("HELP"),
-            keys: vec![
-                key_chip("j", "Down", KeyCode::Char('j')),
-                key_chip("k", "Up", KeyCode::Char('k')),
-                key_chip("ESC", "Close", KeyCode::Esc),
-                key_chip("?", "Close", KeyCode::Char('?')),
-            ],
-            task: None,
-            mode_indicators: vec![],
-        },
+        UiMode::Help => {
+            // Help is now on the widget stack — this branch is only reached if
+            // UiMode::Help lingers from legacy code paths.  Fall through to the
+            // widget-mode override above, which handles ModeId::Help.
+            StatusBarContent {
+                status: StatusSection::plain("HELP"),
+                keys: vec![
+                    key_chip("j", "Down", KeyCode::Char('j')),
+                    key_chip("k", "Up", KeyCode::Char('k')),
+                    key_chip("ESC", "Close", KeyCode::Esc),
+                    key_chip("?", "Close", KeyCode::Char('?')),
+                ],
+                task: None,
+                mode_indicators: vec![],
+            }
+        }
         UiMode::CommandPalette { ref input, .. } => {
             let status_text = format!("/{}", input.value());
             StatusBarContent {
@@ -1019,29 +1063,6 @@ fn render_debug_panel(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut
     let panel =
         Paragraph::new(text).block(Block::bordered().style(theme.block_style()).title(" Debug (D to toggle) ")).wrap(Wrap { trim: true });
     frame.render_widget(panel, area);
-}
-
-fn render_action_menu(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
-    let UiMode::ActionMenu { ref items, index } = ui.mode else {
-        return;
-    };
-
-    let area = ui_helpers::popup_area(frame.area(), 40, 40);
-    ui.layout.menu_area = area;
-    frame.render_widget(Clear, area);
-
-    let labels = model.active_labels();
-    let list_items: Vec<ListItem> =
-        items.iter().enumerate().map(|(i, intent)| ListItem::new(format!(" {}: {}", i + 1, intent.label(labels)))).collect();
-
-    let list = List::new(list_items)
-        .block(Block::bordered().style(theme.block_style()).title(" Actions "))
-        .highlight_style(Style::default().bg(theme.action_highlight).bold())
-        .highlight_symbol("▸ ");
-
-    let mut state = ListState::default();
-    state.select(Some(index));
-    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_input_popup(ui: &UiState, theme: &Theme, frame: &mut Frame) {
