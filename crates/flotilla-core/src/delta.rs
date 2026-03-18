@@ -358,6 +358,7 @@ mod tests {
             source: None,
             terminal_keys: vec![],
             attachable_set_id: None,
+            agent_keys: vec![],
         }
     }
 

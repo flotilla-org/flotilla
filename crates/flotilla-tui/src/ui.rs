@@ -776,6 +776,12 @@ fn build_item_row<'a>(
         } else {
             String::new()
         }
+    } else if let Some(agent_key) = item.agent_keys.first() {
+        if let Some(agent) = providers.agents.get(agent_key.as_str()) {
+            ui_helpers::agent_status_display(&agent.status)
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };

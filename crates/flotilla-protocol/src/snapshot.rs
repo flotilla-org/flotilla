@@ -106,6 +106,8 @@ pub struct WorkItem {
     pub terminal_keys: Vec<crate::ManagedTerminalId>,
     #[serde(default)]
     pub attachable_set_id: Option<AttachableSetId>,
+    #[serde(default)]
+    pub agent_keys: Vec<String>,
 }
 
 impl WorkItem {
@@ -247,6 +249,7 @@ mod tests {
                     source: None,
                     terminal_keys: vec![],
                     attachable_set_id: None,
+                    agent_keys: vec![],
                 },
                 WorkItem {
                     kind: WorkItemKind::Session,
@@ -264,6 +267,7 @@ mod tests {
                     source: None,
                     terminal_keys: vec![],
                     attachable_set_id: None,
+                    agent_keys: vec![],
                 },
             ],
             providers: ProviderData::default(),
@@ -301,6 +305,7 @@ mod tests {
                 source: None,
                 terminal_keys: vec![],
                 attachable_set_id: None,
+                agent_keys: vec![],
             },
             WorkItem {
                 kind: WorkItemKind::Checkout,
@@ -318,6 +323,7 @@ mod tests {
                 source: None,
                 terminal_keys: vec![],
                 attachable_set_id: None,
+                agent_keys: vec![],
             },
         ];
 

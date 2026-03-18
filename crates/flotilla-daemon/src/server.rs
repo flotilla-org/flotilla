@@ -256,7 +256,7 @@ impl DaemonServer {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
 
-        let agent_state_store = flotilla_core::agents::shared_file_backed_agent_state_store(flotilla_core::config::flotilla_config_dir());
+        let agent_state_store = Arc::clone(daemon.agent_state_store());
 
         Ok(Self {
             daemon,
@@ -1945,6 +1945,10 @@ async fn dispatch_request(ctx: &DispatchContext<'_>, id: u64, request: Request) 
                 } else {
                     Ok(())
                 }
+                // NOTE: agent state changes are not pushed to the TUI immediately.
+                // They become visible on the next refresh cycle (~10s). A proper fix
+                // requires the log-based architecture (#256) where push events can
+                // trigger targeted view re-materialization without a full provider refresh.
             })();
 
             match result {

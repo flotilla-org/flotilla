@@ -618,6 +618,7 @@ pub struct InProcessDaemon {
     session_id: uuid::Uuid,
     /// Static local host summary published to peers.
     local_host_summary: HostSummary,
+    agent_state_store: crate::agents::SharedAgentStateStore,
 }
 
 impl InProcessDaemon {
@@ -637,6 +638,7 @@ impl InProcessDaemon {
 
         // Run host detection once before the repo loop
         let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
+        let agent_state_store = crate::agents::shared_file_backed_agent_state_store(crate::config::flotilla_config_dir());
 
         for path in repo_paths {
             if path_identities.contains_key(&path) {
@@ -660,7 +662,7 @@ impl InProcessDaemon {
 
             let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
             let slug = repo_slug.clone();
-            let mut model = RepoModel::new(path.clone(), registry, repo_slug, attachable_store);
+            let mut model = RepoModel::new(path.clone(), registry, repo_slug, attachable_store, Arc::clone(&agent_state_store));
             model.data.loading = true;
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
@@ -706,6 +708,7 @@ impl InProcessDaemon {
             active_command: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4(),
             local_host_summary,
+            agent_state_store,
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -741,6 +744,10 @@ impl InProcessDaemon {
 
     pub fn local_host_summary(&self) -> &HostSummary {
         &self.local_host_summary
+    }
+
+    pub fn agent_state_store(&self) -> &crate::agents::SharedAgentStateStore {
+        &self.agent_state_store
     }
 
     /// Returns the current connection status for a peer host.
@@ -1839,7 +1846,13 @@ impl InProcessDaemon {
         }
         let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
         let slug = repo_slug.clone();
-        let mut model = RepoModel::new(path.clone(), registry, repo_slug, self.discovery.shared_attachable_store(&self.config));
+        let mut model = RepoModel::new(
+            path.clone(),
+            registry,
+            repo_slug,
+            self.discovery.shared_attachable_store(&self.config),
+            Arc::clone(&self.agent_state_store),
+        );
         model.data.loading = true;
         let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 

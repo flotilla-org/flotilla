@@ -71,11 +71,18 @@ pub struct RepoModel {
 }
 
 impl RepoModel {
-    pub fn new(repo_root: PathBuf, registry: ProviderRegistry, repo_slug: Option<String>, attachable_store: SharedAttachableStore) -> Self {
+    pub fn new(
+        repo_root: PathBuf,
+        registry: ProviderRegistry,
+        repo_slug: Option<String>,
+        attachable_store: SharedAttachableStore,
+        agent_state_store: crate::agents::SharedAgentStateStore,
+    ) -> Self {
         let labels = labels_from_registry(&registry);
         let registry = Arc::new(registry);
         let criteria = RepoCriteria { repo_slug };
-        let refresh_handle = RepoRefreshHandle::spawn(repo_root, registry.clone(), criteria, attachable_store, Duration::from_secs(10));
+        let refresh_handle =
+            RepoRefreshHandle::spawn(repo_root, registry.clone(), criteria, attachable_store, agent_state_store, Duration::from_secs(10));
         Self { registry, data: DataStore::default(), labels, refresh_handle }
     }
 
@@ -415,6 +422,7 @@ mod tests {
             reg,
             Some("owner/repo".to_string()),
             crate::attachable::shared_file_backed_attachable_store("/tmp"),
+            crate::agents::shared_in_memory_agent_state_store(),
         );
 
         assert_eq!(model.labels.checkouts.section, "Checkouts");
@@ -435,7 +443,13 @@ mod tests {
     #[tokio::test]
     async fn repo_model_new_with_empty_registry_uses_default_labels() {
         let reg = ProviderRegistry::new();
-        let model = RepoModel::new(PathBuf::from("/tmp/empty"), reg, None, crate::attachable::shared_file_backed_attachable_store("/tmp"));
+        let model = RepoModel::new(
+            PathBuf::from("/tmp/empty"),
+            reg,
+            None,
+            crate::attachable::shared_file_backed_attachable_store("/tmp"),
+            crate::agents::shared_in_memory_agent_state_store(),
+        );
         assert_eq!(model.labels.checkouts.section, "\u{2014}");
         assert_eq!(model.labels.change_requests.section, "\u{2014}");
         model.refresh_handle.trigger_refresh();

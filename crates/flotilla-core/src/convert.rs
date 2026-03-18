@@ -87,6 +87,7 @@ pub fn correlation_result_to_work_item(item: &CorrelationResult, groups: &[Corre
         source: item.source().map(|s| s.to_string()),
         terminal_keys: item.terminal_ids().to_vec(),
         attachable_set_id: item.attachable_set_id().cloned(),
+        agent_keys: item.agent_keys().to_vec(),
     }
 }
 
@@ -101,6 +102,7 @@ fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
             CorItemKind::CloudSession => "Session",
             CorItemKind::Workspace => "Workspace",
             CorItemKind::ManagedTerminal => "Terminal",
+            CorItemKind::Agent => "Agent",
         };
         lines.push(format!("  {}: {} [{:?}]", kind_label, ci.title, ci.source_key));
         for key in &ci.correlation_keys {
@@ -318,6 +320,7 @@ mod tests {
             host: Some(test_host()),
             source: None,
             terminal_ids: vec![],
+            agent_keys: vec![],
         });
 
         let proto = correlation_result_to_work_item(&item, &[], &test_host());
@@ -380,6 +383,7 @@ mod tests {
             host: Some(test_host()),
             source: Some(hostname.clone()),
             terminal_ids: vec![],
+            agent_keys: vec![],
         });
         let proto = correlation_result_to_work_item(&item, &[], &test_host());
         assert_eq!(proto.source, Some(hostname));
@@ -401,6 +405,7 @@ mod tests {
             host: None,
             source: Some("Claude".to_string()),
             terminal_ids: vec![],
+            agent_keys: vec![],
         });
         let proto = correlation_result_to_work_item(&item, &[], &test_host());
         assert_eq!(proto.source, Some("Claude".to_string()));
@@ -446,6 +451,7 @@ mod tests {
             linked_issues: vec![],
             workspace_refs: vec![],
             terminal_ids: vec![],
+            agent_keys: vec![],
             correlation_group_idx: 0,
             host: Some(remote_host.clone()),
             source: None,

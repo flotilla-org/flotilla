@@ -15,6 +15,7 @@ pub enum ItemKind {
     CloudSession,
     Workspace,
     ManagedTerminal,
+    Agent,
 }
 
 /// A key that uniquely identifies a provider item by its natural identity.
@@ -26,6 +27,7 @@ pub enum ProviderItemKey {
     Session(String),
     Workspace(String),
     ManagedTerminal(String),
+    Agent(String),
 }
 
 /// A single item submitted for correlation.

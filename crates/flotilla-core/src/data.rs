@@ -55,6 +55,7 @@ pub enum CorrelatedAnchor {
     AttachableSet(flotilla_protocol::AttachableSetId),
     ChangeRequest(String),
     Session(String),
+    Agent(String),
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +73,7 @@ pub struct CorrelatedWorkItem {
     pub host: Option<flotilla_protocol::HostName>,
     pub source: Option<String>,
     pub terminal_ids: Vec<flotilla_protocol::ManagedTerminalId>,
+    pub agent_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,7 @@ impl CorrelationResult {
                 CorrelatedAnchor::AttachableSet(_) => WorkItemKind::AttachableSet,
                 CorrelatedAnchor::ChangeRequest(_) => WorkItemKind::ChangeRequest,
                 CorrelatedAnchor::Session(_) => WorkItemKind::Session,
+                CorrelatedAnchor::Agent(_) => WorkItemKind::Agent,
             },
             CorrelationResult::Standalone(s) => match s {
                 StandaloneResult::Issue { .. } => WorkItemKind::Issue,
@@ -188,6 +191,13 @@ impl CorrelationResult {
         }
     }
 
+    pub fn agent_keys(&self) -> &[String] {
+        match self {
+            CorrelationResult::Correlated(c) => &c.agent_keys,
+            _ => &[],
+        }
+    }
+
     pub fn correlation_group_idx(&self) -> Option<usize> {
         match self {
             CorrelationResult::Correlated(c) => Some(c.correlation_group_idx),
@@ -227,6 +237,7 @@ impl CorrelationResult {
                 CorrelatedAnchor::AttachableSet(id) => WorkItemIdentity::AttachableSet(id.clone()),
                 CorrelatedAnchor::ChangeRequest(key) => WorkItemIdentity::ChangeRequest(key.clone()),
                 CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
+                CorrelatedAnchor::Agent(key) => WorkItemIdentity::Agent(key.clone()),
             },
             CorrelationResult::Standalone(s) => match s {
                 StandaloneResult::Issue { key, .. } => WorkItemIdentity::Issue(key.clone()),
@@ -283,6 +294,8 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
     let mut attachable_set_id: Option<flotilla_protocol::AttachableSetId> = None;
     let mut change_request_key: Option<String> = None;
     let mut session_key: Option<String> = None;
+    let mut agent_key: Option<String> = None;
+    let mut agent_keys: Vec<String> = Vec::new();
     let mut workspace_refs: Vec<String> = Vec::new();
     let mut terminal_ids: Vec<flotilla_protocol::ManagedTerminalId> = Vec::new();
     let mut host: Option<flotilla_protocol::HostName> = None;
@@ -311,6 +324,12 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
             (CorItemKind::CloudSession, ProviderItemKey::Session(id)) => {
                 if session_key.is_none() {
                     session_key = Some(id.clone());
+                }
+            }
+            (CorItemKind::Agent, ProviderItemKey::Agent(id)) => {
+                agent_keys.push(id.clone());
+                if agent_key.is_none() {
+                    agent_key = Some(id.clone());
                 }
             }
             (CorItemKind::Workspace, ProviderItemKey::Workspace(ws_ref)) => {
@@ -343,6 +362,8 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         (CorrelatedAnchor::ChangeRequest(key), None, session_key.clone())
     } else if let Some(key) = session_key.clone() {
         (CorrelatedAnchor::Session(key), None, None)
+    } else if let Some(key) = agent_key.clone() {
+        (CorrelatedAnchor::Agent(key), None, None)
     } else {
         return None;
     };
@@ -360,6 +381,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
 
     let pr_title = pr_ref.and_then(|k| providers.change_requests.get(k)).map(|cr| cr.title.clone()).filter(|t| !t.is_empty());
     let session_title = session_ref.and_then(|k| providers.sessions.get(k)).map(|s| s.title.clone()).filter(|t| !t.is_empty());
+    let agent_title = agent_key.as_deref().and_then(|k| providers.agents.get(k)).map(|a| format!("{:?}", a.harness));
     let set_description = attachable_set_id.as_ref().and_then(|id| {
         providers.attachable_sets.get(id).and_then(|set| {
             set.checkout
@@ -369,7 +391,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
                 .or_else(|| Some(id.to_string()))
         })
     });
-    let description = pr_title.or(session_title).or_else(|| branch.clone()).or(set_description).unwrap_or_default();
+    let description = pr_title.or(session_title).or(agent_title).or_else(|| branch.clone()).or(set_description).unwrap_or_default();
 
     let source = match &anchor {
         CorrelatedAnchor::Checkout(co) => Some(co.key.host.to_string()),
@@ -381,6 +403,9 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         }
         CorrelatedAnchor::Session(key) => {
             providers.sessions.get(key.as_str()).map(|s| s.provider_display_name.clone()).filter(|s| !s.is_empty())
+        }
+        CorrelatedAnchor::Agent(key) => {
+            providers.agents.get(key.as_str()).map(|a| a.provider_display_name.clone()).filter(|s| !s.is_empty())
         }
     };
 
@@ -398,6 +423,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         host,
         source,
         terminal_ids,
+        agent_keys,
     }))
 }
 
@@ -476,6 +502,16 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
                 .map(|id| vec![CorrelationKey::AttachableSet(id.clone())])
                 .unwrap_or_default(),
             source_key: ProviderItemKey::ManagedTerminal(key.clone()),
+        });
+    }
+
+    for (id, agent) in &providers.agents {
+        items.push(CorrelatedItem {
+            provider_name: "agent".to_string(),
+            kind: CorItemKind::Agent,
+            title: format!("{:?}", agent.harness),
+            correlation_keys: agent.correlation_keys.clone(),
+            source_key: ProviderItemKey::Agent(id.clone()),
         });
     }
 
@@ -839,6 +875,7 @@ mod tests {
             host: None,
             source: None,
             terminal_ids: vec![],
+            agent_keys: vec![],
         }
     }
 
@@ -1387,6 +1424,68 @@ mod tests {
         assert_eq!(items[0].change_request_key(), Some("10"));
         // Description comes from PR title since it's non-empty
         assert_eq!(items[0].description(), "Add auth");
+    }
+
+    #[test]
+    fn correlate_agent_only_becomes_agent_anchor() {
+        let mut providers = new_providers();
+        providers.agents.insert("att-1".to_string(), flotilla_protocol::Agent {
+            harness: flotilla_protocol::AgentHarness::ClaudeCode,
+            status: flotilla_protocol::AgentStatus::Active,
+            model: Some("opus-4".into()),
+            context: flotilla_protocol::AgentContext::Local { attachable_id: flotilla_protocol::AttachableId::new("att-1") },
+            correlation_keys: vec![],
+            provider_name: "cli-agent".into(),
+            provider_display_name: "CLI Agent".into(),
+            item_noun: "agent".into(),
+        });
+
+        let (items, _) = correlate(&providers);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind(), WorkItemKind::Agent);
+    }
+
+    #[test]
+    fn correlate_agent_with_terminal_via_attachable_set() {
+        let mut providers = new_providers();
+        let set_id = flotilla_protocol::AttachableSetId::new("set-1");
+
+        // Terminal in set-1
+        providers.managed_terminals.insert("t1".to_string(), flotilla_protocol::ManagedTerminal {
+            id: flotilla_protocol::ManagedTerminalId { checkout: "feat".into(), role: "agent".into(), index: 0 },
+            role: "agent".into(),
+            command: "claude".into(),
+            working_directory: PathBuf::from("/repo/feat"),
+            status: flotilla_protocol::TerminalStatus::Running,
+            attachable_id: Some(flotilla_protocol::AttachableId::new("att-1")),
+            attachable_set_id: Some(set_id.clone()),
+        });
+
+        // AttachableSet
+        providers.attachable_sets.insert(set_id.clone(), make_attachable_set("set-1", "/repo/feat"));
+
+        // Checkout in same set (via CheckoutPath)
+        providers.checkouts.insert(hp("/repo/feat"), make_checkout("feat-branch", "/repo/feat", false));
+
+        // Agent with same attachable set key
+        providers.agents.insert("att-1".to_string(), flotilla_protocol::Agent {
+            harness: flotilla_protocol::AgentHarness::ClaudeCode,
+            status: flotilla_protocol::AgentStatus::Active,
+            model: None,
+            context: flotilla_protocol::AgentContext::Local { attachable_id: flotilla_protocol::AttachableId::new("att-1") },
+            correlation_keys: vec![CorrelationKey::AttachableSet(set_id)],
+            provider_name: "cli-agent".into(),
+            provider_display_name: "CLI Agent".into(),
+            item_noun: "agent".into(),
+        });
+
+        let (items, _) = correlate(&providers);
+        // Checkout is the anchor (higher priority than agent), both correlated together
+        let checkout_items: Vec<_> = items.iter().filter(|wi| wi.kind() == WorkItemKind::Checkout).collect();
+        assert_eq!(checkout_items.len(), 1, "agent and checkout should merge into one work item");
+        // The standalone agent shouldn't appear since it merged with the checkout
+        let agent_items: Vec<_> = items.iter().filter(|wi| wi.kind() == WorkItemKind::Agent).collect();
+        assert_eq!(agent_items.len(), 0, "agent should merge with checkout, not appear standalone");
     }
 
     #[test]

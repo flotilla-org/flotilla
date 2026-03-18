@@ -52,6 +52,7 @@ impl RepoRefreshHandle {
         registry: Arc<ProviderRegistry>,
         criteria: RepoCriteria,
         attachable_store: SharedAttachableStore,
+        agent_state_store: crate::agents::SharedAgentStateStore,
         interval: Duration,
     ) -> Self {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(RefreshSnapshot::default()));
@@ -69,7 +70,8 @@ impl RepoRefreshHandle {
 
                 // Fetch all provider data
                 let mut provider_data = ProviderData::default();
-                let errors = refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, &attachable_store).await;
+                let errors =
+                    refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, &attachable_store, &agent_state_store).await;
                 let provider_health = compute_provider_health(&registry, &errors);
 
                 // Correlate
@@ -158,6 +160,7 @@ async fn refresh_providers(
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
     attachable_store: &SharedAttachableStore,
+    agent_state_store: &crate::agents::SharedAgentStateStore,
 ) -> Vec<RefreshError> {
     let mut errors = Vec::new();
 
@@ -245,6 +248,7 @@ async fn refresh_providers(
     pd.managed_terminals = managed_terminals.into_iter().map(|t| (t.id.to_string(), t)).collect();
     collect_errors(&mut errors, "terminals", tp_errors);
     project_attachable_data(pd, registry, attachable_store);
+    project_agent_data(pd, agent_state_store);
     {
         use flotilla_protocol::delta::{Branch, BranchStatus};
         let remote = branches;
@@ -304,6 +308,37 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
     referenced_set_ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     pd.attachable_sets =
         referenced_set_ids.into_iter().filter_map(|set_id| store.registry().sets.get(&set_id).cloned().map(|set| (set_id, set))).collect();
+}
+
+fn project_agent_data(pd: &mut ProviderData, agent_state_store: &crate::agents::SharedAgentStateStore) {
+    let Ok(store) = agent_state_store.lock() else {
+        tracing::warn!("agent state store lock poisoned while projecting agent data");
+        return;
+    };
+    for (attachable_id, entry) in store.list_agents() {
+        // Only include agents whose terminal is in this repo's managed_terminals.
+        // Without this check, every agent would appear in every tracked repo.
+        let matching_terminal = pd.managed_terminals.values().find(|t| t.attachable_id.as_ref() == Some(&attachable_id));
+        let Some(terminal) = matching_terminal else {
+            continue;
+        };
+        let correlation_keys = terminal
+            .attachable_set_id
+            .clone()
+            .map(|set_id| vec![flotilla_protocol::CorrelationKey::AttachableSet(set_id)])
+            .unwrap_or_default();
+
+        pd.agents.insert(attachable_id.to_string(), flotilla_protocol::Agent {
+            harness: entry.harness,
+            status: entry.status,
+            model: entry.model,
+            context: flotilla_protocol::AgentContext::Local { attachable_id },
+            correlation_keys,
+            provider_name: "cli-agent".to_string(),
+            provider_display_name: "CLI Agent".to_string(),
+            item_noun: "agent".to_string(),
+        });
+    }
 }
 
 fn compute_provider_health(registry: &ProviderRegistry, errors: &[RefreshError]) -> HashMap<(&'static str, String), bool> {
@@ -638,6 +673,10 @@ mod tests {
         crate::attachable::shared_in_memory_attachable_store()
     }
 
+    fn test_agent_state_store() -> crate::agents::SharedAgentStateStore {
+        crate::agents::shared_in_memory_agent_state_store()
+    }
+
     fn refresh_error(category: &'static str) -> RefreshError {
         RefreshError { category, provider: String::new(), message: format!("{category} failure") }
     }
@@ -707,7 +746,15 @@ mod tests {
     #[tokio::test]
     async fn refresh_empty_registry_produces_empty_data() {
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &ProviderRegistry::new(), &criteria(), &test_attachable_store()).await;
+        let errors = refresh_providers(
+            &mut pd,
+            &repo_root(),
+            &ProviderRegistry::new(),
+            &criteria(),
+            &test_attachable_store(),
+            &test_agent_state_store(),
+        )
+        .await;
 
         assert!(errors.is_empty());
         assert!(pd.checkouts.is_empty());
@@ -747,7 +794,8 @@ mod tests {
         );
 
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store()).await;
+        let errors =
+            refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store()).await;
 
         assert!(errors.is_empty());
         assert_eq!(pd.checkouts.len(), 1);
@@ -820,7 +868,8 @@ mod tests {
         registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("checkout failed")));
 
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store()).await;
+        let errors =
+            refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store()).await;
 
         assert!(errors.iter().any(|e| e.category == "checkouts"));
         assert!(pd.checkouts.is_empty());
@@ -840,7 +889,8 @@ mod tests {
         registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail")));
 
         let mut pd = ProviderData::default();
-        let errors = refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store()).await;
+        let errors =
+            refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store()).await;
 
         let categories: HashSet<&str> = errors.iter().map(|e| e.category).collect();
         for expected in ["PRs", "merged", "sessions", "branches", "workspaces"] {
@@ -861,6 +911,7 @@ mod tests {
             Arc::new(ProviderRegistry::new()),
             criteria(),
             test_attachable_store(),
+            test_agent_state_store(),
             Duration::from_secs(3600),
         );
 
@@ -876,8 +927,14 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.cloud_agents.insert("claude", desc("MockCA"), Arc::new(MockCloudAgent::failing("agent offline")));
 
-        let handle =
-            RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), test_attachable_store(), Duration::from_secs(3600));
+        let handle = RepoRefreshHandle::spawn(
+            repo_root(),
+            Arc::new(registry),
+            criteria(),
+            test_attachable_store(),
+            test_agent_state_store(),
+            Duration::from_secs(3600),
+        );
 
         let mut rx = handle.snapshot_rx.clone();
         let snapshot = wait_for_snapshot(&mut rx).await;
@@ -892,6 +949,7 @@ mod tests {
             Arc::new(ProviderRegistry::new()),
             criteria(),
             test_attachable_store(),
+            test_agent_state_store(),
             Duration::from_secs(3600),
         );
 
@@ -923,8 +981,14 @@ mod tests {
         registry.cloud_agents.insert("claude", desc("Claude"), Arc::new(MockCloudAgent::ok_named("Claude", vec![])));
         registry.cloud_agents.insert("cursor", desc("Cursor"), Arc::new(MockCloudAgent::failing_named("Cursor", "auth failed")));
 
-        let handle =
-            RepoRefreshHandle::spawn(repo_root(), Arc::new(registry), criteria(), test_attachable_store(), Duration::from_secs(3600));
+        let handle = RepoRefreshHandle::spawn(
+            repo_root(),
+            Arc::new(registry),
+            criteria(),
+            test_attachable_store(),
+            test_agent_state_store(),
+            Duration::from_secs(3600),
+        );
 
         let mut rx = handle.snapshot_rx.clone();
         let snapshot = wait_for_snapshot(&mut rx).await;

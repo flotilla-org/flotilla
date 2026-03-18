@@ -97,6 +97,17 @@ pub fn session_status_display(status: &SessionStatus) -> &'static str {
     }
 }
 
+/// Return the display string for an agent status.
+pub fn agent_status_display(status: &flotilla_protocol::AgentStatus) -> String {
+    match status {
+        flotilla_protocol::AgentStatus::Active => "▶".to_string(),
+        flotilla_protocol::AgentStatus::Idle => "◆".to_string(),
+        flotilla_protocol::AgentStatus::WaitingForPermission => "⏳".to_string(),
+        flotilla_protocol::AgentStatus::WaitingForInput => "⏳".to_string(),
+        flotilla_protocol::AgentStatus::Errored => "⚠".to_string(),
+    }
+}
+
 /// Return the display icon for a change request status.
 pub fn change_request_status_icon(status: &ChangeRequestStatus) -> &'static str {
     match status {
