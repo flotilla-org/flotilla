@@ -203,12 +203,10 @@ fn sample_remote_host_summary(name: &str) -> HostSummary {
 }
 
 fn definitely_remote_host() -> HostName {
-    let local = HostName::local().to_string();
-    let candidate = "peer-feta";
-    if local == candidate {
-        HostName::new("peer-udder")
+    if HostName::local().to_string() == "test-remote-host" {
+        HostName::new("test-remote-host-alt")
     } else {
-        HostName::new(candidate)
+        HostName::new("test-remote-host")
     }
 }
 

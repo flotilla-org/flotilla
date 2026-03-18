@@ -235,7 +235,8 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     listener.set_nonblocking(true).map_err(|err| format!("set listener nonblocking: {err}"))?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let pty_fd = spawn_pty_child(&session)?;
+    let pty_child = spawn_pty_child(&session)?;
+    let pty_fd = pty_child.master_fd;
     set_nonblocking(pty_fd)?;
     let mut vt_engine = default_vt_engine();
 
@@ -334,7 +335,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
             }
         }
 
-        if child_exited()?.is_some() {
+        if child_exited(pty_child.pid)?.is_some() {
             break;
         }
     }
@@ -404,12 +405,21 @@ struct PollResult {
     pty_readable: bool,
 }
 
+struct PtyChild {
+    master_fd: RawFd,
+    pid: Pid,
+}
+
 fn poll_ready(listener_fd: RawFd, client_fd: Option<RawFd>, pty_fd: RawFd, timeout_ms: i32) -> Result<PollResult, String> {
-    let listener_borrowed = borrow_fd(listener_fd);
-    let pty_borrowed = borrow_fd(pty_fd);
+    // SAFETY: the fds are owned by this process and remain open for the duration of the poll call.
+    let listener_borrowed = unsafe { BorrowedFd::borrow_raw(listener_fd) };
+    // SAFETY: the fd is owned by this process and remains open for the duration of the poll call.
+    let pty_borrowed = unsafe { BorrowedFd::borrow_raw(pty_fd) };
     let mut fds = vec![PollFd::new(listener_borrowed, PollFlags::POLLIN), PollFd::new(pty_borrowed, PollFlags::POLLIN)];
     let client_index = if let Some(fd) = client_fd {
-        fds.push(PollFd::new(borrow_fd(fd), PollFlags::POLLIN));
+        // SAFETY: the client fd is owned by this process and remains open for the duration of the poll call.
+        let client_borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        fds.push(PollFd::new(client_borrowed, PollFlags::POLLIN));
         Some(fds.len() - 1)
     } else {
         None
@@ -440,11 +450,6 @@ fn has_pollin(fd: &PollFd<'_>) -> bool {
     fd.revents().map(|flags| flags.contains(PollFlags::POLLIN)).unwrap_or(false)
 }
 
-fn borrow_fd(fd: RawFd) -> BorrowedFd<'static> {
-    // SAFETY: callers only pass live fds owned by this process, and the borrowed view is used immediately.
-    unsafe { BorrowedFd::borrow_raw(fd) }
-}
-
 fn current_terminal_size() -> (u16, u16) {
     #[cfg(unix)]
     {
@@ -470,11 +475,11 @@ fn load_session(root: &Path, id: &str) -> Result<Option<SessionMetadata>, String
 }
 
 #[cfg(unix)]
-fn spawn_pty_child(session: &SessionMetadata) -> Result<RawFd, String> {
+fn spawn_pty_child(session: &SessionMetadata) -> Result<PtyChild, String> {
     // SAFETY: `forkpty` creates a child attached to a new PTY; parent receives the owned master fd.
     let result = unsafe { forkpty(None, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
     match result {
-        ForkptyResult::Parent { master, .. } => Ok(master.into_raw_fd()),
+        ForkptyResult::Parent { master, child } => Ok(PtyChild { master_fd: master.into_raw_fd(), pid: child }),
         ForkptyResult::Child => {
             if let Some(cwd) = &session.cwd {
                 let _ = chdir(cwd);
@@ -500,7 +505,8 @@ fn spawn_pty_child(session: &SessionMetadata) -> Result<RawFd, String> {
 
 #[cfg(unix)]
 fn set_nonblocking(fd: RawFd) -> Result<(), String> {
-    let borrowed = borrow_fd(fd);
+    // SAFETY: the fd is owned by this process and remains open for the duration of these fcntl calls.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let flags = fcntl(borrowed, FcntlArg::F_GETFL).map_err(|err| format!("fcntl F_GETFL failed: {err}"))?;
     let mut oflags = OFlag::from_bits_retain(flags);
     oflags.insert(OFlag::O_NONBLOCK);
@@ -510,24 +516,37 @@ fn set_nonblocking(fd: RawFd) -> Result<(), String> {
 
 #[cfg(unix)]
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-    nix_read(borrow_fd(fd), buf).map_err(std::io::Error::from)
+    // SAFETY: the fd is owned by this process and remains open for the duration of the read call.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    nix_read(borrowed, buf).map_err(std::io::Error::from)
 }
 
 #[cfg(unix)]
 fn write_fd_all(fd: RawFd, mut bytes: &[u8]) -> Result<(), String> {
     while !bytes.is_empty() {
-        match nix_write(borrow_fd(fd), bytes) {
+        // SAFETY: the fd is owned by this process and remains open for the duration of the write call.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match nix_write(borrowed, bytes) {
             Ok(written) => bytes = &bytes[written..],
             Err(err) => {
                 let err = std::io::Error::from(err);
                 if err.kind() == std::io::ErrorKind::WouldBlock {
-                    thread::sleep(Duration::from_millis(5));
+                    wait_for_writable(fd)?;
                     continue;
                 }
                 return Err(format!("write pty input: {err}"));
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_writable(fd: RawFd) -> Result<(), String> {
+    // SAFETY: the fd is owned by this process and remains open for the duration of the poll call.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut fds = [PollFd::new(borrowed, PollFlags::POLLOUT)];
+    poll(&mut fds, PollTimeout::NONE).map_err(|err| format!("poll writable pty fd: {err}"))?;
     Ok(())
 }
 
@@ -544,8 +563,8 @@ fn resize_pty(fd: RawFd, cols: u16, rows: u16) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn child_exited() -> Result<Option<i32>, String> {
-    match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+fn child_exited(child_pid: Pid) -> Result<Option<i32>, String> {
+    match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::StillAlive) => Ok(None),
         Ok(_) => Ok(Some(1)),
         Err(nix::errno::Errno::ECHILD) => Ok(None),
@@ -555,9 +574,18 @@ fn child_exited() -> Result<Option<i32>, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
 
     use super::{apply_attach_state, default_vt_engine, is_executable_file, record_pty_output, resolve_bollard_executable};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn default_vt_engine_starts_with_default_size() {
@@ -577,6 +605,7 @@ mod tests {
 
     #[test]
     fn resolve_bollard_executable_prefers_cargo_bin_env() {
+        let _lock = env_lock().lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let bollard = temp.path().join("bollard");
         fs::write(&bollard, b"#!/bin/sh\n").expect("write fake bollard");
@@ -594,6 +623,7 @@ mod tests {
 
     #[test]
     fn resolve_bollard_executable_falls_back_to_path() {
+        let _lock = env_lock().lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).expect("create bin dir");

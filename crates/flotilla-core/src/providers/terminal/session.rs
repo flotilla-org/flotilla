@@ -218,7 +218,7 @@ impl TerminalPool for SessionTerminalPool {
             .ok()
             .and_then(|store| Self::find_persisted_session_id(store.as_ref(), id))
             .unwrap_or_else(|| terminal_session_binding_ref(id));
-        let mut parts = vec![self.binary.clone(), "attach".into(), sq(&session_id), "--cwd".into(), sq(&cwd.display().to_string())];
+        let mut parts = vec![sq(&self.binary), "attach".into(), sq(&session_id), "--cwd".into(), sq(&cwd.display().to_string())];
         if !command.is_empty() || !env_vars.is_empty() {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             let env_prefix = if env_vars.is_empty() {
@@ -303,7 +303,7 @@ mod tests {
 
         let command = pool.attach_command(&id, "bash", Path::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert!(command.contains("bollard attach"));
+        assert!(command.contains("'bollard' attach"));
         assert!(command.contains("'flotilla/feat/shell/0'"));
         assert!(command.contains("--cwd '/repo'"));
     }
