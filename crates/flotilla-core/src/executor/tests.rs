@@ -8,7 +8,9 @@ use super::{
     checkout::{resolve_checkout_branch, validate_checkout_target, write_branch_issue_links, CheckoutIntent},
     execute,
     session_actions::resolve_attach_command,
-    terminals::{build_terminal_env_vars, escape_for_double_quotes, resolve_terminal_pool, wrap_remote_attach_commands},
+    terminals::{
+        build_terminal_env_vars, escape_for_double_quotes, resolve_terminal_pool, wrap_remote_attach_commands, TerminalPreparationService,
+    },
     workspace_config, ExecutionPlan, ExecutorStepResolver, RepoExecutionContext,
 };
 use crate::{
@@ -1139,6 +1141,48 @@ impl TerminalPool for MockTerminalPool {
     }
     async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
         self.killed.lock().await.push(id.clone());
+        Ok(())
+    }
+}
+
+struct ConfigurableTerminalPool {
+    ensured: tokio::sync::Mutex<Vec<ManagedTerminalId>>,
+    attached: tokio::sync::Mutex<Vec<ManagedTerminalId>>,
+    ensure_failures: Vec<ManagedTerminalId>,
+    attach_failures: Vec<ManagedTerminalId>,
+}
+
+#[async_trait]
+impl TerminalPool for ConfigurableTerminalPool {
+    async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
+        Ok(vec![])
+    }
+
+    async fn ensure_running(&self, id: &ManagedTerminalId, _cmd: &str, _cwd: &Path) -> Result<(), String> {
+        self.ensured.lock().await.push(id.clone());
+        if self.ensure_failures.contains(id) {
+            Err(format!("failed to ensure {id}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn attach_command(
+        &self,
+        id: &ManagedTerminalId,
+        _cmd: &str,
+        _cwd: &Path,
+        _env_vars: &crate::providers::terminal::TerminalEnvVars,
+    ) -> Result<String, String> {
+        self.attached.lock().await.push(id.clone());
+        if self.attach_failures.contains(id) {
+            Err(format!("failed to attach {id}"))
+        } else {
+            Ok(format!("attach:{}:{}:{}", id.checkout, id.role, id.index))
+        }
+    }
+
+    async fn kill_terminal(&self, _id: &ManagedTerminalId) -> Result<(), String> {
         Ok(())
     }
 }
@@ -2391,6 +2435,99 @@ content:
     assert!(config.resolved_commands.is_none());
 }
 
+#[tokio::test]
+async fn prepare_terminal_commands_wraps_requested_commands_and_falls_back_on_attach_error() {
+    let mock_pool = Arc::new(ConfigurableTerminalPool {
+        ensured: tokio::sync::Mutex::new(Vec::new()),
+        attached: tokio::sync::Mutex::new(Vec::new()),
+        ensure_failures: vec![],
+        attach_failures: vec![ManagedTerminalId { checkout: "feat".into(), role: "main".into(), index: 1 }],
+    });
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let mut registry = empty_registry();
+    registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
+
+    let service = TerminalPreparationService::new(&registry, Path::new("/config"), &store, None);
+    let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }, PreparedTerminalCommand {
+        role: "main".into(),
+        command: "bash".into(),
+    }];
+
+    let result = service
+        .prepare_terminal_commands("feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))
+        .await
+        .expect("prepare requested terminal commands");
+
+    assert_eq!(result, vec![
+        PreparedTerminalCommand { role: "main".into(), command: "attach:feat:main:0".into() },
+        PreparedTerminalCommand { role: "main".into(), command: "bash".into() },
+    ]);
+
+    let ensured = mock_pool.ensured.lock().await;
+    assert_eq!(&*ensured, &[ManagedTerminalId { checkout: "feat".into(), role: "main".into(), index: 0 }, ManagedTerminalId {
+        checkout: "feat".into(),
+        role: "main".into(),
+        index: 1
+    },]);
+    let attached = mock_pool.attached.lock().await;
+    assert_eq!(&*attached, &[ManagedTerminalId { checkout: "feat".into(), role: "main".into(), index: 0 }, ManagedTerminalId {
+        checkout: "feat".into(),
+        role: "main".into(),
+        index: 1
+    },]);
+}
+
+#[tokio::test]
+async fn resolve_terminal_pool_skips_ensure_failure_and_attach_failure() {
+    let mock_pool = Arc::new(ConfigurableTerminalPool {
+        ensured: tokio::sync::Mutex::new(Vec::new()),
+        attached: tokio::sync::Mutex::new(Vec::new()),
+        ensure_failures: vec![ManagedTerminalId { checkout: "test-branch".into(), role: "main".into(), index: 0 }],
+        attach_failures: vec![ManagedTerminalId { checkout: "test-branch".into(), role: "aux".into(), index: 0 }],
+    });
+    let yaml = r#"
+content:
+  - role: main
+    type: terminal
+    command: "claude"
+  - role: aux
+    type: terminal
+    command: "bash"
+"#;
+    let mut config = WorkspaceConfig {
+        name: "test-branch".to_string(),
+        working_directory: PathBuf::from("/repo/wt"),
+        template_vars: std::collections::HashMap::new(),
+        template_yaml: Some(yaml.to_string()),
+        resolved_commands: None,
+    };
+
+    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
+
+    assert_eq!(
+        config.resolved_commands, None,
+        "ensure failure should skip the first entry and attach failure should skip recording the second"
+    );
+}
+
+#[tokio::test]
+async fn resolve_terminal_pool_invalid_template_uses_default() {
+    let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+    let mut config = WorkspaceConfig {
+        name: "test-branch".to_string(),
+        working_directory: PathBuf::from("/repo/wt"),
+        template_vars: [("main_command".to_string(), "claude".to_string())].into_iter().collect(),
+        template_yaml: Some("content: [".to_string()),
+        resolved_commands: None,
+    };
+
+    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
+
+    let commands = config.resolved_commands.expect("invalid template should fall back to default template");
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, "main");
+}
+
 // -----------------------------------------------------------------------
 // Tests: build_terminal_env_vars
 // -----------------------------------------------------------------------
@@ -2618,6 +2755,39 @@ fn wrap_remote_attach_commands_per_host_multiplex_override() {
         .expect("wrap remote attach commands");
 
     assert!(!result[0].command.contains("ControlMaster"), "per-host override should disable multiplex, got: {}", result[0].command);
+}
+
+#[test]
+fn wrap_remote_attach_commands_unknown_host_errors() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("hosts.toml"),
+        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
+    )
+    .expect("write hosts config");
+
+    let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
+    let err = wrap_remote_attach_commands(&HostName::new("laptop"), &PathBuf::from("/home/dev/project"), &commands, temp.path())
+        .expect_err("unknown host should error");
+
+    assert!(err.contains("unknown remote host"));
+}
+
+#[test]
+fn wrap_remote_attach_commands_disables_multiplex_when_control_dir_creation_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("hosts.toml"),
+        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
+    )
+    .expect("write hosts config");
+    std::fs::write(temp.path().join("ssh"), "not-a-directory").expect("create conflicting ssh file");
+
+    let commands = vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }];
+    let result = wrap_remote_attach_commands(&HostName::new("desktop"), &PathBuf::from("/home/dev/project"), &commands, temp.path())
+        .expect("wrap remote attach commands");
+
+    assert!(!result[0].command.contains("ControlMaster"), "multiplex should be disabled when ctrl dir creation fails");
 }
 
 // -----------------------------------------------------------------------
