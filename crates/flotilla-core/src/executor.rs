@@ -13,22 +13,12 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
-use flotilla_protocol::CheckoutSelector;
-#[cfg(test)]
-use flotilla_protocol::PreparedTerminalCommand;
 use flotilla_protocol::{CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId};
 use tracing::{debug, error, info};
 
-#[cfg(test)]
-use self::checkout::validate_checkout_target;
-#[cfg(test)]
-use self::session_actions::resolve_attach_command;
-#[cfg(test)]
-use self::terminals::{build_terminal_env_vars, escape_for_double_quotes, resolve_terminal_pool, wrap_remote_attach_commands};
 use self::{
     checkout::{resolve_checkout_branch, write_branch_issue_links, CheckoutIntent, CheckoutService},
-    session_actions::SessionActionService,
+    session_actions::{ReadOnlySessionActionService, TeleportSessionActionService},
     terminals::TerminalPreparationService,
     workspace::WorkspaceOrchestrator,
 };
@@ -246,7 +236,7 @@ async fn build_teleport_session_plan(
     daemon_socket_path: Option<PathBuf>,
     local_host: flotilla_protocol::HostName,
 ) -> ExecutionPlan {
-    let session_actions = SessionActionService::new(
+    let session_actions = TeleportSessionActionService::new(
         &repo_root,
         registry.as_ref(),
         providers_data.as_ref(),
@@ -284,7 +274,7 @@ async fn build_teleport_session_plan(
             host: StepHost::Local,
             action: StepAction::Closure(Box::new(move |_prior| {
                 Box::pin(async move {
-                    let session_actions = SessionActionService::new(
+                    let session_actions = TeleportSessionActionService::new(
                         &repo_root,
                         registry.as_ref(),
                         providers_data.as_ref(),
@@ -322,7 +312,7 @@ async fn build_teleport_session_plan(
                     if slot.lock().await.is_some() {
                         return Ok(StepOutcome::Skipped);
                     }
-                    let session_actions = SessionActionService::new(
+                    let session_actions = TeleportSessionActionService::new(
                         &repo_root,
                         registry.as_ref(),
                         providers_data.as_ref(),
@@ -359,7 +349,7 @@ async fn build_teleport_session_plan(
                     let path =
                         path_slot.lock().await.clone().ok_or_else(|| "Could not determine checkout path for teleport".to_string())?;
                     let teleport_cmd = teleport_slot.lock().await.clone().ok_or_else(|| "Attach command not resolved".to_string())?;
-                    let session_actions = SessionActionService::new(
+                    let session_actions = TeleportSessionActionService::new(
                         &repo_root,
                         registry.as_ref(),
                         providers_data.as_ref(),
@@ -447,7 +437,7 @@ async fn build_archive_session_plan(
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
 ) -> ExecutionPlan {
-    let session_actions = SessionActionService::new_read_only(registry.as_ref(), providers_data.as_ref());
+    let session_actions = ReadOnlySessionActionService::new(registry.as_ref(), providers_data.as_ref());
 
     if !session_actions.should_run_archive_as_step(&session_id) {
         return ExecutionPlan::Immediate(session_actions.archive_session_result(&session_id).await);
@@ -458,7 +448,7 @@ async fn build_archive_session_plan(
         host: StepHost::Local,
         action: StepAction::Closure(Box::new(move |_prior| {
             Box::pin(async move {
-                let session_actions = SessionActionService::new_read_only(registry.as_ref(), providers_data.as_ref());
+                let session_actions = ReadOnlySessionActionService::new(registry.as_ref(), providers_data.as_ref());
                 match session_actions.archive_session_result(&session_id).await {
                     CommandResult::Error { message } => Err(message),
                     result => Ok(StepOutcome::CompletedWith(result)),
@@ -473,7 +463,7 @@ async fn build_generate_branch_name_plan(
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
 ) -> ExecutionPlan {
-    let session_actions = SessionActionService::new_read_only(registry.as_ref(), providers_data.as_ref());
+    let session_actions = ReadOnlySessionActionService::new(registry.as_ref(), providers_data.as_ref());
 
     if !session_actions.should_run_generate_branch_name_as_step() {
         return ExecutionPlan::Immediate(session_actions.generate_branch_name_result(&issue_keys).await);
@@ -484,7 +474,7 @@ async fn build_generate_branch_name_plan(
         host: StepHost::Local,
         action: StepAction::Closure(Box::new(move |_prior| {
             Box::pin(async move {
-                let session_actions = SessionActionService::new_read_only(registry.as_ref(), providers_data.as_ref());
+                let session_actions = ReadOnlySessionActionService::new(registry.as_ref(), providers_data.as_ref());
                 Ok(StepOutcome::CompletedWith(session_actions.generate_branch_name_result(&issue_keys).await))
             })
         })),
@@ -671,34 +661,18 @@ pub async fn execute(
         }
 
         CommandAction::ArchiveSession { session_id } => {
-            let session_actions = SessionActionService::new(
-                &repo.root,
-                registry,
-                providers_data,
-                config_base,
-                attachable_store,
-                daemon_socket_path,
-                local_host,
-            );
+            let session_actions = ReadOnlySessionActionService::new(registry, providers_data);
             session_actions.archive_session_result(&session_id).await
         }
 
         CommandAction::GenerateBranchName { issue_keys } => {
-            let session_actions = SessionActionService::new(
-                &repo.root,
-                registry,
-                providers_data,
-                config_base,
-                attachable_store,
-                daemon_socket_path,
-                local_host,
-            );
+            let session_actions = ReadOnlySessionActionService::new(registry, providers_data);
             session_actions.generate_branch_name_result(&issue_keys).await
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
             info!(%session_id, "teleporting to session");
-            let session_actions = SessionActionService::new(
+            let session_actions = TeleportSessionActionService::new(
                 &repo.root,
                 registry,
                 providers_data,

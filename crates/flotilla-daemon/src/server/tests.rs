@@ -1,19 +1,49 @@
-use std::{path::Path, sync::Mutex as StdMutex, time::Duration as StdDuration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+    time::Duration as StdDuration,
+};
 
 use async_trait::async_trait;
-use flotilla_core::providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote};
+use flotilla_core::{
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+    providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
+};
 use flotilla_protocol::{
-    Checkout, CheckoutTarget, Command, CommandAction, CommandPeerEvent, CommandResult, DaemonEvent, HostName, HostPath, HostSummary,
-    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, Request, Response, ResponseResult,
-    RoutedPeerMessage, StreamKey, VectorClock,
+    Checkout, CheckoutTarget, Command, CommandAction, CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName,
+    HostPath, HostSummary, Message, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity,
+    RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage, StreamKey, VectorClock, PROTOCOL_VERSION,
 };
 use indexmap::IndexMap;
-use tokio::sync::oneshot;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader, BufWriter},
+    sync::{mpsc, oneshot, watch, Mutex, Notify},
+    time::Duration,
+};
 
-use super::*;
+use super::{
+    handle_client,
+    peer_runtime::{
+        disconnect_peer_and_rebuild, forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer,
+        should_send_local_version, ForwardResult,
+    },
+    remote_commands::{
+        extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
+        PendingRemoteCommand, PendingRemoteCommandMap, RemoteCommandRouter,
+    },
+    request_dispatch::RequestDispatcher,
+    shared::{sync_peer_query_state, write_message, SocketPeerSender},
+    DaemonServer, PeerConnectedNotice,
+};
 use crate::peer::{
     test_support::{ensure_test_connection_generation, handle_test_peer_data},
-    PeerSender,
+    PeerManager, PeerSender,
 };
 
 struct CapturePeerSender {
@@ -1710,7 +1740,7 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
     let gen_a = {
         let mut pm = peer_manager.lock().await;
         ensure_test_connection_generation(&mut pm, &HostName::new("peer-a"), || {
-            Arc::new(super::SocketPeerSender { tx: tokio::sync::Mutex::new(Some(mpsc::channel(1).0)) }) as Arc<dyn PeerSender>
+            Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(Some(mpsc::channel(1).0)) }) as Arc<dyn PeerSender>
         })
     };
 

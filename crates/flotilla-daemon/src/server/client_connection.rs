@@ -1,6 +1,18 @@
-use flotilla_protocol::Request;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
-use super::*;
+use flotilla_core::{agents::SharedAgentStateStore, daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_protocol::{Message, Request};
+use tokio::sync::{watch, Notify};
+use tracing::{error, info, warn};
+
+use super::{
+    remote_commands::RemoteCommandRouter,
+    request_dispatch::RequestDispatcher,
+    shared::{write_message, ConnectionLines, ConnectionWriter},
+};
 
 pub(super) struct ClientConnection {
     daemon: Arc<InProcessDaemon>,

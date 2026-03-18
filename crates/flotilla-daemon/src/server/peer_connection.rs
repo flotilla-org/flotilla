@@ -1,4 +1,16 @@
-use super::*;
+use std::sync::Arc;
+
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::{GoodbyeReason, HostName, Message, PeerConnectionState, PeerWireMessage, PROTOCOL_VERSION};
+use tokio::sync::{mpsc, watch, Mutex};
+use tracing::{error, warn};
+
+use super::{
+    peer_runtime::disconnect_peer_and_rebuild,
+    shared::{write_message, ConnectionLines, ConnectionWriter},
+    sync_peer_query_state, ConnectionDirection, ConnectionMeta, PeerConnectedNotice, SocketPeerSender,
+};
+use crate::peer::{ActivationResult, InboundPeerEnvelope, PeerManager};
 
 pub(super) struct PeerConnection {
     daemon: Arc<InProcessDaemon>,

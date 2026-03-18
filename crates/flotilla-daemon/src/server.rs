@@ -12,46 +12,28 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use flotilla_core::{
-    agents::{AgentEntry, SharedAgentStateStore},
-    config::ConfigStore,
-    daemon::DaemonHandle,
-    in_process::InProcessDaemon,
-    providers::discovery::DiscoveryRuntime,
+    agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
-use flotilla_protocol::{
-    Command, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, Message, PeerConnectionState, PeerDataMessage, PeerWireMessage,
-    RepoIdentity, PROTOCOL_VERSION,
-};
-use futures::future::join_all;
+use flotilla_protocol::{ConfigLabel, HostName, Message};
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
     net::UnixListener,
     sync::{mpsc, watch, Mutex, Notify},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-#[cfg(test)]
-use self::peer_runtime::{
-    forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer, should_send_local_version,
-    ForwardResult,
-};
-#[cfg(test)]
-use self::remote_commands::{extract_command_repo_identity, ForwardedCommand, ForwardedCommandState, PendingRemoteCommand};
 use self::{
     client_connection::ClientConnection,
     peer_connection::PeerConnection,
-    peer_runtime::{disconnect_peer_and_rebuild, PeerRuntime},
+    peer_runtime::PeerRuntime,
     remote_commands::{ForwardedCommandMap, PendingRemoteCancelMap, PendingRemoteCommandMap, RemoteCommandRouter},
-    request_dispatch::RequestDispatcher,
-    shared::{sync_peer_query_state, write_message, ConnectionLines, ConnectionWriter, SocketPeerSender},
+    shared::{sync_peer_query_state, ConnectionWriter, SocketPeerSender},
 };
-use crate::peer::{
-    ActivationResult, ConnectionDirection, ConnectionMeta, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender, SshTransport,
-};
+use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport};
 
 /// Notification sent from connection sites to the outbound task when a
 /// peer connects or reconnects. The outbound task responds by sending

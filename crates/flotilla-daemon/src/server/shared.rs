@@ -1,6 +1,14 @@
-use async_trait::async_trait;
+use std::sync::Arc;
 
-use super::*;
+use async_trait::async_trait;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::{GoodbyeReason, Message, PeerWireMessage};
+use tokio::{
+    io::{BufReader, BufWriter},
+    sync::{mpsc, Mutex},
+};
+
+use crate::peer::{PeerManager, PeerSender};
 
 pub(super) struct SocketPeerSender {
     pub(super) tx: tokio::sync::Mutex<Option<mpsc::Sender<Message>>>,

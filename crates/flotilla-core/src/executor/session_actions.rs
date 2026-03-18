@@ -13,47 +13,23 @@ use crate::{
     },
 };
 
-pub(super) struct SessionActionService<'a> {
-    repo_root: Option<&'a Path>,
+pub(super) struct ReadOnlySessionActionService<'a> {
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
-    config_base: Option<&'a Path>,
-    attachable_store: Option<&'a SharedAttachableStore>,
-    daemon_socket_path: Option<&'a Path>,
-    local_host: Option<&'a HostName>,
 }
 
-impl<'a> SessionActionService<'a> {
-    pub(super) fn new(
-        repo_root: &'a Path,
-        registry: &'a ProviderRegistry,
-        providers_data: &'a ProviderData,
-        config_base: &'a Path,
-        attachable_store: &'a SharedAttachableStore,
-        daemon_socket_path: Option<&'a Path>,
-        local_host: &'a HostName,
-    ) -> Self {
-        Self {
-            repo_root: Some(repo_root),
-            registry,
-            providers_data,
-            config_base: Some(config_base),
-            attachable_store: Some(attachable_store),
-            daemon_socket_path,
-            local_host: Some(local_host),
-        }
-    }
+pub(super) struct TeleportSessionActionService<'a> {
+    read_only: ReadOnlySessionActionService<'a>,
+    repo_root: &'a Path,
+    config_base: &'a Path,
+    attachable_store: &'a SharedAttachableStore,
+    daemon_socket_path: Option<&'a Path>,
+    local_host: &'a HostName,
+}
 
-    pub(super) fn new_read_only(registry: &'a ProviderRegistry, providers_data: &'a ProviderData) -> Self {
-        Self {
-            repo_root: None,
-            registry,
-            providers_data,
-            config_base: None,
-            attachable_store: None,
-            daemon_socket_path: None,
-            local_host: None,
-        }
+impl<'a> ReadOnlySessionActionService<'a> {
+    pub(super) fn new(registry: &'a ProviderRegistry, providers_data: &'a ProviderData) -> Self {
+        Self { registry, providers_data }
     }
 
     pub(super) fn should_run_archive_as_step(&self, session_id: &str) -> bool {
@@ -133,6 +109,31 @@ impl<'a> SessionActionService<'a> {
     pub(super) async fn resolve_attach_command(&self, session_id: &str) -> Result<String, String> {
         resolve_attach_command(session_id, self.registry, self.providers_data).await
     }
+}
+
+impl<'a> TeleportSessionActionService<'a> {
+    pub(super) fn new(
+        repo_root: &'a Path,
+        registry: &'a ProviderRegistry,
+        providers_data: &'a ProviderData,
+        config_base: &'a Path,
+        attachable_store: &'a SharedAttachableStore,
+        daemon_socket_path: Option<&'a Path>,
+        local_host: &'a HostName,
+    ) -> Self {
+        Self {
+            read_only: ReadOnlySessionActionService::new(registry, providers_data),
+            repo_root,
+            config_base,
+            attachable_store,
+            daemon_socket_path,
+            local_host,
+        }
+    }
+
+    pub(super) async fn resolve_attach_command(&self, session_id: &str) -> Result<String, String> {
+        self.read_only.resolve_attach_command(session_id).await
+    }
 
     pub(super) async fn resolve_teleport_checkout_path(
         &self,
@@ -145,10 +146,14 @@ impl<'a> SessionActionService<'a> {
 
         match branch {
             Some(branch_name) => {
-                let checkout_manager =
-                    self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-                let repo_root = self.repo_root.ok_or_else(|| "bug: session action missing repo root".to_string())?;
-                let (path, _checkout) = checkout_manager.create_checkout(repo_root, branch_name, false).await?;
+                let checkout_manager = self
+                    .read_only
+                    .registry
+                    .checkout_managers
+                    .preferred()
+                    .cloned()
+                    .ok_or_else(|| "No checkout manager available".to_string())?;
+                let (path, _checkout) = checkout_manager.create_checkout(self.repo_root, branch_name, false).await?;
                 Ok(Some(path))
             }
             None => Ok(None),
@@ -161,20 +166,22 @@ impl<'a> SessionActionService<'a> {
         branch: Option<&str>,
         teleport_cmd: &str,
     ) -> Result<(), String> {
-        let repo_root = self.repo_root.ok_or_else(|| "bug: session action missing repo root".to_string())?;
-        let config_base = self.config_base.ok_or_else(|| "bug: session action missing config base".to_string())?;
-        let attachable_store = self.attachable_store.ok_or_else(|| "bug: session action missing attachable store".to_string())?;
-        let local_host = self.local_host.ok_or_else(|| "bug: session action missing local host".to_string())?;
-        let workspace_orchestrator =
-            WorkspaceOrchestrator::new(repo_root, self.registry, config_base, attachable_store, self.daemon_socket_path, local_host);
+        let workspace_orchestrator = WorkspaceOrchestrator::new(
+            self.repo_root,
+            self.read_only.registry,
+            self.config_base,
+            self.attachable_store,
+            self.daemon_socket_path,
+            self.local_host,
+        );
         let name = branch.unwrap_or("session");
         workspace_orchestrator.create_workspace_for_teleport(checkout_path, name, teleport_cmd).await
     }
 
     fn checkout_path_from_key(&self, checkout_key: Option<&PathBuf>) -> Option<PathBuf> {
         checkout_key.and_then(|key| {
-            let host_key = flotilla_protocol::HostPath::new(self.local_host?.clone(), key.clone());
-            self.providers_data.checkouts.get(&host_key).map(|_| key.clone())
+            let host_key = flotilla_protocol::HostPath::new(self.local_host.clone(), key.clone());
+            self.read_only.providers_data.checkouts.get(&host_key).map(|_| key.clone())
         })
     }
 }

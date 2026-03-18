@@ -1,4 +1,18 @@
-use super::*;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_protocol::{DaemonEvent, HostName, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RoutedPeerMessage};
+use futures::future::join_all;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, info, warn};
+
+use super::{remote_commands::RemoteCommandRouter, shared::sync_peer_query_state, PeerConnectedNotice, SshTransport};
+use crate::peer::{HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
 
 pub(super) enum ForwardResult {
     Disconnected,
@@ -491,16 +505,16 @@ pub(super) async fn rebuild_peer_overlays(
     }
 }
 
-pub(super) async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManager>>, requests: Vec<flotilla_protocol::RoutedPeerMessage>) {
+pub(super) async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManager>>, requests: Vec<RoutedPeerMessage>) {
     for request in requests {
         let target = match &request {
-            flotilla_protocol::RoutedPeerMessage::RequestResync { target_host, .. } => target_host.clone(),
-            flotilla_protocol::RoutedPeerMessage::ResyncSnapshot { requester_host, .. } => requester_host.clone(),
-            flotilla_protocol::RoutedPeerMessage::CommandRequest { target_host, .. } => target_host.clone(),
-            flotilla_protocol::RoutedPeerMessage::CommandCancelRequest { target_host, .. } => target_host.clone(),
-            flotilla_protocol::RoutedPeerMessage::CommandEvent { requester_host, .. } => requester_host.clone(),
-            flotilla_protocol::RoutedPeerMessage::CommandResponse { requester_host, .. } => requester_host.clone(),
-            flotilla_protocol::RoutedPeerMessage::CommandCancelResponse { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::RequestResync { target_host, .. } => target_host.clone(),
+            RoutedPeerMessage::ResyncSnapshot { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::CommandRequest { target_host, .. } => target_host.clone(),
+            RoutedPeerMessage::CommandCancelRequest { target_host, .. } => target_host.clone(),
+            RoutedPeerMessage::CommandEvent { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::CommandResponse { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::CommandCancelResponse { requester_host, .. } => requester_host.clone(),
         };
         let sender = {
             let pm = peer_manager.lock().await;

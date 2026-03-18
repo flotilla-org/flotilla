@@ -1,27 +1,43 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use super::*;
+use super::{
+    build_plan,
+    checkout::{resolve_checkout_branch, validate_checkout_target, write_branch_issue_links, CheckoutIntent},
+    execute,
+    session_actions::resolve_attach_command,
+    terminals::{build_terminal_env_vars, escape_for_double_quotes, resolve_terminal_pool, wrap_remote_attach_commands},
+    workspace_config, ExecutionPlan, ExecutorStepResolver, RepoExecutionContext,
+};
 use crate::{
     attachable::{AttachableStore, BindingObjectKind, SharedAttachableStore},
+    provider_data::ProviderData,
     providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::{ProviderCategory, ProviderDescriptor},
         issue_tracker::IssueTracker,
+        registry::ProviderRegistry,
         terminal::TerminalPool,
         testing::MockRunner,
         types::*,
         vcs::CheckoutManager,
         workspace::WorkspaceManager,
     },
+    step::{StepAction, StepOutcome, StepResolver},
 };
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
 }
 use async_trait::async_trait;
-use flotilla_protocol::{HostName, HostPath, RepoSelector};
+use flotilla_protocol::{
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId,
+    PreparedTerminalCommand, RepoSelector,
+};
 
 fn hp(path: &str) -> HostPath {
     HostPath::new(HostName::local(), PathBuf::from(path))
@@ -1805,7 +1821,7 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
 
     assert_checkout_removed_branch(execute_result, "feat-x");
     let execute_killed = execute_pool.killed.lock().await;
-    assert_eq!(execute_killed.as_slice(), &[terminal_id.clone()]);
+    assert_eq!(execute_killed.as_slice(), std::slice::from_ref(&terminal_id));
     drop(execute_killed);
 
     let plan_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });

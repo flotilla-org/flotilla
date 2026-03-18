@@ -1,6 +1,14 @@
-use flotilla_protocol::{CommandAction, RepoSelector, Request, Response};
+use std::sync::Arc;
 
-use super::*;
+use flotilla_core::{
+    agents::{AgentEntry, SharedAgentStateStore},
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+};
+use flotilla_protocol::{AgentHookEvent, Command, CommandAction, Message, RepoSelector, Request, Response};
+use tracing::warn;
+
+use super::remote_commands::RemoteCommandRouter;
 
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
@@ -123,7 +131,7 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
-    fn handle_agent_hook(&self, event: flotilla_protocol::AgentHookEvent) -> Result<(), String> {
+    fn handle_agent_hook(&self, event: AgentHookEvent) -> Result<(), String> {
         use flotilla_protocol::AgentEventType;
 
         tracing::info!(
