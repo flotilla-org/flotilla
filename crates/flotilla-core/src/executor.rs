@@ -3,17 +3,23 @@
 //! Takes a `Command`, the repo context, and returns a `CommandResult`.
 //! No UI state mutation — all results are carried in the return value.
 
+mod checkout;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+#[cfg(test)]
+use flotilla_protocol::CheckoutSelector;
 use flotilla_protocol::{
-    AttachableSetId, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId,
-    PreparedTerminalCommand,
+    AttachableSetId, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
 };
 use tracing::{debug, error, info, warn};
 
+#[cfg(test)]
+use self::checkout::validate_checkout_target;
+use self::checkout::{resolve_checkout_branch, write_branch_issue_links, CheckoutIntent, CheckoutService};
 use crate::{
     attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
     data,
@@ -44,12 +50,6 @@ pub enum ExecutionPlan {
 pub struct RepoExecutionContext {
     pub identity: flotilla_protocol::RepoIdentity,
     pub root: PathBuf,
-}
-
-#[derive(Clone, Copy)]
-enum CheckoutIntent {
-    ExistingBranch,
-    FreshBranch,
 }
 
 /// Build an execution plan for a command.
@@ -105,7 +105,7 @@ pub async fn build_plan(
 
         CommandAction::RemoveCheckout { checkout, terminal_keys } => {
             match resolve_checkout_branch(&checkout, &providers_data, &local_host) {
-                Ok(branch) => build_remove_checkout_plan(branch, terminal_keys, repo.root, registry),
+                Ok(branch) => build_remove_checkout_plan(branch, terminal_keys, repo.root, registry, runner),
                 Err(message) => ExecutionPlan::Immediate(CommandResult::Error { message }),
             }
         }
@@ -180,7 +180,8 @@ async fn build_create_checkout_plan(
             host: StepHost::Local,
             action: StepAction::Closure(Box::new(move |_prior| {
                 Box::pin(async move {
-                    validate_checkout_target(&repo_root, &branch, intent, &*runner).await?;
+                    let checkout_service = CheckoutService::new(registry.as_ref(), runner.as_ref());
+                    checkout_service.validate_target(&repo_root, &branch, intent).await?;
                     // If checkout already exists, emit CheckoutCreated so the workspace
                     // step can find the path in prior outcomes.
                     if let Some(path) = existing {
@@ -189,8 +190,7 @@ async fn build_create_checkout_plan(
                         }
                         return Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch, path }));
                     }
-                    let cm = registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-                    let (path, _checkout) = cm.create_checkout(&repo_root, &branch, create_branch).await?;
+                    let path = checkout_service.create_checkout(&repo_root, &branch, create_branch).await?;
                     info!(checkout_path = %path.display(), "created checkout");
                     Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch, path }))
                 })
@@ -361,53 +361,19 @@ fn build_remove_checkout_plan(
     terminal_keys: Vec<ManagedTerminalId>,
     repo_root: PathBuf,
     registry: Arc<ProviderRegistry>,
+    runner: Arc<dyn CommandRunner>,
 ) -> ExecutionPlan {
-    let mut steps = Vec::new();
-
-    // Step 1: Remove checkout
-    {
-        let branch = branch.clone();
-        let repo_root = repo_root.clone();
-        let registry = Arc::clone(&registry);
-        steps.push(Step {
-            description: format!("Remove checkout for branch {branch}"),
-            host: StepHost::Local,
-            action: StepAction::Closure(Box::new(move |_prior| {
-                Box::pin(async move {
-                    let cm = registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-                    cm.remove_checkout(&repo_root, &branch).await?;
-                    Ok(StepOutcome::Completed)
-                })
-            })),
-        });
-    }
-
-    // Step 2: Clean up terminal sessions (best-effort)
-    if !terminal_keys.is_empty() {
-        let registry = Arc::clone(&registry);
-        steps.push(Step {
-            description: "Clean up terminal sessions".to_string(),
-            host: StepHost::Local,
-            action: StepAction::Closure(Box::new(move |_prior| {
-                Box::pin(async move {
-                    if let Some(tp) = registry.terminal_pools.preferred() {
-                        for terminal_id in &terminal_keys {
-                            if let Err(e) = tp.kill_terminal(terminal_id).await {
-                                warn!(
-                                    terminal = %terminal_id,
-                                    err = %e,
-                                    "failed to kill terminal session (best-effort)"
-                                );
-                            }
-                        }
-                    }
-                    Ok(StepOutcome::Completed)
-                })
-            })),
-        });
-    }
-
-    ExecutionPlan::Steps(StepPlan::new(steps))
+    ExecutionPlan::Steps(StepPlan::new(vec![Step {
+        description: format!("Remove checkout for branch {branch}"),
+        host: StepHost::Local,
+        action: StepAction::Closure(Box::new(move |_prior| {
+            Box::pin(async move {
+                let checkout_service = CheckoutService::new(registry.as_ref(), runner.as_ref());
+                checkout_service.remove_checkout(&repo_root, &branch, &terminal_keys).await?;
+                Ok(StepOutcome::Completed)
+            })
+        })),
+    }]))
 }
 
 /// Check if a workspace already exists for `checkout_path` and select it.
@@ -733,29 +699,24 @@ pub async fn execute(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            if let Err(message) = validate_checkout_target(&repo.root, &branch, intent, runner).await {
+            let checkout_service = CheckoutService::new(registry, runner);
+            if let Err(message) = checkout_service.validate_target(&repo.root, &branch, intent).await {
                 return CommandResult::Error { message };
             }
             info!(%branch, "creating checkout");
-            let checkout_result = if let Some(cm) = registry.checkout_managers.preferred() {
-                Some(cm.create_checkout(&repo.root, &branch, create_branch).await)
-            } else {
-                None
-            };
-            match checkout_result {
-                Some(Ok((checkout_path, _checkout))) => {
+            match checkout_service.create_checkout(&repo.root, &branch, create_branch).await {
+                Ok(checkout_path) => {
                     // Write issue links to git config
                     if !issue_ids.is_empty() {
-                        write_branch_issue_links(&repo.root, &branch, &issue_ids, runner).await;
+                        checkout_service.write_branch_issue_links(&repo.root, &branch, &issue_ids).await;
                     }
                     info!(checkout_path = %checkout_path.display(), "created checkout");
                     CommandResult::CheckoutCreated { branch: branch.clone(), path: checkout_path }
                 }
-                Some(Err(e)) => {
+                Err(e) => {
                     error!(err = %e, "create checkout failed");
                     CommandResult::Error { message: e }
                 }
-                None => CommandResult::Error { message: "No checkout manager available".to_string() },
             }
         }
 
@@ -791,34 +752,15 @@ pub async fn execute(
         }
 
         CommandAction::RemoveCheckout { checkout, terminal_keys } => {
+            let checkout_service = CheckoutService::new(registry, runner);
             let branch = match resolve_checkout_branch(&checkout, providers_data, local_host) {
                 Ok(branch) => branch,
                 Err(message) => return CommandResult::Error { message },
             };
             info!(%branch, "removing checkout");
-            let result = if let Some(cm) = registry.checkout_managers.preferred() {
-                Some(cm.remove_checkout(&repo.root, &branch).await)
-            } else {
-                None
-            };
-            match result {
-                Some(Ok(())) => {
-                    // Best-effort cleanup of correlated terminal sessions
-                    if let Some(tp) = registry.terminal_pools.preferred() {
-                        for terminal_id in &terminal_keys {
-                            if let Err(e) = tp.kill_terminal(terminal_id).await {
-                                warn!(
-                                    terminal = %terminal_id,
-                                    err = %e,
-                                    "failed to kill terminal session (best-effort)"
-                                );
-                            }
-                        }
-                    }
-                    CommandResult::CheckoutRemoved { branch }
-                }
-                Some(Err(e)) => CommandResult::Error { message: e },
-                None => CommandResult::Error { message: "No checkout manager available".to_string() },
+            match checkout_service.remove_checkout(&repo.root, &branch, &terminal_keys).await {
+                Ok(()) => CommandResult::CheckoutRemoved { branch },
+                Err(e) => CommandResult::Error { message: e },
             }
         }
 
@@ -998,56 +940,6 @@ async fn generate_branch_name_result(issue_keys: &[String], registry: &ProviderR
             let name = fallback.join("-");
             CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
         }
-    }
-}
-
-fn resolve_checkout_branch(
-    selector: &CheckoutSelector,
-    providers_data: &ProviderData,
-    local_host: &flotilla_protocol::HostName,
-) -> Result<String, String> {
-    match selector {
-        CheckoutSelector::Path(path) => providers_data
-            .checkouts
-            .iter()
-            .find(|(host_path, _)| host_path.host == *local_host && host_path.path == *path)
-            .map(|(_, checkout)| checkout.branch.clone())
-            .ok_or_else(|| format!("checkout not found: {}", path.display())),
-        CheckoutSelector::Query(query) => {
-            let matches: Vec<String> = providers_data
-                .checkouts
-                .iter()
-                .filter(|(host_path, checkout)| {
-                    host_path.host == *local_host
-                        && (checkout.branch == *query
-                            || checkout.branch.contains(query)
-                            || host_path.path.to_string_lossy().contains(query))
-                })
-                .map(|(_, checkout)| checkout.branch.clone())
-                .collect();
-            match matches.len() {
-                0 => Err(format!("checkout not found: {query}")),
-                1 => Ok(matches[0].clone()),
-                _ => Err(format!("checkout selector is ambiguous: {query}")),
-            }
-        }
-    }
-}
-
-async fn validate_checkout_target(
-    repo_root: &Path,
-    branch: &str,
-    intent: CheckoutIntent,
-    runner: &dyn CommandRunner,
-) -> Result<(), String> {
-    let local_exists = run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")], repo_root).is_ok();
-    let remote_exists =
-        run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")], repo_root).is_ok();
-    match intent {
-        CheckoutIntent::ExistingBranch if local_exists || remote_exists => Ok(()),
-        CheckoutIntent::ExistingBranch => Err(format!("branch not found: {branch}")),
-        CheckoutIntent::FreshBranch if local_exists || remote_exists => Err(format!("branch already exists: {branch}")),
-        CheckoutIntent::FreshBranch => Ok(()),
     }
 }
 
@@ -1372,22 +1264,5 @@ fn local_workspace_directory(repo_root: &Path, config_base: &Path) -> PathBuf {
     config_base.to_path_buf()
 }
 
-/// Write branch-to-issue links into git config.
-async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
-    use std::collections::HashMap;
-    let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (provider, id) in issue_ids {
-        by_provider.entry(provider.as_str()).or_default().push(id.as_str());
-    }
-    for (provider, ids) in by_provider {
-        let key = format!("branch.{branch}.flotilla.issues.{provider}");
-        let value = ids.join(",");
-        if let Err(e) = run!(runner, "git", &["config", &key, &value], repo_root) {
-            tracing::warn!(err = %e, "failed to write issue link");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;
-
