@@ -1055,6 +1055,91 @@
     }
 
     #[tokio::test]
+    async fn handle_client_streams_daemon_events_to_request_clients() {
+        let (_tmp, daemon) = empty_daemon().await;
+        let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let client_count = Arc::new(AtomicUsize::new(0));
+        let client_notify = Arc::new(Notify::new());
+        let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
+        let daemon_for_task = Arc::clone(&daemon);
+        let pm = Arc::clone(&peer_manager);
+        let count_ref = Arc::clone(&client_count);
+        let notify_ref = Arc::clone(&client_notify);
+        let handle = tokio::spawn(async move {
+            let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+            let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
+            let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+            handle_client(
+                server_stream,
+                daemon_for_task,
+                shutdown_rx,
+                peer_data_tx,
+                pm,
+                pending_remote_commands,
+                pending_remote_cancels,
+                next_remote_command_id,
+                count_ref,
+                notify_ref,
+                peer_connected_tx,
+                flotilla_core::agents::shared_in_memory_agent_state_store(),
+            )
+            .await;
+        });
+
+        let (read_half, write_half) = client_stream.into_split();
+        let mut reader = BufReader::new(read_half).lines();
+        let mut writer = BufWriter::new(write_half);
+
+        let request = Message::Request { id: 1, request: Request::ListRepos };
+        flotilla_protocol::framing::write_message_line(&mut writer, &request).await.expect("write request");
+
+        let response_line = reader.next_line().await.expect("read response").expect("response line");
+        let response_msg: Message = serde_json::from_str(&response_line).expect("parse response");
+        match ok_response(response_msg, 1) {
+            Response::ListRepos(_) => {}
+            other => panic!("expected ListRepos response, got {other:?}"),
+        }
+        assert_eq!(client_count.load(Ordering::SeqCst), 1, "request client should be tracked while connected");
+
+        let repo_identity = RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() };
+        let repo = PathBuf::from("/tmp/repo");
+        daemon.send_event(DaemonEvent::CommandStarted {
+            command_id: 77,
+            host: daemon.host_name().clone(),
+            repo_identity: repo_identity.clone(),
+            repo: repo.clone(),
+            description: "streamed event".to_string(),
+        });
+
+        let event_line = tokio::time::timeout(Duration::from_secs(2), reader.next_line())
+            .await
+            .expect("timeout waiting for event")
+            .expect("read event line")
+            .expect("event payload");
+        let event_msg: Message = serde_json::from_str(&event_line).expect("parse event");
+        match event_msg {
+            Message::Event { event } => match *event {
+                DaemonEvent::CommandStarted { command_id, repo_identity: event_identity, repo: event_repo, description, .. } => {
+                    assert_eq!(command_id, 77);
+                    assert_eq!(event_identity, repo_identity);
+                    assert_eq!(event_repo, repo);
+                    assert_eq!(description, "streamed event");
+                }
+                other => panic!("expected CommandStarted event, got {other:?}"),
+            },
+            other => panic!("expected event message, got {other:?}"),
+        }
+
+        drop(writer);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
+    }
+
+    #[tokio::test]
     async fn send_local_to_peer_sends_host_summary_for_empty_daemon() {
         let (_tmp, daemon) = empty_daemon().await;
         let peer = HostName::new("remote-host");
