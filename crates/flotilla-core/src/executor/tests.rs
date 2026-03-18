@@ -524,13 +524,9 @@ async fn prepare_terminal_for_checkout_returns_terminal_commands() {
     data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
     let runner = runner_ok();
 
-    let result = run_execute(
-        CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] },
-        &registry,
-        &data,
-        &runner,
-    )
-    .await;
+    let result =
+        run_execute(CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] }, &registry, &data, &runner)
+            .await;
 
     match result {
         CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
@@ -781,12 +777,8 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
 #[tokio::test]
 async fn create_workspace_for_checkout_selects_existing_workspace() {
     let checkout_path = PathBuf::from("/repo/wt-feat");
-    let existing_workspace = Workspace {
-        name: "feat".to_string(),
-        directories: vec![checkout_path.clone()],
-        correlation_keys: vec![],
-        attachable_set_id: None,
-    };
+    let existing_workspace =
+        Workspace { name: "feat".to_string(), directories: vec![checkout_path.clone()], correlation_keys: vec![], attachable_set_id: None };
     let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:42".to_string(), existing_workspace)]));
 
     let mut registry = empty_registry();
@@ -825,9 +817,7 @@ async fn checkout_action_does_not_create_workspace() {
     assert_checkout_created_branch(result, "feat-x");
     let calls = ws_mgr.calls.lock().await;
     assert!(
-        !calls
-            .iter()
-            .any(|c| c.starts_with("list_workspaces") || c.starts_with("select_workspace") || c.starts_with("create_workspace")),
+        !calls.iter().any(|c| c.starts_with("list_workspaces") || c.starts_with("select_workspace") || c.starts_with("create_workspace")),
         "checkout should not touch workspaces, got: {calls:?}"
     );
 }
@@ -884,12 +874,8 @@ async fn teleport_session_creates_workspace_even_when_one_exists() {
     // is session-specific. Reusing an existing workspace would attach to
     // whatever session was there before, not the requested one.
     let checkout_path = PathBuf::from("/repo/wt-feat");
-    let existing_workspace = Workspace {
-        name: "feat".to_string(),
-        directories: vec![checkout_path.clone()],
-        correlation_keys: vec![],
-        attachable_set_id: None,
-    };
+    let existing_workspace =
+        Workspace { name: "feat".to_string(), directories: vec![checkout_path.clone()], correlation_keys: vec![], attachable_set_id: None };
     let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:77".to_string(), existing_workspace)]));
 
     let mut registry = empty_registry();
@@ -1479,13 +1465,9 @@ async fn generate_branch_name_multiple_issues() {
     data.issues.insert("2".to_string(), make_issue("2", "Signup feature"));
     let runner = runner_ok();
 
-    let result = run_execute(
-        CommandAction::GenerateBranchName { issue_keys: vec!["1".to_string(), "2".to_string()] },
-        &registry,
-        &data,
-        &runner,
-    )
-    .await;
+    let result =
+        run_execute(CommandAction::GenerateBranchName { issue_keys: vec!["1".to_string(), "2".to_string()] }, &registry, &data, &runner)
+            .await;
 
     assert_branch_name_generated(result, "feat/login-and-signup", &[("github", "1"), ("github", "2")]);
 }
@@ -1772,9 +1754,11 @@ async fn checkout_create_plan_and_execute_return_same_checkout_created_result() 
     let plan_runner = MockRunner::new(vec![Err("not found".into()), Err("not found".into())]);
 
     let mut execute_registry = empty_registry();
-    execute_registry
-        .checkout_managers
-        .insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", expected_path.to_str().expect("utf8 path"))));
+    execute_registry.checkout_managers.insert(
+        "wt",
+        desc("wt"),
+        Arc::new(MockCheckoutManager::succeeding("feat-x", expected_path.to_str().expect("utf8 path"))),
+    );
 
     let execute_result = run_execute(fresh_checkout_action("feat-x"), &execute_registry, &empty_data(), &execute_runner).await;
 
@@ -1787,9 +1771,11 @@ async fn checkout_create_plan_and_execute_return_same_checkout_created_result() 
     }
 
     let mut plan_registry = empty_registry();
-    plan_registry
-        .checkout_managers
-        .insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", expected_path.to_str().expect("utf8 path"))));
+    plan_registry.checkout_managers.insert(
+        "wt",
+        desc("wt"),
+        Arc::new(MockCheckoutManager::succeeding("feat-x", expected_path.to_str().expect("utf8 path"))),
+    );
 
     let plan_result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), plan_registry, empty_data(), plan_runner).await;
 
@@ -1813,13 +1799,8 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
     let mut execute_data = empty_data();
     execute_data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
 
-    let execute_result = run_execute(
-        remove_checkout_action("feat-x", vec![terminal_id.clone()]),
-        &execute_registry,
-        &execute_data,
-        &runner_ok(),
-    )
-    .await;
+    let execute_result =
+        run_execute(remove_checkout_action("feat-x", vec![terminal_id.clone()]), &execute_registry, &execute_data, &runner_ok()).await;
 
     assert_checkout_removed_branch(execute_result, "feat-x");
     let execute_killed = execute_pool.killed.lock().await;
@@ -1845,12 +1826,8 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
 #[tokio::test]
 async fn teleport_plan_and_execute_both_create_new_workspace_even_when_one_exists() {
     let checkout_path = PathBuf::from("/repo/wt-feat");
-    let existing_workspace = Workspace {
-        name: "feat".to_string(),
-        directories: vec![checkout_path.clone()],
-        correlation_keys: vec![],
-        attachable_set_id: None,
-    };
+    let existing_workspace =
+        Workspace { name: "feat".to_string(), directories: vec![checkout_path.clone()], correlation_keys: vec![], attachable_set_id: None };
 
     let execute_ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:77".to_string(), existing_workspace.clone())]));
     let mut execute_registry = empty_registry();
@@ -1874,8 +1851,14 @@ async fn teleport_plan_and_execute_both_create_new_workspace_even_when_one_exist
 
     assert_ok(execute_result);
     let execute_calls = execute_ws_mgr.calls.lock().await;
-    assert!(execute_calls.iter().any(|call| call.starts_with("create_workspace")), "execute teleport should create a new workspace, got: {execute_calls:?}");
-    assert!(!execute_calls.iter().any(|call| call.starts_with("select_workspace")), "execute teleport should not reuse an existing workspace, got: {execute_calls:?}");
+    assert!(
+        execute_calls.iter().any(|call| call.starts_with("create_workspace")),
+        "execute teleport should create a new workspace, got: {execute_calls:?}"
+    );
+    assert!(
+        !execute_calls.iter().any(|call| call.starts_with("select_workspace")),
+        "execute teleport should not reuse an existing workspace, got: {execute_calls:?}"
+    );
     drop(execute_calls);
 
     let plan_ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:77".to_string(), existing_workspace)]));
@@ -1900,8 +1883,14 @@ async fn teleport_plan_and_execute_both_create_new_workspace_even_when_one_exist
 
     assert_ok(plan_result);
     let plan_calls = plan_ws_mgr.calls.lock().await;
-    assert!(plan_calls.iter().any(|call| call.starts_with("create_workspace")), "planned teleport should create a new workspace, got: {plan_calls:?}");
-    assert!(!plan_calls.iter().any(|call| call.starts_with("select_workspace")), "planned teleport should not reuse an existing workspace, got: {plan_calls:?}");
+    assert!(
+        plan_calls.iter().any(|call| call.starts_with("create_workspace")),
+        "planned teleport should create a new workspace, got: {plan_calls:?}"
+    );
+    assert!(
+        !plan_calls.iter().any(|call| call.starts_with("select_workspace")),
+        "planned teleport should not reuse an existing workspace, got: {plan_calls:?}"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -2011,9 +2000,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => {
-            run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await
-        }
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
         _ => panic!("expected steps"),
     };
 
@@ -2069,9 +2056,7 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => {
-            run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await
-        }
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
         _ => panic!("expected steps"),
     };
 
@@ -2126,9 +2111,7 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => {
-            run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await
-        }
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
         _ => panic!("expected steps"),
     };
 
@@ -2225,8 +2208,7 @@ async fn build_plan_archive_session_missing_session_returns_immediate_error() {
     let registry = empty_registry();
     let runner = runner_ok();
 
-    let plan =
-        run_build_plan(CommandAction::ArchiveSession { session_id: "missing".to_string() }, registry, empty_data(), runner).await;
+    let plan = run_build_plan(CommandAction::ArchiveSession { session_id: "missing".to_string() }, registry, empty_data(), runner).await;
 
     match plan {
         ExecutionPlan::Immediate(CommandResult::Error { message }) => {
@@ -2360,8 +2342,7 @@ async fn resolve_terminal_pool_no_template_uses_default() {
         resolved_commands: None,
     };
 
-    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None)
-        .await;
+    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
 
     // Default template has one "main" terminal entry
     assert!(config.resolved_commands.is_some());
@@ -2387,8 +2368,7 @@ content:
         resolved_commands: None,
     };
 
-    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None)
-        .await;
+    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
 
     // All content entries were non-terminal, so resolved_commands stays None
     assert!(config.resolved_commands.is_none());
@@ -2643,10 +2623,8 @@ async fn executor_step_resolver_creates_workspace() {
         local_host: local_host(),
     };
 
-    let prior = vec![StepOutcome::CompletedWith(CommandResult::CheckoutCreated {
-        branch: "feat".into(),
-        path: PathBuf::from("/repo/wt-feat"),
-    })];
+    let prior =
+        vec![StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
     let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into() };
     let outcome = resolver.resolve("create workspace", action, &prior).await;
     assert!(outcome.is_ok(), "resolve should succeed: {outcome:?}");
