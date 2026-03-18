@@ -24,12 +24,12 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
   help  show key bindings                                                                                         ?
+
+
+
+
+
+
+
 /he                          <ENT> RUN  <TAB> FILL  <ESC> CLOSE                                   ◫ auto   @local

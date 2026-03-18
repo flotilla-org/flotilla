@@ -1271,13 +1271,14 @@ fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, status
     };
 
     let filtered: Vec<&crate::palette::PaletteEntry> = crate::palette::filter_entries(entries, input.value());
-    let visible_rows = filtered.len().min(MAX_PALETTE_ROWS) as u16;
+    let palette_height = MAX_PALETTE_ROWS as u16;
 
-    // Overlay area: sits directly above the status bar, drawing over content
-    let overlay_y = status_bar_area.y.saturating_sub(visible_rows);
-    let area = Rect::new(status_bar_area.x, overlay_y, status_bar_area.width, visible_rows);
+    // Overlay area: fixed height, sits directly above the status bar, drawing over content
+    let overlay_y = status_bar_area.y.saturating_sub(palette_height);
+    let area = Rect::new(status_bar_area.x, overlay_y, status_bar_area.width, palette_height);
 
     frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
 
     let name_width = filtered.iter().map(|e| e.name.len()).max().unwrap_or(0).min(20);
     let hint_width: u16 = 7;
