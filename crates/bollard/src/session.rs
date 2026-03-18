@@ -241,88 +241,102 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     let mut vt_engine = default_vt_engine();
 
     let mut active_client: Option<UnixStream> = None;
-    // Phase 1 uses a small polling interval instead of poll/epoll to keep the first implementation simple.
     loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_millis(10))).map_err(|err| format!("set client read timeout: {err}"))?;
-                if let Ok(Frame::AttachInit { cols, rows }) = Frame::read(&mut stream) {
-                    if active_client.is_none() {
-                        resize_pty(pty_fd, cols, rows)?;
-                        let replay = apply_attach_state(vt_engine.as_mut(), cols, rows)?;
-                        Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
-                        if let Some(payload) = replay {
-                            if !payload.is_empty() {
-                                Frame::Output(payload).write(&mut stream).map_err(|err| format!("write replay output: {err}"))?;
+        let poll_result = poll_ready(listener.as_raw_fd(), active_client.as_ref().map(AsRawFd::as_raw_fd), pty_fd, 100)?;
+
+        if poll_result.listener_readable {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_millis(10))).map_err(|err| format!("set client read timeout: {err}"))?;
+                    if let Ok(Frame::AttachInit { cols, rows }) = Frame::read(&mut stream) {
+                        if active_client.is_none() {
+                            resize_pty(pty_fd, cols, rows)?;
+                            let replay = apply_attach_state(vt_engine.as_mut(), cols, rows)?;
+                            Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
+                            if let Some(payload) = replay {
+                                if !payload.is_empty() {
+                                    Frame::Output(payload).write(&mut stream).map_err(|err| format!("write replay output: {err}"))?;
+                                }
                             }
+                            stream.set_nonblocking(true).map_err(|err| format!("set client nonblocking: {err}"))?;
+                            let _ = fs::write(foreground_path(root, id), b"1");
+                            active_client = Some(stream);
+                        } else {
+                            let _ = Frame::Busy.write(&mut stream);
                         }
-                        stream.set_nonblocking(true).map_err(|err| format!("set client nonblocking: {err}"))?;
-                        let _ = fs::write(foreground_path(root, id), b"1");
-                        active_client = Some(stream);
                     } else {
                         let _ = Frame::Busy.write(&mut stream);
                     }
-                } else {
-                    let _ = Frame::Busy.write(&mut stream);
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(format!("accept client: {err}")),
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(format!("accept client: {err}")),
         }
 
-        if let Some(stream) = active_client.as_mut() {
+        if poll_result.client_readable {
             let mut client_disconnected = false;
             let mut pending = VecDeque::new();
-            loop {
-                match Frame::read(stream) {
-                    Ok(frame) => pending.push_back(frame),
-                    Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                        break;
+            if let Some(stream) = active_client.as_mut() {
+                loop {
+                    match Frame::read(stream) {
+                        Ok(frame) => pending.push_back(frame),
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) =>
+                        {
+                            client_disconnected = true;
+                            break;
+                        }
+                        Err(err) => return Err(format!("read client frame: {err}")),
                     }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::UnexpectedEof
-                                | std::io::ErrorKind::BrokenPipe
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionAborted
-                        ) =>
-                    {
-                        client_disconnected = true;
-                        break;
-                    }
-                    Err(err) => return Err(format!("read client frame: {err}")),
                 }
             }
+
             while let Some(frame) = pending.pop_front() {
                 match frame {
                     Frame::Input(bytes) => write_fd_all(pty_fd, &bytes)?,
-                    Frame::Resize { cols, rows } => resize_pty(pty_fd, cols, rows)?,
+                    Frame::Resize { cols, rows } => {
+                        resize_pty(pty_fd, cols, rows)?;
+                        vt_engine.resize(cols, rows)?;
+                    }
                     _ => {}
                 }
             }
 
-            let mut buf = [0u8; 4096];
-            match read_fd(pty_fd, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    record_pty_output(vt_engine.as_mut(), &buf[..n])?;
-                    if Frame::Output(buf[..n].to_vec()).write(stream).is_err() {
-                        client_disconnected = true;
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(format!("read pty output: {err}")),
-            }
             if client_disconnected {
                 let _ = fs::remove_file(foreground_path(root, id));
                 active_client = None;
             }
         }
 
-        match child_exited()? {
-            Some(_) => break,
-            None => thread::sleep(Duration::from_millis(10)),
+        if poll_result.pty_readable {
+            loop {
+                let mut buf = [0u8; 4096];
+                match read_fd(pty_fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        record_pty_output(vt_engine.as_mut(), &buf[..n])?;
+                        if let Some(stream) = active_client.as_mut() {
+                            if Frame::Output(buf[..n].to_vec()).write(stream).is_err() {
+                                let _ = fs::remove_file(foreground_path(root, id));
+                                active_client = None;
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => return Err(format!("read pty output: {err}")),
+                }
+            }
+        }
+
+        if child_exited()?.is_some() {
+            break;
         }
     }
 
@@ -372,6 +386,38 @@ fn resolve_bollard_executable() -> Result<PathBuf, String> {
 
 fn is_executable_file(path: &Path) -> bool {
     path.is_file() && fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+struct PollResult {
+    listener_readable: bool,
+    client_readable: bool,
+    pty_readable: bool,
+}
+
+fn poll_ready(listener_fd: RawFd, client_fd: Option<RawFd>, pty_fd: RawFd, timeout_ms: i32) -> Result<PollResult, String> {
+    let mut fds = vec![libc::pollfd { fd: listener_fd, events: libc::POLLIN, revents: 0 }, libc::pollfd {
+        fd: pty_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let client_index = if let Some(fd) = client_fd {
+        fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+        Some(fds.len() - 1)
+    } else {
+        None
+    };
+
+    // SAFETY: `poll` reads and writes the provided pollfd array for valid fds owned by this process.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    if rc < 0 {
+        return Err(format!("poll daemon fds: {}", std::io::Error::last_os_error()));
+    }
+
+    Ok(PollResult {
+        listener_readable: fds[0].revents & libc::POLLIN != 0,
+        pty_readable: fds[1].revents & libc::POLLIN != 0,
+        client_readable: client_index.map(|index| fds[index].revents & libc::POLLIN != 0).unwrap_or(false),
+    })
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), String> {
