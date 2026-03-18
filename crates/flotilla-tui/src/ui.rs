@@ -880,7 +880,7 @@ fn build_item_row<'a>(
         Cell::from(Span::styled(format!(" {icon}"), Style::default().fg(icon_color))),
         Cell::from(Span::styled(source_display, Style::default().fg(theme.source))),
         Cell::from(Span::styled(path_display, Style::default().fg(theme.path))),
-        Cell::from(description),
+        Cell::from(Span::styled(description, Style::default().fg(theme.text))),
         Cell::from(Span::styled(branch_display, Style::default().fg(theme.branch))),
         Cell::from(Span::styled(wt_indicator.to_string(), Style::default().fg(theme.checkout))),
         Cell::from(Span::styled(ws_indicator, Style::default().fg(theme.workspace))),

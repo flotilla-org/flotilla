@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 pub const CHEVRON_SEPARATOR: &str = "";
 pub const DEFAULT_STATUS_WIDTH_BUDGET: usize = 28;
@@ -165,7 +165,10 @@ impl StatusBarModel {
         let mut visible_keys = if input.keys_visible { input.keys.clone() } else { vec![] };
         let mode_width = total_mode_width(&input.mode_indicators);
 
-        loop {
+        // Upper bound: each iteration must shed a key or shrink a text field.
+        // Keys + task chars + status chars is a safe ceiling.
+        let max_iterations = visible_keys.len() + displayed_width(&task_text) + displayed_width(&status_text) + 1;
+        for _ in 0..max_iterations {
             let keys_width = total_keys_width(&visible_keys);
             let task_width = displayed_width(&task_text);
             let status_width = displayed_width(&status_text);
@@ -202,16 +205,20 @@ impl StatusBarModel {
                 continue;
             }
 
-            let fallback_keys_start = status_width.min(input.width);
-            return Self {
-                status_text,
-                visible_keys,
-                mode_indicators: input.mode_indicators,
-                task_text,
-                keys_start: fallback_keys_start,
-                mode_start: fallback_keys_start,
-                task_start: input.width,
-            };
+            break;
+        }
+
+        // Fallback: nothing more to shed — use whatever we have.
+        let status_width = displayed_width(&status_text);
+        let fallback_keys_start = status_width.min(input.width);
+        Self {
+            status_text,
+            visible_keys,
+            mode_indicators: input.mode_indicators,
+            task_text,
+            keys_start: fallback_keys_start,
+            mode_start: fallback_keys_start,
+            task_start: input.width,
         }
     }
 }
@@ -232,15 +239,17 @@ fn ellipsize(text: &str, max_width: usize) -> String {
         return "…".to_string();
     }
 
+    // Build candidate by adding characters one at a time, measuring the
+    // result with `displayed_width` (string-level) rather than summing
+    // per-char widths.  This avoids divergence when `UnicodeWidthStr`
+    // and `UnicodeWidthChar` disagree on sequences like emoji/ZWJ.
     let mut result = String::new();
-    let mut used = 0;
     for ch in text.chars() {
-        let glyph_width = ch.width().unwrap_or(0);
-        if used + glyph_width >= max_width {
+        result.push(ch);
+        if displayed_width(&result) >= max_width {
+            result.pop();
             break;
         }
-        result.push(ch);
-        used += glyph_width;
     }
     result.push('…');
     result
