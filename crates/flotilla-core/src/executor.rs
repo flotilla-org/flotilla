@@ -866,9 +866,13 @@ pub async fn execute(
             };
             match result {
                 Some(Ok(())) => {
-                    // Cascade: remove attachable sets owned by this checkout
-                    let deleted_checkout_paths: Vec<HostPath> =
-                        providers_data.checkouts.iter().filter(|(_, co)| co.branch == branch).map(|(hp, _)| hp.clone()).collect();
+                    // Cascade: remove attachable sets owned by this checkout (local host only)
+                    let deleted_checkout_paths: Vec<HostPath> = providers_data
+                        .checkouts
+                        .iter()
+                        .filter(|(hp, co)| co.branch == branch && hp.host == *local_host)
+                        .map(|(hp, _)| hp.clone())
+                        .collect();
 
                     let mut all_session_refs = Vec::new();
                     let mut any_removed = false;

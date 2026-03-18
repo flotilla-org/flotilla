@@ -660,7 +660,15 @@ impl TerminalPool for ShpoolTerminalPool {
             }
             Err(e) => {
                 tracing::debug!(err = %e, "shpool list failed (daemon may not be running)");
-                Ok(vec![])
+                // Return all known terminals as Disconnected so they remain visible
+                // in the snapshot. Do NOT reap — we can't distinguish "shpool down"
+                // from "all sessions gone".
+                let Ok(mut store) = self.attachable_store.lock() else {
+                    return Ok(vec![]);
+                };
+                let empty = HashSet::new();
+                let (disconnected, _) = Self::disconnected_terminals_from_bindings(store.as_mut(), &empty);
+                Ok(disconnected)
             }
         }
     }
@@ -1069,7 +1077,11 @@ mod tests {
         }
 
         let terminals = pool.list_terminals().await.expect("should succeed");
-        assert!(terminals.is_empty()); // shpool is down
+
+        // Known terminal should appear as Disconnected (not vanish)
+        assert_eq!(terminals.len(), 1, "known terminal should be emitted as Disconnected when shpool is down");
+        assert_eq!(terminals[0].status, TerminalStatus::Disconnected);
+        assert_eq!(terminals[0].id.checkout, "feat");
 
         // Binding should still exist (reaper did NOT run)
         let s = store.lock().expect("lock store");
