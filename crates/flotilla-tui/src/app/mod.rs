@@ -6,7 +6,7 @@ mod navigation;
 #[doc(hidden)]
 pub mod test_builders;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 pub mod ui_state;
 
 use std::{
@@ -260,6 +260,7 @@ pub struct App {
     pub in_flight: HashMap<u64, InFlightCommand>,
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
+    pub widget_stack: Vec<Box<dyn crate::widgets::InteractiveWidget>>,
 }
 
 impl App {
@@ -285,6 +286,7 @@ impl App {
             in_flight: HashMap::new(),
             pending_cancel: None,
             should_quit: false,
+            widget_stack: vec![],
         }
     }
 
@@ -392,6 +394,51 @@ impl App {
         }
         self.model.status_message = status_message;
     }
+
+    // ── Widget stack helpers ──
+
+    pub fn build_widget_context(&mut self) -> crate::widgets::WidgetContext<'_> {
+        crate::widgets::WidgetContext {
+            model: &self.model,
+            keymap: &self.keymap,
+            config: &self.config,
+            in_flight: &self.in_flight,
+            target_host: self.ui.target_host.as_ref(),
+            active_repo: self.model.active_repo,
+            repo_order: &self.model.repo_order,
+            commands: &mut self.proto_commands,
+            repo_ui: &mut self.ui.repo_ui,
+            should_quit: false,
+            pending_cancel: None,
+        }
+    }
+
+    pub fn apply_outcome(&mut self, index: usize, outcome: crate::widgets::Outcome) {
+        match outcome {
+            crate::widgets::Outcome::Consumed => {}
+            crate::widgets::Outcome::Ignored => {}
+            crate::widgets::Outcome::Finished => {
+                self.widget_stack.remove(index);
+            }
+            crate::widgets::Outcome::Push(widget) => {
+                self.widget_stack.push(widget);
+            }
+            crate::widgets::Outcome::Swap(widget) => {
+                self.widget_stack.remove(index);
+                self.widget_stack.insert(index, widget);
+            }
+        }
+    }
+
+    pub fn apply_context_signals(&mut self, ctx: crate::widgets::WidgetContext) {
+        if ctx.should_quit {
+            self.should_quit = true;
+        }
+        if let Some(command_id) = ctx.pending_cancel {
+            self.pending_cancel = Some(command_id);
+        }
+    }
+
     // ── Daemon event handling ──
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {

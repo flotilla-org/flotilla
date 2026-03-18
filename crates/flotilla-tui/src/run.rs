@@ -34,7 +34,14 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     events.attach_daemon(daemon_rx);
 
     // Initial draw before entering the event loop
-    terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, &app.keymap, f))?;
+    terminal.draw(|f| {
+        ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, &app.keymap, f);
+        let area = f.area();
+        let ctx = crate::widgets::RenderContext { model: &app.model, theme: &app.theme, keymap: &app.keymap, in_flight: &app.in_flight };
+        for widget in &mut app.widget_stack {
+            widget.render(f, area, &ctx);
+        }
+    })?;
 
     loop {
         // ── Wait for the first event (blocking) ──
@@ -239,7 +246,15 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
 
         // ── Draw once ──
-        terminal.draw(|f| ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, &app.keymap, f))?;
+        terminal.draw(|f| {
+            ui::render(&app.model, &mut app.ui, &app.in_flight, &app.theme, &app.keymap, f);
+            let area = f.area();
+            let ctx =
+                crate::widgets::RenderContext { model: &app.model, theme: &app.theme, keymap: &app.keymap, in_flight: &app.in_flight };
+            for widget in &mut app.widget_stack {
+                widget.render(f, area, &ctx);
+            }
+        })?;
 
         if app.should_quit {
             break;

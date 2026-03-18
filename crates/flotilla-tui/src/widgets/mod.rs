@@ -1,3 +1,5 @@
+pub mod help;
+
 use std::collections::HashMap;
 
 use crossterm::event::{KeyEvent, MouseEvent};

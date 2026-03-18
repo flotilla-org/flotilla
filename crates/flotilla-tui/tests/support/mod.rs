@@ -26,6 +26,7 @@ pub struct TestHarness {
     pub model: TuiModel,
     pub ui: UiState,
     pub in_flight: HashMap<u64, InFlightCommand>,
+    pub widget_stack: Vec<Box<dyn flotilla_tui::widgets::InteractiveWidget>>,
     theme: Option<Theme>,
     width: u16,
     height: u16,
@@ -37,7 +38,7 @@ impl TestHarness {
         let info = test_repo_info("empty");
         let model = TuiModel::from_repo_info(vec![info]);
         let ui = UiState::new(&model.repo_order);
-        Self { model, ui, in_flight: HashMap::new(), theme: None, width: WIDTH, height: HEIGHT }
+        Self { model, ui, in_flight: HashMap::new(), widget_stack: vec![], theme: None, width: WIDTH, height: HEIGHT }
     }
 
     /// Single repo with given name, empty data.
@@ -45,7 +46,7 @@ impl TestHarness {
         let info = test_repo_info(name);
         let model = TuiModel::from_repo_info(vec![info]);
         let ui = UiState::new(&model.repo_order);
-        Self { model, ui, in_flight: HashMap::new(), theme: None, width: WIDTH, height: HEIGHT }
+        Self { model, ui, in_flight: HashMap::new(), widget_stack: vec![], theme: None, width: WIDTH, height: HEIGHT }
     }
 
     /// Multiple repos by name, all with empty data.
@@ -53,7 +54,7 @@ impl TestHarness {
         let infos = names.iter().map(|n| test_repo_info(n)).collect();
         let model = TuiModel::from_repo_info(infos);
         let ui = UiState::new(&model.repo_order);
-        Self { model, ui, in_flight: HashMap::new(), theme: None, width: WIDTH, height: HEIGHT }
+        Self { model, ui, in_flight: HashMap::new(), widget_stack: vec![], theme: None, width: WIDTH, height: HEIGHT }
     }
 
     /// Override the terminal height for this test.
@@ -141,6 +142,12 @@ impl TestHarness {
         terminal
             .draw(|frame| {
                 ui::render(&self.model, &mut self.ui, &self.in_flight, &theme, &keymap, frame);
+                let area = frame.area();
+                let ctx =
+                    flotilla_tui::widgets::RenderContext { model: &self.model, theme: &theme, keymap: &keymap, in_flight: &self.in_flight };
+                for widget in &mut self.widget_stack {
+                    widget.render(frame, area, &ctx);
+                }
             })
             .expect("failed to draw test frame");
         terminal.backend().buffer().clone()

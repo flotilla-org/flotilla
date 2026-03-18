@@ -98,7 +98,7 @@ pub fn render(
     ui: &mut UiState,
     in_flight: &HashMap<u64, InFlightCommand>,
     theme: &Theme,
-    keymap: &Keymap,
+    _keymap: &Keymap,
     frame: &mut Frame,
 ) {
     let constraints = vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)];
@@ -122,7 +122,6 @@ pub fn render(
     render_input_popup(ui, theme, frame);
     render_delete_confirm(model, ui, theme, frame);
     render_close_confirm(model, ui, theme, frame);
-    render_help(ui, theme, keymap, frame);
     render_file_picker(ui, theme, frame);
 }
 
@@ -1179,68 +1178,6 @@ fn render_close_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &m
 
     let block_title = format!(" Close {} ", noun);
     let paragraph = Paragraph::new(lines).block(Block::bordered().style(theme.block_style()).title(block_title)).wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
-}
-
-fn render_help(ui: &mut UiState, theme: &Theme, keymap: &Keymap, frame: &mut Frame) {
-    if !matches!(ui.mode, UiMode::Help) {
-        return;
-    }
-
-    let area = ui_helpers::popup_area(frame.area(), 60, 85);
-    frame.render_widget(Clear, area);
-
-    let mut help_text = vec![
-        Line::from(Span::styled("Item Icons", Style::default().bold())),
-        Line::from("  ●  Checkout with workspace    ○  Checkout (no workspace)"),
-        Line::from("  ▶  Running session            ◆  Idle session"),
-        Line::from("  ⊙  Pull request               ◇  Issue"),
-        Line::from("  ⊶  Remote branch"),
-        Line::from(""),
-        Line::from(Span::styled("Column Indicators", Style::default().bold())),
-        Line::from("  WT: ◆ main  ✓ checked out"),
-        Line::from("  WS: ● has workspace  2/3/… multiple"),
-        Line::from("  PR: ✓ merged  ✗ closed"),
-        Line::from("  Git: ? untracked  M modified  ↑ ahead  ↓ behind"),
-        Line::from(""),
-    ];
-
-    // Dynamic sections from keymap
-    for section in keymap.help_sections() {
-        help_text.push(Line::from(Span::styled(section.title, Style::default().bold())));
-        for binding in &section.bindings {
-            help_text.push(Line::from(format!("  {:18}{}", binding.key_display, binding.description)));
-        }
-        help_text.push(Line::from(""));
-    }
-
-    // Mouse hints (not configurable)
-    help_text.push(Line::from(Span::styled("Mouse", Style::default().bold())));
-    help_text.push(Line::from("  Click            Select item"));
-    help_text.push(Line::from("  Double-click     Open workspace"));
-    help_text.push(Line::from("  Right-click      Action menu"));
-    help_text.push(Line::from("  Scroll wheel     Navigate list"));
-    help_text.push(Line::from("  Drag tab         Reorder tabs"));
-
-    let total_lines = help_text.len() as u16;
-    let inner_height = area.height.saturating_sub(2); // borders
-    let max_scroll = total_lines.saturating_sub(inner_height);
-    ui.help_scroll = ui.help_scroll.min(max_scroll);
-    let scroll = ui.help_scroll;
-
-    let has_more_below = scroll < max_scroll;
-    let has_more_above = scroll > 0;
-    let title = match (has_more_above, has_more_below) {
-        (true, true) => " Help ↑↓ ",
-        (false, true) => " Help ↓ ",
-        (true, false) => " Help ↑ ",
-        (false, false) => " Help ",
-    };
-
-    let paragraph = Paragraph::new(help_text)
-        .block(Block::bordered().style(theme.block_style()).title(title))
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 

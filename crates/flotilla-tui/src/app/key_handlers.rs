@@ -72,9 +72,6 @@ impl App {
                         self.ui.event_log.selected = Some(self.ui.event_log.count - 1);
                     }
                 }
-                FocusTarget::HelpText => {
-                    self.ui.help_scroll = self.ui.help_scroll.saturating_add(1);
-                }
                 FocusTarget::ActionMenu => {
                     if let UiMode::ActionMenu { ref items, ref mut index } = self.ui.mode {
                         if *index < items.len().saturating_sub(1) {
@@ -97,7 +94,8 @@ impl App {
                         }
                     }
                 }
-                FocusTarget::BranchInput
+                FocusTarget::HelpText
+                | FocusTarget::BranchInput
                 | FocusTarget::IssueSearchInput
                 | FocusTarget::DeleteConfirmDialog
                 | FocusTarget::CloseConfirmDialog => {}
@@ -110,9 +108,6 @@ impl App {
                             self.ui.event_log.selected = Some(sel - 1);
                         }
                     }
-                }
-                FocusTarget::HelpText => {
-                    self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1);
                 }
                 FocusTarget::ActionMenu => {
                     if let UiMode::ActionMenu { ref mut index, .. } = self.ui.mode {
@@ -134,7 +129,8 @@ impl App {
                         }
                     }
                 }
-                FocusTarget::BranchInput
+                FocusTarget::HelpText
+                | FocusTarget::BranchInput
                 | FocusTarget::IssueSearchInput
                 | FocusTarget::DeleteConfirmDialog
                 | FocusTarget::CloseConfirmDialog => {}
@@ -264,14 +260,11 @@ impl App {
                     self.config.save_tab_order(&self.persisted_tab_order_paths());
                 }
             }
-            Action::ToggleHelp => match self.ui.mode {
-                UiMode::Normal => self.ui.mode = UiMode::Help,
-                UiMode::Help => {
-                    self.ui.mode = UiMode::Normal;
-                    self.ui.help_scroll = 0;
+            Action::ToggleHelp => {
+                if matches!(self.ui.mode, UiMode::Normal) {
+                    self.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
                 }
-                _ => {}
-            },
+            }
             Action::ToggleMultiSelect => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.toggle_multi_select();
@@ -358,11 +351,8 @@ impl App {
                 FocusTarget::EventLog => {
                     self.ui.mode = UiMode::Normal;
                 }
-                FocusTarget::HelpText => {
-                    self.ui.mode = UiMode::Normal;
-                    self.ui.help_scroll = 0;
-                }
-                FocusTarget::ActionMenu
+                FocusTarget::HelpText
+                | FocusTarget::ActionMenu
                 | FocusTarget::BranchInput
                 | FocusTarget::FilePickerList
                 | FocusTarget::DeleteConfirmDialog
@@ -387,6 +377,52 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // ── Widget stack dispatch (bridge) ──
+        if !self.widget_stack.is_empty() {
+            let captures_raw = self.widget_stack.last().expect("checked non-empty").captures_raw_keys();
+            let mode_id = self.widget_stack.last().expect("checked non-empty").mode_id();
+
+            let action = if captures_raw {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.resolve_action(key),
+                    _ => None,
+                }
+            } else {
+                self.keymap.resolve(mode_id, crokey::KeyCombination::from(key))
+            };
+
+            let mut stack = std::mem::take(&mut self.widget_stack);
+            let (outcome_action, should_quit, pending_cancel) = {
+                let mut ctx = self.build_widget_context();
+                let mut result: Option<(usize, crate::widgets::Outcome)> = None;
+                for i in (0..stack.len()).rev() {
+                    let outcome = if let Some(action) = action {
+                        stack[i].handle_action(action, &mut ctx)
+                    } else {
+                        stack[i].handle_raw_key(key, &mut ctx)
+                    };
+                    if !matches!(outcome, crate::widgets::Outcome::Ignored) {
+                        result = Some((i, outcome));
+                        break;
+                    }
+                }
+                (result, ctx.should_quit, ctx.pending_cancel)
+            };
+
+            self.widget_stack = stack;
+            if let Some((index, outcome)) = outcome_action {
+                self.apply_outcome(index, outcome);
+            }
+            if should_quit {
+                self.should_quit = true;
+            }
+            if let Some(command_id) = pending_cancel {
+                self.pending_cancel = Some(command_id);
+            }
+            return;
+        }
+
+        // ── Legacy path ──
         if let Some(action) = self.resolve_action(key) {
             self.dispatch_action(action);
             return;
@@ -810,16 +846,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_action_select_next_scrolls_help() {
-        let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
-
-        app.dispatch_action(Action::SelectNext);
-
-        assert_eq!(app.ui.help_scroll, 1);
-    }
-
-    #[test]
     fn dispatch_action_select_next_advances_menu_index() {
         let mut app = stub_app();
         app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
@@ -990,15 +1016,15 @@ mod tests {
         let mut app = stub_app();
         assert!(matches!(app.ui.mode, UiMode::Normal));
         app.handle_key(key(KeyCode::Char('?')));
-        assert!(matches!(app.ui.mode, UiMode::Help));
+        assert!(!app.widget_stack.is_empty());
     }
 
     #[test]
     fn question_mark_toggles_help_back_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
         app.handle_key(key(KeyCode::Char('?')));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
     }
 
     #[test]
@@ -1020,9 +1046,9 @@ mod tests {
     #[test]
     fn esc_in_help_returns_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
         app.handle_key(key(KeyCode::Esc));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
     }
 
     // ── handle_config_key ────────────────────────────────────────────
@@ -1143,13 +1169,11 @@ mod tests {
     #[test]
     fn help_q_returns_to_normal_and_resets_scroll() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
-        app.ui.help_scroll = 7;
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
 
         app.handle_key(key(KeyCode::Char('q')));
 
-        assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert_eq!(app.ui.help_scroll, 0);
+        assert!(app.widget_stack.is_empty());
     }
 
     #[test]
