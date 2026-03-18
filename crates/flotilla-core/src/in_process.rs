@@ -619,6 +619,9 @@ pub struct InProcessDaemon {
     /// Static local host summary published to peers.
     local_host_summary: HostSummary,
     agent_state_store: crate::agents::SharedAgentStateStore,
+    /// Socket path for the daemon server — set by the daemon after startup.
+    /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
+    daemon_socket_path: RwLock<Option<PathBuf>>,
 }
 
 impl InProcessDaemon {
@@ -709,6 +712,7 @@ impl InProcessDaemon {
             session_id: uuid::Uuid::new_v4(),
             local_host_summary,
             agent_state_store,
+            daemon_socket_path: RwLock::new(None),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -748,6 +752,14 @@ impl InProcessDaemon {
 
     pub fn agent_state_store(&self) -> &crate::agents::SharedAgentStateStore {
         &self.agent_state_store
+    }
+
+    pub async fn set_daemon_socket_path(&self, path: PathBuf) {
+        *self.daemon_socket_path.write().await = Some(path);
+    }
+
+    pub async fn daemon_socket_path(&self) -> Option<PathBuf> {
+        self.daemon_socket_path.read().await.clone()
     }
 
     /// Returns the current connection status for a peer host.
@@ -2201,6 +2213,7 @@ impl DaemonHandle for InProcessDaemon {
         let active_ref = Arc::clone(&self.active_command);
         let local_host = self.host_name.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
+        let daemon_socket_path = self.daemon_socket_path.read().await.clone();
         tokio::spawn(async move {
             // Clone values the resolver needs before build_plan consumes them.
             let resolver_registry = Arc::clone(&registry);
@@ -2217,6 +2230,7 @@ impl DaemonHandle for InProcessDaemon {
                 runner,
                 config_base,
                 attachable_store,
+                daemon_socket_path.clone(),
                 local_host,
                 None,
             )
@@ -2260,6 +2274,7 @@ impl DaemonHandle for InProcessDaemon {
                         registry: resolver_registry,
                         config_base: resolver_config_base,
                         attachable_store: resolver_attachable_store,
+                        daemon_socket_path: daemon_socket_path.clone(),
                         local_host: resolver_local_host,
                     };
                     let result = run_step_plan(

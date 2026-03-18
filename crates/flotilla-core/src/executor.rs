@@ -67,6 +67,7 @@ pub async fn build_plan(
     runner: Arc<dyn CommandRunner>,
     config_base: PathBuf,
     attachable_store: SharedAttachableStore,
+    daemon_socket_path: Option<PathBuf>,
     local_host: HostName,
     // TODO(multi-host): When a command is forwarded from another host, this carries
     // the requester's hostname so plan builders can stamp `StepHost::Remote(originator)`
@@ -87,8 +88,19 @@ pub async fn build_plan(
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
-            build_teleport_session_plan(session_id, branch, checkout_key, repo.root, registry, providers_data, config_base, local_host)
-                .await
+            build_teleport_session_plan(
+                session_id,
+                branch,
+                checkout_key,
+                repo.root,
+                registry,
+                providers_data,
+                config_base,
+                attachable_store.clone(),
+                daemon_socket_path.clone(),
+                local_host,
+            )
+            .await
         }
 
         CommandAction::RemoveCheckout { checkout, terminal_keys } => {
@@ -103,7 +115,18 @@ pub async fn build_plan(
         CommandAction::GenerateBranchName { issue_keys } => build_generate_branch_name_plan(issue_keys, registry, providers_data).await,
 
         action => {
-            let result = execute(action, &repo, &registry, &providers_data, &*runner, &config_base, &attachable_store, &local_host).await;
+            let result = execute(
+                action,
+                &repo,
+                &registry,
+                &providers_data,
+                &*runner,
+                &config_base,
+                &attachable_store,
+                daemon_socket_path.as_deref(),
+                &local_host,
+            )
+            .await;
             ExecutionPlan::Immediate(result)
         }
     }
@@ -217,6 +240,8 @@ async fn build_teleport_session_plan(
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
     config_base: PathBuf,
+    attachable_store: SharedAttachableStore,
+    daemon_socket_path: Option<PathBuf>,
     local_host: flotilla_protocol::HostName,
 ) -> ExecutionPlan {
     // Shared slot for the teleport (attach) command — populated by step 1.
@@ -289,6 +314,8 @@ async fn build_teleport_session_plan(
         let repo_root = repo_root.clone();
         let registry = Arc::clone(&registry);
         let config_base = config_base.clone();
+        let attachable_store = attachable_store.clone();
+        let daemon_socket_path = daemon_socket_path.clone();
         steps.push(Step {
             description: "Create workspace with teleport command".to_string(),
             host: StepHost::Local,
@@ -300,8 +327,15 @@ async fn build_teleport_session_plan(
                     let name = branch.as_deref().unwrap_or("session");
                     if let Some(ws_mgr) = registry.workspace_managers.preferred() {
                         let mut config = workspace_config(&repo_root, name, &path, &teleport_cmd, &config_base);
-                        if let Some(tp) = registry.terminal_pools.preferred() {
-                            resolve_terminal_pool(&mut config, tp.as_ref()).await;
+                        if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
+                            resolve_terminal_pool(
+                                &mut config,
+                                tp.as_ref(),
+                                &attachable_store,
+                                &tp_desc.implementation,
+                                daemon_socket_path.as_deref(),
+                            )
+                            .await;
                         }
                         // Teleport always creates a new workspace — the attach command is
                         // session-specific, so reusing an existing workspace would attach
@@ -488,6 +522,7 @@ fn preferred_workspace_manager(registry: &ProviderRegistry) -> Option<(&str, &Ar
 
 /// Core workspace creation logic, shared by the step resolver and the
 /// standalone `CreateWorkspaceForCheckout` command.
+#[allow(clippy::too_many_arguments)]
 async fn create_workspace_for_checkout_impl(
     checkout_path: &Path,
     label: &str,
@@ -495,6 +530,7 @@ async fn create_workspace_for_checkout_impl(
     registry: &ProviderRegistry,
     config_base: &Path,
     attachable_store: &SharedAttachableStore,
+    daemon_socket_path: Option<&Path>,
     local_host: &HostName,
 ) -> Result<StepOutcome, String> {
     if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
@@ -502,8 +538,8 @@ async fn create_workspace_for_checkout_impl(
             return Ok(StepOutcome::Completed);
         }
         let mut config = workspace_config(&repo.root, label, checkout_path, "claude", config_base);
-        if let Some(tp) = registry.terminal_pools.preferred() {
-            resolve_terminal_pool(&mut config, tp.as_ref()).await;
+        if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
+            resolve_terminal_pool(&mut config, tp.as_ref(), attachable_store, &tp_desc.implementation, daemon_socket_path).await;
         }
         match ws_mgr.create_workspace(&config).await {
             Ok((ws_ref, _workspace)) => {
@@ -523,6 +559,7 @@ pub(crate) struct ExecutorStepResolver {
     pub registry: Arc<ProviderRegistry>,
     pub config_base: PathBuf,
     pub attachable_store: SharedAttachableStore,
+    pub daemon_socket_path: Option<PathBuf>,
     pub local_host: HostName,
 }
 
@@ -545,6 +582,7 @@ impl StepResolver for ExecutorStepResolver {
                             &self.registry,
                             &self.config_base,
                             &self.attachable_store,
+                            self.daemon_socket_path.as_deref(),
                             &self.local_host,
                         )
                         .await
@@ -621,6 +659,7 @@ pub async fn execute(
     runner: &dyn CommandRunner,
     config_base: &Path,
     attachable_store: &SharedAttachableStore,
+    daemon_socket_path: Option<&Path>,
     local_host: &HostName,
 ) -> CommandResult {
     match action {
@@ -630,8 +669,17 @@ pub async fn execute(
                 return CommandResult::Error { message: format!("checkout not found: {}", checkout_path.display()) };
             }
             info!(%label, "entering workspace");
-            match create_workspace_for_checkout_impl(&checkout_path, &label, repo, registry, config_base, attachable_store, local_host)
-                .await
+            match create_workspace_for_checkout_impl(
+                &checkout_path,
+                &label,
+                repo,
+                registry,
+                config_base,
+                attachable_store,
+                daemon_socket_path,
+                local_host,
+            )
+            .await
             {
                 Ok(_) => CommandResult::Ok,
                 Err(e) => CommandResult::Error { message: e },
@@ -715,7 +763,18 @@ pub async fn execute(
             let host_key = HostPath::new(local_host.clone(), checkout_path.clone());
             if let Some(co) = providers_data.checkouts.get(&host_key).cloned() {
                 let attachable_set_id = ensure_attachable_set_for_checkout(attachable_store, local_host, &checkout_path);
-                match prepare_terminal_commands(&repo.root, &co.branch, &checkout_path, registry, config_base, &requested_commands).await {
+                match prepare_terminal_commands(
+                    &repo.root,
+                    &co.branch,
+                    &checkout_path,
+                    registry,
+                    config_base,
+                    &requested_commands,
+                    attachable_store,
+                    daemon_socket_path,
+                )
+                .await
+                {
                     Ok(commands) => CommandResult::TerminalPrepared {
                         repo_identity: repo.identity.clone(),
                         target_host: local_host.clone(),
@@ -850,8 +909,9 @@ pub async fn execute(
                 let name = branch.as_deref().unwrap_or("session");
                 if let Some((provider_name, ws_mgr)) = preferred_workspace_manager(registry) {
                     let mut config = workspace_config(&repo.root, name, &path, &teleport_cmd, config_base);
-                    if let Some(tp) = registry.terminal_pools.preferred() {
-                        resolve_terminal_pool(&mut config, tp.as_ref()).await;
+                    if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
+                        resolve_terminal_pool(&mut config, tp.as_ref(), attachable_store, &tp_desc.implementation, daemon_socket_path)
+                            .await;
                     }
                     // Teleport always creates a new workspace — the attach command is
                     // session-specific, so reusing an existing workspace would attach
@@ -991,9 +1051,48 @@ async fn validate_checkout_target(
     }
 }
 
+/// Build the env vars to inject into a managed terminal session.
+fn build_terminal_env_vars(
+    id: &ManagedTerminalId,
+    attachable_store: &SharedAttachableStore,
+    terminal_pool_provider: &str,
+    daemon_socket_path: Option<&Path>,
+) -> crate::providers::terminal::TerminalEnvVars {
+    use crate::attachable::{terminal_session_binding_ref, BindingObjectKind};
+
+    let mut vars = Vec::new();
+
+    // Look up the stable AttachableId for this terminal from the store.
+    let session_name = terminal_session_binding_ref(id);
+    match attachable_store.lock() {
+        Ok(store) => {
+            if let Some(attachable_id) =
+                store.lookup_binding("terminal_pool", terminal_pool_provider, BindingObjectKind::Attachable, &session_name)
+            {
+                vars.push(("FLOTILLA_ATTACHABLE_ID".to_string(), attachable_id.to_string()));
+            }
+        }
+        Err(e) => {
+            warn!(err = %e, "attachable store lock poisoned in build_terminal_env_vars");
+        }
+    }
+
+    if let Some(socket) = daemon_socket_path {
+        vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.display().to_string()));
+    }
+
+    vars
+}
+
 /// Resolve terminal sessions through the pool. Each terminal content entry is
 /// ensured running and its attach command is stored in `config.resolved_commands`.
-async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn TerminalPool) {
+async fn resolve_terminal_pool(
+    config: &mut WorkspaceConfig,
+    terminal_pool: &dyn TerminalPool,
+    attachable_store: &SharedAttachableStore,
+    terminal_pool_provider: &str,
+    daemon_socket_path: Option<&Path>,
+) {
     let tmpl = if let Some(ref yaml) = config.template_yaml {
         serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
             warn!(err = %e, "failed to parse workspace template, using default");
@@ -1021,8 +1120,7 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
                 warn!(%id, err = %e, "failed to ensure terminal");
                 continue;
             }
-            // TODO(#390): populate with FLOTILLA_ATTACHABLE_ID and FLOTILLA_DAEMON_SOCKET
-            let env_vars = vec![];
+            let env_vars = build_terminal_env_vars(&id, attachable_store, terminal_pool_provider, daemon_socket_path);
             match terminal_pool.attach_command(&id, &entry.command, &config.working_directory, &env_vars).await {
                 Ok(cmd) => {
                     debug!(%id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
@@ -1038,6 +1136,7 @@ async fn resolve_terminal_pool(config: &mut WorkspaceConfig, terminal_pool: &dyn
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_terminal_commands(
     repo_root: &Path,
     branch: &str,
@@ -1045,12 +1144,15 @@ async fn prepare_terminal_commands(
     registry: &ProviderRegistry,
     config_base: &Path,
     requested_commands: &[PreparedTerminalCommand],
+    attachable_store: &SharedAttachableStore,
+    daemon_socket_path: Option<&Path>,
 ) -> Result<Vec<PreparedTerminalCommand>, String> {
     if !requested_commands.is_empty() {
         // The requesting host sent its template's role→command mappings.
         // If a terminal pool is available, wrap each command through it
         // for persistent sessions. Otherwise return as-is for passthrough.
-        if let Some(tp) = registry.terminal_pools.preferred() {
+        if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
+            let terminal_pool_provider = tp_desc.implementation.as_str();
             let mut resolved = Vec::new();
             let mut role_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
             for cmd in requested_commands {
@@ -1060,8 +1162,8 @@ async fn prepare_terminal_commands(
                 if let Err(e) = tp.ensure_running(&id, &cmd.command, checkout_path).await {
                     warn!(%id, err = %e, "failed to ensure terminal");
                 }
-                // TODO(#390): populate with FLOTILLA_ATTACHABLE_ID and FLOTILLA_DAEMON_SOCKET
-                match tp.attach_command(&id, &cmd.command, checkout_path, &vec![]).await {
+                let env_vars = build_terminal_env_vars(&id, attachable_store, terminal_pool_provider, daemon_socket_path);
+                match tp.attach_command(&id, &cmd.command, checkout_path, &env_vars).await {
                     Ok(attach_cmd) => resolved.push(PreparedTerminalCommand { role: cmd.role.clone(), command: attach_cmd }),
                     Err(e) => {
                         warn!(%id, err = %e, "failed to get attach command, using original");
@@ -1076,8 +1178,8 @@ async fn prepare_terminal_commands(
 
     // Fallback: read the local template (for backwards compat or local use)
     let mut config = workspace_config(repo_root, branch, checkout_path, "claude", config_base);
-    if let Some(tp) = registry.terminal_pools.preferred() {
-        resolve_terminal_pool(&mut config, tp.as_ref()).await;
+    if let Some((tp_desc, tp)) = registry.terminal_pools.preferred_with_desc() {
+        resolve_terminal_pool(&mut config, tp.as_ref(), attachable_store, &tp_desc.implementation, daemon_socket_path).await;
     }
 
     let commands = if let Some(resolved) = config.resolved_commands { resolved } else { render_template_commands(&config) };
@@ -1601,7 +1703,7 @@ mod tests {
         };
         let config_base = config_base();
         let attachable_store = test_attachable_store(&config_base);
-        execute(action, &repo, registry, providers_data, runner, &config_base, &attachable_store, &local_host()).await
+        execute(action, &repo, registry, providers_data, runner, &config_base, &attachable_store, None, &local_host()).await
     }
 
     fn assert_error_contains(result: CommandResult, expected_substring: &str) {
@@ -1750,6 +1852,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -1839,6 +1942,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -1875,6 +1979,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -1924,6 +2029,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -1976,6 +2082,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -2021,6 +2128,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -2121,6 +2229,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -2203,6 +2312,7 @@ mod tests {
             &runner,
             temp.path(),
             &attachable_store,
+            None,
             &local_host(),
         )
         .await;
@@ -2961,6 +3071,7 @@ mod tests {
             Arc::new(runner),
             config_base.clone(),
             test_attachable_store(&config_base),
+            None,
             local_host(),
             None,
         )
@@ -3057,13 +3168,21 @@ mod tests {
             runner,
             cb.clone(),
             attachable.clone(),
+            None,
             lh.clone(),
             None,
         )
         .await;
 
         let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
-        let resolver = ExecutorStepResolver { repo, registry, config_base: cb, attachable_store: attachable, local_host: lh.clone() };
+        let resolver = ExecutorStepResolver {
+            repo,
+            registry,
+            config_base: cb,
+            attachable_store: attachable,
+            daemon_socket_path: None,
+            local_host: lh.clone(),
+        };
 
         let result = match plan {
             ExecutionPlan::Steps(step_plan) => {
@@ -3107,13 +3226,21 @@ mod tests {
             runner,
             cb.clone(),
             attachable.clone(),
+            None,
             lh.clone(),
             None,
         )
         .await;
 
         let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
-        let resolver = ExecutorStepResolver { repo, registry, config_base: cb, attachable_store: attachable, local_host: lh.clone() };
+        let resolver = ExecutorStepResolver {
+            repo,
+            registry,
+            config_base: cb,
+            attachable_store: attachable,
+            daemon_socket_path: None,
+            local_host: lh.clone(),
+        };
 
         let result = match plan {
             ExecutionPlan::Steps(step_plan) => {
@@ -3156,13 +3283,21 @@ mod tests {
             runner,
             cb.clone(),
             attachable.clone(),
+            None,
             lh.clone(),
             None,
         )
         .await;
 
         let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
-        let resolver = ExecutorStepResolver { repo, registry, config_base: cb, attachable_store: attachable, local_host: lh.clone() };
+        let resolver = ExecutorStepResolver {
+            repo,
+            registry,
+            config_base: cb,
+            attachable_store: attachable,
+            daemon_socket_path: None,
+            local_host: lh.clone(),
+        };
 
         let result = match plan {
             ExecutionPlan::Steps(step_plan) => {
@@ -3399,7 +3534,8 @@ mod tests {
             resolved_commands: None,
         };
 
-        resolve_terminal_pool(&mut config, mock_pool.as_ref()).await;
+        resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None)
+            .await;
 
         // Default template has one "main" terminal entry
         assert!(config.resolved_commands.is_some());
@@ -3425,10 +3561,56 @@ content:
             resolved_commands: None,
         };
 
-        resolve_terminal_pool(&mut config, mock_pool.as_ref()).await;
+        resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None)
+            .await;
 
         // All content entries were non-terminal, so resolved_commands stays None
         assert!(config.resolved_commands.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: build_terminal_env_vars
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_terminal_env_vars_populates_both_vars_when_binding_exists() {
+        use flotilla_protocol::TerminalStatus;
+
+        use crate::attachable::{shared_in_memory_attachable_store, TerminalPurpose};
+
+        let store = shared_in_memory_attachable_store();
+        {
+            let mut s = store.lock().expect("lock");
+            let set_id = s.ensure_terminal_set(None, None);
+            s.ensure_terminal_attachable(
+                &set_id,
+                "terminal_pool",
+                "shpool",
+                "flotilla/feat/agent/0",
+                TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
+                "claude",
+                std::path::PathBuf::from("/repo/feat"),
+                TerminalStatus::Running,
+            );
+        }
+
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "agent".into(), index: 0 };
+        let socket = std::path::PathBuf::from("/tmp/flotilla.sock");
+        let vars = build_terminal_env_vars(&id, &store, "shpool", Some(&socket));
+
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].0, "FLOTILLA_ATTACHABLE_ID");
+        assert!(!vars[0].1.is_empty());
+        assert_eq!(vars[1].0, "FLOTILLA_DAEMON_SOCKET");
+        assert_eq!(vars[1].1, "/tmp/flotilla.sock");
+    }
+
+    #[test]
+    fn build_terminal_env_vars_empty_when_no_binding() {
+        let store = crate::attachable::shared_in_memory_attachable_store();
+        let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
+        let vars = build_terminal_env_vars(&id, &store, "shpool", None);
+        assert!(vars.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3643,6 +3825,7 @@ content:
             registry: Arc::new(registry),
             config_base: config_base.clone(),
             attachable_store: test_attachable_store(&config_base),
+            daemon_socket_path: None,
             local_host: local_host(),
         };
 
@@ -3670,6 +3853,7 @@ content:
             registry: Arc::new(registry),
             config_base: config_base.clone(),
             attachable_store: test_attachable_store(&config_base),
+            daemon_socket_path: None,
             local_host: local_host(),
         };
 

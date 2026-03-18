@@ -302,6 +302,10 @@ impl DaemonServer {
 
         info!(path = %self.socket_path.display(), "daemon listening");
 
+        // Tell the InProcessDaemon where the socket is so terminal sessions
+        // can get FLOTILLA_DAEMON_SOCKET injected.
+        self.daemon.set_daemon_socket_path(self.socket_path.clone()).await;
+
         // Take peer_data_rx before destructuring self
         let peer_data_rx = self.take_peer_data_rx();
 
