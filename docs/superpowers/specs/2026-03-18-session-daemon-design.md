@@ -210,6 +210,26 @@ Testing should follow behavior seams, not only subprocess realism:
 - `TerminalPool` integration tests in `flotilla-core` covering discovery preference, attach command generation, stable handle persistence, and list/kill mapping
 - in-process daemon-style tests wherever possible before relying on end-to-end PTY integration for every scenario
 
+### External terminal test suites and reference corpora
+
+The design should plan to reuse existing terminal-emulation test assets where practical rather than inventing a corpus from scratch.
+
+- `vttest` is the long-lived baseline suite for VT100, VT220, VT420, VT520, and xterm-oriented terminal behavior. It is old, but still actively maintained and remains the standard compatibility smoke test for display and keyboard behavior.
+- `esctest` is a more automated terminal-emulation test suite from the freedesktop terminal working group. It is a better fit for CI-style sequence validation than `vttest`, which is menu-driven and more interactive.
+
+For sequence selection and expected behavior research, the most useful current references are:
+
+- the xterm control-sequences reference, which remains the de facto compatibility baseline for many terminal features
+- Ghostty's VT reference, which is useful when deciding modern sequence coverage and future `libghostty-vt` alignment
+
+Recommended testing strategy:
+
+- use internal contract tests as the primary regression suite for daemon and `VtEngine` behavior
+- use `esctest` first at the `VtEngine` seam, where terminal input/output behavior can be validated without the full daemon lifecycle in the way
+- add a narrower end-to-end `esctest`-style layer later for daemon attach, detach, and replay-path validation once reattach fidelity exists
+- use `vttest` as a supplemental manual or scripted compatibility sweep, especially for baseline VT/xterm behaviors and keyboard handling
+- treat xterm and Ghostty documentation as the reference inputs for deciding which controls are in scope for phase 2 and later
+
 ## Files and components likely involved
 
 Likely new or changed areas:
