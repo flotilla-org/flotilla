@@ -9,6 +9,7 @@ use crate::{
         coding_agent::CloudAgentService,
         discovery::{ProviderCategory, ProviderDescriptor},
         issue_tracker::IssueTracker,
+        terminal::TerminalPool,
         testing::MockRunner,
         types::*,
         vcs::CheckoutManager,
