@@ -138,7 +138,7 @@ impl App {
 
     /// Toggle multi-select on the currently selected work item.
     ///
-    /// Production code now uses `WorkItemTable::toggle_multi_select` via the
+    /// Production code now uses `BaseView::toggle_multi_select` via the
     /// widget stack. This method remains for unit tests and will be removed
     /// when the legacy scaffolding is cleaned up.
     #[allow(dead_code)]

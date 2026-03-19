@@ -11,7 +11,6 @@ use flotilla_tui::{
     app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState},
     keymap::Keymap,
     theme::Theme,
-    ui,
 };
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
@@ -46,7 +45,7 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
-            widget_stack: vec![],
+            widget_stack: vec![Box::new(flotilla_tui::widgets::base_view::BaseView::new())],
             tab_bar: flotilla_tui::widgets::tab_bar::TabBar::new(),
             status_bar_widget: flotilla_tui::widgets::status_bar_widget::StatusBarWidget::new(),
             event_log_widget: flotilla_tui::widgets::event_log::EventLogWidget::new(),
@@ -66,7 +65,7 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
-            widget_stack: vec![],
+            widget_stack: vec![Box::new(flotilla_tui::widgets::base_view::BaseView::new())],
             tab_bar: flotilla_tui::widgets::tab_bar::TabBar::new(),
             status_bar_widget: flotilla_tui::widgets::status_bar_widget::StatusBarWidget::new(),
             event_log_widget: flotilla_tui::widgets::event_log::EventLogWidget::new(),
@@ -86,7 +85,7 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
-            widget_stack: vec![],
+            widget_stack: vec![Box::new(flotilla_tui::widgets::base_view::BaseView::new())],
             tab_bar: flotilla_tui::widgets::tab_bar::TabBar::new(),
             status_bar_widget: flotilla_tui::widgets::status_bar_widget::StatusBarWidget::new(),
             event_log_widget: flotilla_tui::widgets::event_log::EventLogWidget::new(),
@@ -185,27 +184,24 @@ impl TestHarness {
         let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         let keymap = Keymap::defaults();
+        let active_widget_mode = self.widget_stack.last().map(|w| w.mode_id());
         terminal
             .draw(|frame| {
-                let widget_mode = self.widget_stack.last().map(|w| w.mode_id());
-                ui::render(
-                    &self.model,
-                    &mut self.ui,
-                    &self.in_flight,
-                    &theme,
-                    &keymap,
-                    frame,
-                    widget_mode,
-                    &mut self.tab_bar,
-                    &mut self.status_bar_widget,
-                    &mut self.event_log_widget,
-                    &self.preview_panel,
-                );
                 let area = frame.area();
-                let ctx =
-                    flotilla_tui::widgets::RenderContext { model: &self.model, theme: &theme, keymap: &keymap, in_flight: &self.in_flight };
+                let mut ctx = flotilla_tui::widgets::RenderContext {
+                    model: &self.model,
+                    ui: &mut self.ui,
+                    theme: &theme,
+                    keymap: &keymap,
+                    in_flight: &self.in_flight,
+                    active_widget_mode,
+                    tab_bar: &mut self.tab_bar,
+                    status_bar_widget: &mut self.status_bar_widget,
+                    event_log_widget: &mut self.event_log_widget,
+                    preview_panel: &self.preview_panel,
+                };
                 for widget in &mut self.widget_stack {
-                    widget.render(frame, area, &ctx);
+                    widget.render(frame, area, &mut ctx);
                 }
             })
             .expect("failed to draw test frame");

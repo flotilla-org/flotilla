@@ -67,7 +67,7 @@ impl App {
     pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
             Action::SelectNext => {
-                // Widget handles WorkItemTable; only EventLog reaches here.
+                // BaseView handles Normal mode; only EventLog reaches here.
                 if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     self.event_log_widget.select_next();
                 }
@@ -106,7 +106,7 @@ impl App {
                 }
             }
             Action::Dismiss => {
-                // Widget handles WorkItemTable dismiss cascade. Only EventLog reaches here.
+                // BaseView handles Normal mode dismiss cascade. Only EventLog reaches here.
                 if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     self.ui.mode = UiMode::Normal;
                 }
@@ -139,7 +139,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        // The widget stack is always non-empty (WorkItemTable is the base layer).
+        // The widget stack is always non-empty (BaseView is the base layer).
         let captures_raw = self.widget_stack.last().expect("stack is never empty").captures_raw_keys();
         let mode_id = self.widget_stack.last().expect("stack is never empty").mode_id();
 
@@ -222,7 +222,7 @@ impl App {
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         // ── Widget stack mouse dispatch ──
-        // The stack is always non-empty (WorkItemTable is the base layer).
+        // The stack is always non-empty (BaseView is the base layer).
         // Modal widgets on top act as focus barriers — if a modal is present,
         // mouse events that it doesn't consume must NOT fall through to the
         // base table layer. Only dispatch to the top widget when modals are
@@ -898,7 +898,7 @@ mod tests {
 
         app.dismiss_modals();
 
-        assert_eq!(app.widget_stack.len(), 1, "only base WorkItemTable should remain");
+        assert_eq!(app.widget_stack.len(), 1, "only base BaseView should remain");
     }
 
     #[test]

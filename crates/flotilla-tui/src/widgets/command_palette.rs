@@ -293,7 +293,7 @@ impl InteractiveWidget for CommandPaletteWidget {
         Outcome::Consumed
     }
 
-    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &RenderContext) {
+    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {
         // The palette is still rendered by ui.rs via UiMode::CommandPalette.
         // This widget currently owns event handling/state sync only.
     }

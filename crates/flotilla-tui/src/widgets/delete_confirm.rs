@@ -68,7 +68,7 @@ impl InteractiveWidget for DeleteConfirmWidget {
         }
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderContext) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
         let popup = ui_helpers::popup_area(area, 60, 50);
         frame.render_widget(Clear, popup);
 

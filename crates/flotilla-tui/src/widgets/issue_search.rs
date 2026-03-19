@@ -76,7 +76,7 @@ impl InteractiveWidget for IssueSearchWidget {
         Outcome::Consumed
     }
 
-    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &RenderContext) {
+    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {
         // IssueSearch is displayed via the status bar, not a separate popup.
         // The status bar reads from UiMode::IssueSearch which is kept in sync
         // via sync_mode().

@@ -9,7 +9,6 @@ use crossterm::{
 use crate::{
     app::{self, App, UiMode},
     event::{self, Event},
-    ui,
     widgets::tab_bar::TabBarAction,
 };
 
@@ -34,27 +33,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     events.attach_daemon(daemon_rx);
 
     // Initial draw before entering the event loop
-    terminal.draw(|f| {
-        let widget_mode = app.widget_stack.last().map(|w| w.mode_id());
-        ui::render(
-            &app.model,
-            &mut app.ui,
-            &app.in_flight,
-            &app.theme,
-            &app.keymap,
-            f,
-            widget_mode,
-            &mut app.tab_bar,
-            &mut app.status_bar_widget,
-            &mut app.event_log_widget,
-            &app.preview_panel,
-        );
-        let area = f.area();
-        let ctx = crate::widgets::RenderContext { model: &app.model, theme: &app.theme, keymap: &app.keymap, in_flight: &app.in_flight };
-        for widget in &mut app.widget_stack {
-            widget.render(f, area, &ctx);
-        }
-    })?;
+    render_frame(&mut terminal, &mut app)?;
 
     loop {
         // ── Wait for the first event (blocking) ──
@@ -234,28 +213,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
 
         // ── Draw once ──
-        terminal.draw(|f| {
-            let widget_mode = app.widget_stack.last().map(|w| w.mode_id());
-            ui::render(
-                &app.model,
-                &mut app.ui,
-                &app.in_flight,
-                &app.theme,
-                &app.keymap,
-                f,
-                widget_mode,
-                &mut app.tab_bar,
-                &mut app.status_bar_widget,
-                &mut app.event_log_widget,
-                &app.preview_panel,
-            );
-            let area = f.area();
-            let ctx =
-                crate::widgets::RenderContext { model: &app.model, theme: &app.theme, keymap: &app.keymap, in_flight: &app.in_flight };
-            for widget in &mut app.widget_stack {
-                widget.render(f, area, &ctx);
-            }
-        })?;
+        render_frame(&mut terminal, &mut app)?;
 
         if app.should_quit {
             break;
@@ -263,5 +221,35 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     }
 
     crate::terminal::restore_terminal();
+    Ok(())
+}
+
+/// Render one frame by iterating the widget stack.
+///
+/// Takes the widget stack out of `app` to avoid borrow conflicts between the
+/// stack iteration and the mutable `RenderContext` (which borrows `app.ui`,
+/// `app.tab_bar`, etc.). The stack is restored after rendering.
+fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+    let mut stack = std::mem::take(&mut app.widget_stack);
+    let active_widget_mode = stack.last().map(|w| w.mode_id());
+    terminal.draw(|f| {
+        let area = f.area();
+        let mut ctx = crate::widgets::RenderContext {
+            model: &app.model,
+            ui: &mut app.ui,
+            theme: &app.theme,
+            keymap: &app.keymap,
+            in_flight: &app.in_flight,
+            active_widget_mode,
+            tab_bar: &mut app.tab_bar,
+            status_bar_widget: &mut app.status_bar_widget,
+            event_log_widget: &mut app.event_log_widget,
+            preview_panel: &app.preview_panel,
+        };
+        for widget in &mut stack {
+            widget.render(f, area, &mut ctx);
+        }
+    })?;
+    app.widget_stack = stack;
     Ok(())
 }

@@ -290,7 +290,7 @@ impl App {
             in_flight: HashMap::new(),
             pending_cancel: None,
             should_quit: false,
-            widget_stack: vec![Box::new(crate::widgets::work_item_table::WorkItemTable::new())],
+            widget_stack: vec![Box::new(crate::widgets::base_view::BaseView::new())],
             tab_bar: crate::widgets::tab_bar::TabBar::new(),
             status_bar_widget: crate::widgets::status_bar_widget::StatusBarWidget::new(),
             event_log_widget: crate::widgets::event_log::EventLogWidget::new(),
@@ -405,7 +405,7 @@ impl App {
 
     // ── Widget stack helpers ──
 
-    /// Pop all modal widgets from the stack, leaving only the base WorkItemTable.
+    /// Pop all modal widgets from the stack, leaving only the base BaseView.
     /// Called when the user switches tabs or navigates away, so stale modals
     /// don't linger across context changes.
     pub fn dismiss_modals(&mut self) {

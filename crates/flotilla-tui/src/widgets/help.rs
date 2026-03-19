@@ -49,7 +49,7 @@ impl InteractiveWidget for HelpWidget {
         Outcome::Ignored
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderContext) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
         let popup = ui_helpers::popup_area(area, 60, 85);
         frame.render_widget(Clear, popup);
 

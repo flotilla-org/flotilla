@@ -185,7 +185,7 @@ impl InteractiveWidget for FilePickerWidget {
         Outcome::Consumed
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderContext) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
 
         let (popup_area, inner) = ui_helpers::render_popup_frame(frame, area, 60, 60, " Add Repository ", theme.block_style());

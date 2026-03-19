@@ -84,7 +84,7 @@ impl InteractiveWidget for BranchInputWidget {
         Outcome::Consumed
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderContext) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
         let (_outer, inner) = ui_helpers::render_popup_frame(frame, area, 50, 20, " New Branch ", theme.block_style());
 

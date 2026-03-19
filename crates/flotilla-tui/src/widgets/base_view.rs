@@ -7,34 +7,28 @@ use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext}
 use crate::{
     app::ui_state::UiMode,
     keymap::{Action, ModeId},
+    ui,
 };
 
-/// Base-layer widget for the main work item table.
+/// Root widget that composes the base layer: tab bar, content area (table +
+/// preview), status bar, and event log.
 ///
-/// Handles navigation, selection, multi-select, dismiss cascade, and
-/// delegating to modal widgets (help, branch input, issue search,
-/// command palette). Actions that need `&App` context (action_enter,
-/// open_action_menu, open_file_picker, dispatch intent, tab navigation,
-/// theme/layout/debug toggles) return `Ignored` and fall through to the
-/// legacy `dispatch_action` path.
+/// Sits at `widget_stack[0]` and handles all Normal-mode actions that the
+/// previous `WorkItemTable` widget handled. Modal widgets are pushed on top
+/// and rendered after BaseView.
 ///
-/// Rendering is handled by `ui.rs` for now — the widget's `render()` is
-/// a no-op. Mouse handling stays in the legacy path as well.
-pub struct WorkItemTable;
+/// Rendering delegates to `ui::render` which orchestrates layout across the
+/// child components (TabBar, StatusBarWidget, EventLogWidget, PreviewPanel).
+/// Those children live on `App` for now and are accessed through `RenderContext`.
+pub struct BaseView;
 
-impl WorkItemTable {
+impl BaseView {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl Default for WorkItemTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    // ── Action helpers (absorbed from WorkItemTable) ──
 
-impl WorkItemTable {
     fn select_next(ctx: &mut WidgetContext) -> Outcome {
         let repo_key = &ctx.repo_order[ctx.active_repo];
         let rui = ctx.repo_ui.get_mut(repo_key).expect("active repo must have UI state");
@@ -52,8 +46,6 @@ impl WorkItemTable {
         rui.selected_selectable_idx = Some(next);
         rui.table_state.select(Some(table_idx));
 
-        // Infinite scroll fetch-more is handled by the App-level
-        // check_infinite_scroll() post-dispatch hook after SelectNext/Prev.
         Outcome::Consumed
     }
 
@@ -111,9 +103,6 @@ impl WorkItemTable {
         let rui = ctx.repo_ui.get_mut(repo_key).expect("active repo must have UI state");
 
         if rui.active_search_query.is_some() {
-            // Clear active issue search — need to dispatch a command and clear the query.
-            // The actual ClearIssueSearch command dispatch needs repo path from model,
-            // which we have via ctx.model.
             let repo_path = ctx.model.active_repo_root().clone();
             ctx.commands.push(flotilla_protocol::Command {
                 host: None,
@@ -132,10 +121,16 @@ impl WorkItemTable {
     }
 }
 
-impl InteractiveWidget for WorkItemTable {
+impl Default for BaseView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InteractiveWidget for BaseView {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        // Only handle actions when the focus target is WorkItemTable (Normal mode).
-        // If we're in Config/EventLog mode, let the legacy path handle it.
+        // Only handle table actions when in Normal mode. Config/EventLog mode
+        // actions fall through to the legacy dispatch_action path.
         if !matches!(*ctx.mode, UiMode::Normal) {
             return Outcome::Ignored;
         }
@@ -160,7 +155,7 @@ impl InteractiveWidget for WorkItemTable {
                 Outcome::Consumed
             }
 
-            // Open modal widgets — return Push outcomes
+            // Open modal widgets -- return Push outcomes
             Action::ToggleHelp => Outcome::Push(Box::new(super::help::HelpWidget::new())),
 
             Action::OpenBranchInput => {
@@ -187,7 +182,7 @@ impl InteractiveWidget for WorkItemTable {
                 Outcome::Push(Box::new(super::command_palette::CommandPaletteWidget::new()))
             }
 
-            // App-level toggles — push AppAction and consume
+            // App-level toggles
             Action::ToggleDebug => {
                 ctx.app_actions.push(AppAction::ToggleDebug);
                 Outcome::Consumed
@@ -209,7 +204,7 @@ impl InteractiveWidget for WorkItemTable {
                 Outcome::Consumed
             }
 
-            // Actions that need &App context — fall through to legacy dispatch
+            // Actions that need &App context -- fall through to legacy dispatch
             Action::Confirm
             | Action::OpenActionMenu
             | Action::OpenFilePicker
@@ -221,9 +216,20 @@ impl InteractiveWidget for WorkItemTable {
         }
     }
 
-    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {
-        // Rendering is handled by ui.rs for now. The WorkItemTable widget
-        // only participates in event handling at this stage.
+    fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
+        ui::render(
+            ctx.model,
+            ctx.ui,
+            ctx.in_flight,
+            ctx.theme,
+            ctx.keymap,
+            frame,
+            ctx.active_widget_mode,
+            ctx.tab_bar,
+            ctx.status_bar_widget,
+            ctx.event_log_widget,
+            ctx.preview_panel,
+        );
     }
 
     fn mode_id(&self) -> ModeId {
@@ -260,19 +266,19 @@ mod tests {
         harness
     }
 
-    // ── mode_id ──────────────────────────────────────────────────────
+    // -- mode_id --
 
     #[test]
     fn mode_id_is_normal() {
-        let widget = WorkItemTable::new();
+        let widget = BaseView::new();
         assert_eq!(widget.mode_id(), ModeId::Normal);
     }
 
-    // ── SelectNext / SelectPrev ──────────────────────────────────────
+    // -- SelectNext / SelectPrev --
 
     #[test]
     fn select_next_from_none_selects_first() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(5);
         let mut ctx = harness.ctx();
 
@@ -285,7 +291,7 @@ mod tests {
 
     #[test]
     fn select_next_advances() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_selected_items(5);
         let mut ctx = harness.ctx();
 
@@ -297,7 +303,7 @@ mod tests {
 
     #[test]
     fn select_next_stays_at_end() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_selected_items(2);
 
         {
@@ -315,7 +321,7 @@ mod tests {
 
     #[test]
     fn select_next_noop_on_empty() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(0);
         let mut ctx = harness.ctx();
 
@@ -328,7 +334,7 @@ mod tests {
 
     #[test]
     fn select_prev_from_none_selects_first() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(5);
         let mut ctx = harness.ctx();
 
@@ -341,7 +347,7 @@ mod tests {
 
     #[test]
     fn select_prev_decrements() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_selected_items(5);
 
         {
@@ -363,7 +369,7 @@ mod tests {
 
     #[test]
     fn select_prev_stays_at_zero() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_selected_items(5);
         let mut ctx = harness.ctx();
 
@@ -374,11 +380,11 @@ mod tests {
         assert_eq!(harness.repo_ui[repo_key].selected_selectable_idx, Some(0));
     }
 
-    // ── ToggleMultiSelect ────────────────────────────────────────────
+    // -- ToggleMultiSelect --
 
     #[test]
     fn toggle_multi_select_adds() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_selected_items(3);
         let mut ctx = harness.ctx();
 
@@ -391,7 +397,7 @@ mod tests {
 
     #[test]
     fn toggle_multi_select_removes() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_selected_items(3);
 
         {
@@ -409,7 +415,7 @@ mod tests {
 
     #[test]
     fn toggle_multi_select_noop_when_no_selection() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(3);
         let mut ctx = harness.ctx();
 
@@ -419,11 +425,11 @@ mod tests {
         assert!(harness.repo_ui[repo_key].multi_selected.is_empty());
     }
 
-    // ── ToggleProviders ──────────────────────────────────────────────
+    // -- ToggleProviders --
 
     #[test]
     fn toggle_providers_toggles() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(1);
         let repo_key = harness.model.repo_order[0].clone();
 
@@ -442,11 +448,11 @@ mod tests {
         assert!(!harness.repo_ui[&repo_key].show_providers);
     }
 
-    // ── Dismiss cascade ──────────────────────────────────────────────
+    // -- Dismiss cascade --
 
     #[test]
     fn dismiss_cancels_in_flight_first() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(1);
         harness.in_flight.insert(42, crate::app::InFlightCommand {
             repo_identity: harness.model.repo_order[0].clone(),
@@ -463,7 +469,7 @@ mod tests {
 
     #[test]
     fn dismiss_clears_search_second() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(1);
         let repo_key = harness.model.repo_order[0].clone();
         harness.repo_ui.get_mut(&repo_key).expect("repo ui").active_search_query = Some("test".into());
@@ -480,7 +486,7 @@ mod tests {
 
     #[test]
     fn dismiss_clears_providers_third() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(1);
         let repo_key = harness.model.repo_order[0].clone();
         harness.repo_ui.get_mut(&repo_key).expect("repo ui").show_providers = true;
@@ -495,7 +501,7 @@ mod tests {
 
     #[test]
     fn dismiss_clears_multi_select_fourth() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_selected_items(3);
         let repo_key = harness.model.repo_order[0].clone();
         harness.repo_ui.get_mut(&repo_key).expect("repo ui").multi_selected.insert(WorkItemIdentity::Issue("0".into()));
@@ -510,7 +516,7 @@ mod tests {
 
     #[test]
     fn dismiss_quits_when_nothing_to_clear() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(1);
         let mut ctx = harness.ctx();
 
@@ -519,11 +525,11 @@ mod tests {
         assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::Quit)));
     }
 
-    // ── Quit ─────────────────────────────────────────────────────────
+    // -- Quit --
 
     #[test]
     fn quit_pushes_app_action() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = harness_with_items(1);
         let mut ctx = harness.ctx();
 
@@ -532,11 +538,11 @@ mod tests {
         assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::Quit)));
     }
 
-    // ── Push modal widgets ───────────────────────────────────────────
+    // -- Push modal widgets --
 
     #[test]
     fn toggle_help_pushes_help_widget() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -546,7 +552,7 @@ mod tests {
 
     #[test]
     fn open_branch_input_pushes_widget_and_sets_mode() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -557,7 +563,7 @@ mod tests {
 
     #[test]
     fn open_issue_search_pushes_widget_and_sets_mode() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -568,7 +574,7 @@ mod tests {
 
     #[test]
     fn open_command_palette_pushes_widget_and_sets_mode() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -577,11 +583,11 @@ mod tests {
         assert!(matches!(harness.mode, UiMode::CommandPalette { .. }));
     }
 
-    // ── Ignored actions ──────────────────────────────────────────────
+    // -- Ignored actions --
 
     #[test]
     fn confirm_returns_ignored() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -591,7 +597,7 @@ mod tests {
 
     #[test]
     fn open_action_menu_returns_ignored() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -601,7 +607,7 @@ mod tests {
 
     #[test]
     fn tab_navigation_returns_ignored() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -611,7 +617,7 @@ mod tests {
 
     #[test]
     fn cycle_theme_pushes_app_action() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -620,11 +626,11 @@ mod tests {
         assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::CycleTheme)));
     }
 
-    // ── Non-Normal mode returns Ignored ──────────────────────────────
+    // -- Non-Normal mode returns Ignored --
 
     #[test]
     fn non_normal_mode_returns_ignored() {
-        let mut widget = WorkItemTable::new();
+        let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         harness.mode = UiMode::Config;
         let mut ctx = harness.ctx();
