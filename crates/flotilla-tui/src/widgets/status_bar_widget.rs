@@ -411,8 +411,6 @@ fn status_bar_content(
             task: None,
             mode_indicators: vec![],
         },
-        // All other modes are handled by the widget-mode override above.
-        _ => StatusBarContent { status: StatusSection::plain(""), keys: normal_mode_key_chips(), task: None, mode_indicators: vec![] },
     }
 }
 

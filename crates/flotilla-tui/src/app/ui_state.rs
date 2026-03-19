@@ -4,11 +4,10 @@ use std::{
 };
 
 use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-use flotilla_protocol::{CheckoutStatus, HostName, RepoIdentity, WorkItemIdentity};
+use flotilla_protocol::{HostName, RepoIdentity, WorkItemIdentity};
 use ratatui::{layout::Rect, widgets::TableState};
 use tui_input::Input;
 
-use super::intent::Intent;
 use crate::status_bar::StatusBarTarget;
 
 #[derive(Clone)]
@@ -32,44 +31,9 @@ pub enum BranchInputKind {
 pub enum UiMode {
     #[default]
     Normal,
-    Help,
     Config,
-    ActionMenu {
-        items: Vec<Intent>,
-        index: usize,
-    },
-    BranchInput {
-        input: Input,
-        kind: BranchInputKind,
-        /// Issue IDs to link to the branch when created (provider_name, issue_id).
-        pending_issue_ids: Vec<(String, String)>,
-    },
-    FilePicker {
-        input: Input,
-        dir_entries: Vec<DirEntry>,
-        selected: usize,
-    },
-    DeleteConfirm {
-        info: Option<CheckoutStatus>,
-        loading: bool,
-        terminal_keys: Vec<flotilla_protocol::ManagedTerminalId>,
-        identity: WorkItemIdentity,
-        remote_host: Option<flotilla_protocol::HostName>,
-    },
-    CloseConfirm {
-        id: String,
-        title: String,
-        identity: WorkItemIdentity,
-        command: flotilla_protocol::Command,
-    },
     IssueSearch {
         input: Input,
-    },
-    CommandPalette {
-        input: Input,
-        entries: &'static [crate::palette::PaletteEntry],
-        selected: usize,
-        scroll_top: usize,
     },
 }
 
@@ -304,39 +268,8 @@ mod tests {
 
     #[test]
     fn is_config_returns_true_only_for_config_variant() {
-        let cases: Vec<(UiMode, bool)> = vec![
-            (UiMode::Normal, false),
-            (UiMode::Help, false),
-            (UiMode::Config, true),
-            (UiMode::ActionMenu { items: vec![], index: 0 }, false),
-            (UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] }, false),
-            (UiMode::FilePicker { input: Input::default(), dir_entries: vec![], selected: 0 }, false),
-            (
-                UiMode::DeleteConfirm {
-                    info: None,
-                    loading: false,
-                    terminal_keys: vec![],
-                    identity: WorkItemIdentity::Session("test".into()),
-                    remote_host: None,
-                },
-                false,
-            ),
-            (
-                UiMode::CloseConfirm {
-                    id: "42".into(),
-                    title: "test".into(),
-                    identity: WorkItemIdentity::Session("test".into()),
-                    command: flotilla_protocol::Command {
-                        host: None,
-                        context_repo: None,
-                        action: flotilla_protocol::CommandAction::CloseChangeRequest { id: "42".into() },
-                    },
-                },
-                false,
-            ),
-            (UiMode::IssueSearch { input: Input::default() }, false),
-            (UiMode::CommandPalette { input: Input::default(), entries: &[], selected: 0, scroll_top: 0 }, false),
-        ];
+        let cases: Vec<(UiMode, bool)> =
+            vec![(UiMode::Normal, false), (UiMode::Config, true), (UiMode::IssueSearch { input: Input::default() }, false)];
         for (mode, expected) in &cases {
             assert_eq!(mode.is_config(), *expected, "failed for mode variant");
         }

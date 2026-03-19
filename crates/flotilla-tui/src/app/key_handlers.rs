@@ -646,9 +646,6 @@ mod tests {
 
         app.ui.mode = UiMode::Config;
         assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Dismiss));
-
-        app.ui.mode = UiMode::Help;
-        assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Dismiss));
     }
 
     // resolve_action_maps_file_picker_navigation_keys: removed because

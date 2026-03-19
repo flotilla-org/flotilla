@@ -223,15 +223,8 @@ impl From<&UiMode> for ModeId {
     fn from(mode: &UiMode) -> Self {
         match mode {
             UiMode::Normal => ModeId::Normal,
-            UiMode::Help => ModeId::Help,
             UiMode::Config => ModeId::Config,
-            UiMode::ActionMenu { .. } => ModeId::ActionMenu,
-            UiMode::BranchInput { .. } => ModeId::BranchInput,
-            UiMode::FilePicker { .. } => ModeId::FilePicker,
-            UiMode::DeleteConfirm { .. } => ModeId::DeleteConfirm,
-            UiMode::CloseConfirm { .. } => ModeId::CloseConfirm,
             UiMode::IssueSearch { .. } => ModeId::IssueSearch,
-            UiMode::CommandPalette { .. } => ModeId::CommandPalette,
         }
     }
 }
@@ -755,9 +748,8 @@ mod tests {
     #[test]
     fn mode_id_from_ui_mode() {
         assert_eq!(ModeId::from(&UiMode::Normal), ModeId::Normal);
-        assert_eq!(ModeId::from(&UiMode::Help), ModeId::Help);
         assert_eq!(ModeId::from(&UiMode::Config), ModeId::Config);
-        assert_eq!(ModeId::from(&UiMode::ActionMenu { items: vec![], index: 0 }), ModeId::ActionMenu);
+        assert_eq!(ModeId::from(&UiMode::IssueSearch { input: tui_input::Input::default() }), ModeId::IssueSearch);
     }
 
     // ── help_sections tests ──

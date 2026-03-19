@@ -143,6 +143,9 @@ pub trait InteractiveWidget {
         WidgetStatusData::None
     }
 
+    /// Downcast support for reading widget state from outside the trait.
+    fn as_any(&self) -> &dyn Any;
+
     /// Downcast support for updating widget state from outside the trait.
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }

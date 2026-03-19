@@ -306,7 +306,20 @@ impl App {
         if self.ui.repo_ui.values().any(|rui| rui.pending_actions.values().any(|a| matches!(a.status, PendingStatus::InFlight))) {
             return true;
         }
-        matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. } | UiMode::DeleteConfirm { loading: true, .. })
+        // Check widget stack for loading states
+        if let Some(widget) = self.widget_stack.last() {
+            if let Some(biw) = widget.as_any().downcast_ref::<crate::widgets::branch_input::BranchInputWidget>() {
+                if biw.is_generating() {
+                    return true;
+                }
+            }
+            if let Some(dcw) = widget.as_any().downcast_ref::<crate::widgets::delete_confirm::DeleteConfirmWidget>() {
+                if dcw.loading {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn persist_layout(&self) {

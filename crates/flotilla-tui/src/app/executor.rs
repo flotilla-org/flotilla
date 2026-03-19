@@ -2,7 +2,7 @@ use flotilla_protocol::{Command, CommandAction, CommandResult};
 use tracing::info;
 
 use super::{
-    ui_state::{PendingAction, PendingActionContext, PendingStatus, UiMode},
+    ui_state::{PendingAction, PendingActionContext, PendingStatus},
     App,
 };
 
@@ -61,10 +61,6 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
 /// `DeleteConfirm { loading: true }` must be cleared so the user
 /// can see the error message and isn't stuck in a loading state.
 fn reset_loading_mode(app: &mut App) {
-    if let UiMode::BranchInput { kind: super::BranchInputKind::Generating, .. } = &app.ui.mode {
-        app.ui.mode = UiMode::Normal;
-    }
-
     // Pop loading widgets from the widget stack on error.
     if let Some(widget) = app.widget_stack.last_mut() {
         if let Some(dcw) = widget.as_any_mut().downcast_mut::<crate::widgets::delete_confirm::DeleteConfirmWidget>() {

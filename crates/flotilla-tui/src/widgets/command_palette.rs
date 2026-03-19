@@ -333,6 +333,10 @@ impl InteractiveWidget for CommandPaletteWidget {
         WidgetStatusData::CommandPalette { input_text: self.input.value().to_string() }
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }

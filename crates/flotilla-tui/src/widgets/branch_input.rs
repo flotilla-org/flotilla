@@ -107,6 +107,10 @@ impl InteractiveWidget for BranchInputWidget {
         WidgetStatusData::BranchInput { generating: self.is_generating() }
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
