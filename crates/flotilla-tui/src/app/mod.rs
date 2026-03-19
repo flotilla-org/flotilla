@@ -760,8 +760,11 @@ impl App {
             let parent_str = format!("{}/", parent.display());
             input = Input::from(parent_str.as_str());
         }
-        self.ui.mode = UiMode::FilePicker { input, dir_entries: Vec::new(), selected: 0 };
+        self.ui.mode = UiMode::FilePicker { input: input.clone(), dir_entries: Vec::new(), selected: 0 };
         self.refresh_dir_listing();
+        // Build dir_entries after refresh so the widget has them
+        let dir_entries = if let UiMode::FilePicker { ref dir_entries, .. } = self.ui.mode { dir_entries.clone() } else { Vec::new() };
+        self.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
     }
 
     pub(super) fn clear_active_issue_search(&mut self, dispatch: ClearDispatch) {

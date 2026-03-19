@@ -438,6 +438,36 @@ fn status_bar_content(
                     mode_indicators: vec![],
                 };
             }
+            ModeId::CommandPalette => {
+                // Read the current palette input from the UiMode bridge
+                let input_text =
+                    if let UiMode::CommandPalette { ref input, .. } = ui.mode { input.value().to_string() } else { String::new() };
+                let status_text = format!("/{}", input_text);
+                return StatusBarContent {
+                    status: StatusSection::plain(&status_text),
+                    keys: vec![
+                        key_chip(ENTER_KEY_GLYPH, "Run", KeyCode::Enter),
+                        key_chip("TAB", "Fill", KeyCode::Tab),
+                        key_chip("ESC", "Close", KeyCode::Esc),
+                    ],
+                    task: None,
+                    mode_indicators: normal_mode_indicators(ui),
+                };
+            }
+            ModeId::FilePicker => {
+                return StatusBarContent {
+                    status: StatusSection::plain("ADD REPO"),
+                    keys: vec![
+                        key_chip("j", "Down", KeyCode::Char('j')),
+                        key_chip("k", "Up", KeyCode::Char('k')),
+                        key_chip("tab", "Complete", KeyCode::Tab),
+                        key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
+                        key_chip("ESC", "Cancel", KeyCode::Esc),
+                    ],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
             _ => {} // Other widget modes will be handled as they are extracted
         }
     }

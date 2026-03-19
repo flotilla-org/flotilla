@@ -1,7 +1,9 @@
 pub mod action_menu;
 pub mod branch_input;
 pub mod close_confirm;
+pub mod command_palette;
 pub mod delete_confirm;
+pub mod file_picker;
 pub mod help;
 pub mod issue_search;
 

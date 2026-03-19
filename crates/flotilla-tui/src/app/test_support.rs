@@ -193,7 +193,8 @@ pub(crate) fn setup_selectable_table(app: &mut App, items: Vec<WorkItem>) {
 }
 
 pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry>) {
-    app.ui.mode = UiMode::FilePicker { input: Input::from(path), dir_entries: entries, selected: 0 };
+    app.ui.mode = UiMode::FilePicker { input: Input::from(path), dir_entries: entries.clone(), selected: 0 };
+    app.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(Input::from(path), entries)));
 }
 
 pub(crate) fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {

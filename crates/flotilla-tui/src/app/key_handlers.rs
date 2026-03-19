@@ -3,7 +3,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, CommandAction, WorkItem};
-use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
+use tui_input::Input;
 
 use super::{
     ui_state::{FocusTarget, PendingActionContext},
@@ -72,20 +72,8 @@ impl App {
                         self.ui.event_log.selected = Some(self.ui.event_log.count - 1);
                     }
                 }
-                FocusTarget::FilePickerList => self.file_picker_select_next(),
-                FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
-                        let count = crate::palette::filter_entries(entries, input.value()).len();
-                        if count > 0 {
-                            *selected = (*selected + 1) % count;
-                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
-                            if *selected >= *scroll_top + max_visible {
-                                *scroll_top = selected.saturating_sub(max_visible - 1);
-                            } else if *selected < *scroll_top {
-                                *scroll_top = *selected;
-                            }
-                        }
-                    }
+                FocusTarget::FilePickerList | FocusTarget::CommandPalette => {
+                    // Handled by widget stack
                 }
                 FocusTarget::ActionMenu
                 | FocusTarget::HelpText
@@ -103,20 +91,8 @@ impl App {
                         }
                     }
                 }
-                FocusTarget::FilePickerList => self.file_picker_select_prev(),
-                FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
-                        let count = crate::palette::filter_entries(entries, input.value()).len();
-                        if count > 0 {
-                            *selected = if *selected == 0 { count - 1 } else { *selected - 1 };
-                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
-                            if *selected >= *scroll_top + max_visible {
-                                *scroll_top = selected.saturating_sub(max_visible - 1);
-                            } else if *selected < *scroll_top {
-                                *scroll_top = *selected;
-                            }
-                        }
-                    }
+                FocusTarget::FilePickerList | FocusTarget::CommandPalette => {
+                    // Handled by widget stack
                 }
                 FocusTarget::ActionMenu
                 | FocusTarget::HelpText
@@ -127,44 +103,11 @@ impl App {
             },
             Action::Confirm => match self.ui.mode.focus_target() {
                 FocusTarget::WorkItemTable => self.action_enter(),
-                FocusTarget::BranchInput | FocusTarget::IssueSearchInput => {
+                FocusTarget::BranchInput | FocusTarget::IssueSearchInput | FocusTarget::FilePickerList | FocusTarget::CommandPalette => {
                     // Handled by widget stack
                 }
-                FocusTarget::FilePickerList => self.activate_dir_entry(),
                 FocusTarget::DeleteConfirmDialog | FocusTarget::CloseConfirmDialog => {
                     // Handled by widget stack
-                }
-                FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, entries, selected, .. } = self.ui.mode {
-                        let text = input.value().to_string();
-
-                        // "search <terms>" — apply filter directly, empty clears
-                        if let Some(query) = text.strip_prefix("search ") {
-                            let query = query.trim().to_string();
-                            self.ui.mode = UiMode::Normal;
-                            if query.is_empty() {
-                                self.clear_active_issue_search(crate::app::ClearDispatch::Always);
-                            } else {
-                                let repo = self.model.active_repo_root().clone();
-                                self.proto_commands.push(self.command(CommandAction::SearchIssues {
-                                    repo: flotilla_protocol::RepoSelector::Path(repo),
-                                    query: query.clone(),
-                                }));
-                                self.active_ui_mut().active_search_query = Some(query);
-                            }
-                            return;
-                        }
-
-                        // Otherwise dispatch the selected entry's action
-                        let filtered = crate::palette::filter_entries(entries, &text);
-                        if let Some(entry) = filtered.get(selected) {
-                            let action = entry.action;
-                            self.ui.mode = UiMode::Normal;
-                            self.dispatch_action(action);
-                            return;
-                        }
-                    }
-                    self.ui.mode = UiMode::Normal;
                 }
                 FocusTarget::ActionMenu | FocusTarget::HelpText | FocusTarget::EventLog => {}
             },
@@ -255,6 +198,7 @@ impl App {
                         selected: 0,
                         scroll_top: 0,
                     };
+                    self.widget_stack.push(Box::new(crate::widgets::command_palette::CommandPaletteWidget::new()));
                 }
             }
             Action::Dismiss => match self.ui.mode.focus_target() {
@@ -312,7 +256,27 @@ impl App {
                     _ => None,
                 }
             } else {
-                self.keymap.resolve(mode_id, crokey::KeyCombination::from(key))
+                // Hybrid widgets (text input + action keys) need hardcoded
+                // resolution to prevent shared bindings (e.g. j/k → SelectNext/
+                // SelectPrev) from intercepting text input. Other non-capturing
+                // widgets use the normal keymap.
+                match mode_id {
+                    ModeId::CommandPalette => match key.code {
+                        KeyCode::Esc => Some(Action::Dismiss),
+                        KeyCode::Enter => Some(Action::Confirm),
+                        KeyCode::Up => Some(Action::SelectPrev),
+                        KeyCode::Down => Some(Action::SelectNext),
+                        _ => None,
+                    },
+                    ModeId::FilePicker => match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
+                        KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
+                        KeyCode::Esc => Some(Action::Dismiss),
+                        KeyCode::Enter => Some(Action::Confirm),
+                        _ => None,
+                    },
+                    _ => self.keymap.resolve(mode_id, crokey::KeyCombination::from(key)),
+                }
             };
 
             let mut stack = std::mem::take(&mut self.widget_stack);
@@ -349,43 +313,6 @@ impl App {
         // ── Legacy path ──
         if let Some(action) = self.resolve_action(key) {
             self.dispatch_action(action);
-            return;
-        }
-
-        // Unresolved keys in text input modes pass through to tui_input
-        match self.ui.mode {
-            UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
-            UiMode::CommandPalette { ref mut input, entries, ref mut selected, ref mut scroll_top, .. } => {
-                // Tab / Right arrow: fill selected command name into input
-                if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
-                    let filtered = crate::palette::filter_entries(entries, input.value());
-                    if let Some(entry) = filtered.get(*selected) {
-                        let filled = format!("{} ", entry.name);
-                        *input = Input::from(filled.as_str());
-                        *selected = 0;
-                        *scroll_top = 0;
-                    }
-                    return;
-                }
-
-                // Backspace on empty input closes the palette
-                if matches!(key.code, KeyCode::Backspace) && input.value().is_empty() {
-                    self.ui.mode = UiMode::Normal;
-                    return;
-                }
-
-                input.handle_event(&crossterm::event::Event::Key(key));
-                // Shortcut: typing / when input is empty fills "search "
-                if input.value() == "/" {
-                    *input = Input::from("search ");
-                    *selected = 0;
-                    *scroll_top = 0;
-                    return;
-                }
-                *selected = 0;
-                *scroll_top = 0;
-            }
-            _ => {}
         }
     }
 
@@ -426,8 +353,8 @@ impl App {
         }
 
         match self.ui.mode {
-            UiMode::FilePicker { .. } => {
-                self.handle_file_picker_mouse(mouse);
+            UiMode::FilePicker { .. } | UiMode::CommandPalette { .. } => {
+                // Handled by widget stack
                 return;
             }
             UiMode::ActionMenu { .. }
@@ -435,8 +362,7 @@ impl App {
             | UiMode::DeleteConfirm { .. }
             | UiMode::CloseConfirm { .. }
             | UiMode::BranchInput { .. }
-            | UiMode::IssueSearch { .. }
-            | UiMode::CommandPalette { .. } => {
+            | UiMode::IssueSearch { .. } => {
                 return;
             }
             UiMode::Config | UiMode::Normal => {}
@@ -718,11 +644,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_action_select_next_advances_file_picker_selection() {
+    fn file_picker_select_next_advances_selection_via_handle_key() {
+        // FilePicker selection is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![dir_entry("alpha", false, false), dir_entry("beta", false, false)]);
 
-        app.dispatch_action(Action::SelectNext);
+        app.handle_key(key(KeyCode::Down));
 
         match app.ui.mode {
             UiMode::FilePicker { selected, .. } => assert_eq!(selected, 1),
@@ -775,7 +703,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_action_confirm_activates_file_picker_selection() {
+    fn file_picker_confirm_activates_selection_via_handle_key() {
+        // FilePicker confirm is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let tmp = tempfile::tempdir().expect("create tempdir");
         let repo_dir = tmp.path().join("my-repo");
         std::fs::create_dir(&repo_dir).expect("create repo dir");
@@ -786,9 +716,10 @@ mod tests {
         let entries = vec![DirEntry { name: "my-repo".to_string(), is_dir: true, is_git_repo: true, is_added: false }];
         enter_file_picker(&mut app, &parent_path, entries);
 
-        app.dispatch_action(Action::Confirm);
+        app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         let (cmd, _) = app.proto_commands.take_next().expect("expected track repo command");
         match cmd {
             Command { action: CommandAction::TrackRepoPath { path }, .. } => {

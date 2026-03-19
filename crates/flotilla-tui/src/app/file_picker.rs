@@ -1,118 +1,8 @@
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::CommandAction;
-use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
-
 use super::{App, DirEntry, UiMode};
 
 impl App {
-    pub(super) fn file_picker_select_next(&mut self) {
-        if let UiMode::FilePicker { ref dir_entries, ref mut selected, .. } = self.ui.mode {
-            if !dir_entries.is_empty() {
-                *selected = (*selected + 1).min(dir_entries.len() - 1);
-            }
-        }
-    }
-
-    pub(super) fn file_picker_select_prev(&mut self) {
-        if let UiMode::FilePicker { ref mut selected, .. } = self.ui.mode {
-            *selected = selected.saturating_sub(1);
-        }
-    }
-
-    pub(super) fn handle_file_picker_key(&mut self, key: KeyEvent) {
-        let needs_refresh = {
-            let UiMode::FilePicker { ref mut input, ref mut dir_entries, ref mut selected } = self.ui.mode else {
-                return;
-            };
-            match key.code {
-                KeyCode::Tab => {
-                    if let Some(entry) = dir_entries.get(*selected).cloned() {
-                        let current = input.value().to_string();
-                        let base = if current.ends_with('/') {
-                            current.clone()
-                        } else {
-                            current.rsplit_once('/').map(|(prefix, _)| format!("{prefix}/")).unwrap_or_default()
-                        };
-                        let new_path = format!("{}{}/", base, entry.name);
-                        *input = Input::from(new_path.as_str());
-                        *selected = 0;
-                    }
-                    true
-                }
-                _ => {
-                    input.handle_event(&crossterm::event::Event::Key(key));
-                    *selected = 0;
-                    true
-                }
-            }
-        };
-        if needs_refresh {
-            self.refresh_dir_listing();
-        }
-    }
-
-    pub(super) fn activate_dir_entry(&mut self) {
-        let (entry, base) = {
-            let UiMode::FilePicker { ref input, ref dir_entries, selected } = self.ui.mode else {
-                return;
-            };
-            let Some(entry) = dir_entries.get(selected).cloned() else {
-                return;
-            };
-            let current = input.value().to_string();
-            let base = if current.ends_with('/') {
-                current
-            } else {
-                current.rsplit_once('/').map(|(prefix, _)| format!("{prefix}/")).unwrap_or_default()
-            };
-            (entry, base)
-        };
-
-        if entry.is_git_repo && !entry.is_added {
-            let path = PathBuf::from(format!("{}{}", base, entry.name));
-            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            self.proto_commands.push(self.command(CommandAction::TrackRepoPath { path: canonical }));
-            self.ui.mode = UiMode::Normal;
-        } else if entry.is_dir {
-            let new_path = format!("{}{}/", base, entry.name);
-            if let UiMode::FilePicker { ref mut input, ref mut selected, .. } = self.ui.mode {
-                *input = Input::from(new_path.as_str());
-                *selected = 0;
-            }
-            self.refresh_dir_listing();
-        }
-    }
-
-    pub(super) fn handle_file_picker_mouse(&mut self, mouse: MouseEvent) {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return;
-        }
-        let x = mouse.column;
-        let y = mouse.row;
-        let a = self.ui.layout.file_picker_area;
-        if x < a.x || x >= a.x + a.width || y < a.y || y >= a.y + a.height {
-            self.ui.mode = UiMode::Normal;
-            return;
-        }
-        let la = self.ui.layout.file_picker_list_area;
-        if x >= la.x && x < la.x + la.width && y >= la.y && y < la.y + la.height {
-            let row = (y - la.y) as usize;
-            let len = if let UiMode::FilePicker { ref dir_entries, .. } = self.ui.mode {
-                dir_entries.len()
-            } else {
-                return;
-            };
-            if row < len {
-                if let UiMode::FilePicker { ref mut selected, .. } = self.ui.mode {
-                    *selected = row;
-                }
-                self.activate_dir_entry();
-            }
-        }
-    }
-
     pub fn refresh_dir_listing(&mut self) {
         let Self { model, ui, .. } = self;
         let UiMode::FilePicker { ref input, ref mut dir_entries, .. } = ui.mode else {
@@ -160,8 +50,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{Command, RepoLabels};
-    use tui_input::Input;
+    use crossterm::event::KeyCode;
+    use flotilla_protocol::{Command, CommandAction, RepoLabels};
 
     use super::*;
     use crate::app::test_support::{default_repo_model, dir_entry, enter_file_picker, key, stub_app};
@@ -261,13 +151,11 @@ mod tests {
     fn tab_completes_directory_name() {
         let mut app = stub_app();
         let entries = vec![dir_entry("alpha", false, false), dir_entry("bar", false, false)];
-        app.ui.mode = UiMode::FilePicker {
-            input: Input::from("foo/"),
-            dir_entries: entries,
-            selected: 1, // "bar" is selected
-        };
+        enter_file_picker(&mut app, "foo/", entries);
 
-        app.handle_file_picker_key(key(KeyCode::Tab));
+        // Move to "bar" (index 1), then Tab to complete
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Tab));
 
         if let UiMode::FilePicker { ref input, selected, .. } = app.ui.mode {
             assert_eq!(input.value(), "foo/bar/");
@@ -296,8 +184,10 @@ mod tests {
     fn k_decrements_selection() {
         let mut app = stub_app();
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
-        app.ui.mode = UiMode::FilePicker { input: Input::from("/tmp/"), dir_entries: entries, selected: 1 };
+        enter_file_picker(&mut app, "/tmp/", entries);
 
+        // Advance to index 1 first, then move back
+        app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Char('k')));
 
         if let UiMode::FilePicker { selected, .. } = app.ui.mode {
@@ -313,8 +203,8 @@ mod tests {
     fn enter_on_git_repo_pushes_add_repo() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let repo_dir = tmp.path().join("my-repo");
-        std::fs::create_dir(&repo_dir).unwrap();
-        std::fs::create_dir(repo_dir.join(".git")).unwrap();
+        std::fs::create_dir(&repo_dir).expect("create repo dir");
+        std::fs::create_dir(repo_dir.join(".git")).expect("create .git dir");
 
         let mut app = stub_app();
         let parent_path = format!("{}/", tmp.path().to_string_lossy());
@@ -330,7 +220,7 @@ mod tests {
         let (cmd, _) = app.proto_commands.take_next().expect("expected a command");
         match cmd {
             Command { action: CommandAction::TrackRepoPath { path }, .. } => {
-                let canonical = std::fs::canonicalize(&repo_dir).unwrap();
+                let canonical = std::fs::canonicalize(&repo_dir).expect("canonicalize");
                 assert_eq!(path, canonical);
             }
             other => panic!("expected TrackRepoPath, got {:?}", other),
@@ -341,10 +231,10 @@ mod tests {
     fn enter_on_added_git_repo_navigates_into_it() {
         // When is_git_repo=true AND is_added=true, the code skips the AddRepo
         // branch and falls through to the is_dir branch, navigating into it.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let sub = tmp.path().join("existing-repo");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::create_dir(sub.join(".git")).unwrap();
+        std::fs::create_dir(&sub).expect("create dir");
+        std::fs::create_dir(sub.join(".git")).expect("create .git dir");
 
         let base = format!("{}/", tmp.path().display());
         let mut app = stub_app();
@@ -415,7 +305,7 @@ mod tests {
         // Path "foo/ba" means base is "foo/" (rsplit_once on '/')
         let mut app = stub_app();
         let entries = vec![dir_entry("bar", false, false)];
-        app.ui.mode = UiMode::FilePicker { input: Input::from("foo/ba"), dir_entries: entries, selected: 0 };
+        enter_file_picker(&mut app, "foo/ba", entries);
 
         app.handle_key(key(KeyCode::Enter));
 
@@ -431,10 +321,10 @@ mod tests {
     #[test]
     fn refresh_lists_directories_from_temp_dir() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
-        std::fs::create_dir(tmp.path().join("beta")).unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).expect("create alpha dir");
+        std::fs::create_dir(tmp.path().join("beta")).expect("create beta dir");
         // Create a regular file (should not appear in results)
-        std::fs::write(tmp.path().join("file.txt"), "hello").unwrap();
+        std::fs::write(tmp.path().join("file.txt"), "hello").expect("create file");
 
         let mut app = stub_app();
         let dir_path = format!("{}/", tmp.path().to_string_lossy());
@@ -456,8 +346,8 @@ mod tests {
     #[test]
     fn refresh_filters_hidden_dirs() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        std::fs::create_dir(tmp.path().join(".hidden")).unwrap();
-        std::fs::create_dir(tmp.path().join("visible")).unwrap();
+        std::fs::create_dir(tmp.path().join(".hidden")).expect("create .hidden dir");
+        std::fs::create_dir(tmp.path().join("visible")).expect("create visible dir");
 
         let mut app = stub_app();
         let dir_path = format!("{}/", tmp.path().to_string_lossy());
@@ -478,9 +368,9 @@ mod tests {
     #[test]
     fn refresh_filters_by_prefix() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        std::fs::create_dir(tmp.path().join("Foo")).unwrap();
-        std::fs::create_dir(tmp.path().join("foobar")).unwrap();
-        std::fs::create_dir(tmp.path().join("baz")).unwrap();
+        std::fs::create_dir(tmp.path().join("Foo")).expect("create Foo dir");
+        std::fs::create_dir(tmp.path().join("foobar")).expect("create foobar dir");
+        std::fs::create_dir(tmp.path().join("baz")).expect("create baz dir");
 
         let mut app = stub_app();
         // Path without trailing slash: ".../<tmpdir>/foo" means filter is "foo"
@@ -505,11 +395,11 @@ mod tests {
     fn refresh_detects_git_repos() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let git_dir = tmp.path().join("my-repo");
-        std::fs::create_dir(&git_dir).unwrap();
-        std::fs::create_dir(git_dir.join(".git")).unwrap();
+        std::fs::create_dir(&git_dir).expect("create my-repo dir");
+        std::fs::create_dir(git_dir.join(".git")).expect("create .git dir");
 
         let plain_dir = tmp.path().join("plain");
-        std::fs::create_dir(&plain_dir).unwrap();
+        std::fs::create_dir(&plain_dir).expect("create plain dir");
 
         let mut app = stub_app();
         let dir_path = format!("{}/", tmp.path().to_string_lossy());
@@ -518,10 +408,10 @@ mod tests {
         app.refresh_dir_listing();
 
         if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
-            let repo_entry = dir_entries.iter().find(|e| e.name == "my-repo").unwrap();
+            let repo_entry = dir_entries.iter().find(|e| e.name == "my-repo").expect("find my-repo");
             assert!(repo_entry.is_git_repo, "should detect .git subdir");
 
-            let plain_entry = dir_entries.iter().find(|e| e.name == "plain").unwrap();
+            let plain_entry = dir_entries.iter().find(|e| e.name == "plain").expect("find plain");
             assert!(!plain_entry.is_git_repo, "plain dir is not a git repo");
         } else {
             panic!("expected FilePicker mode");
@@ -532,12 +422,12 @@ mod tests {
     fn refresh_marks_added_repos() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let repo_dir = tmp.path().join("tracked-repo");
-        std::fs::create_dir(&repo_dir).unwrap();
+        std::fs::create_dir(&repo_dir).expect("create tracked-repo dir");
 
         let mut app = stub_app();
 
         // Add the canonical path of repo_dir to model.repos so it's "already added"
-        let canonical = std::fs::canonicalize(&repo_dir).unwrap();
+        let canonical = std::fs::canonicalize(&repo_dir).expect("canonicalize");
         let repo_identity = flotilla_protocol::RepoIdentity { authority: "local".into(), path: canonical.to_string_lossy().into_owned() };
         let mut model = default_repo_model(RepoLabels::default());
         model.identity = repo_identity.clone();
@@ -551,7 +441,7 @@ mod tests {
         app.refresh_dir_listing();
 
         if let UiMode::FilePicker { ref dir_entries, .. } = app.ui.mode {
-            let entry = dir_entries.iter().find(|e| e.name == "tracked-repo").unwrap();
+            let entry = dir_entries.iter().find(|e| e.name == "tracked-repo").expect("find tracked-repo");
             assert!(entry.is_added, "repo in model.repos should be marked added");
         } else {
             panic!("expected FilePicker mode");
@@ -561,9 +451,9 @@ mod tests {
     #[test]
     fn refresh_sorts_alphabetically() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        std::fs::create_dir(tmp.path().join("zulu")).unwrap();
-        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
-        std::fs::create_dir(tmp.path().join("mike")).unwrap();
+        std::fs::create_dir(tmp.path().join("zulu")).expect("create zulu dir");
+        std::fs::create_dir(tmp.path().join("alpha")).expect("create alpha dir");
+        std::fs::create_dir(tmp.path().join("mike")).expect("create mike dir");
 
         let mut app = stub_app();
         let dir_path = format!("{}/", tmp.path().to_string_lossy());
