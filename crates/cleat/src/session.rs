@@ -216,7 +216,7 @@ fn record_pty_output(engine: &mut dyn VtEngine, bytes: &[u8]) -> Result<(), Stri
 fn apply_attach_state(engine: &mut dyn VtEngine, cols: u16, rows: u16) -> Result<Option<Vec<u8>>, String> {
     engine.resize(cols, rows)?;
     if engine.supports_replay() {
-        engine.replay_payload()
+        engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
     } else {
         Ok(None)
     }
@@ -581,11 +581,48 @@ mod tests {
     };
 
     use super::{apply_attach_state, default_vt_engine, is_executable_file, record_pty_output, resolve_cleat_executable};
-    use crate::vt;
+    use crate::vt::{self, VtEngine};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[derive(Debug)]
+    struct ReplayProbeEngine {
+        cols: u16,
+        rows: u16,
+    }
+
+    impl ReplayProbeEngine {
+        fn new(cols: u16, rows: u16) -> Self {
+            Self { cols, rows }
+        }
+    }
+
+    impl vt::VtEngine for ReplayProbeEngine {
+        fn feed(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+            self.cols = cols;
+            self.rows = rows;
+            Ok(())
+        }
+
+        fn supports_replay(&self) -> bool {
+            true
+        }
+
+        fn replay_payload(&self, capabilities: &vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+            let payload = format!("{:?}:{}", capabilities.color_level, capabilities.kitty_keyboard);
+            Ok(Some(payload.into_bytes()))
+        }
+
+        fn size(&self) -> (u16, u16) {
+            (self.cols, self.rows)
+        }
     }
 
     #[test]
@@ -594,7 +631,7 @@ mod tests {
         assert_eq!(vt::default_vt_engine_kind(), "passthrough");
         assert_eq!(engine.size(), (super::DEFAULT_TERMINAL_COLS, super::DEFAULT_TERMINAL_ROWS));
         assert!(!engine.supports_replay());
-        assert_eq!(engine.replay_payload().expect("replay payload"), None);
+        assert_eq!(engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()).expect("replay payload"), None);
     }
 
     #[test]
@@ -605,6 +642,16 @@ mod tests {
 
         assert_eq!(engine.size(), (132, 40));
         assert_eq!(replay, None);
+    }
+
+    #[test]
+    fn vt_apply_attach_state_uses_conservative_fallback_capabilities_for_replay() {
+        let mut engine = ReplayProbeEngine::new(80, 24);
+
+        let replay = apply_attach_state(&mut engine, 100, 30).expect("apply attach state");
+
+        assert_eq!(engine.size(), (100, 30));
+        assert_eq!(replay, Some(b"Sixteen:false".to_vec()));
     }
 
     #[cfg(not(feature = "ghostty-vt"))]

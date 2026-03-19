@@ -1,4 +1,4 @@
-use super::VtEngine;
+use super::{ClientCapabilities, VtEngine};
 
 #[derive(Debug, Clone)]
 pub struct PassthroughVtEngine {
@@ -33,7 +33,7 @@ impl VtEngine for PassthroughVtEngine {
         false
     }
 
-    fn replay_payload(&self) -> Result<Option<Vec<u8>>, String> {
+    fn replay_payload(&self, _capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
         Ok(None)
     }
 
