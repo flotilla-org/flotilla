@@ -127,6 +127,8 @@ This intentionally asymmetric model is simpler and more correct than pretending 
 
 If a second interactive client attempts to attach while one is active, the daemon should reject it clearly until richer takeover semantics are designed.
 
+Terminal cleanup on disconnect is a client responsibility. The attach client should write a fixed, idempotent reset sequence to its own stdout on teardown so mouse modes, alternate screen state, bracketed paste, kitty keyboard mode, and cursor visibility are restored even when the daemon keeps the session alive.
+
 ## VT engine model
 
 The daemon owns a `VtEngine` trait from day one, even though phase 1 uses a minimal implementation.
@@ -137,6 +139,7 @@ The trait should cover engine capabilities, not just parsing. It needs to:
 - track dimensions
 - report whether replay is supported
 - produce a restore payload for reattach when supported
+- generate replay for a specific client capability profile rather than assuming one fixed terminal type
 
 Initial engines:
 
@@ -147,6 +150,8 @@ Initial engines:
 Replay is engine-dependent. On reattach, the daemon asks the current engine whether it can generate a restore payload. If yes, that payload is sent before live PTY output resumes. If not, the client receives only future live output.
 
 This keeps replay behavior out of daemon phase branching and lets all engines share the same behavioral contract.
+
+The first richer engine integration should be capability-aware at replay time. The attach protocol should carry a compact client capability profile, and replay generation should accept that profile so the engine can choose what state to emit for the reattached client. The initial implementation can stay conservative and avoid full terminfo-style downconversion.
 
 ## Flotilla integration
 
@@ -191,7 +196,11 @@ Phase 1 replaces shpool for basic persistence but does not promise replay fideli
 - add feature-gated richer VT engine implementation
 - feed PTY output into the engine
 - generate restore payloads on reattach when supported
+- make replay capability-aware by threading attach-time client capabilities through the internal protocol
+- keep disconnect cleanup client-side
 - add engine-focused behavior tests shared across implementations
+
+Phase 2 can stop short of full terminal capability downconversion, DA query synthesis while detached, and `esctest` integration. Those are follow-up hardening tasks once the replay seam and first richer engine are proven.
 
 ### Phase 3: hardening and extended control
 

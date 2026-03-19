@@ -28,13 +28,13 @@ enum SessionStatus {
     Detached,
 }
 
-pub struct SessionTerminalPool {
+pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
     attachable_store: SharedAttachableStore,
 }
 
-impl SessionTerminalPool {
+impl CleatTerminalPool {
     pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>, attachable_store: SharedAttachableStore) -> Self {
         Self { runner, binary: binary.into(), attachable_store }
     }
@@ -47,7 +47,7 @@ impl SessionTerminalPool {
         let expected = TerminalPurpose { checkout: id.checkout.clone(), role: id.role.clone(), index: id.index };
         for binding in &store.registry().bindings {
             if binding.provider_category != "terminal_pool"
-                || binding.provider_name != "session"
+                || binding.provider_name != "cleat"
                 || binding.object_kind != BindingObjectKind::Attachable
             {
                 continue;
@@ -79,7 +79,7 @@ impl SessionTerminalPool {
         let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
             &set_id,
             "terminal_pool",
-            "session",
+            "cleat",
             session_id,
             TerminalPurpose { checkout: id.checkout.clone(), role: id.role.clone(), index: id.index },
             command,
@@ -91,7 +91,7 @@ impl SessionTerminalPool {
 
     fn reconcile_listed_session(store: &mut dyn AttachableStoreApi, session: SessionInfo) -> Option<ManagedTerminal> {
         let attachable_id = store
-            .lookup_binding("terminal_pool", "session", BindingObjectKind::Attachable, &session.id)
+            .lookup_binding("terminal_pool", "cleat", BindingObjectKind::Attachable, &session.id)
             .map(|id| AttachableId::new(id.to_string()))?;
         let attachable = store.registry().attachables.get(&attachable_id)?;
         let (set_id, purpose, persisted_command, persisted_working_directory) = match &attachable.content {
@@ -108,7 +108,7 @@ impl SessionTerminalPool {
         let (_, _) = store.ensure_terminal_attachable_with_change(
             &set_id,
             "terminal_pool",
-            "session",
+            "cleat",
             &session.id,
             purpose.clone(),
             &command,
@@ -133,7 +133,7 @@ impl SessionTerminalPool {
         let mut terminals = Vec::new();
         for binding in &store.registry().bindings {
             if binding.provider_category != "terminal_pool"
-                || binding.provider_name != "session"
+                || binding.provider_name != "cleat"
                 || binding.object_kind != BindingObjectKind::Attachable
                 || observed_sessions.contains(&binding.external_ref)
             {
@@ -163,7 +163,7 @@ impl SessionTerminalPool {
 }
 
 #[async_trait]
-impl TerminalPool for SessionTerminalPool {
+impl TerminalPool for CleatTerminalPool {
     async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
         let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
         let sessions = Self::parse_list_output(&output)?;
@@ -250,7 +250,7 @@ impl TerminalPool for SessionTerminalPool {
         let Ok(mut store) = self.attachable_store.lock() else {
             return Ok(());
         };
-        if store.remove_binding_object("terminal_pool", "session", BindingObjectKind::Attachable, &session_id) {
+        if store.remove_binding_object("terminal_pool", "cleat", BindingObjectKind::Attachable, &session_id) {
             let _ = store.save();
         }
         Ok(())
@@ -298,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_command_wraps_cli_with_name_and_cwd() {
-        let pool = SessionTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat", shared_in_memory_attachable_store());
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat", shared_in_memory_attachable_store());
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
         let command = pool.attach_command(&id, "bash", Path::new("/repo"), &vec![]).await.expect("attach command");
@@ -314,7 +314,7 @@ mod tests {
         let store = shared_in_memory_attachable_store();
         {
             let mut store_guard = store.lock().expect("store");
-            SessionTerminalPool::persist_attachable(
+            CleatTerminalPool::persist_attachable(
                 store_guard.as_mut(),
                 &ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 },
                 "session-123",
@@ -323,7 +323,7 @@ mod tests {
                 TerminalStatus::Disconnected,
             );
         }
-        let pool = SessionTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into())])), "cleat", store);
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into())])), "cleat", store);
 
         let terminals = pool.list_terminals().await.expect("list terminals");
 
@@ -340,7 +340,7 @@ mod tests {
         let store = shared_in_memory_attachable_store();
         {
             let mut store_guard = store.lock().expect("store");
-            SessionTerminalPool::persist_attachable(
+            CleatTerminalPool::persist_attachable(
                 store_guard.as_mut(),
                 &ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 },
                 "session-123",
@@ -349,7 +349,7 @@ mod tests {
                 TerminalStatus::Disconnected,
             );
         }
-        let pool = SessionTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", store.clone());
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", store.clone());
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
         pool.kill_terminal(&id).await.expect("kill terminal");
@@ -360,7 +360,7 @@ mod tests {
         drop(calls);
 
         let store = store.lock().expect("store");
-        assert!(SessionTerminalPool::find_persisted_session_id(store.as_ref(), &id).is_none());
+        assert!(CleatTerminalPool::find_persisted_session_id(store.as_ref(), &id).is_none());
     }
 
     #[tokio::test]
@@ -368,12 +368,12 @@ mod tests {
         let json = r#"{ "id":"session-123", "name":"flotilla/feat/shell/0", "cwd":"/repo", "cmd":"bash", "status":"Detached" }"#;
         let store = shared_in_memory_attachable_store();
         let runner = Arc::new(MockRunner::new(vec![Ok(json.into())]));
-        let pool = SessionTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", store.clone());
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", store.clone());
         let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
 
         pool.ensure_running(&id, "bash", Path::new("/repo")).await.expect("ensure running");
 
         let store = store.lock().expect("store lock");
-        assert!(SessionTerminalPool::find_persisted_session_id(store.as_ref(), &id).as_deref() == Some("session-123"));
+        assert!(CleatTerminalPool::find_persisted_session_id(store.as_ref(), &id).as_deref() == Some("session-123"));
     }
 }

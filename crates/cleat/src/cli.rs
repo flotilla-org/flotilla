@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::server::SessionService;
+use crate::{server::SessionService, vt::VtEngineKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "cleat", version)]
@@ -21,6 +21,8 @@ pub enum Command {
         id: Option<String>,
         #[arg(long)]
         no_create: bool,
+        #[arg(long, value_enum)]
+        vt: Option<VtEngineKind>,
         #[arg(long)]
         cwd: Option<PathBuf>,
         #[arg(long)]
@@ -31,6 +33,8 @@ pub enum Command {
         id: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long, value_enum)]
+        vt: Option<VtEngineKind>,
         #[arg(long)]
         cwd: Option<PathBuf>,
         #[arg(long)]
@@ -39,6 +43,9 @@ pub enum Command {
     List {
         #[arg(long)]
         json: bool,
+    },
+    Detach {
+        id: String,
     },
     Kill {
         id: String,
@@ -60,13 +67,13 @@ pub fn command() -> clap::Command {
 
 pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, String> {
     match cli.command {
-        Command::Attach { id, no_create, cwd, cmd } => {
-            let (_attached, guard) = service.attach(id, cwd, cmd, no_create)?;
+        Command::Attach { id, no_create, vt, cwd, cmd } => {
+            let (_attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
             guard.relay_stdio()?;
             Ok(None)
         }
-        Command::Create { id, json, cwd, cmd } => {
-            let created = service.create(id, cwd, cmd)?;
+        Command::Create { id, json, vt, cwd, cmd } => {
+            let created = service.create(id, vt, cwd, cmd)?;
             if json {
                 serde_json::to_string(&created).map(Some).map_err(|err| format!("serialize create result: {err}"))
             } else {
@@ -83,6 +90,10 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                 Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
+        Command::Detach { id } => {
+            service.detach(&id)?;
+            Ok(None)
+        }
         Command::Kill { id } => {
             service.kill(&id)?;
             Ok(None)
@@ -95,7 +106,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
 }
 
 fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
-    let mut fields = vec![session.id.clone(), format_session_status(&session.status).to_string()];
+    let mut fields = vec![session.id.clone(), format_session_status(&session.status).to_string(), session.vt_engine.as_str().to_string()];
     if let Some(cwd) = &session.cwd {
         fields.push(cwd.display().to_string());
     } else if let Some(cmd) = &session.cmd {

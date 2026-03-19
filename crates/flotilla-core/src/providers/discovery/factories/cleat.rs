@@ -8,19 +8,19 @@ use crate::{
     config::ConfigStore,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        terminal::{session::SessionTerminalPool, TerminalPool},
+        terminal::{cleat::CleatTerminalPool, TerminalPool},
         CommandRunner,
     },
 };
 
-pub struct SessionTerminalPoolFactory;
+pub struct CleatTerminalPoolFactory;
 
 #[async_trait]
-impl Factory for SessionTerminalPoolFactory {
+impl Factory for CleatTerminalPoolFactory {
     type Output = dyn TerminalPool;
 
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor::named(ProviderCategory::TerminalPool, "session")
+        ProviderDescriptor::named(ProviderCategory::TerminalPool, "cleat")
     }
 
     async fn probe(
@@ -32,7 +32,7 @@ impl Factory for SessionTerminalPoolFactory {
         attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if let Some(binary) = env.find_binary("cleat") {
-            Ok(Arc::new(SessionTerminalPool::new(runner, binary.display().to_string(), attachable_store)))
+            Ok(Arc::new(CleatTerminalPool::new(runner, binary.display().to_string(), attachable_store)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("cleat".into())])
         }
@@ -43,7 +43,7 @@ impl Factory for SessionTerminalPoolFactory {
 mod tests {
     use std::{path::Path, sync::Arc};
 
-    use super::SessionTerminalPoolFactory;
+    use super::CleatTerminalPoolFactory;
     use crate::{
         config::ConfigStore,
         providers::discovery::{
@@ -58,7 +58,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = SessionTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
+        let result = CleatTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
         assert!(result.is_ok());
     }
 
@@ -68,7 +68,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = SessionTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
+        let result = CleatTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
         let unmet = result.err().expect("missing binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("cleat".into())));
     }
