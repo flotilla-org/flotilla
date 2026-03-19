@@ -430,7 +430,38 @@ impl App {
             }
             crate::widgets::Outcome::FinishedWith(action) => {
                 self.widget_stack.remove(index);
-                self.dispatch_action(action);
+                // Re-dispatch through the widget stack first (the palette is now
+                // popped, so WorkItemTable will handle actions like Quit,
+                // ToggleMultiSelect, etc.). Fall through to legacy dispatch for
+                // actions the stack doesn't handle.
+                let mut stack = std::mem::take(&mut self.widget_stack);
+                let (result, should_quit, pending_cancel) = {
+                    let mut ctx = self.build_widget_context();
+                    let mut result: Option<(usize, crate::widgets::Outcome)> = None;
+                    let top = stack.len().saturating_sub(1);
+                    let stop_at = if stack.len() > 1 { 1 } else { 0 };
+                    for i in (stop_at..=top).rev() {
+                        let outcome = stack[i].handle_action(action, &mut ctx);
+                        if !matches!(outcome, crate::widgets::Outcome::Ignored) {
+                            result = Some((i, outcome));
+                            break;
+                        }
+                    }
+                    (result, ctx.should_quit, ctx.pending_cancel)
+                };
+                if should_quit {
+                    self.should_quit = true;
+                }
+                if let Some(command_id) = pending_cancel {
+                    self.pending_cancel = Some(command_id);
+                }
+                self.widget_stack = stack;
+                if let Some((idx, outcome)) = result {
+                    self.apply_outcome(idx, outcome);
+                } else {
+                    // No widget handled it — legacy fallback
+                    self.dispatch_action(action);
+                }
             }
         }
     }
