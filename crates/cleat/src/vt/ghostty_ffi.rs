@@ -1,4 +1,4 @@
-use std::{ffi::c_void, ptr};
+use std::{ffi::c_void, ptr, slice};
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -196,7 +196,10 @@ pub fn format_terminal_alloc(terminal: GhosttyTerminal, options: GhosttyFormatte
         return Ok(Vec::new());
     }
 
-    let bytes = unsafe { Vec::from_raw_parts(out_ptr, out_len, out_len) };
+    let bytes = unsafe { slice::from_raw_parts(out_ptr, out_len) }.to_vec();
+    unsafe {
+        libc::free(out_ptr.cast());
+    }
     Ok(bytes)
 }
 

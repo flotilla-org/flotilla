@@ -47,7 +47,7 @@ impl CleatTerminalPool {
         let expected = TerminalPurpose { checkout: id.checkout.clone(), role: id.role.clone(), index: id.index };
         for binding in &store.registry().bindings {
             if binding.provider_category != "terminal_pool"
-                || binding.provider_name != "session"
+                || binding.provider_name != "cleat"
                 || binding.object_kind != BindingObjectKind::Attachable
             {
                 continue;
@@ -79,7 +79,7 @@ impl CleatTerminalPool {
         let (_, changed_attachable) = store.ensure_terminal_attachable_with_change(
             &set_id,
             "terminal_pool",
-            "session",
+            "cleat",
             session_id,
             TerminalPurpose { checkout: id.checkout.clone(), role: id.role.clone(), index: id.index },
             command,
@@ -91,7 +91,7 @@ impl CleatTerminalPool {
 
     fn reconcile_listed_session(store: &mut dyn AttachableStoreApi, session: SessionInfo) -> Option<ManagedTerminal> {
         let attachable_id = store
-            .lookup_binding("terminal_pool", "session", BindingObjectKind::Attachable, &session.id)
+            .lookup_binding("terminal_pool", "cleat", BindingObjectKind::Attachable, &session.id)
             .map(|id| AttachableId::new(id.to_string()))?;
         let attachable = store.registry().attachables.get(&attachable_id)?;
         let (set_id, purpose, persisted_command, persisted_working_directory) = match &attachable.content {
@@ -108,7 +108,7 @@ impl CleatTerminalPool {
         let (_, _) = store.ensure_terminal_attachable_with_change(
             &set_id,
             "terminal_pool",
-            "session",
+            "cleat",
             &session.id,
             purpose.clone(),
             &command,
@@ -133,7 +133,7 @@ impl CleatTerminalPool {
         let mut terminals = Vec::new();
         for binding in &store.registry().bindings {
             if binding.provider_category != "terminal_pool"
-                || binding.provider_name != "session"
+                || binding.provider_name != "cleat"
                 || binding.object_kind != BindingObjectKind::Attachable
                 || observed_sessions.contains(&binding.external_ref)
             {
@@ -250,7 +250,7 @@ impl TerminalPool for CleatTerminalPool {
         let Ok(mut store) = self.attachable_store.lock() else {
             return Ok(());
         };
-        if store.remove_binding_object("terminal_pool", "session", BindingObjectKind::Attachable, &session_id) {
+        if store.remove_binding_object("terminal_pool", "cleat", BindingObjectKind::Attachable, &session_id) {
             let _ = store.save();
         }
         Ok(())

@@ -44,6 +44,7 @@ const DEFAULT_TERMINAL_COLS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DETACH_CLEANUP_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
+const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 static ATTACH_SIGNAL_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
@@ -637,7 +638,13 @@ impl ActiveClient {
     }
 
     fn enqueue_frame(&mut self, frame: &Frame) -> Result<(), String> {
-        frame.write(&mut self.pending_output).map_err(|err| format!("buffer client frame: {err}"))
+        let mut encoded = Vec::new();
+        frame.write(&mut encoded).map_err(|err| format!("buffer client frame: {err}"))?;
+        if self.pending_output.len().saturating_add(encoded.len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
+            return Err(format!("client output backlog exceeded {} bytes", MAX_PENDING_CLIENT_OUTPUT_BYTES));
+        }
+        self.pending_output.extend_from_slice(&encoded);
+        Ok(())
     }
 
     fn flush_pending_output(&mut self) -> Result<bool, String> {
@@ -906,6 +913,16 @@ mod tests {
     fn graceful_socket_shutdown_classifies_broken_pipe_disconnects() {
         let err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         assert!(super::is_graceful_socket_shutdown(&err));
+    }
+
+    #[test]
+    fn active_client_rejects_unbounded_output_backlog() {
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let mut client = super::ActiveClient { stream, pending_output: vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1] };
+
+        let err = client.enqueue_frame(&super::Frame::Output(vec![1])).expect_err("backlog should overflow");
+
+        assert!(err.contains("client output backlog exceeded"));
     }
 
     #[test]

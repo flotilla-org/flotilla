@@ -20,7 +20,7 @@ impl Factory for CleatTerminalPoolFactory {
     type Output = dyn TerminalPool;
 
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor::named(ProviderCategory::TerminalPool, "session")
+        ProviderDescriptor::named(ProviderCategory::TerminalPool, "cleat")
     }
 
     async fn probe(
