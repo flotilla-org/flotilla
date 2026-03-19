@@ -28,6 +28,14 @@ fn encodes_control_and_meta_modifiers() {
 #[test]
 fn encodes_shifted_named_keys_where_supported() {
     assert_eq!(encode_send_keys(&strings(&["S-Tab"]), false, false, 1).expect("shifted tab"), b"\x1b[Z");
+    assert_eq!(encode_send_keys(&strings(&["S-F2"]), false, false, 1).expect("shifted function"), b"\x1b[1;2Q");
+}
+
+#[test]
+fn encodes_modified_named_keys() {
+    assert_eq!(encode_send_keys(&strings(&["M-Up"]), false, false, 1).expect("meta cursor"), b"\x1b[1;3A");
+    assert_eq!(encode_send_keys(&strings(&["C-Left"]), false, false, 1).expect("control cursor"), b"\x1b[1;5D");
+    assert_eq!(encode_send_keys(&strings(&["M-Home"]), false, false, 1).expect("meta home"), b"\x1b[1;3H");
 }
 
 #[test]
