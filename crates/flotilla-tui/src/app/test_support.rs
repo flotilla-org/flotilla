@@ -14,16 +14,17 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError, RepoDelta,
-    RepoDetailResponse, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, StatusResponse, StreamKey,
-    TopologyResponse, WorkItem,
+    Change, Command, DaemonEvent, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError,
+    RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse,
+    StatusResponse, StreamKey, TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
 
 // Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
 pub(crate) use super::test_builders::*;
-use super::{App, DirEntry, TuiRepoModel, UiMode};
+use super::{App, CommandQueue, DirEntry, InFlightCommand, RepoUiState, TuiModel, TuiRepoModel, UiMode};
+use crate::{keymap::Keymap, widgets::WidgetContext};
 
 pub(crate) struct StubDaemon {
     tx: broadcast::Sender<DaemonEvent>,
@@ -192,7 +193,8 @@ pub(crate) fn setup_selectable_table(app: &mut App, items: Vec<WorkItem>) {
 }
 
 pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry>) {
-    app.ui.mode = UiMode::FilePicker { input: Input::from(path), dir_entries: entries, selected: 0 };
+    app.ui.mode = UiMode::FilePicker { input: Input::from(path), dir_entries: entries.clone(), selected: 0 };
+    app.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(Input::from(path), entries)));
 }
 
 pub(crate) fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
@@ -214,4 +216,63 @@ fn stub_app_with_repo_infos(repos_info: Vec<RepoInfo>) -> App {
     let _ = std::fs::remove_dir_all(&config_base);
     let config = Arc::new(ConfigStore::with_base(config_base));
     App::new(daemon, repos_info, config, crate::theme::Theme::classic())
+}
+
+/// Test harness that owns the state needed to construct a `WidgetContext`.
+///
+/// Use `new()` to build from a default `stub_app()`, then call `ctx()` to
+/// get a `WidgetContext` suitable for driving widget event handlers in tests.
+pub(crate) struct TestWidgetHarness {
+    pub model: TuiModel,
+    pub keymap: Keymap,
+    pub config: Arc<ConfigStore>,
+    pub in_flight: HashMap<u64, InFlightCommand>,
+    pub commands: CommandQueue,
+    pub repo_ui: HashMap<RepoIdentity, RepoUiState>,
+    pub target_host: Option<HostName>,
+    pub mode: UiMode,
+}
+
+impl TestWidgetHarness {
+    pub fn new() -> Self {
+        let app = stub_app();
+        Self {
+            model: app.model,
+            keymap: app.keymap,
+            config: app.config,
+            in_flight: app.in_flight,
+            commands: app.proto_commands,
+            repo_ui: app.ui.repo_ui,
+            target_host: app.ui.target_host,
+            mode: UiMode::Normal,
+        }
+    }
+
+    pub fn ctx(&mut self) -> WidgetContext<'_> {
+        WidgetContext {
+            model: &self.model,
+            keymap: &self.keymap,
+            config: &self.config,
+            in_flight: &self.in_flight,
+            target_host: self.target_host.as_ref(),
+            active_repo: self.model.active_repo,
+            repo_order: &self.model.repo_order,
+            commands: &mut self.commands,
+            repo_ui: &mut self.repo_ui,
+            mode: &mut self.mode,
+            app_actions: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_widget_harness_builds_context() {
+        let mut harness = TestWidgetHarness::new();
+        let ctx = harness.ctx();
+        assert!(ctx.app_actions.is_empty());
+    }
 }

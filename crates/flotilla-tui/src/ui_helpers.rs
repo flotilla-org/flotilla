@@ -9,6 +9,13 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BottomAnchoredOverlayLayout {
+    pub status_row: Rect,
+    pub body: Rect,
+    pub visible_body_rows: u16,
+}
+
 /// Truncate a string to `max` characters, appending '…' if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
@@ -57,6 +64,14 @@ pub fn render_popup_frame(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     (area, inner)
+}
+
+pub fn bottom_anchored_overlay(frame_area: Rect, reserved_top_rows: u16, requested_body_rows: u16) -> BottomAnchoredOverlayLayout {
+    let visible_body_rows = requested_body_rows.min(frame_area.height.saturating_sub(reserved_top_rows.saturating_add(1)));
+    let status_row_y = frame_area.y + frame_area.height.saturating_sub(visible_body_rows.saturating_add(1));
+    let status_row = Rect::new(frame_area.x, status_row_y, frame_area.width, 1);
+    let body = Rect::new(frame_area.x, status_row_y.saturating_add(1), frame_area.width, visible_body_rows);
+    BottomAnchoredOverlayLayout { status_row, body, visible_body_rows }
 }
 
 /// Return (icon, color) for a work item based on its kind, workspace status,
@@ -295,6 +310,24 @@ mod tests {
         assert_eq!(inner.y, popup.y + 1);
         assert_eq!(inner.width, popup.width - 2);
         assert_eq!(inner.height, popup.height - 2);
+    }
+
+    #[test]
+    fn bottom_anchored_overlay_clamps_body_rows_to_available_space() {
+        let layout = bottom_anchored_overlay(Rect::new(0, 0, 40, 6), 1, 8);
+
+        assert_eq!(layout.visible_body_rows, 4);
+        assert_eq!(layout.status_row, Rect::new(0, 1, 40, 1));
+        assert_eq!(layout.body, Rect::new(0, 2, 40, 4));
+    }
+
+    #[test]
+    fn bottom_anchored_overlay_preserves_requested_rows_when_space_allows() {
+        let layout = bottom_anchored_overlay(Rect::new(0, 0, 40, 12), 1, 3);
+
+        assert_eq!(layout.visible_body_rows, 3);
+        assert_eq!(layout.status_row, Rect::new(0, 8, 40, 1));
+        assert_eq!(layout.body, Rect::new(0, 9, 40, 3));
     }
 
     #[test]

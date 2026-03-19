@@ -22,7 +22,7 @@ use crate::{
         BranchInputKind, InFlightCommand, PeerStatus, ProviderStatus, RepoViewLayout, TabId, TuiHostState, TuiModel, UiMode, UiState,
     },
     event_log::{self, LevelExt},
-    keymap::Keymap,
+    keymap::{Keymap, ModeId},
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
     shimmer::{shimmer_spans, Shimmer},
     status_bar::{
@@ -98,8 +98,9 @@ pub fn render(
     ui: &mut UiState,
     in_flight: &HashMap<u64, InFlightCommand>,
     theme: &Theme,
-    keymap: &Keymap,
+    _keymap: &Keymap,
     frame: &mut Frame,
+    active_widget_mode: Option<ModeId>,
 ) {
     let constraints = vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)];
     let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
@@ -110,19 +111,13 @@ pub fn render(
     // When the palette is active, move the status bar to the top of the overlay so the
     // input sits above the results instead of being pinned to the bottom of the screen.
     let status_bar_area = if matches!(ui.mode, UiMode::CommandPalette { .. }) {
-        let palette_height = crate::palette::MAX_PALETTE_ROWS as u16;
-        let overlay_y = chunks[2].y.saturating_sub(palette_height);
-        Rect::new(chunks[2].x, overlay_y, chunks[2].width, 1)
+        ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
     } else {
         chunks[2]
     };
-    render_status_bar(model, ui, in_flight, theme, frame, status_bar_area);
+    render_status_bar(model, ui, in_flight, theme, frame, status_bar_area, active_widget_mode);
     render_command_palette(ui, theme, frame, status_bar_area);
-    render_action_menu(model, ui, theme, frame);
     render_input_popup(ui, theme, frame);
-    render_delete_confirm(model, ui, theme, frame);
-    render_close_confirm(model, ui, theme, frame);
-    render_help(ui, theme, keymap, frame);
     render_file_picker(ui, theme, frame);
 }
 
@@ -245,12 +240,13 @@ fn render_status_bar(
     theme: &Theme,
     frame: &mut Frame,
     area: Rect,
+    active_widget_mode: Option<ModeId>,
 ) {
     ui.layout.status_bar.area = area;
     ui.layout.status_bar.key_targets.clear();
     ui.layout.status_bar.dismiss_targets.clear();
 
-    let content = status_bar_content(model, ui, in_flight);
+    let content = status_bar_content(model, ui, in_flight, active_widget_mode);
     let status_section = content.status.clone();
     let status_model = StatusBarModel::build(StatusBarInput {
         width: area.width as usize,
@@ -358,8 +354,121 @@ struct StatusBarContent {
     mode_indicators: Vec<ModeIndicator>,
 }
 
-fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, InFlightCommand>) -> StatusBarContent {
+fn status_bar_content(
+    model: &TuiModel,
+    ui: &UiState,
+    in_flight: &HashMap<u64, InFlightCommand>,
+    active_widget_mode: Option<ModeId>,
+) -> StatusBarContent {
     let visible_error = collect_visible_status_items(model, ui).into_iter().next();
+
+    // Widget stack overrides UiMode for status bar content.
+    if let Some(widget_mode) = active_widget_mode {
+        match widget_mode {
+            ModeId::Help => {
+                return StatusBarContent {
+                    status: StatusSection::plain("HELP"),
+                    keys: vec![
+                        key_chip("j", "Down", KeyCode::Char('j')),
+                        key_chip("k", "Up", KeyCode::Char('k')),
+                        key_chip("ESC", "Close", KeyCode::Esc),
+                        key_chip("?", "Close", KeyCode::Char('?')),
+                    ],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            ModeId::ActionMenu => {
+                return StatusBarContent {
+                    status: StatusSection::plain("ACTIONS"),
+                    keys: vec![
+                        key_chip("j", "Down", KeyCode::Char('j')),
+                        key_chip("k", "Up", KeyCode::Char('k')),
+                        key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
+                        key_chip("ESC", "Close", KeyCode::Esc),
+                    ],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            ModeId::DeleteConfirm => {
+                return StatusBarContent {
+                    status: StatusSection::plain("CONFIRM DELETE"),
+                    keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            ModeId::CloseConfirm => {
+                return StatusBarContent {
+                    status: StatusSection::plain("CONFIRM CLOSE"),
+                    keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            ModeId::BranchInput => {
+                // Distinguish generating vs manual via the UiMode bridge
+                let generating = matches!(ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. });
+                return if generating {
+                    StatusBarContent {
+                        status: StatusSection::plain("NEW BRANCH"),
+                        keys: vec![],
+                        task: Some(TaskSection::new("Generating branch name...", 0)),
+                        mode_indicators: vec![],
+                    }
+                } else {
+                    StatusBarContent {
+                        status: StatusSection::plain("NEW BRANCH"),
+                        keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
+                        task: None,
+                        mode_indicators: vec![],
+                    }
+                };
+            }
+            ModeId::IssueSearch => {
+                // Read the current search text from the UiMode bridge
+                let query = if let UiMode::IssueSearch { ref input } = ui.mode { input.value().to_string() } else { String::new() };
+                return StatusBarContent {
+                    status: StatusSection::plain(&format!("SEARCH {}", query)),
+                    keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            ModeId::CommandPalette => {
+                // Read the current palette input from the UiMode bridge
+                let input_text =
+                    if let UiMode::CommandPalette { ref input, .. } = ui.mode { input.value().to_string() } else { String::new() };
+                let status_text = format!("/{}", input_text);
+                return StatusBarContent {
+                    status: StatusSection::plain(&status_text),
+                    keys: vec![
+                        key_chip(ENTER_KEY_GLYPH, "Run", KeyCode::Enter),
+                        key_chip("TAB", "Fill", KeyCode::Tab),
+                        key_chip("ESC", "Close", KeyCode::Esc),
+                    ],
+                    task: None,
+                    mode_indicators: normal_mode_indicators(ui),
+                };
+            }
+            ModeId::FilePicker => {
+                return StatusBarContent {
+                    status: StatusSection::plain("ADD REPO"),
+                    keys: vec![
+                        key_chip("j", "Down", KeyCode::Char('j')),
+                        key_chip("k", "Up", KeyCode::Char('k')),
+                        key_chip("tab", "Complete", KeyCode::Tab),
+                        key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
+                        key_chip("ESC", "Cancel", KeyCode::Esc),
+                    ],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
+            _ => {} // Other widget modes will be handled as they are extracted
+        }
+    }
 
     match &ui.mode {
         UiMode::Normal => {
@@ -448,17 +557,22 @@ fn status_bar_content(model: &TuiModel, ui: &UiState, in_flight: &HashMap<u64, I
             task: None,
             mode_indicators: vec![],
         },
-        UiMode::Help => StatusBarContent {
-            status: StatusSection::plain("HELP"),
-            keys: vec![
-                key_chip("j", "Down", KeyCode::Char('j')),
-                key_chip("k", "Up", KeyCode::Char('k')),
-                key_chip("ESC", "Close", KeyCode::Esc),
-                key_chip("?", "Close", KeyCode::Char('?')),
-            ],
-            task: None,
-            mode_indicators: vec![],
-        },
+        UiMode::Help => {
+            // Help is now on the widget stack — this branch is only reached if
+            // UiMode::Help lingers from legacy code paths.  Fall through to the
+            // widget-mode override above, which handles ModeId::Help.
+            StatusBarContent {
+                status: StatusSection::plain("HELP"),
+                keys: vec![
+                    key_chip("j", "Down", KeyCode::Char('j')),
+                    key_chip("k", "Up", KeyCode::Char('k')),
+                    key_chip("ESC", "Close", KeyCode::Esc),
+                    key_chip("?", "Close", KeyCode::Char('?')),
+                ],
+                task: None,
+                mode_indicators: vec![],
+            }
+        }
         UiMode::CommandPalette { ref input, .. } => {
             let status_text = format!("/{}", input.value());
             StatusBarContent {
@@ -1022,29 +1136,6 @@ fn render_debug_panel(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut
     frame.render_widget(panel, area);
 }
 
-fn render_action_menu(model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
-    let UiMode::ActionMenu { ref items, index } = ui.mode else {
-        return;
-    };
-
-    let area = ui_helpers::popup_area(frame.area(), 40, 40);
-    ui.layout.menu_area = area;
-    frame.render_widget(Clear, area);
-
-    let labels = model.active_labels();
-    let list_items: Vec<ListItem> =
-        items.iter().enumerate().map(|(i, intent)| ListItem::new(format!(" {}: {}", i + 1, intent.label(labels)))).collect();
-
-    let list = List::new(list_items)
-        .block(Block::bordered().style(theme.block_style()).title(" Actions "))
-        .highlight_style(Style::default().bg(theme.action_highlight).bold())
-        .highlight_symbol("▸ ");
-
-    let mut state = ListState::default();
-    state.select(Some(index));
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
 fn render_input_popup(ui: &UiState, theme: &Theme, frame: &mut Frame) {
     let UiMode::BranchInput { ref input, ref kind, .. } = ui.mode else {
         return;
@@ -1067,181 +1158,6 @@ fn render_input_popup(ui: &UiState, theme: &Theme, frame: &mut Frame) {
     let cursor_x = inner_area.x + 2 + input.visual_cursor() as u16;
     let cursor_y = inner_area.y;
     frame.set_cursor_position((cursor_x, cursor_y));
-}
-
-fn render_delete_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame) {
-    let UiMode::DeleteConfirm { ref info, loading, ref remote_host, .. } = ui.mode else {
-        return;
-    };
-
-    let area = ui_helpers::popup_area(frame.area(), 60, 50);
-    frame.render_widget(Clear, area);
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Wrap { trim: true } strips leading whitespace, so don't add prefix spaces.
-    const MAX_FILES: usize = 10;
-    const MAX_COMMITS: usize = 5;
-
-    if loading {
-        lines.push(Line::from(shimmer_spans("Loading safety info...", theme)));
-    } else if let Some(info) = info {
-        lines.push(Line::from(vec![Span::raw("Branch: "), Span::styled(&info.branch, Style::default().bold())]));
-        lines.push(Line::from(""));
-
-        if let Some(pr_status) = &info.change_request_status {
-            let color = theme.change_request_status_color(pr_status);
-            let status_text = pr_status.as_str();
-            lines.push(Line::from(vec![
-                Span::raw(format!("{}: ", model.active_labels().change_requests.abbr)),
-                Span::styled(status_text, Style::default().fg(color).bold()),
-            ]));
-            if let Some(sha) = &info.merge_commit_sha {
-                lines.push(Line::from(format!("Merge commit: {}", sha)));
-            }
-        } else {
-            lines.push(Line::from(Span::styled(
-                format!("No {} found", model.active_labels().change_requests.abbr),
-                Style::default().fg(theme.muted),
-            )));
-        }
-
-        lines.push(Line::from(""));
-
-        if info.has_uncommitted {
-            if info.uncommitted_files.is_empty() {
-                lines.push(Line::from(Span::styled("⚠ Has uncommitted changes", Style::default().fg(theme.error).bold())));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    format!("⚠ {} uncommitted file(s):", info.uncommitted_files.len()),
-                    Style::default().fg(theme.error).bold(),
-                )));
-                for file_line in info.uncommitted_files.iter().take(MAX_FILES) {
-                    lines.push(Line::from(Span::styled(file_line.to_string(), Style::default().fg(theme.muted))));
-                }
-                if info.uncommitted_files.len() > MAX_FILES {
-                    lines.push(Line::from(Span::styled(
-                        format!("...and {} more", info.uncommitted_files.len() - MAX_FILES),
-                        Style::default().fg(theme.muted),
-                    )));
-                }
-            }
-        }
-
-        if let Some(warning) = &info.base_detection_warning {
-            lines.push(Line::from(Span::styled(format!("⚠ {}", warning), Style::default().fg(theme.warning))));
-        } else if !info.unpushed_commits.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("⚠ {} unpushed commit(s):", info.unpushed_commits.len()),
-                Style::default().fg(theme.error).bold(),
-            )));
-            for commit in info.unpushed_commits.iter().take(MAX_COMMITS) {
-                lines.push(Line::from(commit.to_string()));
-            }
-        }
-
-        if !info.has_uncommitted
-            && info.unpushed_commits.is_empty()
-            && info.base_detection_warning.is_none()
-            && info.change_request_status.as_ref().is_some_and(|s| s.eq_ignore_ascii_case("merged"))
-        {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("✓ Safe to delete", Style::default().fg(theme.status_ok).bold())));
-        }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("y/Enter: confirm    n/Esc: cancel", Style::default().fg(theme.muted))));
-    }
-
-    let title = match remote_host {
-        Some(host) => format!(" Remove {} on {} ", model.active_labels().checkouts.noun_capitalized(), host),
-        None => format!(" Remove {} ", model.active_labels().checkouts.noun_capitalized()),
-    };
-    let paragraph = Paragraph::new(lines).block(Block::bordered().style(theme.block_style()).title(title)).wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
-}
-
-fn render_close_confirm(model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame) {
-    let UiMode::CloseConfirm { ref id, ref title, .. } = ui.mode else {
-        return;
-    };
-
-    let area = ui_helpers::popup_area(frame.area(), 50, 30);
-    frame.render_widget(Clear, area);
-
-    let noun = &model.active_labels().change_requests.noun;
-    let lines = vec![
-        Line::from(vec![Span::raw(format!("{} #", noun)), Span::styled(id, Style::default().bold())]),
-        Line::from(Span::styled(title.as_str(), Style::default().fg(theme.muted))),
-        Line::from(""),
-        Line::from(Span::styled("y/Enter: confirm    n/Esc: cancel", Style::default().fg(theme.muted))),
-    ];
-
-    let block_title = format!(" Close {} ", noun);
-    let paragraph = Paragraph::new(lines).block(Block::bordered().style(theme.block_style()).title(block_title)).wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
-}
-
-fn render_help(ui: &mut UiState, theme: &Theme, keymap: &Keymap, frame: &mut Frame) {
-    if !matches!(ui.mode, UiMode::Help) {
-        return;
-    }
-
-    let area = ui_helpers::popup_area(frame.area(), 60, 85);
-    frame.render_widget(Clear, area);
-
-    let mut help_text = vec![
-        Line::from(Span::styled("Item Icons", Style::default().bold())),
-        Line::from("  ●  Checkout with workspace    ○  Checkout (no workspace)"),
-        Line::from("  ▶  Running session            ◆  Idle session"),
-        Line::from("  ⊙  Pull request               ◇  Issue"),
-        Line::from("  ⊶  Remote branch"),
-        Line::from(""),
-        Line::from(Span::styled("Column Indicators", Style::default().bold())),
-        Line::from("  WT: ◆ main  ✓ checked out"),
-        Line::from("  WS: ● has workspace  2/3/… multiple"),
-        Line::from("  PR: ✓ merged  ✗ closed"),
-        Line::from("  Git: ? untracked  M modified  ↑ ahead  ↓ behind"),
-        Line::from(""),
-    ];
-
-    // Dynamic sections from keymap
-    for section in keymap.help_sections() {
-        help_text.push(Line::from(Span::styled(section.title, Style::default().bold())));
-        for binding in &section.bindings {
-            help_text.push(Line::from(format!("  {:18}{}", binding.key_display, binding.description)));
-        }
-        help_text.push(Line::from(""));
-    }
-
-    // Mouse hints (not configurable)
-    help_text.push(Line::from(Span::styled("Mouse", Style::default().bold())));
-    help_text.push(Line::from("  Click            Select item"));
-    help_text.push(Line::from("  Double-click     Open workspace"));
-    help_text.push(Line::from("  Right-click      Action menu"));
-    help_text.push(Line::from("  Scroll wheel     Navigate list"));
-    help_text.push(Line::from("  Drag tab         Reorder tabs"));
-
-    let total_lines = help_text.len() as u16;
-    let inner_height = area.height.saturating_sub(2); // borders
-    let max_scroll = total_lines.saturating_sub(inner_height);
-    ui.help_scroll = ui.help_scroll.min(max_scroll);
-    let scroll = ui.help_scroll;
-
-    let has_more_below = scroll < max_scroll;
-    let has_more_above = scroll > 0;
-    let title = match (has_more_above, has_more_below) {
-        (true, true) => " Help ↑↓ ",
-        (false, true) => " Help ↓ ",
-        (true, false) => " Help ↑ ",
-        (false, false) => " Help ",
-    };
-
-    let paragraph = Paragraph::new(help_text)
-        .block(Block::bordered().style(theme.block_style()).title(title))
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
 }
 
 fn render_file_picker(ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
@@ -1302,11 +1218,8 @@ fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, status
     };
 
     let filtered: Vec<&crate::palette::PaletteEntry> = crate::palette::filter_entries(entries, input.value());
-    let palette_height = crate::palette::MAX_PALETTE_ROWS as u16;
-
-    // Overlay area: fixed height, sits directly below the status bar (which has been
-    // moved to the top of the overlay by the caller).
-    let area = Rect::new(status_bar_area.x, status_bar_area.y + 1, status_bar_area.width, palette_height);
+    let overlay = ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16);
+    let area = overlay.body;
 
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
@@ -1314,7 +1227,7 @@ fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, status
     let name_width = filtered.iter().map(|e| e.name.len()).max().unwrap_or(0).min(20);
     let hint_width: u16 = 7;
 
-    for (i, entry) in filtered.iter().skip(scroll_top).take(crate::palette::MAX_PALETTE_ROWS).enumerate() {
+    for (i, entry) in filtered.iter().skip(scroll_top).take(overlay.visible_body_rows as usize).enumerate() {
         let row_y = area.y + i as u16;
         let is_selected = scroll_top + i == selected;
 

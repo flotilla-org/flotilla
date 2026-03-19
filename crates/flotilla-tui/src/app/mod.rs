@@ -6,7 +6,7 @@ mod navigation;
 #[doc(hidden)]
 pub mod test_builders;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 pub mod ui_state;
 
 use std::{
@@ -260,6 +260,7 @@ pub struct App {
     pub in_flight: HashMap<u64, InFlightCommand>,
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
+    pub widget_stack: Vec<Box<dyn crate::widgets::InteractiveWidget>>,
 }
 
 impl App {
@@ -285,6 +286,7 @@ impl App {
             in_flight: HashMap::new(),
             pending_cancel: None,
             should_quit: false,
+            widget_stack: vec![Box::new(crate::widgets::work_item_table::WorkItemTable::new())],
         }
     }
 
@@ -392,6 +394,96 @@ impl App {
         }
         self.model.status_message = status_message;
     }
+
+    // ── Widget stack helpers ──
+
+    /// Pop all modal widgets from the stack, leaving only the base WorkItemTable.
+    /// Called when the user switches tabs or navigates away, so stale modals
+    /// don't linger across context changes.
+    pub fn dismiss_modals(&mut self) {
+        self.widget_stack.truncate(1);
+    }
+
+    /// Returns true if a modal widget is on the stack above the base layer.
+    pub fn has_modal(&self) -> bool {
+        self.widget_stack.len() > 1
+    }
+
+    pub fn build_widget_context(&mut self) -> crate::widgets::WidgetContext<'_> {
+        crate::widgets::WidgetContext {
+            model: &self.model,
+            keymap: &self.keymap,
+            config: &self.config,
+            in_flight: &self.in_flight,
+            target_host: self.ui.target_host.as_ref(),
+            active_repo: self.model.active_repo,
+            repo_order: &self.model.repo_order,
+            commands: &mut self.proto_commands,
+            repo_ui: &mut self.ui.repo_ui,
+            mode: &mut self.ui.mode,
+            app_actions: Vec::new(),
+        }
+    }
+
+    pub fn apply_outcome(&mut self, index: usize, outcome: crate::widgets::Outcome) {
+        match outcome {
+            crate::widgets::Outcome::Consumed => {}
+            // Callers only invoke apply_outcome for non-Ignored outcomes; this arm is unreachable today.
+            crate::widgets::Outcome::Ignored => {}
+            crate::widgets::Outcome::Finished => {
+                self.widget_stack.remove(index);
+            }
+            crate::widgets::Outcome::Push(widget) => {
+                self.widget_stack.push(widget);
+            }
+            crate::widgets::Outcome::Swap(widget) => {
+                self.widget_stack.remove(index);
+                self.widget_stack.insert(index, widget);
+            }
+        }
+    }
+
+    pub fn process_app_actions(&mut self, actions: Vec<crate::widgets::AppAction>) {
+        use crate::widgets::AppAction;
+        for action in actions {
+            match action {
+                AppAction::Quit => self.should_quit = true,
+                AppAction::CancelCommand(id) => self.pending_cancel = Some(id),
+                AppAction::CycleTheme => {
+                    let themes = crate::theme::available_themes();
+                    let current = self.theme.name;
+                    let idx = themes.iter().position(|(name, _)| *name == current).unwrap_or(0);
+                    let next = (idx + 1) % themes.len();
+                    self.theme = (themes[next].1)();
+                }
+                AppAction::CycleLayout => {
+                    self.ui.cycle_layout();
+                    self.persist_layout();
+                }
+                AppAction::CycleHost => {
+                    let peer_hosts = self.model.peer_host_names();
+                    self.ui.cycle_target_host(&peer_hosts);
+                }
+                AppAction::ToggleDebug => {
+                    self.ui.show_debug = !self.ui.show_debug;
+                }
+                AppAction::ToggleStatusBarKeys => {
+                    self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
+                }
+                AppAction::ToggleProviders => {
+                    let sp = self.active_ui().show_providers;
+                    self.active_ui_mut().show_providers = !sp;
+                }
+                AppAction::ToggleMultiSelect => {
+                    self.toggle_multi_select();
+                }
+                AppAction::OpenActionMenu => {
+                    self.open_action_menu();
+                }
+            }
+        }
+    }
+
     // ── Daemon event handling ──
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
@@ -706,35 +798,18 @@ impl App {
         self.ui.mode = UiMode::BranchInput { input: Input::from(branch_name), kind: BranchInputKind::Manual, pending_issue_ids };
     }
 
-    pub(super) fn enter_branch_input(&mut self, kind: BranchInputKind) {
-        self.ui.mode = UiMode::BranchInput { input: Input::default(), kind, pending_issue_ids: Vec::new() };
-    }
-
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
         let mut input = Input::default();
         if let Some(parent) = self.model.active_repo_root().parent() {
             let parent_str = format!("{}/", parent.display());
             input = Input::from(parent_str.as_str());
         }
-        self.ui.mode = UiMode::FilePicker { input, dir_entries: Vec::new(), selected: 0 };
+        self.ui.mode = UiMode::FilePicker { input: input.clone(), dir_entries: Vec::new(), selected: 0 };
         self.refresh_dir_listing();
+        // Build dir_entries after refresh so the widget has them
+        let dir_entries = if let UiMode::FilePicker { ref dir_entries, .. } = self.ui.mode { dir_entries.clone() } else { Vec::new() };
+        self.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
     }
-
-    pub(super) fn clear_active_issue_search(&mut self, dispatch: ClearDispatch) {
-        if dispatch == ClearDispatch::Always || self.active_ui().active_search_query.is_some() {
-            let repo = self.model.active_repo_root().clone();
-            self.proto_commands.push(self.command(CommandAction::ClearIssueSearch { repo: flotilla_protocol::RepoSelector::Path(repo) }));
-        }
-        self.active_ui_mut().active_search_query = None;
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ClearDispatch {
-    /// Always dispatch the clear command, even if no search is active.
-    Always,
-    /// Only dispatch if there is an active search query.
-    OnlyIfActive,
 }
 
 #[cfg(test)]
@@ -1345,19 +1420,24 @@ mod tests {
         }
     }
 
-    // -- CloseConfirm flow --
+    // -- CloseConfirm flow (via widget stack) --
+
+    fn push_close_confirm_widget(app: &mut App, id: &str) {
+        let widget = crate::widgets::close_confirm::CloseConfirmWidget::new(
+            id.into(),
+            "Test PR".into(),
+            WorkItemIdentity::Session("test".into()),
+            Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: id.into() } },
+        );
+        app.widget_stack.push(Box::new(widget));
+    }
 
     #[test]
     fn close_confirm_y_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-            identity: WorkItemIdentity::Session("test".into()),
-            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
-        };
+        push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let cmd = app.proto_commands.take_next();
         assert!(matches!(cmd, Some((Command { action: CommandAction::CloseChangeRequest { id }, .. }, _)) if id == "42"));
     }
@@ -1365,14 +1445,9 @@ mod tests {
     #[test]
     fn close_confirm_enter_dispatches_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-            identity: WorkItemIdentity::Session("test".into()),
-            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
-        };
+        push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let cmd = app.proto_commands.take_next();
         assert!(matches!(cmd, Some((Command { action: CommandAction::CloseChangeRequest { id }, .. }, _)) if id == "42"));
     }
@@ -1380,28 +1455,18 @@ mod tests {
     #[test]
     fn close_confirm_esc_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-            identity: WorkItemIdentity::Session("test".into()),
-            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
-        };
+        push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Esc));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
     #[test]
     fn close_confirm_n_cancels() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "42".into(),
-            title: "Test PR".into(),
-            identity: WorkItemIdentity::Session("test".into()),
-            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "42".into() } },
-        };
+        push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 

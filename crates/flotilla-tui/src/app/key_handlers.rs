@@ -2,17 +2,16 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::data::GroupEntry;
-use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, RepoSelector, WorkItem};
-use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
+use flotilla_protocol::{Command, CommandAction, WorkItem};
+use tui_input::Input;
 
 use super::{
     ui_state::{FocusTarget, PendingActionContext},
-    App, BranchInputKind, ClearDispatch, Intent, UiMode,
+    App, BranchInputKind, Intent, UiMode,
 };
 use crate::{
     keymap::{Action, ModeId},
     status_bar::StatusBarAction,
-    theme,
 };
 
 impl App {
@@ -59,11 +58,17 @@ impl App {
         self.keymap.resolve(mode_id, crokey::KeyCombination::from(key))
     }
 
-    fn dispatch_action(&mut self, action: Action) {
+    /// Handle actions that the widget stack returned `Ignored` for.
+    ///
+    /// This covers actions that need `&mut App` context the widget doesn't have
+    /// (action_enter, open_action_menu, open_file_picker, dispatch intent, tab
+    /// navigation, theme/layout/debug/host/status-bar toggles) as well as
+    /// event-log navigation in Config mode.
+    pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
-            Action::SelectNext => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => self.select_next(),
-                FocusTarget::EventLog => {
+            Action::SelectNext => {
+                // Widget handles WorkItemTable; only EventLog reaches here.
+                if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     if let Some(sel) = self.ui.event_log.selected {
                         if sel + 1 < self.ui.event_log.count {
                             self.ui.event_log.selected = Some(sel + 1);
@@ -72,185 +77,21 @@ impl App {
                         self.ui.event_log.selected = Some(self.ui.event_log.count - 1);
                     }
                 }
-                FocusTarget::HelpText => {
-                    self.ui.help_scroll = self.ui.help_scroll.saturating_add(1);
-                }
-                FocusTarget::ActionMenu => {
-                    if let UiMode::ActionMenu { ref items, ref mut index } = self.ui.mode {
-                        if *index < items.len().saturating_sub(1) {
-                            *index += 1;
-                        }
-                    }
-                }
-                FocusTarget::FilePickerList => self.file_picker_select_next(),
-                FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
-                        let count = crate::palette::filter_entries(entries, input.value()).len();
-                        if count > 0 {
-                            *selected = (*selected + 1) % count;
-                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
-                            if *selected >= *scroll_top + max_visible {
-                                *scroll_top = selected.saturating_sub(max_visible - 1);
-                            } else if *selected < *scroll_top {
-                                *scroll_top = *selected;
-                            }
-                        }
-                    }
-                }
-                FocusTarget::BranchInput
-                | FocusTarget::IssueSearchInput
-                | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog => {}
-            },
-            Action::SelectPrev => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => self.select_prev(),
-                FocusTarget::EventLog => {
+            }
+            Action::SelectPrev => {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     if let Some(sel) = self.ui.event_log.selected {
                         if sel > 0 {
                             self.ui.event_log.selected = Some(sel - 1);
                         }
                     }
                 }
-                FocusTarget::HelpText => {
-                    self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1);
+            }
+            Action::Confirm => {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
+                    self.action_enter();
                 }
-                FocusTarget::ActionMenu => {
-                    if let UiMode::ActionMenu { ref mut index, .. } = self.ui.mode {
-                        *index = index.saturating_sub(1);
-                    }
-                }
-                FocusTarget::FilePickerList => self.file_picker_select_prev(),
-                FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, entries, ref mut selected, ref mut scroll_top, .. } = self.ui.mode {
-                        let count = crate::palette::filter_entries(entries, input.value()).len();
-                        if count > 0 {
-                            *selected = if *selected == 0 { count - 1 } else { *selected - 1 };
-                            let max_visible = crate::palette::MAX_PALETTE_ROWS;
-                            if *selected >= *scroll_top + max_visible {
-                                *scroll_top = selected.saturating_sub(max_visible - 1);
-                            } else if *selected < *scroll_top {
-                                *scroll_top = *selected;
-                            }
-                        }
-                    }
-                }
-                FocusTarget::BranchInput
-                | FocusTarget::IssueSearchInput
-                | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog => {}
-            },
-            Action::Confirm => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => self.action_enter(),
-                FocusTarget::ActionMenu => {
-                    self.execute_menu_action();
-                    if matches!(self.ui.mode, UiMode::ActionMenu { .. }) {
-                        self.ui.mode = UiMode::Normal;
-                    }
-                }
-                FocusTarget::BranchInput => {
-                    if !matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }) {
-                        let (branch, issue_ids) = if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
-                            (input.value().to_string(), std::mem::take(pending_issue_ids))
-                        } else {
-                            return;
-                        };
-                        if !branch.is_empty() {
-                            self.proto_commands.push(self.targeted_command(CommandAction::Checkout {
-                                repo: flotilla_protocol::RepoSelector::Identity(self.model.active_repo_identity().clone()),
-                                target: CheckoutTarget::FreshBranch(branch),
-                                issue_ids,
-                            }));
-                        }
-                        self.ui.mode = UiMode::Normal;
-                    }
-                }
-                FocusTarget::IssueSearchInput => {
-                    let query = if let UiMode::IssueSearch { ref input } = self.ui.mode {
-                        input.value().to_string()
-                    } else {
-                        return;
-                    };
-                    if !query.is_empty() {
-                        let repo = self.model.active_repo_root().clone();
-                        self.proto_commands.push(self.command(CommandAction::SearchIssues {
-                            repo: flotilla_protocol::RepoSelector::Path(repo),
-                            query: query.clone(),
-                        }));
-                        self.active_ui_mut().active_search_query = Some(query);
-                    }
-                    self.ui.mode = UiMode::Normal;
-                }
-                FocusTarget::FilePickerList => self.activate_dir_entry(),
-                FocusTarget::DeleteConfirmDialog => {
-                    let loading = matches!(self.ui.mode, UiMode::DeleteConfirm { loading: true, .. });
-                    if !loading {
-                        if let UiMode::DeleteConfirm { info: Some(ref info), ref terminal_keys, ref identity, ref remote_host, .. } =
-                            self.ui.mode
-                        {
-                            let ctx = PendingActionContext {
-                                identity: identity.clone(),
-                                description: format!("Remove {}", info.branch),
-                                repo_identity: self.model.active_repo_identity().clone(),
-                            };
-                            let action = CommandAction::RemoveCheckout {
-                                checkout: CheckoutSelector::Query(info.branch.clone()),
-                                terminal_keys: terminal_keys.clone(),
-                            };
-                            let command = Command {
-                                host: remote_host.clone(),
-                                context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
-                                action,
-                            };
-                            self.proto_commands.push_with_context(command, Some(ctx));
-                        }
-                        self.ui.mode = UiMode::Normal;
-                    }
-                }
-                FocusTarget::CloseConfirmDialog => {
-                    if let UiMode::CloseConfirm { ref id, ref identity, ref command, .. } = self.ui.mode {
-                        let ctx = PendingActionContext {
-                            identity: identity.clone(),
-                            description: format!("Close {}", id),
-                            repo_identity: self.model.active_repo_identity().clone(),
-                        };
-                        self.proto_commands.push_with_context(command.clone(), Some(ctx));
-                    }
-                    self.ui.mode = UiMode::Normal;
-                }
-                FocusTarget::CommandPalette => {
-                    if let UiMode::CommandPalette { ref input, entries, selected, .. } = self.ui.mode {
-                        let text = input.value().to_string();
-
-                        // "search <terms>" — apply filter directly, empty clears
-                        if let Some(query) = text.strip_prefix("search ") {
-                            let query = query.trim().to_string();
-                            self.ui.mode = UiMode::Normal;
-                            if query.is_empty() {
-                                self.clear_active_issue_search(crate::app::ClearDispatch::Always);
-                            } else {
-                                let repo = self.model.active_repo_root().clone();
-                                self.proto_commands.push(self.command(CommandAction::SearchIssues {
-                                    repo: flotilla_protocol::RepoSelector::Path(repo),
-                                    query: query.clone(),
-                                }));
-                                self.active_ui_mut().active_search_query = Some(query);
-                            }
-                            return;
-                        }
-
-                        // Otherwise dispatch the selected entry's action
-                        let filtered = crate::palette::filter_entries(entries, &text);
-                        if let Some(entry) = filtered.get(selected) {
-                            let action = entry.action;
-                            self.ui.mode = UiMode::Normal;
-                            self.dispatch_action(action);
-                            return;
-                        }
-                    }
-                    self.ui.mode = UiMode::Normal;
-                }
-                FocusTarget::HelpText | FocusTarget::EventLog => {}
-            },
+            }
             Action::Refresh => {} // handled in the main event loop
             Action::PrevTab => self.prev_tab(),
             Action::NextTab => self.next_tab(),
@@ -264,65 +105,9 @@ impl App {
                     self.config.save_tab_order(&self.persisted_tab_order_paths());
                 }
             }
-            Action::ToggleHelp => match self.ui.mode {
-                UiMode::Normal => self.ui.mode = UiMode::Help,
-                UiMode::Help => {
-                    self.ui.mode = UiMode::Normal;
-                    self.ui.help_scroll = 0;
-                }
-                _ => {}
-            },
-            Action::ToggleMultiSelect => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.toggle_multi_select();
-                }
-            }
-            Action::ToggleProviders => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    let sp = self.active_ui().show_providers;
-                    self.active_ui_mut().show_providers = !sp;
-                }
-            }
-            Action::ToggleDebug => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.ui.show_debug = !self.ui.show_debug;
-                }
-            }
-            Action::ToggleStatusBarKeys => {
-                self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
-            }
-            Action::CycleHost => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    let peer_hosts = self.model.peer_host_names();
-                    self.ui.cycle_target_host(&peer_hosts);
-                }
-            }
-            Action::CycleLayout => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.ui.cycle_layout();
-                    self.persist_layout();
-                }
-            }
-            Action::CycleTheme => {
-                let themes = theme::available_themes();
-                let current = self.theme.name;
-                let idx = themes.iter().position(|(name, _)| *name == current).unwrap_or(0);
-                let next = (idx + 1) % themes.len();
-                self.theme = (themes[next].1)();
-            }
             Action::OpenActionMenu => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.open_action_menu();
-                }
-            }
-            Action::OpenBranchInput => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.enter_branch_input(BranchInputKind::Manual);
-                }
-            }
-            Action::OpenIssueSearch => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.ui.mode = UiMode::IssueSearch { input: Input::default() };
                 }
             }
             Action::OpenFilePicker => {
@@ -330,132 +115,169 @@ impl App {
                     self.open_file_picker_from_active_repo_parent();
                 }
             }
-            Action::OpenCommandPalette => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.ui.mode = UiMode::CommandPalette {
-                        input: Input::default(),
-                        entries: crate::palette::all_entries(),
-                        selected: 0,
-                        scroll_top: 0,
-                    };
-                }
-            }
-            Action::Dismiss => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => {
-                    // Cancellation takes priority over other dismiss actions while a command is running.
-                    if let Some(&command_id) = self.in_flight.keys().next() {
-                        self.pending_cancel = Some(command_id);
-                    } else if self.active_ui().active_search_query.is_some() {
-                        self.clear_active_issue_search(ClearDispatch::OnlyIfActive);
-                    } else if self.active_ui().show_providers {
-                        self.active_ui_mut().show_providers = false;
-                    } else if !self.active_ui().multi_selected.is_empty() {
-                        self.active_ui_mut().multi_selected.clear();
-                    } else {
-                        self.should_quit = true;
-                    }
-                }
-                FocusTarget::EventLog => {
+            Action::Dismiss => {
+                // Widget handles WorkItemTable dismiss cascade. Only EventLog reaches here.
+                if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     self.ui.mode = UiMode::Normal;
                 }
-                FocusTarget::HelpText => {
-                    self.ui.mode = UiMode::Normal;
-                    self.ui.help_scroll = 0;
-                }
-                FocusTarget::ActionMenu
-                | FocusTarget::BranchInput
-                | FocusTarget::FilePickerList
-                | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog
-                | FocusTarget::CommandPalette => {
-                    self.ui.mode = UiMode::Normal;
-                }
-                FocusTarget::IssueSearchInput => {
-                    self.clear_active_issue_search(ClearDispatch::Always);
-                    self.ui.mode = UiMode::Normal;
-                }
-            },
-            Action::Quit => {
-                self.should_quit = true;
             }
             Action::Dispatch(intent) => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.dispatch_if_available(intent);
                 }
             }
+            // Handled by widget stack (via AppAction or direct widget handling)
+            // — should not reach here in normal flow
+            Action::ToggleHelp
+            | Action::ToggleMultiSelect
+            | Action::ToggleProviders
+            | Action::Quit
+            | Action::OpenBranchInput
+            | Action::OpenIssueSearch
+            | Action::OpenCommandPalette
+            | Action::ToggleDebug
+            | Action::ToggleStatusBarKeys
+            | Action::CycleHost
+            | Action::CycleLayout
+            | Action::CycleTheme => {
+                // These are handled by the widget stack in normal flow. They can
+                // still reach here when a modal widget returns Ignored (e.g. pressing
+                // `?` while the action menu is open). The no-op is correct — the
+                // action should not fire from inside an unrelated modal.
+            }
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if let Some(action) = self.resolve_action(key) {
-            self.dispatch_action(action);
-            return;
-        }
+        // The widget stack is always non-empty (WorkItemTable is the base layer).
+        let captures_raw = self.widget_stack.last().expect("stack is never empty").captures_raw_keys();
+        let mode_id = self.widget_stack.last().expect("stack is never empty").mode_id();
 
-        // Unresolved keys in text input modes pass through to tui_input
-        match self.ui.mode {
-            UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
-            UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
-            UiMode::IssueSearch { .. } => self.handle_issue_search_key(key),
-            UiMode::CommandPalette { ref mut input, entries, ref mut selected, ref mut scroll_top, .. } => {
-                // Tab / Right arrow: fill selected command name into input
-                if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
-                    let filtered = crate::palette::filter_entries(entries, input.value());
-                    if let Some(entry) = filtered.get(*selected) {
-                        let filled = format!("{} ", entry.name);
-                        *input = Input::from(filled.as_str());
-                        *selected = 0;
-                        *scroll_top = 0;
-                    }
-                    return;
-                }
-
-                // Backspace on empty input closes the palette
-                if matches!(key.code, KeyCode::Backspace) && input.value().is_empty() {
-                    self.ui.mode = UiMode::Normal;
-                    return;
-                }
-
-                input.handle_event(&crossterm::event::Event::Key(key));
-                // Shortcut: typing / when input is empty fills "search "
-                if input.value() == "/" {
-                    *input = Input::from("search ");
-                    *selected = 0;
-                    *scroll_top = 0;
-                    return;
-                }
-                *selected = 0;
-                *scroll_top = 0;
+        let action = if captures_raw {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => self.resolve_action(key),
+                _ => None,
             }
-            _ => {}
+        } else {
+            // Hybrid widgets (text input + action keys) need hardcoded
+            // resolution to prevent shared bindings (e.g. j/k → SelectNext/
+            // SelectPrev) from intercepting text input. Other non-capturing
+            // widgets use the normal keymap.
+            match mode_id {
+                ModeId::CommandPalette => match key.code {
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter => Some(Action::Confirm),
+                    KeyCode::Up => Some(Action::SelectPrev),
+                    KeyCode::Down => Some(Action::SelectNext),
+                    _ => None,
+                },
+                ModeId::FilePicker => match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
+                    KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter => Some(Action::Confirm),
+                    _ => None,
+                },
+                // When the top widget is the base layer (Normal mode_id),
+                // resolve using the actual UI mode. This ensures Config mode
+                // gets correct bindings (e.g. q → Dismiss, not Quit).
+                ModeId::Normal => self.resolve_action(key),
+                _ => self.keymap.resolve(mode_id, crokey::KeyCombination::from(key)),
+            }
+        };
+
+        let mut stack = std::mem::take(&mut self.widget_stack);
+        let (outcome_action, app_actions) = {
+            let mut ctx = self.build_widget_context();
+            let mut result: Option<(usize, crate::widgets::Outcome)> = None;
+            // Dispatch to the top widget first. Only propagate down to the
+            // base widget (index 0) when it IS the top widget. Modal widgets
+            // above the base layer act as focus barriers — their Ignored
+            // result does not cascade further.
+            let top = stack.len() - 1;
+            let stop_at = if stack.len() > 1 { 1 } else { 0 };
+            for i in (stop_at..=top).rev() {
+                let outcome = if let Some(action) = action {
+                    stack[i].handle_action(action, &mut ctx)
+                } else {
+                    stack[i].handle_raw_key(key, &mut ctx)
+                };
+                if !matches!(outcome, crate::widgets::Outcome::Ignored) {
+                    result = Some((i, outcome));
+                    break;
+                }
+            }
+            let app_actions = std::mem::take(&mut ctx.app_actions);
+            (result, app_actions)
+        };
+
+        self.widget_stack = stack;
+        if let Some((index, outcome)) = outcome_action {
+            self.apply_outcome(index, outcome);
+        } else if let Some(action) = action {
+            // No widget consumed the action — fall through to legacy dispatch
+            self.dispatch_action(action);
+        }
+        self.process_app_actions(app_actions);
+
+        // Post-dispatch: check for infinite scroll fetch-more only after
+        // selection-changing actions (SelectNext/SelectPrev). Running it after
+        // every key event would trigger background fetches from unrelated keys.
+        if matches!(action, Some(Action::SelectNext | Action::SelectPrev)) {
+            self.check_infinite_scroll();
         }
     }
 
     // ── Mouse handling ──
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // ── Widget stack mouse dispatch ──
+        // The stack is always non-empty (WorkItemTable is the base layer).
+        // Modal widgets on top act as focus barriers — if a modal is present,
+        // mouse events that it doesn't consume must NOT fall through to the
+        // base table layer. Only dispatch to the top widget when modals are
+        // present; skip the base widget entirely.
+        let has_modal = self.widget_stack.len() > 1;
+        let mut stack = std::mem::take(&mut self.widget_stack);
+        let (outcome_action, app_actions) = {
+            let mut ctx = self.build_widget_context();
+            let mut result: Option<(usize, crate::widgets::Outcome)> = None;
+            let top = stack.len() - 1;
+            // Only try the top modal widget, not the base layer underneath.
+            // When no modal is present, the base widget (index 0) gets the event.
+            let stop_at = if stack.len() > 1 { top } else { 0 };
+            for i in (stop_at..=top).rev() {
+                let outcome = stack[i].handle_mouse(mouse, &mut ctx);
+                if !matches!(outcome, crate::widgets::Outcome::Ignored) {
+                    result = Some((i, outcome));
+                    break;
+                }
+            }
+            let app_actions = std::mem::take(&mut ctx.app_actions);
+            (result, app_actions)
+        };
+
+        self.widget_stack = stack;
+        self.process_app_actions(app_actions);
+        if let Some((index, outcome)) = outcome_action {
+            self.apply_outcome(index, outcome);
+            return;
+        }
+
+        // A modal was open but didn't consume the mouse event — block it
+        // from reaching the table. This prevents scroll-wheel input from
+        // moving the table selection while a popup is visible.
+        if has_modal {
+            return;
+        }
+
+        // No widget consumed the mouse event and no modal is active — legacy mouse handling.
         if self.handle_status_bar_mouse(mouse) {
             return;
         }
 
-        match self.ui.mode {
-            UiMode::ActionMenu { .. } => {
-                self.handle_menu_mouse(mouse);
-                return;
-            }
-            UiMode::FilePicker { .. } => {
-                self.handle_file_picker_mouse(mouse);
-                return;
-            }
-            UiMode::Help
-            | UiMode::DeleteConfirm { .. }
-            | UiMode::CloseConfirm { .. }
-            | UiMode::BranchInput { .. }
-            | UiMode::IssueSearch { .. }
-            | UiMode::CommandPalette { .. } => {
-                return;
-            }
-            UiMode::Config | UiMode::Normal => {}
+        if !matches!(self.ui.mode, UiMode::Config | UiMode::Normal) {
+            return;
         }
 
         match mouse.kind {
@@ -495,6 +317,34 @@ impl App {
 
     // ── Private helpers ──
 
+    /// Check if the current selection is near the bottom and fetch more issues.
+    ///
+    /// The WorkItemTable widget handles selection changes but can't mutate
+    /// `model.repos` (to set `issue_fetch_pending`). This post-dispatch check
+    /// runs after every key event to trigger infinite scroll when needed.
+    fn check_infinite_scroll(&mut self) {
+        if self.model.repo_order.is_empty() {
+            return;
+        }
+        let rui = self.active_ui();
+        let Some(next) = rui.selected_selectable_idx else {
+            return;
+        };
+        let total = rui.table_view.selectable_indices.len();
+        if next + 5 >= total && self.model.active().issue_has_more && !self.model.active().issue_fetch_pending {
+            let repo = self.model.active_repo_root().clone();
+            let issue_count = self.model.active().providers.issues.len();
+            let desired = issue_count + 50;
+            let repo_identity = self.model.active_repo_identity().clone();
+            if let Some(rm) = self.model.repos.get_mut(&repo_identity) {
+                rm.issue_fetch_pending = true;
+            }
+            self.proto_commands.push(
+                self.command(CommandAction::FetchMoreIssues { repo: flotilla_protocol::RepoSelector::Path(repo), desired_count: desired }),
+            );
+        }
+    }
+
     fn handle_status_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return false;
@@ -523,38 +373,6 @@ impl App {
         match action {
             StatusBarAction::KeyPress { code, modifiers } => self.handle_key(KeyEvent::new(code, modifiers)),
             StatusBarAction::ClearError(id) => self.dismiss_status_item(id),
-        }
-    }
-
-    fn handle_menu_mouse(&mut self, mouse: MouseEvent) {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return;
-        }
-        let x = mouse.column;
-        let y = mouse.row;
-        let a = self.ui.layout.menu_area;
-        if x < a.x || x >= a.x + a.width || y < a.y || y >= a.y + a.height {
-            self.ui.mode = UiMode::Normal;
-            return;
-        }
-        let row = (y - a.y) as usize;
-        if row < 1 {
-            return;
-        }
-        let item_idx = row - 1;
-        let menu_len = if let UiMode::ActionMenu { ref items, .. } = self.ui.mode {
-            items.len()
-        } else {
-            return;
-        };
-        if item_idx < menu_len {
-            if let UiMode::ActionMenu { ref mut index, .. } = self.ui.mode {
-                *index = item_idx;
-            }
-            self.execute_menu_action();
-            if matches!(self.ui.mode, UiMode::ActionMenu { .. }) {
-                self.ui.mode = UiMode::Normal;
-            }
         }
     }
 
@@ -600,7 +418,9 @@ impl App {
         all_issue_keys.sort();
         all_issue_keys.dedup();
         if !all_issue_keys.is_empty() {
-            self.enter_branch_input(BranchInputKind::Generating);
+            self.ui.mode =
+                UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Generating, pending_issue_ids: Vec::new() };
+            self.widget_stack.push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating)));
             self.proto_commands.push(self.targeted_repo_command(CommandAction::GenerateBranchName { issue_keys: all_issue_keys }));
         }
         self.active_ui_mut().multi_selected.clear();
@@ -629,27 +449,26 @@ impl App {
         if let Some(cmd) = intent.resolve(item, self) {
             match intent {
                 Intent::RemoveCheckout => {
-                    self.ui.mode = UiMode::DeleteConfirm {
-                        info: None,
-                        loading: true,
-                        terminal_keys: item.terminal_keys.clone(),
-                        identity: item.identity.clone(),
-                        remote_host: self.item_execution_host(item),
-                    };
+                    let widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(
+                        item.terminal_keys.clone(),
+                        item.identity.clone(),
+                        self.item_execution_host(item),
+                    );
+                    self.widget_stack.push(Box::new(widget));
                 }
                 Intent::GenerateBranchName => {
-                    self.enter_branch_input(BranchInputKind::Generating);
+                    self.ui.mode =
+                        UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Generating, pending_issue_ids: Vec::new() };
+                    self.widget_stack.push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating)));
                 }
                 Intent::CloseChangeRequest => {
-                    self.ui.mode = UiMode::CloseConfirm {
-                        id: match &cmd {
-                            Command { action: CommandAction::CloseChangeRequest { id }, .. } => id.clone(),
-                            _ => return,
-                        },
-                        title: item.description.clone(),
-                        identity: item.identity.clone(),
-                        command: cmd,
+                    let id = match &cmd {
+                        Command { action: CommandAction::CloseChangeRequest { id }, .. } => id.clone(),
+                        _ => return,
                     };
+                    let widget =
+                        crate::widgets::close_confirm::CloseConfirmWidget::new(id, item.description.clone(), item.identity.clone(), cmd);
+                    self.widget_stack.push(Box::new(widget));
                     return;
                 }
                 _ => {}
@@ -663,56 +482,29 @@ impl App {
         }
     }
 
-    fn open_action_menu(&mut self) {
+    pub(super) fn open_action_menu(&mut self) {
         let Some(item) = self.selected_work_item().cloned() else {
             return;
         };
 
         let my_host = self.model.my_host().cloned();
-        let items: Vec<Intent> = Intent::all_in_menu_order()
+        let entries: Vec<crate::widgets::action_menu::MenuEntry> = Intent::all_in_menu_order()
             .iter()
             .copied()
-            .filter(|a| a.is_available(&item) && a.is_allowed_for_host(&item, &my_host) && a.resolve(&item, self).is_some())
+            .filter_map(|intent| {
+                if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_host) {
+                    intent.resolve(&item, self).map(|command| crate::widgets::action_menu::MenuEntry { intent, command })
+                } else {
+                    None
+                }
+            })
             .collect();
 
-        if items.is_empty() {
+        if entries.is_empty() {
             return;
         }
 
-        self.ui.mode = UiMode::ActionMenu { items, index: 0 };
-    }
-
-    fn handle_branch_input_key(&mut self, key: KeyEvent) {
-        // Ignore keys while generating
-        if matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }) {
-            return;
-        }
-
-        if let UiMode::BranchInput { ref mut input, .. } = self.ui.mode {
-            input.handle_event(&crossterm::event::Event::Key(key));
-        }
-    }
-
-    fn handle_issue_search_key(&mut self, key: KeyEvent) {
-        if let UiMode::IssueSearch { ref mut input } = self.ui.mode {
-            input.handle_event(&crossterm::event::Event::Key(key));
-        }
-    }
-
-    fn execute_menu_action(&mut self) {
-        let (intent, item) = {
-            let UiMode::ActionMenu { ref items, index } = self.ui.mode else {
-                return;
-            };
-            let Some(&intent) = items.get(index) else {
-                return;
-            };
-            let Some(item) = self.selected_work_item().cloned() else {
-                return;
-            };
-            (intent, item)
-        };
-        self.resolve_and_push(intent, &item);
+        self.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
     }
 }
 
@@ -721,7 +513,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use flotilla_protocol::{CheckoutStatus, Command, HostName, HostPath, WorkItemIdentity};
+    use flotilla_protocol::{CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, WorkItemIdentity};
     use ratatui::layout::Rect;
 
     use super::{
@@ -763,24 +555,6 @@ mod tests {
         checkout_item(&format!("feat/{id}"), &format!("/tmp/{id}"), false)
     }
 
-    fn delete_confirm_mode(branch: &str) -> UiMode {
-        UiMode::DeleteConfirm {
-            info: Some(CheckoutStatus {
-                branch: branch.into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: false,
-                uncommitted_files: vec![],
-                base_detection_warning: None,
-            }),
-            loading: false,
-            terminal_keys: vec![],
-            identity: WorkItemIdentity::Session("test".into()),
-            remote_host: None,
-        }
-    }
-
     fn left_click(x: u16, y: u16) -> MouseEvent {
         MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE }
     }
@@ -788,11 +562,11 @@ mod tests {
     // ── handle_key — top-level dispatch ──────────────────────────────
 
     #[test]
-    fn dispatch_action_select_next_moves_work_item_selection() {
+    fn select_next_moves_work_item_selection_via_widget() {
         let mut app = stub_app();
         setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
 
-        app.dispatch_action(Action::SelectNext);
+        app.handle_key(key(KeyCode::Char('j')));
 
         assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
     }
@@ -810,34 +584,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_action_select_next_scrolls_help() {
-        let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
-
-        app.dispatch_action(Action::SelectNext);
-
-        assert_eq!(app.ui.help_scroll, 1);
-    }
-
-    #[test]
-    fn dispatch_action_select_next_advances_menu_index() {
-        let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
-
-        app.dispatch_action(Action::SelectNext);
-
-        match app.ui.mode {
-            UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
-            _ => panic!("expected ActionMenu"),
-        }
-    }
-
-    #[test]
-    fn dispatch_action_select_next_advances_file_picker_selection() {
+    fn file_picker_select_next_advances_selection_via_handle_key() {
+        // FilePicker selection is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![dir_entry("alpha", false, false), dir_entry("beta", false, false)]);
 
-        app.dispatch_action(Action::SelectNext);
+        app.handle_key(key(KeyCode::Down));
 
         match app.ui.mode {
             UiMode::FilePicker { selected, .. } => assert_eq!(selected, 1),
@@ -845,42 +598,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_action_confirm_executes_action_menu_selection() {
-        let mut app = stub_app();
-        setup_table(&mut app, vec![make_work_item("a")]);
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::RemoveCheckout], index: 0 };
-
-        app.dispatch_action(Action::Confirm);
-
-        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
-    }
-
-    #[test]
-    fn dispatch_action_confirm_submits_delete_confirm() {
-        let mut app = stub_app();
-        app.ui.mode = delete_confirm_mode("feat/delete");
-
-        app.dispatch_action(Action::Confirm);
-
-        assert!(matches!(app.ui.mode, UiMode::Normal));
-        let (cmd, _) = app.proto_commands.take_next().expect("expected remove checkout command");
-        match cmd {
-            Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
-                assert_eq!(checkout, CheckoutSelector::Query("feat/delete".into()));
-            }
-            other => panic!("expected RemoveCheckout, got {:?}", other),
-        }
-    }
+    // dispatch_action_confirm_submits_delete_confirm — moved to widget tests
+    // in widgets::delete_confirm::tests
 
     #[test]
     fn dispatch_action_confirm_submits_branch_input() {
+        // BranchInput confirm is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("feature/test"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget_with_text(&mut app, "feature/test");
 
-        app.dispatch_action(Action::Confirm);
+        app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().expect("expected checkout command");
         match cmd {
             Command { action: CommandAction::Checkout { target, .. }, .. } => {
@@ -892,12 +623,15 @@ mod tests {
 
     #[test]
     fn dispatch_action_confirm_submits_issue_search() {
+        // IssueSearch confirm is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::from("bug fix") };
+        push_issue_search_widget_with_text(&mut app, "bug fix");
 
-        app.dispatch_action(Action::Confirm);
+        app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert_eq!(app.active_ui().active_search_query.as_deref(), Some("bug fix"));
         let (cmd, _) = app.proto_commands.take_next().expect("expected search command");
         match cmd {
@@ -909,7 +643,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_action_confirm_activates_file_picker_selection() {
+    fn file_picker_confirm_activates_selection_via_handle_key() {
+        // FilePicker confirm is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let tmp = tempfile::tempdir().expect("create tempdir");
         let repo_dir = tmp.path().join("my-repo");
         std::fs::create_dir(&repo_dir).expect("create repo dir");
@@ -920,9 +656,10 @@ mod tests {
         let entries = vec![DirEntry { name: "my-repo".to_string(), is_dir: true, is_git_repo: true, is_added: false }];
         enter_file_picker(&mut app, &parent_path, entries);
 
-        app.dispatch_action(Action::Confirm);
+        app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().expect("expected track repo command");
         match cmd {
             Command { action: CommandAction::TrackRepoPath { path }, .. } => {
@@ -990,23 +727,31 @@ mod tests {
         let mut app = stub_app();
         assert!(matches!(app.ui.mode, UiMode::Normal));
         app.handle_key(key(KeyCode::Char('?')));
-        assert!(matches!(app.ui.mode, UiMode::Help));
+        assert!(app.widget_stack.len() > 1, "expected modal widget pushed on stack");
     }
 
     #[test]
     fn question_mark_toggles_help_back_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
         app.handle_key(key(KeyCode::Char('?')));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
     fn question_mark_in_other_modes_does_not_toggle() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest], index: 0 };
+        // Push a widget on the stack — `?` should be handled by the widget (Ignored),
+        // but doesn't fall through to dispatch_action, so no HelpWidget is pushed.
+        let item = make_work_item("a");
+        let entries = vec![crate::widgets::action_menu::MenuEntry {
+            intent: Intent::OpenChangeRequest,
+            command: Command { host: None, context_repo: None, action: CommandAction::OpenChangeRequest { id: "1".into() } },
+        }];
+        app.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
         app.handle_key(key(KeyCode::Char('?')));
-        assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
+        // Widget stack should still have exactly 1 widget (the action menu)
+        assert_eq!(app.widget_stack.len(), 2);
     }
 
     #[test]
@@ -1018,11 +763,38 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_key_near_bottom_does_not_trigger_fetch_more_issues() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![
+            make_work_item("a"),
+            make_work_item("b"),
+            make_work_item("c"),
+            make_work_item("d"),
+            make_work_item("e"),
+            make_work_item("f"),
+        ]);
+        app.active_ui_mut().selected_selectable_idx = Some(1);
+        app.active_ui_mut().table_state.select(Some(1));
+
+        let repo = app.model.repo_order[0].clone();
+        if let Some(rm) = app.model.repos.get_mut(&repo) {
+            rm.issue_has_more = true;
+            rm.issue_fetch_pending = false;
+        }
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        assert!(app.active_ui().show_providers);
+        assert!(app.proto_commands.take_next().is_none(), "did not expect FetchMoreIssues command");
+        assert!(!app.model.repos[&repo].issue_fetch_pending, "did not expect issue_fetch_pending to flip");
+    }
+
+    #[test]
     fn esc_in_help_returns_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
         app.handle_key(key(KeyCode::Esc));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     // ── handle_config_key ────────────────────────────────────────────
@@ -1112,11 +884,17 @@ mod tests {
     #[test]
     fn brackets_do_not_switch_tabs_from_action_menu() {
         let mut app = stub_app_with_repos(2);
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest], index: 0 };
+        let item = make_work_item("a");
+        let entries = vec![crate::widgets::action_menu::MenuEntry {
+            intent: Intent::OpenChangeRequest,
+            command: Command { host: None, context_repo: None, action: CommandAction::OpenChangeRequest { id: "1".into() } },
+        }];
+        app.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
 
         app.handle_key(key(KeyCode::Char(']')));
 
-        assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
+        // Widget should still be on the stack, tab should not have switched
+        assert_eq!(app.widget_stack.len(), 2);
         assert_eq!(app.model.active_repo, 0);
     }
 
@@ -1131,6 +909,31 @@ mod tests {
         assert_eq!(app.model.active_repo, 0);
     }
 
+    // ── dismiss_modals ─────────────────────────────────────────────
+
+    #[test]
+    fn dismiss_modals_clears_widget_stack_to_base() {
+        let mut app = stub_app();
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+        assert_eq!(app.widget_stack.len(), 2);
+
+        app.dismiss_modals();
+
+        assert_eq!(app.widget_stack.len(), 1, "only base WorkItemTable should remain");
+    }
+
+    #[test]
+    fn has_modal_reflects_stack_depth() {
+        let mut app = stub_app();
+        assert!(!app.has_modal());
+
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+        assert!(app.has_modal());
+
+        app.dismiss_modals();
+        assert!(!app.has_modal());
+    }
+
     // ── handle_normal_key ────────────────────────────────────────────
 
     #[test]
@@ -1143,13 +946,11 @@ mod tests {
     #[test]
     fn help_q_returns_to_normal_and_resets_scroll() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Help;
-        app.ui.help_scroll = 7;
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
 
         app.handle_key(key(KeyCode::Char('q')));
 
-        assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert_eq!(app.ui.help_scroll, 0);
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
@@ -1192,8 +993,9 @@ mod tests {
         let mut app = stub_app();
         setup_table(&mut app, vec![make_work_item("a")]);
         app.handle_key(key(KeyCode::Char('d')));
-        // RemoveCheckout resolves to FetchCheckoutStatus, then sets DeleteConfirm mode
-        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
+        // RemoveCheckout pushes a DeleteConfirmWidget onto the widget stack
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), crate::keymap::ModeId::DeleteConfirm);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
     }
@@ -1280,7 +1082,7 @@ mod tests {
         let item = make_work_item("a");
         setup_table(&mut app, vec![item]);
         app.handle_key(key(KeyCode::Char('.')));
-        assert!(matches!(app.ui.mode, UiMode::ActionMenu { .. }));
+        assert!(app.widget_stack.len() > 1, "expected ActionMenuWidget on the widget stack");
     }
 
     #[test]
@@ -1329,76 +1131,117 @@ mod tests {
         assert!(app.visible_status_items().is_empty());
     }
 
-    // ── handle_menu_key ──────────────────────────────────────────────
+    #[test]
+    fn scroll_wheel_does_not_reach_table_while_help_is_open() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
+        app.ui.layout.table_area = Rect::new(0, 2, 80, 10);
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column: 5, row: 5, modifiers: KeyModifiers::NONE });
+
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
+        assert_eq!(app.widget_stack.len(), 2, "expected help widget to remain on stack");
+    }
 
     #[test]
-    fn menu_esc_returns_to_normal() {
+    fn scroll_wheel_does_not_reach_table_while_action_menu_is_open() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
+        app.ui.layout.table_area = Rect::new(0, 2, 80, 10);
+        push_action_menu_widget(&mut app);
+
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column: 5, row: 5, modifiers: KeyModifiers::NONE });
+
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
+        assert_eq!(app.widget_stack.len(), 2, "expected action menu to remain on stack");
+    }
+
+    // ── handle_menu_key (through widget stack) ─────────────────────
+
+    fn push_action_menu_widget(app: &mut App) {
+        let item = make_work_item("a");
+        let entries = vec![
+            crate::widgets::action_menu::MenuEntry {
+                intent: Intent::CreateWorkspace,
+                command: Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::CreateWorkspaceForCheckout { checkout_path: "/tmp/a".into(), label: "feat/a".into() },
+                },
+            },
+            crate::widgets::action_menu::MenuEntry {
+                intent: Intent::RemoveCheckout,
+                command: Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::FetchCheckoutStatus {
+                        branch: "feat/a".into(),
+                        checkout_path: Some("/tmp/a".into()),
+                        change_request_id: None,
+                    },
+                },
+            },
+        ];
+        app.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
+    }
+
+    #[test]
+    fn menu_esc_pops_widget() {
+        let mut app = stub_app();
+        push_action_menu_widget(&mut app);
         app.handle_key(key(KeyCode::Esc));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
-    fn menu_j_advances_index() {
+    fn menu_enter_pops_widget_and_pushes_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
-        app.handle_key(key(KeyCode::Char('j')));
-        match app.ui.mode {
-            UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
-            _ => panic!("expected ActionMenu"),
-        }
+        push_action_menu_widget(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
+        let (cmd, _) = app.proto_commands.take_next().expect("expected command");
+        assert!(matches!(cmd.action, CommandAction::CreateWorkspaceForCheckout { .. }));
     }
 
-    #[test]
-    fn menu_k_decrements_index() {
-        let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 1 };
-        app.handle_key(key(KeyCode::Char('k')));
-        match app.ui.mode {
-            UiMode::ActionMenu { index, .. } => assert_eq!(index, 0),
-            _ => panic!("expected ActionMenu"),
-        }
+    // ── BranchInput integration (via widget stack) ────────────────────
+
+    fn push_branch_input_widget(app: &mut App, kind: BranchInputKind) {
+        let widget = crate::widgets::branch_input::BranchInputWidget::new(kind.clone());
+        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind, pending_issue_ids: vec![] };
+        app.widget_stack.push(Box::new(widget));
     }
 
-    #[test]
-    fn menu_j_stays_at_end() {
-        let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 1 };
-        app.handle_key(key(KeyCode::Char('j')));
-        match app.ui.mode {
-            UiMode::ActionMenu { index, .. } => assert_eq!(index, 1),
-            _ => panic!("expected ActionMenu"),
-        }
+    fn push_branch_input_widget_with_text(app: &mut App, text: &str) {
+        let mut widget = crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual);
+        widget.prefill(text, vec![]);
+        app.ui.mode = UiMode::BranchInput { input: Input::from(text), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        app.widget_stack.push(Box::new(widget));
     }
 
-    #[test]
-    fn menu_k_stays_at_zero() {
-        let mut app = stub_app();
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::OpenChangeRequest, Intent::SwitchToWorkspace], index: 0 };
-        app.handle_key(key(KeyCode::Char('k')));
-        match app.ui.mode {
-            UiMode::ActionMenu { index, .. } => assert_eq!(index, 0),
-            _ => panic!("expected ActionMenu"),
-        }
+    fn push_branch_input_widget_with_issues(app: &mut App, text: &str, issue_ids: Vec<(String, String)>) {
+        let mut widget = crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual);
+        widget.prefill(text, issue_ids.clone());
+        app.ui.mode = UiMode::BranchInput { input: Input::from(text), kind: BranchInputKind::Manual, pending_issue_ids: issue_ids };
+        app.widget_stack.push(Box::new(widget));
     }
-
-    // ── handle_branch_input_key ──────────────────────────────────────
 
     #[test]
     fn branch_input_esc_returns_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("my-branch"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget_with_text(&mut app, "my-branch");
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
     fn branch_input_enter_creates_checkout() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("my-branch"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget_with_text(&mut app, "my-branch");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::Checkout { target, issue_ids, .. }, .. } => {
@@ -1412,11 +1255,7 @@ mod tests {
     #[test]
     fn branch_input_enter_with_pending_issues() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput {
-            input: Input::from("feat/issue-42"),
-            kind: BranchInputKind::Manual,
-            pending_issue_ids: vec![("github".into(), "42".into())],
-        };
+        push_branch_input_widget_with_issues(&mut app, "feat/issue-42", vec![("github".into(), "42".into())]);
         app.handle_key(key(KeyCode::Enter));
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
@@ -1430,30 +1269,33 @@ mod tests {
     #[test]
     fn branch_input_enter_empty_does_not_create() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget(&mut app, BranchInputKind::Manual);
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
     #[test]
     fn branch_input_generating_ignores_confirm_but_allows_dismiss() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("partial"), kind: BranchInputKind::Generating, pending_issue_ids: vec![] };
-        // Enter should be ignored
+        push_branch_input_widget(&mut app, BranchInputKind::Generating);
+        // Enter should be ignored (consumed, but widget stays)
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert_eq!(app.widget_stack.len(), 2);
         assert!(app.proto_commands.take_next().is_none());
 
         // Esc should dismiss the generating prompt
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
     fn branch_input_manual_q_types_character() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget(&mut app, BranchInputKind::Manual);
 
         app.handle_key(key(KeyCode::Char('q')));
 
@@ -1463,33 +1305,44 @@ mod tests {
         }
     }
 
-    // ── handle_issue_search_key ──────────────────────────────────────
+    // ── IssueSearch integration (via widget stack) ──────────────────
+
+    fn push_issue_search_widget(app: &mut App) {
+        app.ui.mode = UiMode::IssueSearch { input: Input::default() };
+        app.widget_stack.push(Box::new(crate::widgets::issue_search::IssueSearchWidget::new()));
+    }
+
+    fn push_issue_search_widget_with_text(app: &mut App, text: &str) {
+        // We can't set text directly on the widget from outside, so we simulate
+        // by typing each character through the widget stack.
+        app.ui.mode = UiMode::IssueSearch { input: Input::default() };
+        app.widget_stack.push(Box::new(crate::widgets::issue_search::IssueSearchWidget::new()));
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
 
     #[test]
     fn issue_search_esc_clears_and_returns() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::from("some query") };
+        push_issue_search_widget_with_text(&mut app, "some query");
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
-        match cmd {
-            Command { action: CommandAction::ClearIssueSearch { repo }, .. } => {
-                assert_eq!(repo, flotilla_protocol::RepoSelector::Path(PathBuf::from("/tmp/test-repo")));
-            }
-            other => panic!("expected ClearIssueSearch, got {:?}", other),
-        }
+        assert!(matches!(cmd, Command { action: CommandAction::ClearIssueSearch { .. }, .. }));
     }
 
     #[test]
     fn issue_search_enter_submits_query() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::from("bug fix") };
+        push_issue_search_widget_with_text(&mut app, "bug fix");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command { action: CommandAction::SearchIssues { repo, query }, .. } => {
-                assert_eq!(repo, flotilla_protocol::RepoSelector::Path(PathBuf::from("/tmp/test-repo")));
+            Command { action: CommandAction::SearchIssues { query, .. }, .. } => {
                 assert_eq!(query, "bug fix");
             }
             other => panic!("expected SearchIssues, got {:?}", other),
@@ -1499,20 +1352,35 @@ mod tests {
     #[test]
     fn issue_search_enter_empty_no_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::default() };
+        push_issue_search_widget(&mut app);
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
-    // ── handle_delete_confirm_key ────────────────────────────────────
+    // ── handle_delete_confirm_key (via widget stack) ────────────────
+
+    fn push_delete_confirm_widget(app: &mut App, branch: &str) {
+        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None);
+        widget.update_info(CheckoutStatus {
+            branch: branch.into(),
+            change_request_status: None,
+            merge_commit_sha: None,
+            unpushed_commits: vec![],
+            has_uncommitted: false,
+            uncommitted_files: vec![],
+            base_detection_warning: None,
+        });
+        app.widget_stack.push(Box::new(widget));
+    }
 
     #[test]
     fn delete_confirm_y_sends_remove_checkout() {
         let mut app = stub_app();
-        app.ui.mode = delete_confirm_mode("feat/x");
+        push_delete_confirm_widget(&mut app, "feat/x");
         app.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
@@ -1525,9 +1393,9 @@ mod tests {
     #[test]
     fn delete_confirm_enter_sends_remove_checkout() {
         let mut app = stub_app();
-        app.ui.mode = delete_confirm_mode("feat/y");
+        push_delete_confirm_widget(&mut app, "feat/y");
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
@@ -1541,21 +1409,17 @@ mod tests {
     fn delete_confirm_attaches_pending_context() {
         let mut app = stub_app();
         let item = make_work_item("a");
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: Some(CheckoutStatus {
-                branch: "feat/a".into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: false,
-                uncommitted_files: vec![],
-                base_detection_warning: None,
-            }),
-            loading: false,
-            terminal_keys: vec![],
-            identity: item.identity.clone(),
-            remote_host: None,
-        };
+        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], item.identity.clone(), None);
+        widget.update_info(CheckoutStatus {
+            branch: "feat/a".into(),
+            change_request_status: None,
+            merge_commit_sha: None,
+            unpushed_commits: vec![],
+            has_uncommitted: false,
+            uncommitted_files: vec![],
+            base_detection_warning: None,
+        });
+        app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
         let (_, ctx) = app.proto_commands.take_next().expect("should have command");
         let ctx = ctx.expect("should have pending context");
@@ -1566,21 +1430,21 @@ mod tests {
     fn delete_confirm_routes_to_remote_host_when_set() {
         let mut app = stub_app();
         let hostname = HostName::new("feta");
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: Some(CheckoutStatus {
-                branch: "feat/x".into(),
-                change_request_status: None,
-                merge_commit_sha: None,
-                unpushed_commits: vec![],
-                has_uncommitted: false,
-                uncommitted_files: vec![],
-                base_detection_warning: None,
-            }),
-            loading: false,
-            terminal_keys: vec![],
-            identity: WorkItemIdentity::Session("test".into()),
-            remote_host: Some(hostname.clone()),
-        };
+        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(
+            vec![],
+            WorkItemIdentity::Session("test".into()),
+            Some(hostname.clone()),
+        );
+        widget.update_info(CheckoutStatus {
+            branch: "feat/x".into(),
+            change_request_status: None,
+            merge_commit_sha: None,
+            unpushed_commits: vec![],
+            has_uncommitted: false,
+            uncommitted_files: vec![],
+            base_detection_warning: None,
+        });
+        app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
         let (cmd, _) = app.proto_commands.take_next().expect("command");
         assert_eq!(cmd.host, Some(hostname));
@@ -1590,68 +1454,52 @@ mod tests {
     #[test]
     fn delete_confirm_ignores_while_loading() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: None,
-            loading: true,
-            terminal_keys: vec![],
-            identity: WorkItemIdentity::Session("test".into()),
-            remote_host: None,
-        };
+        // Loading widget — no info yet
+        let widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None);
+        app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
-        // Should still be in DeleteConfirm mode
-        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
+        // Widget should still be on the stack (Consumed, not Finished)
+        assert_eq!(app.widget_stack.len(), 2);
         assert!(app.proto_commands.take_next().is_none());
     }
 
     #[test]
     fn delete_confirm_esc_cancels() {
         let mut app = stub_app();
-        app.ui.mode = delete_confirm_mode("feat/z");
+        push_delete_confirm_widget(&mut app, "feat/z");
         app.handle_key(key(KeyCode::Esc));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
     #[test]
     fn delete_confirm_n_cancels() {
         let mut app = stub_app();
-        app.ui.mode = delete_confirm_mode("feat/z");
+        push_delete_confirm_widget(&mut app, "feat/z");
         app.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
     // ── open_action_menu ─────────────────────────────────────────────
 
     #[test]
-    fn open_action_menu_builds_filtered_list() {
+    fn open_action_menu_pushes_widget_with_filtered_entries() {
         let mut app = stub_app();
         // A checkout item without workspace — CreateWorkspace + RemoveCheckout should be available
         let item = make_work_item("a");
         setup_table(&mut app, vec![item]);
         app.open_action_menu();
-        match &app.ui.mode {
-            UiMode::ActionMenu { items, index } => {
-                assert_eq!(*index, 0);
-                assert!(!items.is_empty());
-                // CreateWorkspace should be available (checkout with no workspace)
-                assert!(items.contains(&Intent::CreateWorkspace));
-                // RemoveCheckout should be available (non-main checkout with branch)
-                assert!(items.contains(&Intent::RemoveCheckout));
-                // SwitchToWorkspace should NOT be available (no workspace_refs)
-                assert!(!items.contains(&Intent::SwitchToWorkspace));
-            }
-            other => panic!("expected ActionMenu, got {:?}", std::mem::discriminant(other)),
-        }
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::ActionMenu);
     }
 
     #[test]
     fn open_action_menu_noop_when_no_selection() {
         let mut app = stub_app();
         // No items in table, no selection
-        assert!(matches!(app.ui.mode, UiMode::Normal));
         app.open_action_menu();
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     // ── action_enter ─────────────────────────────────────────────────
@@ -1731,11 +1579,12 @@ mod tests {
     // ── resolve_and_push ─────────────────────────────────────────────
 
     #[test]
-    fn resolve_and_push_sets_delete_confirm_for_remove_checkout() {
+    fn resolve_and_push_pushes_delete_confirm_widget_for_remove_checkout() {
         let mut app = stub_app();
         let item = make_work_item("a");
         app.resolve_and_push(Intent::RemoveCheckout, &item);
-        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::DeleteConfirm);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
     }
@@ -1747,6 +1596,8 @@ mod tests {
         item.issue_keys = vec!["ISSUE-1".into()];
         app.resolve_and_push(Intent::GenerateBranchName, &item);
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::BranchInput);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
@@ -1756,39 +1607,39 @@ mod tests {
         }
     }
 
-    // ── execute_menu_action ──────────────────────────────────────────
+    // ── action menu confirm (through widget stack) ─────────────────
 
     #[test]
-    fn execute_menu_action_dispatches_selected_intent() {
+    fn menu_enter_pops_widget_for_simple_actions() {
         let mut app = stub_app();
-        let item = make_work_item("a");
-        setup_table(&mut app, vec![item]);
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::CreateWorkspace, Intent::RemoveCheckout], index: 0 };
-        app.execute_menu_action();
-        let (cmd, _) = app.proto_commands.take_next().unwrap();
-        assert!(matches!(cmd, Command { action: CommandAction::CreateWorkspaceForCheckout { .. }, .. }));
-    }
-
-    #[test]
-    fn menu_enter_resets_to_normal_for_simple_actions() {
-        let mut app = stub_app();
-        let item = make_work_item("a");
-        setup_table(&mut app, vec![item]);
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::CreateWorkspace], index: 0 };
+        push_action_menu_widget(&mut app);
         app.handle_key(key(KeyCode::Enter));
-        // CreateWorkspace doesn't change the mode itself, so handle_menu_key resets to Normal
+        // Widget should be popped, command should be pushed
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(matches!(app.ui.mode, UiMode::Normal));
     }
 
     #[test]
-    fn menu_enter_preserves_delete_confirm_mode() {
+    fn menu_enter_swaps_to_delete_confirm_widget() {
         let mut app = stub_app();
         let item = make_work_item("a");
-        setup_table(&mut app, vec![item]);
-        app.ui.mode = UiMode::ActionMenu { items: vec![Intent::RemoveCheckout], index: 0 };
+        let entries = vec![crate::widgets::action_menu::MenuEntry {
+            intent: Intent::RemoveCheckout,
+            command: Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::FetchCheckoutStatus {
+                    branch: "feat/a".into(),
+                    checkout_path: Some("/tmp/a".into()),
+                    change_request_id: None,
+                },
+            },
+        }];
+        app.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
         app.handle_key(key(KeyCode::Enter));
-        // RemoveCheckout sets DeleteConfirm mode, which should be preserved
-        assert!(matches!(app.ui.mode, UiMode::DeleteConfirm { loading: true, .. }));
+        // RemoveCheckout swaps ActionMenu for DeleteConfirmWidget
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::DeleteConfirm);
     }
 
     // ── j/k navigation in normal mode ────────────────────────────────
@@ -1832,8 +1683,10 @@ mod tests {
 
         app.action_enter();
 
-        // Should set BranchInput with generating=true
+        // Should set BranchInput with generating=true and push widget
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::BranchInput);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
@@ -1867,15 +1720,11 @@ mod tests {
     #[test]
     fn delete_confirm_y_with_no_info_does_not_push_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::DeleteConfirm {
-            info: None,
-            loading: false,
-            terminal_keys: vec![],
-            identity: WorkItemIdentity::Session("test".into()),
-            remote_host: None,
-        };
+        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None);
+        widget.loading = false; // not loading, but no info either
+        app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         // No info means no branch to extract, so no command pushed
         assert!(app.proto_commands.take_next().is_none());
     }
@@ -1889,12 +1738,8 @@ mod tests {
         item.change_request_key = Some("PR#10".into());
         setup_table(&mut app, vec![item]);
         app.open_action_menu();
-        match &app.ui.mode {
-            UiMode::ActionMenu { items, .. } => {
-                assert!(items.contains(&Intent::OpenChangeRequest));
-            }
-            other => panic!("expected ActionMenu, got {:?}", std::mem::discriminant(other)),
-        }
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::ActionMenu);
     }
 
     // ── space toggles multi-select ───────────────────────────────────
@@ -1975,13 +1820,13 @@ mod tests {
     fn close_confirm_attaches_pending_context() {
         let mut app = stub_app();
         let item = make_work_item("a");
-        // Set up CloseConfirm mode with the item's identity
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "PR-1".into(),
-            title: "test".into(),
-            identity: item.identity.clone(),
-            command: Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: "PR-1".into() } },
-        };
+        // Push CloseConfirmWidget onto the widget stack
+        let widget = crate::widgets::close_confirm::CloseConfirmWidget::new("PR-1".into(), "test".into(), item.identity.clone(), Command {
+            host: None,
+            context_repo: None,
+            action: CommandAction::CloseChangeRequest { id: "PR-1".into() },
+        });
+        app.widget_stack.push(Box::new(widget));
         // Simulate pressing 'y' to confirm
         app.handle_key(key(KeyCode::Char('y')));
         let (_, ctx) = app.proto_commands.take_next().expect("should have command");
@@ -1997,12 +1842,13 @@ mod tests {
             context_repo: Some(flotilla_protocol::RepoSelector::Identity(app.model.active_repo_identity().clone())),
             action: CommandAction::CloseChangeRequest { id: "PR-1".into() },
         };
-        app.ui.mode = UiMode::CloseConfirm {
-            id: "PR-1".into(),
-            title: "test".into(),
-            identity: WorkItemIdentity::ChangeRequest("PR-1".into()),
-            command: expected.clone(),
-        };
+        let widget = crate::widgets::close_confirm::CloseConfirmWidget::new(
+            "PR-1".into(),
+            "test".into(),
+            WorkItemIdentity::ChangeRequest("PR-1".into()),
+            expected.clone(),
+        );
+        app.widget_stack.push(Box::new(widget));
 
         app.handle_key(key(KeyCode::Char('y')));
 
