@@ -1,3 +1,4 @@
+pub mod contracts;
 pub mod passthrough;
 
 pub trait VtEngine: Send {
