@@ -6,6 +6,7 @@ pub mod delete_confirm;
 pub mod file_picker;
 pub mod help;
 pub mod issue_search;
+pub mod work_item_table;
 
 use std::{any::Any, collections::HashMap};
 

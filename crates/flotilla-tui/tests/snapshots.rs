@@ -612,7 +612,8 @@ fn action_menu_widget_renders_on_short_terminals_without_overflow() {
 
 #[test]
 fn branch_input_widget_renders_on_short_terminals_without_overflow() {
-    let mut harness = cramped_widget_harness(Box::new(flotilla_tui::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual)));
+    let mut harness =
+        cramped_widget_harness(Box::new(flotilla_tui::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual)));
 
     let _ = harness.render_to_buffer();
 }

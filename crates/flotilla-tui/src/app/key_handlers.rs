@@ -7,7 +7,7 @@ use tui_input::Input;
 
 use super::{
     ui_state::{FocusTarget, PendingActionContext},
-    App, BranchInputKind, ClearDispatch, Intent, UiMode,
+    App, BranchInputKind, Intent, UiMode,
 };
 use crate::{
     keymap::{Action, ModeId},
@@ -59,11 +59,17 @@ impl App {
         self.keymap.resolve(mode_id, crokey::KeyCombination::from(key))
     }
 
+    /// Handle actions that the widget stack returned `Ignored` for.
+    ///
+    /// This covers actions that need `&mut App` context the widget doesn't have
+    /// (action_enter, open_action_menu, open_file_picker, dispatch intent, tab
+    /// navigation, theme/layout/debug/host/status-bar toggles) as well as
+    /// event-log navigation in Config mode.
     fn dispatch_action(&mut self, action: Action) {
         match action {
-            Action::SelectNext => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => self.select_next(),
-                FocusTarget::EventLog => {
+            Action::SelectNext => {
+                // Widget handles WorkItemTable; only EventLog reaches here.
+                if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     if let Some(sel) = self.ui.event_log.selected {
                         if sel + 1 < self.ui.event_log.count {
                             self.ui.event_log.selected = Some(sel + 1);
@@ -72,45 +78,21 @@ impl App {
                         self.ui.event_log.selected = Some(self.ui.event_log.count - 1);
                     }
                 }
-                FocusTarget::FilePickerList | FocusTarget::CommandPalette => {
-                    // Handled by widget stack
-                }
-                FocusTarget::ActionMenu
-                | FocusTarget::HelpText
-                | FocusTarget::BranchInput
-                | FocusTarget::IssueSearchInput
-                | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog => {}
-            },
-            Action::SelectPrev => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => self.select_prev(),
-                FocusTarget::EventLog => {
+            }
+            Action::SelectPrev => {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     if let Some(sel) = self.ui.event_log.selected {
                         if sel > 0 {
                             self.ui.event_log.selected = Some(sel - 1);
                         }
                     }
                 }
-                FocusTarget::FilePickerList | FocusTarget::CommandPalette => {
-                    // Handled by widget stack
+            }
+            Action::Confirm => {
+                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
+                    self.action_enter();
                 }
-                FocusTarget::ActionMenu
-                | FocusTarget::HelpText
-                | FocusTarget::BranchInput
-                | FocusTarget::IssueSearchInput
-                | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog => {}
-            },
-            Action::Confirm => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => self.action_enter(),
-                FocusTarget::BranchInput | FocusTarget::IssueSearchInput | FocusTarget::FilePickerList | FocusTarget::CommandPalette => {
-                    // Handled by widget stack
-                }
-                FocusTarget::DeleteConfirmDialog | FocusTarget::CloseConfirmDialog => {
-                    // Handled by widget stack
-                }
-                FocusTarget::ActionMenu | FocusTarget::HelpText | FocusTarget::EventLog => {}
-            },
+            }
             Action::Refresh => {} // handled in the main event loop
             Action::PrevTab => self.prev_tab(),
             Action::NextTab => self.next_tab(),
@@ -122,22 +104,6 @@ impl App {
             Action::MoveTabRight => {
                 if !self.ui.mode.is_config() && self.move_tab(1) {
                     self.config.save_tab_order(&self.persisted_tab_order_paths());
-                }
-            }
-            Action::ToggleHelp => {
-                if matches!(self.ui.mode, UiMode::Normal) {
-                    self.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
-                }
-            }
-            Action::ToggleMultiSelect => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.toggle_multi_select();
-                }
-            }
-            Action::ToggleProviders => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    let sp = self.active_ui().show_providers;
-                    self.active_ui_mut().show_providers = !sp;
                 }
             }
             Action::ToggleDebug => {
@@ -172,173 +138,139 @@ impl App {
                     self.open_action_menu();
                 }
             }
-            Action::OpenBranchInput => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.ui.mode =
-                        UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: Vec::new() };
-                    self.widget_stack.push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual)));
-                }
-            }
-            Action::OpenIssueSearch => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.ui.mode = UiMode::IssueSearch { input: Input::default() };
-                    self.widget_stack.push(Box::new(crate::widgets::issue_search::IssueSearchWidget::new()));
-                }
-            }
             Action::OpenFilePicker => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.open_file_picker_from_active_repo_parent();
                 }
             }
-            Action::OpenCommandPalette => {
-                if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.ui.mode = UiMode::CommandPalette {
-                        input: Input::default(),
-                        entries: crate::palette::all_entries(),
-                        selected: 0,
-                        scroll_top: 0,
-                    };
-                    self.widget_stack.push(Box::new(crate::widgets::command_palette::CommandPaletteWidget::new()));
-                }
-            }
-            Action::Dismiss => match self.ui.mode.focus_target() {
-                FocusTarget::WorkItemTable => {
-                    // Cancellation takes priority over other dismiss actions while a command is running.
-                    if let Some(&command_id) = self.in_flight.keys().next() {
-                        self.pending_cancel = Some(command_id);
-                    } else if self.active_ui().active_search_query.is_some() {
-                        self.clear_active_issue_search(ClearDispatch::OnlyIfActive);
-                    } else if self.active_ui().show_providers {
-                        self.active_ui_mut().show_providers = false;
-                    } else if !self.active_ui().multi_selected.is_empty() {
-                        self.active_ui_mut().multi_selected.clear();
-                    } else {
-                        self.should_quit = true;
-                    }
-                }
-                FocusTarget::EventLog => {
+            Action::Dismiss => {
+                // Widget handles WorkItemTable dismiss cascade. Only EventLog reaches here.
+                if matches!(self.ui.mode.focus_target(), FocusTarget::EventLog) {
                     self.ui.mode = UiMode::Normal;
                 }
-                FocusTarget::HelpText
-                | FocusTarget::ActionMenu
-                | FocusTarget::BranchInput
-                | FocusTarget::FilePickerList
-                | FocusTarget::DeleteConfirmDialog
-                | FocusTarget::CloseConfirmDialog
-                | FocusTarget::CommandPalette => {
-                    self.ui.mode = UiMode::Normal;
-                }
-                FocusTarget::IssueSearchInput => {
-                    self.clear_active_issue_search(ClearDispatch::Always);
-                    self.ui.mode = UiMode::Normal;
-                }
-            },
-            Action::Quit => {
-                self.should_quit = true;
             }
             Action::Dispatch(intent) => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.dispatch_if_available(intent);
                 }
             }
+            // Handled by widget stack — should not reach here in normal flow
+            Action::ToggleHelp
+            | Action::ToggleMultiSelect
+            | Action::ToggleProviders
+            | Action::Quit
+            | Action::OpenBranchInput
+            | Action::OpenIssueSearch
+            | Action::OpenCommandPalette => {}
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        // ── Widget stack dispatch (bridge) ──
-        if !self.widget_stack.is_empty() {
-            let captures_raw = self.widget_stack.last().expect("checked non-empty").captures_raw_keys();
-            let mode_id = self.widget_stack.last().expect("checked non-empty").mode_id();
+        // The widget stack is always non-empty (WorkItemTable is the base layer).
+        let captures_raw = self.widget_stack.last().expect("stack is never empty").captures_raw_keys();
+        let mode_id = self.widget_stack.last().expect("stack is never empty").mode_id();
 
-            let action = if captures_raw {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Enter => self.resolve_action(key),
+        let action = if captures_raw {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => self.resolve_action(key),
+                _ => None,
+            }
+        } else {
+            // Hybrid widgets (text input + action keys) need hardcoded
+            // resolution to prevent shared bindings (e.g. j/k → SelectNext/
+            // SelectPrev) from intercepting text input. Other non-capturing
+            // widgets use the normal keymap.
+            match mode_id {
+                ModeId::CommandPalette => match key.code {
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter => Some(Action::Confirm),
+                    KeyCode::Up => Some(Action::SelectPrev),
+                    KeyCode::Down => Some(Action::SelectNext),
                     _ => None,
-                }
-            } else {
-                // Hybrid widgets (text input + action keys) need hardcoded
-                // resolution to prevent shared bindings (e.g. j/k → SelectNext/
-                // SelectPrev) from intercepting text input. Other non-capturing
-                // widgets use the normal keymap.
-                match mode_id {
-                    ModeId::CommandPalette => match key.code {
-                        KeyCode::Esc => Some(Action::Dismiss),
-                        KeyCode::Enter => Some(Action::Confirm),
-                        KeyCode::Up => Some(Action::SelectPrev),
-                        KeyCode::Down => Some(Action::SelectNext),
-                        _ => None,
-                    },
-                    ModeId::FilePicker => match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
-                        KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
-                        KeyCode::Esc => Some(Action::Dismiss),
-                        KeyCode::Enter => Some(Action::Confirm),
-                        _ => None,
-                    },
-                    _ => self.keymap.resolve(mode_id, crokey::KeyCombination::from(key)),
-                }
-            };
-
-            let mut stack = std::mem::take(&mut self.widget_stack);
-            let (outcome_action, should_quit, pending_cancel) = {
-                let mut ctx = self.build_widget_context();
-                let mut result: Option<(usize, crate::widgets::Outcome)> = None;
-                for i in (0..stack.len()).rev() {
-                    let outcome = if let Some(action) = action {
-                        stack[i].handle_action(action, &mut ctx)
-                    } else {
-                        stack[i].handle_raw_key(key, &mut ctx)
-                    };
-                    if !matches!(outcome, crate::widgets::Outcome::Ignored) {
-                        result = Some((i, outcome));
-                        break;
-                    }
-                }
-                (result, ctx.should_quit, ctx.pending_cancel)
-            };
-
-            self.widget_stack = stack;
-            if let Some((index, outcome)) = outcome_action {
-                self.apply_outcome(index, outcome);
+                },
+                ModeId::FilePicker => match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
+                    KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
+                    KeyCode::Esc => Some(Action::Dismiss),
+                    KeyCode::Enter => Some(Action::Confirm),
+                    _ => None,
+                },
+                // When the top widget is the base layer (Normal mode_id),
+                // resolve using the actual UI mode. This ensures Config mode
+                // gets correct bindings (e.g. q → Dismiss, not Quit).
+                ModeId::Normal => self.resolve_action(key),
+                _ => self.keymap.resolve(mode_id, crokey::KeyCombination::from(key)),
             }
-            if should_quit {
-                self.should_quit = true;
-            }
-            if let Some(command_id) = pending_cancel {
-                self.pending_cancel = Some(command_id);
-            }
-            return;
-        }
+        };
 
-        // ── Legacy path ──
-        if let Some(action) = self.resolve_action(key) {
+        let mut stack = std::mem::take(&mut self.widget_stack);
+        let (outcome_action, should_quit, pending_cancel) = {
+            let mut ctx = self.build_widget_context();
+            let mut result: Option<(usize, crate::widgets::Outcome)> = None;
+            // Dispatch to the top widget first. Only propagate down to the
+            // base widget (index 0) when it IS the top widget. Modal widgets
+            // above the base layer act as focus barriers — their Ignored
+            // result does not cascade further.
+            let top = stack.len() - 1;
+            let stop_at = if stack.len() > 1 { 1 } else { 0 };
+            for i in (stop_at..=top).rev() {
+                let outcome = if let Some(action) = action {
+                    stack[i].handle_action(action, &mut ctx)
+                } else {
+                    stack[i].handle_raw_key(key, &mut ctx)
+                };
+                if !matches!(outcome, crate::widgets::Outcome::Ignored) {
+                    result = Some((i, outcome));
+                    break;
+                }
+            }
+            (result, ctx.should_quit, ctx.pending_cancel)
+        };
+
+        self.widget_stack = stack;
+        if let Some((index, outcome)) = outcome_action {
+            self.apply_outcome(index, outcome);
+        } else if let Some(action) = action {
+            // No widget consumed the action — fall through to legacy dispatch
             self.dispatch_action(action);
         }
+        if should_quit {
+            self.should_quit = true;
+        }
+        if let Some(command_id) = pending_cancel {
+            self.pending_cancel = Some(command_id);
+        }
+
+        // Post-dispatch: check for infinite scroll fetch-more after selection changes.
+        // The widget handles selection but can't mutate model.repos to set
+        // issue_fetch_pending, so we handle it here.
+        self.check_infinite_scroll();
     }
 
     // ── Mouse handling ──
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         // ── Widget stack mouse dispatch ──
-        if !self.widget_stack.is_empty() {
-            let mut stack = std::mem::take(&mut self.widget_stack);
-            let (outcome_action, should_quit, pending_cancel) = {
-                let mut ctx = self.build_widget_context();
-                let mut result: Option<(usize, crate::widgets::Outcome)> = None;
-                for i in (0..stack.len()).rev() {
-                    let outcome = stack[i].handle_mouse(mouse, &mut ctx);
-                    if !matches!(outcome, crate::widgets::Outcome::Ignored) {
-                        result = Some((i, outcome));
-                        break;
-                    }
+        // The stack is always non-empty (WorkItemTable is the base layer).
+        // Modal widgets on top may consume mouse events; if none do, fall
+        // through to the legacy mouse handling below.
+        let mut stack = std::mem::take(&mut self.widget_stack);
+        let (outcome_action, should_quit, pending_cancel) = {
+            let mut ctx = self.build_widget_context();
+            let mut result: Option<(usize, crate::widgets::Outcome)> = None;
+            for i in (0..stack.len()).rev() {
+                let outcome = stack[i].handle_mouse(mouse, &mut ctx);
+                if !matches!(outcome, crate::widgets::Outcome::Ignored) {
+                    result = Some((i, outcome));
+                    break;
                 }
-                (result, ctx.should_quit, ctx.pending_cancel)
-            };
-
-            self.widget_stack = stack;
-            if let Some((index, outcome)) = outcome_action {
-                self.apply_outcome(index, outcome);
             }
+            (result, ctx.should_quit, ctx.pending_cancel)
+        };
+
+        self.widget_stack = stack;
+        if let Some((index, outcome)) = outcome_action {
+            self.apply_outcome(index, outcome);
             if should_quit {
                 self.should_quit = true;
             }
@@ -348,6 +280,7 @@ impl App {
             return;
         }
 
+        // No widget consumed the mouse event — legacy mouse handling.
         if self.handle_status_bar_mouse(mouse) {
             return;
         }
@@ -404,6 +337,34 @@ impl App {
     }
 
     // ── Private helpers ──
+
+    /// Check if the current selection is near the bottom and fetch more issues.
+    ///
+    /// The WorkItemTable widget handles selection changes but can't mutate
+    /// `model.repos` (to set `issue_fetch_pending`). This post-dispatch check
+    /// runs after every key event to trigger infinite scroll when needed.
+    fn check_infinite_scroll(&mut self) {
+        if self.model.repo_order.is_empty() {
+            return;
+        }
+        let rui = self.active_ui();
+        let Some(next) = rui.selected_selectable_idx else {
+            return;
+        };
+        let total = rui.table_view.selectable_indices.len();
+        if next + 5 >= total && self.model.active().issue_has_more && !self.model.active().issue_fetch_pending {
+            let repo = self.model.active_repo_root().clone();
+            let issue_count = self.model.active().providers.issues.len();
+            let desired = issue_count + 50;
+            let repo_identity = self.model.active_repo_identity().clone();
+            if let Some(rm) = self.model.repos.get_mut(&repo_identity) {
+                rm.issue_fetch_pending = true;
+            }
+            self.proto_commands.push(
+                self.command(CommandAction::FetchMoreIssues { repo: flotilla_protocol::RepoSelector::Path(repo), desired_count: desired }),
+            );
+        }
+    }
 
     fn handle_status_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -622,11 +583,11 @@ mod tests {
     // ── handle_key — top-level dispatch ──────────────────────────────
 
     #[test]
-    fn dispatch_action_select_next_moves_work_item_selection() {
+    fn select_next_moves_work_item_selection_via_widget() {
         let mut app = stub_app();
         setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
 
-        app.dispatch_action(Action::SelectNext);
+        app.handle_key(key(KeyCode::Char('j')));
 
         assert_eq!(app.active_ui().selected_selectable_idx, Some(1));
     }
@@ -671,7 +632,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().expect("expected checkout command");
         match cmd {
             Command { action: CommandAction::Checkout { target, .. }, .. } => {
@@ -691,7 +652,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert_eq!(app.active_ui().active_search_query.as_deref(), Some("bug fix"));
         let (cmd, _) = app.proto_commands.take_next().expect("expected search command");
         match cmd {
@@ -719,7 +680,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().expect("expected track repo command");
         match cmd {
             Command { action: CommandAction::TrackRepoPath { path }, .. } => {
@@ -787,7 +748,7 @@ mod tests {
         let mut app = stub_app();
         assert!(matches!(app.ui.mode, UiMode::Normal));
         app.handle_key(key(KeyCode::Char('?')));
-        assert!(!app.widget_stack.is_empty());
+        assert!(app.widget_stack.len() > 1, "expected modal widget pushed on stack");
     }
 
     #[test]
@@ -795,7 +756,7 @@ mod tests {
         let mut app = stub_app();
         app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
         app.handle_key(key(KeyCode::Char('?')));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
@@ -811,7 +772,7 @@ mod tests {
         app.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
         app.handle_key(key(KeyCode::Char('?')));
         // Widget stack should still have exactly 1 widget (the action menu)
-        assert_eq!(app.widget_stack.len(), 1);
+        assert_eq!(app.widget_stack.len(), 2);
     }
 
     #[test]
@@ -827,7 +788,7 @@ mod tests {
         let mut app = stub_app();
         app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     // ── handle_config_key ────────────────────────────────────────────
@@ -927,7 +888,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char(']')));
 
         // Widget should still be on the stack, tab should not have switched
-        assert_eq!(app.widget_stack.len(), 1);
+        assert_eq!(app.widget_stack.len(), 2);
         assert_eq!(app.model.active_repo, 0);
     }
 
@@ -958,7 +919,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('q')));
 
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
@@ -1002,8 +963,8 @@ mod tests {
         setup_table(&mut app, vec![make_work_item("a")]);
         app.handle_key(key(KeyCode::Char('d')));
         // RemoveCheckout pushes a DeleteConfirmWidget onto the widget stack
-        assert_eq!(app.widget_stack.len(), 1);
-        assert_eq!(app.widget_stack[0].mode_id(), crate::keymap::ModeId::DeleteConfirm);
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), crate::keymap::ModeId::DeleteConfirm);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
     }
@@ -1090,7 +1051,7 @@ mod tests {
         let item = make_work_item("a");
         setup_table(&mut app, vec![item]);
         app.handle_key(key(KeyCode::Char('.')));
-        assert!(!app.widget_stack.is_empty(), "expected ActionMenuWidget on the widget stack");
+        assert!(app.widget_stack.len() > 1, "expected ActionMenuWidget on the widget stack");
     }
 
     #[test]
@@ -1173,7 +1134,7 @@ mod tests {
         let mut app = stub_app();
         push_action_menu_widget(&mut app);
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
@@ -1181,7 +1142,7 @@ mod tests {
         let mut app = stub_app();
         push_action_menu_widget(&mut app);
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().expect("expected command");
         assert!(matches!(cmd.action, CommandAction::CreateWorkspaceForCheckout { .. }));
     }
@@ -1214,7 +1175,7 @@ mod tests {
         push_branch_input_widget_with_text(&mut app, "my-branch");
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
@@ -1223,7 +1184,7 @@ mod tests {
         push_branch_input_widget_with_text(&mut app, "my-branch");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::Checkout { target, issue_ids, .. }, .. } => {
@@ -1254,7 +1215,7 @@ mod tests {
         push_branch_input_widget(&mut app, BranchInputKind::Manual);
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1265,13 +1226,13 @@ mod tests {
         // Enter should be ignored (consumed, but widget stays)
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
-        assert_eq!(app.widget_stack.len(), 1);
+        assert_eq!(app.widget_stack.len(), 2);
         assert!(app.proto_commands.take_next().is_none());
 
         // Esc should dismiss the generating prompt
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     #[test]
@@ -1310,7 +1271,7 @@ mod tests {
         push_issue_search_widget_with_text(&mut app, "some query");
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command { action: CommandAction::ClearIssueSearch { .. }, .. }));
     }
@@ -1321,7 +1282,7 @@ mod tests {
         push_issue_search_widget_with_text(&mut app, "bug fix");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::SearchIssues { query, .. }, .. } => {
@@ -1337,7 +1298,7 @@ mod tests {
         push_issue_search_widget(&mut app);
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1362,7 +1323,7 @@ mod tests {
         let mut app = stub_app();
         push_delete_confirm_widget(&mut app, "feat/x");
         app.handle_key(key(KeyCode::Char('y')));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
@@ -1377,7 +1338,7 @@ mod tests {
         let mut app = stub_app();
         push_delete_confirm_widget(&mut app, "feat/y");
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
@@ -1441,7 +1402,7 @@ mod tests {
         app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
         // Widget should still be on the stack (Consumed, not Finished)
-        assert_eq!(app.widget_stack.len(), 1);
+        assert_eq!(app.widget_stack.len(), 2);
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1450,7 +1411,7 @@ mod tests {
         let mut app = stub_app();
         push_delete_confirm_widget(&mut app, "feat/z");
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1459,7 +1420,7 @@ mod tests {
         let mut app = stub_app();
         push_delete_confirm_widget(&mut app, "feat/z");
         app.handle_key(key(KeyCode::Char('n')));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1472,8 +1433,8 @@ mod tests {
         let item = make_work_item("a");
         setup_table(&mut app, vec![item]);
         app.open_action_menu();
-        assert_eq!(app.widget_stack.len(), 1);
-        assert_eq!(app.widget_stack[0].mode_id(), ModeId::ActionMenu);
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::ActionMenu);
     }
 
     #[test]
@@ -1481,7 +1442,7 @@ mod tests {
         let mut app = stub_app();
         // No items in table, no selection
         app.open_action_menu();
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 
     // ── action_enter ─────────────────────────────────────────────────
@@ -1565,8 +1526,8 @@ mod tests {
         let mut app = stub_app();
         let item = make_work_item("a");
         app.resolve_and_push(Intent::RemoveCheckout, &item);
-        assert_eq!(app.widget_stack.len(), 1);
-        assert_eq!(app.widget_stack[0].mode_id(), ModeId::DeleteConfirm);
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::DeleteConfirm);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
     }
@@ -1578,8 +1539,8 @@ mod tests {
         item.issue_keys = vec!["ISSUE-1".into()];
         app.resolve_and_push(Intent::GenerateBranchName, &item);
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
-        assert_eq!(app.widget_stack.len(), 1);
-        assert_eq!(app.widget_stack[0].mode_id(), ModeId::BranchInput);
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::BranchInput);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
@@ -1597,7 +1558,7 @@ mod tests {
         push_action_menu_widget(&mut app);
         app.handle_key(key(KeyCode::Enter));
         // Widget should be popped, command should be pushed
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(matches!(app.ui.mode, UiMode::Normal));
     }
 
@@ -1620,8 +1581,8 @@ mod tests {
         app.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
         app.handle_key(key(KeyCode::Enter));
         // RemoveCheckout swaps ActionMenu for DeleteConfirmWidget
-        assert_eq!(app.widget_stack.len(), 1);
-        assert_eq!(app.widget_stack[0].mode_id(), ModeId::DeleteConfirm);
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::DeleteConfirm);
     }
 
     // ── j/k navigation in normal mode ────────────────────────────────
@@ -1667,8 +1628,8 @@ mod tests {
 
         // Should set BranchInput with generating=true and push widget
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
-        assert_eq!(app.widget_stack.len(), 1);
-        assert_eq!(app.widget_stack[0].mode_id(), ModeId::BranchInput);
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::BranchInput);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
@@ -1706,7 +1667,7 @@ mod tests {
         widget.loading = false; // not loading, but no info either
         app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         // No info means no branch to extract, so no command pushed
         assert!(app.proto_commands.take_next().is_none());
     }
@@ -1720,8 +1681,8 @@ mod tests {
         item.change_request_key = Some("PR#10".into());
         setup_table(&mut app, vec![item]);
         app.open_action_menu();
-        assert_eq!(app.widget_stack.len(), 1);
-        assert_eq!(app.widget_stack[0].mode_id(), ModeId::ActionMenu);
+        assert_eq!(app.widget_stack.len(), 2);
+        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::ActionMenu);
     }
 
     // ── space toggles multi-select ───────────────────────────────────

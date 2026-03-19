@@ -286,7 +286,7 @@ impl App {
             in_flight: HashMap::new(),
             pending_cancel: None,
             should_quit: false,
-            widget_stack: vec![],
+            widget_stack: vec![Box::new(crate::widgets::work_item_table::WorkItemTable::new())],
         }
     }
 
@@ -767,6 +767,12 @@ impl App {
         self.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
     }
 
+    /// Clear the active issue search and optionally dispatch a clear command.
+    ///
+    /// Production code now uses inline logic in `WorkItemTable::dismiss` and
+    /// `IssueSearchWidget`. This method remains for unit tests and will be
+    /// removed when the legacy scaffolding is cleaned up.
+    #[allow(dead_code)]
     pub(super) fn clear_active_issue_search(&mut self, dispatch: ClearDispatch) {
         if dispatch == ClearDispatch::Always || self.active_ui().active_search_query.is_some() {
             let repo = self.model.active_repo_root().clone();
@@ -1409,7 +1415,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Char('y')));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let cmd = app.proto_commands.take_next();
         assert!(matches!(cmd, Some((Command { action: CommandAction::CloseChangeRequest { id }, .. }, _)) if id == "42"));
     }
@@ -1419,7 +1425,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         let cmd = app.proto_commands.take_next();
         assert!(matches!(cmd, Some((Command { action: CommandAction::CloseChangeRequest { id }, .. }, _)) if id == "42"));
     }
@@ -1429,7 +1435,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1438,7 +1444,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Char('n')));
-        assert!(app.widget_stack.is_empty());
+        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
