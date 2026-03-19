@@ -104,9 +104,11 @@ impl GhosttyFormatterTerminalOptions {
 }
 
 pub enum GhosttyTerminalOpaque {}
+pub enum GhosttyTerminalVtStreamOpaque {}
 pub enum GhosttyFormatterOpaque {}
 
 pub type GhosttyTerminal = *mut GhosttyTerminalOpaque;
+pub type GhosttyTerminalVtStream = *mut GhosttyTerminalVtStreamOpaque;
 pub type GhosttyFormatter = *mut GhosttyFormatterOpaque;
 
 #[link(name = "ghostty-vt")]
@@ -114,7 +116,13 @@ unsafe extern "C" {
     fn ghostty_terminal_new(allocator: *const c_void, terminal: *mut GhosttyTerminal, options: GhosttyTerminalOptions) -> GhosttyResult;
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16) -> GhosttyResult;
-    fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
+    fn ghostty_terminal_vt_stream_new(
+        allocator: *const c_void,
+        stream: *mut GhosttyTerminalVtStream,
+        terminal: GhosttyTerminal,
+    ) -> GhosttyResult;
+    fn ghostty_terminal_vt_stream_free(stream: GhosttyTerminalVtStream);
+    fn ghostty_terminal_vt_stream_write(stream: GhosttyTerminalVtStream, data: *const u8, len: usize);
 
     fn ghostty_formatter_terminal_new(
         allocator: *const c_void,
@@ -133,6 +141,7 @@ unsafe extern "C" {
 
 pub struct TerminalHandle {
     raw: GhosttyTerminal,
+    stream: GhosttyTerminalVtStream,
 }
 
 impl TerminalHandle {
@@ -140,7 +149,13 @@ impl TerminalHandle {
         let mut raw = ptr::null_mut();
         let result = unsafe { ghostty_terminal_new(ptr::null(), &mut raw, GhosttyTerminalOptions { cols, rows, max_scrollback }) };
         check_result(result, "ghostty_terminal_new")?;
-        Ok(Self { raw })
+        let mut stream = ptr::null_mut();
+        let result = unsafe { ghostty_terminal_vt_stream_new(ptr::null(), &mut stream, raw) };
+        if let Err(err) = check_result(result, "ghostty_terminal_vt_stream_new") {
+            unsafe { ghostty_terminal_free(raw) };
+            return Err(err);
+        }
+        Ok(Self { raw, stream })
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
@@ -149,7 +164,7 @@ impl TerminalHandle {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        unsafe { ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len()) };
+        unsafe { ghostty_terminal_vt_stream_write(self.stream, bytes.as_ptr(), bytes.len()) };
     }
 
     pub fn raw(&self) -> GhosttyTerminal {
@@ -159,7 +174,10 @@ impl TerminalHandle {
 
 impl Drop for TerminalHandle {
     fn drop(&mut self) {
-        unsafe { ghostty_terminal_free(self.raw) };
+        unsafe {
+            ghostty_terminal_vt_stream_free(self.stream);
+            ghostty_terminal_free(self.raw);
+        };
     }
 }
 

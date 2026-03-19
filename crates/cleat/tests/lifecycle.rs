@@ -383,6 +383,104 @@ fn cleat_attach_exits_when_session_is_killed() {
 }
 
 #[test]
+fn cleat_detach_exits_foreground_client_and_keeps_session_alive() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
+
+    let cleat_bin = std::env::var("CARGO_BIN_EXE_cleat").expect("cleat bin");
+    let mut child = Command::new(cleat_bin)
+        .arg("--runtime-root")
+        .arg(temp.path())
+        .arg("attach")
+        .arg("alpha")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cleat attach");
+    let _stdin = child.stdin.take().expect("attach stdin");
+
+    let attach_deadline = Instant::now() + Duration::from_secs(2);
+    while !foreground_path(temp.path(), "alpha").exists() && Instant::now() < attach_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(foreground_path(temp.path(), "alpha").exists(), "attach should establish a foreground client before detach");
+
+    service.detach("alpha").expect("detach session");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait attach child") {
+            assert!(status.success(), "attach should exit cleanly after detach: {status:?}");
+            break;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("cleat attach did not exit after detach");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(!foreground_path(temp.path(), "alpha").exists(), "detach should clear the foreground marker");
+    assert!(temp.path().join("alpha").exists(), "detach should leave the session directory intact");
+}
+
+#[test]
+fn cleat_attach_exits_on_sigterm_and_keeps_session_alive() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
+
+    let cleat_bin = std::env::var("CARGO_BIN_EXE_cleat").expect("cleat bin");
+    let mut child = Command::new(cleat_bin)
+        .arg("--runtime-root")
+        .arg(temp.path())
+        .arg("attach")
+        .arg("alpha")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cleat attach");
+    let _stdin = child.stdin.take().expect("attach stdin");
+
+    let attach_deadline = Instant::now() + Duration::from_secs(2);
+    while !foreground_path(temp.path(), "alpha").exists() && Instant::now() < attach_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(foreground_path(temp.path(), "alpha").exists(), "attach should establish a foreground client before signal exit");
+
+    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(rc, 0, "send SIGTERM to attach process");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait attach child") {
+            assert!(status.success(), "attach should exit cleanly after SIGTERM: {status:?}");
+            break;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("cleat attach did not exit after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let cleared_deadline = Instant::now() + Duration::from_secs(2);
+    while foreground_path(temp.path(), "alpha").exists() && Instant::now() < cleared_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(!foreground_path(temp.path(), "alpha").exists(), "signal exit should clear the foreground marker");
+    assert!(temp.path().join("alpha").exists(), "signal exit should leave the session directory intact");
+}
+
+#[test]
 fn short_lived_session_reaps_its_directory_after_child_exit() {
     let _lock = env_lock().lock().expect("env lock");
     let temp = tempfile::tempdir().expect("tempdir");

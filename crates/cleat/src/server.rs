@@ -1,9 +1,9 @@
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::{
-    protocol::{SessionInfo, SessionStatus},
+    protocol::{Frame, SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, SessionRecord},
-    session::{attach_foreground, ensure_session_started, foreground_path, run_session_daemon, ForegroundAttach},
+    session::{attach_foreground, ensure_session_started, foreground_path, run_session_daemon, session_socket_path, ForegroundAttach},
     vt::VtEngineKind,
 };
 
@@ -59,6 +59,18 @@ impl SessionService {
             }
         }
         self.layout.remove_session(id)
+    }
+
+    pub fn detach(&self, id: &str) -> Result<(), String> {
+        if !self.layout.root().join(id).join("meta.json").exists() {
+            return Err(format!("missing session {id}"));
+        }
+
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        Frame::Detach.write(&mut stream).map_err(|err| format!("write detach request: {err}"))?;
+        Ok(())
     }
 
     pub fn attach(

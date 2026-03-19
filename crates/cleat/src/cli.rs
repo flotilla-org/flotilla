@@ -44,6 +44,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Detach {
+        id: String,
+    },
     Kill {
         id: String,
     },
@@ -86,6 +89,10 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             } else {
                 Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
+        }
+        Command::Detach { id } => {
+            service.detach(&id)?;
+            Ok(None)
         }
         Command::Kill { id } => {
             service.kill(&id)?;

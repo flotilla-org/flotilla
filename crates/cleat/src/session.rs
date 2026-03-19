@@ -3,6 +3,7 @@ use std::{
     ffi::CString,
     fs,
     io::{Read, Write},
+    net::Shutdown,
     os::{
         fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd},
         unix::{fs::PermissionsExt, net::UnixStream},
@@ -18,6 +19,7 @@ use std::{
 };
 
 use nix::{
+    errno::Errno,
     fcntl::{fcntl, FcntlArg, OFlag},
     poll::{poll, PollFd, PollFlags, PollTimeout},
     pty::{forkpty, ForkptyResult},
@@ -41,6 +43,8 @@ const STRIP_ENV_VARS: &[&str] = &["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
 const DEFAULT_TERMINAL_COLS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DETACH_CLEANUP_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
+const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
+static ATTACH_SIGNAL_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub struct ForegroundAttach {
@@ -51,6 +55,7 @@ impl ForegroundAttach {
     pub fn relay_stdio(self) -> Result<(), String> {
         let cleanup = AttachCleanupGuard::stdout();
         let _tty_mode = TerminalModeGuard::activate()?;
+        let _signal_handlers = AttachSignalHandlers::install()?;
         let read_handle = {
             let stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
             stream.try_clone().map_err(|err| format!("clone attach stream: {err}"))?
@@ -98,11 +103,14 @@ impl ForegroundAttach {
         let stdin_fd = stdin.as_raw_fd();
         let mut buf = [0u8; 4096];
         let stdin_result = loop {
-            if !alive.load(Ordering::SeqCst) {
+            if !alive.load(Ordering::SeqCst) || ATTACH_SIGNAL_EXIT.load(Ordering::SeqCst) {
                 break Ok(());
             }
-            if !poll_fd_readable(stdin_fd, 100)? {
-                continue;
+            match poll_fd_readable(stdin_fd, 100) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(_err) if ATTACH_SIGNAL_EXIT.load(Ordering::SeqCst) => break Ok(()),
+                Err(err) => break Err(err),
             }
             match stdin.read(&mut buf) {
                 Ok(0) => break Ok(()),
@@ -120,10 +128,17 @@ impl ForegroundAttach {
             }
         };
 
+        let signal_exit = ATTACH_SIGNAL_EXIT.load(Ordering::SeqCst);
         alive.store(false, Ordering::SeqCst);
+        if let Ok(stream) = self.stream.lock() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         let out_result = relay_out.join().map_err(|_| "stdout relay thread panicked".to_string())?;
         let resize_result = resize_loop.join().map_err(|_| "resize thread panicked".to_string())?;
         cleanup.emit()?;
+        if signal_exit {
+            return Ok(());
+        }
         stdin_result?;
         out_result?;
         resize_result
@@ -149,6 +164,47 @@ enum AttachCleanupTarget {
 struct AttachCleanupGuard {
     target: AttachCleanupTarget,
     enabled: bool,
+}
+
+struct AttachSignalHandlers {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl AttachSignalHandlers {
+    fn install() -> Result<Self, String> {
+        ATTACH_SIGNAL_EXIT.store(false, Ordering::SeqCst);
+        let mut previous = Vec::new();
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let mut old = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            let mut new = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            new.sa_sigaction = attach_signal_handler as *const () as usize;
+            new.sa_flags = 0;
+            unsafe {
+                libc::sigemptyset(&mut new.sa_mask);
+            }
+            let rc = unsafe { libc::sigaction(signal, &new, &mut old) };
+            if rc != 0 {
+                return Err(format!("install signal handler {signal}: {}", std::io::Error::last_os_error()));
+            }
+            previous.push((signal, old));
+        }
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for AttachSignalHandlers {
+    fn drop(&mut self) {
+        ATTACH_SIGNAL_EXIT.store(false, Ordering::SeqCst);
+        for (signal, action) in self.previous.drain(..).rev() {
+            unsafe {
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+extern "C" fn attach_signal_handler(_signal: libc::c_int) {
+    ATTACH_SIGNAL_EXIT.store(true, Ordering::SeqCst);
 }
 
 impl AttachCleanupGuard {
@@ -375,32 +431,49 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     set_nonblocking(pty_fd)?;
     let mut vt_engine = default_vt_engine(session.vt_engine)?;
 
-    let mut active_client: Option<UnixStream> = None;
+    let mut active_client: Option<ActiveClient> = None;
     loop {
-        let poll_result = poll_ready(listener.as_raw_fd(), active_client.as_ref().map(AsRawFd::as_raw_fd), pty_fd, 100)?;
+        let poll_result = poll_ready(
+            listener.as_raw_fd(),
+            active_client.as_ref().map(|client| client.stream.as_raw_fd()),
+            active_client.as_ref().map(|client| !client.pending_output.is_empty()).unwrap_or(false),
+            pty_fd,
+            100,
+        )?;
 
         if poll_result.listener_readable {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_read_timeout(Some(Duration::from_millis(10))).map_err(|err| format!("set client read timeout: {err}"))?;
-                    if let Ok(Frame::AttachInit { cols, rows, capabilities }) = Frame::read(&mut stream) {
-                        if active_client.is_none() {
-                            resize_pty(pty_fd, cols, rows)?;
-                            let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
-                            Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
-                            if let Some(payload) = replay {
-                                if !payload.is_empty() {
-                                    Frame::Output(payload).write(&mut stream).map_err(|err| format!("write replay output: {err}"))?;
+                    match Frame::read(&mut stream) {
+                        Ok(Frame::AttachInit { cols, rows, capabilities }) => {
+                            if active_client.is_none() {
+                                resize_pty(pty_fd, cols, rows)?;
+                                let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
+                                Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
+                                stream.set_nonblocking(true).map_err(|err| format!("set client nonblocking: {err}"))?;
+                                let mut client = ActiveClient::new(stream);
+                                if let Some(payload) = replay {
+                                    if !payload.is_empty() {
+                                        client.enqueue_frame(&Frame::Output(payload))?;
+                                    }
                                 }
+                                let _ = fs::write(foreground_path(root, id), b"1");
+                                active_client = Some(client);
+                            } else {
+                                let _ = Frame::Busy.write(&mut stream);
                             }
-                            stream.set_nonblocking(true).map_err(|err| format!("set client nonblocking: {err}"))?;
-                            let _ = fs::write(foreground_path(root, id), b"1");
-                            active_client = Some(stream);
-                        } else {
+                        }
+                        Ok(Frame::Detach) => {
+                            let _ = fs::remove_file(foreground_path(root, id));
+                            active_client = None;
+                        }
+                        Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);
                         }
-                    } else {
-                        let _ = Frame::Busy.write(&mut stream);
+                        Err(_) => {
+                            let _ = Frame::Busy.write(&mut stream);
+                        }
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -413,7 +486,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
             let mut pending = VecDeque::new();
             if let Some(stream) = active_client.as_mut() {
                 loop {
-                    match Frame::read(stream) {
+                    match Frame::read(&mut stream.stream) {
                         Ok(frame) => pending.push_back(frame),
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(err)
@@ -450,15 +523,26 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
             }
         }
 
+        if poll_result.client_writable {
+            let client_writable = match active_client.as_mut() {
+                Some(client) => client.flush_pending_output()?,
+                None => true,
+            };
+            if !client_writable {
+                let _ = fs::remove_file(foreground_path(root, id));
+                active_client = None;
+            }
+        }
+
         if poll_result.pty_readable {
             loop {
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
                 match read_fd(pty_fd, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         record_pty_output(vt_engine.as_mut(), &buf[..n])?;
-                        if let Some(stream) = active_client.as_mut() {
-                            if Frame::Output(buf[..n].to_vec()).write(stream).is_err() {
+                        if let Some(client) = active_client.as_mut() {
+                            if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
                                 let _ = fs::remove_file(foreground_path(root, id));
                                 active_client = None;
                             }
@@ -538,15 +622,49 @@ fn is_executable_file(path: &Path) -> bool {
 struct PollResult {
     listener_readable: bool,
     client_readable: bool,
+    client_writable: bool,
     pty_readable: bool,
+}
+
+struct ActiveClient {
+    stream: UnixStream,
+    pending_output: Vec<u8>,
+}
+
+impl ActiveClient {
+    fn new(stream: UnixStream) -> Self {
+        Self { stream, pending_output: Vec::new() }
+    }
+
+    fn enqueue_frame(&mut self, frame: &Frame) -> Result<(), String> {
+        frame.write(&mut self.pending_output).map_err(|err| format!("buffer client frame: {err}"))
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool, String> {
+        while !self.pending_output.is_empty() {
+            match self.stream.write(&self.pending_output) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    self.pending_output.drain(..n);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) if is_graceful_socket_shutdown(&err) => return Ok(false),
+                Err(err) => return Err(format!("flush client output: {err}")),
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn poll_fd_readable(fd: RawFd, timeout_ms: i32) -> Result<bool, String> {
     // SAFETY: the fd remains open for the duration of the poll call; we only borrow it temporarily.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-    poll(&mut fds, PollTimeout::try_from(timeout_ms).map_err(|err| format!("invalid poll timeout: {err}"))?)
-        .map_err(|err| format!("poll readable fd: {err}"))?;
+    match poll(&mut fds, PollTimeout::try_from(timeout_ms).map_err(|err| format!("invalid poll timeout: {err}"))?) {
+        Ok(_) => {}
+        Err(Errno::EINTR) => return Ok(false),
+        Err(err) => return Err(format!("poll readable fd: {err}")),
+    }
     Ok(has_pollin(&fds[0]))
 }
 
@@ -555,7 +673,13 @@ struct PtyChild {
     pid: Pid,
 }
 
-fn poll_ready(listener_fd: RawFd, client_fd: Option<RawFd>, pty_fd: RawFd, timeout_ms: i32) -> Result<PollResult, String> {
+fn poll_ready(
+    listener_fd: RawFd,
+    client_fd: Option<RawFd>,
+    client_needs_write: bool,
+    pty_fd: RawFd,
+    timeout_ms: i32,
+) -> Result<PollResult, String> {
     // SAFETY: the fds are owned by this process and remain open for the duration of the poll call.
     let listener_borrowed = unsafe { BorrowedFd::borrow_raw(listener_fd) };
     // SAFETY: the fd is owned by this process and remains open for the duration of the poll call.
@@ -564,7 +688,11 @@ fn poll_ready(listener_fd: RawFd, client_fd: Option<RawFd>, pty_fd: RawFd, timeo
     let client_index = if let Some(fd) = client_fd {
         // SAFETY: the client fd is owned by this process and remains open for the duration of the poll call.
         let client_borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        fds.push(PollFd::new(client_borrowed, PollFlags::POLLIN));
+        let mut flags = PollFlags::POLLIN;
+        if client_needs_write {
+            flags |= PollFlags::POLLOUT;
+        }
+        fds.push(PollFd::new(client_borrowed, flags));
         Some(fds.len() - 1)
     } else {
         None
@@ -577,6 +705,7 @@ fn poll_ready(listener_fd: RawFd, client_fd: Option<RawFd>, pty_fd: RawFd, timeo
         listener_readable: has_pollin(&fds[0]),
         pty_readable: has_pollin(&fds[1]),
         client_readable: client_index.map(|index| has_pollin(&fds[index])).unwrap_or(false),
+        client_writable: client_index.map(|index| has_pollout(&fds[index])).unwrap_or(false),
     })
 }
 
@@ -593,6 +722,10 @@ fn wait_for_socket(path: &Path) -> Result<(), String> {
 
 fn has_pollin(fd: &PollFd<'_>) -> bool {
     fd.revents().map(|flags| flags.contains(PollFlags::POLLIN)).unwrap_or(false)
+}
+
+fn has_pollout(fd: &PollFd<'_>) -> bool {
+    fd.revents().map(|flags| flags.contains(PollFlags::POLLOUT)).unwrap_or(false)
 }
 
 fn current_terminal_size() -> (u16, u16) {

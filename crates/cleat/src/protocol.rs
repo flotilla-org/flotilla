@@ -29,6 +29,7 @@ const TAG_OUTPUT: u8 = 3;
 const TAG_RESIZE: u8 = 4;
 const TAG_ACK: u8 = 5;
 const TAG_BUSY: u8 = 6;
+const TAG_DETACH: u8 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -38,6 +39,7 @@ pub enum Frame {
     Resize { cols: u16, rows: u16 },
     Ack,
     Busy,
+    Detach,
 }
 
 impl Frame {
@@ -79,6 +81,7 @@ impl Frame {
             Frame::Output(bytes) => (TAG_OUTPUT, bytes.clone()),
             Frame::Ack => (TAG_ACK, vec![]),
             Frame::Busy => (TAG_BUSY, vec![]),
+            Frame::Detach => (TAG_DETACH, vec![]),
         }
     }
 
@@ -90,6 +93,7 @@ impl Frame {
             TAG_OUTPUT => Ok(Frame::Output(payload)),
             TAG_ACK => Ok(Frame::Ack),
             TAG_BUSY => Ok(Frame::Busy),
+            TAG_DETACH => Ok(Frame::Detach),
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
     }

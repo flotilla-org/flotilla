@@ -339,20 +339,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cleat"
-version = "0.1.0"
-dependencies = [
- "clap",
- "libc",
- "nix 0.31.2",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "uuid",
-]
-
-[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -507,6 +493,20 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cleat"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "nix 0.31.2",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "uuid",
+]
 
 [[package]]
 name = "cmake"

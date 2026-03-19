@@ -8,7 +8,7 @@ use cleat::{
 fn help_lists_expected_subcommands() {
     let command = Cli::command();
     let subcommands: Vec<_> = command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name().to_string()).collect();
-    assert_eq!(subcommands, vec!["attach", "create", "list", "kill"]);
+    assert_eq!(subcommands, vec!["attach", "create", "list", "detach", "kill"]);
 }
 
 #[test]
@@ -75,6 +75,12 @@ fn list_command_parses() {
 fn list_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "list", "--json"]).expect("list --json parses");
     assert_eq!(cli.command, Command::List { json: true });
+}
+
+#[test]
+fn detach_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "detach", "session-1"]).expect("detach parses");
+    assert_eq!(cli.command, Command::Detach { id: "session-1".into() });
 }
 
 #[test]
