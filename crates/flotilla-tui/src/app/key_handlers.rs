@@ -271,20 +271,8 @@ impl App {
             return;
         }
 
-        match self.ui.mode {
-            UiMode::FilePicker { .. } | UiMode::CommandPalette { .. } => {
-                // Handled by widget stack
-                return;
-            }
-            UiMode::ActionMenu { .. }
-            | UiMode::Help
-            | UiMode::DeleteConfirm { .. }
-            | UiMode::CloseConfirm { .. }
-            | UiMode::BranchInput { .. }
-            | UiMode::IssueSearch { .. } => {
-                return;
-            }
-            UiMode::Config | UiMode::Normal => {}
+        if !matches!(self.ui.mode, UiMode::Config | UiMode::Normal) {
+            return;
         }
 
         match mouse.kind {
