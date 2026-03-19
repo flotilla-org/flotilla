@@ -431,7 +431,6 @@ impl App {
         }
     }
 
-
     // ── Daemon event handling ──
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
