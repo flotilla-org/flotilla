@@ -431,14 +431,6 @@ impl App {
         }
     }
 
-    pub fn apply_context_signals(&mut self, ctx: crate::widgets::WidgetContext) {
-        if ctx.should_quit {
-            self.should_quit = true;
-        }
-        if let Some(command_id) = ctx.pending_cancel {
-            self.pending_cancel = Some(command_id);
-        }
-    }
 
     // ── Daemon event handling ──
 

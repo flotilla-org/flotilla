@@ -52,28 +52,8 @@ impl WorkItemTable {
         rui.selected_selectable_idx = Some(next);
         rui.table_state.select(Some(table_idx));
 
-        // Infinite scroll: fetch more issues when near the bottom.
-        // We queue the command but the actual FetchMoreIssues logic stays
-        // in the App-level select_next (legacy path) because it needs
-        // mutable access to the repo model. Return Ignored so the legacy
-        // path can handle the fetch-more side-effect.
-        //
-        // Actually, we can handle the fetch here since we have command queue access.
-        let total = rui.table_view.selectable_indices.len();
-        if next + 5 >= total && ctx.model.active().issue_has_more && !ctx.model.active().issue_fetch_pending {
-            // We need to push a FetchMoreIssues command, but we can't mutate
-            // model.repos (issue_fetch_pending). Return Ignored to let legacy
-            // handle infinite scroll. For now, the selection is set correctly.
-            //
-            // Since we already updated selection, and the legacy path also
-            // calls select_next, we'd get a double-move. So we must handle
-            // this entirely here OR entirely in the legacy path.
-            //
-            // Decision: handle selection here, but DON'T do fetch-more.
-            // The App-level code will check for fetch-more separately after
-            // widget dispatch (we'll add a post-dispatch hook).
-        }
-
+        // Infinite scroll fetch-more is handled by the App-level
+        // check_infinite_scroll() post-dispatch hook after SelectNext/Prev.
         Outcome::Consumed
     }
 
