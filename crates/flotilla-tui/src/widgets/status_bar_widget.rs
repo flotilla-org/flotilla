@@ -52,10 +52,8 @@ impl StatusBarWidget {
         Self::default()
     }
 
-    /// Render the status bar into `area`.
-    ///
-    /// Writes click targets back into `ui.layout.status_bar` for backward
-    /// compatibility with callers that still read from there.
+    /// Render the status bar into `area`. Click targets are stored on
+    /// `self` for later hit-testing via `handle_click`.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,

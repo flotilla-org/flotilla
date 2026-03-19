@@ -122,13 +122,6 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                         }
                         let action = app.tab_bar.handle_click(x, y, app.ui.mode.is_config());
                         let tab_clicked = match action {
-                            TabBarAction::CycleEventLogFilter => {
-                                // Fallback: TabBar detected the filter area. Delegate
-                                // to the widget (should not normally fire since we
-                                // check the widget first, but kept for safety).
-                                app.event_log_widget.handle_click(x, y);
-                                true
-                            }
                             TabBarAction::SwitchToConfig => {
                                 app.dismiss_modals();
                                 app.ui.mode = UiMode::Config;

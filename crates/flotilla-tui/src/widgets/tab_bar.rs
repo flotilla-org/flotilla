@@ -18,8 +18,6 @@ pub enum TabBarAction {
     SwitchToRepo(usize),
     /// Open the file picker to add a new repo.
     OpenFilePicker,
-    /// A click in the event log filter area — cycle the log level.
-    CycleEventLogFilter,
     /// No recognized tab was hit. The caller should continue with
     /// normal mouse handling.
     None,
@@ -34,8 +32,6 @@ pub enum TabBarAction {
 pub struct TabBar {
     /// Click target areas populated during the most recent render.
     tab_areas: BTreeMap<TabId, Rect>,
-    /// Event log filter click area populated during render.
-    event_log_filter_area: Rect,
 }
 
 impl TabBar {
@@ -118,12 +114,6 @@ impl TabBar {
     /// Returns a `TabBarAction` describing what was clicked. The caller
     /// is responsible for actually performing the action on `App`.
     pub fn handle_click(&self, x: u16, y: u16, _is_config_mode: bool) -> TabBarAction {
-        // Check event log filter area
-        let ef = self.event_log_filter_area;
-        if ef.width > 0 && x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height {
-            return TabBarAction::CycleEventLogFilter;
-        }
-
         // Check which tab area was clicked
         let hit =
             self.tab_areas.iter().find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height).map(|(id, _)| id.clone());
@@ -169,12 +159,6 @@ impl TabBar {
         }
 
         false
-    }
-
-    /// Update the event log filter area (set during content rendering, not
-    /// tab bar rendering, but needed for click detection).
-    pub fn set_event_log_filter_area(&mut self, area: Rect) {
-        self.event_log_filter_area = area;
     }
 
     /// Read-only access to the tab areas for external code that still
@@ -228,19 +212,4 @@ mod tests {
         assert_eq!(tab_bar.handle_click(41, 0, false), TabBarAction::None);
     }
 
-    #[test]
-    fn handle_click_detects_event_log_filter() {
-        let mut tab_bar = TabBar::new();
-        tab_bar.event_log_filter_area = Rect::new(50, 0, 5, 1);
-        assert_eq!(tab_bar.handle_click(52, 0, false), TabBarAction::CycleEventLogFilter);
-    }
-
-    #[test]
-    fn handle_click_event_log_filter_takes_priority() {
-        let mut tab_bar = TabBar::new();
-        // Overlapping areas: event log filter should win
-        tab_bar.event_log_filter_area = Rect::new(0, 0, 10, 1);
-        tab_bar.tab_areas.insert(TabId::Flotilla, Rect::new(0, 0, 10, 1));
-        assert_eq!(tab_bar.handle_click(5, 0, false), TabBarAction::CycleEventLogFilter);
-    }
 }
