@@ -16,8 +16,6 @@ pub enum TabBarAction {
     SwitchToConfig,
     /// Switch to a repo tab and start a potential drag.
     SwitchToRepo(usize),
-    /// Toggle the provider panel on/off.
-    ToggleProviders,
     /// Open the file picker to add a new repo.
     OpenFilePicker,
     /// A click in the event log filter area — cycle the log level.
@@ -119,7 +117,7 @@ impl TabBar {
     ///
     /// Returns a `TabBarAction` describing what was clicked. The caller
     /// is responsible for actually performing the action on `App`.
-    pub fn handle_click(&self, x: u16, y: u16, is_config_mode: bool) -> TabBarAction {
+    pub fn handle_click(&self, x: u16, y: u16, _is_config_mode: bool) -> TabBarAction {
         // Check event log filter area
         let ef = self.event_log_filter_area;
         if ef.width > 0 && x >= ef.x && x < ef.x + ef.width && y >= ef.y && y < ef.y + ef.height {
@@ -133,8 +131,9 @@ impl TabBar {
         match hit {
             Some(TabId::Flotilla) => TabBarAction::SwitchToConfig,
             Some(TabId::Repo(i)) => TabBarAction::SwitchToRepo(i),
-            Some(TabId::Gear) if !is_config_mode => TabBarAction::ToggleProviders,
             Some(TabId::Add) => TabBarAction::OpenFilePicker,
+            // TabId::Gear is not a tab bar item — it's rendered in the table
+            // border and handled by the table mouse path in key_handlers.rs.
             _ => TabBarAction::None,
         }
     }
@@ -221,17 +220,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_click_detects_gear_icon() {
+    fn gear_click_not_handled_by_tab_bar() {
+        // TabId::Gear is rendered in the table border, not the tab bar.
+        // Even if it ends up in tab_areas, the tab bar should not handle it.
         let mut tab_bar = TabBar::new();
         tab_bar.tab_areas.insert(TabId::Gear, Rect::new(40, 0, 3, 1));
-        assert_eq!(tab_bar.handle_click(41, 0, false), TabBarAction::ToggleProviders);
-    }
-
-    #[test]
-    fn handle_click_gear_ignored_in_config_mode() {
-        let mut tab_bar = TabBar::new();
-        tab_bar.tab_areas.insert(TabId::Gear, Rect::new(40, 0, 3, 1));
-        assert_eq!(tab_bar.handle_click(41, 0, true), TabBarAction::None);
+        assert_eq!(tab_bar.handle_click(41, 0, false), TabBarAction::None);
     }
 
     #[test]

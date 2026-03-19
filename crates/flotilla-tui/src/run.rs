@@ -143,11 +143,6 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                                 app.ui.drag.active = false;
                                 true
                             }
-                            TabBarAction::ToggleProviders => {
-                                let sp = app.active_ui().show_providers;
-                                app.active_ui_mut().show_providers = !sp;
-                                true
-                            }
                             TabBarAction::OpenFilePicker => {
                                 app.open_file_picker_from_active_repo_parent();
                                 true

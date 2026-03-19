@@ -5,7 +5,7 @@ use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, CommandAction, WorkItem};
 use tui_input::Input;
 
-use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, UiMode};
+use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, TabId, UiMode};
 use crate::{
     keymap::{Action, ModeId},
     status_bar::StatusBarAction,
@@ -248,6 +248,20 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Gear icon is rendered in the table border area — check it first.
+                if let Some(gear_area) = self.ui.layout.tab_areas.get(&TabId::Gear) {
+                    if mouse.column >= gear_area.x
+                        && mouse.column < gear_area.x + gear_area.width
+                        && mouse.row >= gear_area.y
+                        && mouse.row < gear_area.y + gear_area.height
+                        && !self.ui.mode.is_config()
+                    {
+                        let sp = self.active_ui().show_providers;
+                        self.active_ui_mut().show_providers = !sp;
+                        return;
+                    }
+                }
+
                 if let Some(si) = self.row_at_mouse(mouse.column, mouse.row) {
                     let now = Instant::now();
                     let is_double_click = self.ui.double_click.last_time.map(|t| now.duration_since(t).as_millis() < 400).unwrap_or(false)
