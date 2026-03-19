@@ -1,7 +1,9 @@
 pub mod action_menu;
+pub mod branch_input;
 pub mod close_confirm;
 pub mod delete_confirm;
 pub mod help;
+pub mod issue_search;
 
 use std::{any::Any, collections::HashMap};
 

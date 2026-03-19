@@ -409,6 +409,35 @@ fn status_bar_content(
                     mode_indicators: vec![],
                 };
             }
+            ModeId::BranchInput => {
+                // Distinguish generating vs manual via the UiMode bridge
+                let generating = matches!(ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. });
+                return if generating {
+                    StatusBarContent {
+                        status: StatusSection::plain("NEW BRANCH"),
+                        keys: vec![],
+                        task: Some(TaskSection::new("Generating branch name...", 0)),
+                        mode_indicators: vec![],
+                    }
+                } else {
+                    StatusBarContent {
+                        status: StatusSection::plain("NEW BRANCH"),
+                        keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
+                        task: None,
+                        mode_indicators: vec![],
+                    }
+                };
+            }
+            ModeId::IssueSearch => {
+                // Read the current search text from the UiMode bridge
+                let query = if let UiMode::IssueSearch { ref input } = ui.mode { input.value().to_string() } else { String::new() };
+                return StatusBarContent {
+                    status: StatusSection::plain(&format!("SEARCH {}", query)),
+                    keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
+                    task: None,
+                    mode_indicators: vec![],
+                };
+            }
             _ => {} // Other widget modes will be handled as they are extracted
         }
     }

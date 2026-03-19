@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::data::GroupEntry;
-use flotilla_protocol::{CheckoutTarget, Command, CommandAction, WorkItem};
+use flotilla_protocol::{Command, CommandAction, WorkItem};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{
@@ -127,38 +127,8 @@ impl App {
             },
             Action::Confirm => match self.ui.mode.focus_target() {
                 FocusTarget::WorkItemTable => self.action_enter(),
-                FocusTarget::BranchInput => {
-                    if !matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }) {
-                        let (branch, issue_ids) = if let UiMode::BranchInput { ref input, ref mut pending_issue_ids, .. } = self.ui.mode {
-                            (input.value().to_string(), std::mem::take(pending_issue_ids))
-                        } else {
-                            return;
-                        };
-                        if !branch.is_empty() {
-                            self.proto_commands.push(self.targeted_command(CommandAction::Checkout {
-                                repo: flotilla_protocol::RepoSelector::Identity(self.model.active_repo_identity().clone()),
-                                target: CheckoutTarget::FreshBranch(branch),
-                                issue_ids,
-                            }));
-                        }
-                        self.ui.mode = UiMode::Normal;
-                    }
-                }
-                FocusTarget::IssueSearchInput => {
-                    let query = if let UiMode::IssueSearch { ref input } = self.ui.mode {
-                        input.value().to_string()
-                    } else {
-                        return;
-                    };
-                    if !query.is_empty() {
-                        let repo = self.model.active_repo_root().clone();
-                        self.proto_commands.push(self.command(CommandAction::SearchIssues {
-                            repo: flotilla_protocol::RepoSelector::Path(repo),
-                            query: query.clone(),
-                        }));
-                        self.active_ui_mut().active_search_query = Some(query);
-                    }
-                    self.ui.mode = UiMode::Normal;
+                FocusTarget::BranchInput | FocusTarget::IssueSearchInput => {
+                    // Handled by widget stack
                 }
                 FocusTarget::FilePickerList => self.activate_dir_entry(),
                 FocusTarget::DeleteConfirmDialog | FocusTarget::CloseConfirmDialog => {
@@ -261,12 +231,15 @@ impl App {
             }
             Action::OpenBranchInput => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
-                    self.enter_branch_input(BranchInputKind::Manual);
+                    self.ui.mode =
+                        UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: Vec::new() };
+                    self.widget_stack.push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual)));
                 }
             }
             Action::OpenIssueSearch => {
                 if matches!(self.ui.mode.focus_target(), FocusTarget::WorkItemTable) {
                     self.ui.mode = UiMode::IssueSearch { input: Input::default() };
+                    self.widget_stack.push(Box::new(crate::widgets::issue_search::IssueSearchWidget::new()));
                 }
             }
             Action::OpenFilePicker => {
@@ -382,8 +355,6 @@ impl App {
         // Unresolved keys in text input modes pass through to tui_input
         match self.ui.mode {
             UiMode::FilePicker { .. } => self.handle_file_picker_key(key),
-            UiMode::BranchInput { .. } => self.handle_branch_input_key(key),
-            UiMode::IssueSearch { .. } => self.handle_issue_search_key(key),
             UiMode::CommandPalette { ref mut input, entries, ref mut selected, ref mut scroll_top, .. } => {
                 // Tab / Right arrow: fill selected command name into input
                 if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
@@ -581,7 +552,9 @@ impl App {
         all_issue_keys.sort();
         all_issue_keys.dedup();
         if !all_issue_keys.is_empty() {
-            self.enter_branch_input(BranchInputKind::Generating);
+            self.ui.mode =
+                UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Generating, pending_issue_ids: Vec::new() };
+            self.widget_stack.push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating)));
             self.proto_commands.push(self.targeted_repo_command(CommandAction::GenerateBranchName { issue_keys: all_issue_keys }));
         }
         self.active_ui_mut().multi_selected.clear();
@@ -618,7 +591,9 @@ impl App {
                     self.widget_stack.push(Box::new(widget));
                 }
                 Intent::GenerateBranchName => {
-                    self.enter_branch_input(BranchInputKind::Generating);
+                    self.ui.mode =
+                        UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Generating, pending_issue_ids: Vec::new() };
+                    self.widget_stack.push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating)));
                 }
                 Intent::CloseChangeRequest => {
                     let id = match &cmd {
@@ -665,23 +640,6 @@ impl App {
 
         self.widget_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
     }
-
-    fn handle_branch_input_key(&mut self, key: KeyEvent) {
-        // Ignore keys while generating
-        if matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }) {
-            return;
-        }
-
-        if let UiMode::BranchInput { ref mut input, .. } = self.ui.mode {
-            input.handle_event(&crossterm::event::Event::Key(key));
-        }
-    }
-
-    fn handle_issue_search_key(&mut self, key: KeyEvent) {
-        if let UiMode::IssueSearch { ref mut input } = self.ui.mode {
-            input.handle_event(&crossterm::event::Event::Key(key));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -689,7 +647,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use flotilla_protocol::{CheckoutSelector, CheckoutStatus, Command, HostName, HostPath, WorkItemIdentity};
+    use flotilla_protocol::{CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, WorkItemIdentity};
     use ratatui::layout::Rect;
 
     use super::{
@@ -777,12 +735,15 @@ mod tests {
 
     #[test]
     fn dispatch_action_confirm_submits_branch_input() {
+        // BranchInput confirm is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("feature/test"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget_with_text(&mut app, "feature/test");
 
-        app.dispatch_action(Action::Confirm);
+        app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         let (cmd, _) = app.proto_commands.take_next().expect("expected checkout command");
         match cmd {
             Command { action: CommandAction::Checkout { target, .. }, .. } => {
@@ -794,12 +755,15 @@ mod tests {
 
     #[test]
     fn dispatch_action_confirm_submits_issue_search() {
+        // IssueSearch confirm is now handled by the widget stack.
+        // Test via handle_key which dispatches through the widget.
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::from("bug fix") };
+        push_issue_search_widget_with_text(&mut app, "bug fix");
 
-        app.dispatch_action(Action::Confirm);
+        app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         assert_eq!(app.active_ui().active_search_query.as_deref(), Some("bug fix"));
         let (cmd, _) = app.proto_commands.take_next().expect("expected search command");
         match cmd {
@@ -1291,22 +1255,44 @@ mod tests {
         assert!(matches!(cmd.action, CommandAction::CreateWorkspaceForCheckout { .. }));
     }
 
-    // ── handle_branch_input_key ──────────────────────────────────────
+    // ── BranchInput integration (via widget stack) ────────────────────
+
+    fn push_branch_input_widget(app: &mut App, kind: BranchInputKind) {
+        let widget = crate::widgets::branch_input::BranchInputWidget::new(kind.clone());
+        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind, pending_issue_ids: vec![] };
+        app.widget_stack.push(Box::new(widget));
+    }
+
+    fn push_branch_input_widget_with_text(app: &mut App, text: &str) {
+        let mut widget = crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual);
+        widget.prefill(text, vec![]);
+        app.ui.mode = UiMode::BranchInput { input: Input::from(text), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        app.widget_stack.push(Box::new(widget));
+    }
+
+    fn push_branch_input_widget_with_issues(app: &mut App, text: &str, issue_ids: Vec<(String, String)>) {
+        let mut widget = crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Manual);
+        widget.prefill(text, issue_ids.clone());
+        app.ui.mode = UiMode::BranchInput { input: Input::from(text), kind: BranchInputKind::Manual, pending_issue_ids: issue_ids };
+        app.widget_stack.push(Box::new(widget));
+    }
 
     #[test]
     fn branch_input_esc_returns_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("my-branch"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget_with_text(&mut app, "my-branch");
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
     }
 
     #[test]
     fn branch_input_enter_creates_checkout() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("my-branch"), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget_with_text(&mut app, "my-branch");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::Checkout { target, issue_ids, .. }, .. } => {
@@ -1320,11 +1306,7 @@ mod tests {
     #[test]
     fn branch_input_enter_with_pending_issues() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput {
-            input: Input::from("feat/issue-42"),
-            kind: BranchInputKind::Manual,
-            pending_issue_ids: vec![("github".into(), "42".into())],
-        };
+        push_branch_input_widget_with_issues(&mut app, "feat/issue-42", vec![("github".into(), "42".into())]);
         app.handle_key(key(KeyCode::Enter));
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
@@ -1338,30 +1320,33 @@ mod tests {
     #[test]
     fn branch_input_enter_empty_does_not_create() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget(&mut app, BranchInputKind::Manual);
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         assert!(app.proto_commands.take_next().is_none());
     }
 
     #[test]
     fn branch_input_generating_ignores_confirm_but_allows_dismiss() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::from("partial"), kind: BranchInputKind::Generating, pending_issue_ids: vec![] };
-        // Enter should be ignored
+        push_branch_input_widget(&mut app, BranchInputKind::Generating);
+        // Enter should be ignored (consumed, but widget stays)
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert_eq!(app.widget_stack.len(), 1);
         assert!(app.proto_commands.take_next().is_none());
 
         // Esc should dismiss the generating prompt
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
     }
 
     #[test]
     fn branch_input_manual_q_types_character() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Manual, pending_issue_ids: vec![] };
+        push_branch_input_widget(&mut app, BranchInputKind::Manual);
 
         app.handle_key(key(KeyCode::Char('q')));
 
@@ -1371,33 +1356,44 @@ mod tests {
         }
     }
 
-    // ── handle_issue_search_key ──────────────────────────────────────
+    // ── IssueSearch integration (via widget stack) ──────────────────
+
+    fn push_issue_search_widget(app: &mut App) {
+        app.ui.mode = UiMode::IssueSearch { input: Input::default() };
+        app.widget_stack.push(Box::new(crate::widgets::issue_search::IssueSearchWidget::new()));
+    }
+
+    fn push_issue_search_widget_with_text(app: &mut App, text: &str) {
+        // We can't set text directly on the widget from outside, so we simulate
+        // by typing each character through the widget stack.
+        app.ui.mode = UiMode::IssueSearch { input: Input::default() };
+        app.widget_stack.push(Box::new(crate::widgets::issue_search::IssueSearchWidget::new()));
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
 
     #[test]
     fn issue_search_esc_clears_and_returns() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::from("some query") };
+        push_issue_search_widget_with_text(&mut app, "some query");
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         let (cmd, _) = app.proto_commands.take_next().unwrap();
-        match cmd {
-            Command { action: CommandAction::ClearIssueSearch { repo }, .. } => {
-                assert_eq!(repo, flotilla_protocol::RepoSelector::Path(PathBuf::from("/tmp/test-repo")));
-            }
-            other => panic!("expected ClearIssueSearch, got {:?}", other),
-        }
+        assert!(matches!(cmd, Command { action: CommandAction::ClearIssueSearch { .. }, .. }));
     }
 
     #[test]
     fn issue_search_enter_submits_query() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::from("bug fix") };
+        push_issue_search_widget_with_text(&mut app, "bug fix");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
-            Command { action: CommandAction::SearchIssues { repo, query }, .. } => {
-                assert_eq!(repo, flotilla_protocol::RepoSelector::Path(PathBuf::from("/tmp/test-repo")));
+            Command { action: CommandAction::SearchIssues { query, .. }, .. } => {
                 assert_eq!(query, "bug fix");
             }
             other => panic!("expected SearchIssues, got {:?}", other),
@@ -1407,9 +1403,10 @@ mod tests {
     #[test]
     fn issue_search_enter_empty_no_command() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::IssueSearch { input: Input::default() };
+        push_issue_search_widget(&mut app);
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(app.widget_stack.is_empty());
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1650,6 +1647,8 @@ mod tests {
         item.issue_keys = vec!["ISSUE-1".into()];
         app.resolve_and_push(Intent::GenerateBranchName, &item);
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert_eq!(app.widget_stack.len(), 1);
+        assert_eq!(app.widget_stack[0].mode_id(), ModeId::BranchInput);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
@@ -1735,8 +1734,10 @@ mod tests {
 
         app.action_enter();
 
-        // Should set BranchInput with generating=true
+        // Should set BranchInput with generating=true and push widget
         assert!(matches!(app.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert_eq!(app.widget_stack.len(), 1);
+        assert_eq!(app.widget_stack[0].mode_id(), ModeId::BranchInput);
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {

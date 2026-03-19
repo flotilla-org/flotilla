@@ -754,10 +754,6 @@ impl App {
         self.ui.mode = UiMode::BranchInput { input: Input::from(branch_name), kind: BranchInputKind::Manual, pending_issue_ids };
     }
 
-    pub(super) fn enter_branch_input(&mut self, kind: BranchInputKind) {
-        self.ui.mode = UiMode::BranchInput { input: Input::default(), kind, pending_issue_ids: Vec::new() };
-    }
-
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
         let mut input = Input::default();
         if let Some(parent) = self.model.active_repo_root().parent() {

@@ -65,12 +65,18 @@ fn reset_loading_mode(app: &mut App) {
         app.ui.mode = UiMode::Normal;
     }
 
-    // Pop a loading DeleteConfirmWidget from the widget stack on error.
+    // Pop loading widgets from the widget stack on error.
     if let Some(widget) = app.widget_stack.last_mut() {
         if let Some(dcw) = widget.as_any_mut().downcast_mut::<crate::widgets::delete_confirm::DeleteConfirmWidget>() {
             if dcw.loading {
                 app.widget_stack.pop();
+                return;
             }
+        }
+    }
+    if let Some(widget) = app.widget_stack.last() {
+        if widget.mode_id() == crate::keymap::ModeId::BranchInput {
+            app.widget_stack.pop();
         }
     }
 }
@@ -110,7 +116,18 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
             }
         }
         CommandResult::BranchNameGenerated { name, issue_ids } => {
-            app.prefill_branch_input(&name, issue_ids);
+            let updated = app
+                .widget_stack
+                .last_mut()
+                .and_then(|widget| widget.as_any_mut().downcast_mut::<crate::widgets::branch_input::BranchInputWidget>());
+            if let Some(biw) = updated {
+                biw.prefill(&name, issue_ids);
+                // Keep UiMode in sync for status bar rendering
+                app.prefill_branch_input(&name, vec![]);
+            } else {
+                tracing::warn!("BranchNameGenerated arrived but no BranchInputWidget on stack");
+                app.prefill_branch_input(&name, issue_ids);
+            }
         }
         CommandResult::CheckoutStatus(info) => {
             let updated = app
