@@ -185,6 +185,7 @@ impl TestHarness {
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         let keymap = Keymap::defaults();
         let active_widget_mode = self.widget_stack.last().map(|w| w.mode_id());
+        let active_widget_data = self.widget_stack.last().map(|w| w.status_data()).unwrap_or_default();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -195,6 +196,7 @@ impl TestHarness {
                     keymap: &keymap,
                     in_flight: &self.in_flight,
                     active_widget_mode,
+                    active_widget_data: active_widget_data.clone(),
                     tab_bar: &mut self.tab_bar,
                     status_bar_widget: &mut self.status_bar_widget,
                     event_log_widget: &mut self.event_log_widget,

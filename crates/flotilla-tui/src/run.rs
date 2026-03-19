@@ -220,6 +220,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let mut stack = std::mem::take(&mut app.widget_stack);
     let active_widget_mode = stack.last().map(|w| w.mode_id());
+    let active_widget_data = stack.last().map(|w| w.status_data()).unwrap_or_default();
     terminal.draw(|f| {
         let area = f.area();
         let mut ctx = crate::widgets::RenderContext {
@@ -229,6 +230,7 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
             keymap: &app.keymap,
             in_flight: &app.in_flight,
             active_widget_mode,
+            active_widget_data: active_widget_data.clone(),
             tab_bar: &mut app.tab_bar,
             status_bar_widget: &mut app.status_bar_widget,
             event_log_widget: &mut app.event_log_widget,

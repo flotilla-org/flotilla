@@ -814,20 +814,13 @@ impl App {
         }
     }
 
-    pub fn prefill_branch_input(&mut self, branch_name: &str, pending_issue_ids: Vec<(String, String)>) {
-        self.ui.mode = UiMode::BranchInput { input: Input::from(branch_name), kind: BranchInputKind::Manual, pending_issue_ids };
-    }
-
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
         let mut input = Input::default();
         if let Some(parent) = self.model.active_repo_root().parent() {
             let parent_str = format!("{}/", parent.display());
             input = Input::from(parent_str.as_str());
         }
-        self.ui.mode = UiMode::FilePicker { input: input.clone(), dir_entries: Vec::new(), selected: 0 };
-        self.refresh_dir_listing();
-        // Build dir_entries after refresh so the widget has them
-        let dir_entries = if let UiMode::FilePicker { ref dir_entries, .. } = self.ui.mode { dir_entries.clone() } else { Vec::new() };
+        let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
         self.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
     }
 }
@@ -1424,20 +1417,6 @@ mod tests {
         let item = app.selected_work_item();
         assert!(item.is_some());
         assert_eq!(item.unwrap().branch.as_deref(), Some("feat"));
-    }
-
-    #[test]
-    fn prefill_branch_input_sets_mode() {
-        let mut app = stub_app();
-        app.prefill_branch_input("my-branch", vec![("gh".into(), "1".into())]);
-        match &app.ui.mode {
-            UiMode::BranchInput { input, kind, pending_issue_ids } => {
-                assert_eq!(input.value(), "my-branch");
-                assert_eq!(*kind, BranchInputKind::Manual);
-                assert_eq!(pending_issue_ids.len(), 1);
-            }
-            _ => panic!("expected BranchInput mode"),
-        }
     }
 
     // -- CloseConfirm flow (via widget stack) --

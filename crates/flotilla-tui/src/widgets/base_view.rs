@@ -159,11 +159,6 @@ impl InteractiveWidget for BaseView {
             Action::ToggleHelp => Outcome::Push(Box::new(super::help::HelpWidget::new())),
 
             Action::OpenBranchInput => {
-                *ctx.mode = UiMode::BranchInput {
-                    input: tui_input::Input::default(),
-                    kind: crate::app::BranchInputKind::Manual,
-                    pending_issue_ids: Vec::new(),
-                };
                 Outcome::Push(Box::new(super::branch_input::BranchInputWidget::new(crate::app::BranchInputKind::Manual)))
             }
 
@@ -172,15 +167,7 @@ impl InteractiveWidget for BaseView {
                 Outcome::Push(Box::new(super::issue_search::IssueSearchWidget::new()))
             }
 
-            Action::OpenCommandPalette => {
-                *ctx.mode = UiMode::CommandPalette {
-                    input: tui_input::Input::default(),
-                    entries: crate::palette::all_entries(),
-                    selected: 0,
-                    scroll_top: 0,
-                };
-                Outcome::Push(Box::new(super::command_palette::CommandPaletteWidget::new()))
-            }
+            Action::OpenCommandPalette => Outcome::Push(Box::new(super::command_palette::CommandPaletteWidget::new())),
 
             // App-level toggles
             Action::ToggleDebug => {
@@ -225,6 +212,7 @@ impl InteractiveWidget for BaseView {
             ctx.keymap,
             frame,
             ctx.active_widget_mode,
+            ctx.active_widget_data.clone(),
             ctx.tab_bar,
             ctx.status_bar_widget,
             ctx.event_log_widget,
@@ -551,14 +539,13 @@ mod tests {
     }
 
     #[test]
-    fn open_branch_input_pushes_widget_and_sets_mode() {
+    fn open_branch_input_pushes_widget() {
         let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::OpenBranchInput, &mut ctx);
         assert!(matches!(outcome, Outcome::Push(_)));
-        assert!(matches!(harness.mode, UiMode::BranchInput { .. }));
     }
 
     #[test]
@@ -573,14 +560,13 @@ mod tests {
     }
 
     #[test]
-    fn open_command_palette_pushes_widget_and_sets_mode() {
+    fn open_command_palette_pushes_widget() {
         let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::OpenCommandPalette, &mut ctx);
         assert!(matches!(outcome, Outcome::Push(_)));
-        assert!(matches!(harness.mode, UiMode::CommandPalette { .. }));
     }
 
     // -- Ignored actions --

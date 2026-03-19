@@ -124,11 +124,8 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
                 .and_then(|widget| widget.as_any_mut().downcast_mut::<crate::widgets::branch_input::BranchInputWidget>());
             if let Some(biw) = updated {
                 biw.prefill(&name, issue_ids);
-                // Keep UiMode in sync for status bar rendering
-                app.prefill_branch_input(&name, vec![]);
             } else {
                 tracing::warn!("BranchNameGenerated arrived but no BranchInputWidget on stack");
-                app.prefill_branch_input(&name, issue_ids);
             }
         }
         CommandResult::CheckoutStatus(info) => {

@@ -9,17 +9,17 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Table},
+    widgets::{Block, Cell, HighlightSpacing, Row, Table},
     Frame,
 };
 
 use crate::{
     app::{
         ui_state::{PendingAction, PendingStatus},
-        BranchInputKind, InFlightCommand, ProviderStatus, RepoViewLayout, TabId, TuiModel, UiMode, UiState,
+        InFlightCommand, ProviderStatus, RepoViewLayout, TabId, TuiModel, UiState,
     },
     keymap::{Keymap, ModeId},
-    shimmer::{shimmer_spans, Shimmer},
+    shimmer::Shimmer,
     theme::Theme,
     ui_helpers,
 };
@@ -91,6 +91,7 @@ pub fn render(
     _keymap: &Keymap,
     frame: &mut Frame,
     active_widget_mode: Option<ModeId>,
+    active_widget_data: crate::widgets::WidgetStatusData,
     tab_bar: &mut crate::widgets::tab_bar::TabBar,
     status_bar_widget: &mut crate::widgets::status_bar_widget::StatusBarWidget,
     event_log_widget: &mut crate::widgets::event_log::EventLogWidget,
@@ -104,15 +105,12 @@ pub fn render(
 
     // When the palette is active, move the status bar to the top of the overlay so the
     // input sits above the results instead of being pinned to the bottom of the screen.
-    let status_bar_area = if matches!(ui.mode, UiMode::CommandPalette { .. }) {
+    let status_bar_area = if active_widget_mode == Some(ModeId::CommandPalette) {
         ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
     } else {
         chunks[2]
     };
-    status_bar_widget.render(model, ui, in_flight, theme, frame, status_bar_area, active_widget_mode);
-    render_command_palette(ui, theme, frame, status_bar_area);
-    render_input_popup(ui, theme, frame);
-    render_file_picker(ui, theme, frame);
+    status_bar_widget.render(model, ui, in_flight, theme, frame, status_bar_area, active_widget_mode, active_widget_data);
 }
 
 fn active_rui<'a>(model: &TuiModel, ui: &'a UiState) -> &'a crate::app::RepoUiState {
@@ -527,129 +525,6 @@ fn build_item_row<'a>(
         Cell::from(Span::styled(issues_display, Style::default().fg(theme.issue))),
         Cell::from(Span::styled(git_display, Style::default().fg(theme.git_status))),
     ])
-}
-
-fn render_input_popup(ui: &UiState, theme: &Theme, frame: &mut Frame) {
-    let UiMode::BranchInput { ref input, ref kind, .. } = ui.mode else {
-        return;
-    };
-
-    let (_area, inner_area) = ui_helpers::render_popup_frame(frame, frame.area(), 50, 20, " New Branch ", theme.block_style());
-
-    if *kind == BranchInputKind::Generating {
-        let spans = shimmer_spans("  Generating branch name...", theme);
-        let paragraph = Paragraph::new(Line::from(spans));
-        frame.render_widget(paragraph, inner_area);
-        return;
-    }
-
-    let input_text = input.value();
-    let display = format!("> {}", input_text);
-    let paragraph = Paragraph::new(display).style(Style::default().fg(theme.input_text));
-    frame.render_widget(paragraph, inner_area);
-
-    let cursor_x = inner_area.x + 2 + input.visual_cursor() as u16;
-    let cursor_y = inner_area.y;
-    frame.set_cursor_position((cursor_x, cursor_y));
-}
-
-fn render_file_picker(ui: &mut UiState, theme: &Theme, frame: &mut Frame) {
-    let UiMode::FilePicker { ref input, ref dir_entries, selected } = ui.mode else {
-        return;
-    };
-
-    let (area, inner) = ui_helpers::render_popup_frame(frame, frame.area(), 60, 60, " Add Repository ", theme.block_style());
-    ui.layout.file_picker_area = area;
-
-    let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-
-    ui.layout.file_picker_list_area = chunks[1];
-
-    let input_text = input.value();
-    let display = format!("> {}", input_text);
-    let paragraph = Paragraph::new(display).style(Style::default().fg(theme.input_text));
-    frame.render_widget(paragraph, chunks[0]);
-
-    let cursor_x = chunks[0].x + 2 + input.visual_cursor() as u16;
-    frame.set_cursor_position((cursor_x, chunks[0].y));
-
-    let items: Vec<ListItem> = dir_entries
-        .iter()
-        .map(|entry| {
-            let tag = if entry.is_added {
-                " (added)"
-            } else if entry.is_git_repo {
-                " (git repo)"
-            } else if entry.is_dir {
-                "/"
-            } else {
-                ""
-            };
-            let style = if entry.is_git_repo && !entry.is_added {
-                Style::default().fg(theme.status_ok)
-            } else if entry.is_added {
-                Style::default().fg(theme.muted)
-            } else {
-                Style::default()
-            };
-            ListItem::new(format!("  {}{}", entry.name, tag)).style(style)
-        })
-        .collect();
-
-    let list = List::new(items).highlight_style(Style::default().bg(theme.row_highlight).bold()).highlight_symbol("▸ ");
-
-    let mut state = ListState::default();
-    if !dir_entries.is_empty() {
-        state.select(Some(selected));
-    }
-    frame.render_stateful_widget(list, chunks[1], &mut state);
-}
-
-fn render_command_palette(ui: &UiState, theme: &Theme, frame: &mut Frame, status_bar_area: Rect) {
-    let UiMode::CommandPalette { ref input, entries, selected, scroll_top } = ui.mode else {
-        return;
-    };
-
-    let filtered: Vec<&crate::palette::PaletteEntry> = crate::palette::filter_entries(entries, input.value());
-    let overlay = ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16);
-    let area = overlay.body;
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
-
-    let name_width = filtered.iter().map(|e| e.name.len()).max().unwrap_or(0).min(20);
-    let hint_width: u16 = 7;
-
-    for (i, entry) in filtered.iter().skip(scroll_top).take(overlay.visible_body_rows as usize).enumerate() {
-        let row_y = area.y + i as u16;
-        let is_selected = scroll_top + i == selected;
-
-        let row_style = if is_selected {
-            Style::default().bg(theme.action_highlight).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().bg(theme.bar_bg)
-        };
-
-        let row_area = Rect::new(area.x, row_y, area.width, 1);
-        frame.render_widget(Block::default().style(row_style), row_area);
-
-        let name_span = Span::styled(format!("  {:<width$}", entry.name, width = name_width), row_style.fg(theme.text));
-        let desc_span = Span::styled(format!("  {}", entry.description), row_style.fg(theme.muted));
-
-        let line = Line::from(vec![name_span, desc_span]);
-        frame.render_widget(Paragraph::new(line), Rect::new(area.x, row_y, area.width.saturating_sub(hint_width), 1));
-
-        let hint_text = entry.key_hint.unwrap_or("");
-        if !hint_text.is_empty() {
-            let hint_span = Span::styled(format!(" {} ", hint_text), row_style.fg(theme.key_hint));
-            let hint_x = area.x + area.width.saturating_sub(hint_width);
-            frame.render_widget(Paragraph::new(Line::from(hint_span)), Rect::new(hint_x, row_y, hint_width, 1));
-        }
-    }
-
-    // Cursor on the status bar row
-    let cursor_x = status_bar_area.x + 1 + input.visual_cursor() as u16;
-    frame.set_cursor_position((cursor_x, status_bar_area.y));
 }
 
 #[cfg(test)]

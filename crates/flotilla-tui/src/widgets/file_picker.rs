@@ -12,10 +12,7 @@ use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{
-        ui_state::{DirEntry, UiMode},
-        TuiModel,
-    },
+    app::{ui_state::DirEntry, TuiModel},
     keymap::{Action, ModeId},
     ui_helpers,
 };
@@ -33,8 +30,10 @@ impl FilePickerWidget {
         Self { input, dir_entries, selected: 0, picker_area: Rect::default(), list_area: Rect::default() }
     }
 
-    fn sync_mode(&self, ctx: &mut WidgetContext) {
-        *ctx.mode = UiMode::FilePicker { input: self.input.clone(), dir_entries: self.dir_entries.clone(), selected: self.selected };
+    /// Create a file picker with a pre-set selection index.
+    pub fn with_selected(mut self, selected: usize) -> Self {
+        self.selected = selected;
+        self
     }
 
     fn refresh_dir_listing(&mut self, model: &TuiModel) {
@@ -96,14 +95,12 @@ impl FilePickerWidget {
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
             let cmd = Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path: canonical } };
             ctx.commands.push(cmd);
-            *ctx.mode = UiMode::Normal;
             return Outcome::Finished;
         } else if entry.is_dir {
             let new_path = format!("{}{}/", base, entry.name);
             self.input = Input::from(new_path.as_str());
             self.selected = 0;
             self.refresh_dir_listing(ctx.model);
-            self.sync_mode(ctx);
             return Outcome::Consumed;
         }
 
@@ -118,19 +115,14 @@ impl InteractiveWidget for FilePickerWidget {
                 if !self.dir_entries.is_empty() {
                     self.selected = (self.selected + 1).min(self.dir_entries.len() - 1);
                 }
-                self.sync_mode(ctx);
                 Outcome::Consumed
             }
             Action::SelectPrev => {
                 self.selected = self.selected.saturating_sub(1);
-                self.sync_mode(ctx);
                 Outcome::Consumed
             }
             Action::Confirm => self.activate_dir_entry(ctx),
-            Action::Dismiss => {
-                *ctx.mode = UiMode::Normal;
-                Outcome::Finished
-            }
+            Action::Dismiss => Outcome::Finished,
             _ => Outcome::Ignored,
         }
     }
@@ -145,14 +137,12 @@ impl InteractiveWidget for FilePickerWidget {
                     self.selected = 0;
                 }
                 self.refresh_dir_listing(ctx.model);
-                self.sync_mode(ctx);
                 Outcome::Consumed
             }
             _ => {
                 self.input.handle_event(&crossterm::event::Event::Key(key));
                 self.selected = 0;
                 self.refresh_dir_listing(ctx.model);
-                self.sync_mode(ctx);
                 Outcome::Consumed
             }
         }
@@ -169,7 +159,6 @@ impl InteractiveWidget for FilePickerWidget {
 
         // Click outside dismisses
         if x < a.x || x >= a.x + a.width || y < a.y || y >= a.y + a.height {
-            *ctx.mode = UiMode::Normal;
             return Outcome::Finished;
         }
 
@@ -289,7 +278,6 @@ mod tests {
 
         let outcome = widget.handle_action(Action::Dismiss, &mut ctx);
         assert!(matches!(outcome, Outcome::Finished));
-        assert!(matches!(*ctx.mode, UiMode::Normal));
     }
 
     #[test]

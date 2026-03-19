@@ -2,10 +2,16 @@ use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use flotilla_protocol::{Command, CommandAction, RepoSelector};
-use ratatui::{layout::Rect, Frame};
+use ratatui::{
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Clear, Paragraph},
+    Frame,
+};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
-use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
+use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext, WidgetStatusData};
 use crate::{
     app::ui_state::UiMode,
     keymap::{Action, ModeId},
@@ -30,13 +36,9 @@ impl CommandPaletteWidget {
         Self { input: Input::default(), entries: palette::all_entries(), selected: 0, scroll_top: 0 }
     }
 
-    fn sync_mode(&self, ctx: &mut WidgetContext) {
-        *ctx.mode = UiMode::CommandPalette {
-            input: self.input.clone(),
-            entries: self.entries,
-            selected: self.selected,
-            scroll_top: self.scroll_top,
-        };
+    /// Create a palette widget with pre-filled input text and selection.
+    pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
+        Self { input, entries: palette::all_entries(), selected, scroll_top }
     }
 
     fn filtered(&self) -> Vec<&'static PaletteEntry> {
@@ -81,7 +83,6 @@ impl CommandPaletteWidget {
                     rui.active_search_query = Some(query);
                 }
             }
-            *ctx.mode = UiMode::Normal;
             return Outcome::Finished;
         }
 
@@ -89,11 +90,9 @@ impl CommandPaletteWidget {
         let filtered = self.filtered();
         if let Some(entry) = filtered.get(self.selected) {
             let action = entry.action;
-            *ctx.mode = UiMode::Normal;
             return self.dispatch_palette_action(action, ctx);
         }
 
-        *ctx.mode = UiMode::Normal;
         Outcome::Finished
     }
 
@@ -102,11 +101,6 @@ impl CommandPaletteWidget {
             // Actions that open other widgets — use Swap to replace the palette
             Action::OpenBranchInput => {
                 let widget = super::branch_input::BranchInputWidget::new(crate::app::ui_state::BranchInputKind::Manual);
-                *ctx.mode = UiMode::BranchInput {
-                    input: Input::default(),
-                    kind: crate::app::ui_state::BranchInputKind::Manual,
-                    pending_issue_ids: Vec::new(),
-                };
                 Outcome::Swap(Box::new(widget))
             }
             Action::OpenIssueSearch => {
@@ -119,8 +113,7 @@ impl CommandPaletteWidget {
                 let parent_path = ctx.model.active_repo_root().parent().map(|p| format!("{}/", p.display()));
                 let input = parent_path.map(|s| Input::from(s.as_str())).unwrap_or_default();
                 let dir_entries = refresh_dir_listing_standalone(input.value(), ctx.model);
-                let widget = super::file_picker::FilePickerWidget::new(input.clone(), dir_entries.clone());
-                *ctx.mode = UiMode::FilePicker { input, dir_entries, selected: 0 };
+                let widget = super::file_picker::FilePickerWidget::new(input.clone(), dir_entries);
                 Outcome::Swap(Box::new(widget))
             }
             Action::ToggleHelp => {
@@ -184,7 +177,7 @@ impl CommandPaletteWidget {
 }
 
 /// Standalone directory listing that doesn't require `&mut App`.
-fn refresh_dir_listing_standalone(path_str: &str, model: &crate::app::TuiModel) -> Vec<crate::app::ui_state::DirEntry> {
+pub fn refresh_dir_listing_standalone(path_str: &str, model: &crate::app::TuiModel) -> Vec<crate::app::ui_state::DirEntry> {
     use std::path::PathBuf;
 
     use crate::app::ui_state::DirEntry;
@@ -235,7 +228,6 @@ impl InteractiveWidget for CommandPaletteWidget {
                     self.selected = (self.selected + 1) % count;
                     self.adjust_scroll();
                 }
-                self.sync_mode(ctx);
                 Outcome::Consumed
             }
             Action::SelectPrev => {
@@ -244,19 +236,15 @@ impl InteractiveWidget for CommandPaletteWidget {
                     self.selected = if self.selected == 0 { count - 1 } else { self.selected - 1 };
                     self.adjust_scroll();
                 }
-                self.sync_mode(ctx);
                 Outcome::Consumed
             }
             Action::Confirm => self.confirm(ctx),
-            Action::Dismiss => {
-                *ctx.mode = UiMode::Normal;
-                Outcome::Finished
-            }
+            Action::Dismiss => Outcome::Finished,
             _ => Outcome::Ignored,
         }
     }
 
-    fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
+    fn handle_raw_key(&mut self, key: KeyEvent, _ctx: &mut WidgetContext) -> Outcome {
         // Tab / Right arrow: fill selected entry name into input
         if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
             let filtered = self.filtered();
@@ -266,13 +254,11 @@ impl InteractiveWidget for CommandPaletteWidget {
                 self.selected = 0;
                 self.scroll_top = 0;
             }
-            self.sync_mode(ctx);
             return Outcome::Consumed;
         }
 
         // Backspace on empty input closes the palette
         if matches!(key.code, KeyCode::Backspace) && self.input.value().is_empty() {
-            *ctx.mode = UiMode::Normal;
             return Outcome::Finished;
         }
 
@@ -283,19 +269,56 @@ impl InteractiveWidget for CommandPaletteWidget {
             self.input = Input::from("search ");
             self.selected = 0;
             self.scroll_top = 0;
-            self.sync_mode(ctx);
             return Outcome::Consumed;
         }
 
         self.selected = 0;
         self.scroll_top = 0;
-        self.sync_mode(ctx);
         Outcome::Consumed
     }
 
-    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {
-        // The palette is still rendered by ui.rs via UiMode::CommandPalette.
-        // This widget currently owns event handling/state sync only.
+    fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
+        let theme = ctx.theme;
+        let filtered = self.filtered();
+        let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16);
+        let area = overlay.body;
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
+
+        let name_width = filtered.iter().map(|e| e.name.len()).max().unwrap_or(0).min(20);
+        let hint_width: u16 = 7;
+
+        for (i, entry) in filtered.iter().skip(self.scroll_top).take(overlay.visible_body_rows as usize).enumerate() {
+            let row_y = area.y + i as u16;
+            let is_selected = self.scroll_top + i == self.selected;
+
+            let row_style = if is_selected {
+                Style::default().bg(theme.action_highlight).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(theme.bar_bg)
+            };
+
+            let row_area = Rect::new(area.x, row_y, area.width, 1);
+            frame.render_widget(Block::default().style(row_style), row_area);
+
+            let name_span = Span::styled(format!("  {:<width$}", entry.name, width = name_width), row_style.fg(theme.text));
+            let desc_span = Span::styled(format!("  {}", entry.description), row_style.fg(theme.muted));
+
+            let line = Line::from(vec![name_span, desc_span]);
+            frame.render_widget(Paragraph::new(line), Rect::new(area.x, row_y, area.width.saturating_sub(hint_width), 1));
+
+            let hint_text = entry.key_hint.unwrap_or("");
+            if !hint_text.is_empty() {
+                let hint_span = Span::styled(format!(" {} ", hint_text), row_style.fg(theme.key_hint));
+                let hint_x = area.x + area.width.saturating_sub(hint_width);
+                frame.render_widget(Paragraph::new(Line::from(hint_span)), Rect::new(hint_x, row_y, hint_width, 1));
+            }
+        }
+
+        // Cursor on the status bar row (computed via the same overlay layout)
+        let cursor_x = overlay.status_row.x + 1 + self.input.visual_cursor() as u16;
+        frame.set_cursor_position((cursor_x, overlay.status_row.y));
     }
 
     fn mode_id(&self) -> ModeId {
@@ -304,6 +327,10 @@ impl InteractiveWidget for CommandPaletteWidget {
 
     fn captures_raw_keys(&self) -> bool {
         false
+    }
+
+    fn status_data(&self) -> WidgetStatusData {
+        WidgetStatusData::CommandPalette { input_text: self.input.value().to_string() }
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -342,7 +369,6 @@ mod tests {
         let mut ctx = harness.ctx();
         let outcome = widget.handle_action(Action::Dismiss, &mut ctx);
         assert!(matches!(outcome, Outcome::Finished));
-        assert!(matches!(*ctx.mode, UiMode::Normal));
     }
 
     #[test]

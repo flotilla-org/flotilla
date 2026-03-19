@@ -350,11 +350,8 @@ fn status_bar_with_multiple_in_flight_commands() {
 
 #[test]
 fn branch_input_generating_popup() {
-    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::BranchInput {
-        input: Input::from("feature/new-branch"),
-        kind: BranchInputKind::Generating,
-        pending_issue_ids: vec![],
-    });
+    let widget = flotilla_tui::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating);
+    let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget));
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -368,16 +365,14 @@ fn issue_search_mode_status_bar() {
 
 #[test]
 fn file_picker_popup() {
-    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::FilePicker {
-        input: Input::from("/test"),
-        dir_entries: vec![picker_entry("repo-a", true, false), picker_entry("repo-b", true, true), flotilla_tui::app::DirEntry {
-            name: "notes.txt".into(),
-            is_dir: false,
-            is_git_repo: false,
-            is_added: false,
-        }],
-        selected: 1,
-    });
+    let entries = vec![picker_entry("repo-a", true, false), picker_entry("repo-b", true, true), flotilla_tui::app::DirEntry {
+        name: "notes.txt".into(),
+        is_dir: false,
+        is_git_repo: false,
+        is_added: false,
+    }];
+    let widget = flotilla_tui::widgets::file_picker::FilePickerWidget::new(Input::from("/test"), entries).with_selected(1);
+    let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget));
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
@@ -553,40 +548,24 @@ fn theme_switching_changes_output() {
 
 #[test]
 fn command_palette_open() {
-    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::CommandPalette {
-        input: Input::default(),
-        entries: flotilla_tui::palette::all_entries(),
-        selected: 0,
-        scroll_top: 0,
-    });
+    let widget = flotilla_tui::widgets::command_palette::CommandPaletteWidget::new();
+    let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget));
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn command_palette_widget_renders_without_overflow() {
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_mode(UiMode::CommandPalette {
-            input: Input::default(),
-            entries: flotilla_tui::palette::all_entries(),
-            selected: 0,
-            scroll_top: 0,
-        })
-        .with_widget(Box::new(flotilla_tui::widgets::command_palette::CommandPaletteWidget::new()));
+    let widget = flotilla_tui::widgets::command_palette::CommandPaletteWidget::new();
+    let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget));
 
     let _ = harness.render_to_buffer();
 }
 
 #[test]
 fn command_palette_renders_on_short_terminals_without_overflow() {
-    let mut harness = TestHarness::single_repo("my-project")
-        .with_mode(UiMode::CommandPalette {
-            input: Input::default(),
-            entries: flotilla_tui::palette::all_entries(),
-            selected: 0,
-            scroll_top: 0,
-        })
-        .with_height(6);
+    let widget = flotilla_tui::widgets::command_palette::CommandPaletteWidget::new();
+    let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget)).with_height(6);
 
     let _ = harness.render_to_buffer();
 }
@@ -675,24 +654,16 @@ fn help_widget_renders_on_short_terminals_without_overflow() {
 
 #[test]
 fn command_palette_filtered() {
-    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::CommandPalette {
-        input: Input::from("he"),
-        entries: flotilla_tui::palette::all_entries(),
-        selected: 0,
-        scroll_top: 0,
-    });
+    let widget = flotilla_tui::widgets::command_palette::CommandPaletteWidget::with_state(Input::from("he"), 0, 0);
+    let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget));
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn command_palette_selection() {
-    let mut harness = TestHarness::single_repo("my-project").with_mode(UiMode::CommandPalette {
-        input: Input::default(),
-        entries: flotilla_tui::palette::all_entries(),
-        selected: 3,
-        scroll_top: 0,
-    });
+    let widget = flotilla_tui::widgets::command_palette::CommandPaletteWidget::with_state(Input::default(), 3, 0);
+    let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget));
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }

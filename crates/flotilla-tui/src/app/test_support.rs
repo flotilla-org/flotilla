@@ -23,7 +23,7 @@ use tui_input::Input;
 
 // Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
 pub(crate) use super::test_builders::*;
-use super::{App, CommandQueue, DirEntry, InFlightCommand, RepoUiState, TuiModel, TuiRepoModel, UiMode};
+use super::{App, CommandQueue, DirEntry, InFlightCommand, RepoUiState, TuiModel, UiMode};
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
 pub(crate) struct StubDaemon {
@@ -145,23 +145,6 @@ pub(crate) fn delta(repo: &Path, changes: Vec<Change>) -> RepoDelta {
     }
 }
 
-pub(crate) fn default_repo_model(labels: RepoLabels) -> TuiRepoModel {
-    TuiRepoModel {
-        identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
-        path: PathBuf::from("/tmp/test-repo"),
-        providers: Arc::new(flotilla_protocol::ProviderData::default()),
-        labels,
-        provider_names: HashMap::new(),
-        provider_health: HashMap::new(),
-        loading: false,
-        issue_has_more: false,
-        issue_total: None,
-        issue_search_active: false,
-        issue_fetch_pending: false,
-        issue_initial_requested: false,
-    }
-}
-
 pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -193,7 +176,6 @@ pub(crate) fn setup_selectable_table(app: &mut App, items: Vec<WorkItem>) {
 }
 
 pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry>) {
-    app.ui.mode = UiMode::FilePicker { input: Input::from(path), dir_entries: entries.clone(), selected: 0 };
     app.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(Input::from(path), entries)));
 }
 

@@ -25,6 +25,23 @@ use crate::{
     theme::Theme,
 };
 
+/// Extra data the active widget exposes for the status bar.
+///
+/// Replaces the old pattern of reading overlay state from `UiMode`.
+/// Widgets that need to communicate status text or flags override
+/// `InteractiveWidget::status_data()`.
+#[derive(Debug, Clone, Default)]
+pub enum WidgetStatusData {
+    #[default]
+    None,
+    BranchInput {
+        generating: bool,
+    },
+    CommandPalette {
+        input_text: String,
+    },
+}
+
 /// App-level effects that widgets can request. Processed by the event
 /// loop after widget dispatch — widgets declare intent, the app executes.
 #[derive(Debug, Clone)]
@@ -83,6 +100,8 @@ pub struct RenderContext<'a> {
     /// The mode of the topmost widget on the stack. Used by the status bar
     /// to show the correct key hints.
     pub active_widget_mode: Option<ModeId>,
+    /// Extra data from the active widget for status bar rendering.
+    pub active_widget_data: WidgetStatusData,
     // Child components used by BaseView rendering.
     pub tab_bar: &'a mut tab_bar::TabBar,
     pub status_bar_widget: &'a mut status_bar_widget::StatusBarWidget,
@@ -114,6 +133,14 @@ pub trait InteractiveWidget {
     /// Whether this widget needs raw key events instead of resolved actions.
     fn captures_raw_keys(&self) -> bool {
         false
+    }
+
+    /// Extra data for the status bar (e.g. input text, generating flag).
+    ///
+    /// The default returns `WidgetStatusData::None`. Override in widgets
+    /// that need to communicate state to the status bar without a UiMode bridge.
+    fn status_data(&self) -> WidgetStatusData {
+        WidgetStatusData::None
     }
 
     /// Downcast support for updating widget state from outside the trait.
