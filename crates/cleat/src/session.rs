@@ -54,7 +54,7 @@ pub struct ForegroundAttach {
 
 impl ForegroundAttach {
     pub fn relay_stdio(self) -> Result<(), String> {
-        let cleanup = AttachCleanupGuard::stdout();
+        let mut cleanup = AttachCleanupGuard::stdout();
         let _tty_mode = TerminalModeGuard::activate()?;
         let _signal_handlers = AttachSignalHandlers::install()?;
         let read_handle = {
@@ -165,6 +165,7 @@ enum AttachCleanupTarget {
 struct AttachCleanupGuard {
     target: AttachCleanupTarget,
     enabled: bool,
+    emitted: bool,
 }
 
 struct AttachSignalHandlers {
@@ -210,24 +211,24 @@ extern "C" fn attach_signal_handler(_signal: libc::c_int) {
 
 impl AttachCleanupGuard {
     fn stdout() -> Self {
-        Self { target: AttachCleanupTarget::Stdout, enabled: stdout_is_tty().unwrap_or(false) }
+        Self { target: AttachCleanupTarget::Stdout, enabled: stdout_is_tty().unwrap_or(false), emitted: false }
     }
 
     #[cfg(test)]
     fn test_buffer(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self { target: AttachCleanupTarget::Buffer(buffer), enabled: true }
+        Self { target: AttachCleanupTarget::Buffer(buffer), enabled: true, emitted: false }
     }
 
     #[cfg(test)]
     fn test_buffer_disabled(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self { target: AttachCleanupTarget::Buffer(buffer), enabled: false }
+        Self { target: AttachCleanupTarget::Buffer(buffer), enabled: false, emitted: false }
     }
 
-    fn emit(self) -> Result<(), String> {
-        if !self.enabled {
+    fn emit(&mut self) -> Result<(), String> {
+        if !self.enabled || self.emitted {
             return Ok(());
         }
-        match self.target {
+        let result = match &self.target {
             AttachCleanupTarget::Stdout => {
                 let mut stdout = std::io::stdout().lock();
                 write_detach_cleanup(&mut stdout)
@@ -240,7 +241,17 @@ impl AttachCleanupGuard {
                     Err("cleanup buffer lock poisoned".to_string())
                 }
             }
+        };
+        if result.is_ok() {
+            self.emitted = true;
         }
+        result
+    }
+}
+
+impl Drop for AttachCleanupGuard {
+    fn drop(&mut self) {
+        let _ = self.emit();
     }
 }
 
@@ -877,21 +888,25 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_only_writes_when_explicitly_emitted() {
+    fn cleanup_guard_writes_on_drop() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let guard = AttachCleanupGuard::test_buffer(Arc::clone(&output));
 
         drop(guard);
 
-        assert!(output.lock().expect("lock output").is_empty());
+        assert_eq!(
+            *output.lock().expect("lock output"),
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h"
+        );
     }
 
     #[test]
     fn cleanup_writes_fixed_reset_sequence_when_emitted() {
         let output = Arc::new(Mutex::new(Vec::new()));
-        let guard = AttachCleanupGuard::test_buffer(Arc::clone(&output));
+        let mut guard = AttachCleanupGuard::test_buffer(Arc::clone(&output));
 
         guard.emit().expect("emit cleanup");
+        drop(guard);
 
         assert_eq!(
             *output.lock().expect("lock output"),
@@ -902,9 +917,10 @@ mod tests {
     #[test]
     fn cleanup_does_not_write_when_target_is_disabled() {
         let output = Arc::new(Mutex::new(Vec::new()));
-        let guard = AttachCleanupGuard::test_buffer_disabled(Arc::clone(&output));
+        let mut guard = AttachCleanupGuard::test_buffer_disabled(Arc::clone(&output));
 
         guard.emit().expect("emit cleanup");
+        drop(guard);
 
         assert!(output.lock().expect("lock output").is_empty());
     }

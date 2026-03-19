@@ -272,7 +272,11 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
     assert!(String::from_utf8_lossy(&first_live_bytes).contains("before"));
     drop(first);
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let detach_deadline = Instant::now() + Duration::from_secs(2);
+    while foreground_path(temp.path(), "alpha").exists() && Instant::now() < detach_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!foreground_path(temp.path(), "alpha").exists(), "foreground marker should clear before reattach");
 
     let mut second = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect second socket");
     Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }

@@ -398,21 +398,21 @@ Recommendation: Start with ghostty's tests (free with the library), then conside
 
 ### Multiplexers / Session Managers
 
-| Project | Path | Screen State | Reattach Model | VT Parser |
-|---------|------|-------------|----------------|-----------|
-| tmux | `/home/robert/dev/pools/tmux` | Full grid with cell attributes | Regenerate sequences from grid for new client's capabilities | Custom (input.c) |
-| zellij | `/home/robert/dev/pools/zellij` | Grid struct with full VT state | Serialize current screen as ANSI | `vte` crate (0.11) |
-| shpool | `/home/robert/dev/pools/shpool` | Pluggable SessionSpool trait | `restore_buffer()` generates restore sequences | `shpool_vt100` / `shpool_vterm` |
-| zmx | `/home/robert/dev/pools/zmx` | ghostty-vt Terminal | TerminalFormatter serializes state as VT | libghostty-vt |
-| dtach | `/home/robert/dev/pools/dtach` | None | No restore (SIGWINCH/Ctrl-L for app redraw) | None |
-| abduco | `/home/robert/dev/pools/abduco` | Exit status only | No restore, alt-buffer awareness on detach | None |
+| Project | Screen State | Reattach Model | VT Parser |
+|---------|-------------|----------------|-----------|
+| tmux | Full grid with cell attributes | Regenerate sequences from grid for new client's capabilities | Custom (input.c) |
+| zellij | Grid struct with full VT state | Serialize current screen as ANSI | `vte` crate (0.11) |
+| shpool | Pluggable SessionSpool trait | `restore_buffer()` generates restore sequences | `shpool_vt100` / `shpool_vterm` |
+| zmx | ghostty-vt Terminal | TerminalFormatter serializes state as VT | libghostty-vt |
+| dtach | None | No restore (SIGWINCH/Ctrl-L for app redraw) | None |
+| abduco | Exit status only | No restore, alt-buffer awareness on detach | None |
 
 ### Terminal Emulators / Libraries
 
-| Project | Path | Language | Library Form | Serialization | Key Feature |
-|---------|------|----------|-------------|---------------|-------------|
-| ghostty | `/home/robert/dev/terms/ghostty` | Zig | libghostty-vt (C API, 100+ functions) | TerminalFormatter (VT/text/HTML) | Complete, proven, MIT |
-| alacritty | `/home/robert/dev/terms/alacritty` | Rust | alacritty_terminal crate | Serde (grid only, no restore gen) | Pure Rust, lean deps |
-| wezterm | `/home/robert/dev/terms/wezterm` | Rust | termwiz crate | Surface diffs + serde | Change tracking, capabilities |
-| kitty | `/home/robert/dev/terms/kitty` | C/Python | Not a library | N/A | GPL, not reusable |
-| libvterm | `/home/robert/dev/terms/libvterm` | C | Yes (MIT) | Cell-by-cell read only | Clean 3-layer API, 43 tests |
+| Project | Language | Library Form | Serialization | Key Feature |
+|---------|----------|-------------|---------------|-------------|
+| ghostty | Zig | libghostty-vt (C API, 100+ functions) | TerminalFormatter (VT/text/HTML) | Complete, proven, MIT |
+| alacritty | Rust | alacritty_terminal crate | Serde (grid only, no restore gen) | Pure Rust, lean deps |
+| wezterm | Rust | termwiz crate | Surface diffs + serde | Change tracking, capabilities |
+| kitty | C/Python | Not a library | N/A | GPL, not reusable |
+| libvterm | C | Yes (MIT) | Cell-by-cell read only | Clean 3-layer API, 43 tests |

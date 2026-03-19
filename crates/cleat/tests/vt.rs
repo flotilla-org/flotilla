@@ -40,3 +40,19 @@ fn vt_passthrough_replay_remains_disabled_for_client_capabilities() {
 fn vt_ghostty_engine_contract_is_locked() {
     assert_replay_contract(&GhosttyFixture);
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_formatter_alloc_round_trips_output() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+
+    engine.feed(b"hello ghostty formatter").expect("feed bytes");
+
+    let replay = engine
+        .replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, false))
+        .expect("replay payload")
+        .expect("ghostty replay payload");
+
+    let replay_text = String::from_utf8_lossy(&replay);
+    assert!(replay_text.contains("hello ghostty formatter"), "unexpected replay payload: {replay_text}");
+}

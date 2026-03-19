@@ -3,6 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("ghostty-vt feature requires Linux or macOS");
+
 fn main() {
     if env::var_os("CARGO_FEATURE_GHOSTTY_VT").is_none() {
         return;
@@ -11,9 +14,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CLEAT_GHOSTTY_PREFIX");
 
     let prefix = ghostty_prefix().unwrap_or_else(|| {
-        panic!(
-            "ghostty-vt feature requires libghostty-vt. Set CLEAT_GHOSTTY_PREFIX or install it under ~/.local/opt/libghostty-vt or ~/.local/opt/libghossty-vt"
-        )
+        panic!("ghostty-vt feature requires libghostty-vt. Set CLEAT_GHOSTTY_PREFIX or install it under ~/.local/opt/libghostty-vt")
     });
     let include_dir = prefix.join("include");
     let lib_dir = prefix.join("lib");
@@ -36,7 +37,7 @@ fn ghostty_prefix() -> Option<PathBuf> {
     }
 
     let home = env::var_os("HOME").map(PathBuf::from)?;
-    [home.join(".local/opt/libghostty-vt"), home.join(".local/opt/libghossty-vt")].into_iter().find(|path| is_valid_prefix(path))
+    [home.join(".local/opt/libghostty-vt")].into_iter().find(|path| is_valid_prefix(path))
 }
 
 fn is_valid_prefix(path: &Path) -> bool {

@@ -65,6 +65,8 @@ impl VtEngineKind {
     }
 }
 
+// NOTE: VtEngine is intentionally not Send. Engines may wrap foreign terminal-state
+// handles that are only accessed from the single session daemon event loop.
 pub trait VtEngine {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String>;
