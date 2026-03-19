@@ -180,7 +180,9 @@ pub fn attach_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundA
     loop {
         let mut stream = UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
         let (cols, rows) = current_terminal_size();
-        Frame::AttachInit { cols, rows }.write(&mut stream).map_err(|err| format!("write attach init: {err}"))?;
+        Frame::AttachInit { cols, rows, capabilities: attach_init_capabilities() }
+            .write(&mut stream)
+            .map_err(|err| format!("write attach init: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read attach response: {err}"))? {
             Frame::Ack => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
             Frame::Busy => {}
@@ -206,17 +208,68 @@ pub fn foreground_path(root: &Path, id: &str) -> PathBuf {
 }
 
 fn default_vt_engine() -> Box<dyn VtEngine> {
+    if std::env::var_os("CARGO_BIN_EXE_cleat").is_some()
+        && std::env::var_os("CLEAT_TEST_VT_ENGINE").as_deref() == Some(std::ffi::OsStr::new("replay-probe"))
+    {
+        return Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS));
+    }
     vt::make_default_vt_engine(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+}
+
+#[derive(Debug)]
+struct TestReplayProbeVtEngine {
+    cols: u16,
+    rows: u16,
+}
+
+impl TestReplayProbeVtEngine {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self { cols, rows }
+    }
+}
+
+impl VtEngine for TestReplayProbeVtEngine {
+    fn feed(&mut self, _bytes: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+        self.cols = cols;
+        self.rows = rows;
+        Ok(())
+    }
+
+    fn supports_replay(&self) -> bool {
+        true
+    }
+
+    fn replay_payload(&self, capabilities: &vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+        let payload = format!("{:?}:{}", capabilities.color_level, capabilities.kitty_keyboard);
+        Ok(Some(payload.into_bytes()))
+    }
+
+    fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
 }
 
 fn record_pty_output(engine: &mut dyn VtEngine, bytes: &[u8]) -> Result<(), String> {
     engine.feed(bytes)
 }
 
-fn apply_attach_state(engine: &mut dyn VtEngine, cols: u16, rows: u16) -> Result<Option<Vec<u8>>, String> {
+fn attach_init_capabilities() -> vt::ClientCapabilities {
+    vt::ClientCapabilities::conservative_fallback()
+}
+
+fn apply_attach_state(
+    engine: &mut dyn VtEngine,
+    cols: u16,
+    rows: u16,
+    capabilities: &vt::ClientCapabilities,
+) -> Result<Option<Vec<u8>>, String> {
     engine.resize(cols, rows)?;
     if engine.supports_replay() {
-        engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
+        engine.replay_payload(capabilities)
     } else {
         Ok(None)
     }
@@ -248,10 +301,10 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_read_timeout(Some(Duration::from_millis(10))).map_err(|err| format!("set client read timeout: {err}"))?;
-                    if let Ok(Frame::AttachInit { cols, rows }) = Frame::read(&mut stream) {
+                    if let Ok(Frame::AttachInit { cols, rows, capabilities }) = Frame::read(&mut stream) {
                         if active_client.is_none() {
                             resize_pty(pty_fd, cols, rows)?;
-                            let replay = apply_attach_state(vt_engine.as_mut(), cols, rows)?;
+                            let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
                             Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
                             if let Some(payload) = replay {
                                 if !payload.is_empty() {
@@ -580,49 +633,15 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
 
-    use super::{apply_attach_state, default_vt_engine, is_executable_file, record_pty_output, resolve_cleat_executable};
+    use super::{
+        apply_attach_state, attach_init_capabilities, default_vt_engine, is_executable_file, record_pty_output, resolve_cleat_executable,
+        TestReplayProbeVtEngine,
+    };
     use crate::vt::{self, VtEngine};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[derive(Debug)]
-    struct ReplayProbeEngine {
-        cols: u16,
-        rows: u16,
-    }
-
-    impl ReplayProbeEngine {
-        fn new(cols: u16, rows: u16) -> Self {
-            Self { cols, rows }
-        }
-    }
-
-    impl vt::VtEngine for ReplayProbeEngine {
-        fn feed(&mut self, _bytes: &[u8]) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
-            self.cols = cols;
-            self.rows = rows;
-            Ok(())
-        }
-
-        fn supports_replay(&self) -> bool {
-            true
-        }
-
-        fn replay_payload(&self, capabilities: &vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
-            let payload = format!("{:?}:{}", capabilities.color_level, capabilities.kitty_keyboard);
-            Ok(Some(payload.into_bytes()))
-        }
-
-        fn size(&self) -> (u16, u16) {
-            (self.cols, self.rows)
-        }
     }
 
     #[test]
@@ -638,20 +657,27 @@ mod tests {
     fn vt_engine_helpers_feed_and_resize_default_engine() {
         let mut engine = default_vt_engine();
         record_pty_output(engine.as_mut(), b"hello").expect("feed output");
-        let replay = apply_attach_state(engine.as_mut(), 132, 40).expect("apply attach state");
+        let replay =
+            apply_attach_state(engine.as_mut(), 132, 40, &vt::ClientCapabilities::conservative_fallback()).expect("apply attach state");
 
         assert_eq!(engine.size(), (132, 40));
         assert_eq!(replay, None);
     }
 
     #[test]
-    fn vt_apply_attach_state_uses_conservative_fallback_capabilities_for_replay() {
-        let mut engine = ReplayProbeEngine::new(80, 24);
+    fn lifecycle_attach_init_capabilities_use_conservative_terminal_assumptions() {
+        assert_eq!(attach_init_capabilities(), vt::ClientCapabilities::conservative_fallback());
+    }
 
-        let replay = apply_attach_state(&mut engine, 100, 30).expect("apply attach state");
+    #[test]
+    fn lifecycle_apply_attach_state_uses_attach_capabilities_for_replay() {
+        let mut engine = TestReplayProbeVtEngine::new(80, 24);
+        let capabilities = vt::ClientCapabilities::new(vt::ColorLevel::Ansi256, true);
+
+        let replay = apply_attach_state(&mut engine, 100, 30, &capabilities).expect("apply attach state");
 
         assert_eq!(engine.size(), (100, 30));
-        assert_eq!(replay, Some(b"Sixteen:false".to_vec()));
+        assert_eq!(replay, Some(b"Ansi256:true".to_vec()));
     }
 
     #[cfg(not(feature = "ghostty-vt"))]
@@ -660,7 +686,8 @@ mod tests {
         let mut engine = vt::make_default_vt_engine(80, 24);
 
         record_pty_output(engine.as_mut(), b"hello").expect("feed output");
-        let replay = apply_attach_state(engine.as_mut(), 100, 30).expect("apply attach state");
+        let replay =
+            apply_attach_state(engine.as_mut(), 100, 30, &vt::ClientCapabilities::conservative_fallback()).expect("apply attach state");
 
         assert_eq!(engine.size(), (100, 30));
         assert_eq!(replay, None);
