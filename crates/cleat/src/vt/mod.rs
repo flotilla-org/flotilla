@@ -1,5 +1,8 @@
 pub mod passthrough;
 
+#[cfg(feature = "ghostty-vt")]
+pub mod ghostty;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ClientCapabilities {
@@ -44,14 +47,13 @@ pub(crate) fn default_vt_engine_kind() -> &'static str {
 
 #[cfg(feature = "ghostty-vt")]
 fn select_default_vt_engine(cols: u16, rows: u16) -> Box<dyn VtEngine> {
-    // Ghostty is feature-gated for now; Task 4 will replace this with the real engine.
-    Box::new(passthrough::PassthroughVtEngine::new(cols, rows))
+    Box::new(ghostty::GhosttyVtEngine::new(cols, rows))
 }
 
 #[cfg(test)]
 #[cfg(feature = "ghostty-vt")]
 fn select_default_vt_engine_kind() -> &'static str {
-    "passthrough"
+    "ghostty"
 }
 
 #[cfg(not(feature = "ghostty-vt"))]
@@ -63,4 +65,22 @@ fn select_default_vt_engine(cols: u16, rows: u16) -> Box<dyn VtEngine> {
 #[cfg(not(feature = "ghostty-vt"))]
 fn select_default_vt_engine_kind() -> &'static str {
     "passthrough"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{make_default_vt_engine, select_default_vt_engine_kind};
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn ghostty_engine_smoke_constructs_resizes_and_drops() {
+        let mut engine = make_default_vt_engine(80, 24);
+
+        assert_eq!(select_default_vt_engine_kind(), "ghostty");
+        assert_eq!(engine.size(), (80, 24));
+
+        engine.resize(120, 40).expect("resize ghostty engine");
+
+        assert_eq!(engine.size(), (120, 40));
+    }
 }
