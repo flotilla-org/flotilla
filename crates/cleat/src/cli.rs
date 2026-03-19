@@ -114,7 +114,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             service.kill(&id)?;
             Ok(None)
         }
-        Command::SendKeys { .. } => Ok(None),
+        Command::SendKeys { .. } => Err("send-keys is not yet implemented in this CLI-surface task".to_string()),
         Command::Serve { id } => {
             service.serve(&id)?;
             Ok(None)

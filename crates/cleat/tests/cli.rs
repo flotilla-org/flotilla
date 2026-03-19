@@ -1,6 +1,8 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
-    cli::{Cli, Command},
+    cli::{execute, Cli, Command},
+    runtime::RuntimeLayout,
+    server::SessionService,
     vt::VtEngineKind,
 };
 
@@ -144,4 +146,17 @@ fn send_keys_command_rejects_literal_and_hex_together() {
 #[test]
 fn send_keys_command_rejects_zero_repeat() {
     assert!(Cli::try_parse_from(["cleat", "send-keys", "-N", "0", "demo", "Enter"]).is_err());
+}
+
+#[test]
+fn send_keys_execute_returns_explicit_error() {
+    let cli = Cli {
+        runtime_root: None,
+        command: Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 1, keys: vec!["Enter".into()] },
+    };
+    let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
+
+    let err = execute(cli, &service).expect_err("send-keys execution should be rejected");
+    assert!(err.contains("send-keys"));
+    assert!(err.contains("not yet implemented"));
 }
