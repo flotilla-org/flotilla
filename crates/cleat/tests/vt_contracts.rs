@@ -69,6 +69,10 @@ impl VtEngine for PlaceholderReplayVtEngine {
         Ok(Some(format!("placeholder:{color_level}:{kitty_keyboard}").into_bytes()))
     }
 
+    fn screen_text(&self) -> Result<String, String> {
+        Ok("placeholder".to_string())
+    }
+
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }

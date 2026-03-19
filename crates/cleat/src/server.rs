@@ -73,6 +73,22 @@ impl SessionService {
         Ok(())
     }
 
+    pub fn capture(&self, id: &str) -> Result<String, String> {
+        if !self.layout.root().join(id).join("meta.json").exists() {
+            return Err(format!("missing session {id}"));
+        }
+
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        Frame::Capture.write(&mut stream).map_err(|err| format!("write capture request: {err}"))?;
+        match Frame::read(&mut stream).map_err(|err| format!("read capture response: {err}"))? {
+            Frame::Output(bytes) => String::from_utf8(bytes).map_err(|err| format!("capture response was not valid utf-8: {err}")),
+            Frame::Error(message) => Err(message),
+            other => Err(format!("unexpected capture response: {other:?}")),
+        }
+    }
+
     pub fn attach(
         &self,
         name: Option<String>,

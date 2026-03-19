@@ -44,6 +44,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Capture {
+        id: String,
+    },
     Detach {
         id: String,
     },
@@ -90,6 +93,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                 Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
+        Command::Capture { id } => service.capture(&id).map(Some),
         Command::Detach { id } => {
             service.detach(&id)?;
             Ok(None)

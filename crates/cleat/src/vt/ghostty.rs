@@ -54,6 +54,13 @@ impl VtEngine for GhosttyVtEngine {
         Ok((!payload.is_empty()).then_some(payload))
     }
 
+    fn screen_text(&self) -> Result<String, String> {
+        let mut options = GhosttyFormatterTerminalOptions::init();
+        options.emit = GhosttyFormatterFormat::Plain;
+        let payload = ghostty_ffi::format_terminal_alloc(self.terminal.raw(), options)?;
+        String::from_utf8(payload).map_err(|err| format!("ghostty plain-text snapshot was not valid utf-8: {err}"))
+    }
+
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }

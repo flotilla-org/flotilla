@@ -136,6 +136,49 @@ fn list_json_reports_existing_sessions() {
 }
 
 #[test]
+fn capture_rejects_passthrough_sessions() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 5".into())).expect("create alpha");
+    let cli = Cli::try_parse_from(["cleat", "capture", "alpha"]).expect("parse capture");
+
+    let err = cli::execute(cli, &service).expect_err("passthrough capture should fail");
+
+    assert!(err.contains("unsupported"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn capture_returns_text_for_ghostty_sessions() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("printf 'hello capture'; sleep 5".into()))
+        .expect("create alpha");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let output = loop {
+        let cli = Cli::try_parse_from(["cleat", "capture", "alpha"]).expect("parse capture");
+        match cli::execute(cli, &service) {
+            Ok(Some(text)) if text.contains("hello capture") => break text,
+            Ok(Some(_)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(Some(text)) => panic!("capture did not include expected text: {text}"),
+            Ok(None) => panic!("capture returned no output"),
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("capture failed: {err}"),
+        }
+    };
+
+    assert!(output.contains("hello capture"));
+}
+
+#[test]
 fn kill_removes_session_directory() {
     let _lock = env_lock().lock().expect("env lock");
     let temp = tempfile::tempdir().expect("tempdir");

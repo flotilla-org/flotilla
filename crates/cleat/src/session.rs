@@ -398,6 +398,10 @@ impl VtEngine for TestReplayProbeVtEngine {
         Ok(Some(payload.into_bytes()))
     }
 
+    fn screen_text(&self) -> Result<String, String> {
+        Ok(format!("probe:{}x{}", self.cols, self.rows))
+    }
+
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
@@ -480,6 +484,14 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                             let _ = fs::remove_file(foreground_path(root, id));
                             active_client = None;
                         }
+                        Ok(Frame::Capture) => match vt_engine.screen_text() {
+                            Ok(text) => {
+                                let _ = Frame::Output(text.into_bytes()).write(&mut stream);
+                            }
+                            Err(err) => {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        },
                         Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);
                         }

@@ -30,6 +30,8 @@ const TAG_RESIZE: u8 = 4;
 const TAG_ACK: u8 = 5;
 const TAG_BUSY: u8 = 6;
 const TAG_DETACH: u8 = 7;
+const TAG_CAPTURE: u8 = 8;
+const TAG_ERROR: u8 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -40,6 +42,8 @@ pub enum Frame {
     Ack,
     Busy,
     Detach,
+    Capture,
+    Error(String),
 }
 
 impl Frame {
@@ -82,6 +86,8 @@ impl Frame {
             Frame::Ack => (TAG_ACK, vec![]),
             Frame::Busy => (TAG_BUSY, vec![]),
             Frame::Detach => (TAG_DETACH, vec![]),
+            Frame::Capture => (TAG_CAPTURE, vec![]),
+            Frame::Error(message) => (TAG_ERROR, message.clone().into_bytes()),
         }
     }
 
@@ -94,6 +100,10 @@ impl Frame {
             TAG_ACK => Ok(Frame::Ack),
             TAG_BUSY => Ok(Frame::Busy),
             TAG_DETACH => Ok(Frame::Detach),
+            TAG_CAPTURE => Ok(Frame::Capture),
+            TAG_ERROR => String::from_utf8(payload)
+                .map(Frame::Error)
+                .map_err(|err| Error::new(ErrorKind::InvalidData, format!("invalid error frame utf-8: {err}"))),
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
     }
