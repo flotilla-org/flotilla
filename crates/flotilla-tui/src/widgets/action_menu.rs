@@ -9,7 +9,8 @@ use ratatui::{
 use tui_input::Input;
 
 use super::{
-    close_confirm::CloseConfirmWidget, delete_confirm::DeleteConfirmWidget, InteractiveWidget, Outcome, RenderContext, WidgetContext,
+    branch_input::BranchInputWidget, close_confirm::CloseConfirmWidget, delete_confirm::DeleteConfirmWidget, InteractiveWidget, Outcome,
+    RenderContext, WidgetContext,
 };
 use crate::{
     app::{
@@ -64,6 +65,8 @@ impl ActionMenuWidget {
                 let pending_ctx =
                     PendingActionContext { identity: self.item.identity.clone(), description: entry.intent.label(labels), repo_identity };
                 ctx.commands.push_with_context(entry.command.clone(), Some(pending_ctx));
+                let widget = BranchInputWidget::new(BranchInputKind::Generating);
+                return Outcome::Swap(Box::new(widget));
             }
             Intent::CloseChangeRequest => {
                 let id = match &entry.command {
@@ -372,8 +375,7 @@ mod tests {
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(matches!(harness.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. }));
+        assert!(matches!(outcome, Outcome::Swap(_)), "expected Swap(BranchInputWidget)");
 
         let (cmd, _) = harness.commands.take_next().expect("expected command");
         assert!(matches!(cmd.action, CommandAction::GenerateBranchName { .. }));

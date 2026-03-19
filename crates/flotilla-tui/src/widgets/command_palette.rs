@@ -127,34 +127,11 @@ impl CommandPaletteWidget {
                 let widget = super::help::HelpWidget::new();
                 Outcome::Swap(Box::new(widget))
             }
-            Action::OpenActionMenu => {
-                // Can't open action menu from palette (needs selected item context),
-                // just close the palette and let normal dispatch handle it next time.
-                Outcome::Finished
-            }
-            // Simple state toggles — apply directly through ctx and finish
-            Action::Quit => {
-                ctx.should_quit = true;
-                Outcome::Finished
-            }
-            Action::CycleLayout => {
-                // Cycle the layout via the model pointer isn't available, so just
-                // set the mode to Normal and let legacy handle it.
-                // Actually, we have no mutable access to UiState.view_layout through ctx.
-                // Return Finished; the palette is gone and the action won't re-fire.
-                // Instead we accept this minor limitation — these simple actions won't
-                // fire from the palette via widget path.  We'll fall through to Finished.
-                Outcome::Finished
-            }
-            Action::Refresh => {
-                // Refresh is handled by the main event loop, not dispatch_action.
-                // Just finish — the palette closes.
-                Outcome::Finished
-            }
-            // For all other actions, the palette closes and they don't auto-fire.
-            // This covers CycleTheme, CycleHost, ToggleProviders, ToggleDebug,
-            // ToggleMultiSelect, ToggleStatusBarKeys, etc.
-            _ => Outcome::Finished,
+            // All other actions: pop the palette and re-dispatch through the
+            // stack/legacy path. This covers CycleLayout, CycleTheme, CycleHost,
+            // ToggleProviders, ToggleDebug, ToggleMultiSelect, ToggleStatusBarKeys,
+            // OpenActionMenu, Refresh, Quit, etc.
+            action => Outcome::FinishedWith(action),
         }
     }
 }
@@ -428,9 +405,8 @@ mod tests {
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        // The widget should finish, and should_quit should be true
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.should_quit);
+        // Quit is dispatched via FinishedWith so the legacy path handles it
+        assert!(matches!(outcome, Outcome::FinishedWith(Action::Quit)));
     }
 
     #[test]

@@ -428,6 +428,10 @@ impl App {
                 self.widget_stack.remove(index);
                 self.widget_stack.insert(index, widget);
             }
+            crate::widgets::Outcome::FinishedWith(action) => {
+                self.widget_stack.remove(index);
+                self.dispatch_action(action);
+            }
         }
     }
 

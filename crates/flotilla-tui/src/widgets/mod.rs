@@ -33,6 +33,8 @@ pub enum Outcome {
     Push(Box<dyn InteractiveWidget>),
     /// Pop the current widget and push a replacement.
     Swap(Box<dyn InteractiveWidget>),
+    /// Pop this widget, then re-dispatch the given action through the stack/legacy path.
+    FinishedWith(Action),
 }
 
 /// Mutable context provided to widgets during event handling.

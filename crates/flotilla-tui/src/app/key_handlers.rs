@@ -65,7 +65,7 @@ impl App {
     /// (action_enter, open_action_menu, open_file_picker, dispatch intent, tab
     /// navigation, theme/layout/debug/host/status-bar toggles) as well as
     /// event-log navigation in Config mode.
-    fn dispatch_action(&mut self, action: Action) {
+    pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
             Action::SelectNext => {
                 // Widget handles WorkItemTable; only EventLog reaches here.
