@@ -39,6 +39,7 @@ cargo test -p flotilla-core --locked --features test-support --test in_process_d
 - Keep real-backed implementations covered too, but verify them against the same behavioral contract instead of forcing all behavior tests through the real backing store.
 - Favor reusable test harnesses over ad hoc setup. The goal is to make new multi-step scenarios cheap to express and debug.
 - For multi-host orchestration logic, prefer `InProcessDaemon`-level tests unless the bug specifically depends on real process or transport boundaries.
+- **Snapshot tests are a signal, not a formality.** Never run `cargo insta accept` or update snapshots just because a test failed. A failing snapshot means the rendered output changed — investigate *why* it changed. If the change is an intended consequence of the current work, accept it with a clear justification. If the change is unintended, it's a bug — fix the code, don't update the snapshot.
 
 ## Claude Code Web (changedirection/flotilla fork)
 
