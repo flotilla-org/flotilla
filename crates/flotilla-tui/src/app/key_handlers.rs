@@ -800,6 +800,33 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_key_near_bottom_does_not_trigger_fetch_more_issues() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![
+            make_work_item("a"),
+            make_work_item("b"),
+            make_work_item("c"),
+            make_work_item("d"),
+            make_work_item("e"),
+            make_work_item("f"),
+        ]);
+        app.active_ui_mut().selected_selectable_idx = Some(1);
+        app.active_ui_mut().table_state.select(Some(1));
+
+        let repo = app.model.repo_order[0].clone();
+        if let Some(rm) = app.model.repos.get_mut(&repo) {
+            rm.issue_has_more = true;
+            rm.issue_fetch_pending = false;
+        }
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        assert!(app.active_ui().show_providers);
+        assert!(app.proto_commands.take_next().is_none(), "did not expect FetchMoreIssues command");
+        assert!(!app.model.repos[&repo].issue_fetch_pending, "did not expect issue_fetch_pending to flip");
+    }
+
+    #[test]
     fn esc_in_help_returns_to_normal() {
         let mut app = stub_app();
         app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
@@ -1114,6 +1141,42 @@ mod tests {
         app.handle_mouse(left_click(20, 29));
 
         assert!(app.visible_status_items().is_empty());
+    }
+
+    #[test]
+    fn scroll_wheel_does_not_reach_table_while_help_is_open() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
+        app.ui.layout.table_area = Rect::new(0, 2, 80, 10);
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
+        assert_eq!(app.widget_stack.len(), 2, "expected help widget to remain on stack");
+    }
+
+    #[test]
+    fn scroll_wheel_does_not_reach_table_while_action_menu_is_open() {
+        let mut app = stub_app();
+        setup_table(&mut app, vec![make_work_item("a"), make_work_item("b")]);
+        app.ui.layout.table_area = Rect::new(0, 2, 80, 10);
+        push_action_menu_widget(&mut app);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.active_ui().selected_selectable_idx, Some(0));
+        assert_eq!(app.widget_stack.len(), 2, "expected action menu to remain on stack");
     }
 
     // ── handle_menu_key (through widget stack) ─────────────────────
