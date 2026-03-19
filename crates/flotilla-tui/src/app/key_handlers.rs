@@ -489,7 +489,7 @@ impl App {
         }
     }
 
-    fn open_action_menu(&mut self) {
+    pub(super) fn open_action_menu(&mut self) {
         let Some(item) = self.selected_work_item().cloned() else {
             return;
         };

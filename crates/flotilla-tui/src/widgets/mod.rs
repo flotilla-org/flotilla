@@ -32,6 +32,9 @@ pub enum AppAction {
     CycleHost,
     ToggleDebug,
     ToggleStatusBarKeys,
+    ToggleProviders,
+    ToggleMultiSelect,
+    OpenActionMenu,
 }
 
 /// Result of handling an event in a widget.

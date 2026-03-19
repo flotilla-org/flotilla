@@ -397,6 +397,18 @@ impl App {
 
     // ── Widget stack helpers ──
 
+    /// Pop all modal widgets from the stack, leaving only the base WorkItemTable.
+    /// Called when the user switches tabs or navigates away, so stale modals
+    /// don't linger across context changes.
+    pub fn dismiss_modals(&mut self) {
+        self.widget_stack.truncate(1);
+    }
+
+    /// Returns true if a modal widget is on the stack above the base layer.
+    pub fn has_modal(&self) -> bool {
+        self.widget_stack.len() > 1
+    }
+
     pub fn build_widget_context(&mut self) -> crate::widgets::WidgetContext<'_> {
         crate::widgets::WidgetContext {
             model: &self.model,
@@ -456,6 +468,16 @@ impl App {
                 }
                 AppAction::ToggleStatusBarKeys => {
                     self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
+                }
+                AppAction::ToggleProviders => {
+                    let sp = self.active_ui().show_providers;
+                    self.active_ui_mut().show_providers = !sp;
+                }
+                AppAction::ToggleMultiSelect => {
+                    self.toggle_multi_select();
+                }
+                AppAction::OpenActionMenu => {
+                    self.open_action_menu();
                 }
             }
         }

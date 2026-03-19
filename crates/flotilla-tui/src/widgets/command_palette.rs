@@ -163,11 +163,21 @@ impl CommandPaletteWidget {
                 Outcome::Finished
             }
 
-            // Remaining actions that the palette re-dispatches to the base layer
-            // via FinishedWith are now handled directly. Actions that toggle
-            // widget-level state (ToggleMultiSelect, ToggleProviders) or need
-            // App context (OpenActionMenu) close the palette without effect —
-            // acceptable since they lack item context when dispatched from the palette.
+            // Widget-level actions dispatched via AppAction
+            Action::ToggleProviders => {
+                ctx.app_actions.push(AppAction::ToggleProviders);
+                Outcome::Finished
+            }
+            Action::ToggleMultiSelect => {
+                ctx.app_actions.push(AppAction::ToggleMultiSelect);
+                Outcome::Finished
+            }
+            Action::OpenActionMenu => {
+                ctx.app_actions.push(AppAction::OpenActionMenu);
+                Outcome::Finished
+            }
+
+            // Remaining actions that don't have meaningful palette behavior
             _ => Outcome::Finished,
         }
     }

@@ -102,7 +102,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                         continue;
                     }
 
-                    let is_normal = matches!(app.ui.mode, UiMode::Normal);
+                    let is_normal = matches!(app.ui.mode, UiMode::Normal) && !app.has_modal();
                     if k.code == KeyCode::Char('r') && is_normal {
                         let repo = app.model.active_repo_root().clone();
                         let daemon = app.daemon.clone();
@@ -148,11 +148,13 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 
                                 match hit {
                                     Some(TabId::Flotilla) => {
+                                        app.dismiss_modals();
                                         app.ui.mode = UiMode::Config;
                                         app.ui.drag.dragging_tab = None;
                                         tab_clicked = true;
                                     }
                                     Some(TabId::Repo(i)) => {
+                                        app.dismiss_modals();
                                         app.switch_tab(i);
                                         app.ui.drag.dragging_tab = Some(i);
                                         app.ui.drag.start_x = x;
