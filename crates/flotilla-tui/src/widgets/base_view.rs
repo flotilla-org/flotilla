@@ -1,16 +1,69 @@
 use std::any::Any;
 
-use ratatui::{layout::Rect, Frame};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    Frame,
+};
 
 use super::{
     event_log::EventLogWidget, preview_panel::PreviewPanel, status_bar_widget::StatusBarWidget, tab_bar::TabBar,
     work_item_table::WorkItemTable, AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::ui_state::UiMode,
+    app::{ui_state::UiMode, RepoViewLayout, TuiModel, UiState},
     keymap::{Action, ModeId},
-    ui,
+    theme::Theme,
+    ui_helpers,
 };
+
+// ── Preview layout constants ──
+
+const PREVIEW_SPLIT_RIGHT_PERCENT: u16 = 40;
+const PREVIEW_SPLIT_BELOW_PERCENT: u16 = 40;
+const MIN_TABLE_WIDTH: u16 = 50;
+const MIN_PREVIEW_WIDTH: u16 = 32;
+const MIN_TABLE_HEIGHT: u16 = 8;
+const MIN_PREVIEW_HEIGHT: u16 = 6;
+const PREVIEW_BELOW_ASPECT_RATIO_THRESHOLD: f32 = 2.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedPreviewPosition {
+    Right,
+    Below,
+}
+
+fn resolve_preview_position(area: Rect, layout: RepoViewLayout) -> Option<ResolvedPreviewPosition> {
+    match layout {
+        RepoViewLayout::Right => Some(ResolvedPreviewPosition::Right),
+        RepoViewLayout::Below => Some(ResolvedPreviewPosition::Below),
+        RepoViewLayout::Auto => Some(resolve_auto_preview_position(area)),
+        RepoViewLayout::Zoom => None,
+    }
+}
+
+fn resolve_auto_preview_position(area: Rect) -> ResolvedPreviewPosition {
+    let right_preview_width = area.width.saturating_mul(PREVIEW_SPLIT_RIGHT_PERCENT) / 100;
+    let right_table_width = area.width.saturating_sub(right_preview_width);
+    let below_preview_height = area.height.saturating_mul(PREVIEW_SPLIT_BELOW_PERCENT) / 100;
+    let below_table_height = area.height.saturating_sub(below_preview_height);
+
+    let right_viable = right_table_width >= MIN_TABLE_WIDTH && right_preview_width >= MIN_PREVIEW_WIDTH;
+    let below_viable = below_table_height >= MIN_TABLE_HEIGHT && below_preview_height >= MIN_PREVIEW_HEIGHT;
+
+    match (right_viable, below_viable) {
+        (true, false) => ResolvedPreviewPosition::Right,
+        (false, true) => ResolvedPreviewPosition::Below,
+        (false, false) => ResolvedPreviewPosition::Right,
+        (true, true) => {
+            let aspect_ratio = area.width as f32 / area.height as f32;
+            if aspect_ratio < PREVIEW_BELOW_ASPECT_RATIO_THRESHOLD {
+                ResolvedPreviewPosition::Below
+            } else {
+                ResolvedPreviewPosition::Right
+            }
+        }
+    }
+}
 
 /// Root widget that composes the base layer: tab bar, content area (table +
 /// preview), status bar, and event log.
@@ -18,9 +71,6 @@ use crate::{
 /// Sits at `widget_stack[0]` and handles all Normal-mode actions that the
 /// previous `WorkItemTable` widget handled. Modal widgets are pushed on top
 /// and rendered after BaseView.
-///
-/// Rendering delegates to `ui::render` which orchestrates layout across the
-/// child components (TabBar, StatusBarWidget, EventLogWidget, PreviewPanel).
 pub struct BaseView {
     pub tab_bar: TabBar,
     pub status_bar: StatusBarWidget,
@@ -44,6 +94,40 @@ impl BaseView {
             preview: PreviewPanel::new(),
             event_log: EventLogWidget::new(),
         }
+    }
+
+    // ── Rendering helpers ──
+
+    fn render_content(&mut self, model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
+        if ui.mode.is_config() {
+            self.event_log.render_config_screen(model, theme, frame, area);
+            return;
+        }
+
+        let Some(position) = resolve_preview_position(area, ui.view_layout) else {
+            self.table.render(model, ui, theme, frame, area);
+            return;
+        };
+
+        let chunks = match position {
+            ResolvedPreviewPosition::Right => Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(100 - PREVIEW_SPLIT_RIGHT_PERCENT),
+                    Constraint::Percentage(PREVIEW_SPLIT_RIGHT_PERCENT),
+                ])
+                .split(area),
+            ResolvedPreviewPosition::Below => Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(100 - PREVIEW_SPLIT_BELOW_PERCENT),
+                    Constraint::Percentage(PREVIEW_SPLIT_BELOW_PERCENT),
+                ])
+                .split(area),
+        };
+
+        self.table.render(model, ui, theme, frame, chunks[0]);
+        self.preview.render(model, ui, theme, frame, chunks[1]);
     }
 
     // ── Action helpers ──
@@ -170,20 +254,28 @@ impl InteractiveWidget for BaseView {
     }
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
-        ui::render(
+        let constraints = vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)];
+        let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
+
+        self.tab_bar.render(ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
+        self.render_content(ctx.model, ctx.ui, ctx.theme, frame, chunks[1]);
+
+        // When the palette is active, move the status bar to the top of the overlay so the
+        // input sits above the results instead of being pinned to the bottom of the screen.
+        let status_bar_area = if ctx.active_widget_mode == Some(ModeId::CommandPalette) {
+            ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
+        } else {
+            chunks[2]
+        };
+        self.status_bar.render(
             ctx.model,
             ctx.ui,
             ctx.in_flight,
             ctx.theme,
-            ctx.keymap,
             frame,
+            status_bar_area,
             ctx.active_widget_mode,
             ctx.active_widget_data.clone(),
-            &mut self.tab_bar,
-            &mut self.status_bar,
-            &mut self.event_log,
-            &self.preview,
-            &self.table,
         );
     }
 
@@ -203,9 +295,13 @@ impl InteractiveWidget for BaseView {
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::WorkItemIdentity;
+    use ratatui::layout::Rect;
 
     use super::*;
-    use crate::app::test_support::{issue_table_entries, TestWidgetHarness};
+    use crate::app::{
+        test_support::{issue_table_entries, TestWidgetHarness},
+        RepoViewLayout,
+    };
 
     fn harness_with_items(count: usize) -> TestWidgetHarness {
         let mut harness = TestWidgetHarness::new();
@@ -594,5 +690,76 @@ mod tests {
 
         let outcome = widget.handle_action(Action::SelectNext, &mut ctx);
         assert!(matches!(outcome, Outcome::Ignored));
+    }
+
+    // -- Preview position resolution --
+
+    #[test]
+    fn auto_layout_prefers_right_when_wide() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Auto);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Right));
+    }
+
+    #[test]
+    fn auto_layout_prefers_below_when_tall() {
+        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), RepoViewLayout::Auto);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Below));
+    }
+
+    #[test]
+    fn explicit_right_layout() {
+        let position = resolve_preview_position(Rect::new(0, 0, 90, 50), RepoViewLayout::Right);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Right));
+    }
+
+    #[test]
+    fn explicit_below_layout() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Below);
+        assert_eq!(position, Some(ResolvedPreviewPosition::Below));
+    }
+
+    #[test]
+    fn zoom_layout_returns_none() {
+        let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Zoom);
+        assert_eq!(position, None);
+    }
+
+    #[test]
+    fn auto_neither_viable_falls_back_to_right() {
+        // 60x10: right_preview_width = 24 (< MIN_PREVIEW_WIDTH 32),
+        //        below_preview_height = 4 (< MIN_PREVIEW_HEIGHT 6)
+        // Both layouts are non-viable, so fallback to Right.
+        let result = resolve_auto_preview_position(Rect::new(0, 0, 60, 10));
+        assert_eq!(result, ResolvedPreviewPosition::Right);
+    }
+
+    #[test]
+    fn auto_only_right_viable() {
+        // 210x10: right_preview_width = 84 (>= 32), right_table_width = 126 (>= 50) -> viable
+        //         below_preview_height = 4 (< 6) -> not viable
+        let result = resolve_auto_preview_position(Rect::new(0, 0, 210, 10));
+        assert_eq!(result, ResolvedPreviewPosition::Right);
+    }
+
+    #[test]
+    fn auto_only_below_viable() {
+        // 60x40: right_preview_width = 24 (< 32) -> not viable
+        //        below_preview_height = 16 (>= 6), below_table_height = 24 (>= 8) -> viable
+        let result = resolve_auto_preview_position(Rect::new(0, 0, 60, 40));
+        assert_eq!(result, ResolvedPreviewPosition::Below);
+    }
+
+    #[test]
+    fn auto_both_viable_wide_prefers_right() {
+        // 160x40: both viable, aspect_ratio = 4.0 (>= 2.0) -> Right
+        let result = resolve_auto_preview_position(Rect::new(0, 0, 160, 40));
+        assert_eq!(result, ResolvedPreviewPosition::Right);
+    }
+
+    #[test]
+    fn auto_both_viable_tall_prefers_below() {
+        // 90x50: both viable, aspect_ratio = 1.8 (< 2.0) -> Below
+        let result = resolve_auto_preview_position(Rect::new(0, 0, 90, 50));
+        assert_eq!(result, ResolvedPreviewPosition::Below);
     }
 }
