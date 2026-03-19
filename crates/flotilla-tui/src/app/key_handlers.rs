@@ -904,6 +904,31 @@ mod tests {
         assert_eq!(app.model.active_repo, 0);
     }
 
+    // ── dismiss_modals ─────────────────────────────────────────────
+
+    #[test]
+    fn dismiss_modals_clears_widget_stack_to_base() {
+        let mut app = stub_app();
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+        assert_eq!(app.widget_stack.len(), 2);
+
+        app.dismiss_modals();
+
+        assert_eq!(app.widget_stack.len(), 1, "only base WorkItemTable should remain");
+    }
+
+    #[test]
+    fn has_modal_reflects_stack_depth() {
+        let mut app = stub_app();
+        assert!(!app.has_modal());
+
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+        assert!(app.has_modal());
+
+        app.dismiss_modals();
+        assert!(!app.has_modal());
+    }
+
     // ── handle_normal_key ────────────────────────────────────────────
 
     #[test]

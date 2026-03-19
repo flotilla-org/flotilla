@@ -512,6 +512,42 @@ mod tests {
     }
 
     #[test]
+    fn confirm_entry_providers_pushes_app_action() {
+        let mut widget = CommandPaletteWidget::new();
+        widget.input = Input::from("providers");
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+
+        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
+        assert!(matches!(outcome, Outcome::Finished));
+        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::ToggleProviders)));
+    }
+
+    #[test]
+    fn confirm_entry_select_pushes_app_action() {
+        let mut widget = CommandPaletteWidget::new();
+        widget.input = Input::from("select");
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+
+        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
+        assert!(matches!(outcome, Outcome::Finished));
+        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::ToggleMultiSelect)));
+    }
+
+    #[test]
+    fn confirm_entry_actions_pushes_app_action() {
+        let mut widget = CommandPaletteWidget::new();
+        widget.input = Input::from("actions");
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+
+        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
+        assert!(matches!(outcome, Outcome::Finished));
+        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::OpenActionMenu)));
+    }
+
+    #[test]
     fn unhandled_action_returns_ignored() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
