@@ -291,6 +291,42 @@ fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
     assert_eq!(replay, Frame::Output(b"Ansi256:true".to_vec()));
 }
 
+#[test]
+fn send_keys_injects_input_into_running_session_pty() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("cat".into())).expect("create alpha");
+
+    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
+    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
+        .write(&mut stream)
+        .expect("write attach init");
+    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+
+    service.send_keys("alpha", b"hello\n").expect("send keys");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut output = Vec::new();
+    while Instant::now() < deadline {
+        match Frame::read(&mut stream).expect("read output") {
+            Frame::Output(bytes) => {
+                output.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&output).contains("hello") {
+                    break;
+                }
+            }
+            other => panic!("expected output frame, got {other:?}"),
+        }
+    }
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("hello"),
+        "send-keys output should reach the attached session, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn replay_reattach_delivers_restore_before_new_live_output() {

@@ -492,6 +492,11 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         },
+                        Ok(Frame::SendKeys(bytes)) => {
+                            if let Err(err) = write_fd_all(pty_fd, &bytes) {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        }
                         Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);
                         }
