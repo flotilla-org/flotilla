@@ -76,3 +76,13 @@ fn vt_ghostty_screen_text_round_trips_output() {
     let text = engine.screen_text().expect("screen text");
     assert!(text.contains("hello capture"), "unexpected screen text: {text}");
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_blank_engine_does_not_emit_replay_payload() {
+    let engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+
+    let replay = engine.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, false)).expect("replay payload");
+
+    assert_eq!(replay, None, "blank ghostty engine should not emit replay");
+}

@@ -9,18 +9,22 @@ pub struct GhosttyVtEngine {
     terminal: TerminalHandle,
     cols: u16,
     rows: u16,
+    saw_output: bool,
 }
 
 impl GhosttyVtEngine {
     pub fn new(cols: u16, rows: u16) -> Self {
         let terminal = TerminalHandle::new(cols, rows, DEFAULT_MAX_SCROLLBACK).expect("create ghostty terminal");
-        Self { terminal, cols, rows }
+        Self { terminal, cols, rows, saw_output: false }
     }
 }
 
 impl VtEngine for GhosttyVtEngine {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.terminal.feed(bytes);
+        if !bytes.is_empty() {
+            self.saw_output = true;
+        }
         Ok(())
     }
 
@@ -36,6 +40,9 @@ impl VtEngine for GhosttyVtEngine {
     }
 
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+        if !self.saw_output {
+            return Ok(None);
+        }
         let mut options = GhosttyFormatterTerminalOptions::init();
         options.emit = GhosttyFormatterFormat::Vt;
         options.extra.modes = true;
