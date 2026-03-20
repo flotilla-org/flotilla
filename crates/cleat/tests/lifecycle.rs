@@ -400,6 +400,9 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
         .expect("write second attach init");
     assert_eq!(Frame::read(&mut second).expect("read second attach response"), Frame::Ack);
 
+    let clear = Frame::read(&mut second).expect("read clear output");
+    assert_eq!(clear, Frame::Output(b"\x1b[2J\x1b[H".to_vec()));
+
     let replay = Frame::read(&mut second).expect("read replay output");
     let replay_bytes = match replay {
         Frame::Output(bytes) => bytes,
@@ -417,6 +420,29 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
         }
     };
     assert!(String::from_utf8_lossy(&live).contains("after"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn first_attach_replay_does_not_clear_before_output() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 5".into())).expect("create alpha");
+
+    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
+    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
+        .write(&mut stream)
+        .expect("write attach init");
+    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+
+    let first = Frame::read(&mut stream).expect("read first output");
+    let bytes = match first {
+        Frame::Output(bytes) => bytes,
+        other => panic!("expected output frame, got {other:?}"),
+    };
+
+    assert_ne!(bytes, b"\x1b[2J\x1b[H".to_vec(), "first attach should not clear before replay/output");
 }
 
 #[test]
