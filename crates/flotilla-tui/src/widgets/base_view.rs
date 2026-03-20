@@ -329,8 +329,9 @@ impl InteractiveWidget for BaseView {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // 1. Event log filter area
-                if self.event_log.handle_click(x, y) {
+                // 1. Event log filter area (only active in Config mode —
+                // the filter area Rect is stale when not in Config mode)
+                if ctx.mode.is_config() && self.event_log.handle_click(x, y) {
                     return Outcome::Consumed;
                 }
 

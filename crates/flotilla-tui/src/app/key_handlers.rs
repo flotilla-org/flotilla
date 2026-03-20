@@ -209,9 +209,16 @@ impl App {
         }
 
         // ── Infinite scroll check ──
-        // After mouse scroll or click that changed selection, check if we
-        // need to fetch more issues. This is cheap (just reads position).
-        self.check_infinite_scroll();
+        // Only after mouse events that actually change selection (scroll or
+        // table click). Other mouse events (status bar, modals, tab bar)
+        // should not trigger background issue fetches.
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp | MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+        ) && !self.has_modal()
+        {
+            self.check_infinite_scroll();
+        }
     }
 
     // ── Private helpers ──
