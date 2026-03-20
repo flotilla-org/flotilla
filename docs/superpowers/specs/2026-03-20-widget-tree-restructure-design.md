@@ -230,6 +230,10 @@ Modals remain at `Screen` level (app-scoped). The current set stays as-is:
 
 Several of these are candidates for folding into the command palette in future (BranchInput, IssueSearch, DeleteConfirm, CloseConfirm), but that is out of scope.
 
+### Status Bar (Future)
+
+The status bar should behave the same regardless of which page is active. Key hints should be context-sensitive to what's available (e.g. commands requiring a selection should not appear when nothing is selected) rather than switching wholesale based on page type. This is orthogonal to the widget restructure and can be addressed separately. Consider whether the work item table should always have a default cursor position so selection-dependent commands are always available.
+
 ## Migration Sequence
 
 Each step leaves the app working.
