@@ -186,13 +186,13 @@ fn parse_named_key(token: &str) -> Option<NamedKey> {
         "F10" => NamedKey::Function(10),
         "F11" => NamedKey::Function(11),
         "F12" => NamedKey::Function(12),
-        _ if token.chars().count() == 1 => NamedKey::Char(token.as_bytes()[0]),
+        _ if token.is_ascii() && token.chars().count() == 1 => NamedKey::Char(token.as_bytes()[0]),
         _ => return None,
     })
 }
 
 fn parse_single_byte_key(token: &str, modifiers: Modifiers) -> Option<Vec<u8>> {
-    if token.chars().count() != 1 {
+    if !token.is_ascii() || token.chars().count() != 1 {
         return None;
     }
 
@@ -302,7 +302,10 @@ fn encode_function_key(function: u8, modifier: Option<u8>) -> Option<Vec<u8>> {
     match function {
         1..=4 => {
             let final_byte = b'P' + (function - 1);
-            encode_modified_csi(final_byte, modifier).or_else(|| Some(vec![0x1b, b'O', final_byte]))
+            match modifier {
+                None => Some(vec![0x1b, b'O', final_byte]),
+                Some(_) => encode_modified_csi(final_byte, modifier),
+            }
         }
         5 => encode_tilde_key(b"15", modifier),
         6 => encode_tilde_key(b"17", modifier),

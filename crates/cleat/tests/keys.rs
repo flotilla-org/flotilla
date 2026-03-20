@@ -16,6 +16,7 @@ fn encodes_named_keys() {
     assert_eq!(encode_send_keys(&strings(&["Tab"]), false, false, 1).expect("tab"), b"\t");
     assert_eq!(encode_send_keys(&strings(&["BSpace"]), false, false, 1).expect("backspace"), b"\x7f");
     assert_eq!(encode_send_keys(&strings(&["Up"]), false, false, 1).expect("up"), b"\x1b[A");
+    assert_eq!(encode_send_keys(&strings(&["F1"]), false, false, 1).expect("f1"), b"\x1bOP");
 }
 
 #[test]
@@ -42,6 +43,12 @@ fn encodes_modified_named_keys() {
 fn encodes_literal_mode_verbatim() {
     let bytes = encode_send_keys(&strings(&["hello", "world"]), true, false, 1).expect("literal mode");
     assert_eq!(bytes, b"helloworld");
+}
+
+#[test]
+fn non_ascii_single_char_tokens_fall_back_to_literal_utf8() {
+    let bytes = encode_send_keys(&strings(&["é"]), false, false, 1).expect("utf-8 fallback");
+    assert_eq!(bytes, "é".as_bytes());
 }
 
 #[test]
