@@ -193,8 +193,7 @@ impl WorkItemTable {
                             .and_then(|co| model.hosts.get(&co.host))
                             .and_then(|h| h.summary.system.home_dir.as_deref())
                             .or(local_home.as_deref());
-                        let repo_root =
-                            item.checkout_key().and_then(|co| host_repo_roots.get(&co.host)).unwrap_or(&local_repo_root);
+                        let repo_root = item.checkout_key().and_then(|co| host_repo_roots.get(&co.host)).unwrap_or(&local_repo_root);
                         let mut row =
                             build_item_row(item, &rm.providers, &col_widths, repo_root, prev_source.as_deref(), pending, theme, home_dir);
                         prev_source = item.source.clone();

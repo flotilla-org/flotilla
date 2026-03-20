@@ -53,6 +53,27 @@ impl Hash for Action {
 }
 
 impl Action {
+    /// Returns true if the action is global — handled before the widget stack.
+    ///
+    /// Global actions are those that affect app-level state (tabs, theme, layout,
+    /// host filter, debug panel, status bar keys, refresh) and should not flow
+    /// through the widget stack.
+    pub fn is_global(&self) -> bool {
+        matches!(
+            self,
+            Action::PrevTab
+                | Action::NextTab
+                | Action::MoveTabLeft
+                | Action::MoveTabRight
+                | Action::CycleTheme
+                | Action::CycleLayout
+                | Action::CycleHost
+                | Action::ToggleDebug
+                | Action::ToggleStatusBarKeys
+                | Action::Refresh
+        )
+    }
+
     /// Parse an action from its snake_case config string representation.
     ///
     /// Intent-wrapping actions use the intent name directly (e.g. "remove_checkout"

@@ -17,18 +17,12 @@ impl App {
         self.keymap.resolve(mode_id, crokey::KeyCombination::from(key))
     }
 
-    /// Handle actions that the widget stack returned `Ignored` for.
+    /// Handle global actions that bypass the widget stack entirely.
     ///
-    /// These are actions that need `&mut App` context the widget doesn't
-    /// have: confirm/enter, action menu, file picker, dispatch intent,
-    /// tab navigation, and tab reorder.
-    pub(super) fn dispatch_action(&mut self, action: Action) {
+    /// These are app-level operations (tab switching, theme/layout cycling,
+    /// debug toggle, etc.) that don't depend on the focused widget.
+    pub(super) fn handle_global_action(&mut self, action: Action) {
         match action {
-            Action::Confirm => {
-                if matches!(self.ui.mode, UiMode::Normal) {
-                    self.action_enter();
-                }
-            }
             Action::PrevTab => self.prev_tab(),
             Action::NextTab => self.next_tab(),
             Action::MoveTabLeft => {
@@ -39,6 +33,46 @@ impl App {
             Action::MoveTabRight => {
                 if !self.ui.mode.is_config() && self.move_tab(1) {
                     self.config.save_tab_order(&self.persisted_tab_order_paths());
+                }
+            }
+            Action::CycleTheme => {
+                let themes = crate::theme::available_themes();
+                let current = self.theme.name;
+                let idx = themes.iter().position(|(name, _)| *name == current).unwrap_or(0);
+                let next = (idx + 1) % themes.len();
+                self.theme = (themes[next].1)();
+            }
+            Action::CycleLayout => {
+                self.ui.cycle_layout();
+                self.persist_layout();
+            }
+            Action::CycleHost => {
+                let peer_hosts = self.model.peer_host_names();
+                self.ui.cycle_target_host(&peer_hosts);
+            }
+            Action::ToggleDebug => {
+                self.ui.show_debug = !self.ui.show_debug;
+            }
+            Action::ToggleStatusBarKeys => {
+                self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
+            }
+            Action::Refresh => {
+                let repo = self.model.active_repo_root().clone();
+                self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(flotilla_protocol::RepoSelector::Path(repo)) }));
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle actions that the widget stack returned `Ignored` for.
+    ///
+    /// These are actions that need `&mut App` context the widget doesn't
+    /// have: confirm/enter, action menu, file picker, and dispatch intent.
+    pub(super) fn dispatch_action(&mut self, action: Action) {
+        match action {
+            Action::Confirm => {
+                if matches!(self.ui.mode, UiMode::Normal) {
+                    self.action_enter();
                 }
             }
             Action::OpenActionMenu => {
@@ -56,25 +90,9 @@ impl App {
                     self.dispatch_if_available(intent);
                 }
             }
-            // Handled by the widget stack (BaseView or modal widgets).
-            // Can still reach here when a modal returns Ignored (e.g. pressing
-            // `?` while the action menu is open). The no-op is correct.
-            Action::SelectNext
-            | Action::SelectPrev
-            | Action::Dismiss
-            | Action::Refresh
-            | Action::ToggleHelp
-            | Action::ToggleMultiSelect
-            | Action::ToggleProviders
-            | Action::Quit
-            | Action::OpenBranchInput
-            | Action::OpenIssueSearch
-            | Action::OpenCommandPalette
-            | Action::ToggleDebug
-            | Action::ToggleStatusBarKeys
-            | Action::CycleHost
-            | Action::CycleLayout
-            | Action::CycleTheme => {}
+            // Handled by the widget stack (BaseView or modal widgets) or
+            // pre-dispatched as global actions. No-op if they reach here.
+            _ => {}
         }
     }
 
@@ -115,6 +133,14 @@ impl App {
                 _ => self.keymap.resolve(mode_id, crokey::KeyCombination::from(key)),
             }
         };
+
+        // Global actions bypass the widget stack entirely.
+        if let Some(action) = action {
+            if action.is_global() {
+                self.handle_global_action(action);
+                return;
+            }
+        }
 
         let mut stack = std::mem::take(&mut self.widget_stack);
         let (outcome_action, app_actions) = {

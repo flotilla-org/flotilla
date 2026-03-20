@@ -265,16 +265,6 @@ impl InteractiveWidget for BaseView {
                 ctx.app_actions.push(AppAction::Quit);
                 Outcome::Consumed
             }
-            Action::Refresh => {
-                let repo = ctx.model.active_repo_root().clone();
-                ctx.commands.push(flotilla_protocol::Command {
-                    host: None,
-                    context_repo: None,
-                    action: flotilla_protocol::CommandAction::Refresh { repo: Some(flotilla_protocol::RepoSelector::Path(repo)) },
-                });
-                Outcome::Consumed
-            }
-
             // Open modal widgets -- return Push outcomes
             Action::ToggleHelp => Outcome::Push(Box::new(super::help::HelpWidget::new())),
 
@@ -289,37 +279,13 @@ impl InteractiveWidget for BaseView {
 
             Action::OpenCommandPalette => Outcome::Push(Box::new(super::command_palette::CommandPaletteWidget::new())),
 
-            // App-level toggles
-            Action::ToggleDebug => {
-                ctx.app_actions.push(AppAction::ToggleDebug);
-                Outcome::Consumed
-            }
-            Action::ToggleStatusBarKeys => {
-                ctx.app_actions.push(AppAction::ToggleStatusBarKeys);
-                Outcome::Consumed
-            }
-            Action::CycleHost => {
-                ctx.app_actions.push(AppAction::CycleHost);
-                Outcome::Consumed
-            }
-            Action::CycleLayout => {
-                ctx.app_actions.push(AppAction::CycleLayout);
-                Outcome::Consumed
-            }
-            Action::CycleTheme => {
-                ctx.app_actions.push(AppAction::CycleTheme);
-                Outcome::Consumed
-            }
-
             // Actions that need &App context -- fall through to legacy dispatch
-            Action::Confirm
-            | Action::OpenActionMenu
-            | Action::OpenFilePicker
-            | Action::Dispatch(_)
-            | Action::PrevTab
-            | Action::NextTab
-            | Action::MoveTabLeft
-            | Action::MoveTabRight => Outcome::Ignored,
+            Action::Confirm | Action::OpenActionMenu | Action::OpenFilePicker | Action::Dispatch(_) => Outcome::Ignored,
+
+            // Global actions (tab nav, theme, layout, host, debug, status bar keys,
+            // refresh) are pre-dispatched before the widget stack. If they somehow
+            // reach here, ignore them.
+            _ => Outcome::Ignored,
         }
     }
 
@@ -908,14 +874,19 @@ mod tests {
     }
 
     #[test]
-    fn cycle_theme_pushes_app_action() {
+    fn global_actions_return_ignored() {
         let mut widget = BaseView::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
-        let outcome = widget.handle_action(Action::CycleTheme, &mut ctx);
-        assert!(matches!(outcome, Outcome::Consumed));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::CycleTheme)));
+        // Global actions are pre-dispatched by App before reaching the widget
+        // stack, so BaseView should return Ignored for all of them.
+        let globals =
+            [Action::CycleTheme, Action::CycleLayout, Action::CycleHost, Action::ToggleDebug, Action::ToggleStatusBarKeys, Action::Refresh];
+        for action in globals {
+            let outcome = widget.handle_action(action, &mut ctx);
+            assert!(matches!(outcome, Outcome::Ignored), "expected Ignored for {action:?}");
+        }
     }
 
     // -- Config mode --
