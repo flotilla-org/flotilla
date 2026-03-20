@@ -72,6 +72,7 @@ pub trait VtEngine {
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String>;
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
+    fn screen_text(&self) -> Result<String, String>;
     fn size(&self) -> (u16, u16);
 }
 

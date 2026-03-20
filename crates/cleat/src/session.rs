@@ -43,6 +43,7 @@ const STRIP_ENV_VARS: &[&str] = &["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
 const DEFAULT_TERMINAL_COLS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DETACH_CLEANUP_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
+const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 static ATTACH_SIGNAL_EXIT: AtomicBool = AtomicBool::new(false);
@@ -398,6 +399,10 @@ impl VtEngine for TestReplayProbeVtEngine {
         Ok(Some(payload.into_bytes()))
     }
 
+    fn screen_text(&self) -> Result<String, String> {
+        Ok(format!("probe:{}x{}", self.cols, self.rows))
+    }
+
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
@@ -444,6 +449,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     let mut vt_engine = default_vt_engine(session.vt_engine)?;
 
     let mut active_client: Option<ActiveClient> = None;
+    let mut had_foreground_client = false;
     loop {
         let poll_result = poll_ready(
             listener.as_raw_fd(),
@@ -467,11 +473,15 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                                 let mut client = ActiveClient::new(stream);
                                 if let Some(payload) = replay {
                                     if !payload.is_empty() {
+                                        if had_foreground_client {
+                                            client.enqueue_frame(&Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()))?;
+                                        }
                                         client.enqueue_frame(&Frame::Output(payload))?;
                                     }
                                 }
                                 let _ = fs::write(foreground_path(root, id), b"1");
                                 active_client = Some(client);
+                                had_foreground_client = true;
                             } else {
                                 let _ = Frame::Busy.write(&mut stream);
                             }
@@ -479,6 +489,19 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                         Ok(Frame::Detach) => {
                             let _ = fs::remove_file(foreground_path(root, id));
                             active_client = None;
+                        }
+                        Ok(Frame::Capture) => match vt_engine.screen_text() {
+                            Ok(text) => {
+                                let _ = Frame::Output(text.into_bytes()).write(&mut stream);
+                            }
+                            Err(err) => {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        },
+                        Ok(Frame::SendKeys(bytes)) => {
+                            if let Err(err) = write_fd_all(pty_fd, &bytes) {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
                         }
                         Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);

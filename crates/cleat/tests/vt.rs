@@ -35,6 +35,15 @@ fn vt_passthrough_replay_remains_disabled_for_client_capabilities() {
     assert_eq!(engine.replay_payload(&capabilities).expect("replay payload"), None);
 }
 
+#[test]
+fn vt_passthrough_screen_text_is_unsupported() {
+    let engine = PassthroughVtEngine::new(80, 24);
+
+    let err = engine.screen_text().expect_err("passthrough should not capture text");
+
+    assert!(err.contains("unsupported"));
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn vt_ghostty_engine_contract_is_locked() {
@@ -55,4 +64,25 @@ fn vt_ghostty_formatter_alloc_round_trips_output() {
 
     let replay_text = String::from_utf8_lossy(&replay);
     assert!(replay_text.contains("hello ghostty formatter"), "unexpected replay payload: {replay_text}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_text_round_trips_output() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+
+    engine.feed(b"hello capture").expect("feed bytes");
+
+    let text = engine.screen_text().expect("screen text");
+    assert!(text.contains("hello capture"), "unexpected screen text: {text}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_blank_engine_does_not_emit_replay_payload() {
+    let engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+
+    let replay = engine.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, false)).expect("replay payload");
+
+    assert_eq!(replay, None, "blank ghostty engine should not emit replay");
 }

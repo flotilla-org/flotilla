@@ -37,6 +37,10 @@ impl VtEngine for PassthroughVtEngine {
         Ok(None)
     }
 
+    fn screen_text(&self) -> Result<String, String> {
+        Err("screen text capture is unsupported for vt engine passthrough".to_string())
+    }
+
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }

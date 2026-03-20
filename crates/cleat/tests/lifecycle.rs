@@ -136,6 +136,49 @@ fn list_json_reports_existing_sessions() {
 }
 
 #[test]
+fn capture_rejects_passthrough_sessions() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 5".into())).expect("create alpha");
+    let cli = Cli::try_parse_from(["cleat", "capture", "alpha"]).expect("parse capture");
+
+    let err = cli::execute(cli, &service).expect_err("passthrough capture should fail");
+
+    assert!(err.contains("unsupported"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn capture_returns_text_for_ghostty_sessions() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("printf 'hello capture'; sleep 5".into()))
+        .expect("create alpha");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let output = loop {
+        let cli = Cli::try_parse_from(["cleat", "capture", "alpha"]).expect("parse capture");
+        match cli::execute(cli, &service) {
+            Ok(Some(text)) if text.contains("hello capture") => break text,
+            Ok(Some(_)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(Some(text)) => panic!("capture did not include expected text: {text}"),
+            Ok(None) => panic!("capture returned no output"),
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("capture failed: {err}"),
+        }
+    };
+
+    assert!(output.contains("hello capture"));
+}
+
+#[test]
 fn kill_removes_session_directory() {
     let _lock = env_lock().lock().expect("env lock");
     let temp = tempfile::tempdir().expect("tempdir");
@@ -248,6 +291,79 @@ fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
     assert_eq!(replay, Frame::Output(b"Ansi256:true".to_vec()));
 }
 
+#[test]
+fn send_keys_injects_input_into_running_session_pty() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("cat".into())).expect("create alpha");
+
+    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
+    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
+        .write(&mut stream)
+        .expect("write attach init");
+    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+
+    service.send_keys("alpha", b"hello\n").expect("send keys");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut output = Vec::new();
+    while Instant::now() < deadline {
+        match Frame::read(&mut stream).expect("read output") {
+            Frame::Output(bytes) => {
+                output.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&output).contains("hello") {
+                    break;
+                }
+            }
+            other => panic!("expected output frame, got {other:?}"),
+        }
+    }
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("hello"),
+        "send-keys output should reach the attached session, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn send_keys_cli_executes_end_to_end() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("cat".into())).expect("create alpha");
+
+    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
+    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
+        .write(&mut stream)
+        .expect("write attach init");
+    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+
+    let cli = Cli::try_parse_from(["cleat", "send-keys", "alpha", "h", "i", "Enter"]).expect("parse send-keys");
+    assert_eq!(cli::execute(cli, &service).expect("execute send-keys"), None);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut output = Vec::new();
+    while Instant::now() < deadline {
+        match Frame::read(&mut stream).expect("read output") {
+            Frame::Output(bytes) => {
+                output.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&output).contains("hi") {
+                    break;
+                }
+            }
+            other => panic!("expected output frame, got {other:?}"),
+        }
+    }
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("hi"),
+        "cli send-keys output should reach the attached session, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn replay_reattach_delivers_restore_before_new_live_output() {
@@ -284,6 +400,9 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
         .expect("write second attach init");
     assert_eq!(Frame::read(&mut second).expect("read second attach response"), Frame::Ack);
 
+    let clear = Frame::read(&mut second).expect("read clear output");
+    assert_eq!(clear, Frame::Output(b"\x1b[2J\x1b[H".to_vec()));
+
     let replay = Frame::read(&mut second).expect("read replay output");
     let replay_bytes = match replay {
         Frame::Output(bytes) => bytes,
@@ -301,6 +420,29 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
         }
     };
     assert!(String::from_utf8_lossy(&live).contains("after"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn first_attach_replay_does_not_clear_before_output() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 5".into())).expect("create alpha");
+
+    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
+    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
+        .write(&mut stream)
+        .expect("write attach init");
+    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+
+    let first = Frame::read(&mut stream).expect("read first output");
+    let bytes = match first {
+        Frame::Output(bytes) => bytes,
+        other => panic!("expected output frame, got {other:?}"),
+    };
+
+    assert_ne!(bytes, b"\x1b[2J\x1b[H".to_vec(), "first attach should not clear before replay/output");
 }
 
 #[test]

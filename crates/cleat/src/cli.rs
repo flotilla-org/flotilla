@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::{server::SessionService, vt::VtEngineKind};
+use crate::{keys::encode_send_keys, server::SessionService, vt::VtEngineKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "cleat", version)]
@@ -44,11 +44,26 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Capture {
+        id: String,
+    },
     Detach {
         id: String,
     },
     Kill {
         id: String,
+    },
+    SendKeys {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(short = 'l', conflicts_with = "hex")]
+        literal: bool,
+        #[arg(short = 'H', conflicts_with = "literal")]
+        hex: bool,
+        #[arg(short = 'N', default_value_t = 1, value_parser = parse_repeat)]
+        repeat: usize,
+        #[arg(value_name = "KEY", required = true, num_args = 1..)]
+        keys: Vec<String>,
     },
     #[command(hide = true)]
     Serve {
@@ -90,12 +105,18 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                 Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
+        Command::Capture { id } => service.capture(&id).map(Some),
         Command::Detach { id } => {
             service.detach(&id)?;
             Ok(None)
         }
         Command::Kill { id } => {
             service.kill(&id)?;
+            Ok(None)
+        }
+        Command::SendKeys { id, literal, hex, repeat, keys } => {
+            let bytes = encode_send_keys(&keys, literal, hex, repeat)?;
+            service.send_keys(&id, &bytes)?;
             Ok(None)
         }
         Command::Serve { id } => {
@@ -119,5 +140,14 @@ fn format_session_status(status: &crate::protocol::SessionStatus) -> &'static st
     match status {
         crate::protocol::SessionStatus::Attached => "attached",
         crate::protocol::SessionStatus::Detached => "detached",
+    }
+}
+
+fn parse_repeat(value: &str) -> Result<usize, String> {
+    let repeat = value.parse::<usize>().map_err(|err| err.to_string())?;
+    if repeat == 0 {
+        Err("repeat count must be at least 1".to_string())
+    } else {
+        Ok(repeat)
     }
 }
