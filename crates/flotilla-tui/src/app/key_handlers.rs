@@ -829,6 +829,15 @@ mod tests {
         assert!(!app.has_modal());
     }
 
+    #[test]
+    fn global_tab_switch_blocked_when_modal_is_open() {
+        let mut app = stub_app_with_repos(2);
+        let before = app.model.active_repo;
+        app.widget_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+        app.handle_key(key(KeyCode::Char(']'))); // NextTab
+        assert_eq!(app.model.active_repo, before, "tab switch must not fire through modal");
+    }
+
     // ── handle_normal_key ────────────────────────────────────────────
 
     #[test]
@@ -1527,7 +1536,6 @@ mod tests {
         push_action_menu_widget(&mut app);
         app.handle_key(key(KeyCode::Enter));
         // Widget should be popped, command should be pushed
-        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
         assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
     }
 

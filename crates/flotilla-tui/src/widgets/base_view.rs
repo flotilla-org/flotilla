@@ -72,9 +72,6 @@ fn resolve_auto_preview_position(area: Rect) -> ResolvedPreviewPosition {
 /// Root widget that composes the base layer: tab bar, content area (table +
 /// preview), status bar, and event log.
 ///
-/// Sits at `widget_stack[0]` and handles all Normal-mode actions that the
-/// previous `WorkItemTable` widget handled. Modal widgets are pushed on top
-/// and rendered after BaseView.
 /// Double-click detection state for table row clicks.
 #[derive(Default)]
 pub struct DoubleClickState {
@@ -82,6 +79,12 @@ pub struct DoubleClickState {
     pub last_selectable_idx: Option<usize>,
 }
 
+/// Root widget that composes the base layer: tab bar, content area (table +
+/// preview), status bar, and event log.
+///
+/// Sits at `widget_stack[0]` and handles all Normal-mode actions via
+/// two-phase dispatch (focused child first, then cross-cutting concerns).
+/// Modal widgets are pushed on top and rendered after BaseView.
 pub struct BaseView {
     pub tab_bar: TabBar,
     pub status_bar: StatusBarWidget,

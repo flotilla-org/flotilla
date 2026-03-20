@@ -250,5 +250,4 @@ mod tests {
         tab_bar.tab_areas.insert(TabId::Add, Rect::new(30, 0, 5, 1));
         assert_eq!(tab_bar.handle_click(32, 0, false), TabBarAction::OpenFilePicker);
     }
-
 }
