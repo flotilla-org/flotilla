@@ -222,8 +222,26 @@ impl BaseView {
 
 impl InteractiveWidget for BaseView {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        // Only handle table actions when in Normal mode. Config/EventLog mode
-        // actions fall through to the legacy dispatch_action path.
+        // Config mode: handle event-log navigation and dismiss.
+        if matches!(*ctx.mode, UiMode::Config) {
+            return match action {
+                Action::SelectNext => {
+                    self.event_log.select_next();
+                    Outcome::Consumed
+                }
+                Action::SelectPrev => {
+                    self.event_log.select_prev();
+                    Outcome::Consumed
+                }
+                Action::Dismiss => {
+                    *ctx.mode = UiMode::Normal;
+                    Outcome::Consumed
+                }
+                _ => Outcome::Ignored,
+            };
+        }
+
+        // Normal mode: handle table actions, modal opens, and toggles.
         if !matches!(*ctx.mode, UiMode::Normal) {
             return Outcome::Ignored;
         }
@@ -899,16 +917,58 @@ mod tests {
         assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::CycleTheme)));
     }
 
-    // -- Non-Normal mode returns Ignored --
+    // -- Config mode --
 
     #[test]
-    fn non_normal_mode_returns_ignored() {
+    fn config_select_next_navigates_event_log() {
         let mut widget = BaseView::new();
+        widget.event_log.count = 5;
+        widget.event_log.selected = Some(0);
+
         let mut harness = TestWidgetHarness::new();
         harness.mode = UiMode::Config;
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::SelectNext, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(widget.event_log.selected, Some(1));
+    }
+
+    #[test]
+    fn config_select_prev_navigates_event_log() {
+        let mut widget = BaseView::new();
+        widget.event_log.count = 5;
+        widget.event_log.selected = Some(3);
+
+        let mut harness = TestWidgetHarness::new();
+        harness.mode = UiMode::Config;
+        let mut ctx = harness.ctx();
+
+        let outcome = widget.handle_action(Action::SelectPrev, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(widget.event_log.selected, Some(2));
+    }
+
+    #[test]
+    fn config_dismiss_returns_to_normal() {
+        let mut widget = BaseView::new();
+        let mut harness = TestWidgetHarness::new();
+        harness.mode = UiMode::Config;
+        let mut ctx = harness.ctx();
+
+        let outcome = widget.handle_action(Action::Dismiss, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert!(matches!(harness.mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn config_unhandled_action_returns_ignored() {
+        let mut widget = BaseView::new();
+        let mut harness = TestWidgetHarness::new();
+        harness.mode = UiMode::Config;
+        let mut ctx = harness.ctx();
+
+        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
         assert!(matches!(outcome, Outcome::Ignored));
     }
 

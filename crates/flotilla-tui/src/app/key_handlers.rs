@@ -19,29 +19,16 @@ impl App {
 
     /// Handle actions that the widget stack returned `Ignored` for.
     ///
-    /// This covers actions that need `&mut App` context the widget doesn't have
-    /// (action_enter, open_action_menu, open_file_picker, dispatch intent, tab
-    /// navigation, theme/layout/debug/host/status-bar toggles) as well as
-    /// event-log navigation in Config mode.
+    /// These are actions that need `&mut App` context the widget doesn't
+    /// have: confirm/enter, action menu, file picker, dispatch intent,
+    /// tab navigation, and tab reorder.
     pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
-            Action::SelectNext => {
-                // BaseView handles Normal mode; only EventLog reaches here.
-                if matches!(self.ui.mode, UiMode::Config) {
-                    self.with_base_view(|bv| bv.event_log.select_next());
-                }
-            }
-            Action::SelectPrev => {
-                if matches!(self.ui.mode, UiMode::Config) {
-                    self.with_base_view(|bv| bv.event_log.select_prev());
-                }
-            }
             Action::Confirm => {
                 if matches!(self.ui.mode, UiMode::Normal) {
                     self.action_enter();
                 }
             }
-            Action::Refresh => {} // handled in the main event loop
             Action::PrevTab => self.prev_tab(),
             Action::NextTab => self.next_tab(),
             Action::MoveTabLeft => {
@@ -64,20 +51,19 @@ impl App {
                     self.open_file_picker_from_active_repo_parent();
                 }
             }
-            Action::Dismiss => {
-                // BaseView handles Normal mode dismiss cascade. Only Config reaches here.
-                if matches!(self.ui.mode, UiMode::Config) {
-                    self.ui.mode = UiMode::Normal;
-                }
-            }
             Action::Dispatch(intent) => {
                 if matches!(self.ui.mode, UiMode::Normal) {
                     self.dispatch_if_available(intent);
                 }
             }
-            // Handled by widget stack (via AppAction or direct widget handling)
-            // — should not reach here in normal flow
-            Action::ToggleHelp
+            // Handled by the widget stack (BaseView or modal widgets).
+            // Can still reach here when a modal returns Ignored (e.g. pressing
+            // `?` while the action menu is open). The no-op is correct.
+            Action::SelectNext
+            | Action::SelectPrev
+            | Action::Dismiss
+            | Action::Refresh
+            | Action::ToggleHelp
             | Action::ToggleMultiSelect
             | Action::ToggleProviders
             | Action::Quit
@@ -88,12 +74,7 @@ impl App {
             | Action::ToggleStatusBarKeys
             | Action::CycleHost
             | Action::CycleLayout
-            | Action::CycleTheme => {
-                // These are handled by the widget stack in normal flow. They can
-                // still reach here when a modal widget returns Ignored (e.g. pressing
-                // `?` while the action menu is open). The no-op is correct — the
-                // action should not fire from inside an unrelated modal.
-            }
+            | Action::CycleTheme => {}
         }
     }
 
@@ -455,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_action_select_next_moves_config_event_log_selection() {
+    fn config_select_next_moves_event_log_via_widget() {
         let mut app = stub_app();
         app.ui.mode = UiMode::Config;
         app.with_base_view(|bv| {
@@ -463,7 +444,7 @@ mod tests {
             bv.event_log.selected = Some(0);
         });
 
-        app.dispatch_action(Action::SelectNext);
+        app.handle_key(key(KeyCode::Char('j')));
 
         let selected = app.with_base_view(|bv| bv.event_log.selected);
         assert_eq!(selected, Some(1));
