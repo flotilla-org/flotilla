@@ -25,7 +25,7 @@ mod tests {
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![dir_entry("foo", false, false)]);
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
+        assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     }
 
     #[test]
@@ -37,7 +37,7 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
 
         // Widget should remain on stack
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     #[test]
@@ -51,7 +51,7 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
 
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     #[test]
@@ -65,7 +65,7 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Up));
 
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     #[test]
@@ -75,7 +75,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Down));
 
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     #[test]
@@ -89,7 +89,7 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
 
         // Widget should remain on stack after tab completion
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     #[test]
@@ -100,7 +100,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('j')));
 
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     // ── activate_dir_entry tests ─────────────────────────────────────
@@ -120,7 +120,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should be dismissed after adding a repo
-        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
+        assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
 
         // Should have pushed a TrackRepoPath command
         let (cmd, _) = app.proto_commands.take_next().expect("expected a command");
@@ -149,7 +149,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into dir)
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
         // No AddRepo command should have been pushed
         assert!(app.proto_commands.take_next().is_none());
     }
@@ -163,7 +163,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into subdir)
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     #[test]
@@ -174,7 +174,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack since there are no entries
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -189,7 +189,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into dir)
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 
     #[test]
@@ -202,6 +202,6 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into dir)
-        assert_eq!(app.widget_stack.last().expect("stack non-empty").mode_id(), ModeId::FilePicker);
+        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), ModeId::FilePicker);
     }
 }

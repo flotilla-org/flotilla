@@ -11,6 +11,7 @@ use flotilla_tui::{
     app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState},
     keymap::Keymap,
     theme::Theme,
+    widgets::InteractiveWidget,
 };
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
@@ -25,7 +26,7 @@ pub struct TestHarness {
     pub model: TuiModel,
     pub ui: UiState,
     pub in_flight: HashMap<u64, InFlightCommand>,
-    pub widget_stack: Vec<Box<dyn flotilla_tui::widgets::InteractiveWidget>>,
+    pub screen: flotilla_tui::widgets::screen::Screen,
     theme: Option<Theme>,
     width: u16,
     height: u16,
@@ -41,7 +42,7 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
-            widget_stack: vec![Box::new(flotilla_tui::widgets::base_view::BaseView::new())],
+            screen: flotilla_tui::widgets::screen::Screen::new(),
             theme: None,
             width: WIDTH,
             height: HEIGHT,
@@ -57,7 +58,7 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
-            widget_stack: vec![Box::new(flotilla_tui::widgets::base_view::BaseView::new())],
+            screen: flotilla_tui::widgets::screen::Screen::new(),
             theme: None,
             width: WIDTH,
             height: HEIGHT,
@@ -73,7 +74,7 @@ impl TestHarness {
             model,
             ui,
             in_flight: HashMap::new(),
-            widget_stack: vec![Box::new(flotilla_tui::widgets::base_view::BaseView::new())],
+            screen: flotilla_tui::widgets::screen::Screen::new(),
             theme: None,
             width: WIDTH,
             height: HEIGHT,
@@ -108,9 +109,9 @@ impl TestHarness {
         self
     }
 
-    /// Push an interactive widget onto the widget stack for rendering.
+    /// Push an interactive widget onto the modal stack for rendering.
     pub fn with_widget(mut self, widget: Box<dyn flotilla_tui::widgets::InteractiveWidget>) -> Self {
-        self.widget_stack.push(widget);
+        self.screen.modal_stack.push(widget);
         self
     }
 
@@ -168,8 +169,8 @@ impl TestHarness {
         let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         let keymap = Keymap::defaults();
-        let active_widget_mode = self.widget_stack.last().map(|w| w.mode_id());
-        let active_widget_data = self.widget_stack.last().map(|w| w.status_data()).unwrap_or_default();
+        let active_widget_mode = self.screen.active_mode_id();
+        let active_widget_data = self.screen.active_status_data();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -182,9 +183,7 @@ impl TestHarness {
                     active_widget_mode,
                     active_widget_data: active_widget_data.clone(),
                 };
-                for widget in &mut self.widget_stack {
-                    widget.render(frame, area, &mut ctx);
-                }
+                self.screen.render(frame, area, &mut ctx);
             })
             .expect("failed to draw test frame");
         terminal.backend().buffer().clone()

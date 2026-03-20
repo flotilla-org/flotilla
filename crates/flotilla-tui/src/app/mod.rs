@@ -260,7 +260,7 @@ pub struct App {
     pub in_flight: HashMap<u64, InFlightCommand>,
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
-    pub widget_stack: Vec<Box<dyn crate::widgets::InteractiveWidget>>,
+    pub screen: crate::widgets::screen::Screen,
 }
 
 impl App {
@@ -286,7 +286,7 @@ impl App {
             in_flight: HashMap::new(),
             pending_cancel: None,
             should_quit: false,
-            widget_stack: vec![Box::new(crate::widgets::screen::Screen::new())],
+            screen: crate::widgets::screen::Screen::new(),
         }
     }
 
@@ -298,8 +298,8 @@ impl App {
         if self.ui.repo_ui.values().any(|rui| rui.pending_actions.values().any(|a| matches!(a.status, PendingStatus::InFlight))) {
             return true;
         }
-        // Check widget stack for loading states
-        if let Some(widget) = self.widget_stack.last() {
+        // Check modal stack for loading states
+        if let Some(widget) = self.screen.modal_stack.last() {
             if let Some(biw) = widget.as_any().downcast_ref::<crate::widgets::branch_input::BranchInputWidget>() {
                 if biw.is_generating() {
                     return true;
@@ -410,27 +410,16 @@ impl App {
 
     // ── Widget stack helpers ──
 
-    /// Temporarily extract the widget stack so the caller can downcast and
-    /// mutate the `BaseView` at `stack[0]` without conflicting borrows on
-    /// other `App` fields. The stack is restored after the closure returns.
-    pub fn with_base_view<R>(&mut self, f: impl FnOnce(&mut crate::widgets::base_view::BaseView) -> R) -> R {
-        let mut stack = std::mem::take(&mut self.widget_stack);
-        let screen = stack[0].as_any_mut().downcast_mut::<crate::widgets::screen::Screen>().expect("widget_stack[0] is always Screen");
-        let result = f(&mut screen.base_view);
-        self.widget_stack = stack;
-        result
-    }
-
-    /// Pop all modal widgets from the stack, leaving only the base BaseView.
+    /// Pop all modal widgets from the stack.
     /// Called when the user switches tabs or navigates away, so stale modals
     /// don't linger across context changes.
     pub fn dismiss_modals(&mut self) {
-        self.widget_stack.truncate(1);
+        self.screen.dismiss_modals();
     }
 
     /// Returns true if a modal widget is on the stack above the base layer.
     pub fn has_modal(&self) -> bool {
-        self.widget_stack.len() > 1
+        self.screen.has_modal()
     }
 
     pub fn build_widget_context(&mut self) -> crate::widgets::WidgetContext<'_> {
@@ -446,24 +435,6 @@ impl App {
             repo_ui: &mut self.ui.repo_ui,
             mode: &mut self.ui.mode,
             app_actions: Vec::new(),
-        }
-    }
-
-    pub fn apply_outcome(&mut self, index: usize, outcome: crate::widgets::Outcome) {
-        match outcome {
-            crate::widgets::Outcome::Consumed => {}
-            // Callers only invoke apply_outcome for non-Ignored outcomes; this arm is unreachable today.
-            crate::widgets::Outcome::Ignored => {}
-            crate::widgets::Outcome::Finished => {
-                self.widget_stack.remove(index);
-            }
-            crate::widgets::Outcome::Push(widget) => {
-                self.widget_stack.push(widget);
-            }
-            crate::widgets::Outcome::Swap(widget) => {
-                self.widget_stack.remove(index);
-                self.widget_stack.insert(index, widget);
-            }
         }
     }
 
@@ -876,7 +847,7 @@ impl App {
             input = Input::from(parent_str.as_str());
         }
         let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
-        self.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
+        self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
     }
 }
 
@@ -1483,7 +1454,7 @@ mod tests {
             WorkItemIdentity::Session("test".into()),
             Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: id.into() } },
         );
-        app.widget_stack.push(Box::new(widget));
+        app.screen.modal_stack.push(Box::new(widget));
     }
 
     #[test]
@@ -1491,7 +1462,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Char('y')));
-        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
+        assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
         let cmd = app.proto_commands.take_next();
         assert!(matches!(cmd, Some((Command { action: CommandAction::CloseChangeRequest { id }, .. }, _)) if id == "42"));
     }
@@ -1501,7 +1472,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
+        assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
         let cmd = app.proto_commands.take_next();
         assert!(matches!(cmd, Some((Command { action: CommandAction::CloseChangeRequest { id }, .. }, _)) if id == "42"));
     }
@@ -1511,7 +1482,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
+        assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -1520,7 +1491,7 @@ mod tests {
         let mut app = stub_app();
         push_close_confirm_widget(&mut app, "42");
         app.handle_key(key(KeyCode::Char('n')));
-        assert_eq!(app.widget_stack.len(), 1, "expected only base widget on stack");
+        assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
         assert!(app.proto_commands.take_next().is_none());
     }
 

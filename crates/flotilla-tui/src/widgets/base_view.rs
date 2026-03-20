@@ -82,9 +82,9 @@ pub struct DoubleClickState {
 /// Root widget that composes the base layer: tab bar, content area (table +
 /// preview), status bar, and event log.
 ///
-/// Sits at `widget_stack[0]` and handles all Normal-mode actions via
+/// Owned by `Screen` as the base layer and handles all Normal-mode actions via
 /// two-phase dispatch (focused child first, then cross-cutting concerns).
-/// Modal widgets are pushed on top and rendered after BaseView.
+/// Modal widgets are pushed onto Screen's modal_stack and rendered after BaseView.
 pub struct BaseView {
     pub tab_bar: TabBar,
     pub status_bar: StatusBarWidget,

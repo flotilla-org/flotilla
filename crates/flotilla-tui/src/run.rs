@@ -9,6 +9,7 @@ use crossterm::{
 use crate::{
     app::{self, App},
     event::{self, Event},
+    widgets::InteractiveWidget,
 };
 
 /// Run the TUI event loop: replay initial state, then process events until quit.
@@ -137,15 +138,11 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     Ok(())
 }
 
-/// Render one frame by iterating the widget stack.
-///
-/// Takes the widget stack out of `app` to avoid borrow conflicts between the
-/// stack iteration and the mutable `RenderContext` (which borrows `app.ui`).
-/// The stack is restored after rendering.
+/// Render one frame by calling `Screen::render()` which handles the base
+/// layer and all modals.
 fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
-    let mut stack = std::mem::take(&mut app.widget_stack);
-    let active_widget_mode = stack.last().map(|w| w.mode_id());
-    let active_widget_data = stack.last().map(|w| w.status_data()).unwrap_or_default();
+    let active_widget_mode = app.screen.active_mode_id();
+    let active_widget_data = app.screen.active_status_data();
     terminal.draw(|f| {
         let area = f.area();
         let mut ctx = crate::widgets::RenderContext {
@@ -157,10 +154,7 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
             active_widget_mode,
             active_widget_data: active_widget_data.clone(),
         };
-        for widget in &mut stack {
-            widget.render(f, area, &mut ctx);
-        }
+        app.screen.render(f, area, &mut ctx);
     })?;
-    app.widget_stack = stack;
     Ok(())
 }

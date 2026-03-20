@@ -61,19 +61,19 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
 /// `DeleteConfirm { loading: true }` must be cleared so the user
 /// can see the error message and isn't stuck in a loading state.
 fn reset_loading_mode(app: &mut App) {
-    // Pop loading widgets from the widget stack on error.
-    if let Some(widget) = app.widget_stack.last_mut() {
+    // Pop loading widgets from the modal stack on error.
+    if let Some(widget) = app.screen.modal_stack.last_mut() {
         if let Some(dcw) = widget.as_any_mut().downcast_mut::<crate::widgets::delete_confirm::DeleteConfirmWidget>() {
             if dcw.loading {
-                app.widget_stack.pop();
+                app.screen.modal_stack.pop();
                 return;
             }
         }
     }
-    if let Some(widget) = app.widget_stack.last_mut() {
+    if let Some(widget) = app.screen.modal_stack.last_mut() {
         if let Some(biw) = widget.as_any_mut().downcast_mut::<crate::widgets::branch_input::BranchInputWidget>() {
             if biw.is_generating() {
-                app.widget_stack.pop();
+                app.screen.modal_stack.pop();
             }
         }
     }
@@ -115,7 +115,8 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
         }
         CommandResult::BranchNameGenerated { name, issue_ids } => {
             let updated = app
-                .widget_stack
+                .screen
+                .modal_stack
                 .last_mut()
                 .and_then(|widget| widget.as_any_mut().downcast_mut::<crate::widgets::branch_input::BranchInputWidget>());
             if let Some(biw) = updated {
@@ -126,7 +127,8 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
         }
         CommandResult::CheckoutStatus(info) => {
             let updated = app
-                .widget_stack
+                .screen
+                .modal_stack
                 .last_mut()
                 .and_then(|widget| widget.as_any_mut().downcast_mut::<crate::widgets::delete_confirm::DeleteConfirmWidget>());
             if let Some(dcw) = updated {

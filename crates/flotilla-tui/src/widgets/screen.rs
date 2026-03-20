@@ -6,10 +6,14 @@ use ratatui::{layout::Rect, Frame};
 use super::{base_view::BaseView, AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext, WidgetStatusData};
 use crate::keymap::{Action, ModeId};
 
-/// Root widget that wraps the base layer. Will eventually own Tabs,
-/// StatusBar, and the modal stack. For now, delegates to BaseView.
+/// Root widget that owns the base layer and the modal stack.
+///
+/// Renders the base view first, then any modals on top. Owns the
+/// `has_modal()`, `dismiss_modals()`, and `apply_outcome()` helpers
+/// that previously lived on `App`.
 pub struct Screen {
     pub base_view: BaseView,
+    pub modal_stack: Vec<Box<dyn InteractiveWidget>>,
 }
 
 impl Default for Screen {
@@ -20,7 +24,51 @@ impl Default for Screen {
 
 impl Screen {
     pub fn new() -> Self {
-        Self { base_view: BaseView::new() }
+        Self { base_view: BaseView::new(), modal_stack: Vec::new() }
+    }
+
+    /// Returns true if a modal widget is on the stack above the base layer.
+    pub fn has_modal(&self) -> bool {
+        !self.modal_stack.is_empty()
+    }
+
+    /// Pop all modal widgets from the stack.
+    /// Called when the user switches tabs or navigates away, so stale modals
+    /// don't linger across context changes.
+    pub fn dismiss_modals(&mut self) {
+        self.modal_stack.clear();
+    }
+
+    /// Apply a widget outcome from event dispatch.
+    ///
+    /// Since modals are always on top, `Finished` pops the top modal,
+    /// `Push` pushes a new modal, and `Swap` replaces the top modal.
+    /// If the outcome originated from the base_view (no modals), `Push`
+    /// still pushes onto the modal_stack.
+    pub fn apply_outcome(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Consumed | Outcome::Ignored => {}
+            Outcome::Finished => {
+                self.modal_stack.pop();
+            }
+            Outcome::Push(widget) => {
+                self.modal_stack.push(widget);
+            }
+            Outcome::Swap(widget) => {
+                self.modal_stack.pop();
+                self.modal_stack.push(widget);
+            }
+        }
+    }
+
+    /// The mode of the topmost widget (modal or base_view).
+    pub fn active_mode_id(&self) -> Option<ModeId> {
+        self.modal_stack.last().map(|w| w.mode_id()).or(Some(self.base_view.mode_id()))
+    }
+
+    /// Extra status data from the topmost widget.
+    pub fn active_status_data(&self) -> WidgetStatusData {
+        self.modal_stack.last().map(|w| w.status_data()).unwrap_or_default()
     }
 }
 
@@ -79,7 +127,10 @@ impl InteractiveWidget for Screen {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
-        self.base_view.render(frame, area, ctx)
+        self.base_view.render(frame, area, ctx);
+        for modal in &mut self.modal_stack {
+            modal.render(frame, area, ctx);
+        }
     }
 
     fn mode_id(&self) -> ModeId {
