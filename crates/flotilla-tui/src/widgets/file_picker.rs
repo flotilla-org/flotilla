@@ -484,6 +484,27 @@ mod tests {
     }
 
     #[test]
+    fn refresh_marks_added_repos() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let repo_dir = tmp.path().join("tracked");
+        std::fs::create_dir(&repo_dir).expect("create dir");
+        std::fs::create_dir(tmp.path().join("untracked")).expect("create dir");
+        let canonical = std::fs::canonicalize(&repo_dir).expect("canonicalize");
+
+        let mut harness = TestWidgetHarness::new();
+        // Point the stub repo's path at our tracked directory
+        let first_repo = harness.model.repo_order[0].clone();
+        harness.model.repos.get_mut(&first_repo).expect("repo").path = canonical;
+
+        let widget = picker_for_tmpdir(tmp.path(), &harness);
+
+        let tracked = widget.dir_entries.iter().find(|e| e.name == "tracked").expect("tracked");
+        assert!(tracked.is_added, "tracked repo should be marked as added");
+        let untracked = widget.dir_entries.iter().find(|e| e.name == "untracked").expect("untracked");
+        assert!(!untracked.is_added, "untracked dir should not be marked as added");
+    }
+
+    #[test]
     fn refresh_filters_by_prefix() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         std::fs::create_dir(tmp.path().join("alpha")).expect("create dir");
