@@ -261,10 +261,6 @@ pub struct App {
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
     pub widget_stack: Vec<Box<dyn crate::widgets::InteractiveWidget>>,
-    pub tab_bar: crate::widgets::tab_bar::TabBar,
-    pub status_bar_widget: crate::widgets::status_bar_widget::StatusBarWidget,
-    pub event_log_widget: crate::widgets::event_log::EventLogWidget,
-    pub preview_panel: crate::widgets::preview_panel::PreviewPanel,
 }
 
 impl App {
@@ -291,10 +287,6 @@ impl App {
             pending_cancel: None,
             should_quit: false,
             widget_stack: vec![Box::new(crate::widgets::base_view::BaseView::new())],
-            tab_bar: crate::widgets::tab_bar::TabBar::new(),
-            status_bar_widget: crate::widgets::status_bar_widget::StatusBarWidget::new(),
-            event_log_widget: crate::widgets::event_log::EventLogWidget::new(),
-            preview_panel: crate::widgets::preview_panel::PreviewPanel::new(),
         }
     }
 
@@ -306,7 +298,20 @@ impl App {
         if self.ui.repo_ui.values().any(|rui| rui.pending_actions.values().any(|a| matches!(a.status, PendingStatus::InFlight))) {
             return true;
         }
-        matches!(self.ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. } | UiMode::DeleteConfirm { loading: true, .. })
+        // Check widget stack for loading states
+        if let Some(widget) = self.widget_stack.last() {
+            if let Some(biw) = widget.as_any().downcast_ref::<crate::widgets::branch_input::BranchInputWidget>() {
+                if biw.is_generating() {
+                    return true;
+                }
+            }
+            if let Some(dcw) = widget.as_any().downcast_ref::<crate::widgets::delete_confirm::DeleteConfirmWidget>() {
+                if dcw.loading {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn persist_layout(&self) {
@@ -405,6 +410,17 @@ impl App {
 
     // ── Widget stack helpers ──
 
+    /// Temporarily extract the widget stack so the caller can downcast and
+    /// mutate the `BaseView` at `stack[0]` without conflicting borrows on
+    /// other `App` fields. The stack is restored after the closure returns.
+    pub fn with_base_view<R>(&mut self, f: impl FnOnce(&mut crate::widgets::base_view::BaseView) -> R) -> R {
+        let mut stack = std::mem::take(&mut self.widget_stack);
+        let base = stack[0].as_any_mut().downcast_mut::<crate::widgets::base_view::BaseView>().expect("widget_stack[0] is always BaseView");
+        let result = f(base);
+        self.widget_stack = stack;
+        result
+    }
+
     /// Pop all modal widgets from the stack, leaving only the base BaseView.
     /// Called when the user switches tabs or navigates away, so stale modals
     /// don't linger across context changes.
@@ -499,6 +515,29 @@ impl App {
                 }
                 AppAction::OpenActionMenu => {
                     self.open_action_menu();
+                }
+                AppAction::ActionEnter => {
+                    self.action_enter();
+                }
+                AppAction::StatusBarKeyPress { code, modifiers } => {
+                    self.handle_key(crossterm::event::KeyEvent::new(code, modifiers));
+                }
+                AppAction::ClearError(id) => {
+                    self.dismiss_status_item(id);
+                }
+                AppAction::SwitchToConfig => {
+                    self.dismiss_modals();
+                    self.ui.mode = UiMode::Config;
+                }
+                AppAction::SwitchToRepo(i) => {
+                    self.dismiss_modals();
+                    self.switch_tab(i);
+                }
+                AppAction::SaveTabOrder => {
+                    self.config.save_tab_order(&self.persisted_tab_order_paths());
+                }
+                AppAction::OpenFilePicker => {
+                    self.open_file_picker_from_active_repo_parent();
                 }
             }
         }
@@ -814,20 +853,13 @@ impl App {
         }
     }
 
-    pub fn prefill_branch_input(&mut self, branch_name: &str, pending_issue_ids: Vec<(String, String)>) {
-        self.ui.mode = UiMode::BranchInput { input: Input::from(branch_name), kind: BranchInputKind::Manual, pending_issue_ids };
-    }
-
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
         let mut input = Input::default();
         if let Some(parent) = self.model.active_repo_root().parent() {
             let parent_str = format!("{}/", parent.display());
             input = Input::from(parent_str.as_str());
         }
-        self.ui.mode = UiMode::FilePicker { input: input.clone(), dir_entries: Vec::new(), selected: 0 };
-        self.refresh_dir_listing();
-        // Build dir_entries after refresh so the widget has them
-        let dir_entries = if let UiMode::FilePicker { ref dir_entries, .. } = self.ui.mode { dir_entries.clone() } else { Vec::new() };
+        let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
         self.widget_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
     }
 }
@@ -1424,20 +1456,6 @@ mod tests {
         let item = app.selected_work_item();
         assert!(item.is_some());
         assert_eq!(item.unwrap().branch.as_deref(), Some("feat"));
-    }
-
-    #[test]
-    fn prefill_branch_input_sets_mode() {
-        let mut app = stub_app();
-        app.prefill_branch_input("my-branch", vec![("gh".into(), "1".into())]);
-        match &app.ui.mode {
-            UiMode::BranchInput { input, kind, pending_issue_ids } => {
-                assert_eq!(input.value(), "my-branch");
-                assert_eq!(*kind, BranchInputKind::Manual);
-                assert_eq!(pending_issue_ids.len(), 1);
-            }
-            _ => panic!("expected BranchInput mode"),
-        }
     }
 
     // -- CloseConfirm flow (via widget stack) --

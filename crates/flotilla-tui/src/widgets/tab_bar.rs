@@ -1,9 +1,12 @@
-use std::collections::BTreeMap;
+use std::{any::Any, collections::BTreeMap};
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{layout::Rect, style::Style, Frame};
 
+use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{ui_state::DragState, TabId, TuiModel, UiState},
+    keymap::{Action, ModeId},
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
     theme::{BarKind, Theme},
 };
@@ -25,13 +28,12 @@ pub enum TabBarAction {
 
 /// Standalone tab bar component. Handles rendering and mouse hit-testing
 /// for the top-level tab strip.
-///
-/// Does not implement `InteractiveWidget` — it will be composed into
-/// `BaseView` in a future step.
 #[derive(Default)]
 pub struct TabBar {
     /// Click target areas populated during the most recent render.
     tab_areas: BTreeMap<TabId, Rect>,
+    /// Whether a tab drag is visually active. Set by `BaseView` before render.
+    pub drag_active: bool,
 }
 
 impl TabBar {
@@ -45,7 +47,7 @@ impl TabBar {
     /// The caller should also pass `ui` so the tab areas are written back
     /// into `ui.layout.tab_areas` (shared with other components that still
     /// read from there).
-    pub fn render(&mut self, model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
+    pub fn render_bespoke(&mut self, model: &TuiModel, ui: &mut UiState, drag_active: bool, theme: &Theme, frame: &mut Frame, area: Rect) {
         let mut items = Vec::new();
         let mut tab_ids = Vec::new();
 
@@ -74,7 +76,7 @@ impl TabBar {
                 label,
                 key_hint: None,
                 active: is_active,
-                dragging: is_active && ui.drag.active,
+                dragging: is_active && drag_active,
                 style_override: None,
             });
             tab_ids.push(TabId::Repo(i));
@@ -122,8 +124,6 @@ impl TabBar {
             Some(TabId::Flotilla) => TabBarAction::SwitchToConfig,
             Some(TabId::Repo(i)) => TabBarAction::SwitchToRepo(i),
             Some(TabId::Add) => TabBarAction::OpenFilePicker,
-            // TabId::Gear is not a tab bar item — it's rendered in the table
-            // border and handled by the table mouse path in key_handlers.rs.
             _ => TabBarAction::None,
         }
     }
@@ -168,6 +168,54 @@ impl TabBar {
     }
 }
 
+impl InteractiveWidget for TabBar {
+    fn handle_action(&mut self, _action: Action, _ctx: &mut WidgetContext) -> Outcome {
+        Outcome::Ignored
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, ctx: &mut WidgetContext) -> Outcome {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Outcome::Ignored;
+        }
+
+        let x = mouse.column;
+        let y = mouse.row;
+        let is_config = ctx.mode.is_config();
+        let tab_action = self.handle_click(x, y, is_config);
+        match tab_action {
+            TabBarAction::SwitchToConfig => {
+                ctx.app_actions.push(AppAction::SwitchToConfig);
+                Outcome::Consumed
+            }
+            TabBarAction::SwitchToRepo(i) => {
+                ctx.app_actions.push(AppAction::SwitchToRepo(i));
+                Outcome::Consumed
+            }
+            TabBarAction::OpenFilePicker => {
+                ctx.app_actions.push(AppAction::OpenFilePicker);
+                Outcome::Consumed
+            }
+            TabBarAction::None => Outcome::Ignored,
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
+        self.render_bespoke(ctx.model, ctx.ui, self.drag_active, ctx.theme, frame, area);
+    }
+
+    fn mode_id(&self) -> ModeId {
+        ModeId::Normal
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 use flotilla_protocol::RepoIdentity;
 
 #[cfg(test)]
@@ -201,14 +249,5 @@ mod tests {
         let mut tab_bar = TabBar::new();
         tab_bar.tab_areas.insert(TabId::Add, Rect::new(30, 0, 5, 1));
         assert_eq!(tab_bar.handle_click(32, 0, false), TabBarAction::OpenFilePicker);
-    }
-
-    #[test]
-    fn gear_click_not_handled_by_tab_bar() {
-        // TabId::Gear is rendered in the table border, not the tab bar.
-        // Even if it ends up in tab_areas, the tab bar should not handle it.
-        let mut tab_bar = TabBar::new();
-        tab_bar.tab_areas.insert(TabId::Gear, Rect::new(40, 0, 3, 1));
-        assert_eq!(tab_bar.handle_click(41, 0, false), TabBarAction::None);
     }
 }

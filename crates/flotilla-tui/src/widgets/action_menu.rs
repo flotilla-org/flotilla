@@ -6,7 +6,6 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState},
     Frame,
 };
-use tui_input::Input;
 
 use super::{
     branch_input::BranchInputWidget, close_confirm::CloseConfirmWidget, delete_confirm::DeleteConfirmWidget, InteractiveWidget, Outcome,
@@ -15,7 +14,7 @@ use super::{
 use crate::{
     app::{
         intent::Intent,
-        ui_state::{BranchInputKind, PendingActionContext, UiMode},
+        ui_state::{BranchInputKind, PendingActionContext},
     },
     keymap::{Action, ModeId},
     ui_helpers,
@@ -60,8 +59,6 @@ impl ActionMenuWidget {
                 return Outcome::Swap(Box::new(widget));
             }
             Intent::GenerateBranchName => {
-                *ctx.mode =
-                    UiMode::BranchInput { input: Input::default(), kind: BranchInputKind::Generating, pending_issue_ids: Vec::new() };
                 let pending_ctx =
                     PendingActionContext { identity: self.item.identity.clone(), description: entry.intent.label(labels), repo_identity };
                 ctx.commands.push_with_context(entry.command.clone(), Some(pending_ctx));
@@ -160,6 +157,10 @@ impl InteractiveWidget for ActionMenuWidget {
 
     fn mode_id(&self) -> ModeId {
         ModeId::ActionMenu
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

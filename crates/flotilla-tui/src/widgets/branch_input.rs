@@ -5,9 +5,9 @@ use flotilla_protocol::{CheckoutTarget, Command, CommandAction, RepoSelector};
 use ratatui::{layout::Rect, style::Style, text::Line, widgets::Paragraph, Frame};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
-use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
+use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext, WidgetStatusData};
 use crate::{
-    app::ui_state::{BranchInputKind, UiMode},
+    app::ui_state::BranchInputKind,
     keymap::{Action, ModeId},
     shimmer::shimmer_spans,
     ui_helpers,
@@ -35,11 +35,6 @@ impl BranchInputWidget {
         self.kind = BranchInputKind::Manual;
         self.pending_issue_ids = issue_ids;
     }
-
-    fn sync_mode(&self, ctx: &mut WidgetContext) {
-        *ctx.mode =
-            UiMode::BranchInput { input: self.input.clone(), kind: self.kind.clone(), pending_issue_ids: self.pending_issue_ids.clone() };
-    }
 }
 
 impl InteractiveWidget for BranchInputWidget {
@@ -64,23 +59,18 @@ impl InteractiveWidget for BranchInputWidget {
                     };
                     ctx.commands.push(cmd);
                 }
-                *ctx.mode = UiMode::Normal;
                 Outcome::Finished
             }
-            Action::Dismiss => {
-                *ctx.mode = UiMode::Normal;
-                Outcome::Finished
-            }
+            Action::Dismiss => Outcome::Finished,
             _ => Outcome::Ignored,
         }
     }
 
-    fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
+    fn handle_raw_key(&mut self, key: KeyEvent, _ctx: &mut WidgetContext) -> Outcome {
         if self.kind == BranchInputKind::Generating {
             return Outcome::Consumed;
         }
         self.input.handle_event(&crossterm::event::Event::Key(key));
-        self.sync_mode(ctx);
         Outcome::Consumed
     }
 
@@ -111,6 +101,14 @@ impl InteractiveWidget for BranchInputWidget {
 
     fn captures_raw_keys(&self) -> bool {
         true
+    }
+
+    fn status_data(&self) -> WidgetStatusData {
+        WidgetStatusData::BranchInput { generating: self.is_generating() }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

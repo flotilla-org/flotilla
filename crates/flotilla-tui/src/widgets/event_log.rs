@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::{any::Any, collections::HashMap};
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -8,9 +9,11 @@ use ratatui::{
     Frame,
 };
 
+use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{PeerStatus, ProviderStatus, TuiHostState, TuiModel},
     event_log::{self, LevelExt},
+    keymap::{Action, ModeId},
     theme::Theme,
 };
 
@@ -47,25 +50,6 @@ impl Default for EventLogWidget {
 impl EventLogWidget {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Render the full config screen: providers panel, hosts panel, and event log.
-    pub fn render_config_screen(&mut self, model: &TuiModel, theme: &Theme, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
-
-        let host_count = model.hosts.len();
-        let host_height = (host_count as u16 + 2).min(8);
-        let left_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(host_height)])
-            .split(chunks[0]);
-        render_global_status(model, theme, frame, left_chunks[0]);
-        render_hosts_status(model, theme, frame, left_chunks[1]);
-
-        self.render_event_log(theme, frame, chunks[1]);
     }
 
     /// Render just the event log panel (scrollable list with level filter).
@@ -161,6 +145,65 @@ impl EventLogWidget {
     /// backward-compatible layout areas or tab bar click detection).
     pub fn filter_area(&self) -> Rect {
         self.filter_area
+    }
+}
+
+impl InteractiveWidget for EventLogWidget {
+    fn handle_action(&mut self, action: Action, _ctx: &mut WidgetContext) -> Outcome {
+        match action {
+            Action::SelectNext => {
+                self.select_next();
+                Outcome::Consumed
+            }
+            Action::SelectPrev => {
+                self.select_prev();
+                Outcome::Consumed
+            }
+            _ => Outcome::Ignored,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, _ctx: &mut WidgetContext) -> Outcome {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.handle_click(mouse.column, mouse.row) {
+                    Outcome::Consumed
+                } else {
+                    Outcome::Ignored
+                }
+            }
+            _ => Outcome::Ignored,
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+
+        let host_count = ctx.model.hosts.len();
+        let host_height = (host_count as u16 + 2).min(8);
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(host_height)])
+            .split(chunks[0]);
+        render_global_status(ctx.model, ctx.theme, frame, left_chunks[0]);
+        render_hosts_status(ctx.model, ctx.theme, frame, left_chunks[1]);
+
+        self.render_event_log(ctx.theme, frame, chunks[1]);
+    }
+
+    fn mode_id(&self) -> ModeId {
+        ModeId::Config
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

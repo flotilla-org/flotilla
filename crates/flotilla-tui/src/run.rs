@@ -2,14 +2,13 @@ use std::{io::stdout, time::Duration};
 
 use color_eyre::Result;
 use crossterm::{
-    event::{EnableMouseCapture, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
+    event::{EnableMouseCapture, KeyCode, KeyModifiers, MouseEventKind},
     execute,
 };
 
 use crate::{
     app::{self, App, UiMode},
     event::{self, Event},
-    widgets::tab_bar::TabBarAction,
 };
 
 /// Run the TUI event loop: replay initial state, then process events until quit.
@@ -112,66 +111,9 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                         app.handle_key(k);
                     }
                 }
-                Event::Mouse(m) => match m.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let x = m.column;
-                        let y = m.row;
-                        // Check event log filter click first (owned by EventLogWidget)
-                        if app.event_log_widget.handle_click(x, y) {
-                            continue;
-                        }
-                        let action = app.tab_bar.handle_click(x, y, app.ui.mode.is_config());
-                        let tab_clicked = match action {
-                            TabBarAction::SwitchToConfig => {
-                                app.dismiss_modals();
-                                app.ui.mode = UiMode::Config;
-                                app.ui.drag.dragging_tab = None;
-                                true
-                            }
-                            TabBarAction::SwitchToRepo(i) => {
-                                app.dismiss_modals();
-                                app.switch_tab(i);
-                                app.ui.drag.dragging_tab = Some(i);
-                                app.ui.drag.start_x = x;
-                                app.ui.drag.active = false;
-                                true
-                            }
-                            TabBarAction::OpenFilePicker => {
-                                app.open_file_picker_from_active_repo_parent();
-                                true
-                            }
-                            TabBarAction::None => false,
-                        };
-                        if !tab_clicked {
-                            app.ui.drag.dragging_tab = None;
-                            app.handle_mouse(m);
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if app.ui.drag.dragging_tab.is_some() {
-                            app.tab_bar.handle_drag(
-                                m.column,
-                                m.row,
-                                &mut app.ui.drag,
-                                &mut app.model.repo_order,
-                                &mut app.model.active_repo,
-                            );
-                        } else {
-                            app.handle_mouse(m);
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if app.ui.drag.dragging_tab.take().is_some() {
-                            if app.ui.drag.active {
-                                app.config.save_tab_order(&app.persisted_tab_order_paths());
-                            }
-                            app.ui.drag.active = false;
-                        }
-                    }
-                    _ => {
-                        app.handle_mouse(m);
-                    }
-                },
+                Event::Mouse(m) => {
+                    app.handle_mouse(m);
+                }
                 Event::Tick => {} // already filtered out
             }
         }
@@ -215,11 +157,12 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 /// Render one frame by iterating the widget stack.
 ///
 /// Takes the widget stack out of `app` to avoid borrow conflicts between the
-/// stack iteration and the mutable `RenderContext` (which borrows `app.ui`,
-/// `app.tab_bar`, etc.). The stack is restored after rendering.
+/// stack iteration and the mutable `RenderContext` (which borrows `app.ui`).
+/// The stack is restored after rendering.
 fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let mut stack = std::mem::take(&mut app.widget_stack);
     let active_widget_mode = stack.last().map(|w| w.mode_id());
+    let active_widget_data = stack.last().map(|w| w.status_data()).unwrap_or_default();
     terminal.draw(|f| {
         let area = f.area();
         let mut ctx = crate::widgets::RenderContext {
@@ -229,10 +172,7 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
             keymap: &app.keymap,
             in_flight: &app.in_flight,
             active_widget_mode,
-            tab_bar: &mut app.tab_bar,
-            status_bar_widget: &mut app.status_bar_widget,
-            event_log_widget: &mut app.event_log_widget,
-            preview_panel: &app.preview_panel,
+            active_widget_data: active_widget_data.clone(),
         };
         for widget in &mut stack {
             widget.render(f, area, &mut ctx);

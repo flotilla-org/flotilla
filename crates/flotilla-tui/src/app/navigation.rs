@@ -70,6 +70,7 @@ impl App {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn select_next(&mut self) {
         let indices = &self.active_ui().table_view.selectable_indices;
         if indices.is_empty() {
@@ -102,6 +103,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn select_prev(&mut self) {
         let indices = &self.active_ui().table_view.selectable_indices;
         if indices.is_empty() {
@@ -118,6 +120,7 @@ impl App {
         self.active_ui_mut().table_state.select(Some(table_idx));
     }
 
+    #[cfg(test)]
     pub(super) fn row_at_mouse(&self, x: u16, y: u16) -> Option<usize> {
         let ta = self.ui.layout.table_area;
         if x >= ta.x && x < ta.x + ta.width && y >= ta.y && y < ta.y + ta.height {
@@ -148,7 +151,7 @@ mod tests {
     #[test]
     fn switch_tab_sets_active_repo_and_mode() {
         let mut app = stub_app_with_repos(3);
-        app.ui.mode = UiMode::Help;
+        app.ui.mode = UiMode::Config;
         app.switch_tab(2);
         assert_eq!(app.model.active_repo, 2);
         assert!(matches!(app.ui.mode, UiMode::Normal));

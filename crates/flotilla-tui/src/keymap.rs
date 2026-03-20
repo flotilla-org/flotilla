@@ -53,6 +53,27 @@ impl Hash for Action {
 }
 
 impl Action {
+    /// Returns true if the action is global — handled before the widget stack.
+    ///
+    /// Global actions are those that affect app-level state (tabs, theme, layout,
+    /// host filter, debug panel, status bar keys, refresh) and should not flow
+    /// through the widget stack.
+    pub fn is_global(&self) -> bool {
+        matches!(
+            self,
+            Action::PrevTab
+                | Action::NextTab
+                | Action::MoveTabLeft
+                | Action::MoveTabRight
+                | Action::CycleTheme
+                | Action::CycleLayout
+                | Action::CycleHost
+                | Action::ToggleDebug
+                | Action::ToggleStatusBarKeys
+                | Action::Refresh
+        )
+    }
+
     /// Parse an action from its snake_case config string representation.
     ///
     /// Intent-wrapping actions use the intent name directly (e.g. "remove_checkout"
@@ -223,15 +244,8 @@ impl From<&UiMode> for ModeId {
     fn from(mode: &UiMode) -> Self {
         match mode {
             UiMode::Normal => ModeId::Normal,
-            UiMode::Help => ModeId::Help,
             UiMode::Config => ModeId::Config,
-            UiMode::ActionMenu { .. } => ModeId::ActionMenu,
-            UiMode::BranchInput { .. } => ModeId::BranchInput,
-            UiMode::FilePicker { .. } => ModeId::FilePicker,
-            UiMode::DeleteConfirm { .. } => ModeId::DeleteConfirm,
-            UiMode::CloseConfirm { .. } => ModeId::CloseConfirm,
             UiMode::IssueSearch { .. } => ModeId::IssueSearch,
-            UiMode::CommandPalette { .. } => ModeId::CommandPalette,
         }
     }
 }
@@ -755,9 +769,8 @@ mod tests {
     #[test]
     fn mode_id_from_ui_mode() {
         assert_eq!(ModeId::from(&UiMode::Normal), ModeId::Normal);
-        assert_eq!(ModeId::from(&UiMode::Help), ModeId::Help);
         assert_eq!(ModeId::from(&UiMode::Config), ModeId::Config);
-        assert_eq!(ModeId::from(&UiMode::ActionMenu { items: vec![], index: 0 }), ModeId::ActionMenu);
+        assert_eq!(ModeId::from(&UiMode::IssueSearch { input: tui_input::Input::default() }), ModeId::IssueSearch);
     }
 
     // ── help_sections tests ──

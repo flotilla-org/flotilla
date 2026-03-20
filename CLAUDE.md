@@ -45,7 +45,7 @@ cargo test -p flotilla-core --locked --features test-support --test in_process_d
 
 This fork exists for Claude Code Web sessions. Two things to be aware of:
 
-- **Upstream repo for gh commands**: Issues and PRs live on the upstream `rjwittams/flotilla`. Always pass `-R rjwittams/flotilla` to `gh issue` and `gh pr` commands (e.g. `gh issue list -R rjwittams/flotilla`, `gh pr create -R rjwittams/flotilla`). PRs should target `rjwittams/flotilla:main` as the base.
+- **Upstream repo for gh commands**: Issues and PRs live on the upstream `flotilla-org/flotilla`. Always pass `-R flotilla-org/flotilla` to `gh issue` and `gh pr` commands (e.g. `gh issue list -R flotilla-org/flotilla`, `gh pr create -R flotilla-org/flotilla`). PRs should target `flotilla-org/flotilla:main` as the base.
 - **No local servers**: The sandbox blocks binding ports, so MCP servers and visualization tools that start local HTTP servers won't work.
 
 ## Architecture

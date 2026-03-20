@@ -11,6 +11,7 @@ pub mod issue_search;
 pub mod preview_panel;
 pub mod status_bar_widget;
 pub mod tab_bar;
+pub mod work_item_table;
 
 use std::{any::Any, collections::HashMap};
 
@@ -24,6 +25,23 @@ use crate::{
     keymap::{Action, Keymap, ModeId},
     theme::Theme,
 };
+
+/// Extra data the active widget exposes for the status bar.
+///
+/// Replaces the old pattern of reading overlay state from `UiMode`.
+/// Widgets that need to communicate status text or flags override
+/// `InteractiveWidget::status_data()`.
+#[derive(Debug, Clone, Default)]
+pub enum WidgetStatusData {
+    #[default]
+    None,
+    BranchInput {
+        generating: bool,
+    },
+    CommandPalette {
+        input_text: String,
+    },
+}
 
 /// App-level effects that widgets can request. Processed by the event
 /// loop after widget dispatch — widgets declare intent, the app executes.
@@ -39,6 +57,13 @@ pub enum AppAction {
     ToggleProviders,
     ToggleMultiSelect,
     OpenActionMenu,
+    ActionEnter,
+    StatusBarKeyPress { code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers },
+    ClearError(usize),
+    SwitchToConfig,
+    SwitchToRepo(usize),
+    SaveTabOrder,
+    OpenFilePicker,
 }
 
 /// Result of handling an event in a widget.
@@ -72,8 +97,8 @@ pub struct WidgetContext<'a> {
 
 /// Context provided to widgets during rendering.
 ///
-/// Mutable fields (`ui`, child components) are needed because the base layer
-/// rendering updates table state, layout areas, and widget-internal caches.
+/// Mutable fields (`ui`) are needed because the base layer rendering updates
+/// table state and layout areas.
 pub struct RenderContext<'a> {
     pub model: &'a TuiModel,
     pub ui: &'a mut UiState,
@@ -83,11 +108,8 @@ pub struct RenderContext<'a> {
     /// The mode of the topmost widget on the stack. Used by the status bar
     /// to show the correct key hints.
     pub active_widget_mode: Option<ModeId>,
-    // Child components used by BaseView rendering.
-    pub tab_bar: &'a mut tab_bar::TabBar,
-    pub status_bar_widget: &'a mut status_bar_widget::StatusBarWidget,
-    pub event_log_widget: &'a mut event_log::EventLogWidget,
-    pub preview_panel: &'a preview_panel::PreviewPanel,
+    /// Extra data from the active widget for status bar rendering.
+    pub active_widget_data: WidgetStatusData,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.
@@ -115,6 +137,17 @@ pub trait InteractiveWidget {
     fn captures_raw_keys(&self) -> bool {
         false
     }
+
+    /// Extra data for the status bar (e.g. input text, generating flag).
+    ///
+    /// The default returns `WidgetStatusData::None`. Override in widgets
+    /// that need to communicate state to the status bar without a UiMode bridge.
+    fn status_data(&self) -> WidgetStatusData {
+        WidgetStatusData::None
+    }
+
+    /// Downcast support for reading widget state from outside the trait.
+    fn as_any(&self) -> &dyn Any;
 
     /// Downcast support for updating widget state from outside the trait.
     fn as_any_mut(&mut self) -> &mut dyn Any;

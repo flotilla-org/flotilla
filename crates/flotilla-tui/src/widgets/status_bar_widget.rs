@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::{any::Any, collections::HashMap};
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -10,9 +10,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{collect_visible_status_items, BranchInputKind, InFlightCommand, RepoViewLayout, TuiModel, UiMode, UiState},
-    keymap::ModeId,
+    app::{collect_visible_status_items, InFlightCommand, RepoViewLayout, TuiModel, UiMode, UiState},
+    keymap::{Action, ModeId},
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
     shimmer::shimmer_spans,
     status_bar::{
@@ -20,6 +21,7 @@ use crate::{
         DEFAULT_STATUS_WIDTH_BUDGET,
     },
     theme::Theme,
+    widgets::WidgetStatusData,
 };
 
 const ENTER_KEY_GLYPH: &str = "ENT";
@@ -34,9 +36,6 @@ struct StatusBarContent {
 
 /// Standalone status bar component. Handles rendering and mouse hit-testing
 /// for the bottom status strip.
-///
-/// Does not implement `InteractiveWidget` — it will be composed into
-/// `BaseView` in a future step.
 #[derive(Default)]
 pub struct StatusBarWidget {
     /// Click targets for key chips, populated during render.
@@ -55,7 +54,7 @@ impl StatusBarWidget {
     /// Render the status bar into `area`. Click targets are stored on
     /// `self` for later hit-testing via `handle_click`.
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub fn render_bespoke(
         &mut self,
         model: &TuiModel,
         ui: &mut UiState,
@@ -64,12 +63,13 @@ impl StatusBarWidget {
         frame: &mut Frame,
         area: Rect,
         active_widget_mode: Option<ModeId>,
+        active_widget_data: WidgetStatusData,
     ) {
         self.area = area;
         self.key_targets.clear();
         self.dismiss_targets.clear();
 
-        let content = status_bar_content(model, ui, in_flight, active_widget_mode);
+        let content = status_bar_content(model, ui, in_flight, active_widget_mode, &active_widget_data);
         let status_section = content.status.clone();
         let status_model = StatusBarModel::build(StatusBarInput {
             width: area.width as usize,
@@ -190,6 +190,55 @@ impl StatusBarWidget {
     }
 }
 
+impl InteractiveWidget for StatusBarWidget {
+    fn handle_action(&mut self, _action: Action, _ctx: &mut WidgetContext) -> Outcome {
+        Outcome::Ignored
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, ctx: &mut WidgetContext) -> Outcome {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Outcome::Ignored;
+        }
+
+        match self.handle_click(mouse.column, mouse.row) {
+            Some(StatusBarAction::KeyPress { code, modifiers }) => {
+                ctx.app_actions.push(AppAction::StatusBarKeyPress { code, modifiers });
+                Outcome::Consumed
+            }
+            Some(StatusBarAction::ClearError(id)) => {
+                ctx.app_actions.push(AppAction::ClearError(id));
+                Outcome::Consumed
+            }
+            None => Outcome::Ignored,
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
+        self.render_bespoke(
+            ctx.model,
+            ctx.ui,
+            ctx.in_flight,
+            ctx.theme,
+            frame,
+            area,
+            ctx.active_widget_mode,
+            ctx.active_widget_data.clone(),
+        );
+    }
+
+    fn mode_id(&self) -> ModeId {
+        ModeId::Normal
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 // ── Content computation (moved from ui.rs) ───────────────────────────
 
 fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<(String, usize)> {
@@ -255,6 +304,7 @@ fn status_bar_content(
     ui: &UiState,
     in_flight: &HashMap<u64, InFlightCommand>,
     active_widget_mode: Option<ModeId>,
+    active_widget_data: &WidgetStatusData,
 ) -> StatusBarContent {
     let visible_error = collect_visible_status_items(model, ui).into_iter().next();
 
@@ -304,7 +354,7 @@ fn status_bar_content(
                 };
             }
             ModeId::BranchInput => {
-                let generating = matches!(ui.mode, UiMode::BranchInput { kind: BranchInputKind::Generating, .. });
+                let generating = matches!(active_widget_data, WidgetStatusData::BranchInput { generating: true });
                 return if generating {
                     StatusBarContent {
                         status: StatusSection::plain("NEW BRANCH"),
@@ -331,8 +381,10 @@ fn status_bar_content(
                 };
             }
             ModeId::CommandPalette => {
-                let input_text =
-                    if let UiMode::CommandPalette { ref input, .. } = ui.mode { input.value().to_string() } else { String::new() };
+                let input_text = match active_widget_data {
+                    WidgetStatusData::CommandPalette { input_text } => input_text.clone(),
+                    _ => String::new(),
+                };
                 let status_text = format!("/{}", input_text);
                 return StatusBarContent {
                     status: StatusSection::plain(&status_text),
@@ -363,6 +415,9 @@ fn status_bar_content(
         }
     }
 
+    // Legacy UiMode fallback — only reached when no widget-mode override matched.
+    // The remaining UiMode variants that have no widget on the stack are Normal,
+    // Config, and IssueSearch (which still uses the bridge for status bar text).
     match &ui.mode {
         UiMode::Normal => {
             let rui = active_rui(model, ui);
@@ -397,83 +452,12 @@ fn status_bar_content(
             task: None,
             mode_indicators: vec![],
         },
-        UiMode::BranchInput { kind: BranchInputKind::Generating, .. } => StatusBarContent {
-            status: StatusSection::plain("NEW BRANCH"),
-            keys: vec![],
-            task: Some(TaskSection::new("Generating branch name...", 0)),
-            mode_indicators: vec![],
-        },
-        UiMode::BranchInput { kind: BranchInputKind::Manual, .. } => StatusBarContent {
-            status: StatusSection::plain("NEW BRANCH"),
-            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
-            task: None,
-            mode_indicators: vec![],
-        },
-        UiMode::ActionMenu { .. } => StatusBarContent {
-            status: StatusSection::plain("ACTIONS"),
-            keys: vec![
-                key_chip("j", "Down", KeyCode::Char('j')),
-                key_chip("k", "Up", KeyCode::Char('k')),
-                key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
-                key_chip("ESC", "Close", KeyCode::Esc),
-            ],
-            task: None,
-            mode_indicators: vec![],
-        },
         UiMode::IssueSearch { input } => StatusBarContent {
             status: StatusSection::plain(&format!("SEARCH {}", input.value())),
             keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
             task: None,
             mode_indicators: vec![],
         },
-        UiMode::FilePicker { .. } => StatusBarContent {
-            status: StatusSection::plain("ADD REPO"),
-            keys: vec![
-                key_chip("j", "Down", KeyCode::Char('j')),
-                key_chip("k", "Up", KeyCode::Char('k')),
-                key_chip("tab", "Complete", KeyCode::Tab),
-                key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
-                key_chip("ESC", "Cancel", KeyCode::Esc),
-            ],
-            task: None,
-            mode_indicators: vec![],
-        },
-        UiMode::DeleteConfirm { .. } => StatusBarContent {
-            status: StatusSection::plain("CONFIRM DELETE"),
-            keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
-            task: None,
-            mode_indicators: vec![],
-        },
-        UiMode::CloseConfirm { .. } => StatusBarContent {
-            status: StatusSection::plain("CONFIRM CLOSE"),
-            keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
-            task: None,
-            mode_indicators: vec![],
-        },
-        UiMode::Help => StatusBarContent {
-            status: StatusSection::plain("HELP"),
-            keys: vec![
-                key_chip("j", "Down", KeyCode::Char('j')),
-                key_chip("k", "Up", KeyCode::Char('k')),
-                key_chip("ESC", "Close", KeyCode::Esc),
-                key_chip("?", "Close", KeyCode::Char('?')),
-            ],
-            task: None,
-            mode_indicators: vec![],
-        },
-        UiMode::CommandPalette { ref input, .. } => {
-            let status_text = format!("/{}", input.value());
-            StatusBarContent {
-                status: StatusSection::plain(&status_text),
-                keys: vec![
-                    key_chip(ENTER_KEY_GLYPH, "Run", KeyCode::Enter),
-                    key_chip("TAB", "Fill", KeyCode::Tab),
-                    key_chip("ESC", "Close", KeyCode::Esc),
-                ],
-                task: None,
-                mode_indicators: normal_mode_indicators(ui),
-            }
-        }
     }
 }
 

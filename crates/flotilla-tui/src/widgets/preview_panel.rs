@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use flotilla_core::data::GroupEntry;
 use flotilla_protocol::WorkItem;
 use ratatui::{
@@ -6,8 +8,10 @@ use ratatui::{
     Frame,
 };
 
+use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{TuiModel, UiState},
+    keymap::{Action, ModeId},
     theme::Theme,
 };
 
@@ -24,7 +28,7 @@ impl PreviewPanel {
     }
 
     /// Render the preview panel, optionally splitting for the debug overlay.
-    pub fn render(&self, model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
+    pub fn render_bespoke(&self, model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
         if ui.show_debug {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -165,6 +169,28 @@ impl PreviewPanel {
 impl Default for PreviewPanel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl InteractiveWidget for PreviewPanel {
+    fn handle_action(&mut self, _action: Action, _ctx: &mut WidgetContext) -> Outcome {
+        Outcome::Ignored
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
+        self.render_bespoke(ctx.model, ctx.ui, ctx.theme, frame, area);
+    }
+
+    fn mode_id(&self) -> ModeId {
+        ModeId::Normal
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
