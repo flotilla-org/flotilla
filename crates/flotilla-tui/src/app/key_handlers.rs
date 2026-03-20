@@ -352,10 +352,12 @@ impl App {
         if let Some(cmd) = intent.resolve(item, self) {
             match intent {
                 Intent::RemoveCheckout => {
+                    let checkout_path = item.checkout_key().map(|hp| hp.path.clone());
                     let widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(
                         item.terminal_keys.clone(),
                         item.identity.clone(),
                         self.item_execution_host(item),
+                        checkout_path,
                     );
                     self.widget_stack.push(Box::new(widget));
                 }
@@ -1283,7 +1285,8 @@ mod tests {
     // ── handle_delete_confirm_key (via widget stack) ────────────────
 
     fn push_delete_confirm_widget(app: &mut App, branch: &str) {
-        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None);
+        let mut widget =
+            crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None);
         widget.update_info(CheckoutStatus {
             branch: branch.into(),
             change_request_status: None,
@@ -1330,7 +1333,7 @@ mod tests {
     fn delete_confirm_attaches_pending_context() {
         let mut app = stub_app();
         let item = make_work_item("a");
-        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], item.identity.clone(), None);
+        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], item.identity.clone(), None, None);
         widget.update_info(CheckoutStatus {
             branch: "feat/a".into(),
             change_request_status: None,
@@ -1355,6 +1358,7 @@ mod tests {
             vec![],
             WorkItemIdentity::Session("test".into()),
             Some(hostname.clone()),
+            None,
         );
         widget.update_info(CheckoutStatus {
             branch: "feat/x".into(),
@@ -1376,7 +1380,7 @@ mod tests {
     fn delete_confirm_ignores_while_loading() {
         let mut app = stub_app();
         // Loading widget — no info yet
-        let widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None);
+        let widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None);
         app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
         // Widget should still be on the stack (Consumed, not Finished)
@@ -1640,7 +1644,8 @@ mod tests {
     #[test]
     fn delete_confirm_y_with_no_info_does_not_push_command() {
         let mut app = stub_app();
-        let mut widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None);
+        let mut widget =
+            crate::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None);
         widget.loading = false; // not loading, but no info either
         app.widget_stack.push(Box::new(widget));
         app.handle_key(key(KeyCode::Char('y')));
