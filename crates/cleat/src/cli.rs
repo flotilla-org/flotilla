@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::{server::SessionService, vt::VtEngineKind};
+use crate::{keys::encode_send_keys, server::SessionService, vt::VtEngineKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "cleat", version)]
@@ -114,7 +114,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             service.kill(&id)?;
             Ok(None)
         }
-        Command::SendKeys { .. } => Err("send-keys is not yet implemented in this CLI-surface task".to_string()),
+        Command::SendKeys { id, literal, hex, repeat, keys } => {
+            let bytes = encode_send_keys(&keys, literal, hex, repeat)?;
+            service.send_keys(&id, &bytes)?;
+            Ok(None)
+        }
         Command::Serve { id } => {
             service.serve(&id)?;
             Ok(None)

@@ -149,14 +149,13 @@ fn send_keys_command_rejects_zero_repeat() {
 }
 
 #[test]
-fn send_keys_execute_returns_explicit_error() {
+fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
         command: Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 1, keys: vec!["Enter".into()] },
     };
     let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
 
-    let err = execute(cli, &service).expect_err("send-keys execution should be rejected");
-    assert!(err.contains("send-keys"));
-    assert!(err.contains("not yet implemented"));
+    let err = execute(cli, &service).expect_err("missing session should fail");
+    assert!(err.contains("missing"));
 }

@@ -66,7 +66,7 @@ fn encode_hex(tokens: &[String]) -> Result<Vec<u8>, String> {
 }
 
 fn parse_hex_token(token: &str) -> Result<Vec<u8>, String> {
-    if token.len() % 2 != 0 {
+    if !token.len().is_multiple_of(2) {
         return Err(format!("hex token {token:?} must have an even number of digits"));
     }
 
