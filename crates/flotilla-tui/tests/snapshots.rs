@@ -360,8 +360,9 @@ fn branch_input_generating_popup() {
 fn issue_search_mode_status_bar() {
     let mut widget = flotilla_tui::widgets::issue_search::IssueSearchWidget::new();
     widget.prefill("auth timeout");
-    let mut harness =
-        TestHarness::single_repo("my-project").with_mode(UiMode::IssueSearch { input: Input::from("auth timeout") }).with_widget(Box::new(widget));
+    let mut harness = TestHarness::single_repo("my-project")
+        .with_mode(UiMode::IssueSearch { input: Input::from("auth timeout") })
+        .with_widget(Box::new(widget));
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
 }

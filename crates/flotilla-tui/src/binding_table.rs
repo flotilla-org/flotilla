@@ -413,7 +413,6 @@ fn display_for_combo(combo: &KeyCombination) -> (String, KeyCode, KeyModifiers) 
     (display, code, modifiers)
 }
 
-
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
