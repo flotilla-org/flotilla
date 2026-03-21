@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
-use flotilla_protocol::{Command, CommandAction, CommandResult, DaemonEvent, HostName, RepoSelector, StreamKey};
+use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector, StreamKey};
 use tokio::time::Instant;
 
 #[tokio::test]
@@ -323,7 +323,7 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
     assert_eq!(lifecycle.0, Some(command_id));
     let (finished_id, result) = lifecycle.1.expect("command finished event");
     assert_eq!(finished_id, command_id);
-    assert_eq!(result, CommandResult::Refreshed { repos: vec![repo.clone()] });
+    assert_eq!(result, CommandValue::Refreshed { repos: vec![repo.clone()] });
 
     server_handle.abort();
 }

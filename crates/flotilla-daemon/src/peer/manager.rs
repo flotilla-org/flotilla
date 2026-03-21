@@ -6,7 +6,7 @@ use std::{
 };
 
 use flotilla_protocol::{
-    Command, CommandPeerEvent, CommandResult, ConfigLabel, GoodbyeReason, HostName, HostSummary, PeerDataKind, PeerDataMessage,
+    Command, CommandPeerEvent, CommandValue, ConfigLabel, GoodbyeReason, HostName, HostSummary, PeerDataKind, PeerDataMessage,
     PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage, TopologyRoute, VectorClock,
 };
 use tokio::sync::mpsc;
@@ -45,7 +45,7 @@ pub enum HandleResult {
     /// A routed command lifecycle event reached the original requester.
     CommandEventReceived { request_id: u64, responder_host: HostName, event: CommandPeerEvent },
     /// A routed command completed and the final result reached the requester.
-    CommandResponseReceived { request_id: u64, responder_host: HostName, result: CommandResult },
+    CommandResponseReceived { request_id: u64, responder_host: HostName, result: CommandValue },
     /// A routed command cancel response reached the original requester.
     CommandCancelResponseReceived { cancel_id: u64, responder_host: HostName, error: Option<String> },
     /// Nothing to do (e.g. message from self).

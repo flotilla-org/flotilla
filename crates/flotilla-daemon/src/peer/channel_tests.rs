@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandResult, GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage,
+    Command, CommandAction, CommandPeerEvent, CommandValue, GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage,
     ProviderData, RepoIdentity, RepoSelector, RoutedPeerMessage, StepStatus, VectorClock,
 };
 
@@ -311,7 +311,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
                 requester_host: HostName::new("host-a"),
                 responder_host: HostName::new("host-c"),
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                result: Box::new(CommandResult::Refreshed { repos: vec![PathBuf::from("/repo")] }),
+                result: Box::new(CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")] }),
             }),
         )
         .await
@@ -322,7 +322,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
         a_response_results.as_slice(),
         [HandleResult::CommandResponseReceived { request_id: 77, responder_host, result }]
             if responder_host == &HostName::new("host-c")
-                && *result == CommandResult::Refreshed { repos: vec![PathBuf::from("/repo")] }
+                && *result == CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")] }
     ));
 }
 

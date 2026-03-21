@@ -21,7 +21,7 @@ use flotilla_core::{
     data::{self, SectionLabels},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandResult, DaemonEvent, HostName, HostSummary, PeerConnectionState, ProviderData, ProviderError, RepoDelta,
+    Command, CommandAction, CommandValue, DaemonEvent, HostName, HostSummary, PeerConnectionState, ProviderData, ProviderError, RepoDelta,
     RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
@@ -617,7 +617,7 @@ impl App {
                 if let Some(_cmd) = self.in_flight.remove(&command_id) {
                     tracing::info!(%command_id, "command finished");
                     let error_message = match &result {
-                        CommandResult::Error { message } => Some(message.clone()),
+                        CommandValue::Error { message } => Some(message.clone()),
                         _ => None,
                     };
                     executor::handle_result(result, self);
@@ -1707,7 +1707,7 @@ mod tests {
             host: HostName::local(),
             repo_identity: repo.clone(),
             repo: repo_path,
-            result: CommandResult::Ok,
+            result: CommandValue::Ok,
         });
 
         assert!(!app.ui.repo_ui[&repo].pending_actions.contains_key(&identity));
@@ -1734,7 +1734,7 @@ mod tests {
             host: HostName::local(),
             repo_identity: repo.clone(),
             repo: repo_path,
-            result: CommandResult::Error { message: "boom".into() },
+            result: CommandValue::Error { message: "boom".into() },
         });
 
         let pending = &app.ui.repo_ui[&repo].pending_actions[&identity];
@@ -1762,7 +1762,7 @@ mod tests {
             host: HostName::local(),
             repo_identity: repo.clone(),
             repo: repo_path,
-            result: CommandResult::Cancelled,
+            result: CommandValue::Cancelled,
         });
 
         assert!(!app.ui.repo_ui[&repo].pending_actions.contains_key(&identity));
@@ -1790,7 +1790,7 @@ mod tests {
             host: HostName::local(),
             repo_identity: repo.clone(),
             repo: repo_path,
-            result: CommandResult::Ok,
+            result: CommandValue::Ok,
         });
 
         // The pending action with command_id 99 should still be there
@@ -1815,7 +1815,7 @@ mod tests {
             host: HostName::new("my-desktop"),
             repo_identity,
             repo: repo_path,
-            result: CommandResult::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/tmp/repo/wt-feat") },
+            result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/tmp/repo/wt-feat") },
         });
 
         assert!(app.proto_commands.take_next().is_none(), "workspace creation is now handled by checkout plan, not TUI");
@@ -1839,7 +1839,7 @@ mod tests {
             host: HostName::new("remote-a"),
             repo_identity,
             repo: repo_path,
-            result: CommandResult::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/remote/wt-feat") },
+            result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/remote/wt-feat") },
         });
 
         assert!(app.proto_commands.take_next().is_none(), "remote checkout should not auto-create local workspace");

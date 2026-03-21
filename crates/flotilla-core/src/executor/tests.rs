@@ -28,6 +28,7 @@ use crate::{
         types::*,
         vcs::CheckoutManager,
         workspace::WorkspaceManager,
+        CommandRunner,
     },
     step::{StepAction, StepOutcome, StepResolver},
 };
@@ -37,8 +38,8 @@ fn desc(name: &str) -> ProviderDescriptor {
 }
 use async_trait::async_trait;
 use flotilla_protocol::{
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId,
-    PreparedTerminalCommand, RepoSelector, TerminalStatus,
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
+    RepoSelector, TerminalStatus,
 };
 
 fn hp(path: &str) -> HostPath {
@@ -350,7 +351,7 @@ async fn run_execute(
     registry: &ProviderRegistry,
     providers_data: &ProviderData,
     runner: &MockRunner,
-) -> CommandResult {
+) -> CommandValue {
     let repo = RepoExecutionContext {
         identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         root: repo_root(),
@@ -360,52 +361,52 @@ async fn run_execute(
     execute(action, &repo, registry, providers_data, runner, &config_base, &attachable_store, None, &local_host()).await
 }
 
-fn assert_error_contains(result: CommandResult, expected_substring: &str) {
+fn assert_error_contains(result: CommandValue, expected_substring: &str) {
     match result {
-        CommandResult::Error { message } => {
+        CommandValue::Error { message } => {
             assert!(message.contains(expected_substring), "expected error containing {expected_substring:?}, got {message:?}");
         }
         other => panic!("expected Error, got {:?}", other),
     }
 }
 
-fn assert_error_eq(result: CommandResult, expected: &str) {
+fn assert_error_eq(result: CommandValue, expected: &str) {
     match result {
-        CommandResult::Error { message } => assert_eq!(message, expected),
+        CommandValue::Error { message } => assert_eq!(message, expected),
         other => panic!("expected Error, got {:?}", other),
     }
 }
 
-fn assert_checkout_created_branch(result: CommandResult, expected_branch: &str) {
+fn assert_checkout_created_branch(result: CommandValue, expected_branch: &str) {
     match result {
-        CommandResult::CheckoutCreated { branch, .. } => {
+        CommandValue::CheckoutCreated { branch, .. } => {
             assert_eq!(branch, expected_branch);
         }
         other => panic!("expected CheckoutCreated, got {:?}", other),
     }
 }
 
-fn assert_checkout_status_branch(result: CommandResult, expected_branch: &str) {
+fn assert_checkout_status_branch(result: CommandValue, expected_branch: &str) {
     match result {
-        CommandResult::CheckoutStatus(info) => {
+        CommandValue::CheckoutStatus(info) => {
             assert_eq!(info.branch, expected_branch);
         }
         other => panic!("expected CheckoutStatus, got {:?}", other),
     }
 }
 
-fn assert_checkout_removed_branch(result: CommandResult, expected_branch: &str) {
+fn assert_checkout_removed_branch(result: CommandValue, expected_branch: &str) {
     match result {
-        CommandResult::CheckoutRemoved { branch } => {
+        CommandValue::CheckoutRemoved { branch } => {
             assert_eq!(branch, expected_branch);
         }
         other => panic!("expected CheckoutRemoved, got {:?}", other),
     }
 }
 
-fn assert_branch_name_generated(result: CommandResult, expected_name: &str, expected_issue_ids: &[(&str, &str)]) {
+fn assert_branch_name_generated(result: CommandValue, expected_name: &str, expected_issue_ids: &[(&str, &str)]) {
     match result {
-        CommandResult::BranchNameGenerated { name, issue_ids } => {
+        CommandValue::BranchNameGenerated { name, issue_ids } => {
             assert_eq!(name, expected_name);
             let expected_issue_ids: Vec<_> =
                 expected_issue_ids.iter().map(|(provider, id)| (provider.to_string(), id.to_string())).collect();
@@ -415,8 +416,8 @@ fn assert_branch_name_generated(result: CommandResult, expected_name: &str, expe
     }
 }
 
-fn assert_ok(result: CommandResult) {
-    assert!(matches!(result, CommandResult::Ok));
+fn assert_ok(result: CommandValue) {
+    assert!(matches!(result, CommandValue::Ok));
 }
 
 // -----------------------------------------------------------------------
@@ -548,7 +549,7 @@ async fn prepare_terminal_for_checkout_returns_terminal_commands() {
             .await;
 
     match result {
-        CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
+        CommandValue::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
             assert_eq!(repo_identity, flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
             assert_eq!(target_host, HostName::local());
             assert_eq!(branch, "feat");
@@ -598,7 +599,7 @@ async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present()
     .await;
 
     match result {
-        CommandResult::TerminalPrepared { attachable_set_id, .. } => {
+        CommandValue::TerminalPrepared { attachable_set_id, .. } => {
             let set_id = attachable_set_id.expect("attachable set id");
             let store = AttachableStore::with_base(temp.path());
             assert!(store.registry().sets.contains_key(&set_id), "prepare should reuse persisted set");
@@ -635,7 +636,7 @@ async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
     .await;
 
     let set_id = match result {
-        CommandResult::TerminalPrepared { attachable_set_id, .. } => attachable_set_id.expect("attachable set id"),
+        CommandValue::TerminalPrepared { attachable_set_id, .. } => attachable_set_id.expect("attachable set id"),
         other => panic!("expected TerminalPrepared, got {other:?}"),
     };
 
@@ -1260,7 +1261,7 @@ async fn fetch_checkout_status_populates_uncommitted_files() {
     .await;
 
     match result {
-        CommandResult::CheckoutStatus(info) => {
+        CommandValue::CheckoutStatus(info) => {
             assert!(info.has_uncommitted);
             assert_eq!(info.uncommitted_files, vec![" M src/main.rs".to_string(), "?? TODO.txt".to_string(),]);
         }
@@ -1761,7 +1762,7 @@ async fn run_build_plan_to_completion(
     registry: ProviderRegistry,
     providers_data: ProviderData,
     runner: MockRunner,
-) -> CommandResult {
+) -> CommandValue {
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
@@ -1772,13 +1773,15 @@ async fn run_build_plan_to_completion(
     let local_host = local_host();
     let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
     let registry = Arc::new(registry);
+    let providers_data = Arc::new(providers_data);
+    let runner: Arc<dyn CommandRunner> = Arc::new(runner);
 
     let plan = build_plan(
         local_command(action),
         repo.clone(),
         Arc::clone(&registry),
-        Arc::new(providers_data),
-        Arc::new(runner),
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         config_base.clone(),
         attachable_store.clone(),
         None,
@@ -1794,12 +1797,14 @@ async fn run_build_plan_to_completion(
             let resolver = ExecutorStepResolver {
                 repo,
                 registry,
+                providers_data,
+                runner,
                 config_base,
                 attachable_store,
                 daemon_socket_path: None,
                 local_host: local_host.clone(),
             };
-            run_step_plan(step_plan, 1, local_host, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await
+            run_step_plan(step_plan, 1, local_host, repo_identity(), repo_root(), cancel, tx, &resolver).await
         }
     }
 }
@@ -1824,7 +1829,7 @@ async fn checkout_create_plan_and_execute_return_same_checkout_created_result() 
     let execute_result = run_execute(fresh_checkout_action("feat-x"), &execute_registry, &empty_data(), &execute_runner).await;
 
     match execute_result {
-        CommandResult::CheckoutCreated { branch, path } => {
+        CommandValue::CheckoutCreated { branch, path } => {
             assert_eq!(branch, "feat-x");
             assert_eq!(path, expected_path);
         }
@@ -1841,7 +1846,7 @@ async fn checkout_create_plan_and_execute_return_same_checkout_created_result() 
     let plan_result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), plan_registry, empty_data(), plan_runner).await;
 
     match plan_result {
-        CommandResult::CheckoutCreated { branch, path } => {
+        CommandValue::CheckoutCreated { branch, path } => {
             assert_eq!(branch, "feat-x");
             assert_eq!(path, expected_path);
         }
@@ -1879,7 +1884,7 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
         run_build_plan_to_completion(remove_checkout_action("feat-x", vec![terminal_id.clone()]), plan_registry, plan_data, runner_ok())
             .await;
 
-    assert_ok(plan_result);
+    assert_checkout_removed_branch(plan_result, "feat-x");
     let plan_killed = plan_pool.killed.lock().await;
     assert_eq!(plan_killed.as_slice(), &[terminal_id]);
 }
@@ -2082,7 +2087,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
     let registry = Arc::new(registry);
-    let runner = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let providers_data = Arc::new(empty_data());
     let cb = config_base();
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
@@ -2092,8 +2098,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         local_command(fresh_checkout_action("feat-x")),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
-        Arc::new(empty_data()),
-        runner,
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2106,6 +2112,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     let resolver = ExecutorStepResolver {
         repo,
         registry,
+        providers_data,
+        runner,
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -2113,11 +2121,11 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
-    assert!(matches!(result, CommandResult::CheckoutCreated { .. }));
+    assert!(matches!(result, CommandValue::CheckoutCreated { .. }));
 
     let calls = ws_mgr.calls.lock().await;
     assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "should create workspace from prior outcome: {calls:?}");
@@ -2136,9 +2144,10 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
     let registry = Arc::new(registry);
     // validate_checkout_target needs 2 responses: local ref check (Ok), remote ref check
-    let runner = Arc::new(MockRunner::new(vec![Ok("".into()), Err("missing".into())]));
+    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Ok("".into()), Err("missing".into())]));
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+    let providers_data = Arc::new(data);
     let cb = config_base();
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
@@ -2148,8 +2157,8 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         local_command(existing_branch_checkout_action("feat-x")),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
-        Arc::new(data),
-        runner,
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2162,6 +2171,8 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     let resolver = ExecutorStepResolver {
         repo,
         registry,
+        providers_data,
+        runner,
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -2169,12 +2180,12 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
     assert!(
-        matches!(result, CommandResult::CheckoutCreated { ref branch, .. } if branch == "feat-x"),
+        matches!(result, CommandValue::CheckoutCreated { ref branch, .. } if branch == "feat-x"),
         "should return CheckoutCreated for pre-existing checkout, got: {result:?}"
     );
     let calls = ws_mgr.calls.lock().await;
@@ -2193,7 +2204,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
     let registry = Arc::new(registry);
-    let runner = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let providers_data = Arc::new(empty_data());
     let cb = config_base();
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
@@ -2203,8 +2215,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         local_command(fresh_checkout_action("feat-x")),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
-        Arc::new(empty_data()),
-        runner,
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2217,6 +2229,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     let resolver = ExecutorStepResolver {
         repo,
         registry,
+        providers_data,
+        runner,
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -2224,11 +2238,11 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
-    assert_eq!(result, CommandResult::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/repo/wt-feat-x") });
+    assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/repo/wt-feat-x") });
 }
 
 #[tokio::test]
@@ -2324,7 +2338,7 @@ async fn build_plan_archive_session_missing_session_returns_immediate_error() {
     let plan = run_build_plan(CommandAction::ArchiveSession { session_id: "missing".to_string() }, registry, empty_data(), runner).await;
 
     match plan {
-        ExecutionPlan::Immediate(CommandResult::Error { message }) => {
+        ExecutionPlan::Immediate(CommandValue::Error { message }) => {
             assert!(message.contains("session not found"), "unexpected message: {message}");
         }
         ExecutionPlan::Immediate(other) => panic!("expected Error result, got {other:?}"),
@@ -2342,7 +2356,7 @@ async fn build_plan_generate_branch_name_without_ai_returns_immediate_fallback()
         run_build_plan(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, empty_registry(), data, runner).await;
 
     match plan {
-        ExecutionPlan::Immediate(CommandResult::BranchNameGenerated { name, issue_ids }) => {
+        ExecutionPlan::Immediate(CommandValue::BranchNameGenerated { name, issue_ids }) => {
             assert_eq!(name, "issue-42");
             assert_eq!(issue_ids, vec![("issues".to_string(), "42".to_string())]);
         }
@@ -2858,6 +2872,8 @@ async fn executor_step_resolver_creates_workspace() {
     let resolver = ExecutorStepResolver {
         repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         registry: Arc::new(registry),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
@@ -2865,7 +2881,7 @@ async fn executor_step_resolver_creates_workspace() {
     };
 
     let prior =
-        vec![StepOutcome::CompletedWith(CommandResult::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
+        vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
     let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into() };
     let outcome = resolver.resolve("create workspace", action, &prior).await;
     assert!(outcome.is_ok(), "resolve should succeed: {outcome:?}");
@@ -2884,6 +2900,8 @@ async fn executor_step_resolver_skips_when_no_checkout_path() {
     let resolver = ExecutorStepResolver {
         repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         registry: Arc::new(registry),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
