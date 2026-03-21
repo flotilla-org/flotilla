@@ -189,12 +189,14 @@ With the status bar no longer reading `RepoUiState`, and modal widgets no longer
 | Widget | `binding_mode()` | `status_fragment()` |
 |--------|------------------|---------------------|
 | RepoPage | `Normal` or `Composed([Normal, SearchActive])` | `Label("3 SELECTED")`, `Label("SEARCH \"q\"")`, or default |
-| OverviewPage | `Overview` | `Label("FLOTILLA")` or default |
-| HelpWidget | `Help` | default |
-| ActionMenuWidget | `ActionMenu` | default |
-| DeleteConfirmWidget | `DeleteConfirm` | default |
-| CloseConfirmWidget | `CloseConfirm` | default |
-| BranchInputWidget | `BranchInput` | `Progress("Generating...")` or `ActiveInput` |
+| OverviewPage | `Overview` | `Label("FLOTILLA")` |
+| HelpWidget | `Help` | `Label("HELP")` |
+| ActionMenuWidget | `ActionMenu` | `Label("ACTIONS")` |
+| DeleteConfirmWidget | `DeleteConfirm` | `Label("CONFIRM DELETE")` |
+| CloseConfirmWidget | `CloseConfirm` | `Label("CONFIRM CLOSE")` |
+| BranchInputWidget | `BranchInput` | `Progress("Generating...")` or `ActiveInput { prefix: "NEW BRANCH", text }` |
 | IssueSearchWidget | `IssueSearch` | `ActiveInput { prefix: "SEARCH", text }` |
 | CommandPaletteWidget | `CommandPalette` | `ActiveInput { prefix: "/", text }` |
-| FilePickerWidget | `FilePicker` | default |
+| FilePickerWidget | `FilePicker` | `Label("ADD REPO")` |
+
+Every modal widget must provide a status fragment. Returning default causes a regression — the status bar shows "/ for commands" instead of the mode-specific label.

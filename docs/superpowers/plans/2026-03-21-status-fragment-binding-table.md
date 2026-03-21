@@ -123,6 +123,10 @@ pub const fn h(label: &'static str) -> Option<&'static str> { Some(label) }
 
 Port all bindings from `Keymap::defaults()` (keymap.rs:278-358) into the flat table format. Include hint annotations for bindings that should appear as status bar key chips. Refer to the current `status_bar_content()` function (status_bar_widget.rs:302-462) to identify which bindings get hints.
 
+**Important:** `ModeId::Config` maps to `BindingModeId::Overview`. Port the Config mode bindings (keymap.rs:319-324: `q` → Dismiss, `[` → PrevTab, `]` → NextTab) under `BindingModeId::Overview`.
+
+The `SearchActive` mode's `esc` binding maps to `Action::Dismiss` (not a new `ClearSearch` action). The "Clear" hint is just a display label — the actual behavior (clearing the search query) is handled by RepoPage's dismiss cascade. No new Action variant needed.
+
 - [ ] **Step 3: Add compiled table types and build function**
 
 ```rust
@@ -238,6 +242,12 @@ Search for `ModeId` and replace with `BindingModeId`. Key locations:
 
 User config overrides (`KeysConfig`) should modify the compiled table's key_map. The hint annotations from the base table are preserved unless the override changes the action for a hinted key.
 
+Map config section names to `BindingModeId`: `normal` → `Normal`, `help` → `Help`, `config` → `Overview`, `action_menu` → `ActionMenu`, `delete_confirm` → `DeleteConfirm`, `close_confirm` → `CloseConfirm`. Other modes (IssueSearch, CommandPalette, FilePicker, BranchInput, SearchActive) are not user-configurable for now.
+
+- [ ] **Step 3a: Keep help_sections() working**
+
+`help_sections()` currently uses a curated list with specific section ordering. Keep it as a curated list for now, but have it read key display strings from `CompiledBindings` instead of hardcoding them. This preserves section ordering and grouping while picking up user config overrides. A fully data-driven help screen can be a follow-up.
+
 - [ ] **Step 4: Run CI and commit**
 
 ```bash
@@ -264,33 +274,40 @@ In `InteractiveWidget`:
 
 For each widget, replace `mode_id()` with `binding_mode()` returning the appropriate `BindingModeId.into()`:
 
-| Widget | `binding_mode()` return |
-|--------|------------------------|
-| RepoPage | `Normal.into()` (composed case in Task 5) |
-| OverviewPage | `Overview.into()` |
-| HelpWidget | `Help.into()` |
-| ActionMenuWidget | `ActionMenu.into()` |
-| DeleteConfirmWidget | `DeleteConfirm.into()` |
-| CloseConfirmWidget | `CloseConfirm.into()` |
-| BranchInputWidget | `BranchInput.into()` |
-| IssueSearchWidget | `IssueSearch.into()` |
-| CommandPaletteWidget | `CommandPalette.into()` |
-| FilePickerWidget | `FilePicker.into()` |
+| Widget | `binding_mode()` return | `status_fragment()` |
+|--------|------------------------|---------------------|
+| RepoPage | `Normal.into()` (composed case in Task 5) | (Task 5) |
+| OverviewPage | `Overview.into()` | `Label("FLOTILLA")` |
+| HelpWidget | `Help.into()` | `Label("HELP")` |
+| ActionMenuWidget | `ActionMenu.into()` | `Label("ACTIONS")` |
+| DeleteConfirmWidget | `DeleteConfirm.into()` | `Label("CONFIRM DELETE")` |
+| CloseConfirmWidget | `CloseConfirm.into()` | `Label("CONFIRM CLOSE")` |
+| BranchInputWidget | `BranchInput.into()` | `Progress("Generating...")` when generating, `ActiveInput { prefix: "NEW BRANCH", text }` when manual |
+| IssueSearchWidget | `IssueSearch.into()` | `ActiveInput { prefix: "SEARCH", text }` |
+| CommandPaletteWidget | `CommandPalette.into()` | `ActiveInput { prefix: "/", text }` |
+| FilePickerWidget | `FilePicker.into()` | `Label("ADD REPO")` |
+| WorkItemTable | `Normal.into()` | default |
+| PreviewPanel | `Normal.into()` | default |
+| EventLogWidget | `Overview.into()` | default |
 
-For `status_fragment()`, implement on widgets that have status content:
-- `BranchInputWidget` → `Progress("Generating...")` when generating, default otherwise
-- Other widgets → use default for now (more in Task 5)
+Every modal widget MUST provide a status fragment — returning default causes a regression where the status bar shows "/ for commands" instead of the mode-specific label. Only sub-widgets embedded inside pages (WorkItemTable, PreviewPanel, EventLogWidget) should return default.
 
 - [ ] **Step 3: Update Screen's helper methods**
 
 `active_mode_id()` → `active_binding_mode()` returning `KeyBindingMode`.
 `active_status_data()` → `active_status_fragment()` returning `StatusFragment`.
 
+`active_binding_mode()` must walk: top modal → active page (repo or overview). It must NOT hardcode `Normal` as the fallback — when the Flotilla tab is active, the page's binding mode is `Overview`, not `Normal`. Query the active page widget's `binding_mode()`.
+
+Similarly, `active_status_fragment()` must walk: top modal → active page, returning the first `Some(status)` it finds.
+
 Update `RenderContext` to use the new types.
 
 - [ ] **Step 4: Update key_handlers.rs**
 
-`resolve_action()` uses `binding_mode()` instead of `mode_id()`. Update the mode matching for hybrid widgets (CommandPalette, FilePicker hardcoded keys).
+`resolve_action()` uses `binding_mode()` instead of `mode_id()`. Update the mode matching for hybrid widgets (CommandPalette, FilePicker hardcoded keys). The hybrid matching currently checks `ModeId::CommandPalette` / `ModeId::FilePicker` — change to `BindingModeId::CommandPalette` / `BindingModeId::FilePicker` (extract from `KeyBindingMode::Single`).
+
+Also update all test assertions that call `.mode_id()` or compare against `ModeId::*` — there are ~25 of these in `key_handlers.rs`. Change to `.binding_mode()` and `BindingModeId::*`.
 
 - [ ] **Step 5: Run CI and commit**
 
@@ -537,7 +554,7 @@ git commit -am "chore: remove UiMode::IssueSearch, WidgetStatusData, and stale i
 
 - **Read the spec** at `docs/superpowers/specs/2026-03-21-status-fragment-binding-table-design.md` before starting.
 - **Run CI after every task**: `cargo +nightly-2026-03-12 fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-- **Task dependencies**: Task 1 is independent. Task 2 depends on 1. Task 3 depends on 2. Task 4 depends on 3. Tasks 5 and 6 depend on 4 and can be done in either order. Task 7 depends on 5+6.
+- **Task dependencies**: Task 1 is independent. Task 2 depends on 1. Task 3 depends on 2. Task 4 depends on 3. Tasks 5 and 6 depend on Task 3 (not Task 4) and can be done in either order or in parallel with Task 4. Task 7 depends on 4+5+6.
 - **The hardest task is 4** — simplifying the status bar and moving resolution into Screen. The current `status_bar_content()` is ~160 lines of mode matching that all needs to be replaced with the binding table lookup + fragment cascade.
 - **The binding table key strings** ("j", "esc", "S-K", etc.) need to parse into `KeyCombination`. Use the existing `crokey::key!` macro or write a parser for the string format. Check how `from_config()` currently parses key strings.
 - **`captures_raw_keys()`** stays unchanged — it's orthogonal to binding modes.
