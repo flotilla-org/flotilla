@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use super::{
-    base_view::BaseView, overview_page::OverviewPage, repo_page::RepoPage, status_bar_widget::StatusBarWidget, tabs::Tabs, AppAction,
-    InteractiveWidget, Outcome, RenderContext, WidgetContext, WidgetStatusData,
+    overview_page::OverviewPage, repo_page::RepoPage, status_bar_widget::StatusBarWidget, tabs::Tabs, AppAction, InteractiveWidget,
+    Outcome, RenderContext, WidgetContext, WidgetStatusData,
 };
 use crate::{
     keymap::{Action, ModeId},
@@ -17,18 +17,18 @@ use crate::{
     ui_helpers,
 };
 
-/// Root widget that owns the base layer, tab bar, status bar, and modal stack.
+/// Root widget that owns the tab bar, page content, status bar, and modal stack.
 ///
-/// Renders the tab bar (via `Tabs`), base view content, status bar, and then
-/// any modals on top. Owns the `has_modal()`, `dismiss_modals()`, and
-/// `apply_outcome()` helpers that previously lived on `App`.
+/// Renders the tab bar (via `Tabs`), page content (repo pages or overview
+/// page), status bar, and then any modals on top. Owns the `has_modal()`,
+/// `dismiss_modals()`, and `apply_outcome()` helpers that previously lived
+/// on `App`.
 ///
 /// Modal dispatch is handled internally: `handle_action`, `handle_raw_key`,
 /// and `handle_mouse` route events to the top modal when one exists, with
 /// modals acting as focus barriers (unhandled events do NOT fall through
-/// to the base layer).
+/// to the page layer).
 pub struct Screen {
-    pub base_view: BaseView,
     pub tabs: Tabs,
     pub status_bar: StatusBarWidget,
     pub modal_stack: Vec<Box<dyn InteractiveWidget>>,
@@ -45,7 +45,6 @@ impl Default for Screen {
 impl Screen {
     pub fn new() -> Self {
         Self {
-            base_view: BaseView::new(),
             tabs: Tabs::new(),
             status_bar: StatusBarWidget::new(),
             modal_stack: Vec::new(),
@@ -70,7 +69,7 @@ impl Screen {
     ///
     /// Since modals are always on top, `Finished` pops the top modal,
     /// `Push` pushes a new modal, and `Swap` replaces the top modal.
-    /// If the outcome originated from the base_view (no modals), `Push`
+    /// If the outcome originated from a page widget (no modals), `Push`
     /// still pushes onto the modal_stack.
     pub fn apply_outcome(&mut self, outcome: Outcome) {
         match outcome {
@@ -88,9 +87,9 @@ impl Screen {
         }
     }
 
-    /// The mode of the topmost widget (modal or base_view).
+    /// The mode of the topmost widget (modal or overview page fallback).
     pub fn active_mode_id(&self) -> Option<ModeId> {
-        self.modal_stack.last().map(|w| w.mode_id()).or(Some(self.base_view.mode_id()))
+        self.modal_stack.last().map(|w| w.mode_id()).or(Some(ModeId::Normal))
     }
 
     /// Extra status data from the topmost widget.
@@ -165,19 +164,17 @@ impl InteractiveWidget for Screen {
             return Outcome::Ignored;
         }
 
-        // Phase 3: No modal — dispatch to overview page, repo page, or base_view
+        // Phase 3: No modal — dispatch to overview page or repo page
         let is_config = ctx.mode.is_config();
         let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config).cloned();
-        let outcome = if is_config {
-            self.overview_page.handle_action(action, ctx)
-        } else if let Some(ref identity) = active_identity {
+        let outcome = if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
                 page.handle_action(action, ctx)
             } else {
-                self.base_view.handle_action(action, ctx)
+                self.overview_page.handle_action(action, ctx)
             }
         } else {
-            self.base_view.handle_action(action, ctx)
+            self.overview_page.handle_action(action, ctx)
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -197,19 +194,17 @@ impl InteractiveWidget for Screen {
             return Outcome::Ignored;
         }
 
-        // No modal — dispatch to overview page, repo page, or base_view
+        // No modal — dispatch to overview page or repo page
         let is_config = ctx.mode.is_config();
         let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config).cloned();
-        let outcome = if is_config {
-            self.overview_page.handle_raw_key(key, ctx)
-        } else if let Some(ref identity) = active_identity {
+        let outcome = if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
                 page.handle_raw_key(key, ctx)
             } else {
-                self.base_view.handle_raw_key(key, ctx)
+                self.overview_page.handle_raw_key(key, ctx)
             }
         } else {
-            self.base_view.handle_raw_key(key, ctx)
+            self.overview_page.handle_raw_key(key, ctx)
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -276,19 +271,17 @@ impl InteractiveWidget for Screen {
             _ => {}
         }
 
-        // Dispatch to overview page, repo page, or base_view for content area mouse events
+        // Dispatch to overview page or repo page for content area mouse events
         let is_config = ctx.mode.is_config();
         let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config).cloned();
-        let outcome = if is_config {
-            self.overview_page.handle_mouse(mouse, ctx)
-        } else if let Some(ref identity) = active_identity {
+        let outcome = if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
                 page.handle_mouse(mouse, ctx)
             } else {
-                self.base_view.handle_mouse(mouse, ctx)
+                self.overview_page.handle_mouse(mouse, ctx)
             }
         } else {
-            self.base_view.handle_mouse(mouse, ctx)
+            self.overview_page.handle_mouse(mouse, ctx)
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -304,19 +297,17 @@ impl InteractiveWidget for Screen {
         // 1. Tab bar
         self.tabs.render(ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
 
-        // 2. Content: dispatch to overview page for Flotilla tab, repo page for repo tabs
+        // 2. Content: dispatch to repo page for repo tabs, overview page otherwise
         let is_config = ctx.ui.mode.is_config();
         let active_identity = self.active_repo_identity(&ctx.model.repo_order, ctx.model.active_repo, is_config).cloned();
-        if is_config {
-            self.overview_page.render(frame, chunks[1], ctx);
-        } else if let Some(ref identity) = active_identity {
+        if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
                 page.render(frame, chunks[1], ctx);
             } else {
-                self.base_view.render(frame, chunks[1], ctx);
+                self.overview_page.render(frame, chunks[1], ctx);
             }
         } else {
-            self.base_view.render(frame, chunks[1], ctx);
+            self.overview_page.render(frame, chunks[1], ctx);
         }
 
         // 3. Status bar — when the palette is active, move it to the overlay position
@@ -343,11 +334,11 @@ impl InteractiveWidget for Screen {
     }
 
     fn mode_id(&self) -> ModeId {
-        self.modal_stack.last().map(|w| w.mode_id()).unwrap_or_else(|| self.base_view.mode_id())
+        self.modal_stack.last().map(|w| w.mode_id()).unwrap_or(ModeId::Normal)
     }
 
     fn captures_raw_keys(&self) -> bool {
-        self.modal_stack.last().map(|w| w.captures_raw_keys()).unwrap_or_else(|| self.base_view.captures_raw_keys())
+        self.modal_stack.last().map(|w| w.captures_raw_keys()).unwrap_or(false)
     }
 
     fn status_data(&self) -> WidgetStatusData {

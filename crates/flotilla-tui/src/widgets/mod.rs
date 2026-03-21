@@ -1,5 +1,4 @@
 pub mod action_menu;
-pub mod base_view;
 pub mod branch_input;
 pub mod close_confirm;
 pub mod command_palette;

@@ -40,7 +40,7 @@ const PROVIDER_CATEGORIES: [(&str, &str); 8] = [
     ("Terminal pool", "terminal_pool"),
 ];
 
-/// The work-item table component. Owned by `BaseView` and implements
+/// The work-item table component. Owned by `RepoPage` and implements
 /// `InteractiveWidget` for uniform action/mouse/render dispatch.
 pub struct WorkItemTable {
     /// Stored from render for mouse hit-testing.

@@ -46,7 +46,7 @@ impl App {
                     self.dispatch_if_available(intent);
                 }
             }
-            // Handled by the widget stack (BaseView or modal widgets) or
+            // Handled by the widget stack (page widgets or modals) or
             // pre-dispatched as global actions. No-op if they reach here.
             _ => {}
         }
@@ -59,8 +59,8 @@ impl App {
         // Snapshot selection so we can detect changes for infinite scroll.
         let prev_selection = self.active_ui().selected_selectable_idx;
 
-        // Determine the topmost widget's mode. Screen now delegates to the
-        // top modal (if any) or base_view for mode_id / captures_raw_keys.
+        // Determine the topmost widget's mode. Screen delegates to the
+        // top modal (if any) for mode_id / captures_raw_keys.
         let captures_raw = self.screen.captures_raw_keys();
         let mode_id = self.screen.mode_id();
 
@@ -1034,7 +1034,10 @@ mod tests {
     #[test]
     fn clicking_gear_icon_ignored_in_config_mode() {
         let mut app = stub_app();
-        app.screen.base_view.table.gear_area = Some(Rect::new(75, 2, 3, 1));
+        // Set gear area on the repo page's table — in Config mode the overview
+        // page handles events, so the gear click should not toggle providers.
+        let repo_key = app.model.repo_order[0].clone();
+        app.screen.repo_pages.get_mut(&repo_key).expect("repo page").table.gear_area = Some(Rect::new(75, 2, 3, 1));
         app.ui.mode = UiMode::Config;
 
         app.handle_mouse(left_click(76, 2));
