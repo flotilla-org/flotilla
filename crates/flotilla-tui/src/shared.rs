@@ -96,7 +96,7 @@ mod tests {
         let mut seen = 0u64;
         let guard = s.changed(&mut seen);
         assert!(guard.is_some());
-        assert_eq!(*guard.unwrap(), 42);
+        assert_eq!(*guard.expect("expected changed data"), 42);
         assert_eq!(seen, 1);
     }
 
@@ -116,7 +116,7 @@ mod tests {
         s.mutate(|v| *v = 5);
         let guard = s.changed(&mut seen);
         assert!(guard.is_some());
-        assert_eq!(*guard.unwrap(), 5);
+        assert_eq!(*guard.expect("expected changed data"), 5);
         assert_eq!(seen, 2);
     }
 

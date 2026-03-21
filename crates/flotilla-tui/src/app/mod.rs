@@ -621,7 +621,8 @@ impl App {
                     });
 
                     if let Some((repo_identity, identity)) = found {
-                        // Dual-write: update both rui and RepoPage
+                        // Dual-write: rui for status bar / needs_animation, RepoPage for row rendering.
+                        // See also: executor::dispatch() in executor.rs.
                         if let Some(ref message) = error_message {
                             if let Some(rui) = self.ui.repo_ui.get_mut(&repo_identity) {
                                 if let Some(entry) = rui.pending_actions.get_mut(&identity) {

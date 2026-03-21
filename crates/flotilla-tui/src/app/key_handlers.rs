@@ -883,9 +883,9 @@ mod tests {
     fn normal_esc_clears_providers_first() {
         let mut app = stub_app();
         let identity = app.model.repo_order[0].clone();
-        app.screen.repo_pages.get_mut(&identity).unwrap().show_providers = true;
+        app.screen.repo_pages.get_mut(&identity).expect("repo page exists").show_providers = true;
         app.handle_key(key(KeyCode::Esc));
-        assert!(!app.screen.repo_pages.get(&identity).unwrap().show_providers);
+        assert!(!app.screen.repo_pages.get(&identity).expect("repo page exists").show_providers);
         assert!(!app.should_quit);
     }
 
@@ -894,10 +894,10 @@ mod tests {
         let mut app = stub_app();
         setup_table(&mut app, vec![make_work_item("a")]);
         let identity = app.model.repo_order[0].clone();
-        app.screen.repo_pages.get_mut(&identity).unwrap().multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
-        assert!(!app.screen.repo_pages.get(&identity).unwrap().multi_selected.is_empty());
+        app.screen.repo_pages.get_mut(&identity).expect("repo page exists").multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
+        assert!(!app.screen.repo_pages.get(&identity).expect("repo page exists").multi_selected.is_empty());
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.screen.repo_pages.get(&identity).unwrap().multi_selected.is_empty());
+        assert!(app.screen.repo_pages.get(&identity).expect("repo page exists").multi_selected.is_empty());
         assert!(!app.should_quit);
     }
 
