@@ -324,7 +324,7 @@ impl InteractiveWidget for Screen {
 
         // 3b. Resolve key chips from binding mode via compiled binding table.
         //     Progress fragments suppress key chips (user can't interact during progress).
-        let key_chips = if matches!(fragment.status, Some(crate::binding_table::StatusContent::Progress(_))) {
+        let key_chips = if matches!(fragment.status, Some(crate::binding_table::StatusContent::Progress { .. })) {
             vec![]
         } else {
             ctx.keymap.hints_for(&binding_mode)

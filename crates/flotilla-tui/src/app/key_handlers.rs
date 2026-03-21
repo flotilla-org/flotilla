@@ -12,10 +12,10 @@ use crate::{
 impl App {
     // ── Key handling ──
 
-    /// Resolve a key event to an action using the UI mode rather than the
-    /// widget-stack mode. Called for raw-key widgets (BranchInput, IssueSearch)
-    /// and when the base widget (Normal mode_id) is on top — so Config mode
-    /// gets correct keymap bindings via `BindingModeId::from(&self.ui.mode)`.
+    /// Resolve a key event using the app-level config/normal distinction.
+    ///
+    /// Called when the base layer widget (Normal mode_id) is on top, so that
+    /// config mode gets Overview bindings instead of Normal.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
         let mode_id = if self.ui.is_config { BindingModeId::Overview } else { BindingModeId::Normal };
         let mode: KeyBindingMode = mode_id.into();
@@ -65,7 +65,9 @@ impl App {
 
         let action = if captures_raw {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => self.resolve_action(key),
+                // Resolve Enter/Esc through the widget's own binding mode so
+                // user overrides for e.g. IssueSearch.confirm still fire.
+                KeyCode::Esc | KeyCode::Enter => self.keymap.resolve(&KeyBindingMode::from(mode_id), crokey::KeyCombination::from(key)),
                 _ => None,
             }
         } else {

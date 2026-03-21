@@ -106,7 +106,9 @@ impl InteractiveWidget for BranchInputWidget {
 
     fn status_fragment(&self) -> StatusFragment {
         if self.is_generating() {
-            StatusFragment { status: Some(StatusContent::Progress("Generating branch name...".into())) }
+            StatusFragment {
+                status: Some(StatusContent::Progress { label: "NEW BRANCH".into(), text: "Generating branch name...".into() }),
+            }
         } else {
             StatusFragment {
                 status: Some(StatusContent::ActiveInput { prefix: "NEW BRANCH ".into(), text: self.input.value().to_string() }),

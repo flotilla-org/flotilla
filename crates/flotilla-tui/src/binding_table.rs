@@ -64,7 +64,7 @@ pub struct StatusFragment {
 pub enum StatusContent {
     Label(String),
     ActiveInput { prefix: String, text: String },
-    Progress(String),
+    Progress { label: String, text: String },
 }
 
 /// A single entry in the binding table.

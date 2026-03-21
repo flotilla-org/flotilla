@@ -280,13 +280,13 @@ pub(crate) fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
 ///
 /// - `Label(s)` → `StatusSection::Plain(s)`
 /// - `ActiveInput { prefix, text }` → `StatusSection::Plain(format!("{prefix}{text}"))`
-/// - `Progress(s)` → `StatusSection::Plain(fallback)` (shimmer handled via task)
+/// - `Progress { label, .. }` → `StatusSection::Plain(label)` (task spinner shows text)
 /// - `None` → `StatusSection::Plain(fallback)`
 pub(crate) fn resolve_status_section(fragment: &StatusFragment, fallback: &str) -> StatusSection {
     match &fragment.status {
         Some(StatusContent::Label(label)) => StatusSection::plain(label),
         Some(StatusContent::ActiveInput { prefix, text }) => StatusSection::plain(&format!("{prefix}{text}")),
-        Some(StatusContent::Progress(_)) => StatusSection::plain(fallback),
+        Some(StatusContent::Progress { label, .. }) => StatusSection::plain(label),
         None => StatusSection::plain(fallback),
     }
 }
@@ -294,7 +294,7 @@ pub(crate) fn resolve_status_section(fragment: &StatusFragment, fallback: &str) 
 /// Extract task from a `StatusFragment::Progress` variant.
 pub(crate) fn resolve_task_from_fragment(fragment: &StatusFragment) -> Option<TaskSection> {
     match &fragment.status {
-        Some(StatusContent::Progress(msg)) => Some(TaskSection::new(msg, 0)),
+        Some(StatusContent::Progress { text, .. }) => Some(TaskSection::new(text, 0)),
         _ => None,
     }
 }
