@@ -245,12 +245,9 @@ pub struct Keymap {
 }
 
 impl Keymap {
-    /// Look up the action bound to `key` in the given `mode`.
-    ///
-    /// Uses `Single` mode resolution — composed mode support is used
-    /// directly via `CompiledBindings` in Task 4.
-    pub fn resolve(&self, mode: BindingModeId, key: KeyCombination) -> Option<Action> {
-        self.compiled.resolve(&KeyBindingMode::Single(mode), key)
+    /// Look up the action bound to `key` in the given binding mode.
+    pub fn resolve(&self, mode: &KeyBindingMode, key: KeyCombination) -> Option<Action> {
+        self.compiled.resolve(mode, key)
     }
 
     /// Build the default keymap from the flat binding table.
@@ -518,12 +515,12 @@ mod tests {
     #[test]
     fn defaults_resolve_shared_navigation() {
         let km = Keymap::defaults();
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(j)), Some(Action::SelectNext));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(down)), Some(Action::SelectNext));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(k)), Some(Action::SelectPrev));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(up)), Some(Action::SelectPrev));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(enter)), Some(Action::Confirm));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(j)), Some(Action::SelectNext));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(down)), Some(Action::SelectNext));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(k)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(up)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(esc)), Some(Action::Dismiss));
     }
 
     #[test]
@@ -532,40 +529,66 @@ mod tests {
         let modes =
             [BindingModeId::Normal, BindingModeId::Help, BindingModeId::Overview, BindingModeId::ActionMenu, BindingModeId::FilePicker];
         for mode in modes {
-            assert_eq!(km.resolve(mode, crokey::key!(j)), Some(Action::SelectNext), "j should be SelectNext in {mode:?}");
-            assert_eq!(km.resolve(mode, crokey::key!(enter)), Some(Action::Confirm), "enter should be Confirm in {mode:?}");
+            assert_eq!(
+                km.resolve(&KeyBindingMode::from(mode), crokey::key!(j)),
+                Some(Action::SelectNext),
+                "j should be SelectNext in {mode:?}"
+            );
+            assert_eq!(
+                km.resolve(&KeyBindingMode::from(mode), crokey::key!(enter)),
+                Some(Action::Confirm),
+                "enter should be Confirm in {mode:?}"
+            );
         }
     }
 
     #[test]
     fn normal_mode_specific_bindings() {
         let km = Keymap::defaults();
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(q)), Some(Action::Quit));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(r)), Some(Action::Refresh));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(space)), Some(Action::ToggleMultiSelect));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(h)), Some(Action::CycleHost));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(l)), Some(Action::CycleLayout));
-        assert_eq!(km.resolve(BindingModeId::Normal, kc(KeyCode::Char('T'), KeyModifiers::SHIFT)), Some(Action::CycleTheme));
-        assert_eq!(km.resolve(BindingModeId::Normal, kc(KeyCode::Char('.'), KeyModifiers::NONE)), Some(Action::OpenActionMenu));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(n)), Some(Action::OpenBranchInput));
-        assert_eq!(km.resolve(BindingModeId::Normal, kc(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::OpenCommandPalette));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(a)), Some(Action::OpenFilePicker));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(c)), Some(Action::ToggleProviders));
-        assert_eq!(km.resolve(BindingModeId::Normal, kc(KeyCode::Char('D'), KeyModifiers::SHIFT)), Some(Action::ToggleDebug));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(d)), Some(Action::Dispatch(Intent::RemoveCheckout)));
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(p)), Some(Action::Dispatch(Intent::OpenChangeRequest)));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(q)), Some(Action::Quit));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(r)), Some(Action::Refresh));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(space)), Some(Action::ToggleMultiSelect));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(h)), Some(Action::CycleHost));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(l)), Some(Action::CycleLayout));
+        assert_eq!(
+            km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('T'), KeyModifiers::SHIFT)),
+            Some(Action::CycleTheme)
+        );
+        assert_eq!(
+            km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('.'), KeyModifiers::NONE)),
+            Some(Action::OpenActionMenu)
+        );
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(n)), Some(Action::OpenBranchInput));
+        assert_eq!(
+            km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('/'), KeyModifiers::NONE)),
+            Some(Action::OpenCommandPalette)
+        );
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(a)), Some(Action::OpenFilePicker));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(c)), Some(Action::ToggleProviders));
+        assert_eq!(
+            km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('D'), KeyModifiers::SHIFT)),
+            Some(Action::ToggleDebug)
+        );
+        assert_eq!(
+            km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(d)),
+            Some(Action::Dispatch(Intent::RemoveCheckout))
+        );
+        assert_eq!(
+            km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(p)),
+            Some(Action::Dispatch(Intent::OpenChangeRequest))
+        );
     }
 
     #[test]
     fn mode_specific_overrides_shared() {
         let km = Keymap::defaults();
         // q is Quit in Normal, but Dismiss in Help/Overview/ActionMenu/DeleteConfirm/CloseConfirm
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(q)), Some(Action::Quit));
-        assert_eq!(km.resolve(BindingModeId::Help, crokey::key!(q)), Some(Action::Dismiss));
-        assert_eq!(km.resolve(BindingModeId::Overview, crokey::key!(q)), Some(Action::Dismiss));
-        assert_eq!(km.resolve(BindingModeId::ActionMenu, crokey::key!(q)), Some(Action::Dismiss));
-        assert_eq!(km.resolve(BindingModeId::DeleteConfirm, crokey::key!(q)), Some(Action::Dismiss));
-        assert_eq!(km.resolve(BindingModeId::CloseConfirm, crokey::key!(q)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(q)), Some(Action::Quit));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), crokey::key!(q)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), crokey::key!(q)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::ActionMenu), crokey::key!(q)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DeleteConfirm), crokey::key!(q)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::CloseConfirm), crokey::key!(q)), Some(Action::Dismiss));
     }
 
     #[test]
@@ -574,26 +597,26 @@ mod tests {
         let bracket_left = kc(KeyCode::Char('['), KeyModifiers::NONE);
         let bracket_right = kc(KeyCode::Char(']'), KeyModifiers::NONE);
 
-        assert_eq!(km.resolve(BindingModeId::Normal, bracket_left), Some(Action::PrevTab));
-        assert_eq!(km.resolve(BindingModeId::Normal, bracket_right), Some(Action::NextTab));
-        assert_eq!(km.resolve(BindingModeId::Overview, bracket_left), Some(Action::PrevTab));
-        assert_eq!(km.resolve(BindingModeId::Overview, bracket_right), Some(Action::NextTab));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), bracket_left), Some(Action::PrevTab));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), bracket_right), Some(Action::NextTab));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), bracket_left), Some(Action::PrevTab));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), bracket_right), Some(Action::NextTab));
     }
 
     #[test]
     fn delete_confirm_has_y_n_bindings() {
         let km = Keymap::defaults();
-        assert_eq!(km.resolve(BindingModeId::DeleteConfirm, crokey::key!(y)), Some(Action::Confirm));
-        assert_eq!(km.resolve(BindingModeId::DeleteConfirm, crokey::key!(n)), Some(Action::Dismiss));
-        assert_eq!(km.resolve(BindingModeId::DeleteConfirm, crokey::key!(q)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DeleteConfirm), crokey::key!(y)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DeleteConfirm), crokey::key!(n)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DeleteConfirm), crokey::key!(q)), Some(Action::Dismiss));
     }
 
     #[test]
     fn close_confirm_has_y_n_bindings() {
         let km = Keymap::defaults();
-        assert_eq!(km.resolve(BindingModeId::CloseConfirm, crokey::key!(y)), Some(Action::Confirm));
-        assert_eq!(km.resolve(BindingModeId::CloseConfirm, crokey::key!(n)), Some(Action::Dismiss));
-        assert_eq!(km.resolve(BindingModeId::CloseConfirm, crokey::key!(q)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::CloseConfirm), crokey::key!(y)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::CloseConfirm), crokey::key!(n)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::CloseConfirm), crokey::key!(q)), Some(Action::Dismiss));
     }
 
     #[test]
@@ -601,38 +624,38 @@ mod tests {
         let km = Keymap::defaults();
         let question_mark = kc(KeyCode::Char('?'), KeyModifiers::NONE);
         // ? is a shared binding for ToggleHelp
-        assert_eq!(km.resolve(BindingModeId::Normal, question_mark), Some(Action::ToggleHelp));
-        assert_eq!(km.resolve(BindingModeId::Help, question_mark), Some(Action::ToggleHelp));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), question_mark), Some(Action::ToggleHelp));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), question_mark), Some(Action::ToggleHelp));
     }
 
     #[test]
     fn toggle_status_bar_keys_is_shared_across_modes() {
         let km = Keymap::defaults();
         let shift_k = kc(KeyCode::Char('K'), KeyModifiers::SHIFT);
-        assert_eq!(km.resolve(BindingModeId::Normal, shift_k), Some(Action::ToggleStatusBarKeys));
-        assert_eq!(km.resolve(BindingModeId::Help, shift_k), Some(Action::ToggleStatusBarKeys));
-        assert_eq!(km.resolve(BindingModeId::Overview, shift_k), Some(Action::ToggleStatusBarKeys));
-        assert_eq!(km.resolve(BindingModeId::ActionMenu, shift_k), Some(Action::ToggleStatusBarKeys));
-        assert_eq!(km.resolve(BindingModeId::DeleteConfirm, shift_k), Some(Action::ToggleStatusBarKeys));
-        assert_eq!(km.resolve(BindingModeId::CloseConfirm, shift_k), Some(Action::ToggleStatusBarKeys));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), shift_k), Some(Action::ToggleStatusBarKeys));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), shift_k), Some(Action::ToggleStatusBarKeys));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), shift_k), Some(Action::ToggleStatusBarKeys));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::ActionMenu), shift_k), Some(Action::ToggleStatusBarKeys));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DeleteConfirm), shift_k), Some(Action::ToggleStatusBarKeys));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::CloseConfirm), shift_k), Some(Action::ToggleStatusBarKeys));
     }
 
     #[test]
     fn unbound_key_returns_none() {
         let km = Keymap::defaults();
-        assert_eq!(km.resolve(BindingModeId::Normal, crokey::key!(f12)), None);
-        assert_eq!(km.resolve(BindingModeId::Help, crokey::key!(x)), None);
-        assert_eq!(km.resolve(BindingModeId::Overview, crokey::key!(z)), None);
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(f12)), None);
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), crokey::key!(x)), None);
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), crokey::key!(z)), None);
     }
 
     #[test]
     fn file_picker_falls_through_to_shared() {
         let km = Keymap::defaults();
         // FilePicker has mode-specific bindings that overlap shared, so they resolve directly
-        assert_eq!(km.resolve(BindingModeId::FilePicker, crokey::key!(j)), Some(Action::SelectNext));
-        assert_eq!(km.resolve(BindingModeId::FilePicker, crokey::key!(k)), Some(Action::SelectPrev));
-        assert_eq!(km.resolve(BindingModeId::FilePicker, crokey::key!(enter)), Some(Action::Confirm));
-        assert_eq!(km.resolve(BindingModeId::FilePicker, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(j)), Some(Action::SelectNext));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(k)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(esc)), Some(Action::Dismiss));
     }
 
     // ── from_config tests ──
@@ -642,9 +665,15 @@ mod tests {
         let mut keys = KeysConfig::default();
         keys.shared.insert("g".into(), "select_next".into());
         let keymap = Keymap::from_config(&keys);
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('g'), KeyModifiers::NONE)), Some(Action::SelectNext));
+        assert_eq!(
+            keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(Action::SelectNext)
+        );
         // original 'j' still works
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('j'), KeyModifiers::NONE)), Some(Action::SelectNext));
+        assert_eq!(
+            keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Some(Action::SelectNext)
+        );
     }
 
     #[test]
@@ -652,9 +681,15 @@ mod tests {
         let mut keys = KeysConfig::default();
         keys.normal.insert("x".into(), "quit".into());
         let keymap = Keymap::from_config(&keys);
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('x'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(
+            keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(Action::Quit)
+        );
         // original 'q' still works
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(
+            keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
@@ -663,7 +698,10 @@ mod tests {
         keys.shared.insert("NOT_A_VALID_KEY!!!".into(), "quit".into());
         let keymap = Keymap::from_config(&keys);
         // defaults still work despite invalid override
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(
+            keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
@@ -672,15 +710,21 @@ mod tests {
         keys.shared.insert("g".into(), "nonexistent_action".into());
         let keymap = Keymap::from_config(&keys);
         // 'g' was not bound by default, and the invalid override is skipped
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('g'), KeyModifiers::NONE)), None);
+        assert_eq!(keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('g'), KeyModifiers::NONE)), None);
     }
 
     #[test]
     fn from_config_empty_uses_defaults() {
         let keys = KeysConfig::default();
         let keymap = Keymap::from_config(&keys);
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('j'), KeyModifiers::NONE)), Some(Action::SelectNext));
-        assert_eq!(keymap.resolve(BindingModeId::Normal, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(
+            keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Some(Action::SelectNext)
+        );
+        assert_eq!(
+            keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Action::Quit)
+        );
     }
 
     // ── BindingModeId from UiMode tests ──

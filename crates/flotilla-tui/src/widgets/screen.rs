@@ -22,14 +22,6 @@ use crate::{
     ui_helpers,
 };
 
-/// Extract the primary mode from a `KeyBindingMode`.
-fn primary_mode(mode: &KeyBindingMode) -> BindingModeId {
-    match mode {
-        KeyBindingMode::Single(id) => *id,
-        KeyBindingMode::Composed(ids) => ids.last().copied().unwrap_or(BindingModeId::Normal),
-    }
-}
-
 /// Root widget that owns the tab bar, page content, status bar, and modal stack.
 ///
 /// Renders the tab bar (via `Tabs`), page content (repo pages or overview
@@ -100,24 +92,6 @@ impl Screen {
         }
     }
 
-    /// The binding mode of the topmost widget (modal or active page).
-    pub fn active_binding_mode(&self) -> KeyBindingMode {
-        if let Some(modal) = self.modal_stack.last() {
-            return modal.binding_mode();
-        }
-        // No modal — delegate to the active page
-        // This is a best-effort default; the caller (render_frame) should
-        // use the actual active page, but we don't have enough context here
-        // to know which repo tab is active. Return Normal as the safe default.
-        BindingModeId::Normal.into()
-    }
-
-    /// The mode ID of the topmost widget, for cases that still need a
-    /// single `BindingModeId` (status bar rendering, key handler dispatch).
-    pub fn active_mode_id(&self) -> Option<BindingModeId> {
-        Some(primary_mode(&self.active_binding_mode()))
-    }
-
     /// Status fragment from the topmost widget.
     pub fn active_status_fragment(&self) -> StatusFragment {
         self.modal_stack.last().map(|w| w.status_fragment()).unwrap_or_default()
@@ -145,7 +119,7 @@ impl Screen {
     fn status_fallback_label(&self, ctx: &RenderContext) -> String {
         // If a modal is on the stack, use the modal's mode for the fallback.
         if let Some(modal) = self.modal_stack.last() {
-            let mode = primary_mode(&modal.binding_mode());
+            let mode = modal.binding_mode().primary();
             return match mode {
                 BindingModeId::Help => "HELP".into(),
                 BindingModeId::ActionMenu => "ACTIONS".into(),
@@ -394,7 +368,7 @@ impl InteractiveWidget for Screen {
             (BindingModeId::Normal.into(), StatusFragment::default())
         };
 
-        let active_mode = primary_mode(&binding_mode);
+        let active_mode = binding_mode.primary();
 
         // 3b. Resolve key chips from binding mode via compiled binding table.
         //     Progress fragments suppress key chips (user can't interact during progress).
@@ -439,7 +413,7 @@ impl InteractiveWidget for Screen {
         let show_keys = ctx.ui.status_bar.show_keys;
 
         // 3h. Status bar area — CommandPalette moves it to the overlay position
-        let is_command_palette = self.modal_stack.last().map(|w| primary_mode(&w.binding_mode())) == Some(BindingModeId::CommandPalette);
+        let is_command_palette = self.modal_stack.last().map(|w| w.binding_mode().primary()) == Some(BindingModeId::CommandPalette);
         let status_bar_area = if is_command_palette {
             ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
         } else {

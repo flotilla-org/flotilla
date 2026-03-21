@@ -37,6 +37,17 @@ pub enum KeyBindingMode {
     Composed(Vec<BindingModeId>),
 }
 
+impl KeyBindingMode {
+    /// The "primary" mode: for `Single`, the mode itself; for `Composed`,
+    /// the last (highest-priority) mode in the stack.
+    pub fn primary(&self) -> BindingModeId {
+        match self {
+            KeyBindingMode::Single(id) => *id,
+            KeyBindingMode::Composed(ids) => ids.last().copied().unwrap_or(BindingModeId::Normal),
+        }
+    }
+}
+
 impl From<BindingModeId> for KeyBindingMode {
     fn from(id: BindingModeId) -> Self {
         KeyBindingMode::Single(id)
@@ -215,15 +226,14 @@ impl CompiledBindings {
         for (mode, entries) in hint_entries {
             if let Some(mode_map) = key_map.get(mode) {
                 for (original_combo, action, label) in entries {
-                    // Check if the original key still maps to this action
+                    // Check if the original key still maps to this action.
+                    // If the key was rebound to a different action, drop the
+                    // hint — it was tied to a specific key and is no longer
+                    // relevant.
                     let combo = if mode_map.get(original_combo) == Some(action) {
                         *original_combo
                     } else {
-                        // Key was rebound — search for where the action moved
-                        match mode_map.iter().find(|(_, a)| *a == action) {
-                            Some((c, _)) => *c,
-                            None => continue, // action has no key in this mode
-                        }
+                        continue; // key was rebound — drop the hint
                     };
 
                     let (display, code, modifiers) = display_for_combo(&combo);

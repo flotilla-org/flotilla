@@ -9,14 +9,6 @@ use crate::{
     widgets::InteractiveWidget,
 };
 
-/// Extract the primary mode from a `KeyBindingMode`.
-fn primary_mode(mode: &KeyBindingMode) -> BindingModeId {
-    match mode {
-        KeyBindingMode::Single(id) => *id,
-        KeyBindingMode::Composed(ids) => ids.last().copied().unwrap_or(BindingModeId::Normal),
-    }
-}
-
 impl App {
     // ── Key handling ──
 
@@ -25,8 +17,8 @@ impl App {
     /// and when the base widget (Normal mode_id) is on top — so Config mode
     /// gets correct keymap bindings via `BindingModeId::from(&self.ui.mode)`.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let mode_id = BindingModeId::from(&self.ui.mode);
-        self.keymap.resolve(mode_id, crokey::KeyCombination::from(key))
+        let mode: KeyBindingMode = BindingModeId::from(&self.ui.mode).into();
+        self.keymap.resolve(&mode, crokey::KeyCombination::from(key))
     }
 
     /// Handle actions that the widget stack returned `Ignored` for.
@@ -68,7 +60,7 @@ impl App {
         // Determine the topmost widget's mode. Screen delegates to the
         // top modal (if any) for mode_id / captures_raw_keys.
         let captures_raw = self.screen.captures_raw_keys();
-        let mode_id = primary_mode(&self.screen.binding_mode());
+        let mode_id = self.screen.binding_mode().primary();
 
         let action = if captures_raw {
             match key.code {
@@ -99,7 +91,7 @@ impl App {
                 // resolve using the actual UI mode. This ensures Config mode
                 // gets correct bindings (e.g. q → Dismiss, not Quit).
                 BindingModeId::Normal => self.resolve_action(key),
-                _ => self.keymap.resolve(mode_id, crokey::KeyCombination::from(key)),
+                _ => self.keymap.resolve(&KeyBindingMode::from(mode_id), crokey::KeyCombination::from(key)),
             }
         };
 
@@ -1559,10 +1551,6 @@ mod tests {
         let mut item = make_work_item("a");
         item.issue_keys = vec!["ISSUE-1".into()];
         app.resolve_and_push(Intent::GenerateBranchName, &item);
-        assert_eq!(
-            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
-            KeyBindingMode::from(BindingModeId::BranchInput)
-        );
         assert_eq!(app.screen.modal_stack.len(), 1);
         assert_eq!(
             app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
@@ -1658,10 +1646,6 @@ mod tests {
         app.action_enter();
 
         // Should set BranchInput with generating=true and push widget
-        assert_eq!(
-            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
-            KeyBindingMode::from(BindingModeId::BranchInput)
-        );
         assert_eq!(app.screen.modal_stack.len(), 1);
         assert_eq!(
             app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
