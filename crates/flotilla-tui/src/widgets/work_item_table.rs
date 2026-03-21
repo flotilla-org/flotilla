@@ -5,13 +5,13 @@ use std::{
 };
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_core::data::{GroupEntry, SectionHeader};
+use flotilla_core::data::{GroupEntry, GroupedWorkItems, SectionHeader};
 use flotilla_protocol::{HostName, ProviderData, WorkItem};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Cell, HighlightSpacing, Row, Table},
+    widgets::{Block, Cell, HighlightSpacing, Row, Table, TableState},
     Frame,
 };
 
@@ -47,14 +47,101 @@ pub struct WorkItemTable {
     pub(crate) table_area: Rect,
     /// Gear icon area, captured from layout after table render.
     pub(crate) gear_area: Option<Rect>,
+    // ── Owned selection state (for future RepoPage use) ──────────────
+    /// Ratatui table widget state (tracks selected row and scroll offset).
+    pub table_state: TableState,
+    /// Index into `grouped_items.selectable_indices` for the currently
+    /// highlighted row, or `None` when the table is empty.
+    pub selected_selectable_idx: Option<usize>,
+    /// The grouped work items displayed in this table.
+    pub grouped_items: GroupedWorkItems,
 }
 
 impl WorkItemTable {
     pub fn new() -> Self {
-        Self { table_area: Rect::default(), gear_area: None }
+        Self {
+            table_area: Rect::default(),
+            gear_area: None,
+            table_state: TableState::default(),
+            selected_selectable_idx: None,
+            grouped_items: GroupedWorkItems::default(),
+        }
     }
 
-    // ── Selection helpers ────────────────────────────────────────────
+    // ── Owned data + selection ──────────────────────────────────────
+
+    /// Replace the grouped items and restore selection by work item identity.
+    ///
+    /// After the update, if the previously-selected item still exists in the
+    /// new data it remains selected. Otherwise selection falls back to the
+    /// first selectable row, or `None` if the table is empty.
+    pub fn update_items(&mut self, items: GroupedWorkItems) {
+        let prev_identity =
+            self.selected_selectable_idx.and_then(|si| self.grouped_items.selectable_indices.get(si).copied()).and_then(|ti| {
+                match self.grouped_items.table_entries.get(ti) {
+                    Some(GroupEntry::Item(item)) => Some(item.identity.clone()),
+                    _ => None,
+                }
+            });
+
+        self.grouped_items = items;
+
+        if self.grouped_items.selectable_indices.is_empty() {
+            self.selected_selectable_idx = None;
+            self.table_state.select(None);
+        } else if let Some(ref identity) = prev_identity {
+            let found = self.grouped_items.selectable_indices.iter().enumerate().find(|(_, &ti)| {
+                matches!(
+                    self.grouped_items.table_entries.get(ti),
+                    Some(GroupEntry::Item(item)) if item.identity == *identity
+                )
+            });
+            if let Some((si, &ti)) = found {
+                self.selected_selectable_idx = Some(si);
+                self.table_state.select(Some(ti));
+            } else {
+                self.selected_selectable_idx = Some(0);
+                self.table_state.select(Some(self.grouped_items.selectable_indices[0]));
+            }
+        } else {
+            self.selected_selectable_idx = Some(0);
+            self.table_state.select(Some(self.grouped_items.selectable_indices[0]));
+        }
+    }
+
+    /// Move selection down one row using owned state.
+    pub fn select_next_self(&mut self) {
+        let indices = &self.grouped_items.selectable_indices;
+        if indices.is_empty() {
+            return;
+        }
+        let next = match self.selected_selectable_idx {
+            Some(si) if si + 1 < indices.len() => si + 1,
+            Some(si) => si,
+            None => 0,
+        };
+        let table_idx = indices[next];
+        self.selected_selectable_idx = Some(next);
+        self.table_state.select(Some(table_idx));
+    }
+
+    /// Move selection up one row using owned state.
+    pub fn select_prev_self(&mut self) {
+        let indices = &self.grouped_items.selectable_indices;
+        if indices.is_empty() {
+            return;
+        }
+        let prev = match self.selected_selectable_idx {
+            Some(si) if si > 0 => si - 1,
+            Some(si) => si,
+            None => 0,
+        };
+        let table_idx = indices[prev];
+        self.selected_selectable_idx = Some(prev);
+        self.table_state.select(Some(table_idx));
+    }
+
+    // ── Selection helpers (ctx-based, for current callers) ───────────
 
     pub fn select_next(&self, ctx: &mut WidgetContext) {
         let repo_key = &ctx.repo_order[ctx.active_repo];
@@ -622,4 +709,141 @@ fn build_item_row<'a>(
         Cell::from(Span::styled(issues_display, Style::default().fg(theme.issue))),
         Cell::from(Span::styled(git_display, Style::default().fg(theme.git_status))),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::{checkout_item, grouped_items, issue_item};
+
+    #[test]
+    fn update_items_preserves_selection_by_identity() {
+        let mut table = WorkItemTable::new();
+
+        let items_v1 = grouped_items(vec![
+            checkout_item("feat/a", "/tmp/a", false),
+            checkout_item("feat/b", "/tmp/b", false),
+            checkout_item("feat/c", "/tmp/c", false),
+        ]);
+        table.update_items(items_v1);
+
+        // Select the second item (feat/b)
+        table.select_next_self();
+        assert_eq!(table.selected_selectable_idx, Some(1));
+
+        // Update with reordered items — feat/b is now at index 2
+        let items_v2 = grouped_items(vec![
+            checkout_item("feat/a", "/tmp/a", false),
+            checkout_item("feat/c", "/tmp/c", false),
+            checkout_item("feat/b", "/tmp/b", false),
+        ]);
+        table.update_items(items_v2);
+
+        // Selection should follow feat/b to its new position
+        assert_eq!(table.selected_selectable_idx, Some(2));
+        assert_eq!(table.table_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn update_items_falls_back_to_first_when_selected_removed() {
+        let mut table = WorkItemTable::new();
+
+        let items_v1 = grouped_items(vec![checkout_item("feat/a", "/tmp/a", false), checkout_item("feat/b", "/tmp/b", false)]);
+        table.update_items(items_v1);
+
+        // Select the second item (feat/b)
+        table.select_next_self();
+        assert_eq!(table.selected_selectable_idx, Some(1));
+
+        // Update without feat/b
+        let items_v2 = grouped_items(vec![checkout_item("feat/a", "/tmp/a", false), checkout_item("feat/c", "/tmp/c", false)]);
+        table.update_items(items_v2);
+
+        // Selection should fall back to first item
+        assert_eq!(table.selected_selectable_idx, Some(0));
+        assert_eq!(table.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn update_items_clears_selection_when_empty() {
+        let mut table = WorkItemTable::new();
+
+        let items_v1 = grouped_items(vec![checkout_item("feat/a", "/tmp/a", false)]);
+        table.update_items(items_v1);
+        assert_eq!(table.selected_selectable_idx, Some(0));
+
+        // Update with empty table
+        table.update_items(GroupedWorkItems::default());
+
+        assert_eq!(table.selected_selectable_idx, None);
+        assert_eq!(table.table_state.selected(), None);
+    }
+
+    #[test]
+    fn select_next_self_advances_through_items() {
+        let mut table = WorkItemTable::new();
+        let items = grouped_items(vec![issue_item("1"), issue_item("2"), issue_item("3")]);
+        table.update_items(items);
+
+        // Starts at 0
+        assert_eq!(table.selected_selectable_idx, Some(0));
+
+        table.select_next_self();
+        assert_eq!(table.selected_selectable_idx, Some(1));
+
+        table.select_next_self();
+        assert_eq!(table.selected_selectable_idx, Some(2));
+
+        // At last item, stays put
+        table.select_next_self();
+        assert_eq!(table.selected_selectable_idx, Some(2));
+    }
+
+    #[test]
+    fn select_prev_self_retreats_through_items() {
+        let mut table = WorkItemTable::new();
+        let items = grouped_items(vec![issue_item("1"), issue_item("2"), issue_item("3")]);
+        table.update_items(items);
+
+        // Move to last
+        table.select_next_self();
+        table.select_next_self();
+        assert_eq!(table.selected_selectable_idx, Some(2));
+
+        table.select_prev_self();
+        assert_eq!(table.selected_selectable_idx, Some(1));
+
+        table.select_prev_self();
+        assert_eq!(table.selected_selectable_idx, Some(0));
+
+        // At first item, stays put
+        table.select_prev_self();
+        assert_eq!(table.selected_selectable_idx, Some(0));
+    }
+
+    #[test]
+    fn select_next_self_noop_on_empty() {
+        let mut table = WorkItemTable::new();
+        table.select_next_self();
+        assert_eq!(table.selected_selectable_idx, None);
+    }
+
+    #[test]
+    fn select_prev_self_noop_on_empty() {
+        let mut table = WorkItemTable::new();
+        table.select_prev_self();
+        assert_eq!(table.selected_selectable_idx, None);
+    }
+
+    #[test]
+    fn update_items_selects_first_when_no_prior_selection() {
+        let mut table = WorkItemTable::new();
+        assert_eq!(table.selected_selectable_idx, None);
+
+        let items = grouped_items(vec![issue_item("1"), issue_item("2")]);
+        table.update_items(items);
+
+        assert_eq!(table.selected_selectable_idx, Some(0));
+        assert_eq!(table.table_state.selected(), Some(0));
+    }
 }
