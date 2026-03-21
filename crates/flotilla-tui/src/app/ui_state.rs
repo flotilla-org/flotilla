@@ -156,7 +156,6 @@ pub struct LayoutAreas {
     pub menu_area: Rect,
     pub tab_areas: BTreeMap<TabId, Rect>,
     pub status_bar: StatusBarLayout,
-    pub event_log_filter_area: Rect,
     pub file_picker_area: Rect,
     pub file_picker_list_area: Rect,
 }

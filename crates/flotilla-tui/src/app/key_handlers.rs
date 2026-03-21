@@ -209,10 +209,11 @@ impl App {
 
     /// Sync the active RepoPage's state back into RepoUiState.
     ///
-    /// RepoPage is authoritative for selection, multi-select, search query,
-    /// pending actions, and show_providers. This sync keeps RepoUiState in
-    /// sync for status bar rendering and tests that still read from
-    /// `active_ui()`.
+    /// RepoPage is authoritative for selection, multi-select, and
+    /// show_providers. `active_search_query` and `pending_actions` flow
+    /// rui→page only (written by modals and the executor respectively).
+    /// This sync keeps RepoUiState in sync for status bar rendering and
+    /// tests that still read from `active_ui()`.
     fn sync_repo_page_state(&mut self) {
         if self.ui.mode.is_config() || self.model.repo_order.is_empty() {
             return;

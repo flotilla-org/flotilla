@@ -5,6 +5,7 @@ use super::{
     ui_state::{PendingAction, PendingActionContext, PendingStatus},
     App,
 };
+use crate::widgets::{branch_input::BranchInputWidget, delete_confirm::DeleteConfirmWidget};
 
 /// Dispatch a single protocol command through the daemon.
 ///
@@ -64,7 +65,7 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
 fn reset_loading_mode(app: &mut App) {
     // Pop loading widgets from the modal stack on error.
     if let Some(widget) = app.screen.modal_stack.last_mut() {
-        if let Some(dcw) = widget.as_any_mut().downcast_mut::<crate::widgets::delete_confirm::DeleteConfirmWidget>() {
+        if let Some(dcw) = widget.as_any_mut().downcast_mut::<DeleteConfirmWidget>() {
             if dcw.loading {
                 app.screen.modal_stack.pop();
                 return;
@@ -72,7 +73,7 @@ fn reset_loading_mode(app: &mut App) {
         }
     }
     if let Some(widget) = app.screen.modal_stack.last_mut() {
-        if let Some(biw) = widget.as_any_mut().downcast_mut::<crate::widgets::branch_input::BranchInputWidget>() {
+        if let Some(biw) = widget.as_any_mut().downcast_mut::<BranchInputWidget>() {
             if biw.is_generating() {
                 app.screen.modal_stack.pop();
             }
@@ -119,7 +120,7 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
                 .screen
                 .modal_stack
                 .last_mut()
-                .and_then(|widget| widget.as_any_mut().downcast_mut::<crate::widgets::branch_input::BranchInputWidget>());
+                .and_then(|widget| widget.as_any_mut().downcast_mut::<BranchInputWidget>());
             if let Some(biw) = updated {
                 biw.prefill(&name, issue_ids);
             } else {
@@ -131,7 +132,7 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
                 .screen
                 .modal_stack
                 .last_mut()
-                .and_then(|widget| widget.as_any_mut().downcast_mut::<crate::widgets::delete_confirm::DeleteConfirmWidget>());
+                .and_then(|widget| widget.as_any_mut().downcast_mut::<DeleteConfirmWidget>());
             if let Some(dcw) = updated {
                 dcw.update_info(info);
             } else {
