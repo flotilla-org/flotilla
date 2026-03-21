@@ -75,6 +75,7 @@ flotilla host <name> repo <args>                  # route repo commands to a hos
 
 ```
 flotilla hooks install <harness> [--user|--project|--local]
+flotilla hooks install <harness> --plugin         # show plugin marketplace instructions
 flotilla hooks uninstall <harness>
 flotilla hook <harness> <event>                   # receive a hook event (called by agent)
 ```
