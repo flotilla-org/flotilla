@@ -1,6 +1,6 @@
 //! Daemon-side command executor.
 //!
-//! Takes a `Command`, the repo context, and returns a `CommandResult`.
+//! Takes a `Command`, the repo context, and returns a `CommandValue`.
 //! No UI state mutation — all results are carried in the return value.
 
 mod checkout;
@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, HostName, HostPath, ManagedTerminalId};
+use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, ManagedTerminalId};
 use tracing::{debug, error, info};
 
 use self::{
@@ -33,7 +33,7 @@ use crate::{
 /// The result of `build_plan`: either an immediate result or a multi-step plan.
 pub enum ExecutionPlan {
     /// Command completed synchronously — no steps needed.
-    Immediate(CommandResult),
+    Immediate(CommandValue),
     /// Command requires multiple steps with cancellation support.
     Steps(StepPlan),
 }
@@ -81,7 +81,7 @@ impl<'a> CheckoutFlow<'a> {
         &self,
         existing_policy: CheckoutExistingPolicy,
         issue_link_policy: CheckoutIssueLinkPolicy,
-    ) -> Result<CommandResult, String> {
+    ) -> Result<CommandValue, String> {
         let checkout_service = CheckoutService::new(self.registry, self.runner);
         checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
 
@@ -90,7 +90,7 @@ impl<'a> CheckoutFlow<'a> {
                 if matches!(self.intent, CheckoutIntent::FreshBranch) {
                     return Err(format!("branch already exists: {}", self.branch));
                 }
-                return Ok(CommandResult::CheckoutCreated { branch: self.branch.to_string(), path });
+                return Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path });
             }
         }
 
@@ -98,7 +98,7 @@ impl<'a> CheckoutFlow<'a> {
         if !self.issue_ids.is_empty() && matches!(issue_link_policy, CheckoutIssueLinkPolicy::Inline) {
             checkout_service.write_branch_issue_links(self.repo_root, self.branch, self.issue_ids).await;
         }
-        Ok(CommandResult::CheckoutCreated { branch: self.branch.to_string(), path })
+        Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path })
     }
 }
 
@@ -133,15 +133,15 @@ impl<'a> RemoveCheckoutFlow<'a> {
         checkout_service.remove_checkout(self.repo_root, branch, self.terminal_keys, &deleted_paths, self.attachable_store).await
     }
 
-    async fn execute(&self) -> CommandResult {
+    async fn execute(&self) -> CommandValue {
         let branch = match self.resolve_branch() {
             Ok(branch) => branch,
-            Err(message) => return CommandResult::Error { message },
+            Err(message) => return CommandValue::Error { message },
         };
         info!(%branch, "removing checkout");
         match self.remove_branch(&branch).await {
-            Ok(()) => CommandResult::CheckoutRemoved { branch },
-            Err(message) => CommandResult::Error { message },
+            Ok(()) => CommandValue::CheckoutRemoved { branch },
+            Err(message) => CommandValue::Error { message },
         }
     }
 }
@@ -213,7 +213,7 @@ pub async fn build_plan(
                     let deleted_paths = remove_flow.deleted_checkout_paths(&branch);
                     build_remove_checkout_plan(branch, terminal_keys, repo.root, registry, runner, deleted_paths, attachable_store.clone())
                 }
-                Err(message) => ExecutionPlan::Immediate(CommandResult::Error { message }),
+                Err(message) => ExecutionPlan::Immediate(CommandValue::Error { message }),
             }
         }
 
@@ -291,7 +291,7 @@ async fn build_create_checkout_plan(
                     let result = checkout_flow
                         .checkout_created_result(CheckoutExistingPolicy::ReuseKnownCheckout, CheckoutIssueLinkPolicy::Deferred)
                         .await?;
-                    if let CommandResult::CheckoutCreated { path, .. } = &result {
+                    if let CommandValue::CheckoutCreated { path, .. } = &result {
                         info!(checkout_path = %path.display(), "created checkout");
                     }
                     Ok(StepOutcome::CompletedWith(result))
@@ -365,7 +365,7 @@ async fn build_teleport_session_plan(
     // Shared slot for checkout path — pre-populated if checkout_key references a known checkout.
     let initial_checkout_path = match teleport_flow.initial_checkout_path().await {
         Ok(path) => path,
-        Err(message) => return ExecutionPlan::Immediate(CommandResult::Error { message }),
+        Err(message) => return ExecutionPlan::Immediate(CommandValue::Error { message }),
     };
     let checkout_path_slot: Arc<tokio::sync::Mutex<Option<PathBuf>>> = Arc::new(tokio::sync::Mutex::new(initial_checkout_path));
 
@@ -540,7 +540,7 @@ impl StepResolver for ExecutorStepResolver {
             StepAction::Closure(_) => unreachable!("closures handled by stepper directly"),
             StepAction::CreateWorkspaceForCheckout { label } => {
                 let path = prior.iter().find_map(|o| match o {
-                    StepOutcome::CompletedWith(CommandResult::CheckoutCreated { path, .. }) => Some(path.clone()),
+                    StepOutcome::CompletedWith(CommandValue::CheckoutCreated { path, .. }) => Some(path.clone()),
                     _ => None,
                 });
                 match path {
@@ -580,7 +580,7 @@ async fn build_archive_session_plan(
             Box::pin(async move {
                 let session_actions = ReadOnlySessionActionService::new(registry.as_ref(), providers_data.as_ref());
                 match session_actions.archive_session_result(&session_id).await {
-                    CommandResult::Error { message } => Err(message),
+                    CommandValue::Error { message } => Err(message),
                     result => Ok(StepOutcome::CompletedWith(result)),
                 }
             })
@@ -625,19 +625,19 @@ pub async fn execute(
     attachable_store: &SharedAttachableStore,
     daemon_socket_path: Option<&Path>,
     local_host: &HostName,
-) -> CommandResult {
+) -> CommandValue {
     match action {
         CommandAction::CreateWorkspaceForCheckout { checkout_path, label } => {
             let host_key = HostPath::new(local_host.clone(), checkout_path.clone());
             if !providers_data.checkouts.contains_key(&host_key) {
-                return CommandResult::Error { message: format!("checkout not found: {}", checkout_path.display()) };
+                return CommandValue::Error { message: format!("checkout not found: {}", checkout_path.display()) };
             }
             info!(%label, "entering workspace");
             let workspace_orchestrator =
                 WorkspaceOrchestrator::new(&repo.root, registry, config_base, attachable_store, daemon_socket_path, local_host);
             match workspace_orchestrator.create_workspace_for_checkout(&checkout_path, &label).await {
-                Ok(_) => CommandResult::Ok,
-                Err(e) => CommandResult::Error { message: e },
+                Ok(_) => CommandValue::Ok,
+                Err(e) => CommandValue::Error { message: e },
             }
         }
 
@@ -648,9 +648,9 @@ pub async fn execute(
                 .create_workspace_from_prepared_terminal(&target_host, &branch, &checkout_path, attachable_set_id.as_ref(), &commands)
                 .await
             {
-                return CommandResult::Error { message };
+                return CommandValue::Error { message };
             }
-            CommandResult::Ok
+            CommandValue::Ok
         }
 
         CommandAction::SelectWorkspace { ws_ref } => {
@@ -658,9 +658,9 @@ pub async fn execute(
             let workspace_orchestrator =
                 WorkspaceOrchestrator::new(&repo.root, registry, config_base, attachable_store, daemon_socket_path, local_host);
             if let Err(message) = workspace_orchestrator.select_workspace(&ws_ref).await {
-                return CommandResult::Error { message };
+                return CommandValue::Error { message };
             }
-            CommandResult::Ok
+            CommandValue::Ok
         }
 
         CommandAction::Checkout { target, issue_ids, .. } => {
@@ -682,14 +682,14 @@ pub async fn execute(
             info!(%branch, "creating checkout");
             match checkout_flow.checkout_created_result(CheckoutExistingPolicy::AlwaysCreate, CheckoutIssueLinkPolicy::Inline).await {
                 Ok(result) => {
-                    if let CommandResult::CheckoutCreated { path, .. } = &result {
+                    if let CommandValue::CheckoutCreated { path, .. } = &result {
                         info!(checkout_path = %path.display(), "created checkout");
                     }
                     result
                 }
                 Err(message) => {
                     error!(err = %message, "create checkout failed");
-                    CommandResult::Error { message }
+                    CommandValue::Error { message }
                 }
             }
         }
@@ -707,7 +707,7 @@ pub async fn execute(
                     })
                     .await
                 {
-                    Ok(commands) => CommandResult::TerminalPrepared {
+                    Ok(commands) => CommandValue::TerminalPrepared {
                         repo_identity: repo.identity.clone(),
                         target_host: local_host.clone(),
                         branch: co.branch,
@@ -715,10 +715,10 @@ pub async fn execute(
                         attachable_set_id,
                         commands,
                     },
-                    Err(message) => CommandResult::Error { message },
+                    Err(message) => CommandValue::Error { message },
                 }
             } else {
-                CommandResult::Error { message: format!("checkout not found: {}", checkout_path.display()) }
+                CommandValue::Error { message: format!("checkout not found: {}", checkout_path.display()) }
             }
         }
 
@@ -740,7 +740,7 @@ pub async fn execute(
         CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
             let info =
                 data::fetch_checkout_status(&branch, checkout_path.as_deref(), change_request_id.as_deref(), &repo.root, runner).await;
-            CommandResult::CheckoutStatus(info)
+            CommandValue::CheckoutStatus(info)
         }
 
         CommandAction::OpenChangeRequest { id } => {
@@ -748,7 +748,7 @@ pub async fn execute(
             if let Some(cr) = registry.change_requests.preferred() {
                 let _ = cr.open_in_browser(&repo.root, &id).await;
             }
-            CommandResult::Ok
+            CommandValue::Ok
         }
 
         CommandAction::CloseChangeRequest { id } => {
@@ -756,7 +756,7 @@ pub async fn execute(
             if let Some(cr) = registry.change_requests.preferred() {
                 let _ = cr.close_change_request(&repo.root, &id).await;
             }
-            CommandResult::Ok
+            CommandValue::Ok
         }
 
         CommandAction::OpenIssue { id } => {
@@ -764,7 +764,7 @@ pub async fn execute(
             if let Some(it) = registry.issue_trackers.preferred() {
                 let _ = it.open_in_browser(&repo.root, &id).await;
             }
-            CommandResult::Ok
+            CommandValue::Ok
         }
 
         CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
@@ -782,17 +782,17 @@ pub async fn execute(
                     match result {
                         Ok(_) => {
                             info!(%change_request_id, "linked issues to change request");
-                            CommandResult::Ok
+                            CommandValue::Ok
                         }
                         Err(e) => {
                             error!(err = %e, "failed to edit change request");
-                            CommandResult::Error { message: e }
+                            CommandValue::Error { message: e }
                         }
                     }
                 }
                 Err(e) => {
                     error!(err = %e, "failed to read change request body");
-                    CommandResult::Error { message: e }
+                    CommandValue::Error { message: e }
                 }
             }
         }
@@ -822,8 +822,8 @@ pub async fn execute(
                 checkout_key.as_ref(),
             );
             match teleport_flow.execute().await {
-                Ok(()) => CommandResult::Ok,
-                Err(message) => CommandResult::Error { message },
+                Ok(()) => CommandValue::Ok,
+                Err(message) => CommandValue::Error { message },
             }
         }
 
@@ -836,7 +836,7 @@ pub async fn execute(
         | CommandAction::FetchMoreIssues { .. }
         | CommandAction::SearchIssues { .. }
         | CommandAction::ClearIssueSearch { .. } => {
-            CommandResult::Error { message: "bug: daemon-level command reached per-repo executor".to_string() }
+            CommandValue::Error { message: "bug: daemon-level command reached per-repo executor".to_string() }
         }
     }
 }

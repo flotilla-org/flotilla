@@ -1,6 +1,6 @@
 use std::{future::Future, path::PathBuf, pin::Pin};
 
-use flotilla_protocol::{CommandResult, DaemonEvent, HostName, RepoIdentity, StepStatus};
+use flotilla_protocol::{CommandValue, DaemonEvent, HostName, RepoIdentity, StepStatus};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 pub enum StepOutcome {
     /// Step completed successfully, no specific result to report.
     Completed,
-    /// Step completed and wants to override the final CommandResult.
-    CompletedWith(CommandResult),
+    /// Step completed and wants to override the final CommandValue.
+    CompletedWith(CommandValue),
     /// Step determined its work was already done and skipped.
     Skipped,
 }
@@ -70,13 +70,13 @@ pub async fn run_step_plan(
     cancel: CancellationToken,
     event_tx: broadcast::Sender<DaemonEvent>,
     resolver: Option<&dyn StepResolver>,
-) -> CommandResult {
+) -> CommandValue {
     let step_count = plan.steps.len();
     let mut outcomes: Vec<StepOutcome> = Vec::new();
 
     for (i, step) in plan.steps.into_iter().enumerate() {
         if cancel.is_cancelled() {
-            return CommandResult::Cancelled;
+            return CommandValue::Cancelled;
         }
 
         let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
@@ -101,7 +101,7 @@ pub async fn run_step_plan(
         // Cancellation wins over a successful in-flight step, but provider
         // errors still surface so we don't hide the underlying failure.
         if cancel.is_cancelled() && outcome.is_ok() {
-            return CommandResult::Cancelled;
+            return CommandValue::Cancelled;
         }
 
         match outcome {
@@ -139,7 +139,7 @@ pub async fn run_step_plan(
                     StepOutcome::CompletedWith(r) => Some(r.clone()),
                     _ => None,
                 });
-                return prior_result.unwrap_or(CommandResult::Error { message: e });
+                return prior_result.unwrap_or(CommandValue::Error { message: e });
             }
         }
     }
@@ -152,7 +152,7 @@ pub async fn run_step_plan(
             StepOutcome::CompletedWith(r) => Some(r),
             _ => None,
         })
-        .unwrap_or(CommandResult::Ok)
+        .unwrap_or(CommandValue::Ok)
 }
 
 #[cfg(test)]
@@ -197,7 +197,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::Ok);
+        assert_eq!(result, CommandValue::Ok);
 
         // Should have 4 events: Started+Succeeded for each step
         let mut events = vec![];
@@ -227,7 +227,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::Error { message: "boom".into() });
+        assert_eq!(result, CommandValue::Error { message: "boom".into() });
     }
 
     #[tokio::test]
@@ -247,7 +247,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::Cancelled);
+        assert_eq!(result, CommandValue::Cancelled);
     }
 
     #[tokio::test]
@@ -286,7 +286,7 @@ mod tests {
         release.notify_waiters();
 
         let result = task.await.expect("task should join");
-        assert_eq!(result, CommandResult::Cancelled);
+        assert_eq!(result, CommandValue::Cancelled);
     }
 
     #[tokio::test]
@@ -305,7 +305,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::Ok);
+        assert_eq!(result, CommandValue::Ok);
     }
 
     #[tokio::test]
@@ -314,7 +314,7 @@ mod tests {
         let plan = StepPlan::new(vec![
             make_step(
                 "step-a",
-                Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated {
+                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
                     branch: "feat/x".into(),
                     path: PathBuf::from("/repo/wt-feat-x"),
                 })),
@@ -333,7 +333,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
+        assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
     }
 
     #[tokio::test]
@@ -352,7 +352,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::Ok);
+        assert_eq!(result, CommandValue::Ok);
     }
 
     #[tokio::test]
@@ -375,7 +375,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::Ok);
+        assert_eq!(result, CommandValue::Ok);
     }
 
     #[tokio::test]
@@ -384,7 +384,7 @@ mod tests {
         let plan = StepPlan::new(vec![
             make_step(
                 "step-a",
-                Ok(StepOutcome::CompletedWith(CommandResult::CheckoutCreated {
+                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
                     branch: "feat/x".into(),
                     path: PathBuf::from("/repo/wt-feat-x"),
                 })),
@@ -403,6 +403,6 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result, CommandResult::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
+        assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
     }
 }

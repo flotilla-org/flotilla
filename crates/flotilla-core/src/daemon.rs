@@ -29,7 +29,7 @@ pub trait DaemonHandle: Send + Sync {
     async fn execute(&self, command: Command) -> Result<u64, String>;
 
     /// Cancel a running command. The command will finish with
-    /// `CommandResult::Cancelled` once cancellation takes effect.
+    /// `CommandValue::Cancelled` once cancellation takes effect.
     async fn cancel(&self, command_id: u64) -> Result<(), String>;
 
     /// Get replay events for repos based on last-seen sequence numbers.

@@ -30,7 +30,7 @@ use flotilla_core::{
     },
 };
 use flotilla_protocol::{
-    AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandResult, CorrelationKey, DaemonEvent,
+    AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, CorrelationKey, DaemonEvent,
     HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, ManagedTerminal, ManagedTerminalId, PeerConnectionState,
     ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, TerminalStatus, ToolInventory, TopologyRoute, WorkItemKind,
 };
@@ -501,10 +501,7 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
     .await
     .expect("timeout waiting for checkout status command to finish");
 
-    assert!(
-        matches!(result, CommandResult::CheckoutStatus(_)),
-        "expected checkout status result via identity context repo, got {result:?}"
-    );
+    assert!(matches!(result, CommandValue::CheckoutStatus(_)), "expected checkout status result via identity context repo, got {result:?}");
 }
 
 #[tokio::test]
@@ -561,7 +558,7 @@ async fn archive_session_can_be_cancelled_while_provider_call_is_in_flight() {
     .await
     .expect("timed out waiting for command finish");
 
-    assert_eq!(result, CommandResult::Cancelled);
+    assert_eq!(result, CommandValue::Cancelled);
 }
 
 #[tokio::test]
@@ -611,7 +608,7 @@ async fn generate_branch_name_can_be_cancelled_while_provider_call_is_in_flight(
     .await
     .expect("timed out waiting for command finish");
 
-    assert_eq!(result, CommandResult::Cancelled);
+    assert_eq!(result, CommandValue::Cancelled);
 }
 
 #[tokio::test]
@@ -1205,7 +1202,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     .await
     .expect("timeout waiting for add command events");
     let (finished_identity, finished_result) = finished_add;
-    assert!(matches!(finished_result, CommandResult::RepoTracked { ref path, .. } if *path == repo));
+    assert!(matches!(finished_result, CommandValue::RepoTracked { ref path, .. } if *path == repo));
     assert_eq!(finished_identity, added.identity, "CommandFinished should use the tracked repo identity");
     assert_eq!(started_add, added.identity, "CommandStarted should use the tracked repo identity");
     assert_eq!(added.path, repo);
@@ -1239,7 +1236,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     })
     .await
     .expect("timeout waiting for remove command events");
-    assert!(matches!(finished_remove, CommandResult::RepoUntracked { ref path } if *path == repo));
+    assert!(matches!(finished_remove, CommandValue::RepoUntracked { ref path } if *path == repo));
     assert_eq!(removed, repo);
 
     let repos = daemon.list_repos().await.expect("list_repos after remove");
@@ -1761,7 +1758,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     .await
     .expect("timeout waiting for refresh all CommandFinished");
 
-    assert!(matches!(finished, CommandResult::Refreshed { repos } if repos.len() == 2));
+    assert!(matches!(finished, CommandValue::Refreshed { repos } if repos.len() == 2));
 }
 
 #[tokio::test]
@@ -1807,7 +1804,7 @@ async fn fetch_checkout_status_uses_context_repo_when_checkout_path_is_absent() 
     .await
     .expect("timeout waiting for checkout status command to finish");
 
-    assert!(matches!(result, CommandResult::CheckoutStatus(_)), "expected checkout status result via context repo, got {result:?}");
+    assert!(matches!(result, CommandValue::CheckoutStatus(_)), "expected checkout status result via context repo, got {result:?}");
 }
 
 #[tokio::test]
@@ -1846,11 +1843,11 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
         while branch_err.is_none() || fresh_err.is_none() {
             match rx.recv().await {
                 Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == branch_id => match result {
-                    CommandResult::Error { message } => branch_err = Some(message),
+                    CommandValue::Error { message } => branch_err = Some(message),
                     other => panic!("expected error for Branch checkout, got {other:?}"),
                 },
                 Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == fresh_id => match result {
-                    CommandResult::Error { message } => fresh_err = Some(message),
+                    CommandValue::Error { message } => fresh_err = Some(message),
                     other => panic!("expected error for FreshBranch checkout, got {other:?}"),
                 },
                 Ok(_) => {}
@@ -2228,7 +2225,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
     .await
     .expect("timed out waiting for RemoveCheckout to finish");
 
-    assert!(!matches!(result, CommandResult::Error { .. }), "RemoveCheckout should succeed, got: {result:?}");
+    assert!(!matches!(result, CommandValue::Error { .. }), "RemoveCheckout should succeed, got: {result:?}");
 
     // --- Assert: set removed from store ---
     {

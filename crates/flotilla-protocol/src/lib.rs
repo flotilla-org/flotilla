@@ -37,9 +37,6 @@ pub use commands::{
     CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, PreparedTerminalCommand, RepoSelector,
     StepStatus,
 };
-
-/// Deprecated alias — use CommandValue.
-pub type CommandResult = CommandValue;
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AheadBehind, AssociationKey, AttachableId,
@@ -524,7 +521,7 @@ mod tests {
             host: HostName::new("desktop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repo: PathBuf::from("/tmp/repo"),
-            result: CommandResult::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/tmp/repo/feat-x") },
+            result: CommandValue::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/tmp/repo/feat-x") },
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
@@ -535,7 +532,7 @@ mod tests {
                 assert_eq!(repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
                 assert_eq!(repo, PathBuf::from("/tmp/repo"));
                 match result {
-                    CommandResult::CheckoutCreated { branch, path } => {
+                    CommandValue::CheckoutCreated { branch, path } => {
                         assert_eq!(branch, "feat-x");
                         assert_eq!(path, PathBuf::from("/tmp/repo/feat-x"));
                     }

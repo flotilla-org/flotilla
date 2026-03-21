@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use flotilla_protocol::{CommandResult, HostName};
+use flotilla_protocol::{CommandValue, HostName};
 use tracing::{info, warn};
 
 use super::WorkspaceOrchestrator;
@@ -48,23 +48,23 @@ impl<'a> ReadOnlySessionActionService<'a> {
             .is_some()
     }
 
-    pub(super) async fn archive_session_result(&self, session_id: &str) -> CommandResult {
+    pub(super) async fn archive_session_result(&self, session_id: &str) -> CommandValue {
         if let Some(session) = self.providers_data.sessions.get(session_id) {
             info!(%session_id, "archiving session");
             if let Some(key) = session_provider_key(session, session_id) {
                 if let Some((_, coding_agent)) = self.registry.cloud_agents.get(key) {
                     match coding_agent.archive_session(session_id).await {
-                        Ok(()) => CommandResult::Ok,
-                        Err(err) => CommandResult::Error { message: err },
+                        Ok(()) => CommandValue::Ok,
+                        Err(err) => CommandValue::Error { message: err },
                     }
                 } else {
-                    CommandResult::Error { message: format!("No coding agent provider: {key}") }
+                    CommandValue::Error { message: format!("No coding agent provider: {key}") }
                 }
             } else {
-                CommandResult::Error { message: format!("Cannot determine provider for session {session_id}") }
+                CommandValue::Error { message: format!("Cannot determine provider for session {session_id}") }
             }
         } else {
-            CommandResult::Error { message: format!("session not found: {session_id}") }
+            CommandValue::Error { message: format!("session not found: {session_id}") }
         }
     }
 
@@ -72,7 +72,7 @@ impl<'a> ReadOnlySessionActionService<'a> {
         !self.registry.ai_utilities.is_empty()
     }
 
-    pub(super) async fn generate_branch_name_result(&self, issue_keys: &[String]) -> CommandResult {
+    pub(super) async fn generate_branch_name_result(&self, issue_keys: &[String]) -> CommandValue {
         let issues: Vec<(String, String)> = issue_keys
             .iter()
             .filter_map(|key| self.providers_data.issues.get(key.as_str()).map(|issue| (key.clone(), issue.title.clone())))
@@ -96,19 +96,19 @@ impl<'a> ReadOnlySessionActionService<'a> {
         match branch_result {
             Some(Ok(name)) => {
                 info!(%name, "AI suggested");
-                CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
+                CommandValue::BranchNameGenerated { name, issue_ids: issue_id_pairs }
             }
             Some(Err(error)) => {
                 warn!(%error, "using fallback branch name after AI failure");
                 let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
                 let name = fallback.join("-");
-                CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
+                CommandValue::BranchNameGenerated { name, issue_ids: issue_id_pairs }
             }
             None => {
                 warn!("using fallback branch name without AI provider");
                 let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
                 let name = fallback.join("-");
-                CommandResult::BranchNameGenerated { name, issue_ids: issue_id_pairs }
+                CommandValue::BranchNameGenerated { name, issue_ids: issue_id_pairs }
             }
         }
     }

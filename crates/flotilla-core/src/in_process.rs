@@ -2081,10 +2081,8 @@ impl DaemonHandle for InProcessDaemon {
                     description,
                 });
                 let result = match self.add_repo(path).await {
-                    Ok((tracked_path, resolved_from)) => {
-                        flotilla_protocol::CommandResult::RepoTracked { path: tracked_path, resolved_from }
-                    }
-                    Err(message) => flotilla_protocol::CommandResult::Error { message },
+                    Ok((tracked_path, resolved_from)) => flotilla_protocol::CommandValue::RepoTracked { path: tracked_path, resolved_from },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
                 };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
@@ -2108,8 +2106,8 @@ impl DaemonHandle for InProcessDaemon {
                     description,
                 });
                 let result = match self.remove_repo(&repo_path).await {
-                    Ok(()) => flotilla_protocol::CommandResult::RepoUntracked { path: repo_path.clone() },
-                    Err(message) => flotilla_protocol::CommandResult::Error { message },
+                    Ok(()) => flotilla_protocol::CommandValue::RepoUntracked { path: repo_path.clone() },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
                 };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
@@ -2150,7 +2148,7 @@ impl DaemonHandle for InProcessDaemon {
                     host: self.host_name.clone(),
                     repo_identity: display_repo_identity,
                     repo: display_repo,
-                    result: flotilla_protocol::CommandResult::Refreshed { repos: refreshed },
+                    result: flotilla_protocol::CommandValue::Refreshed { repos: refreshed },
                 });
                 return Ok(id);
             }
@@ -2167,8 +2165,8 @@ impl DaemonHandle for InProcessDaemon {
                     description,
                 });
                 let result = match self.refresh(&flotilla_protocol::RepoSelector::Path(repo_path.clone())).await {
-                    Ok(()) => flotilla_protocol::CommandResult::Refreshed { repos: vec![repo_path.clone()] },
-                    Err(message) => flotilla_protocol::CommandResult::Error { message },
+                    Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: vec![repo_path.clone()] },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
                 };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                     command_id: id,
@@ -2260,7 +2258,7 @@ impl DaemonHandle for InProcessDaemon {
                                 host: command_host.clone(),
                                 repo_identity: repo_identity.clone(),
                                 repo: repo_path,
-                                result: flotilla_protocol::CommandResult::Error {
+                                result: flotilla_protocol::CommandValue::Error {
                                     message: format!("another command is already running (id {})", active.command_id),
                                 },
                             });

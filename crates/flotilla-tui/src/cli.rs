@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandResult, DaemonEvent, HostProvidersResponse, HostStatusResponse, PeerConnectionState,
+    output::OutputFormat, Command, CommandValue, DaemonEvent, HostProvidersResponse, HostStatusResponse, PeerConnectionState,
     RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
@@ -195,22 +195,22 @@ fn repo_name(path: &std::path::Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
-/// Format a `CommandResult` as a short human-readable string.
-fn format_command_result(result: &flotilla_protocol::commands::CommandResult) -> String {
-    use flotilla_protocol::commands::CommandResult;
+/// Format a `CommandValue` as a short human-readable string.
+fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> String {
+    use flotilla_protocol::commands::CommandValue;
     match result {
-        CommandResult::Ok => "ok".to_string(),
-        CommandResult::RepoTracked { path, resolved_from } => match resolved_from {
+        CommandValue::Ok => "ok".to_string(),
+        CommandValue::RepoTracked { path, resolved_from } => match resolved_from {
             Some(original) => format!("repo tracked: {} (resolved from {})", path.display(), original.display()),
             None => format!("repo tracked: {}", path.display()),
         },
-        CommandResult::RepoUntracked { path } => format!("repo untracked: {}", path.display()),
-        CommandResult::Refreshed { repos } => format!("refreshed {} repo(s)", repos.len()),
-        CommandResult::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
-        CommandResult::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
-        CommandResult::TerminalPrepared { branch, target_host, .. } => format!("terminal prepared: {branch} on {target_host}"),
-        CommandResult::BranchNameGenerated { name, .. } => format!("branch name: {name}"),
-        CommandResult::CheckoutStatus(status) => {
+        CommandValue::RepoUntracked { path } => format!("repo untracked: {}", path.display()),
+        CommandValue::Refreshed { repos } => format!("refreshed {} repo(s)", repos.len()),
+        CommandValue::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
+        CommandValue::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
+        CommandValue::TerminalPrepared { branch, target_host, .. } => format!("terminal prepared: {branch} on {target_host}"),
+        CommandValue::BranchNameGenerated { name, .. } => format!("branch name: {name}"),
+        CommandValue::CheckoutStatus(status) => {
             let mut parts = vec![format!("checkout status: {}", status.branch)];
             if let Some(cr) = &status.change_request_status {
                 parts.push(format!("PR: {cr}"));
@@ -229,8 +229,9 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandResult) ->
             }
             parts.join(", ")
         }
-        CommandResult::Error { message } => format!("error: {message}"),
-        CommandResult::Cancelled => "cancelled".to_string(),
+        CommandValue::Error { message } => format!("error: {message}"),
+        CommandValue::Cancelled => "cancelled".to_string(),
+        CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => "internal step result".to_string(),
     }
 }
 
@@ -562,8 +563,8 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
                 }
                 let result = result.clone();
                 return match result {
-                    CommandResult::Error { message } => Err(message),
-                    CommandResult::Cancelled => Err("command cancelled".into()),
+                    CommandValue::Error { message } => Err(message),
+                    CommandValue::Cancelled => Err("command cancelled".into()),
                     _ => Ok(()),
                 };
             }
@@ -755,7 +756,7 @@ mod tests {
     mod watch_human {
         use std::path::PathBuf;
 
-        use flotilla_protocol::{commands::CommandResult, DaemonEvent, HostName, PeerConnectionState, RepoDelta, RepoSnapshot};
+        use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostName, PeerConnectionState, RepoDelta, RepoSnapshot};
 
         use crate::cli::format_event_human;
 
@@ -880,7 +881,7 @@ mod tests {
                 host: HostName::local(),
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
                 repo: PathBuf::from("/tmp/my-repo"),
-                result: CommandResult::Ok,
+                result: CommandValue::Ok,
             };
             let line = format_event_human(&event);
             assert!(line.contains("[command]"), "should have command tag");
@@ -895,7 +896,7 @@ mod tests {
                 host: HostName::local(),
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
                 repo: PathBuf::from("/tmp/my-repo"),
-                result: CommandResult::Error { message: "boom".into() },
+                result: CommandValue::Error { message: "boom".into() },
             };
             let line = format_event_human(&event);
             assert!(line.contains("error: boom"), "should show error message");
@@ -922,18 +923,18 @@ mod tests {
     mod command_result_human {
         use std::path::PathBuf;
 
-        use flotilla_protocol::commands::{CheckoutStatus, CommandResult};
+        use flotilla_protocol::commands::{CheckoutStatus, CommandValue};
 
         use crate::cli::format_command_result;
 
         #[test]
         fn ok() {
-            assert_eq!(format_command_result(&CommandResult::Ok), "ok");
+            assert_eq!(format_command_result(&CommandValue::Ok), "ok");
         }
 
         #[test]
         fn repo_tracked() {
-            let result = CommandResult::RepoTracked { path: PathBuf::from("/tmp/my-repo"), resolved_from: None };
+            let result = CommandValue::RepoTracked { path: PathBuf::from("/tmp/my-repo"), resolved_from: None };
             let output = format_command_result(&result);
             assert!(output.contains("repo tracked"), "should say repo tracked");
             assert!(output.contains("/tmp/my-repo"), "should include path");
@@ -942,7 +943,7 @@ mod tests {
 
         #[test]
         fn repo_tracked_with_resolved_from() {
-            let result = CommandResult::RepoTracked {
+            let result = CommandValue::RepoTracked {
                 path: PathBuf::from("/tmp/my-repo"),
                 resolved_from: Some(PathBuf::from("/tmp/my-repo/wt-feat")),
             };
@@ -954,7 +955,7 @@ mod tests {
 
         #[test]
         fn repo_untracked() {
-            let result = CommandResult::RepoUntracked { path: PathBuf::from("/tmp/old-repo") };
+            let result = CommandValue::RepoUntracked { path: PathBuf::from("/tmp/old-repo") };
             let output = format_command_result(&result);
             assert!(output.contains("repo untracked"), "should say repo untracked");
             assert!(output.contains("/tmp/old-repo"), "should include path");
@@ -962,21 +963,21 @@ mod tests {
 
         #[test]
         fn refreshed() {
-            let result = CommandResult::Refreshed { repos: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")] };
+            let result = CommandValue::Refreshed { repos: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")] };
             let output = format_command_result(&result);
             assert!(output.contains("refreshed 3 repo(s)"), "should show count of repos");
         }
 
         #[test]
         fn refreshed_empty() {
-            let result = CommandResult::Refreshed { repos: vec![] };
+            let result = CommandValue::Refreshed { repos: vec![] };
             let output = format_command_result(&result);
             assert!(output.contains("refreshed 0 repo(s)"), "should handle zero repos");
         }
 
         #[test]
         fn checkout_created() {
-            let result = CommandResult::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/tmp/wt") };
+            let result = CommandValue::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/tmp/wt") };
             let output = format_command_result(&result);
             assert!(output.contains("checkout created"), "should say checkout created");
             assert!(output.contains("feat-new"), "should include branch name");
@@ -984,7 +985,7 @@ mod tests {
 
         #[test]
         fn checkout_removed() {
-            let result = CommandResult::CheckoutRemoved { branch: "feat-old".into() };
+            let result = CommandValue::CheckoutRemoved { branch: "feat-old".into() };
             let output = format_command_result(&result);
             assert!(output.contains("checkout removed"), "should say checkout removed");
             assert!(output.contains("feat-old"), "should include branch name");
@@ -993,7 +994,7 @@ mod tests {
         #[test]
         fn branch_name_generated() {
             let result =
-                CommandResult::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("github".into(), "42".into())] };
+                CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("github".into(), "42".into())] };
             let output = format_command_result(&result);
             assert!(output.contains("branch name"), "should say branch name");
             assert!(output.contains("feat/cool-thing"), "should include generated name");
@@ -1001,14 +1002,14 @@ mod tests {
 
         #[test]
         fn checkout_status_clean() {
-            let result = CommandResult::CheckoutStatus(CheckoutStatus { branch: "main".into(), ..Default::default() });
+            let result = CommandValue::CheckoutStatus(CheckoutStatus { branch: "main".into(), ..Default::default() });
             let output = format_command_result(&result);
             assert_eq!(output, "checkout status: main");
         }
 
         #[test]
         fn checkout_status_with_details() {
-            let result = CommandResult::CheckoutStatus(CheckoutStatus {
+            let result = CommandValue::CheckoutStatus(CheckoutStatus {
                 branch: "feat/x".into(),
                 change_request_status: Some("open".into()),
                 unpushed_commits: vec!["abc1234".into(), "def5678".into()],
@@ -1021,7 +1022,7 @@ mod tests {
 
         #[test]
         fn checkout_status_merged() {
-            let result = CommandResult::CheckoutStatus(CheckoutStatus {
+            let result = CommandValue::CheckoutStatus(CheckoutStatus {
                 branch: "feat/y".into(),
                 change_request_status: Some("merged".into()),
                 merge_commit_sha: Some("abc1234def5678".into()),
@@ -1033,14 +1034,14 @@ mod tests {
 
         #[test]
         fn error() {
-            let result = CommandResult::Error { message: "something broke".into() };
+            let result = CommandValue::Error { message: "something broke".into() };
             let output = format_command_result(&result);
             assert_eq!(output, "error: something broke");
         }
 
         #[test]
         fn cancelled() {
-            assert_eq!(format_command_result(&CommandResult::Cancelled), "cancelled");
+            assert_eq!(format_command_result(&CommandValue::Cancelled), "cancelled");
         }
     }
 
