@@ -1483,6 +1483,24 @@ mod tests {
         assert_eq!(app.model.active_repo, 1);
     }
 
+    #[test]
+    fn handle_repo_removed_syncs_layout_from_new_active_page() {
+        let mut app = stub_app_with_repos(2);
+        // Give the two repo pages different layouts.
+        let repo0 = app.model.repo_order[0].clone();
+        let repo1 = app.model.repo_order[1].clone();
+        app.screen.repo_pages.get_mut(&repo0).expect("page 0").layout = RepoViewLayout::Zoom;
+        app.screen.repo_pages.get_mut(&repo1).expect("page 1").layout = RepoViewLayout::Below;
+
+        // Active repo is 1 (Below layout). Remove it.
+        app.model.active_repo = 1;
+        app.handle_repo_removed(&repo1);
+
+        // Active repo should now be 0, and ui.view_layout should match its page.
+        assert_eq!(app.model.active_repo, 0);
+        assert_eq!(app.ui.view_layout, RepoViewLayout::Zoom);
+    }
+
     // -- handle_daemon_event --
 
     #[test]
