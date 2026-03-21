@@ -677,7 +677,7 @@ async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
                 println!("To install flotilla hooks as a Claude Code plugin:");
                 println!();
                 println!("  1. Add the marketplace:");
-                println!("     /plugin marketplace add rjwittams/flotilla-marketplace");
+                println!("     /plugin marketplace add flotilla-org/marketplace");
                 println!();
                 println!("  2. Install the plugin:");
                 println!("     /plugin install flotilla-hooks@flotilla-marketplace");
