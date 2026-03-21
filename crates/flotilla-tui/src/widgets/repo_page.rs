@@ -248,18 +248,14 @@ impl RepoPage {
             let data = self.repo_data.read();
             let repo_path = data.path.clone();
             drop(data);
+            let repo_identity = ctx.repo_order[ctx.active_repo].clone();
             ctx.commands.push(flotilla_protocol::Command {
                 host: None,
                 context_repo: None,
                 action: flotilla_protocol::CommandAction::ClearIssueSearch { repo: flotilla_protocol::RepoSelector::Path(repo_path) },
             });
             self.active_search_query = None;
-            // Also clear on rui so the status bar sees it immediately
-            // (status bar reads rui.active_search_query).
-            let repo_key = &ctx.repo_order[ctx.active_repo];
-            if let Some(rui) = ctx.repo_ui.get_mut(repo_key) {
-                rui.active_search_query = None;
-            }
+            ctx.app_actions.push(AppAction::ClearSearchQuery { repo: repo_identity });
         } else if self.show_providers {
             self.show_providers = false;
         } else if !self.multi_selected.is_empty() {

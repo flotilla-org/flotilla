@@ -55,6 +55,8 @@ pub enum AppAction {
     MoveTabLeft,
     MoveTabRight,
     Refresh,
+    SetSearchQuery { repo: RepoIdentity, query: String },
+    ClearSearchQuery { repo: RepoIdentity },
 }
 
 /// Result of handling an event in a widget.

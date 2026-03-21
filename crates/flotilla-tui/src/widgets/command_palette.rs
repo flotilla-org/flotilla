@@ -70,9 +70,7 @@ impl CommandPaletteWidget {
                     action: CommandAction::ClearIssueSearch { repo: RepoSelector::Identity(repo_identity.clone()) },
                 };
                 ctx.commands.push(cmd);
-                if let Some(rui) = ctx.repo_ui.get_mut(&repo_identity) {
-                    rui.active_search_query = None;
-                }
+                ctx.app_actions.push(AppAction::ClearSearchQuery { repo: repo_identity });
             } else {
                 let cmd = Command {
                     host: None,
@@ -80,9 +78,7 @@ impl CommandPaletteWidget {
                     action: CommandAction::SearchIssues { repo: RepoSelector::Identity(repo_identity.clone()), query: query.clone() },
                 };
                 ctx.commands.push(cmd);
-                if let Some(rui) = ctx.repo_ui.get_mut(&repo_identity) {
-                    rui.active_search_query = Some(query);
-                }
+                ctx.app_actions.push(AppAction::SetSearchQuery { repo: repo_identity, query });
             }
             return Outcome::Finished;
         }

@@ -62,9 +62,6 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        // Sync any RepoUiState changes into RepoPage before dispatch.
-        self.sync_ui_state_to_repo_page();
-
         // Snapshot selection so we can detect changes for infinite scroll.
         let prev_selection = self.active_page_selection();
 
@@ -144,9 +141,6 @@ impl App {
     // ── Mouse handling ──
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // Sync any RepoUiState changes into RepoPage before dispatch.
-        self.sync_ui_state_to_repo_page();
-
         // Snapshot selection so we can detect changes for infinite scroll.
         let prev_selection = self.active_page_selection();
 
@@ -195,33 +189,11 @@ impl App {
         self.screen.repo_pages.get(identity).and_then(|page| page.table.selected_selectable_idx)
     }
 
-    /// Sync fields written by modal widgets (IssueSearch, CommandPalette)
-    /// into the active RepoPage before dispatch.
-    ///
-    /// `active_search_query` is written by IssueSearchWidget and
-    /// CommandPaletteWidget via `ctx.repo_ui`. This ensures the RepoPage
-    /// picks up those changes before the widget stack processes the next event.
-    ///
-    /// `pending_actions` is NOT synced here — the executor and daemon-event
-    /// handler dual-write to both rui and RepoPage directly.
-    fn sync_ui_state_to_repo_page(&mut self) {
-        if self.ui.mode.is_config() || self.model.repo_order.is_empty() {
-            return;
-        }
-        let identity = &self.model.repo_order[self.model.active_repo];
-        if let Some(rui) = self.ui.repo_ui.get(identity) {
-            if let Some(page) = self.screen.repo_pages.get_mut(identity) {
-                page.active_search_query.clone_from(&rui.active_search_query);
-            }
-        }
-    }
-
     /// Sync the active RepoPage's state back into RepoUiState.
     ///
-    /// RepoPage is authoritative for selection, multi-select, and
-    /// show_providers. `active_search_query` and `pending_actions` flow
-    /// rui→page only (written by modals and the executor respectively).
-    /// This sync keeps RepoUiState in sync for status bar rendering and
+    /// RepoPage is authoritative for selection, multi-select,
+    /// show_providers, and active_search_query. This sync keeps
+    /// RepoUiState in sync for status bar fallback rendering and
     /// tests that still read from `active_ui()`.
     fn sync_repo_page_state(&mut self) {
         if self.ui.mode.is_config() || self.model.repo_order.is_empty() {
@@ -235,12 +207,7 @@ impl App {
                 rui.table_view = page.table.grouped_items.clone();
                 rui.multi_selected.clone_from(&page.multi_selected);
                 rui.show_providers = page.show_providers;
-                // active_search_query is NOT synced page→rui here because
-                // modal widgets (IssueSearch, CommandPalette) write it to rui
-                // during dispatch. The canonical direction is rui→page via
-                // sync_ui_state_to_repo_page. Similarly, pending_actions is
-                // written by the executor to rui, so the canonical direction
-                // is rui→page.
+                rui.active_search_query.clone_from(&page.active_search_query);
             }
         }
     }
