@@ -1,6 +1,6 @@
 # Flotilla
 
-TUI dashboard for managing development workspaces across git worktrees, code review (GitHub PRs), issue trackers, cloud agent sessions (Claude), and terminal multiplexers (cmux).
+A system for improving multi-agent developer workflows. Consists of a daemon mesh, CLI, and TUI dashboard — managing development workspaces across git worktrees, code review (GitHub PRs), issue trackers, cloud agents (Claude Code, Codex, Cursor), terminal persistence (cleat, shpool), and multiplexers (cmux, tmux, zellij).
 
 ## Development Phase
 
@@ -15,7 +15,6 @@ cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
 cargo test --workspace --locked                # CI test gate
 cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
 cargo dylint --all -- --all-targets             # custom lints (requires cargo-dylint + dylint-link)
-cargo run -- --repo-root /path                 # run with explicit repo
 cargo run                                      # run, auto-detect repo from cwd
 ```
 
@@ -53,11 +52,11 @@ This fork exists for Claude Code Web sessions. Two things to be aware of:
 Provider-based plugin system with data correlation:
 
 ```
-Providers (git, wt, github, claude, cmux)
+Providers (git, wt, github, claude, codex, cursor, cmux, tmux, zellij, cleat, shpool)
   → RepoModel (providers, health, correlation groups)
     → Correlation engine (union-find groups items by shared keys)
       → WorkItems (correlated work units)
-        → UI (ratatui table + tabs)
+        → UI (ratatui widget tree) / CLI / daemon events
 ```
 
 User actions flow: **Intent → Command → Executor → Provider call → Refresh**
@@ -66,23 +65,28 @@ User actions flow: **Intent → Command → Executor → Provider call → Refre
 
 | Crate | Role |
 |-------|------|
-| `flotilla-core` | Providers, correlation, refresh, executor, config, `DaemonHandle` trait, `InProcessDaemon` |
+| `flotilla-core` | Providers, correlation, refresh, executor, config, agents, attachables, step plans, `DaemonHandle` trait, `InProcessDaemon` |
 | `flotilla-protocol` | Serde-only types: commands, results, snapshots, events, envelope |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
-| `flotilla-tui` | UI rendering, input handling, event loop, thin executor wrapper |
-| `flotilla-daemon` | Socket server (Step 2, placeholder) |
+| `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
+| `flotilla-daemon` | Socket server, peer networking, multi-host command routing |
+| `cleat` | Terminal I/O: PTY management, VT engine, session persistence |
 | `flotilla` (root) | Thin `src/main.rs` entry point |
 
 ### Key Modules
 
 | Path | Role |
 |------|------|
-| `src/main.rs` | Entry point, event loop, mouse handling |
+| `src/main.rs` | Entry point, CLI dispatch |
 | `crates/flotilla-core/src/daemon.rs` | `DaemonHandle` trait |
 | `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` implementation |
 | `crates/flotilla-core/src/executor.rs` | Executes commands against providers, returns `CommandResult` |
+| `crates/flotilla-core/src/executor/` | Executor submodules: checkout, workspace, terminals, session actions |
 | `crates/flotilla-core/src/model.rs` | `AppModel` (repos, labels), `RepoModel` (per-repo data) |
 | `crates/flotilla-core/src/data.rs` | `WorkItem`, `TableEntry`, correlation + table building |
+| `crates/flotilla-core/src/step.rs` | Step planning and execution system |
+| `crates/flotilla-core/src/agents/` | Agent hook handling and state management |
+| `crates/flotilla-core/src/attachable/` | Attachable session set management |
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
 | `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry, discovery, correlation |
 | `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |
@@ -90,11 +94,19 @@ User actions flow: **Intent → Command → Executor → Provider call → Refre
 | `crates/flotilla-protocol/src/lib.rs` | `Message` envelope, `DaemonEvent` |
 | `crates/flotilla-protocol/src/commands.rs` | `ProtoCommand`, `CommandResult` |
 | `crates/flotilla-protocol/src/snapshot.rs` | `Snapshot`, `ProtoWorkItem`, `RepoInfo` |
+| `crates/flotilla-daemon/src/server.rs` | Daemon server with peer networking |
+| `crates/flotilla-daemon/src/server/` | Server submodules: client/peer connections, request dispatch, remote commands |
 | `crates/flotilla-tui/src/app/mod.rs` | `App` struct, key/mouse dispatch, mode transitions |
 | `crates/flotilla-tui/src/app/intent.rs` | `Intent` enum, resolves to `ProtoCommand` |
 | `crates/flotilla-tui/src/app/executor.rs` | Thin executor: routes to core, interprets results into UI state |
+| `crates/flotilla-tui/src/app/key_handlers.rs` | Key handling logic per binding mode |
+| `crates/flotilla-tui/src/app/navigation.rs` | Navigation logic |
 | `crates/flotilla-tui/src/app/ui_state.rs` | `UiState`, `TabId`, `UiMode`, per-repo UI state |
-| `crates/flotilla-tui/src/ui.rs` | All ratatui rendering |
+| `crates/flotilla-tui/src/binding_table.rs` | `BindingModeId`, flat keybinding table |
+| `crates/flotilla-tui/src/keymap.rs` | Keymap management, configurable key bindings |
+| `crates/flotilla-tui/src/cli.rs` | CLI subcommand parsing |
+| `crates/flotilla-tui/src/widgets/` | Widget tree: `screen`, `tabs`, `repo_page`, `overview_page`, `command_palette`, `work_item_table`, etc. |
+| `crates/flotilla-tui/src/ui_helpers.rs` | Shared rendering utilities |
 | `crates/flotilla-tui/src/event.rs` | Terminal event stream (key, mouse, tick) |
 | `crates/flotilla-tui/src/event_log.rs` | In-app tracing log with level filtering |
 
@@ -105,15 +117,16 @@ Each trait lives in `crates/flotilla-core/src/providers/<category>/mod.rs` with 
 - **Vcs** + **CheckoutManager** (`vcs/git.rs`, `vcs/wt.rs`)
 - **ChangeRequestTracker** (`change_request/github.rs`)
 - **IssueTracker** (`issue_tracker/github.rs`)
-- **CloudAgentService** (`coding_agent/claude.rs`)
+- **CloudAgentService** (`coding_agent/claude.rs`, `coding_agent/codex.rs`, `coding_agent/cursor.rs`)
 - **AiUtility** (`ai_utility/claude.rs`)
-- **WorkspaceManager** (`workspace/cmux.rs`)
+- **WorkspaceManager** (`workspace/cmux.rs`, `workspace/tmux.rs`, `workspace/zellij.rs`)
+- **TerminalPool** (`terminal/cleat.rs`, `terminal/shpool.rs`, `terminal/passthrough.rs`)
 
 Every provider trait has label methods: `section_label()`, `item_noun()`, `abbreviation()`, `display_name()`. Override defaults in implementations for custom terminology.
 
 ### Correlation
 
-Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `ChangeRequestRef`, `SessionRef`). Items sharing any key merge into a single `WorkItem`. Issues link post-correlation via `AssociationKey` (don't cause merges). Tests in `crates/flotilla-core/src/providers/correlation.rs`.
+Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `AttachableSet`, `ChangeRequestRef`, `SessionRef`). Items sharing any key merge into a single `WorkItem`. Issues link post-correlation via `AssociationKey` (don't cause merges). Tests in `crates/flotilla-core/src/providers/correlation.rs`.
 
 ## Conventions
 
@@ -131,21 +144,33 @@ Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `ChangeReques
 
 ## UI Modes
 
-`Normal` → `Help` → `Config` → `ActionMenu` → `BranchInput` → `FilePicker` → `DeleteConfirm`
+`UiMode` has three variants: `Normal`, `Config`, `IssueSearch`. Most modal behaviour is driven by `BindingModeId` in the binding table:
 
-Key bindings: `j/k` navigate, `Enter` execute, `Space` multi-select, `.` action menu, `d` delete, `p` open PR, `n` new branch, `r` refresh, `[/]` switch tabs, `{/}` reorder tabs, `q` quit, `?` help.
+`Shared`, `Normal`, `Overview`, `Help`, `ActionMenu`, `DeleteConfirm`, `CloseConfirm`, `BranchInput`, `IssueSearch`, `CommandPalette`, `FilePicker`, `SearchActive`
+
+Key bindings are configurable via TOML. Defaults: `j/k` navigate, `Enter` execute, `Space` multi-select, `.` action menu, `d` delete, `p` open PR, `n` new branch, `r` refresh, `[/]` switch tabs, `{/}` reorder tabs, `:` command palette, `/` search, `q` quit, `?` help.
 
 ## Config
 
 Stored in `~/.config/flotilla/`:
-- `repos/*.toml` — one per tracked repo (`path = "..."`)
+- `repos/*.toml` — one per tracked repo (`path = "..."`, plus per-provider config: `change_request`, `issue_tracker`, `cloud_agent`, `ai_utility`, `workspace_manager`, `terminal_pool`, `vcs.git`)
 - `tab-order.json` — array of repo paths
+- `keybindings.toml` — user key binding overrides
 
 Workspace templates: `.flotilla/workspace.yaml` in repo root.
 
-## Issue Labels
+## Issue Types and Labels
 
-Use these labels when creating or triaging issues. Combine as appropriate (e.g. `bug` + `ui`, or `from-review` + `refactor` + `quick-win`).
+Issues have a **type** (lifecycle stage) and **labels** (topic tags). Set the type via the GitHub API: `gh api -X PATCH repos/flotilla-org/flotilla/issues/N -f type="TypeName"`.
+
+| Type | Use for |
+|------|---------|
+| `Task` | A specific piece of work |
+| `Bug` | An unexpected problem or behavior |
+| `Feature` | A request, idea, or new functionality |
+| `Brainstorm` | Needs design thinking before it can become a task or feature |
+
+Use labels to tag topics. Combine as appropriate (e.g. `bug` + `ui`, or `from-review` + `refactor` + `quick-win`).
 
 | Label | Use for |
 |-------|---------|
@@ -167,3 +192,111 @@ Use these labels when creating or triaging issues. Combine as appropriate (e.g. 
 | `good first issue` | Good for newcomers |
 | `duplicate` | Already exists |
 | `wontfix` | Will not be worked on |
+
+## Testing Providers with Record/Replay
+
+Providers (git, GitHub, Claude, etc.) integrate with external systems. The `replay` module captures and replays interactions to enable deterministic, offline testing.
+
+### Pattern
+
+Tests follow a 5-step workflow:
+
+```rust
+fn fixture(name: &str) -> String {
+    format!("{}/src/providers/<category>/fixtures/{}",
+        env!("CARGO_MANIFEST_DIR"), name)
+}
+
+#[tokio::test]
+async fn test_my_provider() {
+    let session = replay::test_session(&fixture("my_fixture.yaml"), masks);
+    let runner = replay::test_runner(&session);
+    let gh_api = replay::test_gh_api(&session, &runner);
+    let http = replay::test_http_client(&session);
+
+    // Inject replay implementations into your provider
+    let provider = MyProvider::new(runner, gh_api, http);
+
+    // Assert expected behavior
+    let result = provider.some_method().await;
+    assert!(result.is_ok());
+
+    // Verify all fixtures were consumed
+    session.finish();
+}
+```
+
+In replay mode, fixtures load from disk and responses are deterministic. In record mode (`RECORD=1`), real interactions are captured and masking applies to the fixture before saving.
+
+### Fixture Format
+
+YAML fixtures contain `interactions` — a sequence of captured requests and responses. Each interaction has a `channel` tag: `command`, `gh_api`, or `http`.
+
+**Command channel** (shell execution):
+```yaml
+interactions:
+  - channel: command
+    cmd: git
+    args: [branch, --list, --format=%(refname:short)]
+    cwd: '{repo}'
+    stdout: |
+      main
+      feature/foo
+    stderr: null
+    exit_code: 0
+```
+
+**GitHub API channel** (gh CLI or GhApiClient):
+```yaml
+interactions:
+  - channel: gh_api
+    method: GET
+    endpoint: repos/owner/repo/pulls?state=open&per_page=100
+    status: 200
+    body: '[{"number": 42, "title": "Fix bug"}]'
+    headers:
+      etag: 'W/"abc123"'
+      total_count: "1"
+```
+
+**HTTP channel** (reqwest client):
+```yaml
+interactions:
+  - channel: http
+    method: GET
+    url: https://api.anthropic.com/v1/sessions
+    request_headers:
+      authorization: Bearer token-123
+      anthropic-version: "2023-06-01"
+    status: 200
+    response_body: '{"data": [{"id": "s1", "title": "Work"}]}'
+    response_headers:
+      content-type: application/json
+```
+
+Note: `{repo}` in `cwd` fields is a **mask placeholder** (see Masks section). It is replaced with the real path during recording and restored during replay.
+
+### Recording
+
+Capture real interactions:
+
+```bash
+RECORD=1 cargo test -p flotilla-core test_my_provider
+```
+
+This runs your test against real systems (git, GitHub, Claude API, HTTP endpoints). The test must succeed. On exit, the fixture file is written with all interactions masked.
+
+### Masks
+
+Masks replace sensitive or environment-dependent values (paths, tokens, IDs) with placeholders before saving fixtures. During replay, placeholders are restored.
+
+```rust
+let mut masks = Masks::new();
+masks.add("/Users/alice/dev/my-repo", "{repo}");
+masks.add("/Users/alice", "{home}");
+masks.add("ghp_secrettoken123", "{github_token}");
+
+let session = replay::test_session(&fixture("my.yaml"), masks);
+```
+
+**Important:** Register longer (more specific) values first. Shorter values can partially match longer ones.
