@@ -18,10 +18,7 @@ use super::{
     preview_panel::PreviewPanel, work_item_table::WorkItemTable, AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::{
-        ui_state::{PendingAction, UiMode},
-        RepoViewLayout,
-    },
+    app::{ui_state::PendingAction, RepoViewLayout},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     shared::Shared,
@@ -220,7 +217,7 @@ impl RepoPage {
         self.preview.render_with_item(ctx.model, ctx.ui, selected_item, ctx.theme, frame, chunks[1]);
     }
 
-    /// Render the table using RepoPage-owned state, 
+    /// Render the table using RepoPage-owned state,
     fn render_table(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
         self.table.table_area = area;
         self.table.render_table_owned(
@@ -338,7 +335,7 @@ impl InteractiveWidget for RepoPage {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if matches!(*ctx.mode, UiMode::Normal) {
+                if !*ctx.is_config {
                     let x = mouse.column;
                     let y = mouse.row;
 
@@ -380,7 +377,7 @@ impl InteractiveWidget for RepoPage {
             }
 
             MouseEventKind::Down(MouseButton::Right) => {
-                if matches!(*ctx.mode, UiMode::Normal) {
+                if !*ctx.is_config {
                     // Right-click: select row using owned state, then open action menu
                     if let Some(si) = self.table.row_at_mouse_self(mouse.column, mouse.row) {
                         self.table.select_row_self(si);
@@ -392,7 +389,7 @@ impl InteractiveWidget for RepoPage {
             }
 
             MouseEventKind::ScrollDown => {
-                if matches!(*ctx.mode, UiMode::Normal) {
+                if !*ctx.is_config {
                     self.table.select_next_self();
                     return Outcome::Consumed;
                 }
@@ -400,7 +397,7 @@ impl InteractiveWidget for RepoPage {
             }
 
             MouseEventKind::ScrollUp => {
-                if matches!(*ctx.mode, UiMode::Normal) {
+                if !*ctx.is_config {
                     self.table.select_prev_self();
                     return Outcome::Consumed;
                 }

@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, CommandAction, WorkItem};
 
-use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, UiMode};
+use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent};
 use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
@@ -17,7 +17,8 @@ impl App {
     /// and when the base widget (Normal mode_id) is on top — so Config mode
     /// gets correct keymap bindings via `BindingModeId::from(&self.ui.mode)`.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let mode: KeyBindingMode = BindingModeId::from(&self.ui.mode).into();
+        let mode_id = if self.ui.is_config { BindingModeId::Overview } else { BindingModeId::Normal };
+        let mode: KeyBindingMode = mode_id.into();
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key))
     }
 
@@ -28,22 +29,22 @@ impl App {
     pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
             Action::Confirm => {
-                if matches!(self.ui.mode, UiMode::Normal) {
+                if !self.ui.is_config {
                     self.action_enter();
                 }
             }
             Action::OpenActionMenu => {
-                if matches!(self.ui.mode, UiMode::Normal) {
+                if !self.ui.is_config {
                     self.open_action_menu();
                 }
             }
             Action::OpenFilePicker => {
-                if matches!(self.ui.mode, UiMode::Normal) {
+                if !self.ui.is_config {
                     self.open_file_picker_from_active_repo_parent();
                 }
             }
             Action::Dispatch(intent) => {
-                if matches!(self.ui.mode, UiMode::Normal) {
+                if !self.ui.is_config {
                     self.dispatch_if_available(intent);
                 }
             }
@@ -443,7 +444,7 @@ mod tests {
     #[test]
     fn config_select_next_moves_event_log_via_widget() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         {
             let ov = &mut app.screen.overview_page;
             ov.event_log.count = 3;
@@ -566,7 +567,7 @@ mod tests {
 
         assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Quit));
 
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Dismiss));
     }
 
@@ -671,27 +672,27 @@ mod tests {
     #[test]
     fn config_q_dismisses_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         app.handle_key(key(KeyCode::Char('q')));
         assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
         assert!(!app.should_quit);
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.ui.is_config);
     }
 
     #[test]
     fn config_esc_dismisses_to_normal() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
         assert!(!app.should_quit);
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.ui.is_config);
     }
 
     #[test]
     fn config_j_navigates_event_log_down() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         {
             let ov = &mut app.screen.overview_page;
             ov.event_log.count = 5;
@@ -704,7 +705,7 @@ mod tests {
     #[test]
     fn config_k_navigates_event_log_up() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         {
             let ov = &mut app.screen.overview_page;
             ov.event_log.count = 5;
@@ -717,7 +718,7 @@ mod tests {
     #[test]
     fn config_j_when_no_selection_jumps_to_last() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         {
             let ov = &mut app.screen.overview_page;
             ov.event_log.count = 5;
@@ -730,7 +731,7 @@ mod tests {
     #[test]
     fn config_j_at_end_stays() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         {
             let ov = &mut app.screen.overview_page;
             ov.event_log.count = 3;
@@ -743,7 +744,7 @@ mod tests {
     #[test]
     fn config_k_at_zero_stays() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         {
             let ov = &mut app.screen.overview_page;
             ov.event_log.count = 5;
@@ -756,7 +757,7 @@ mod tests {
     #[test]
     fn config_bracket_switches_tabs() {
         let mut app = stub_app();
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         // ] in Config mode should switch to Normal mode + first repo
         app.handle_key(key(KeyCode::Char(']')));
         assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
@@ -764,7 +765,7 @@ mod tests {
 
         // [ from first repo (index 0) goes back to Config
         app.handle_key(key(KeyCode::Char('[')));
-        assert!(matches!(app.ui.mode, UiMode::Config));
+        assert!(app.ui.is_config);
     }
 
     #[test]
@@ -1062,7 +1063,7 @@ mod tests {
         // page handles events, so the gear click should not toggle providers.
         let repo_key = app.model.repo_order[0].clone();
         app.screen.repo_pages.get_mut(&repo_key).expect("repo page").table.gear_area = Some(Rect::new(75, 2, 3, 1));
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
 
         app.handle_mouse(left_click(76, 2));
         assert!(!active_show_providers(&app));

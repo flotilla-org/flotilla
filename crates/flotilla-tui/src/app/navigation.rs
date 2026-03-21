@@ -103,7 +103,7 @@ mod tests {
 
     use crate::app::{
         test_support::{issue_item, issue_table_entries, set_active_table_view, stub_app_with_repos},
-        App, UiMode,
+        App,
     };
 
     /// Read the selected selectable index from the active RepoPage.
@@ -117,10 +117,10 @@ mod tests {
     #[test]
     fn switch_tab_sets_active_repo_and_mode() {
         let mut app = stub_app_with_repos(3);
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         app.switch_tab(2);
         assert_eq!(app.model.active_repo, 2);
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.ui.is_config);
     }
 
     #[test]
@@ -144,10 +144,10 @@ mod tests {
     #[test]
     fn switch_tab_from_config_mode() {
         let mut app = stub_app_with_repos(2);
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         app.switch_tab(1);
         assert_eq!(app.model.active_repo, 1);
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.ui.is_config);
     }
 
     // ── next_tab tests ───────────────────────────────────────────────
@@ -165,16 +165,16 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         app.switch_tab(1); // go to last repo
         app.next_tab();
-        assert!(app.ui.mode.is_config());
+        assert!(app.ui.is_config);
     }
 
     #[test]
     fn next_tab_from_config_goes_to_first() {
         let mut app = stub_app_with_repos(3);
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         app.next_tab();
         assert_eq!(app.model.active_repo, 0);
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.ui.is_config);
     }
 
     #[test]
@@ -199,16 +199,16 @@ mod tests {
         let mut app = stub_app_with_repos(2);
         // active_repo is 0
         app.prev_tab();
-        assert!(app.ui.mode.is_config());
+        assert!(app.ui.is_config);
     }
 
     #[test]
     fn prev_tab_from_config_goes_to_last() {
         let mut app = stub_app_with_repos(3);
-        app.ui.mode = UiMode::Config;
+        app.ui.is_config = true;
         app.prev_tab();
         assert_eq!(app.model.active_repo, 2);
-        assert!(matches!(app.ui.mode, UiMode::Normal));
+        assert!(!app.ui.is_config);
     }
 
     #[test]

@@ -161,7 +161,7 @@ impl InteractiveWidget for Screen {
         }
 
         // Phase 3: No modal — dispatch to overview page or repo page
-        let is_config = ctx.mode.is_config();
+        let is_config = *ctx.is_config;
         let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config).cloned();
         let outcome = if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
@@ -191,7 +191,7 @@ impl InteractiveWidget for Screen {
         }
 
         // No modal — dispatch to overview page or repo page
-        let is_config = ctx.mode.is_config();
+        let is_config = *ctx.is_config;
         let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config).cloned();
         let outcome = if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
@@ -268,7 +268,7 @@ impl InteractiveWidget for Screen {
         }
 
         // Dispatch to overview page or repo page for content area mouse events
-        let is_config = ctx.mode.is_config();
+        let is_config = *ctx.is_config;
         let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config).cloned();
         let outcome = if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
@@ -294,7 +294,7 @@ impl InteractiveWidget for Screen {
         self.tabs.render(ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
 
         // 2. Content: dispatch to repo page for repo tabs, overview page otherwise
-        let is_config = ctx.ui.mode.is_config();
+        let is_config = ctx.ui.is_config;
         let active_identity = self.active_repo_identity(&ctx.model.repo_order, ctx.model.active_repo, is_config).cloned();
         if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {

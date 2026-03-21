@@ -5,7 +5,6 @@ use ratatui::{layout::Rect, Frame};
 
 use super::{event_log::EventLogWidget, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::ui_state::UiMode,
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
 };
@@ -46,7 +45,7 @@ impl InteractiveWidget for OverviewPage {
                 // Switch back to Normal mode (leave the Flotilla tab).
                 // This mirrors the old BaseView Config-mode dismiss behaviour:
                 // pressing q/Esc on the overview page returns to the active repo tab.
-                *ctx.mode = UiMode::Normal;
+                *ctx.is_config = false;
                 Outcome::Consumed
             }
             Action::Quit => {
@@ -163,7 +162,7 @@ mod tests {
     fn overview_page_dismiss_switches_to_normal() {
         let mut page = OverviewPage::new();
         let mut harness = TestWidgetHarness::new();
-        harness.mode = crate::app::ui_state::UiMode::Config;
+        harness.is_config = true;
 
         {
             let mut ctx = harness.ctx();
@@ -172,7 +171,7 @@ mod tests {
             assert!(!ctx.app_actions.iter().any(|a| matches!(a, super::super::AppAction::Quit)));
         }
 
-        assert!(matches!(harness.mode, crate::app::ui_state::UiMode::Normal));
+        assert!(!harness.is_config);
     }
 
     #[test]

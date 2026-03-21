@@ -6,7 +6,7 @@ use crokey::KeyCombination;
 use flotilla_core::config::KeysConfig;
 
 use crate::{
-    app::{intent::Intent, ui_state::UiMode},
+    app::intent::Intent,
     binding_table::{BindingModeId, CompiledBindings, KeyBindingMode, BINDINGS},
     status_bar::KeyChip,
 };
@@ -221,17 +221,6 @@ pub struct HelpBinding {
 pub struct HelpSection {
     pub title: &'static str,
     pub bindings: Vec<HelpBinding>,
-}
-
-// ── BindingModeId from UiMode ──
-
-impl From<&UiMode> for BindingModeId {
-    fn from(mode: &UiMode) -> Self {
-        match mode {
-            UiMode::Normal => BindingModeId::Normal,
-            UiMode::Config => BindingModeId::Overview,
-        }
-    }
 }
 
 // ── Keymap ──
@@ -724,14 +713,6 @@ mod tests {
             keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(Action::Quit)
         );
-    }
-
-    // ── BindingModeId from UiMode tests ──
-
-    #[test]
-    fn binding_mode_id_from_ui_mode() {
-        assert_eq!(BindingModeId::from(&UiMode::Normal), BindingModeId::Normal);
-        assert_eq!(BindingModeId::from(&UiMode::Config), BindingModeId::Overview);
     }
 
     // ── help_sections tests ──

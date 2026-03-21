@@ -23,7 +23,7 @@ use tui_input::Input;
 
 // Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
 pub(crate) use super::test_builders::*;
-use super::{App, CommandQueue, DirEntry, InFlightCommand, TuiModel, UiMode};
+use super::{App, CommandQueue, DirEntry, InFlightCommand, TuiModel};
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
 pub(crate) struct StubDaemon {
@@ -220,7 +220,7 @@ pub(crate) struct TestWidgetHarness {
     pub in_flight: HashMap<u64, InFlightCommand>,
     pub commands: CommandQueue,
     pub target_host: Option<HostName>,
-    pub mode: UiMode,
+    pub is_config: bool,
 }
 
 impl TestWidgetHarness {
@@ -233,7 +233,7 @@ impl TestWidgetHarness {
             in_flight: app.in_flight,
             commands: app.proto_commands,
             target_host: app.ui.target_host,
-            mode: UiMode::Normal,
+            is_config: false,
         }
     }
 
@@ -247,7 +247,7 @@ impl TestWidgetHarness {
             active_repo: self.model.active_repo,
             repo_order: &self.model.repo_order,
             commands: &mut self.commands,
-            mode: &mut self.mode,
+            is_config: &mut self.is_config,
             app_actions: Vec::new(),
         }
     }

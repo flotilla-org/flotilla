@@ -28,7 +28,7 @@ impl PreviewPanel {
     }
 
     /// Render the preview panel using an explicitly provided selected item.
-    /// Called by RepoPage with the item from its own table, 
+    /// Called by RepoPage with the item from its own table,
     pub fn render_with_item(&self, model: &TuiModel, ui: &UiState, item: Option<&WorkItem>, theme: &Theme, frame: &mut Frame, area: Rect) {
         if ui.show_debug {
             let chunks = Layout::default()

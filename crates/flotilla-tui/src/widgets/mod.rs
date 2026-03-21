@@ -23,7 +23,7 @@ use flotilla_protocol::{HostName, RepoIdentity};
 use ratatui::{layout::Rect, Frame};
 
 use crate::{
-    app::{ui_state::UiMode, CommandQueue, InFlightCommand, TuiModel, UiState},
+    app::{CommandQueue, InFlightCommand, TuiModel, UiState},
     binding_table::{KeyBindingMode, StatusFragment},
     keymap::{Action, Keymap},
     theme::Theme,
@@ -97,7 +97,7 @@ pub struct WidgetContext<'a> {
     pub active_repo: usize,
     pub repo_order: &'a [RepoIdentity],
     pub commands: &'a mut CommandQueue,
-    pub mode: &'a mut UiMode,
+    pub is_config: &'a mut bool,
     pub app_actions: Vec<AppAction>,
 }
 

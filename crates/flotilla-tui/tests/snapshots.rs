@@ -3,7 +3,7 @@ mod support;
 use std::path::PathBuf;
 
 use flotilla_protocol::{HostName, HostPath, ProviderData, RepoIdentity, SessionStatus, WorkItemIdentity};
-use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout, UiMode};
+use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout};
 use ratatui::style::Color;
 use support::*;
 use tui_input::Input;
@@ -132,7 +132,7 @@ fn action_menu() {
 #[test]
 fn config_screen() {
     let mut harness = TestHarness::single_repo("my-project")
-        .with_mode(UiMode::Config)
+        .with_config()
         .with_provider_names("my-project", vec![
             ("change_request", "GitHub"),
             ("issue_tracker", "GitHub"),
@@ -486,7 +486,7 @@ fn providers_overlay() {
 #[test]
 fn config_screen_cross_repo_worst_wins() {
     let mut harness = TestHarness::multi_repo(&["alpha", "beta"])
-        .with_mode(UiMode::Config)
+        .with_config()
         .with_provider_names("alpha", vec![("change_request", "GitHub")])
         .with_provider_names("beta", vec![("change_request", "GitHub")])
         .with_provider_status("alpha", "change_request", "GitHub", ProviderStatus::Ok)

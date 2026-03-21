@@ -7,7 +7,7 @@ use flotilla_protocol::{
 // Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
 pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
 use flotilla_tui::{
-    app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiMode, UiState},
+    app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiState},
     keymap::Keymap,
     shared::Shared,
     theme::Theme,
@@ -89,9 +89,9 @@ impl TestHarness {
         self
     }
 
-    /// Set the UI mode.
-    pub fn with_mode(mut self, mode: UiMode) -> Self {
-        self.ui.mode = mode;
+    /// Set config mode.
+    pub fn with_config(mut self) -> Self {
+        self.ui.is_config = true;
         self
     }
 

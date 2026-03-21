@@ -26,7 +26,7 @@ use flotilla_protocol::{
 pub use intent::Intent;
 use tui_input::Input;
 use ui_state::PendingStatus;
-pub use ui_state::{BranchInputKind, DirEntry, RepoViewLayout, TabId, UiMode, UiState};
+pub use ui_state::{BranchInputKind, DirEntry, RepoViewLayout, TabId, UiState};
 
 use crate::{
     keymap::Keymap,
@@ -465,7 +465,7 @@ impl App {
             active_repo: self.model.active_repo,
             repo_order: &self.model.repo_order,
             commands: &mut self.proto_commands,
-            mode: &mut self.ui.mode,
+            is_config: &mut self.ui.is_config,
             app_actions: Vec::new(),
         }
     }
@@ -543,7 +543,7 @@ impl App {
                 }
                 AppAction::SwitchToConfig => {
                     self.dismiss_modals();
-                    self.ui.mode = UiMode::Config;
+                    self.ui.is_config = true;
                 }
                 AppAction::SwitchToRepo(i) => {
                     self.dismiss_modals();
@@ -564,12 +564,12 @@ impl App {
                     self.next_tab();
                 }
                 AppAction::MoveTabLeft => {
-                    if !self.ui.mode.is_config() && self.move_tab(-1) {
+                    if !self.ui.is_config && self.move_tab(-1) {
                         self.config.save_tab_order(&self.persisted_tab_order_paths());
                     }
                 }
                 AppAction::MoveTabRight => {
-                    if !self.ui.mode.is_config() && self.move_tab(1) {
+                    if !self.ui.is_config && self.move_tab(1) {
                         self.config.save_tab_order(&self.persisted_tab_order_paths());
                     }
                 }

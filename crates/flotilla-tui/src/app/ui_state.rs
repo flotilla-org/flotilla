@@ -22,19 +22,6 @@ pub enum BranchInputKind {
     Generating,
 }
 
-#[derive(Default)]
-pub enum UiMode {
-    #[default]
-    Normal,
-    Config,
-}
-
-impl UiMode {
-    pub fn is_config(&self) -> bool {
-        matches!(self, UiMode::Config)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RepoViewLayout {
     #[default]
@@ -118,7 +105,7 @@ pub struct DragState {
 }
 
 pub struct UiState {
-    pub mode: UiMode,
+    pub is_config: bool,
     pub target_host: Option<HostName>,
     pub view_layout: RepoViewLayout,
     pub status_bar: StatusBarUiState,
@@ -130,7 +117,7 @@ pub struct UiState {
 impl UiState {
     pub fn new(_repo_ids: &[RepoIdentity]) -> Self {
         Self {
-            mode: UiMode::default(),
+            is_config: false,
             target_host: None,
             view_layout: RepoViewLayout::default(),
             status_bar: StatusBarUiState::default(),
@@ -169,27 +156,12 @@ mod tests {
 
     use super::*;
 
-    // ── UiMode tests ──────────────────────────────────────────────────
-
-    #[test]
-    fn is_config_returns_true_only_for_config_variant() {
-        let cases: Vec<(UiMode, bool)> = vec![(UiMode::Normal, false), (UiMode::Config, true)];
-        for (mode, expected) in &cases {
-            assert_eq!(mode.is_config(), *expected, "failed for mode variant");
-        }
-    }
-
-    #[test]
-    fn ui_mode_default_is_normal() {
-        assert!(matches!(UiMode::default(), UiMode::Normal));
-    }
-
     // ── UiState::new tests ────────────────────────────────────────────
 
     #[test]
     fn new_with_empty_paths() {
         let state = UiState::new(&[]);
-        assert!(matches!(state.mode, UiMode::Normal));
+        assert!(!state.is_config);
         assert!(!state.show_debug);
         assert_eq!(state.view_layout, RepoViewLayout::Auto);
     }
