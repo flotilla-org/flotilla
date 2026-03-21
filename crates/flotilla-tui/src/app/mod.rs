@@ -587,6 +587,16 @@ impl App {
                     let repo = self.model.active_repo_root().clone();
                     self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) }));
                 }
+                AppAction::SetSearchQuery { repo, query } => {
+                    if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
+                        page.active_search_query = Some(query);
+                    }
+                }
+                AppAction::ClearSearchQuery { repo } => {
+                    if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
+                        page.active_search_query = None;
+                    }
+                }
             }
         }
     }

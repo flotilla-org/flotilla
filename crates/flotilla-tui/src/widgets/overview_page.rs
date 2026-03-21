@@ -6,7 +6,8 @@ use ratatui::{layout::Rect, Frame};
 use super::{event_log::EventLogWidget, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::ui_state::UiMode,
-    keymap::{Action, ModeId},
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    keymap::Action,
 };
 
 /// Overview page widget for the Flotilla (overview) tab.
@@ -89,8 +90,12 @@ impl InteractiveWidget for OverviewPage {
         InteractiveWidget::render(&mut self.event_log, frame, area, ctx);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::Config
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::Overview.into()
+    }
+
+    fn status_fragment(&self) -> StatusFragment {
+        StatusFragment { status: Some(StatusContent::Label("FLOTILLA".into())) }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -114,7 +119,7 @@ mod tests {
         app::{test_support::TestWidgetHarness, UiState},
         keymap::Keymap,
         theme::Theme,
-        widgets::{RenderContext, WidgetStatusData},
+        widgets::RenderContext,
     };
 
     #[test]
@@ -130,15 +135,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                let mut ctx = RenderContext {
-                    model: &harness.model,
-                    ui: &mut ui,
-                    theme: &theme,
-                    keymap: &keymap,
-                    in_flight: &in_flight,
-                    active_widget_mode: Some(ModeId::Config),
-                    active_widget_data: WidgetStatusData::None,
-                };
+                let mut ctx = RenderContext { model: &harness.model, ui: &mut ui, theme: &theme, keymap: &keymap, in_flight: &in_flight };
                 page.render(frame, frame.area(), &mut ctx);
             })
             .expect("draw should succeed");
@@ -179,9 +176,9 @@ mod tests {
     }
 
     #[test]
-    fn overview_page_mode_id_is_config() {
+    fn overview_page_binding_mode_is_overview() {
         let page = OverviewPage::new();
-        assert_eq!(page.mode_id(), ModeId::Config);
+        assert_eq!(page.binding_mode(), KeyBindingMode::from(BindingModeId::Overview));
     }
 
     #[test]

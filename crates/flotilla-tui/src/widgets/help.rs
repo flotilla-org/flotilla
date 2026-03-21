@@ -9,7 +9,8 @@ use ratatui::{
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    keymap::{Action, ModeId},
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    keymap::Action,
     ui_helpers,
 };
 
@@ -107,8 +108,12 @@ impl InteractiveWidget for HelpWidget {
         frame.render_widget(paragraph, popup);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::Help
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::Help.into()
+    }
+
+    fn status_fragment(&self) -> StatusFragment {
+        StatusFragment { status: Some(StatusContent::Label("HELP".into())) }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -126,9 +131,9 @@ mod tests {
     use crate::app::test_support::TestWidgetHarness;
 
     #[test]
-    fn mode_id_is_help() {
+    fn binding_mode_is_help() {
         let widget = HelpWidget::new();
-        assert_eq!(widget.mode_id(), ModeId::Help);
+        assert_eq!(widget.binding_mode(), KeyBindingMode::from(BindingModeId::Help));
     }
 
     #[test]

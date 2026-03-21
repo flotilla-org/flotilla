@@ -5,10 +5,11 @@ use flotilla_protocol::{Command, CommandAction, RepoSelector};
 use ratatui::{layout::Rect, Frame};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
-use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
+use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::ui_state::UiMode,
-    keymap::{Action, ModeId},
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    keymap::Action,
 };
 
 pub struct IssueSearchWidget {
@@ -26,8 +27,9 @@ impl IssueSearchWidget {
         Self { input: Input::default() }
     }
 
-    fn sync_mode(&self, ctx: &mut WidgetContext) {
-        *ctx.mode = UiMode::IssueSearch { input: self.input.clone() };
+    /// Pre-fill the input with a value (for testing).
+    pub fn prefill(&mut self, text: &str) {
+        self.input = Input::from(text);
     }
 }
 
@@ -44,9 +46,7 @@ impl InteractiveWidget for IssueSearchWidget {
                         action: CommandAction::SearchIssues { repo: RepoSelector::Identity(repo_identity.clone()), query: query.clone() },
                     };
                     ctx.commands.push(cmd);
-                    if let Some(rui) = ctx.repo_ui.get_mut(&repo_identity) {
-                        rui.active_search_query = Some(query);
-                    }
+                    ctx.app_actions.push(AppAction::SetSearchQuery { repo: repo_identity, query });
                 }
                 *ctx.mode = UiMode::Normal;
                 Outcome::Finished
@@ -60,9 +60,7 @@ impl InteractiveWidget for IssueSearchWidget {
                     action: CommandAction::ClearIssueSearch { repo: RepoSelector::Identity(repo_identity.clone()) },
                 };
                 ctx.commands.push(cmd);
-                if let Some(rui) = ctx.repo_ui.get_mut(&repo_identity) {
-                    rui.active_search_query = None;
-                }
+                ctx.app_actions.push(AppAction::ClearSearchQuery { repo: repo_identity });
                 *ctx.mode = UiMode::Normal;
                 Outcome::Finished
             }
@@ -70,20 +68,22 @@ impl InteractiveWidget for IssueSearchWidget {
         }
     }
 
-    fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
+    fn handle_raw_key(&mut self, key: KeyEvent, _ctx: &mut WidgetContext) -> Outcome {
         self.input.handle_event(&crossterm::event::Event::Key(key));
-        self.sync_mode(ctx);
         Outcome::Consumed
     }
 
     fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {
         // IssueSearch is displayed via the status bar, not a separate popup.
-        // The status bar reads from UiMode::IssueSearch which is kept in sync
-        // via sync_mode().
+        // The status bar reads from status_fragment().
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::IssueSearch
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::IssueSearch.into()
+    }
+
+    fn status_fragment(&self) -> StatusFragment {
+        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: "SEARCH ".into(), text: self.input.value().to_string() }) }
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -112,9 +112,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_id_is_issue_search() {
+    fn binding_mode_is_issue_search() {
         let widget = IssueSearchWidget::new();
-        assert_eq!(widget.mode_id(), ModeId::IssueSearch);
+        assert_eq!(widget.binding_mode(), KeyBindingMode::from(BindingModeId::IssueSearch));
     }
 
     #[test]
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_with_query_sets_active_search() {
+    fn confirm_with_query_emits_set_search_query() {
         let mut widget = IssueSearchWidget::new();
         widget.input = Input::from("bug fix");
         let mut harness = TestWidgetHarness::new();
@@ -164,9 +164,10 @@ mod tests {
 
         widget.handle_action(Action::Confirm, &mut ctx);
 
-        let repo_identity = &harness.model.repo_order[harness.model.active_repo];
-        let rui = harness.repo_ui.get(repo_identity).expect("repo ui state");
-        assert_eq!(rui.active_search_query.as_deref(), Some("bug fix"));
+        assert!(
+            ctx.app_actions.iter().any(|a| matches!(a, AppAction::SetSearchQuery { query, .. } if query == "bug fix")),
+            "expected SetSearchQuery app action with query 'bug fix'"
+        );
     }
 
     #[test]

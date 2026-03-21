@@ -31,4 +31,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
-ADD REPO                     <j> DOWN  <k> UP  <tab> COMPLETE  <ENT> SELECT  <ESC> CANCEL 
+ADD REPO                     <j> DOWN  <k> UP  <TAB> COMPLETE  <ENT> SELECT  <ESC> CANCEL 

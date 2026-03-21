@@ -11,10 +11,11 @@ use ratatui::{
 };
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
-use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext, WidgetStatusData};
+use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::ui_state::UiMode,
-    keymap::{Action, ModeId},
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    keymap::Action,
     palette::{self, PaletteEntry, MAX_PALETTE_ROWS},
 };
 
@@ -69,9 +70,7 @@ impl CommandPaletteWidget {
                     action: CommandAction::ClearIssueSearch { repo: RepoSelector::Identity(repo_identity.clone()) },
                 };
                 ctx.commands.push(cmd);
-                if let Some(rui) = ctx.repo_ui.get_mut(&repo_identity) {
-                    rui.active_search_query = None;
-                }
+                ctx.app_actions.push(AppAction::ClearSearchQuery { repo: repo_identity });
             } else {
                 let cmd = Command {
                     host: None,
@@ -79,9 +78,7 @@ impl CommandPaletteWidget {
                     action: CommandAction::SearchIssues { repo: RepoSelector::Identity(repo_identity.clone()), query: query.clone() },
                 };
                 ctx.commands.push(cmd);
-                if let Some(rui) = ctx.repo_ui.get_mut(&repo_identity) {
-                    rui.active_search_query = Some(query);
-                }
+                ctx.app_actions.push(AppAction::SetSearchQuery { repo: repo_identity, query });
             }
             return Outcome::Finished;
         }
@@ -321,16 +318,16 @@ impl InteractiveWidget for CommandPaletteWidget {
         frame.set_cursor_position((cursor_x, overlay.status_row.y));
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::CommandPalette
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::CommandPalette.into()
     }
 
     fn captures_raw_keys(&self) -> bool {
         false
     }
 
-    fn status_data(&self) -> WidgetStatusData {
-        WidgetStatusData::CommandPalette { input_text: self.input.value().to_string() }
+    fn status_fragment(&self) -> StatusFragment {
+        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: "/".into(), text: self.input.value().to_string() }) }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -355,9 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_id_is_command_palette() {
+    fn binding_mode_is_command_palette() {
         let widget = CommandPaletteWidget::new();
-        assert_eq!(widget.mode_id(), ModeId::CommandPalette);
+        assert_eq!(widget.binding_mode(), KeyBindingMode::from(BindingModeId::CommandPalette));
     }
 
     #[test]
