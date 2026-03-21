@@ -1,6 +1,5 @@
 use std::any::Any;
 
-use flotilla_core::data::GroupEntry;
 use flotilla_protocol::WorkItem;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -26,12 +25,6 @@ pub struct PreviewPanel;
 impl PreviewPanel {
     pub fn new() -> Self {
         Self
-    }
-
-    /// Render the preview panel, optionally splitting for the debug overlay.
-    pub fn render_bespoke(&self, model: &TuiModel, ui: &UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
-        let item = selected_work_item(model, ui);
-        self.render_with_item(model, ui, item, theme, frame, area);
     }
 
     /// Render the preview panel using an explicitly provided selected item.
@@ -183,8 +176,9 @@ impl InteractiveWidget for PreviewPanel {
         Outcome::Ignored
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
-        self.render_bespoke(ctx.model, ctx.ui, ctx.theme, frame, area);
+    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {
+        // PreviewPanel is rendered by RepoPage via render_with_item().
+        // This trait method exists to satisfy InteractiveWidget but is never called.
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
@@ -197,16 +191,5 @@ impl InteractiveWidget for PreviewPanel {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────
-
-fn selected_work_item<'a>(model: &TuiModel, ui: &'a UiState) -> Option<&'a WorkItem> {
-    let rui = ui.active_repo_ui(&model.repo_order, model.active_repo);
-    let table_idx = rui.table_state.selected()?;
-    match rui.table_view.table_entries.get(table_idx)? {
-        GroupEntry::Item(item) => Some(item),
-        GroupEntry::Header(_) => None,
     }
 }
