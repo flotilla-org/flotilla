@@ -859,4 +859,64 @@ mod tests {
         let position = resolve_preview_position(Rect::new(0, 0, 160, 40), RepoViewLayout::Zoom);
         assert_eq!(position, None);
     }
+
+    // ── Mouse selection regression tests ──
+
+    fn page_with_table_area(items: Vec<WorkItem>) -> RepoPage {
+        let mut page = page_with_items(items);
+        // Set table_area so row_at_mouse_self can hit-test.
+        // Row 0-1 are header, data rows start at row 2.
+        page.table.table_area = Rect::new(0, 0, 80, 20);
+        page
+    }
+
+    #[test]
+    fn left_click_selects_row_via_owned_state() {
+        let mut page = page_with_table_area(vec![issue_item("1"), issue_item("2"), issue_item("3")]);
+        assert_eq!(page.table.selected_selectable_idx, Some(0));
+
+        // Figure out the actual row index for the last selectable item
+        let last_si = page.table.grouped_items.selectable_indices.len() - 1;
+        let last_table_idx = page.table.grouped_items.selectable_indices[last_si];
+        // table_area header is 2 rows, so visual row = table_idx + 2
+        let click_row = last_table_idx as u16 + 2;
+
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+
+        let mouse = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: click_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let outcome = page.handle_mouse(mouse, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(page.table.selected_selectable_idx, Some(last_si), "owned selection should move to clicked row");
+    }
+
+    #[test]
+    fn right_click_selects_row_and_opens_action_menu() {
+        let mut page = page_with_table_area(vec![issue_item("1"), issue_item("2")]);
+        assert_eq!(page.table.selected_selectable_idx, Some(0));
+
+        // Figure out the row index for the second selectable item
+        let target_si = 1;
+        let target_table_idx = page.table.grouped_items.selectable_indices[target_si];
+        let click_row = target_table_idx as u16 + 2;
+
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+
+        let mouse = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: 5,
+            row: click_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let outcome = page.handle_mouse(mouse, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(page.table.selected_selectable_idx, Some(target_si), "owned selection should move to right-clicked row");
+        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::OpenActionMenu)), "right-click should open action menu");
+    }
 }
