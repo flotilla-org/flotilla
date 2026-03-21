@@ -2287,7 +2287,7 @@ impl DaemonHandle for InProcessDaemon {
                         repo_path.clone(),
                         token,
                         event_tx.clone(),
-                        Some(&resolver),
+                        &resolver,
                     )
                     .await;
                     refresh_trigger.notify_one();

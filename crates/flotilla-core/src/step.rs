@@ -108,7 +108,7 @@ pub async fn run_step_plan(
     repo: PathBuf,
     cancel: CancellationToken,
     event_tx: broadcast::Sender<DaemonEvent>,
-    resolver: Option<&dyn StepResolver>,
+    resolver: &dyn StepResolver,
 ) -> CommandValue {
     let step_count = plan.steps.len();
     let mut outcomes: Vec<StepOutcome> = Vec::new();
@@ -131,10 +131,7 @@ pub async fn run_step_plan(
 
         let outcome = match step.action {
             StepAction::Closure(f) => f(outcomes.clone()).await,
-            symbolic => match resolver {
-                Some(r) => r.resolve(&step.description, symbolic, &outcomes).await,
-                None => Err(format!("no resolver for symbolic step: {}", step.description)),
-            },
+            symbolic => resolver.resolve(&step.description, symbolic, &outcomes).await,
         };
 
         // Cancellation wins over a successful in-flight step, but provider
@@ -202,6 +199,18 @@ mod tests {
 
     use super::*;
 
+    struct TestResolver;
+
+    #[async_trait::async_trait]
+    impl StepResolver for TestResolver {
+        async fn resolve(&self, _desc: &str, action: StepAction, _prior: &[StepOutcome]) -> Result<StepOutcome, String> {
+            match action {
+                StepAction::Closure(_) => unreachable!("closures handled by stepper directly"),
+                _ => panic!("TestResolver: unexpected symbolic action in step.rs unit test"),
+            }
+        }
+    }
+
     fn make_step(desc: &str, outcome: Result<StepOutcome, String>) -> Step {
         let outcome = Arc::new(tokio::sync::Mutex::new(Some(outcome)));
         Step {
@@ -233,7 +242,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::Ok);
@@ -263,7 +272,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::Error { message: "boom".into() });
@@ -283,7 +292,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::Cancelled);
@@ -318,7 +327,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel.clone(),
             tx,
-            None,
+            &TestResolver,
         ));
         started.notified().await;
         cancel.cancel();
@@ -341,7 +350,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::Ok);
@@ -369,7 +378,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
@@ -388,7 +397,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::Ok);
@@ -411,7 +420,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::Ok);
@@ -436,7 +445,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::Ok);
@@ -464,7 +473,7 @@ mod tests {
             PathBuf::from("/repo"),
             cancel,
             tx,
-            None,
+            &TestResolver,
         )
         .await;
         assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });

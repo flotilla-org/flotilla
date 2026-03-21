@@ -1804,7 +1804,7 @@ async fn run_build_plan_to_completion(
                 daemon_socket_path: None,
                 local_host: local_host.clone(),
             };
-            run_step_plan(step_plan, 1, local_host, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await
+            run_step_plan(step_plan, 1, local_host, repo_identity(), repo_root(), cancel, tx, &resolver).await
         }
     }
 }
@@ -2121,7 +2121,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
@@ -2180,7 +2180,7 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
@@ -2238,7 +2238,7 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     };
 
     let result = match plan {
-        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, Some(&resolver)).await,
+        ExecutionPlan::Steps(step_plan) => run_step_plan(step_plan, 1, lh, repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
