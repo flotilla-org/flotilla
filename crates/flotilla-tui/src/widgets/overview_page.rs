@@ -4,7 +4,11 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{layout::Rect, Frame};
 
 use super::{event_log::EventLogWidget, InteractiveWidget, Outcome, RenderContext, WidgetContext};
-use crate::{app::ui_state::UiMode, binding_table::BindingModeId, keymap::Action};
+use crate::{
+    app::ui_state::UiMode,
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    keymap::Action,
+};
 
 /// Overview page widget for the Flotilla (overview) tab.
 ///
@@ -86,8 +90,12 @@ impl InteractiveWidget for OverviewPage {
         InteractiveWidget::render(&mut self.event_log, frame, area, ctx);
     }
 
-    fn mode_id(&self) -> BindingModeId {
-        BindingModeId::Overview
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::Overview.into()
+    }
+
+    fn status_fragment(&self) -> StatusFragment {
+        StatusFragment { status: Some(StatusContent::Label("FLOTILLA".into())) }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -109,9 +117,10 @@ mod tests {
     use super::*;
     use crate::{
         app::{test_support::TestWidgetHarness, UiState},
+        binding_table::StatusFragment,
         keymap::Keymap,
         theme::Theme,
-        widgets::{RenderContext, WidgetStatusData},
+        widgets::RenderContext,
     };
 
     #[test]
@@ -134,7 +143,7 @@ mod tests {
                     keymap: &keymap,
                     in_flight: &in_flight,
                     active_widget_mode: Some(BindingModeId::Overview),
-                    active_widget_data: WidgetStatusData::None,
+                    active_widget_data: StatusFragment::default(),
                 };
                 page.render(frame, frame.area(), &mut ctx);
             })
@@ -176,9 +185,9 @@ mod tests {
     }
 
     #[test]
-    fn overview_page_mode_id_is_config() {
+    fn overview_page_binding_mode_is_overview() {
         let page = OverviewPage::new();
-        assert_eq!(page.mode_id(), BindingModeId::Overview);
+        assert_eq!(page.binding_mode(), KeyBindingMode::from(BindingModeId::Overview));
     }
 
     #[test]

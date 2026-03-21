@@ -182,7 +182,7 @@ impl TestHarness {
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         let keymap = Keymap::defaults();
         let active_widget_mode = self.screen.active_mode_id();
-        let active_widget_data = self.screen.active_status_data();
+        let active_widget_data = self.screen.active_status_fragment();
         terminal
             .draw(|frame| {
                 let area = frame.area();

@@ -6,7 +6,11 @@ use ratatui::{layout::Rect, Frame};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
-use crate::{app::ui_state::UiMode, binding_table::BindingModeId, keymap::Action};
+use crate::{
+    app::ui_state::UiMode,
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    keymap::Action,
+};
 
 pub struct IssueSearchWidget {
     input: Input,
@@ -79,8 +83,12 @@ impl InteractiveWidget for IssueSearchWidget {
         // via sync_mode().
     }
 
-    fn mode_id(&self) -> BindingModeId {
-        BindingModeId::IssueSearch
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::IssueSearch.into()
+    }
+
+    fn status_fragment(&self) -> StatusFragment {
+        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: "SEARCH ".into(), text: self.input.value().to_string() }) }
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -109,9 +117,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_id_is_issue_search() {
+    fn binding_mode_is_issue_search() {
         let widget = IssueSearchWidget::new();
-        assert_eq!(widget.mode_id(), BindingModeId::IssueSearch);
+        assert_eq!(widget.binding_mode(), KeyBindingMode::from(BindingModeId::IssueSearch));
     }
 
     #[test]

@@ -9,9 +9,22 @@ use ratatui::{
 
 use super::{
     overview_page::OverviewPage, repo_page::RepoPage, status_bar_widget::StatusBarWidget, tabs::Tabs, AppAction, InteractiveWidget,
-    Outcome, RenderContext, WidgetContext, WidgetStatusData,
+    Outcome, RenderContext, WidgetContext,
 };
-use crate::{binding_table::BindingModeId, keymap::Action, status_bar::StatusBarAction, ui_helpers};
+use crate::{
+    binding_table::{BindingModeId, KeyBindingMode, StatusFragment},
+    keymap::Action,
+    status_bar::StatusBarAction,
+    ui_helpers,
+};
+
+/// Extract the primary mode from a `KeyBindingMode`.
+fn primary_mode(mode: &KeyBindingMode) -> BindingModeId {
+    match mode {
+        KeyBindingMode::Single(id) => *id,
+        KeyBindingMode::Composed(ids) => ids.last().copied().unwrap_or(BindingModeId::Normal),
+    }
+}
 
 /// Root widget that owns the tab bar, page content, status bar, and modal stack.
 ///
@@ -83,14 +96,27 @@ impl Screen {
         }
     }
 
-    /// The mode of the topmost widget (modal or overview page fallback).
-    pub fn active_mode_id(&self) -> Option<BindingModeId> {
-        self.modal_stack.last().map(|w| w.mode_id()).or(Some(BindingModeId::Normal))
+    /// The binding mode of the topmost widget (modal or active page).
+    pub fn active_binding_mode(&self) -> KeyBindingMode {
+        if let Some(modal) = self.modal_stack.last() {
+            return modal.binding_mode();
+        }
+        // No modal — delegate to the active page
+        // This is a best-effort default; the caller (render_frame) should
+        // use the actual active page, but we don't have enough context here
+        // to know which repo tab is active. Return Normal as the safe default.
+        BindingModeId::Normal.into()
     }
 
-    /// Extra status data from the topmost widget.
-    pub fn active_status_data(&self) -> WidgetStatusData {
-        self.modal_stack.last().map(|w| w.status_data()).unwrap_or_default()
+    /// The mode ID of the topmost widget, for cases that still need a
+    /// single `BindingModeId` (status bar rendering, key handler dispatch).
+    pub fn active_mode_id(&self) -> Option<BindingModeId> {
+        Some(primary_mode(&self.active_binding_mode()))
+    }
+
+    /// Status fragment from the topmost widget.
+    pub fn active_status_fragment(&self) -> StatusFragment {
+        self.modal_stack.last().map(|w| w.status_fragment()).unwrap_or_default()
     }
 
     /// Resolve the active repo identity from model state.
@@ -330,16 +356,16 @@ impl InteractiveWidget for Screen {
         }
     }
 
-    fn mode_id(&self) -> BindingModeId {
-        self.modal_stack.last().map(|w| w.mode_id()).unwrap_or(BindingModeId::Normal)
+    fn binding_mode(&self) -> KeyBindingMode {
+        self.modal_stack.last().map(|w| w.binding_mode()).unwrap_or_else(|| BindingModeId::Normal.into())
     }
 
     fn captures_raw_keys(&self) -> bool {
         self.modal_stack.last().map(|w| w.captures_raw_keys()).unwrap_or(false)
     }
 
-    fn status_data(&self) -> WidgetStatusData {
-        self.modal_stack.last().map(|w| w.status_data()).unwrap_or_default()
+    fn status_fragment(&self) -> StatusFragment {
+        self.modal_stack.last().map(|w| w.status_fragment()).unwrap_or_default()
     }
 
     fn as_any(&self) -> &dyn Any {

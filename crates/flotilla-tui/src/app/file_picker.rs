@@ -15,7 +15,7 @@ mod tests {
             test_support::{dir_entry, enter_file_picker, key, stub_app},
             DirEntry,
         },
-        binding_table::BindingModeId,
+        binding_table::{BindingModeId, KeyBindingMode},
     };
 
     // ── file picker interaction tests ───────────────────────────────
@@ -37,7 +37,10 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
 
         // Widget should remain on stack
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     #[test]
@@ -51,7 +54,10 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
 
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     #[test]
@@ -65,7 +71,10 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Up));
 
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     #[test]
@@ -75,7 +84,10 @@ mod tests {
 
         app.handle_key(key(KeyCode::Down));
 
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     #[test]
@@ -89,7 +101,10 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
 
         // Widget should remain on stack after tab completion
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     #[test]
@@ -100,7 +115,10 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('j')));
 
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     // ── activate_dir_entry tests ─────────────────────────────────────
@@ -149,7 +167,10 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into dir)
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
         // No AddRepo command should have been pushed
         assert!(app.proto_commands.take_next().is_none());
     }
@@ -163,7 +184,10 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into subdir)
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     #[test]
@@ -174,7 +198,10 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack since there are no entries
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
         assert!(app.proto_commands.take_next().is_none());
     }
 
@@ -189,7 +216,10 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into dir)
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     #[test]
@@ -202,6 +232,9 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         // Widget should remain on stack (navigated into dir)
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 }

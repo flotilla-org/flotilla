@@ -3,7 +3,19 @@ use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, CommandAction, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, UiMode};
-use crate::{binding_table::BindingModeId, keymap::Action, widgets::InteractiveWidget};
+use crate::{
+    binding_table::{BindingModeId, KeyBindingMode},
+    keymap::Action,
+    widgets::InteractiveWidget,
+};
+
+/// Extract the primary mode from a `KeyBindingMode`.
+fn primary_mode(mode: &KeyBindingMode) -> BindingModeId {
+    match mode {
+        KeyBindingMode::Single(id) => *id,
+        KeyBindingMode::Composed(ids) => ids.last().copied().unwrap_or(BindingModeId::Normal),
+    }
+}
 
 impl App {
     // ── Key handling ──
@@ -59,7 +71,7 @@ impl App {
         // Determine the topmost widget's mode. Screen delegates to the
         // top modal (if any) for mode_id / captures_raw_keys.
         let captures_raw = self.screen.captures_raw_keys();
-        let mode_id = self.screen.mode_id();
+        let mode_id = primary_mode(&self.screen.binding_mode());
 
         let action = if captures_raw {
             match key.code {
@@ -494,7 +506,10 @@ mod tests {
 
         app.handle_key(key(KeyCode::Down));
 
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::FilePicker);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::FilePicker)
+        );
     }
 
     // dispatch_action_confirm_submits_delete_confirm — moved to widget tests
@@ -819,7 +834,10 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char(']')));
 
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
         assert_eq!(app.model.active_repo, 0);
     }
 
@@ -910,7 +928,10 @@ mod tests {
     fn normal_n_enters_branch_input() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('n')));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
     }
 
     #[test]
@@ -921,8 +942,8 @@ mod tests {
         // RemoveCheckout pushes a DeleteConfirmWidget onto the widget stack
         assert_eq!(app.screen.modal_stack.len(), 1);
         assert_eq!(
-            app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(),
-            crate::binding_table::BindingModeId::DeleteConfirm
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(crate::binding_table::BindingModeId::DeleteConfirm)
         );
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
@@ -955,7 +976,10 @@ mod tests {
     fn normal_slash_opens_command_palette() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('/')));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
     }
 
     #[test]
@@ -1020,7 +1044,10 @@ mod tests {
 
         app.handle_mouse(left_click(12, 29));
 
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
     }
 
     #[test]
@@ -1244,7 +1271,10 @@ mod tests {
         push_branch_input_widget(&mut app, BranchInputKind::Generating);
         // Enter should be ignored (consumed, but widget stays)
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
         assert_eq!(app.screen.modal_stack.len(), 1);
         assert!(app.proto_commands.take_next().is_none());
 
@@ -1261,7 +1291,10 @@ mod tests {
         app.handle_key(key(KeyCode::Char('q')));
 
         // Widget should remain on stack (typing doesn't dismiss)
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
     }
 
     // ── IssueSearch integration (via widget stack) ──────────────────
@@ -1449,7 +1482,10 @@ mod tests {
         setup_table(&mut app, vec![item]);
         app.open_action_menu();
         assert_eq!(app.screen.modal_stack.len(), 1);
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::ActionMenu);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::ActionMenu)
+        );
     }
 
     #[test]
@@ -1542,7 +1578,10 @@ mod tests {
         let item = make_work_item("a");
         app.resolve_and_push(Intent::RemoveCheckout, &item);
         assert_eq!(app.screen.modal_stack.len(), 1);
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::DeleteConfirm);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::DeleteConfirm)
+        );
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         assert!(matches!(cmd, Command { action: CommandAction::FetchCheckoutStatus { .. }, .. }));
     }
@@ -1553,9 +1592,15 @@ mod tests {
         let mut item = make_work_item("a");
         item.issue_keys = vec!["ISSUE-1".into()];
         app.resolve_and_push(Intent::GenerateBranchName, &item);
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
         assert_eq!(app.screen.modal_stack.len(), 1);
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
@@ -1596,7 +1641,10 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         // RemoveCheckout swaps ActionMenu for DeleteConfirmWidget
         assert_eq!(app.screen.modal_stack.len(), 1);
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::DeleteConfirm);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::DeleteConfirm)
+        );
     }
 
     // ── j/k navigation in normal mode ────────────────────────────────
@@ -1643,9 +1691,15 @@ mod tests {
         app.action_enter();
 
         // Should set BranchInput with generating=true and push widget
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
         assert_eq!(app.screen.modal_stack.len(), 1);
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::BranchInput);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::BranchInput)
+        );
         let (cmd, _) = app.proto_commands.take_next().unwrap();
         match cmd {
             Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
@@ -1705,7 +1759,10 @@ mod tests {
         setup_table(&mut app, vec![item]);
         app.open_action_menu();
         assert_eq!(app.screen.modal_stack.len(), 1);
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::ActionMenu);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::ActionMenu)
+        );
     }
 
     // ── space toggles multi-select ───────────────────────────────────
@@ -1828,10 +1885,16 @@ mod tests {
     fn double_slash_fills_search() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('/')));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
         // Typing '/' inside the palette fills "search "
         app.handle_key(key(KeyCode::Char('/')));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
     }
 
     #[test]
@@ -1841,7 +1904,10 @@ mod tests {
         // First entry is "search" — Tab should fill it
         app.handle_key(key(KeyCode::Tab));
         // Widget should remain on stack
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
     }
 
     #[test]
@@ -1874,14 +1940,20 @@ mod tests {
         app.handle_key(key(KeyCode::Char('/')));
         // First entry is "search" which dispatches OpenIssueSearch → Swap
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::IssueSearch);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::IssueSearch)
+        );
     }
 
     #[test]
     fn command_palette_esc_dismisses() {
         let mut app = stub_app();
         app.handle_key(key(KeyCode::Char('/')));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     }
@@ -1892,12 +1964,21 @@ mod tests {
         app.handle_key(key(KeyCode::Char('/')));
         // Down from 0, Up from 0 — widget should remain on stack
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
         // Up again wraps to last — detailed wrap behavior tested in widget unit tests
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
     }
 
     #[test]
@@ -1908,6 +1989,9 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         // Now type a char — widget should still be on stack; detailed selection reset tested in widget unit tests
         app.handle_key(key(KeyCode::Char('h')));
-        assert_eq!(app.screen.modal_stack.last().expect("modal stack non-empty").mode_id(), BindingModeId::CommandPalette);
+        assert_eq!(
+            app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+            KeyBindingMode::from(BindingModeId::CommandPalette)
+        );
     }
 }

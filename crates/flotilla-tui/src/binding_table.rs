@@ -31,7 +31,7 @@ pub enum BindingModeId {
 }
 
 /// What widgets return from `binding_mode()`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyBindingMode {
     Single(BindingModeId),
     Composed(Vec<BindingModeId>),

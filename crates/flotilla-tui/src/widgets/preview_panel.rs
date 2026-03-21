@@ -11,7 +11,7 @@ use ratatui::{
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{TuiModel, UiState},
-    binding_table::BindingModeId,
+    binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     theme::Theme,
 };
@@ -187,8 +187,8 @@ impl InteractiveWidget for PreviewPanel {
         self.render_bespoke(ctx.model, ctx.ui, ctx.theme, frame, area);
     }
 
-    fn mode_id(&self) -> BindingModeId {
-        BindingModeId::Normal
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::Normal.into()
     }
 
     fn as_any(&self) -> &dyn Any {

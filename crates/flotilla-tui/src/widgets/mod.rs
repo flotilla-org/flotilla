@@ -24,27 +24,10 @@ use ratatui::{layout::Rect, Frame};
 
 use crate::{
     app::{ui_state::UiMode, CommandQueue, InFlightCommand, RepoUiState, TuiModel, UiState},
-    binding_table::BindingModeId,
+    binding_table::{BindingModeId, KeyBindingMode, StatusFragment},
     keymap::{Action, Keymap},
     theme::Theme,
 };
-
-/// Extra data the active widget exposes for the status bar.
-///
-/// Replaces the old pattern of reading overlay state from `UiMode`.
-/// Widgets that need to communicate status text or flags override
-/// `InteractiveWidget::status_data()`.
-#[derive(Debug, Clone, Default)]
-pub enum WidgetStatusData {
-    #[default]
-    None,
-    BranchInput {
-        generating: bool,
-    },
-    CommandPalette {
-        input_text: String,
-    },
-}
 
 /// App-level effects that widgets can request. Processed by the event
 /// loop after widget dispatch — widgets declare intent, the app executes.
@@ -117,7 +100,7 @@ pub struct RenderContext<'a> {
     /// to show the correct key hints.
     pub active_widget_mode: Option<BindingModeId>,
     /// Extra data from the active widget for status bar rendering.
-    pub active_widget_data: WidgetStatusData,
+    pub active_widget_data: StatusFragment,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.
@@ -138,20 +121,20 @@ pub trait InteractiveWidget {
     /// Render the widget into the given area.
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext);
 
-    /// The mode identifier for keymap resolution.
-    fn mode_id(&self) -> BindingModeId;
+    /// The binding mode for keymap resolution.
+    fn binding_mode(&self) -> KeyBindingMode;
 
     /// Whether this widget needs raw key events instead of resolved actions.
     fn captures_raw_keys(&self) -> bool {
         false
     }
 
-    /// Extra data for the status bar (e.g. input text, generating flag).
+    /// Widget-provided status content for the status bar.
     ///
-    /// The default returns `WidgetStatusData::None`. Override in widgets
-    /// that need to communicate state to the status bar without a UiMode bridge.
-    fn status_data(&self) -> WidgetStatusData {
-        WidgetStatusData::None
+    /// The default returns an empty `StatusFragment`. Modal widgets should
+    /// override this to provide mode-specific labels or input text.
+    fn status_fragment(&self) -> StatusFragment {
+        StatusFragment::default()
     }
 
     /// Downcast support for reading widget state from outside the trait.

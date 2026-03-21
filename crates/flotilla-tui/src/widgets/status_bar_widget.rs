@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{collect_visible_status_items, InFlightCommand, RepoViewLayout, TuiModel, UiMode, UiState},
-    binding_table::BindingModeId,
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
     shimmer::shimmer_spans,
@@ -22,7 +22,6 @@ use crate::{
         DEFAULT_STATUS_WIDTH_BUDGET,
     },
     theme::Theme,
-    widgets::WidgetStatusData,
 };
 
 const ENTER_KEY_GLYPH: &str = "ENT";
@@ -64,7 +63,7 @@ impl StatusBarWidget {
         frame: &mut Frame,
         area: Rect,
         active_widget_mode: Option<BindingModeId>,
-        active_widget_data: WidgetStatusData,
+        active_widget_data: StatusFragment,
     ) {
         self.area = area;
         self.key_targets.clear();
@@ -227,8 +226,8 @@ impl InteractiveWidget for StatusBarWidget {
         );
     }
 
-    fn mode_id(&self) -> BindingModeId {
-        BindingModeId::Normal
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::Normal.into()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -237,6 +236,60 @@ impl InteractiveWidget for StatusBarWidget {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+// ── Fragment-driven helpers ───────────────────────────────────────────
+
+/// Build a `StatusSection` from a `StatusFragment`, falling back to `fallback_label`
+/// when the fragment has no content.
+fn status_section_from_fragment(fragment: &StatusFragment, fallback_label: &str) -> StatusSection {
+    match &fragment.status {
+        Some(StatusContent::Label(label)) => StatusSection::plain(label),
+        Some(StatusContent::ActiveInput { prefix, text }) => StatusSection::plain(&format!("{}{}", prefix, text)),
+        Some(StatusContent::Progress(_)) => StatusSection::plain(fallback_label),
+        None => StatusSection::plain(fallback_label),
+    }
+}
+
+/// Build full `StatusBarContent` from a `StatusFragment` for widgets that provide
+/// rich status (input text, progress). Falls back to mode-specific defaults when
+/// the fragment content doesn't dictate specific keys/task.
+fn status_bar_from_fragment(fragment: &StatusFragment, fallback_label: &str, ui: &UiState) -> StatusBarContent {
+    match &fragment.status {
+        Some(StatusContent::Progress(msg)) => StatusBarContent {
+            status: StatusSection::plain(fallback_label),
+            keys: vec![],
+            task: Some(TaskSection::new(msg, 0)),
+            mode_indicators: vec![],
+        },
+        Some(StatusContent::ActiveInput { prefix, text }) => {
+            let status_text = format!("{}{}", prefix, text);
+            // CommandPalette keeps mode indicators
+            let mode_indicators = if prefix.starts_with('/') { normal_mode_indicators(ui) } else { vec![] };
+            let keys = if prefix.starts_with('/') {
+                vec![
+                    key_chip(ENTER_KEY_GLYPH, "Run", KeyCode::Enter),
+                    key_chip("TAB", "Fill", KeyCode::Tab),
+                    key_chip("ESC", "Close", KeyCode::Esc),
+                ]
+            } else {
+                vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)]
+            };
+            StatusBarContent { status: StatusSection::plain(&status_text), keys, task: None, mode_indicators }
+        }
+        Some(StatusContent::Label(label)) => StatusBarContent {
+            status: StatusSection::plain(label),
+            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
+            task: None,
+            mode_indicators: vec![],
+        },
+        None => StatusBarContent {
+            status: StatusSection::plain(fallback_label),
+            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
+            task: None,
+            mode_indicators: vec![],
+        },
     }
 }
 
@@ -305,7 +358,7 @@ fn status_bar_content(
     ui: &UiState,
     in_flight: &HashMap<u64, InFlightCommand>,
     active_widget_mode: Option<BindingModeId>,
-    active_widget_data: &WidgetStatusData,
+    active_widget_data: &StatusFragment,
 ) -> StatusBarContent {
     let visible_error = collect_visible_status_items(model, ui).into_iter().next();
 
@@ -314,7 +367,7 @@ fn status_bar_content(
         match widget_mode {
             BindingModeId::Help => {
                 return StatusBarContent {
-                    status: StatusSection::plain("HELP"),
+                    status: status_section_from_fragment(active_widget_data, "HELP"),
                     keys: vec![
                         key_chip("j", "Down", KeyCode::Char('j')),
                         key_chip("k", "Up", KeyCode::Char('k')),
@@ -327,7 +380,7 @@ fn status_bar_content(
             }
             BindingModeId::ActionMenu => {
                 return StatusBarContent {
-                    status: StatusSection::plain("ACTIONS"),
+                    status: status_section_from_fragment(active_widget_data, "ACTIONS"),
                     keys: vec![
                         key_chip("j", "Down", KeyCode::Char('j')),
                         key_chip("k", "Up", KeyCode::Char('k')),
@@ -340,7 +393,7 @@ fn status_bar_content(
             }
             BindingModeId::DeleteConfirm => {
                 return StatusBarContent {
-                    status: StatusSection::plain("CONFIRM DELETE"),
+                    status: status_section_from_fragment(active_widget_data, "CONFIRM DELETE"),
                     keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
                     task: None,
                     mode_indicators: vec![],
@@ -348,59 +401,24 @@ fn status_bar_content(
             }
             BindingModeId::CloseConfirm => {
                 return StatusBarContent {
-                    status: StatusSection::plain("CONFIRM CLOSE"),
+                    status: status_section_from_fragment(active_widget_data, "CONFIRM CLOSE"),
                     keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
                     task: None,
                     mode_indicators: vec![],
                 };
             }
             BindingModeId::BranchInput => {
-                let generating = matches!(active_widget_data, WidgetStatusData::BranchInput { generating: true });
-                return if generating {
-                    StatusBarContent {
-                        status: StatusSection::plain("NEW BRANCH"),
-                        keys: vec![],
-                        task: Some(TaskSection::new("Generating branch name...", 0)),
-                        mode_indicators: vec![],
-                    }
-                } else {
-                    StatusBarContent {
-                        status: StatusSection::plain("NEW BRANCH"),
-                        keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
-                        task: None,
-                        mode_indicators: vec![],
-                    }
-                };
+                return status_bar_from_fragment(active_widget_data, "NEW BRANCH", ui);
             }
             BindingModeId::IssueSearch => {
-                let query = if let UiMode::IssueSearch { ref input } = ui.mode { input.value().to_string() } else { String::new() };
-                return StatusBarContent {
-                    status: StatusSection::plain(&format!("SEARCH {}", query)),
-                    keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
-                    task: None,
-                    mode_indicators: vec![],
-                };
+                return status_bar_from_fragment(active_widget_data, "SEARCH", ui);
             }
             BindingModeId::CommandPalette => {
-                let input_text = match active_widget_data {
-                    WidgetStatusData::CommandPalette { input_text } => input_text.clone(),
-                    _ => String::new(),
-                };
-                let status_text = format!("/{}", input_text);
-                return StatusBarContent {
-                    status: StatusSection::plain(&status_text),
-                    keys: vec![
-                        key_chip(ENTER_KEY_GLYPH, "Run", KeyCode::Enter),
-                        key_chip("TAB", "Fill", KeyCode::Tab),
-                        key_chip("ESC", "Close", KeyCode::Esc),
-                    ],
-                    task: None,
-                    mode_indicators: normal_mode_indicators(ui),
-                };
+                return status_bar_from_fragment(active_widget_data, "/", ui);
             }
             BindingModeId::FilePicker => {
                 return StatusBarContent {
-                    status: StatusSection::plain("ADD REPO"),
+                    status: status_section_from_fragment(active_widget_data, "ADD REPO"),
                     keys: vec![
                         key_chip("j", "Down", KeyCode::Char('j')),
                         key_chip("k", "Up", KeyCode::Char('k')),

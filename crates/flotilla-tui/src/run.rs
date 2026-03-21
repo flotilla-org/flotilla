@@ -145,7 +145,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 /// layer and all modals.
 fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let active_widget_mode = app.screen.active_mode_id();
-    let active_widget_data = app.screen.active_status_data();
+    let active_widget_data = app.screen.active_status_fragment();
     terminal.draw(|f| {
         let area = f.area();
         let mut ctx = crate::widgets::RenderContext {

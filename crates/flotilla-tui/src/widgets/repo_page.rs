@@ -22,7 +22,7 @@ use crate::{
         ui_state::{PendingAction, UiMode},
         RepoViewLayout,
     },
-    binding_table::BindingModeId,
+    binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     shared::Shared,
 };
@@ -423,8 +423,8 @@ impl InteractiveWidget for RepoPage {
         self.render_content(frame, area, ctx);
     }
 
-    fn mode_id(&self) -> BindingModeId {
-        BindingModeId::Normal
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::Normal.into()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -827,9 +827,9 @@ mod tests {
     // ── mode_id ──
 
     #[test]
-    fn mode_id_is_normal() {
+    fn binding_mode_is_normal() {
         let page = page_with_items(vec![]);
-        assert_eq!(page.mode_id(), BindingModeId::Normal);
+        assert_eq!(page.binding_mode(), KeyBindingMode::from(BindingModeId::Normal));
     }
 
     // ── preview position resolution ──

@@ -21,7 +21,7 @@ use crate::{
         ui_state::{BranchInputKind, PendingAction, PendingStatus, UiMode},
         ProviderStatus, TuiModel, UiState,
     },
-    binding_table::BindingModeId,
+    binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     shimmer::Shimmer,
     theme::Theme,
@@ -530,8 +530,8 @@ impl InteractiveWidget for WorkItemTable {
         self.render_table(ctx.model, ctx.ui, ctx.theme, frame, area);
     }
 
-    fn mode_id(&self) -> BindingModeId {
-        BindingModeId::Normal
+    fn binding_mode(&self) -> KeyBindingMode {
+        BindingModeId::Normal.into()
     }
 
     fn as_any(&self) -> &dyn Any {
