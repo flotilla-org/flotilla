@@ -177,8 +177,7 @@ pub async fn build_plan(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            build_create_checkout_plan(branch, create_branch, intent, issue_ids, repo.root, registry, providers_data, runner, local_host)
-                .await
+            build_create_checkout_plan(branch, create_branch, intent, issue_ids)
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
@@ -246,82 +245,34 @@ pub async fn build_plan(
 /// 2. Link issues to the branch (skipped if no issue_ids)
 /// 3. Create a workspace for the new checkout
 ///
-/// The final step creates a workspace for the new checkout. This is a symbolic
-/// step resolved by the `ExecutorStepResolver` at execution time, so it has
-/// access to the registry and config without needing pre-refreshed provider data.
-#[allow(clippy::too_many_arguments)]
-async fn build_create_checkout_plan(
+/// All steps are symbolic — the `ExecutorStepResolver` provides infrastructure
+/// (registry, providers_data, runner, local_host) at execution time.
+fn build_create_checkout_plan(
     branch: String,
     create_branch: bool,
     intent: CheckoutIntent,
     issue_ids: Vec<(String, String)>,
-    repo_root: PathBuf,
-    registry: Arc<ProviderRegistry>,
-    providers_data: Arc<ProviderData>,
-    runner: Arc<dyn CommandRunner>,
-    local_host: flotilla_protocol::HostName,
 ) -> ExecutionPlan {
     let mut steps = Vec::new();
 
-    // Step 1: Create checkout
-    {
-        let branch = branch.clone();
-        let issue_ids = issue_ids.clone();
-        let repo_root = repo_root.clone();
-        let registry = Arc::clone(&registry);
-        let providers_data = Arc::clone(&providers_data);
-        let runner = Arc::clone(&runner);
-        let local_host = local_host.clone();
-        steps.push(Step {
-            description: format!("Create checkout for branch {branch}"),
-            host: StepHost::Local,
-            action: StepAction::Closure(Box::new(move |_prior| {
-                Box::pin(async move {
-                    let checkout_flow = CheckoutFlow {
-                        branch: &branch,
-                        create_branch,
-                        intent,
-                        issue_ids: &issue_ids,
-                        repo_root: &repo_root,
-                        registry: registry.as_ref(),
-                        providers_data: providers_data.as_ref(),
-                        runner: runner.as_ref(),
-                        local_host: &local_host,
-                    };
-                    let result = checkout_flow
-                        .checkout_created_result(CheckoutExistingPolicy::ReuseKnownCheckout, CheckoutIssueLinkPolicy::Deferred)
-                        .await?;
-                    if let CommandValue::CheckoutCreated { path, .. } = &result {
-                        info!(checkout_path = %path.display(), "created checkout");
-                    }
-                    Ok(StepOutcome::CompletedWith(result))
-                })
-            })),
-        });
-    }
+    steps.push(Step {
+        description: format!("Create checkout for branch {branch}"),
+        host: StepHost::Local,
+        action: StepAction::CreateCheckout { branch: branch.clone(), create_branch, intent, issue_ids: issue_ids.clone() },
+    });
 
-    // Step 2: Link issues (only if non-empty)
     if !issue_ids.is_empty() {
-        let branch = branch.clone();
-        let repo_root = repo_root.clone();
-        let runner = Arc::clone(&runner);
         steps.push(Step {
             description: "Link issues to branch".to_string(),
             host: StepHost::Local,
-            action: StepAction::Closure(Box::new(move |_prior| {
-                Box::pin(async move {
-                    write_branch_issue_links(&repo_root, &branch, &issue_ids, &*runner).await;
-                    Ok(StepOutcome::Completed)
-                })
-            })),
+            action: StepAction::LinkIssuesToBranch { branch: branch.clone(), issue_ids },
         });
     }
 
-    // Final step: create workspace for the new checkout.
     steps.push(Step {
         description: "Create workspace".to_string(),
         host: StepHost::Local,
-        action: StepAction::CreateWorkspaceForCheckout { label: branch.clone() },
+        action: StepAction::CreateWorkspaceForCheckout { label: branch },
     });
 
     ExecutionPlan::Steps(StepPlan::new(steps))
@@ -524,8 +475,6 @@ fn build_remove_checkout_plan(
 }
 
 /// Resolves symbolic `StepAction` variants using executor infrastructure.
-// providers_data and runner are used in later resolver arms (tasks 7–9).
-#[allow(dead_code)]
 pub(crate) struct ExecutorStepResolver {
     pub repo: RepoExecutionContext,
     pub registry: Arc<ProviderRegistry>,
@@ -542,8 +491,30 @@ impl StepResolver for ExecutorStepResolver {
     async fn resolve(&self, _description: &str, action: StepAction, prior: &[StepOutcome]) -> Result<StepOutcome, String> {
         match action {
             StepAction::Closure(_) => unreachable!("closures handled by stepper directly"),
-            StepAction::CreateCheckout { .. } => todo!("task 7"),
-            StepAction::LinkIssuesToBranch { .. } => todo!("task 7"),
+            StepAction::CreateCheckout { branch, create_branch, intent, issue_ids } => {
+                let checkout_flow = CheckoutFlow {
+                    branch: &branch,
+                    create_branch,
+                    intent,
+                    issue_ids: &issue_ids,
+                    repo_root: &self.repo.root,
+                    registry: self.registry.as_ref(),
+                    providers_data: self.providers_data.as_ref(),
+                    runner: self.runner.as_ref(),
+                    local_host: &self.local_host,
+                };
+                let result = checkout_flow
+                    .checkout_created_result(CheckoutExistingPolicy::ReuseKnownCheckout, CheckoutIssueLinkPolicy::Deferred)
+                    .await?;
+                if let CommandValue::CheckoutCreated { path, .. } = &result {
+                    info!(checkout_path = %path.display(), "created checkout");
+                }
+                Ok(StepOutcome::CompletedWith(result))
+            }
+            StepAction::LinkIssuesToBranch { branch, issue_ids } => {
+                write_branch_issue_links(&self.repo.root, &branch, &issue_ids, &*self.runner).await;
+                Ok(StepOutcome::Completed)
+            }
             StepAction::RemoveCheckout { .. } => todo!("task 9"),
             StepAction::ResolveAttachCommand { .. } => todo!("task 8"),
             StepAction::EnsureCheckoutForTeleport { .. } => todo!("task 8"),

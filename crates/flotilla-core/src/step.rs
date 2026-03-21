@@ -55,10 +55,14 @@ pub enum StepAction {
 
     // Workspace (existing)
     /// Create a workspace for a checkout path produced by a prior step.
-    CreateWorkspaceForCheckout { label: String },
+    CreateWorkspaceForCheckout {
+        label: String,
+    },
 
     // Teleport
-    ResolveAttachCommand { session_id: String },
+    ResolveAttachCommand {
+        session_id: String,
+    },
     EnsureCheckoutForTeleport {
         branch: Option<String>,
         checkout_key: Option<PathBuf>,
@@ -70,8 +74,12 @@ pub enum StepAction {
     },
 
     // Session
-    ArchiveSession { session_id: String },
-    GenerateBranchName { issue_keys: Vec<String> },
+    ArchiveSession {
+        session_id: String,
+    },
+    GenerateBranchName {
+        issue_keys: Vec<String>,
+    },
 }
 
 /// Resolves symbolic step actions into outcomes.
@@ -430,10 +438,7 @@ mod tests {
     async fn produced_does_not_override_final_result() {
         let (cancel, tx) = setup();
         let plan = StepPlan::new(vec![
-            make_step(
-                "step-a",
-                Ok(StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach cmd".into() })),
-            ),
+            make_step("step-a", Ok(StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach cmd".into() }))),
             make_step("step-b", Ok(StepOutcome::Completed)),
         ]);
 
