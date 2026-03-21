@@ -397,7 +397,7 @@ impl StepResolver for ExecutorStepResolver {
                 checkout_service
                     .remove_checkout(&self.repo.root, &branch, &terminal_keys, &deleted_checkout_paths, &self.attachable_store)
                     .await?;
-                Ok(StepOutcome::Completed)
+                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))
             }
             StepAction::ResolveAttachCommand { session_id } => {
                 let cmd = resolve_attach_command(&session_id, self.registry.as_ref(), self.providers_data.as_ref()).await?;

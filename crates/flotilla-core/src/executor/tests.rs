@@ -1884,7 +1884,7 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
         run_build_plan_to_completion(remove_checkout_action("feat-x", vec![terminal_id.clone()]), plan_registry, plan_data, runner_ok())
             .await;
 
-    assert_ok(plan_result);
+    assert_checkout_removed_branch(plan_result, "feat-x");
     let plan_killed = plan_pool.killed.lock().await;
     assert_eq!(plan_killed.as_slice(), &[terminal_id]);
 }
