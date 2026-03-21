@@ -1143,7 +1143,7 @@ mod tests {
                 host: flotilla_protocol::HostName::new("host"),
                 repo: PathBuf::from("/tmp/repo"),
                 repo_identity: repo_identity(),
-                result: flotilla_protocol::commands::CommandResult::Ok,
+                result: flotilla_protocol::commands::CommandValue::Ok,
             },
             &local_seqs,
             &recovering,

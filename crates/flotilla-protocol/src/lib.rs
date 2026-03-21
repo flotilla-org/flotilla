@@ -34,7 +34,7 @@ pub(crate) mod test_helpers {
 }
 
 pub use commands::{
-    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandResult, PreparedTerminalCommand, RepoSelector,
+    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, PreparedTerminalCommand, RepoSelector,
     StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
@@ -189,7 +189,7 @@ pub enum DaemonEvent {
         host: HostName,
         repo_identity: RepoIdentity,
         repo: std::path::PathBuf,
-        result: commands::CommandResult,
+        result: commands::CommandValue,
     },
     #[serde(rename = "command_step_update")]
     CommandStepUpdate {
@@ -521,7 +521,7 @@ mod tests {
             host: HostName::new("desktop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repo: PathBuf::from("/tmp/repo"),
-            result: CommandResult::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/tmp/repo/feat-x") },
+            result: CommandValue::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/tmp/repo/feat-x") },
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
@@ -532,7 +532,7 @@ mod tests {
                 assert_eq!(repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
                 assert_eq!(repo, PathBuf::from("/tmp/repo"));
                 match result {
-                    CommandResult::CheckoutCreated { branch, path } => {
+                    CommandValue::CheckoutCreated { branch, path } => {
                         assert_eq!(branch, "feat-x");
                         assert_eq!(path, PathBuf::from("/tmp/repo/feat-x"));
                     }

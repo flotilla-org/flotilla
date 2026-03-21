@@ -10,7 +10,7 @@ use std::{
 
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandResult, DaemonEvent, HostName, PeerWireMessage, RepoIdentity, RepoSelector,
+    Command, CommandAction, CommandPeerEvent, CommandValue, DaemonEvent, HostName, PeerWireMessage, RepoIdentity, RepoSelector,
     RoutedPeerMessage,
 };
 use tokio::sync::{oneshot, Mutex, Notify};
@@ -213,7 +213,7 @@ impl RemoteCommandRouter {
         }
     }
 
-    pub(super) async fn complete_remote_command(&self, request_id: u64, responder_host: HostName, result: CommandResult) {
+    pub(super) async fn complete_remote_command(&self, request_id: u64, responder_host: HostName, result: CommandValue) {
         let mut pending = self.pending_remote_commands.lock().await;
         let Some(entry) = pending.remove(&request_id) else {
             return;
@@ -232,7 +232,7 @@ impl RemoteCommandRouter {
             repo_identity: entry
                 .repo_identity
                 .or_else(|| match &result {
-                    CommandResult::TerminalPrepared { repo_identity, .. } => Some(repo_identity.clone()),
+                    CommandValue::TerminalPrepared { repo_identity, .. } => Some(repo_identity.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(fallback_repo_identity),
@@ -271,7 +271,7 @@ impl RemoteCommandRouter {
                     requester_host,
                     responder_host,
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                    result: Box::new(CommandResult::Error { message }),
+                    result: Box::new(CommandValue::Error { message }),
                 };
                 let pm = self.peer_manager.lock().await;
                 let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(response)).await;

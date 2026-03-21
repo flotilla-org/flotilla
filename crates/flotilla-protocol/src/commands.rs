@@ -164,10 +164,10 @@ impl Command {
     }
 }
 
-/// Result returned from command execution.
+/// Result returned from command execution, or inter-step data passed between steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum CommandResult {
+pub enum CommandValue {
     Ok,
     RepoTracked {
         path: PathBuf,
@@ -205,6 +205,12 @@ pub enum CommandResult {
         message: String,
     },
     Cancelled,
+    AttachCommandResolved {
+        command: String,
+    },
+    CheckoutPathResolved {
+        path: PathBuf,
+    },
 }
 
 /// Status of an individual step within a multi-step command.
@@ -374,15 +380,15 @@ mod tests {
     }
 
     #[test]
-    fn command_result_roundtrip_covers_all_variants() {
+    fn command_value_roundtrip_covers_all_variants() {
         let cases = vec![
-            CommandResult::Ok,
-            CommandResult::RepoTracked { path: PathBuf::from("/new/repo"), resolved_from: None },
-            CommandResult::RepoUntracked { path: PathBuf::from("/old/repo") },
-            CommandResult::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")] },
-            CommandResult::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/repos/project/wt-1") },
-            CommandResult::CheckoutRemoved { branch: "feat-old".into() },
-            CommandResult::TerminalPrepared {
+            CommandValue::Ok,
+            CommandValue::RepoTracked { path: PathBuf::from("/new/repo"), resolved_from: None },
+            CommandValue::RepoUntracked { path: PathBuf::from("/old/repo") },
+            CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")] },
+            CommandValue::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/repos/project/wt-1") },
+            CommandValue::CheckoutRemoved { branch: "feat-old".into() },
+            CommandValue::TerminalPrepared {
                 repo_identity: repo_identity(),
                 target_host: HostName::new("desktop"),
                 branch: "feat-x".into(),
@@ -390,8 +396,8 @@ mod tests {
                 attachable_set_id: Some(AttachableSetId::new("set-1")),
                 commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
             },
-            CommandResult::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
-            CommandResult::CheckoutStatus(CheckoutStatus {
+            CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
+            CommandValue::CheckoutStatus(CheckoutStatus {
                 branch: "old".into(),
                 change_request_status: Some("merged".into()),
                 merge_commit_sha: Some("abc123".into()),
@@ -400,8 +406,10 @@ mod tests {
                 uncommitted_files: vec!["M  src/main.rs".into(), "?? TODO.txt".into()],
                 base_detection_warning: Some("warning text".into()),
             }),
-            CommandResult::Error { message: "something failed".into() },
-            CommandResult::Cancelled,
+            CommandValue::Error { message: "something failed".into() },
+            CommandValue::Cancelled,
+            CommandValue::AttachCommandResolved { command: "bash --login".into() },
+            CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
         ];
 
         for result in cases {
@@ -411,7 +419,7 @@ mod tests {
 
     #[test]
     fn command_result_uses_snake_case_tag() {
-        let result = CommandResult::CheckoutCreated { branch: "x".into(), path: PathBuf::from("/tmp/x") };
+        let result = CommandValue::CheckoutCreated { branch: "x".into(), path: PathBuf::from("/tmp/x") };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("checkout_created"));
     }

@@ -24,7 +24,7 @@ use flotilla_daemon::peer::{
     PeerManager, PeerSender, PeerTransport,
 };
 use flotilla_protocol::{
-    Checkout, CheckoutTarget, Command, CommandAction, CommandResult, DaemonEvent, GoodbyeReason, HostName, HostPath, PeerDataKind,
+    Checkout, CheckoutTarget, Command, CommandAction, CommandValue, DaemonEvent, GoodbyeReason, HostName, HostPath, PeerDataKind,
     PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, VectorClock,
 };
 use indexmap::IndexMap;
@@ -126,7 +126,7 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
     }
 }
 
-async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandResult {
+async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             match rx.recv().await {
@@ -352,7 +352,7 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
 
     let result = wait_for_command_result(&mut follower_rx, command_id).await;
     assert!(
-        matches!(result, CommandResult::CheckoutCreated { ref branch, .. } if branch == "feat-remote"),
+        matches!(result, CommandValue::CheckoutCreated { ref branch, .. } if branch == "feat-remote"),
         "expected checkout creation on follower, got {result:?}"
     );
 

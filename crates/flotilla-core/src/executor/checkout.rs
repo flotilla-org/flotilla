@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-pub(super) enum CheckoutIntent {
+pub enum CheckoutIntent {
     ExistingBranch,
     FreshBranch,
 }

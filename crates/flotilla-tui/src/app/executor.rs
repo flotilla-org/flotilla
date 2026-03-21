@@ -1,4 +1,4 @@
-use flotilla_protocol::{Command, CommandAction, CommandResult};
+use flotilla_protocol::{Command, CommandAction, CommandValue};
 use tracing::info;
 
 use super::{
@@ -59,7 +59,7 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
 /// Reset UI modes that are waiting for a command result.
 ///
 /// When a command fails (either synchronously from `dispatch` or
-/// asynchronously via `CommandResult::Error`), loading modes like
+/// asynchronously via `CommandValue::Error`), loading modes like
 /// `DeleteConfirm { loading: true }` must be cleared so the user
 /// can see the error message and isn't stuck in a loading state.
 fn reset_loading_mode(app: &mut App) {
@@ -81,28 +81,28 @@ fn reset_loading_mode(app: &mut App) {
     }
 }
 
-/// Interpret a CommandResult into UI state changes.
+/// Interpret a CommandValue into UI state changes.
 ///
 /// Called when a `CommandFinished` event arrives from the daemon.
-pub fn handle_result(result: CommandResult, app: &mut App) {
+pub fn handle_result(result: CommandValue, app: &mut App) {
     match result {
-        CommandResult::Ok => {}
-        CommandResult::RepoTracked { path, .. } => {
+        CommandValue::Ok => {}
+        CommandValue::RepoTracked { path, .. } => {
             info!(path = %path.display(), "tracked repo");
         }
-        CommandResult::RepoUntracked { path } => {
+        CommandValue::RepoUntracked { path } => {
             info!(path = %path.display(), "untracked repo");
         }
-        CommandResult::Refreshed { repos } => {
+        CommandValue::Refreshed { repos } => {
             info!(count = repos.len(), "refresh completed");
         }
-        CommandResult::CheckoutCreated { branch, .. } => {
+        CommandValue::CheckoutCreated { branch, .. } => {
             info!(%branch, "created checkout");
         }
-        CommandResult::CheckoutRemoved { branch } => {
+        CommandValue::CheckoutRemoved { branch } => {
             info!(%branch, "removed checkout");
         }
-        CommandResult::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
+        CommandValue::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
             if app.repo_path_for_identity(&repo_identity).is_some() {
                 app.proto_commands.push(app.repo_command_for_identity(repo_identity, CommandAction::CreateWorkspaceFromPreparedTerminal {
                     target_host,
@@ -115,7 +115,7 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
                 app.model.status_message = Some(format!("repo not found for terminal result: {repo_identity}"));
             }
         }
-        CommandResult::BranchNameGenerated { name, issue_ids } => {
+        CommandValue::BranchNameGenerated { name, issue_ids } => {
             let updated = app.screen.modal_stack.last_mut().and_then(|widget| widget.as_any_mut().downcast_mut::<BranchInputWidget>());
             if let Some(biw) = updated {
                 biw.prefill(&name, issue_ids);
@@ -123,7 +123,7 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
                 tracing::warn!("BranchNameGenerated arrived but no BranchInputWidget on stack");
             }
         }
-        CommandResult::CheckoutStatus(info) => {
+        CommandValue::CheckoutStatus(info) => {
             let updated = app.screen.modal_stack.last_mut().and_then(|widget| widget.as_any_mut().downcast_mut::<DeleteConfirmWidget>());
             if let Some(dcw) = updated {
                 dcw.update_info(info);
@@ -131,13 +131,16 @@ pub fn handle_result(result: CommandResult, app: &mut App) {
                 tracing::warn!("CheckoutStatus arrived but no DeleteConfirmWidget on stack");
             }
         }
-        CommandResult::Error { message } => {
+        CommandValue::Error { message } => {
             reset_loading_mode(app);
             app.model.status_message = Some(message);
         }
-        CommandResult::Cancelled => {
+        CommandValue::Cancelled => {
             reset_loading_mode(app);
             app.model.status_message = Some("Command cancelled".into());
+        }
+        CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
+            tracing::warn!("unexpected internal step result reached UI handler");
         }
     }
 }
@@ -156,7 +159,7 @@ mod tests {
         let mut app = stub_app();
 
         handle_result(
-            CommandResult::TerminalPrepared {
+            CommandValue::TerminalPrepared {
                 repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
                 target_host: HostName::new("remote-a"),
                 branch: "feat-x".into(),
@@ -187,7 +190,7 @@ mod tests {
         app.model.active_repo = 1;
 
         handle_result(
-            CommandResult::TerminalPrepared {
+            CommandValue::TerminalPrepared {
                 repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/repo-0".into() },
                 target_host: HostName::new("remote-a"),
                 branch: "feat-x".into(),

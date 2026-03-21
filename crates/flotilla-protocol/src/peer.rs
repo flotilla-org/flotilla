@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{delta::Change, provider_data::ProviderData, CommandResult, HostName, HostSummary, RepoIdentity, StepStatus};
+use crate::{delta::Change, provider_data::ProviderData, CommandValue, HostName, HostSummary, RepoIdentity, StepStatus};
 
 /// Logical clock for causal ordering and deduplication of peer messages.
 ///
@@ -127,7 +127,7 @@ pub enum RoutedPeerMessage {
         requester_host: HostName,
         responder_host: HostName,
         remaining_hops: u8,
-        result: Box<crate::CommandResult>,
+        result: Box<crate::CommandValue>,
     },
     CommandCancelResponse {
         cancel_id: u64,
@@ -143,7 +143,7 @@ pub enum RoutedPeerMessage {
 pub enum CommandPeerEvent {
     Started { repo_identity: RepoIdentity, repo: PathBuf, description: String },
     StepUpdate { repo_identity: RepoIdentity, repo: PathBuf, step_index: usize, step_count: usize, description: String, status: StepStatus },
-    Finished { repo_identity: RepoIdentity, repo: PathBuf, result: CommandResult },
+    Finished { repo_identity: RepoIdentity, repo: PathBuf, result: CommandValue },
 }
 
 /// The payload kind within a peer data exchange.
@@ -165,7 +165,7 @@ pub enum PeerDataKind {
 mod tests {
     use super::*;
     use crate::{
-        Command, CommandAction, CommandResult, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, SystemInfo, ToolInventory,
+        Command, CommandAction, CommandValue, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, SystemInfo, ToolInventory,
     };
 
     fn sample_host_summary() -> HostSummary {
@@ -366,7 +366,7 @@ mod tests {
             requester_host: HostName::new("workstation"),
             responder_host: HostName::new("feta"),
             remaining_hops: 7,
-            result: Box::new(CommandResult::RepoTracked { path: PathBuf::from("/srv/repo"), resolved_from: None }),
+            result: Box::new(CommandValue::RepoTracked { path: PathBuf::from("/srv/repo"), resolved_from: None }),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
@@ -376,7 +376,7 @@ mod tests {
                 assert_eq!(requester_host, HostName::new("workstation"));
                 assert_eq!(responder_host, HostName::new("feta"));
                 assert_eq!(remaining_hops, 7);
-                assert!(matches!(*result, CommandResult::RepoTracked { .. }));
+                assert!(matches!(*result, CommandValue::RepoTracked { .. }));
             }
             other => panic!("expected CommandResponse, got {:?}", other),
         }

@@ -18,9 +18,9 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
-    CommandPeerEvent, CommandResult, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, HostPath, HostSummary, Message,
-    PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, Request, Response,
-    ResponseResult, RoutedPeerMessage, StreamKey, VectorClock, PROTOCOL_VERSION,
+    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, HostPath, HostSummary, Message, PeerConnectionState,
+    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, Request, Response, ResponseResult,
+    RoutedPeerMessage, StreamKey, VectorClock, PROTOCOL_VERSION,
 };
 use indexmap::IndexMap;
 use tokio::{
@@ -226,7 +226,7 @@ fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, che
     }
 }
 
-async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandResult {
+async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     tokio::time::timeout(StdDuration::from_secs(5), async {
         loop {
             match rx.recv().await {
@@ -775,7 +775,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                         }
                         CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
                             assert_eq!(event_repo, &repo);
-                            assert_eq!(result, &CommandResult::Refreshed { repos: vec![repo.clone()] });
+                            assert_eq!(result, &CommandValue::Refreshed { repos: vec![repo.clone()] });
                             saw_finished = true;
                         }
                         CommandPeerEvent::StepUpdate { .. } => {}
@@ -787,7 +787,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(*request_id, 7);
                     assert_eq!(requester_host, &HostName::new("desktop"));
                     assert_eq!(responder_host, daemon.host_name());
-                    assert_eq!(result.as_ref(), &CommandResult::Refreshed { repos: vec![repo.clone()] });
+                    assert_eq!(result.as_ref(), &CommandValue::Refreshed { repos: vec![repo.clone()] });
                     saw_response = true;
                 }
                 other => panic!("unexpected proxied message: {other:?}"),
@@ -825,7 +825,7 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
         .expect("dispatch checkout");
     let checkout_result = wait_for_command_result(&mut setup_rx, checkout_id).await;
     match checkout_result {
-        CommandResult::CheckoutCreated { branch, path } => {
+        CommandValue::CheckoutCreated { branch, path } => {
             assert_eq!(branch, "feat-remote");
             assert!(path.ends_with("repo.feat-remote"), "unexpected checkout path: {}", path.display());
         }
@@ -897,7 +897,7 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
                         assert_eq!(event_identity, &repo_identity);
                         assert_eq!(event_repo, &repo);
                         match result {
-                            CommandResult::TerminalPrepared {
+                            CommandValue::TerminalPrepared {
                                 repo_identity: result_identity,
                                 target_host,
                                 branch,
@@ -926,7 +926,7 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
                 assert_eq!(requester_host, &HostName::new("desktop"));
                 assert_eq!(responder_host, daemon.host_name());
                 match result.as_ref() {
-                    CommandResult::TerminalPrepared {
+                    CommandValue::TerminalPrepared {
                         repo_identity: result_identity,
                         target_host,
                         branch,
@@ -1006,7 +1006,7 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
     assert!(sent.iter().any(|msg| matches!(
         msg,
         PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse { result, .. })
-            if matches!(result.as_ref(), CommandResult::CheckoutCreated { branch, .. } if branch == "feat-routed")
+            if matches!(result.as_ref(), CommandValue::CheckoutCreated { branch, .. } if branch == "feat-routed")
     )));
 }
 
