@@ -28,6 +28,20 @@ use crate::{
     theme::Theme,
 };
 
+/// Human-readable label and protocol key for each provider category.
+///
+/// Shared by widgets that render provider status tables (event log, work-item table).
+pub(crate) const PROVIDER_CATEGORIES: [(&str, &str); 8] = [
+    ("VCS", "vcs"),
+    ("Checkout mgr", "checkout_manager"),
+    ("Change request", "change_request"),
+    ("Issue tracker", "issue_tracker"),
+    ("Cloud agents", "cloud_agent"),
+    ("AI utility", "ai_utility"),
+    ("Workspace mgr", "workspace_manager"),
+    ("Terminal pool", "terminal_pool"),
+];
+
 /// Extra data the active widget exposes for the status bar.
 ///
 /// Replaces the old pattern of reading overlay state from `UiMode`.

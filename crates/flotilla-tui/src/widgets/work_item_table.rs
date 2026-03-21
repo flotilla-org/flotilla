@@ -15,7 +15,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
+use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext, PROVIDER_CATEGORIES};
 use crate::{
     app::{
         ui_state::{BranchInputKind, PendingAction, PendingStatus, UiMode},
@@ -29,16 +29,6 @@ use crate::{
 
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
-const PROVIDER_CATEGORIES: [(&str, &str); 8] = [
-    ("VCS", "vcs"),
-    ("Checkout mgr", "checkout_manager"),
-    ("Change request", "change_request"),
-    ("Issue tracker", "issue_tracker"),
-    ("Cloud agents", "cloud_agent"),
-    ("AI utility", "ai_utility"),
-    ("Workspace mgr", "workspace_manager"),
-    ("Terminal pool", "terminal_pool"),
-];
 
 /// The work-item table component. Owned by `RepoPage` and implements
 /// `InteractiveWidget` for uniform action/mouse/render dispatch.

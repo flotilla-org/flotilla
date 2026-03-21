@@ -210,7 +210,25 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandResult) ->
         CommandResult::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
         CommandResult::TerminalPrepared { branch, target_host, .. } => format!("terminal prepared: {branch} on {target_host}"),
         CommandResult::BranchNameGenerated { name, .. } => format!("branch name: {name}"),
-        CommandResult::CheckoutStatus(_) => "checkout status received".to_string(),
+        CommandResult::CheckoutStatus(status) => {
+            let mut parts = vec![format!("checkout status: {}", status.branch)];
+            if let Some(cr) = &status.change_request_status {
+                parts.push(format!("PR: {cr}"));
+            }
+            if let Some(sha) = &status.merge_commit_sha {
+                parts.push(format!("merged via {}", &sha[..sha.len().min(7)]));
+            }
+            if !status.unpushed_commits.is_empty() {
+                parts.push(format!("{} unpushed", status.unpushed_commits.len()));
+            }
+            if status.has_uncommitted {
+                parts.push("uncommitted changes".to_string());
+            }
+            if let Some(warning) = &status.base_detection_warning {
+                parts.push(format!("warning: {warning}"));
+            }
+            parts.join(", ")
+        }
         CommandResult::Error { message } => format!("error: {message}"),
         CommandResult::Cancelled => "cancelled".to_string(),
     }
@@ -982,10 +1000,35 @@ mod tests {
         }
 
         #[test]
-        fn checkout_status() {
+        fn checkout_status_clean() {
             let result = CommandResult::CheckoutStatus(CheckoutStatus { branch: "main".into(), ..Default::default() });
             let output = format_command_result(&result);
-            assert_eq!(output, "checkout status received");
+            assert_eq!(output, "checkout status: main");
+        }
+
+        #[test]
+        fn checkout_status_with_details() {
+            let result = CommandResult::CheckoutStatus(CheckoutStatus {
+                branch: "feat/x".into(),
+                change_request_status: Some("open".into()),
+                unpushed_commits: vec!["abc1234".into(), "def5678".into()],
+                has_uncommitted: true,
+                ..Default::default()
+            });
+            let output = format_command_result(&result);
+            assert_eq!(output, "checkout status: feat/x, PR: open, 2 unpushed, uncommitted changes");
+        }
+
+        #[test]
+        fn checkout_status_merged() {
+            let result = CommandResult::CheckoutStatus(CheckoutStatus {
+                branch: "feat/y".into(),
+                change_request_status: Some("merged".into()),
+                merge_commit_sha: Some("abc1234def5678".into()),
+                ..Default::default()
+            });
+            let output = format_command_result(&result);
+            assert_eq!(output, "checkout status: feat/y, PR: merged, merged via abc1234");
         }
 
         #[test]
