@@ -28,6 +28,7 @@ use crate::{
         types::*,
         vcs::CheckoutManager,
         workspace::WorkspaceManager,
+        CommandRunner,
     },
     step::{StepAction, StepOutcome, StepResolver},
 };
@@ -1772,13 +1773,15 @@ async fn run_build_plan_to_completion(
     let local_host = local_host();
     let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
     let registry = Arc::new(registry);
+    let providers_data = Arc::new(providers_data);
+    let runner: Arc<dyn CommandRunner> = Arc::new(runner);
 
     let plan = build_plan(
         local_command(action),
         repo.clone(),
         Arc::clone(&registry),
-        Arc::new(providers_data),
-        Arc::new(runner),
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         config_base.clone(),
         attachable_store.clone(),
         None,
@@ -1794,6 +1797,8 @@ async fn run_build_plan_to_completion(
             let resolver = ExecutorStepResolver {
                 repo,
                 registry,
+                providers_data,
+                runner,
                 config_base,
                 attachable_store,
                 daemon_socket_path: None,
@@ -2082,7 +2087,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
     let registry = Arc::new(registry);
-    let runner = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let providers_data = Arc::new(empty_data());
     let cb = config_base();
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
@@ -2092,8 +2098,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         local_command(fresh_checkout_action("feat-x")),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
-        Arc::new(empty_data()),
-        runner,
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2106,6 +2112,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     let resolver = ExecutorStepResolver {
         repo,
         registry,
+        providers_data,
+        runner,
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -2136,9 +2144,10 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
     let registry = Arc::new(registry);
     // validate_checkout_target needs 2 responses: local ref check (Ok), remote ref check
-    let runner = Arc::new(MockRunner::new(vec![Ok("".into()), Err("missing".into())]));
+    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Ok("".into()), Err("missing".into())]));
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+    let providers_data = Arc::new(data);
     let cb = config_base();
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
@@ -2148,8 +2157,8 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         local_command(existing_branch_checkout_action("feat-x")),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
-        Arc::new(data),
-        runner,
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2162,6 +2171,8 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     let resolver = ExecutorStepResolver {
         repo,
         registry,
+        providers_data,
+        runner,
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -2193,7 +2204,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
     let registry = Arc::new(registry);
-    let runner = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
+    let providers_data = Arc::new(empty_data());
     let cb = config_base();
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
@@ -2203,8 +2215,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         local_command(fresh_checkout_action("feat-x")),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
-        Arc::new(empty_data()),
-        runner,
+        Arc::clone(&providers_data),
+        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2217,6 +2229,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     let resolver = ExecutorStepResolver {
         repo,
         registry,
+        providers_data,
+        runner,
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -2858,6 +2872,8 @@ async fn executor_step_resolver_creates_workspace() {
     let resolver = ExecutorStepResolver {
         repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         registry: Arc::new(registry),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
@@ -2884,6 +2900,8 @@ async fn executor_step_resolver_skips_when_no_checkout_path() {
     let resolver = ExecutorStepResolver {
         repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         registry: Arc::new(registry),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,

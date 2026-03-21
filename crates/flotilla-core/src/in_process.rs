@@ -2215,6 +2215,8 @@ impl DaemonHandle for InProcessDaemon {
         tokio::spawn(async move {
             // Clone values the resolver needs before build_plan consumes them.
             let resolver_registry = Arc::clone(&registry);
+            let resolver_providers_data = Arc::clone(&providers_data);
+            let resolver_runner = Arc::clone(&runner);
             let resolver_config_base = config_base.clone();
             let resolver_attachable_store = attachable_store.clone();
             let resolver_local_host = local_host.clone();
@@ -2270,6 +2272,8 @@ impl DaemonHandle for InProcessDaemon {
                     let resolver = executor::ExecutorStepResolver {
                         repo: resolver_repo,
                         registry: resolver_registry,
+                        providers_data: resolver_providers_data,
+                        runner: resolver_runner,
                         config_base: resolver_config_base,
                         attachable_store: resolver_attachable_store,
                         daemon_socket_path: daemon_socket_path.clone(),

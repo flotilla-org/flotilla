@@ -524,9 +524,13 @@ fn build_remove_checkout_plan(
 }
 
 /// Resolves symbolic `StepAction` variants using executor infrastructure.
+// providers_data and runner are used in later resolver arms (tasks 7–9).
+#[allow(dead_code)]
 pub(crate) struct ExecutorStepResolver {
     pub repo: RepoExecutionContext,
     pub registry: Arc<ProviderRegistry>,
+    pub providers_data: Arc<ProviderData>,
+    pub runner: Arc<dyn CommandRunner>,
     pub config_base: PathBuf,
     pub attachable_store: SharedAttachableStore,
     pub daemon_socket_path: Option<PathBuf>,
