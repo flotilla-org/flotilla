@@ -9,6 +9,7 @@ pub mod file_picker;
 pub mod help;
 pub mod issue_search;
 pub mod preview_panel;
+pub mod repo_page;
 pub mod screen;
 pub mod status_bar_widget;
 pub mod tabs;

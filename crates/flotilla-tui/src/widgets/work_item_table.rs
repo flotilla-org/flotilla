@@ -141,6 +141,31 @@ impl WorkItemTable {
         self.table_state.select(Some(table_idx));
     }
 
+    /// Hit-test a mouse position using owned table state (no ctx needed).
+    pub fn row_at_mouse_self(&self, x: u16, y: u16) -> Option<usize> {
+        let ta = self.table_area;
+        if x >= ta.x && x < ta.x + ta.width && y >= ta.y && y < ta.y + ta.height {
+            let row_in_table = (y - ta.y) as usize;
+            if row_in_table < 2 {
+                return None;
+            }
+            let data_row = row_in_table - 2;
+            let offset = self.table_state.offset();
+            let actual_row = data_row + offset;
+            self.grouped_items.selectable_indices.iter().position(|&idx| idx == actual_row)
+        } else {
+            None
+        }
+    }
+
+    /// Select a row by selectable index using owned state.
+    pub fn select_row_self(&mut self, si: usize) {
+        if let Some(&table_idx) = self.grouped_items.selectable_indices.get(si) {
+            self.selected_selectable_idx = Some(si);
+            self.table_state.select(Some(table_idx));
+        }
+    }
+
     // ── Selection helpers (ctx-based, for current callers) ───────────
 
     pub fn select_next(&self, ctx: &mut WidgetContext) {
