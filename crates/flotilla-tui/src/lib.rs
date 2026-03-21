@@ -1,4 +1,5 @@
 pub mod app;
+pub mod binding_table;
 pub mod cli;
 pub mod event;
 pub mod event_log;
