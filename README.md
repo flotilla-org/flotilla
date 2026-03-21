@@ -1,7 +1,7 @@
 # flotilla
 
-[![CI](https://github.com/rjwittams/flotilla/actions/workflows/ci.yml/badge.svg)](https://github.com/rjwittams/flotilla/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://rjwittams.github.io/flotilla/coverage/badge.json)](https://rjwittams.github.io/flotilla/coverage/)
+[![CI](https://github.com/flotilla-org/flotilla/actions/workflows/ci.yml/badge.svg)](https://github.com/flotilla-org/flotilla/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://flotilla-org.github.io/flotilla/coverage/badge.json)](https://flotilla-org.github.io/flotilla/coverage/)
 
 Development fleet management. Agents, branches, PRs, and workspaces across every repo in one view.
 
@@ -22,7 +22,7 @@ Available tools are auto-detected from your environment, with configurable overr
 | Code review | [GitHub](https://github.com/) PRs | | [GitLab](https://gitlab.com/) MRs (#49) |
 | Issue tracking | [GitHub Issues](https://github.com/features/issues) | | [Linear](https://linear.app/) (#51), [Jira](https://www.atlassian.com/software/jira) (#50) |
 | Cloud coding agents | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions | | [Codex](https://openai.com/index/introducing-codex/) (#52), others (#53) |
-| Workspace managers | [cmux](https://github.com/rjwittams/cmux) | [tmux](https://tmux.github.io/) (#54), [zellij](https://zellij.dev/) (#55) | |
+| Workspace managers | [cmux](https://cmux.com) | [tmux](https://tmux.github.io/) (#54), [zellij](https://zellij.dev/) (#55) | |
 | AI delegation (e.g branch naming) | Claude Code | | LLM APIs (#56), [ollama](https://ollama.com/) (#56) |
 
 ## How it works
@@ -36,7 +36,7 @@ Available tools are auto-detected from your environment, with configurable overr
 ## Quickstart
 
 ```
-cargo install --git https://github.com/rjwittams/flotilla
+cargo install --git https://github.com/flotilla-org/flotilla
 cd your-repo
 flotilla
 ```
@@ -44,7 +44,7 @@ flotilla
 Or from source:
 
 ```
-git clone https://github.com/rjwittams/flotilla
+git clone https://github.com/flotilla-org/flotilla
 cd flotilla
 cargo run -- --repo-root /path/to/your/repo
 ```
