@@ -12,8 +12,9 @@ use ratatui::{
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{PeerStatus, ProviderStatus, TuiHostState, TuiModel},
+    binding_table::BindingModeId,
     event_log::{self, LevelExt},
-    keymap::{Action, ModeId},
+    keymap::Action,
     theme::Theme,
 };
 
@@ -194,8 +195,8 @@ impl InteractiveWidget for EventLogWidget {
         self.render_event_log(ctx.theme, frame, chunks[1]);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::Config
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::Overview
     }
 
     fn as_any(&self) -> &dyn Any {

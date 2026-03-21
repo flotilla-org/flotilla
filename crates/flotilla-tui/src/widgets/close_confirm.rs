@@ -8,11 +8,7 @@ use ratatui::{
 };
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
-use crate::{
-    app::ui_state::PendingActionContext,
-    keymap::{Action, ModeId},
-    ui_helpers,
-};
+use crate::{app::ui_state::PendingActionContext, binding_table::BindingModeId, keymap::Action, ui_helpers};
 
 pub struct CloseConfirmWidget {
     pub id: String,
@@ -63,8 +59,8 @@ impl InteractiveWidget for CloseConfirmWidget {
         frame.render_widget(paragraph, popup);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::CloseConfirm
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::CloseConfirm
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -94,7 +90,7 @@ mod tests {
     #[test]
     fn mode_id_is_close_confirm() {
         let widget = make_widget();
-        assert_eq!(widget.mode_id(), ModeId::CloseConfirm);
+        assert_eq!(widget.mode_id(), BindingModeId::CloseConfirm);
     }
 
     #[test]

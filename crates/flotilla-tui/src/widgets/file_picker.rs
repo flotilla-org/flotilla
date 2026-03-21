@@ -13,7 +13,8 @@ use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{ui_state::DirEntry, TuiModel},
-    keymap::{Action, ModeId},
+    binding_table::BindingModeId,
+    keymap::Action,
     ui_helpers,
 };
 
@@ -225,8 +226,8 @@ impl InteractiveWidget for FilePickerWidget {
         frame.render_stateful_widget(list, chunks[1], &mut state);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::FilePicker
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::FilePicker
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -265,7 +266,7 @@ mod tests {
     #[test]
     fn mode_id_is_file_picker() {
         let widget = FilePickerWidget::new(Input::default(), vec![]);
-        assert_eq!(widget.mode_id(), ModeId::FilePicker);
+        assert_eq!(widget.mode_id(), BindingModeId::FilePicker);
     }
 
     #[test]

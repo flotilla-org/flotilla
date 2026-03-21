@@ -6,10 +6,7 @@ use ratatui::{layout::Rect, Frame};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
-use crate::{
-    app::ui_state::UiMode,
-    keymap::{Action, ModeId},
-};
+use crate::{app::ui_state::UiMode, binding_table::BindingModeId, keymap::Action};
 
 pub struct IssueSearchWidget {
     input: Input,
@@ -82,8 +79,8 @@ impl InteractiveWidget for IssueSearchWidget {
         // via sync_mode().
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::IssueSearch
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::IssueSearch
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -114,7 +111,7 @@ mod tests {
     #[test]
     fn mode_id_is_issue_search() {
         let widget = IssueSearchWidget::new();
-        assert_eq!(widget.mode_id(), ModeId::IssueSearch);
+        assert_eq!(widget.mode_id(), BindingModeId::IssueSearch);
     }
 
     #[test]

@@ -14,7 +14,8 @@ use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext, WidgetStatusData};
 use crate::{
     app::ui_state::UiMode,
-    keymap::{Action, ModeId},
+    binding_table::BindingModeId,
+    keymap::Action,
     palette::{self, PaletteEntry, MAX_PALETTE_ROWS},
 };
 
@@ -321,8 +322,8 @@ impl InteractiveWidget for CommandPaletteWidget {
         frame.set_cursor_position((cursor_x, overlay.status_row.y));
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::CommandPalette
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::CommandPalette
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -357,7 +358,7 @@ mod tests {
     #[test]
     fn mode_id_is_command_palette() {
         let widget = CommandPaletteWidget::new();
-        assert_eq!(widget.mode_id(), ModeId::CommandPalette);
+        assert_eq!(widget.mode_id(), BindingModeId::CommandPalette);
     }
 
     #[test]

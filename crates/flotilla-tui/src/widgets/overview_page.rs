@@ -4,10 +4,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{layout::Rect, Frame};
 
 use super::{event_log::EventLogWidget, InteractiveWidget, Outcome, RenderContext, WidgetContext};
-use crate::{
-    app::ui_state::UiMode,
-    keymap::{Action, ModeId},
-};
+use crate::{app::ui_state::UiMode, binding_table::BindingModeId, keymap::Action};
 
 /// Overview page widget for the Flotilla (overview) tab.
 ///
@@ -89,8 +86,8 @@ impl InteractiveWidget for OverviewPage {
         InteractiveWidget::render(&mut self.event_log, frame, area, ctx);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::Config
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::Overview
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -136,7 +133,7 @@ mod tests {
                     theme: &theme,
                     keymap: &keymap,
                     in_flight: &in_flight,
-                    active_widget_mode: Some(ModeId::Config),
+                    active_widget_mode: Some(BindingModeId::Overview),
                     active_widget_data: WidgetStatusData::None,
                 };
                 page.render(frame, frame.area(), &mut ctx);
@@ -181,7 +178,7 @@ mod tests {
     #[test]
     fn overview_page_mode_id_is_config() {
         let page = OverviewPage::new();
-        assert_eq!(page.mode_id(), ModeId::Config);
+        assert_eq!(page.mode_id(), BindingModeId::Overview);
     }
 
     #[test]

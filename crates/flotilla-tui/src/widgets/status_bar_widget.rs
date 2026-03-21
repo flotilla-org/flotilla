@@ -13,7 +13,8 @@ use unicode_width::UnicodeWidthStr;
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{collect_visible_status_items, InFlightCommand, RepoViewLayout, TuiModel, UiMode, UiState},
-    keymap::{Action, ModeId},
+    binding_table::BindingModeId,
+    keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
     shimmer::shimmer_spans,
     status_bar::{
@@ -62,7 +63,7 @@ impl StatusBarWidget {
         theme: &Theme,
         frame: &mut Frame,
         area: Rect,
-        active_widget_mode: Option<ModeId>,
+        active_widget_mode: Option<BindingModeId>,
         active_widget_data: WidgetStatusData,
     ) {
         self.area = area;
@@ -226,8 +227,8 @@ impl InteractiveWidget for StatusBarWidget {
         );
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::Normal
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::Normal
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -303,7 +304,7 @@ fn status_bar_content(
     model: &TuiModel,
     ui: &UiState,
     in_flight: &HashMap<u64, InFlightCommand>,
-    active_widget_mode: Option<ModeId>,
+    active_widget_mode: Option<BindingModeId>,
     active_widget_data: &WidgetStatusData,
 ) -> StatusBarContent {
     let visible_error = collect_visible_status_items(model, ui).into_iter().next();
@@ -311,7 +312,7 @@ fn status_bar_content(
     // Widget stack overrides UiMode for status bar content.
     if let Some(widget_mode) = active_widget_mode {
         match widget_mode {
-            ModeId::Help => {
+            BindingModeId::Help => {
                 return StatusBarContent {
                     status: StatusSection::plain("HELP"),
                     keys: vec![
@@ -324,7 +325,7 @@ fn status_bar_content(
                     mode_indicators: vec![],
                 };
             }
-            ModeId::ActionMenu => {
+            BindingModeId::ActionMenu => {
                 return StatusBarContent {
                     status: StatusSection::plain("ACTIONS"),
                     keys: vec![
@@ -337,7 +338,7 @@ fn status_bar_content(
                     mode_indicators: vec![],
                 };
             }
-            ModeId::DeleteConfirm => {
+            BindingModeId::DeleteConfirm => {
                 return StatusBarContent {
                     status: StatusSection::plain("CONFIRM DELETE"),
                     keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
@@ -345,7 +346,7 @@ fn status_bar_content(
                     mode_indicators: vec![],
                 };
             }
-            ModeId::CloseConfirm => {
+            BindingModeId::CloseConfirm => {
                 return StatusBarContent {
                     status: StatusSection::plain("CONFIRM CLOSE"),
                     keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
@@ -353,7 +354,7 @@ fn status_bar_content(
                     mode_indicators: vec![],
                 };
             }
-            ModeId::BranchInput => {
+            BindingModeId::BranchInput => {
                 let generating = matches!(active_widget_data, WidgetStatusData::BranchInput { generating: true });
                 return if generating {
                     StatusBarContent {
@@ -371,7 +372,7 @@ fn status_bar_content(
                     }
                 };
             }
-            ModeId::IssueSearch => {
+            BindingModeId::IssueSearch => {
                 let query = if let UiMode::IssueSearch { ref input } = ui.mode { input.value().to_string() } else { String::new() };
                 return StatusBarContent {
                     status: StatusSection::plain(&format!("SEARCH {}", query)),
@@ -380,7 +381,7 @@ fn status_bar_content(
                     mode_indicators: vec![],
                 };
             }
-            ModeId::CommandPalette => {
+            BindingModeId::CommandPalette => {
                 let input_text = match active_widget_data {
                     WidgetStatusData::CommandPalette { input_text } => input_text.clone(),
                     _ => String::new(),
@@ -397,7 +398,7 @@ fn status_bar_content(
                     mode_indicators: normal_mode_indicators(ui),
                 };
             }
-            ModeId::FilePicker => {
+            BindingModeId::FilePicker => {
                 return StatusBarContent {
                     status: StatusSection::plain("ADD REPO"),
                     keys: vec![

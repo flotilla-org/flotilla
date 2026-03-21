@@ -24,7 +24,8 @@ use ratatui::{layout::Rect, Frame};
 
 use crate::{
     app::{ui_state::UiMode, CommandQueue, InFlightCommand, RepoUiState, TuiModel, UiState},
-    keymap::{Action, Keymap, ModeId},
+    binding_table::BindingModeId,
+    keymap::{Action, Keymap},
     theme::Theme,
 };
 
@@ -114,7 +115,7 @@ pub struct RenderContext<'a> {
     pub in_flight: &'a HashMap<u64, InFlightCommand>,
     /// The mode of the topmost widget on the stack. Used by the status bar
     /// to show the correct key hints.
-    pub active_widget_mode: Option<ModeId>,
+    pub active_widget_mode: Option<BindingModeId>,
     /// Extra data from the active widget for status bar rendering.
     pub active_widget_data: WidgetStatusData,
 }
@@ -138,7 +139,7 @@ pub trait InteractiveWidget {
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext);
 
     /// The mode identifier for keymap resolution.
-    fn mode_id(&self) -> ModeId;
+    fn mode_id(&self) -> BindingModeId;
 
     /// Whether this widget needs raw key events instead of resolved actions.
     fn captures_raw_keys(&self) -> bool {

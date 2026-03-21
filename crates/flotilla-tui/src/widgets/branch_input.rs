@@ -6,12 +6,7 @@ use ratatui::{layout::Rect, style::Style, text::Line, widgets::Paragraph, Frame}
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext, WidgetStatusData};
-use crate::{
-    app::ui_state::BranchInputKind,
-    keymap::{Action, ModeId},
-    shimmer::shimmer_spans,
-    ui_helpers,
-};
+use crate::{app::ui_state::BranchInputKind, binding_table::BindingModeId, keymap::Action, shimmer::shimmer_spans, ui_helpers};
 
 pub struct BranchInputWidget {
     input: Input,
@@ -95,8 +90,8 @@ impl InteractiveWidget for BranchInputWidget {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::BranchInput
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::BranchInput
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -131,7 +126,7 @@ mod tests {
     #[test]
     fn mode_id_is_branch_input() {
         let widget = BranchInputWidget::new(BranchInputKind::Manual);
-        assert_eq!(widget.mode_id(), ModeId::BranchInput);
+        assert_eq!(widget.mode_id(), BindingModeId::BranchInput);
     }
 
     #[test]

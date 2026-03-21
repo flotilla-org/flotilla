@@ -16,7 +16,8 @@ use crate::{
         intent::Intent,
         ui_state::{BranchInputKind, PendingActionContext},
     },
-    keymap::{Action, ModeId},
+    binding_table::BindingModeId,
+    keymap::Action,
     ui_helpers,
 };
 
@@ -157,8 +158,8 @@ impl InteractiveWidget for ActionMenuWidget {
         frame.render_stateful_widget(list, popup, &mut state);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::ActionMenu
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::ActionMenu
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -207,7 +208,7 @@ mod tests {
     fn mode_id_is_action_menu() {
         let (item, entries) = make_simple_entry(Intent::CreateWorkspace);
         let widget = ActionMenuWidget::new(entries, item);
-        assert_eq!(widget.mode_id(), ModeId::ActionMenu);
+        assert_eq!(widget.mode_id(), BindingModeId::ActionMenu);
     }
 
     #[test]

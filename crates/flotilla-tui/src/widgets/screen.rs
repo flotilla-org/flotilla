@@ -11,11 +11,7 @@ use super::{
     overview_page::OverviewPage, repo_page::RepoPage, status_bar_widget::StatusBarWidget, tabs::Tabs, AppAction, InteractiveWidget,
     Outcome, RenderContext, WidgetContext, WidgetStatusData,
 };
-use crate::{
-    keymap::{Action, ModeId},
-    status_bar::StatusBarAction,
-    ui_helpers,
-};
+use crate::{binding_table::BindingModeId, keymap::Action, status_bar::StatusBarAction, ui_helpers};
 
 /// Root widget that owns the tab bar, page content, status bar, and modal stack.
 ///
@@ -88,8 +84,8 @@ impl Screen {
     }
 
     /// The mode of the topmost widget (modal or overview page fallback).
-    pub fn active_mode_id(&self) -> Option<ModeId> {
-        self.modal_stack.last().map(|w| w.mode_id()).or(Some(ModeId::Normal))
+    pub fn active_mode_id(&self) -> Option<BindingModeId> {
+        self.modal_stack.last().map(|w| w.mode_id()).or(Some(BindingModeId::Normal))
     }
 
     /// Extra status data from the topmost widget.
@@ -312,7 +308,7 @@ impl InteractiveWidget for Screen {
         }
 
         // 3. Status bar — when the palette is active, move it to the overlay position
-        let status_bar_area = if ctx.active_widget_mode == Some(ModeId::CommandPalette) {
+        let status_bar_area = if ctx.active_widget_mode == Some(BindingModeId::CommandPalette) {
             ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
         } else {
             chunks[2]
@@ -334,8 +330,8 @@ impl InteractiveWidget for Screen {
         }
     }
 
-    fn mode_id(&self) -> ModeId {
-        self.modal_stack.last().map(|w| w.mode_id()).unwrap_or(ModeId::Normal)
+    fn mode_id(&self) -> BindingModeId {
+        self.modal_stack.last().map(|w| w.mode_id()).unwrap_or(BindingModeId::Normal)
     }
 
     fn captures_raw_keys(&self) -> bool {

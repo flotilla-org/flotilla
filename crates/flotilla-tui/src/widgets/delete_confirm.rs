@@ -12,12 +12,7 @@ use ratatui::{
 };
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
-use crate::{
-    app::ui_state::PendingActionContext,
-    keymap::{Action, ModeId},
-    shimmer::shimmer_spans,
-    ui_helpers,
-};
+use crate::{app::ui_state::PendingActionContext, binding_table::BindingModeId, keymap::Action, shimmer::shimmer_spans, ui_helpers};
 
 pub struct DeleteConfirmWidget {
     pub info: Option<CheckoutStatus>,
@@ -165,8 +160,8 @@ impl InteractiveWidget for DeleteConfirmWidget {
         frame.render_widget(paragraph, popup);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::DeleteConfirm
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::DeleteConfirm
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -206,7 +201,7 @@ mod tests {
     #[test]
     fn mode_id_is_delete_confirm() {
         let widget = make_widget();
-        assert_eq!(widget.mode_id(), ModeId::DeleteConfirm);
+        assert_eq!(widget.mode_id(), BindingModeId::DeleteConfirm);
     }
 
     #[test]

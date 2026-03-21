@@ -8,10 +8,7 @@ use ratatui::{
 };
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
-use crate::{
-    keymap::{Action, ModeId},
-    ui_helpers,
-};
+use crate::{binding_table::BindingModeId, keymap::Action, ui_helpers};
 
 pub struct HelpWidget {
     scroll: u16,
@@ -107,8 +104,8 @@ impl InteractiveWidget for HelpWidget {
         frame.render_widget(paragraph, popup);
     }
 
-    fn mode_id(&self) -> ModeId {
-        ModeId::Help
+    fn mode_id(&self) -> BindingModeId {
+        BindingModeId::Help
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -128,7 +125,7 @@ mod tests {
     #[test]
     fn mode_id_is_help() {
         let widget = HelpWidget::new();
-        assert_eq!(widget.mode_id(), ModeId::Help);
+        assert_eq!(widget.mode_id(), BindingModeId::Help);
     }
 
     #[test]
