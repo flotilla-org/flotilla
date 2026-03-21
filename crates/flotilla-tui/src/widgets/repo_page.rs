@@ -313,7 +313,9 @@ impl InteractiveWidget for RepoPage {
                 Outcome::Consumed
             }
             Action::CycleLayout => {
-                self.cycle_layout();
+                // Don't cycle here — let process_app_actions be the single
+                // source of truth. This handles both direct key press and
+                // command palette paths.
                 ctx.app_actions.push(AppAction::CycleLayout);
                 Outcome::Consumed
             }
@@ -644,7 +646,8 @@ mod tests {
         let outcome = page.handle_action(Action::CycleLayout, &mut ctx);
         assert!(matches!(outcome, Outcome::Consumed));
         assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::CycleLayout)));
-        assert_eq!(page.layout, RepoViewLayout::Zoom);
+        // The page does NOT cycle its own layout — process_app_actions does that.
+        assert_eq!(page.layout, RepoViewLayout::Auto);
     }
 
     // ── select_next / select_prev ──

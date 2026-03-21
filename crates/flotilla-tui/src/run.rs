@@ -126,12 +126,15 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
             app::executor::dispatch(cmd, &mut app, pending_ctx).await;
         }
 
-        // ── Draw once ──
-        render_frame(&mut terminal, &mut app)?;
-
+        // ── Check quit before rendering ──
+        // handle_repo_removed sets should_quit when the last repo is removed,
+        // and rendering with an empty repo_order would panic in the status bar.
         if app.should_quit {
             break;
         }
+
+        // ── Draw once ──
+        render_frame(&mut terminal, &mut app)?;
     }
 
     crate::terminal::restore_terminal();

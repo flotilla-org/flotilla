@@ -682,6 +682,20 @@ mod tests {
         assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     }
 
+    #[test]
+    fn tab_switch_blocked_while_modal_open() {
+        let mut app = stub_app_with_repos(2);
+        setup_table(&mut app, vec![make_work_item("a")]);
+        let initial_tab = app.model.active_repo;
+        app.screen.modal_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+
+        // Press ] to switch tabs — should be blocked by the modal focus barrier
+        app.handle_key(key(KeyCode::Char(']')));
+
+        assert_eq!(app.screen.modal_stack.len(), 1, "modal should remain on stack");
+        assert_eq!(app.model.active_repo, initial_tab, "tab should not have changed");
+    }
+
     // ── handle_config_key ────────────────────────────────────────────
 
     #[test]

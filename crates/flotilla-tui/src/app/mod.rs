@@ -483,11 +483,13 @@ impl App {
                     self.theme = (themes[next].1)();
                 }
                 AppAction::CycleLayout => {
-                    // RepoPage already cycled its own layout in handle_action.
-                    // Sync the page's layout to the global ui field and persist.
+                    // Cycle the active page's layout (handles both the direct
+                    // repo_page path where the page already cycled, and the
+                    // command palette path where only the AppAction was emitted).
                     if !self.model.repo_order.is_empty() {
                         let identity = &self.model.repo_order[self.model.active_repo];
-                        if let Some(page) = self.screen.repo_pages.get(identity) {
+                        if let Some(page) = self.screen.repo_pages.get_mut(identity) {
+                            page.cycle_layout();
                             self.ui.view_layout = page.layout;
                         }
                     }
@@ -563,8 +565,14 @@ impl App {
                 AppAction::OpenFilePicker => {
                     self.open_file_picker_from_active_repo_parent();
                 }
-                AppAction::PrevTab => self.prev_tab(),
-                AppAction::NextTab => self.next_tab(),
+                AppAction::PrevTab => {
+                    self.dismiss_modals();
+                    self.prev_tab();
+                }
+                AppAction::NextTab => {
+                    self.dismiss_modals();
+                    self.next_tab();
+                }
                 AppAction::MoveTabLeft => {
                     if !self.ui.mode.is_config() && self.move_tab(-1) {
                         self.config.save_tab_order(&self.persisted_tab_order_paths());

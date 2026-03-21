@@ -112,7 +112,19 @@ impl Screen {
 
 impl InteractiveWidget for Screen {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        // Phase 1: Global actions (always handled, even with modals)
+        // Phase 1: Modal dispatch — modals are focus barriers that trap all input,
+        // including global actions like tab switching and theme cycling.
+        if let Some(modal) = self.modal_stack.last_mut() {
+            let outcome = modal.handle_action(action, ctx);
+            if !matches!(outcome, Outcome::Ignored) {
+                self.apply_outcome(outcome);
+                return Outcome::Consumed;
+            }
+            // Modal is a focus barrier — don't fall through to globals or base
+            return Outcome::Ignored;
+        }
+
+        // Phase 2: Global actions (only when no modal is open)
         match action {
             Action::PrevTab => {
                 ctx.app_actions.push(AppAction::PrevTab);
@@ -151,17 +163,6 @@ impl InteractiveWidget for Screen {
                 return Outcome::Consumed;
             }
             _ => {}
-        }
-
-        // Phase 2: Modal dispatch — modals are focus barriers
-        if let Some(modal) = self.modal_stack.last_mut() {
-            let outcome = modal.handle_action(action, ctx);
-            if !matches!(outcome, Outcome::Ignored) {
-                self.apply_outcome(outcome);
-                return Outcome::Consumed;
-            }
-            // Modal is a focus barrier — don't fall through to base
-            return Outcome::Ignored;
         }
 
         // Phase 3: No modal — dispatch to overview page or repo page
