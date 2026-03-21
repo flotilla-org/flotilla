@@ -231,10 +231,6 @@ impl<'a> TeleportFlow<'a> {
         self.service.resolve_attach_command(self.session_id).await
     }
 
-    pub(super) async fn ensure_checkout_step(&self) -> Result<Option<PathBuf>, String> {
-        self.service.resolve_teleport_checkout_path(None, self.branch).await
-    }
-
     pub(super) async fn create_workspace_step(&self, checkout_path: &Path, teleport_cmd: &str) -> Result<(), String> {
         self.service.create_workspace_for_teleport(checkout_path, self.branch, teleport_cmd).await
     }
