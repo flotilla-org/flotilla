@@ -237,9 +237,7 @@ impl CompiledBindings {
                     };
 
                     let (display, code, modifiers) = display_for_combo(&combo);
-                    let click_action =
-                        if modifiers == KeyModifiers::NONE { StatusBarAction::key(code) } else { StatusBarAction::shifted(code) };
-                    hints.entry(*mode).or_default().push(KeyChip::new(&display, label, click_action));
+                    hints.entry(*mode).or_default().push(KeyChip::new(&display, label, StatusBarAction::combo(code, modifiers)));
                 }
             }
         }
@@ -356,31 +354,40 @@ impl CompiledBindings {
 
 // ── Key string parsing ───────────────────────────────────────────────
 
-/// Parse a key string like "j", "esc", "S-K", "[", "space" into a `KeyCombination`.
+/// Parse a key string like "j", "esc", "S-K", "C-q", "A-x", "[", "space" into a `KeyCombination`.
 fn parse_key_string(s: &str) -> KeyCombination {
-    // Handle shifted keys (S-X pattern).
-    if let Some(rest) = s.strip_prefix("S-") {
-        if rest.len() == 1 {
-            let ch = rest.chars().next().expect("non-empty rest after S- prefix");
-            return KeyCombination::from(crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT));
+    // Strip modifier prefixes: C- (Ctrl), A- (Alt), S- (Shift).
+    let mut modifiers = KeyModifiers::NONE;
+    let mut rest = s;
+    loop {
+        if let Some(r) = rest.strip_prefix("C-") {
+            modifiers |= KeyModifiers::CONTROL;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("A-") {
+            modifiers |= KeyModifiers::ALT;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("S-") {
+            modifiers |= KeyModifiers::SHIFT;
+            rest = r;
+        } else {
+            break;
         }
     }
 
     // Named keys.
-    let (code, modifiers) = match s {
-        "enter" => (KeyCode::Enter, KeyModifiers::NONE),
-        "esc" => (KeyCode::Esc, KeyModifiers::NONE),
-        "space" => (KeyCode::Char(' '), KeyModifiers::NONE),
-        "tab" => (KeyCode::Tab, KeyModifiers::NONE),
-        "up" => (KeyCode::Up, KeyModifiers::NONE),
-        "down" => (KeyCode::Down, KeyModifiers::NONE),
-        "left" => (KeyCode::Left, KeyModifiers::NONE),
-        "right" => (KeyCode::Right, KeyModifiers::NONE),
+    let code = match rest {
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
+        "space" => KeyCode::Char(' '),
+        "tab" => KeyCode::Tab,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
         _ => {
-            // Single character keys.
-            if s.len() == 1 {
-                let ch = s.chars().next().expect("non-empty single-char key string");
-                (KeyCode::Char(ch), KeyModifiers::NONE)
+            if rest.len() == 1 {
+                let ch = rest.chars().next().expect("non-empty single-char key string");
+                KeyCode::Char(ch)
             } else {
                 panic!("unknown key string: {s}");
             }
@@ -400,24 +407,33 @@ fn display_for_combo(combo: &KeyCombination) -> (String, KeyCode, KeyModifiers) 
     };
     let modifiers = combo.modifiers;
 
-    let display = if modifiers.contains(KeyModifiers::SHIFT) {
-        match code {
-            KeyCode::Char(c) => format!("S-{}", c.to_uppercase()),
-            _ => format!("{code:?}"),
-        }
+    let base = match code {
+        KeyCode::Char(' ') => "SPACE".into(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "ENT".into(),
+        KeyCode::Esc => "ESC".into(),
+        KeyCode::Tab => "TAB".into(),
+        KeyCode::Up => "UP".into(),
+        KeyCode::Down => "DOWN".into(),
+        KeyCode::Left => "LEFT".into(),
+        KeyCode::Right => "RIGHT".into(),
+        _ => format!("{code:?}"),
+    };
+
+    let display = if modifiers.is_empty() {
+        base
     } else {
-        match code {
-            KeyCode::Char(' ') => "SPACE".into(),
-            KeyCode::Char(c) => c.to_string(),
-            KeyCode::Enter => "ENT".into(),
-            KeyCode::Esc => "ESC".into(),
-            KeyCode::Tab => "TAB".into(),
-            KeyCode::Up => "UP".into(),
-            KeyCode::Down => "DOWN".into(),
-            KeyCode::Left => "LEFT".into(),
-            KeyCode::Right => "RIGHT".into(),
-            _ => format!("{code:?}"),
+        let mut prefix = String::new();
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            prefix.push_str("C-");
         }
+        if modifiers.contains(KeyModifiers::ALT) {
+            prefix.push_str("A-");
+        }
+        if modifiers.contains(KeyModifiers::SHIFT) {
+            prefix.push_str("S-");
+        }
+        format!("{prefix}{}", base.to_uppercase())
     };
 
     (display, code, modifiers)
@@ -507,5 +523,44 @@ mod tests {
         // Just call from_table on the BINDINGS constant and verify it doesn't panic.
         let compiled = CompiledBindings::from_table(BINDINGS);
         assert!(compiled.key_map.contains_key(&BindingModeId::Normal));
+    }
+
+    #[test]
+    fn parse_key_string_ctrl_modifier() {
+        let combo = parse_key_string("C-q");
+        let (display, code, modifiers) = display_for_combo(&combo);
+        assert_eq!(code, KeyCode::Char('q'));
+        assert!(modifiers.contains(KeyModifiers::CONTROL));
+        assert_eq!(display, "C-Q");
+    }
+
+    #[test]
+    fn parse_key_string_alt_modifier() {
+        let combo = parse_key_string("A-x");
+        let (display, code, modifiers) = display_for_combo(&combo);
+        assert_eq!(code, KeyCode::Char('x'));
+        assert!(modifiers.contains(KeyModifiers::ALT));
+        assert_eq!(display, "A-X");
+    }
+
+    #[test]
+    fn parse_key_string_combined_modifiers() {
+        let combo = parse_key_string("C-S-k");
+        let (display, code, modifiers) = display_for_combo(&combo);
+        // crokey normalizes Shift+char to uppercase
+        assert!(code == KeyCode::Char('k') || code == KeyCode::Char('K'));
+        assert!(modifiers.contains(KeyModifiers::CONTROL));
+        assert!(modifiers.contains(KeyModifiers::SHIFT));
+        assert_eq!(display, "C-S-K");
+    }
+
+    #[test]
+    fn hint_chip_uses_combo_for_ctrl_binding() {
+        let table = &[Binding { mode: BindingModeId::Normal, key: "C-q", action: Action::Quit, hint: Some("Quit"), hint_key: None }];
+        let compiled = CompiledBindings::from_table(table);
+        let hints = compiled.hints_for(&KeyBindingMode::Single(BindingModeId::Normal));
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].key, "C-Q");
+        assert_eq!(hints[0].action, StatusBarAction::combo(KeyCode::Char('q'), KeyModifiers::CONTROL));
     }
 }

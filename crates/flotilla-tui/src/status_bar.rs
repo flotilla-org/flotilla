@@ -22,6 +22,10 @@ impl StatusBarAction {
     pub fn shifted(code: KeyCode) -> Self {
         Self::KeyPress { code, modifiers: KeyModifiers::SHIFT }
     }
+
+    pub fn combo(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self::KeyPress { code, modifiers }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
