@@ -12,8 +12,8 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{collect_visible_status_items, InFlightCommand, RepoViewLayout, TuiModel, UiMode, UiState},
-    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    app::{InFlightCommand, RepoViewLayout, TuiModel, UiState},
+    binding_table::{KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
     shimmer::shimmer_spans,
@@ -24,18 +24,12 @@ use crate::{
     theme::Theme,
 };
 
-const ENTER_KEY_GLYPH: &str = "ENT";
-
-/// Content computed for a single status bar render pass.
-struct StatusBarContent {
-    status: StatusSection,
-    keys: Vec<KeyChip>,
-    task: Option<TaskSection>,
-    mode_indicators: Vec<ModeIndicator>,
-}
-
 /// Standalone status bar component. Handles rendering and mouse hit-testing
 /// for the bottom status strip.
+///
+/// This is a pure renderer: all content resolution (status text, key chips,
+/// task spinner, error items, mode indicators) is performed by `Screen`
+/// before calling `render_bespoke`.
 #[derive(Default)]
 pub struct StatusBarWidget {
     /// Click targets for key chips, populated during render.
@@ -51,41 +45,47 @@ impl StatusBarWidget {
         Self::default()
     }
 
-    /// Render the status bar into `area`. Click targets are stored on
-    /// `self` for later hit-testing via `handle_click`.
+    /// Render the status bar into `area` with pre-resolved content.
+    ///
+    /// All content resolution is performed by the caller (Screen). This
+    /// method only handles layout and rendering.
     #[allow(clippy::too_many_arguments)]
     pub fn render_bespoke(
         &mut self,
-        model: &TuiModel,
-        ui: &mut UiState,
-        in_flight: &HashMap<u64, InFlightCommand>,
+        status: StatusSection,
+        key_chips: Vec<KeyChip>,
+        task: Option<TaskSection>,
+        error_items: Vec<crate::app::VisibleStatusItem>,
+        mode_indicators: Vec<ModeIndicator>,
+        show_keys: bool,
         theme: &Theme,
         frame: &mut Frame,
         area: Rect,
-        active_widget_mode: Option<BindingModeId>,
-        active_widget_data: StatusFragment,
     ) {
         self.area = area;
         self.key_targets.clear();
         self.dismiss_targets.clear();
 
-        let content = status_bar_content(model, ui, in_flight, active_widget_mode, &active_widget_data);
-        let status_section = content.status.clone();
+        // Error items take priority over the fragment's status.
+        let status_section =
+            if let Some(item) = error_items.into_iter().next() { StatusSection::error(item.id, &item.text) } else { status };
+
+        let status_section_clone = status_section.clone();
         let status_model = StatusBarModel::build(StatusBarInput {
             width: area.width as usize,
             preferred_status_width: DEFAULT_STATUS_WIDTH_BUDGET.min(area.width as usize),
-            keys_visible: ui.status_bar.show_keys,
-            status: content.status,
-            task: content.task,
-            keys: content.keys,
-            mode_indicators: content.mode_indicators,
+            keys_visible: show_keys,
+            status: status_section,
+            task,
+            keys: key_chips,
+            mode_indicators,
         });
 
         frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
 
         let mut spans = Vec::new();
         let mut x = 0usize;
-        let status_style = match status_section {
+        let status_style = match status_section_clone {
             StatusSection::Error { .. } => Style::default().fg(theme.status_error).bg(theme.bar_bg).bold(),
             StatusSection::Plain(_) => Style::default().fg(theme.text).bg(theme.bar_bg),
         };
@@ -93,7 +93,7 @@ impl StatusBarWidget {
         if !status_model.status_text.is_empty() {
             let status_width = status_model.status_text.width();
             spans.push(Span::styled(status_model.status_text.clone(), status_style));
-            if let Some(id) = status_section.dismiss_id() {
+            if let Some(id) = status_section_clone.dismiss_id() {
                 self.dismiss_targets.push(StatusBarTarget::new(
                     Rect::new(area.x + status_width.saturating_sub(1) as u16, area.y, 1, 1),
                     StatusBarAction::ClearError(id),
@@ -213,21 +213,14 @@ impl InteractiveWidget for StatusBarWidget {
         }
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
-        self.render_bespoke(
-            ctx.model,
-            ctx.ui,
-            ctx.in_flight,
-            ctx.theme,
-            frame,
-            area,
-            ctx.active_widget_mode,
-            ctx.active_widget_data.clone(),
-        );
+    fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {
+        // Status bar rendering is driven by Screen::render() which calls
+        // render_bespoke() directly with pre-resolved content.
+        // This InteractiveWidget::render() is not used.
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
-        BindingModeId::Normal.into()
+        crate::binding_table::BindingModeId::Normal.into()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -239,63 +232,10 @@ impl InteractiveWidget for StatusBarWidget {
     }
 }
 
-// ── Fragment-driven helpers ───────────────────────────────────────────
+// ── Utility functions (pub(crate) for Screen to use) ──────────────────
 
-/// Build a `StatusSection` from a `StatusFragment`, falling back to `fallback_label`
-/// when the fragment has no content.
-fn status_section_from_fragment(fragment: &StatusFragment, fallback_label: &str) -> StatusSection {
-    match &fragment.status {
-        Some(StatusContent::Label(label)) => StatusSection::plain(label),
-        Some(StatusContent::ActiveInput { prefix, text }) => StatusSection::plain(&format!("{}{}", prefix, text)),
-        Some(StatusContent::Progress(_)) => StatusSection::plain(fallback_label),
-        None => StatusSection::plain(fallback_label),
-    }
-}
-
-/// Build full `StatusBarContent` from a `StatusFragment` for widgets that provide
-/// rich status (input text, progress). Falls back to mode-specific defaults when
-/// the fragment content doesn't dictate specific keys/task.
-fn status_bar_from_fragment(fragment: &StatusFragment, fallback_label: &str, ui: &UiState) -> StatusBarContent {
-    match &fragment.status {
-        Some(StatusContent::Progress(msg)) => StatusBarContent {
-            status: StatusSection::plain(fallback_label),
-            keys: vec![],
-            task: Some(TaskSection::new(msg, 0)),
-            mode_indicators: vec![],
-        },
-        Some(StatusContent::ActiveInput { prefix, text }) => {
-            let status_text = format!("{}{}", prefix, text);
-            // CommandPalette keeps mode indicators
-            let mode_indicators = if prefix.starts_with('/') { normal_mode_indicators(ui) } else { vec![] };
-            let keys = if prefix.starts_with('/') {
-                vec![
-                    key_chip(ENTER_KEY_GLYPH, "Run", KeyCode::Enter),
-                    key_chip("TAB", "Fill", KeyCode::Tab),
-                    key_chip("ESC", "Close", KeyCode::Esc),
-                ]
-            } else {
-                vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)]
-            };
-            StatusBarContent { status: StatusSection::plain(&status_text), keys, task: None, mode_indicators }
-        }
-        Some(StatusContent::Label(label)) => StatusBarContent {
-            status: StatusSection::plain(label),
-            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
-            task: None,
-            mode_indicators: vec![],
-        },
-        None => StatusBarContent {
-            status: StatusSection::plain(fallback_label),
-            keys: vec![key_chip(ENTER_KEY_GLYPH, "Create", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
-            task: None,
-            mode_indicators: vec![],
-        },
-    }
-}
-
-// ── Content computation (moved from ui.rs) ───────────────────────────
-
-fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<(String, usize)> {
+/// Resolve the active in-flight task description for the current repo.
+pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<TaskSection> {
     let active_repo = &model.repo_order[model.active_repo];
     let active_cmds: Vec<&str> =
         in_flight.values().filter(|cmd| &cmd.repo_identity == active_repo).map(|cmd| cmd.description.as_str()).collect();
@@ -307,20 +247,11 @@ fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> O
     let description =
         if active_cmds.len() == 1 { active_cmds[0].to_string() } else { format!("{} (+{})", active_cmds[0], active_cmds.len() - 1) };
 
-    Some((description, 0))
+    Some(TaskSection::new(&description, 0))
 }
 
-fn normal_mode_key_chips() -> Vec<KeyChip> {
-    vec![
-        key_chip(ENTER_KEY_GLYPH, "Open", KeyCode::Enter),
-        key_chip(".", "Menu", KeyCode::Char('.')),
-        key_chip("n", "New", KeyCode::Char('n')),
-        key_chip("?", "Help", KeyCode::Char('?')),
-        key_chip("q", "Quit", KeyCode::Char('q')),
-    ]
-}
-
-fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
+/// Build mode indicators for Normal mode (layout and host).
+pub(crate) fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
     let layout_icon = match ui.view_layout {
         RepoViewLayout::Auto => "◫",
         RepoViewLayout::Zoom => "□",
@@ -345,138 +276,26 @@ fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
     ]
 }
 
-fn key_chip(key: &str, label: &str, code: KeyCode) -> KeyChip {
-    KeyChip::new(key, label, StatusBarAction::key(code))
-}
-
-fn active_rui<'a>(model: &TuiModel, ui: &'a UiState) -> &'a crate::app::RepoUiState {
-    ui.active_repo_ui(&model.repo_order, model.active_repo)
-}
-
-fn status_bar_content(
-    model: &TuiModel,
-    ui: &UiState,
-    in_flight: &HashMap<u64, InFlightCommand>,
-    active_widget_mode: Option<BindingModeId>,
-    active_widget_data: &StatusFragment,
-) -> StatusBarContent {
-    let visible_error = collect_visible_status_items(model, ui).into_iter().next();
-
-    // Widget stack overrides UiMode for status bar content.
-    if let Some(widget_mode) = active_widget_mode {
-        match widget_mode {
-            BindingModeId::Help => {
-                return StatusBarContent {
-                    status: status_section_from_fragment(active_widget_data, "HELP"),
-                    keys: vec![
-                        key_chip("j", "Down", KeyCode::Char('j')),
-                        key_chip("k", "Up", KeyCode::Char('k')),
-                        key_chip("ESC", "Close", KeyCode::Esc),
-                        key_chip("?", "Close", KeyCode::Char('?')),
-                    ],
-                    task: None,
-                    mode_indicators: vec![],
-                };
-            }
-            BindingModeId::ActionMenu => {
-                return StatusBarContent {
-                    status: status_section_from_fragment(active_widget_data, "ACTIONS"),
-                    keys: vec![
-                        key_chip("j", "Down", KeyCode::Char('j')),
-                        key_chip("k", "Up", KeyCode::Char('k')),
-                        key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
-                        key_chip("ESC", "Close", KeyCode::Esc),
-                    ],
-                    task: None,
-                    mode_indicators: vec![],
-                };
-            }
-            BindingModeId::DeleteConfirm => {
-                return StatusBarContent {
-                    status: status_section_from_fragment(active_widget_data, "CONFIRM DELETE"),
-                    keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
-                    task: None,
-                    mode_indicators: vec![],
-                };
-            }
-            BindingModeId::CloseConfirm => {
-                return StatusBarContent {
-                    status: status_section_from_fragment(active_widget_data, "CONFIRM CLOSE"),
-                    keys: vec![key_chip("y", "Yes", KeyCode::Char('y')), key_chip("n", "No", KeyCode::Char('n'))],
-                    task: None,
-                    mode_indicators: vec![],
-                };
-            }
-            BindingModeId::BranchInput => {
-                return status_bar_from_fragment(active_widget_data, "NEW BRANCH", ui);
-            }
-            BindingModeId::IssueSearch => {
-                return status_bar_from_fragment(active_widget_data, "SEARCH", ui);
-            }
-            BindingModeId::CommandPalette => {
-                return status_bar_from_fragment(active_widget_data, "/", ui);
-            }
-            BindingModeId::FilePicker => {
-                return StatusBarContent {
-                    status: status_section_from_fragment(active_widget_data, "ADD REPO"),
-                    keys: vec![
-                        key_chip("j", "Down", KeyCode::Char('j')),
-                        key_chip("k", "Up", KeyCode::Char('k')),
-                        key_chip("tab", "Complete", KeyCode::Tab),
-                        key_chip(ENTER_KEY_GLYPH, "Select", KeyCode::Enter),
-                        key_chip("ESC", "Cancel", KeyCode::Esc),
-                    ],
-                    task: None,
-                    mode_indicators: vec![],
-                };
-            }
-            _ => {} // Other widget modes will be handled as they are extracted
-        }
+/// Build a `StatusSection` from a `StatusFragment`, resolving the fragment's content.
+///
+/// - `Label(s)` → `StatusSection::Plain(s)`
+/// - `ActiveInput { prefix, text }` → `StatusSection::Plain(format!("{prefix}{text}"))`
+/// - `Progress(s)` → `StatusSection::Plain(fallback)` (shimmer handled via task)
+/// - `None` → `StatusSection::Plain(fallback)`
+pub(crate) fn resolve_status_section(fragment: &StatusFragment, fallback: &str) -> StatusSection {
+    match &fragment.status {
+        Some(StatusContent::Label(label)) => StatusSection::plain(label),
+        Some(StatusContent::ActiveInput { prefix, text }) => StatusSection::plain(&format!("{prefix}{text}")),
+        Some(StatusContent::Progress(_)) => StatusSection::plain(fallback),
+        None => StatusSection::plain(fallback),
     }
+}
 
-    // Legacy UiMode fallback — only reached when no widget-mode override matched.
-    // The remaining UiMode variants that have no widget on the stack are Normal,
-    // Config, and IssueSearch (which still uses the bridge for status bar text).
-    match &ui.mode {
-        UiMode::Normal => {
-            let rui = active_rui(model, ui);
-            let status = if let Some(item) = visible_error {
-                StatusSection::error(item.id, &item.text)
-            } else if rui.show_providers {
-                StatusSection::plain("PROVIDERS")
-            } else if let Some(query) = rui.active_search_query.as_deref() {
-                StatusSection::plain(&format!("SEARCH \"{query}\""))
-            } else if !rui.multi_selected.is_empty() {
-                StatusSection::plain(&format!("{} SELECTED", rui.multi_selected.len()))
-            } else {
-                StatusSection::plain("/ for commands")
-            };
-
-            let task = active_task(model, in_flight).map(|(description, spinner_index)| TaskSection::new(&description, spinner_index));
-            let mut keys = normal_mode_key_chips();
-            if rui.active_search_query.is_some() {
-                keys.insert(0, key_chip("ESC", "Clear", KeyCode::Esc));
-            }
-            StatusBarContent { status, keys, task, mode_indicators: normal_mode_indicators(ui) }
-        }
-        UiMode::Config => StatusBarContent {
-            status: StatusSection::plain("FLOTILLA"),
-            keys: vec![
-                key_chip("j", "Down", KeyCode::Char('j')),
-                key_chip("k", "Up", KeyCode::Char('k')),
-                key_chip("[", "Prev", KeyCode::Char('[')),
-                key_chip("]", "Next", KeyCode::Char(']')),
-                key_chip("q", "Quit", KeyCode::Char('q')),
-            ],
-            task: None,
-            mode_indicators: vec![],
-        },
-        UiMode::IssueSearch { input } => StatusBarContent {
-            status: StatusSection::plain(&format!("SEARCH {}", input.value())),
-            keys: vec![key_chip(ENTER_KEY_GLYPH, "Apply", KeyCode::Enter), key_chip("ESC", "Cancel", KeyCode::Esc)],
-            task: None,
-            mode_indicators: vec![],
-        },
+/// Extract task from a `StatusFragment::Progress` variant.
+pub(crate) fn resolve_task_from_fragment(fragment: &StatusFragment) -> Option<TaskSection> {
+    match &fragment.status {
+        Some(StatusContent::Progress(msg)) => Some(TaskSection::new(msg, 0)),
+        _ => None,
     }
 }
 

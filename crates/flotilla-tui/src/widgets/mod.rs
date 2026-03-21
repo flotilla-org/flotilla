@@ -24,7 +24,7 @@ use ratatui::{layout::Rect, Frame};
 
 use crate::{
     app::{ui_state::UiMode, CommandQueue, InFlightCommand, RepoUiState, TuiModel, UiState},
-    binding_table::{BindingModeId, KeyBindingMode, StatusFragment},
+    binding_table::{KeyBindingMode, StatusFragment},
     keymap::{Action, Keymap},
     theme::Theme,
 };
@@ -96,11 +96,6 @@ pub struct RenderContext<'a> {
     pub theme: &'a Theme,
     pub keymap: &'a Keymap,
     pub in_flight: &'a HashMap<u64, InFlightCommand>,
-    /// The mode of the topmost widget on the stack. Used by the status bar
-    /// to show the correct key hints.
-    pub active_widget_mode: Option<BindingModeId>,
-    /// Extra data from the active widget for status bar rendering.
-    pub active_widget_data: StatusFragment,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.

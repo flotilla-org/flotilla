@@ -62,18 +62,26 @@ pub struct Binding {
     pub key: &'static str,
     pub action: Action,
     pub hint: Option<&'static str>,
+    /// Override the display key shown on the hint chip (e.g. "ENT" for "enter").
+    /// When `None`, uses `key` as the display string.
+    pub hint_key: Option<&'static str>,
 }
 
 // ── Binding table helpers ────────────────────────────────────────────
 
 /// Create a binding without a hint.
 const fn b(mode: BindingModeId, key: &'static str, action: Action) -> Binding {
-    Binding { mode, key, action, hint: None }
+    Binding { mode, key, action, hint: None, hint_key: None }
 }
 
 /// Create a binding with a hint annotation for the status bar.
 const fn h(mode: BindingModeId, key: &'static str, action: Action, hint: &'static str) -> Binding {
-    Binding { mode, key, action, hint: Some(hint) }
+    Binding { mode, key, action, hint: Some(hint), hint_key: None }
+}
+
+/// Create a binding with a hint and a custom display key for the chip.
+const fn hk(mode: BindingModeId, key: &'static str, hint_key: &'static str, action: Action, hint: &'static str) -> Binding {
+    Binding { mode, key, action, hint: Some(hint), hint_key: Some(hint_key) }
 }
 
 // ── The flat binding table ───────────────────────────────────────────
@@ -89,6 +97,11 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Shared, "?", Action::ToggleHelp),
     b(BindingModeId::Shared, "S-K", Action::ToggleStatusBarKeys),
     // ── Normal ──
+    // Hint order matters: ENT, ., n, ?, q matches the old status bar layout.
+    hk(BindingModeId::Normal, "enter", "ENT", Action::Confirm, "Open"),
+    h(BindingModeId::Normal, ".", Action::OpenActionMenu, "Menu"),
+    h(BindingModeId::Normal, "n", Action::OpenBranchInput, "New"),
+    h(BindingModeId::Normal, "?", Action::ToggleHelp, "Help"),
     h(BindingModeId::Normal, "q", Action::Quit, "Quit"),
     b(BindingModeId::Normal, "r", Action::Refresh),
     b(BindingModeId::Normal, "[", Action::PrevTab),
@@ -99,8 +112,6 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Normal, "h", Action::CycleHost),
     b(BindingModeId::Normal, "l", Action::CycleLayout),
     b(BindingModeId::Normal, "S-T", Action::CycleTheme),
-    h(BindingModeId::Normal, ".", Action::OpenActionMenu, "Menu"),
-    h(BindingModeId::Normal, "n", Action::OpenBranchInput, "New"),
     b(BindingModeId::Normal, "/", Action::OpenCommandPalette),
     b(BindingModeId::Normal, "a", Action::OpenFilePicker),
     b(BindingModeId::Normal, "c", Action::ToggleProviders),
@@ -108,12 +119,22 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Normal, "d", Action::Dispatch(Intent::RemoveCheckout)),
     b(BindingModeId::Normal, "p", Action::Dispatch(Intent::OpenChangeRequest)),
     // ── Overview (replaces old Config) ──
+    h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
+    h(BindingModeId::Overview, "k", Action::SelectPrev, "Up"),
+    h(BindingModeId::Overview, "[", Action::PrevTab, "Prev"),
+    h(BindingModeId::Overview, "]", Action::NextTab, "Next"),
     h(BindingModeId::Overview, "q", Action::Dismiss, "Quit"),
-    b(BindingModeId::Overview, "[", Action::PrevTab),
-    b(BindingModeId::Overview, "]", Action::NextTab),
     // ── Help ──
+    h(BindingModeId::Help, "j", Action::SelectNext, "Down"),
+    h(BindingModeId::Help, "k", Action::SelectPrev, "Up"),
+    hk(BindingModeId::Help, "esc", "ESC", Action::Dismiss, "Close"),
+    h(BindingModeId::Help, "?", Action::ToggleHelp, "Close"),
     b(BindingModeId::Help, "q", Action::Dismiss),
     // ── ActionMenu ──
+    h(BindingModeId::ActionMenu, "j", Action::SelectNext, "Down"),
+    h(BindingModeId::ActionMenu, "k", Action::SelectPrev, "Up"),
+    hk(BindingModeId::ActionMenu, "enter", "ENT", Action::Confirm, "Select"),
+    hk(BindingModeId::ActionMenu, "esc", "ESC", Action::Dismiss, "Close"),
     b(BindingModeId::ActionMenu, "q", Action::Dismiss),
     // ── DeleteConfirm ──
     h(BindingModeId::DeleteConfirm, "y", Action::Confirm, "Yes"),
@@ -124,19 +145,22 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::CloseConfirm, "n", Action::Dismiss, "No"),
     b(BindingModeId::CloseConfirm, "q", Action::Dismiss),
     // ── BranchInput ──
-    h(BindingModeId::BranchInput, "enter", Action::Confirm, "Create"),
-    h(BindingModeId::BranchInput, "esc", Action::Dismiss, "Cancel"),
+    hk(BindingModeId::BranchInput, "enter", "ENT", Action::Confirm, "Create"),
+    hk(BindingModeId::BranchInput, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── IssueSearch ──
-    h(BindingModeId::IssueSearch, "enter", Action::Confirm, "Apply"),
-    h(BindingModeId::IssueSearch, "esc", Action::Dismiss, "Cancel"),
+    hk(BindingModeId::IssueSearch, "enter", "ENT", Action::Confirm, "Apply"),
+    hk(BindingModeId::IssueSearch, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── CommandPalette ──
-    // Keys are hardcoded in handle_key, but add hints for the status bar.
-    // (No action bindings here — the hints are advisory only.)
+    // Keys are hardcoded in handle_key; these bindings are advisory for status bar hints.
+    hk(BindingModeId::CommandPalette, "enter", "ENT", Action::Confirm, "Run"),
+    hk(BindingModeId::CommandPalette, "tab", "TAB", Action::Confirm, "Fill"),
+    hk(BindingModeId::CommandPalette, "esc", "ESC", Action::Dismiss, "Close"),
     // ── FilePicker ──
     h(BindingModeId::FilePicker, "j", Action::SelectNext, "Down"),
     h(BindingModeId::FilePicker, "k", Action::SelectPrev, "Up"),
-    h(BindingModeId::FilePicker, "enter", Action::Confirm, "Select"),
-    h(BindingModeId::FilePicker, "esc", Action::Dismiss, "Cancel"),
+    h(BindingModeId::FilePicker, "tab", Action::Confirm, "Complete"),
+    hk(BindingModeId::FilePicker, "enter", "ENT", Action::Confirm, "Select"),
+    hk(BindingModeId::FilePicker, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── SearchActive ──
     h(BindingModeId::SearchActive, "esc", Action::Dismiss, "Clear"),
 ];
@@ -161,7 +185,8 @@ impl CompiledBindings {
             if let Some(hint_label) = binding.hint {
                 let (code, modifiers) = key_code_for_hint(binding.key);
                 let action = if modifiers == KeyModifiers::NONE { StatusBarAction::key(code) } else { StatusBarAction::shifted(code) };
-                let chip = KeyChip::new(binding.key, hint_label, action);
+                let display_key = binding.hint_key.unwrap_or(binding.key);
+                let chip = KeyChip::new(display_key, hint_label, action);
                 hints.entry(binding.mode).or_default().push(chip);
             }
         }
@@ -359,11 +384,12 @@ mod tests {
     #[test]
     fn compiled_bindings_resolve_composed_mode_later_wins() {
         // Build a small table where two modes bind the same key differently.
-        let table = &[Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: None }, Binding {
+        let table = &[Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: None, hint_key: None }, Binding {
             mode: BindingModeId::Help,
             key: "q",
             action: Action::Dismiss,
             hint: None,
+            hint_key: None,
         }];
         let compiled = CompiledBindings::from_table(table);
         // Composed: [Normal, Help] — Help is later, so it wins.
@@ -384,12 +410,14 @@ mod tests {
     #[test]
     fn hints_for_single_mode_includes_shared() {
         // Create a table with a shared hint and a mode hint.
-        let table = &[Binding { mode: BindingModeId::Shared, key: "?", action: Action::ToggleHelp, hint: Some("Help") }, Binding {
-            mode: BindingModeId::Normal,
-            key: "q",
-            action: Action::Quit,
-            hint: Some("Quit"),
-        }];
+        let table =
+            &[Binding { mode: BindingModeId::Shared, key: "?", action: Action::ToggleHelp, hint: Some("Help"), hint_key: None }, Binding {
+                mode: BindingModeId::Normal,
+                key: "q",
+                action: Action::Quit,
+                hint: Some("Quit"),
+                hint_key: None,
+            }];
         let compiled = CompiledBindings::from_table(table);
         let mode = KeyBindingMode::Single(BindingModeId::Normal);
         let hints = compiled.hints_for(&mode);
@@ -401,12 +429,14 @@ mod tests {
     #[test]
     fn hints_for_composed_mode_overrides_by_key() {
         // Two modes both hint 'q' with different labels — later wins.
-        let table = &[Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: Some("Quit") }, Binding {
-            mode: BindingModeId::Help,
-            key: "q",
-            action: Action::Dismiss,
-            hint: Some("Close"),
-        }];
+        let table =
+            &[Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: Some("Quit"), hint_key: None }, Binding {
+                mode: BindingModeId::Help,
+                key: "q",
+                action: Action::Dismiss,
+                hint: Some("Close"),
+                hint_key: None,
+            }];
         let compiled = CompiledBindings::from_table(table);
         let mode = KeyBindingMode::Composed(vec![BindingModeId::Normal, BindingModeId::Help]);
         let hints = compiled.hints_for(&mode);

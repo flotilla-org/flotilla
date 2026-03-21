@@ -181,8 +181,6 @@ impl TestHarness {
         let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         let keymap = Keymap::defaults();
-        let active_widget_mode = self.screen.active_mode_id();
-        let active_widget_data = self.screen.active_status_fragment();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -192,8 +190,6 @@ impl TestHarness {
                     theme: &theme,
                     keymap: &keymap,
                     in_flight: &self.in_flight,
-                    active_widget_mode,
-                    active_widget_data: active_widget_data.clone(),
                 };
                 self.screen.render(frame, area, &mut ctx);
             })

@@ -117,7 +117,6 @@ mod tests {
     use super::*;
     use crate::{
         app::{test_support::TestWidgetHarness, UiState},
-        binding_table::StatusFragment,
         keymap::Keymap,
         theme::Theme,
         widgets::RenderContext,
@@ -136,15 +135,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                let mut ctx = RenderContext {
-                    model: &harness.model,
-                    ui: &mut ui,
-                    theme: &theme,
-                    keymap: &keymap,
-                    in_flight: &in_flight,
-                    active_widget_mode: Some(BindingModeId::Overview),
-                    active_widget_data: StatusFragment::default(),
-                };
+                let mut ctx = RenderContext { model: &harness.model, ui: &mut ui, theme: &theme, keymap: &keymap, in_flight: &in_flight };
                 page.render(frame, frame.area(), &mut ctx);
             })
             .expect("draw should succeed");

@@ -8,10 +8,14 @@ use ratatui::{
 };
 
 use super::{
-    overview_page::OverviewPage, repo_page::RepoPage, status_bar_widget::StatusBarWidget, tabs::Tabs, AppAction, InteractiveWidget,
-    Outcome, RenderContext, WidgetContext,
+    overview_page::OverviewPage,
+    repo_page::RepoPage,
+    status_bar_widget::{self, StatusBarWidget},
+    tabs::Tabs,
+    AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
+    app::collect_visible_status_items,
     binding_table::{BindingModeId, KeyBindingMode, StatusFragment},
     keymap::Action,
     status_bar::StatusBarAction,
@@ -128,6 +132,49 @@ impl Screen {
             None
         } else {
             repo_order.get(active_repo)
+        }
+    }
+
+    /// Compute the fallback status label used when the active widget's
+    /// `status_fragment()` has no explicit status content.
+    ///
+    /// For Normal mode (no modal), this examines RepoUiState to determine
+    /// contextual labels (providers, search, multi-select, default).
+    /// For Overview/Config, returns "FLOTILLA".
+    /// For modals, returns mode-specific fallback labels.
+    fn status_fallback_label(&self, ctx: &RenderContext) -> String {
+        // If a modal is on the stack, use the modal's mode for the fallback.
+        if let Some(modal) = self.modal_stack.last() {
+            let mode = primary_mode(&modal.binding_mode());
+            return match mode {
+                BindingModeId::Help => "HELP".into(),
+                BindingModeId::ActionMenu => "ACTIONS".into(),
+                BindingModeId::DeleteConfirm => "CONFIRM DELETE".into(),
+                BindingModeId::CloseConfirm => "CONFIRM CLOSE".into(),
+                BindingModeId::BranchInput => "NEW BRANCH".into(),
+                BindingModeId::IssueSearch => "SEARCH".into(),
+                BindingModeId::CommandPalette => "/".into(),
+                BindingModeId::FilePicker => "ADD REPO".into(),
+                _ => "/ for commands".into(),
+            };
+        }
+
+        // No modal — check UiMode for legacy modes.
+        match &ctx.ui.mode {
+            crate::app::UiMode::Normal => {
+                let rui = ctx.ui.active_repo_ui(&ctx.model.repo_order, ctx.model.active_repo);
+                if rui.show_providers {
+                    "PROVIDERS".into()
+                } else if let Some(query) = rui.active_search_query.as_deref() {
+                    format!("SEARCH \"{query}\"")
+                } else if !rui.multi_selected.is_empty() {
+                    format!("{} SELECTED", rui.multi_selected.len())
+                } else {
+                    "/ for commands".into()
+                }
+            }
+            crate::app::UiMode::Config => "FLOTILLA".into(),
+            crate::app::UiMode::IssueSearch { input } => format!("SEARCH {}", input.value()),
         }
     }
 }
@@ -333,22 +380,78 @@ impl InteractiveWidget for Screen {
             self.overview_page.render(frame, chunks[1], ctx);
         }
 
-        // 3. Status bar — when the palette is active, move it to the overlay position
-        let status_bar_area = if ctx.active_widget_mode == Some(BindingModeId::CommandPalette) {
+        // 3. Status bar — resolve all content, then call the pure renderer.
+
+        // 3a. Resolve binding mode and status fragment.
+        // Modal stack takes priority; otherwise use the active page or UiMode.
+        let (binding_mode, fragment) = if let Some(modal) = self.modal_stack.last() {
+            (modal.binding_mode(), modal.status_fragment())
+        } else if is_config {
+            (self.overview_page.binding_mode(), self.overview_page.status_fragment())
+        } else {
+            // Check for legacy UiMode (IssueSearch) before falling back to Normal.
+            let mode: KeyBindingMode = BindingModeId::from(&ctx.ui.mode).into();
+            let frag = if let Some(ref identity) = active_identity {
+                self.repo_pages.get(identity).map(|p| p.status_fragment()).unwrap_or_default()
+            } else {
+                StatusFragment::default()
+            };
+            (mode, frag)
+        };
+
+        let active_mode = primary_mode(&binding_mode);
+
+        // 3b. Resolve key chips from binding mode via compiled binding table.
+        //     Progress fragments suppress key chips (user can't interact during progress).
+        let key_chips = if matches!(fragment.status, Some(crate::binding_table::StatusContent::Progress(_))) {
+            vec![]
+        } else {
+            ctx.keymap.hints_for(&binding_mode)
+        };
+
+        // 3c. Resolve status section from fragment (with fallback)
+        let fallback_label = self.status_fallback_label(ctx);
+        let status = status_bar_widget::resolve_status_section(&fragment, &fallback_label);
+
+        // 3d. Task spinner — fragment progress takes priority over in-flight commands.
+        //     Only Normal/Overview modes show in-flight tasks.
+        let task = status_bar_widget::resolve_task_from_fragment(&fragment).or_else(|| {
+            if self.modal_stack.is_empty() {
+                status_bar_widget::active_task(ctx.model, ctx.in_flight)
+            } else {
+                None
+            }
+        });
+
+        // 3e. Error items — only override status in Normal mode (no modals)
+        let error_items = if active_mode == BindingModeId::Normal && self.modal_stack.is_empty() {
+            collect_visible_status_items(ctx.model, ctx.ui)
+        } else {
+            vec![]
+        };
+
+        // 3f. Mode indicators — only for Normal mode (no modals, not config or issue search)
+        let mode_indicators = if active_mode == BindingModeId::Normal && self.modal_stack.is_empty() {
+            status_bar_widget::normal_mode_indicators(ctx.ui)
+        } else if active_mode == BindingModeId::CommandPalette {
+            // CommandPalette keeps mode indicators
+            status_bar_widget::normal_mode_indicators(ctx.ui)
+        } else {
+            vec![]
+        };
+
+        // 3g. show_keys flag
+        let show_keys = ctx.ui.status_bar.show_keys;
+
+        // 3h. Status bar area — CommandPalette moves it to the overlay position
+        let is_command_palette = self.modal_stack.last().map(|w| primary_mode(&w.binding_mode())) == Some(BindingModeId::CommandPalette);
+        let status_bar_area = if is_command_palette {
             ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
         } else {
             chunks[2]
         };
-        self.status_bar.render_bespoke(
-            ctx.model,
-            ctx.ui,
-            ctx.in_flight,
-            ctx.theme,
-            frame,
-            status_bar_area,
-            ctx.active_widget_mode,
-            ctx.active_widget_data.clone(),
-        );
+
+        self.status_bar.render_bespoke(status, key_chips, task, error_items, mode_indicators, show_keys, ctx.theme, frame, status_bar_area);
 
         // 4. Modals on top
         for modal in &mut self.modal_stack {
