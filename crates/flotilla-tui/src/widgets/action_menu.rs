@@ -54,8 +54,7 @@ impl ActionMenuWidget {
                     _ => None,
                 };
                 let checkout_path = self.item.checkout_key().map(|hp| hp.path.clone());
-                let widget =
-                    DeleteConfirmWidget::new(self.item.terminal_keys.clone(), self.item.identity.clone(), remote_host, checkout_path);
+                let widget = DeleteConfirmWidget::new(self.item.identity.clone(), remote_host, checkout_path);
                 let pending_ctx =
                     PendingActionContext { identity: self.item.identity.clone(), description: entry.intent.label(labels), repo_identity };
                 ctx.commands.push_with_context(entry.command.clone(), Some(pending_ctx));

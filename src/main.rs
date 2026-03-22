@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
                 Command {
                     host: None,
                     context_repo: None,
-                    action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(checkout.clone()), terminal_keys: vec![] },
+                    action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(checkout.clone()) },
                 },
                 OutputFormat::from_json_flag(*json),
             )
@@ -504,7 +504,7 @@ fn parse_host_control_command(host: &str, args: &[String]) -> Result<Command, St
         "checkout" if args.len() == 3 && args[2] == "remove" => Command {
             host: None,
             context_repo: None,
-            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(args[1].clone()), terminal_keys: vec![] },
+            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(args[1].clone()) },
         },
         _ => return Err("unsupported host control command".into()),
     };

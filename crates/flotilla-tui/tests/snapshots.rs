@@ -384,7 +384,7 @@ fn delete_confirm_widget(
     identity: WorkItemIdentity,
     remote_host: Option<HostName>,
 ) -> Box<dyn flotilla_tui::widgets::InteractiveWidget> {
-    let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(vec![], identity, remote_host, None);
+    let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(identity, remote_host, None);
     widget.update_info(info);
     Box::new(widget)
 }
@@ -620,7 +620,6 @@ fn close_confirm_widget_renders_on_short_terminals_without_overflow() {
 #[test]
 fn delete_confirm_widget_renders_on_short_terminals_without_overflow() {
     let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(
-        vec![],
         WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat/a"))),
         None,
         None,

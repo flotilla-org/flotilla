@@ -19,6 +19,7 @@ pub(crate) mod repo_state;
 pub mod resolve;
 pub mod step;
 pub mod template;
+pub mod terminal_manager;
 
 // Re-export host types from protocol for convenience.
 pub use flotilla_protocol::HostName;

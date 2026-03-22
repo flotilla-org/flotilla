@@ -29,10 +29,9 @@ impl Factory for CleatTerminalPoolFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
-        attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if let Some(binary) = env.find_binary("cleat") {
-            Ok(Arc::new(CleatTerminalPool::new(runner, binary.display().to_string(), attachable_store)))
+            Ok(Arc::new(CleatTerminalPool::new(runner, binary.display().to_string())))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("cleat".into())])
         }
@@ -46,10 +45,7 @@ mod tests {
     use super::CleatTerminalPoolFactory;
     use crate::{
         config::ConfigStore,
-        providers::discovery::{
-            test_support::{test_attachable_store, DiscoveryMockRunner},
-            EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
-        },
+        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
     #[tokio::test]
@@ -58,7 +54,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CleatTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
+        let result = CleatTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -68,7 +64,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CleatTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
+        let result = CleatTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         let unmet = result.err().expect("missing binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("cleat".into())));
     }

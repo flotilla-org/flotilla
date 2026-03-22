@@ -88,8 +88,8 @@ fn merge_local_provider_data(base: &mut ProviderData, other: &ProviderData) {
         // Preferred root data is merged first and remains authoritative on collisions.
         base.checkouts.entry(host_path.clone()).or_insert_with(|| checkout.clone());
     }
-    for (name, terminal) in &other.managed_terminals {
-        base.managed_terminals.entry(name.clone()).or_insert_with(|| terminal.clone());
+    for (id, terminal) in &other.managed_terminals {
+        base.managed_terminals.entry(id.clone()).or_insert_with(|| terminal.clone());
     }
     for (name, branch) in &other.branches {
         base.branches.entry(name.clone()).or_insert_with(|| branch.clone());
@@ -322,7 +322,6 @@ impl InProcessDaemon {
                 &discovery.factories,
                 &config,
                 Arc::clone(&discovery.runner),
-                Arc::clone(&attachable_store),
                 &*discovery.env,
             )
             .await;
@@ -1366,7 +1365,6 @@ impl InProcessDaemon {
             &self.discovery.factories,
             &self.config,
             Arc::clone(&self.discovery.runner),
-            self.discovery.shared_attachable_store(&self.config),
             &*self.discovery.env,
         )
         .await;

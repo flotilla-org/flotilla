@@ -29,7 +29,6 @@ impl Factory for PassthroughTerminalPoolFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         Ok(Arc::new(PassthroughTerminalPool))
     }
@@ -42,10 +41,7 @@ mod tests {
     use super::PassthroughTerminalPoolFactory;
     use crate::{
         config::ConfigStore,
-        providers::discovery::{
-            test_support::{test_attachable_store, DiscoveryMockRunner},
-            EnvironmentBag, Factory,
-        },
+        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentBag, Factory},
     };
 
     #[tokio::test]
@@ -54,7 +50,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = PassthroughTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
+        let result = PassthroughTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 

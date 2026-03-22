@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use crate::{
-    attachable::{terminal_session_binding_ref, BindingObjectKind, SharedAttachableStore},
+    attachable::{BindingObjectKind, SharedAttachableStore},
     data::{self, CorrelationResult, RefreshError},
     provider_data::ProviderData,
     providers::{correlation::CorrelatedGroup, registry::ProviderRegistry, types::RepoCriteria},
@@ -204,15 +204,17 @@ async fn refresh_providers(
         }
     };
 
+    let terminal_manager = registry.terminal_pools.preferred_with_desc().map(|(desc, tp)| {
+        let tm = crate::terminal_manager::TerminalManager::new(Arc::clone(tp), attachable_store.clone());
+        (desc.display_name.clone(), tm)
+    });
     let tp_fut = async {
-        if let Some((desc, tp)) = registry.terminal_pools.preferred_with_desc() {
-            let name = desc.display_name.clone();
-            match tp.list_terminals().await {
-                Ok(entries) => (entries, vec![]),
-                Err(e) => (vec![], vec![(name, e)]),
-            }
-        } else {
-            (vec![], vec![])
+        match &terminal_manager {
+            Some((name, tm)) => match tm.refresh().await {
+                Ok(_) => vec![],
+                Err(e) => vec![(name.clone(), e)],
+            },
+            None => vec![],
         }
     };
 
@@ -223,7 +225,7 @@ async fn refresh_providers(
         (branches, branch_errors),
         (merged, merged_errors),
         (workspaces, ws_errors),
-        (managed_terminals, tp_errors),
+        tp_errors,
     ) = tokio::join!(checkouts_fut, cr_fut, sessions_fut, branches_fut, merged_fut, ws_fut, tp_fut);
 
     fn collect_errors(errors: &mut Vec<RefreshError>, category: &'static str, provider_errors: Vec<(String, String)>) {
@@ -245,8 +247,8 @@ async fn refresh_providers(
     pd.workspaces = workspaces.into_iter().collect();
     collect_errors(&mut errors, "workspaces", ws_errors);
 
-    pd.managed_terminals = managed_terminals.into_iter().map(|t| (t.id.to_string(), t)).collect();
     collect_errors(&mut errors, "terminals", tp_errors);
+
     project_attachable_data(pd, registry, attachable_store);
     project_agent_data(pd, agent_state_store);
     {
@@ -267,28 +269,11 @@ async fn refresh_providers(
 }
 
 fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, attachable_store: &SharedAttachableStore) {
-    let terminal_provider = registry.terminal_pools.preferred_with_desc().map(|(desc, _)| desc.implementation.clone());
     let workspace_provider = registry.workspace_managers.preferred_with_desc().map(|(desc, _)| desc.implementation.clone());
     let Ok(store) = attachable_store.lock() else {
         tracing::warn!("attachable store lock poisoned while projecting provider data");
         return;
     };
-
-    // Enrichment: populate attachable_id / attachable_set_id on terminals and workspaces
-    if let Some(provider_name) = terminal_provider.as_deref() {
-        for terminal in pd.managed_terminals.values_mut() {
-            let session_name = terminal_session_binding_ref(&terminal.id);
-            let Some(attachable_id) = store.lookup_binding("terminal_pool", provider_name, BindingObjectKind::Attachable, &session_name)
-            else {
-                continue;
-            };
-            let attachable_id = flotilla_protocol::AttachableId::new(attachable_id.to_string());
-            terminal.attachable_id = Some(attachable_id.clone());
-            if let Some(attachable) = store.registry().attachables.get(&attachable_id) {
-                terminal.attachable_set_id = Some(attachable.set_id.clone());
-            }
-        }
-    }
 
     if let Some(provider_name) = workspace_provider.as_deref() {
         for (ws_ref, workspace) in &mut pd.workspaces {
@@ -311,18 +296,20 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
         .map(|(id, set)| (id.clone(), set.clone()))
         .collect();
 
-    // Strip attachable_set_id from terminals whose set exists in the local
-    // store but was not projected (orphaned local set — checkout deleted).
-    // Sets with remote-host affinity are left alone: they arrive via peer
-    // merge and the terminal's reference enables cross-host correlation.
-    let local_host = flotilla_protocol::HostName::local();
-    for terminal in pd.managed_terminals.values_mut() {
-        if let Some(set_id) = &terminal.attachable_set_id {
-            if !pd.attachable_sets.contains_key(set_id) {
-                let is_local_set = store.registry().sets.get(set_id).is_some_and(|s| s.host_affinity.as_ref() == Some(&local_host));
-                if is_local_set {
-                    terminal.attachable_set_id = None;
-                }
+    // Build managed_terminals from the attachable store for projected sets
+    for (attachable_id, attachable) in &store.registry().attachables {
+        if !pd.attachable_sets.contains_key(&attachable.set_id) {
+            continue;
+        }
+        match &attachable.content {
+            crate::attachable::AttachableContent::Terminal(t) => {
+                pd.managed_terminals.insert(attachable_id.clone(), flotilla_protocol::ManagedTerminal {
+                    set_id: attachable.set_id.clone(),
+                    role: t.purpose.role.clone(),
+                    command: t.command.clone(),
+                    working_directory: t.working_directory.clone(),
+                    status: t.status.clone(),
+                });
             }
         }
     }
@@ -334,17 +321,13 @@ fn project_agent_data(pd: &mut ProviderData, agent_state_store: &crate::agents::
         return;
     };
     for (attachable_id, entry) in store.list_agents() {
-        // Only include agents whose terminal is in this repo's managed_terminals.
-        // Without this check, every agent would appear in every tracked repo.
-        let matching_terminal = pd.managed_terminals.values().find(|t| t.attachable_id.as_ref() == Some(&attachable_id));
-        let Some(terminal) = matching_terminal else {
+        // Only include agents whose terminal's attachable set belongs to this repo.
+        // Find the set that contains this attachable_id.
+        let matching_set = pd.attachable_sets.iter().find(|(_, set)| set.members.contains(&attachable_id));
+        let Some((set_id, _)) = matching_set else {
             continue;
         };
-        let correlation_keys = terminal
-            .attachable_set_id
-            .clone()
-            .map(|set_id| vec![flotilla_protocol::CorrelationKey::AttachableSet(set_id)])
-            .unwrap_or_default();
+        let correlation_keys = vec![flotilla_protocol::CorrelationKey::AttachableSet(set_id.clone())];
 
         pd.agents.insert(attachable_id.to_string(), flotilla_protocol::Agent {
             harness: entry.harness,
@@ -602,28 +585,28 @@ mod tests {
     }
 
     struct MockTerminalPool {
-        result: Result<Vec<flotilla_protocol::ManagedTerminal>, String>,
+        result: Result<Vec<crate::providers::terminal::TerminalSession>, String>,
     }
 
     impl MockTerminalPool {
-        fn ok(terminals: Vec<flotilla_protocol::ManagedTerminal>) -> Self {
-            Self { result: Ok(terminals) }
+        fn ok(sessions: Vec<crate::providers::terminal::TerminalSession>) -> Self {
+            Self { result: Ok(sessions) }
         }
     }
 
     #[async_trait]
     impl TerminalPool for MockTerminalPool {
-        async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
+        async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
             self.result.clone()
         }
 
-        async fn ensure_running(&self, _id: &flotilla_protocol::ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<(), String> {
+        async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path) -> Result<(), String> {
             Ok(())
         }
 
         async fn attach_command(
             &self,
-            _id: &flotilla_protocol::ManagedTerminalId,
+            _session_name: &str,
             _command: &str,
             _cwd: &Path,
             _env_vars: &crate::providers::terminal::TerminalEnvVars,
@@ -631,7 +614,7 @@ mod tests {
             Ok("mock attach".into())
         }
 
-        async fn kill_terminal(&self, _id: &flotilla_protocol::ManagedTerminalId) -> Result<(), String> {
+        async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
             Ok(())
         }
     }
@@ -874,23 +857,12 @@ mod tests {
             },
         );
         pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
-        pd.managed_terminals.insert("feat/dev/0".into(), flotilla_protocol::ManagedTerminal {
-            id: flotilla_protocol::ManagedTerminalId { checkout: "feat".into(), role: "dev".into(), index: 0 },
-            role: "dev".into(),
-            command: "bash".into(),
-            working_directory: PathBuf::from("/tmp/wt-feat"),
-            status: flotilla_protocol::TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
-        });
 
         project_attachable_data(&mut pd, &registry, &attachable_store);
 
         assert_eq!(pd.attachable_sets.len(), 1);
         assert!(pd.attachable_sets.contains_key(&set_id));
         assert_eq!(pd.workspaces.get("ws-1").and_then(|ws| ws.attachable_set_id.as_ref()), Some(&set_id));
-        assert_eq!(pd.managed_terminals["feat/dev/0"].attachable_set_id.as_ref(), Some(&set_id));
-        assert!(pd.managed_terminals["feat/dev/0"].attachable_id.is_some());
     }
 
     #[tokio::test]
@@ -1089,47 +1061,5 @@ mod tests {
         project_attachable_data(&mut pd, &registry, &store);
 
         assert_eq!(pd.attachable_sets.len(), 1, "set should appear without terminal scan");
-    }
-
-    #[test]
-    fn project_attachable_data_strips_orphaned_local_set_id_from_terminal() {
-        let store = crate::attachable::shared_in_memory_attachable_store();
-        let host = flotilla_protocol::HostName::local();
-        let checkout = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-deleted");
-
-        let set_id = {
-            let mut s = store.lock().expect("lock");
-            let set_id = s.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
-            s.ensure_terminal_attachable(
-                &set_id,
-                "terminal_pool",
-                "shpool",
-                "flotilla/deleted/shell/0",
-                crate::attachable::TerminalPurpose { checkout: "deleted".into(), role: "shell".into(), index: 0 },
-                "bash",
-                std::path::PathBuf::from("/repo/wt-deleted"),
-                flotilla_protocol::TerminalStatus::Disconnected,
-            );
-            set_id
-        };
-
-        // Terminal references the set, but checkout is gone from pd.checkouts
-        let mut pd = ProviderData::default();
-        pd.managed_terminals.insert("deleted/shell/0".into(), flotilla_protocol::ManagedTerminal {
-            id: flotilla_protocol::ManagedTerminalId { checkout: "deleted".into(), role: "shell".into(), index: 0 },
-            role: "shell".into(),
-            command: "bash".into(),
-            working_directory: std::path::PathBuf::from("/repo/wt-deleted"),
-            status: flotilla_protocol::TerminalStatus::Disconnected,
-            attachable_id: None,
-            attachable_set_id: Some(set_id),
-        });
-
-        let registry = ProviderRegistry::new();
-        project_attachable_data(&mut pd, &registry, &store);
-
-        assert!(pd.attachable_sets.is_empty(), "orphaned set should not be projected");
-        let terminal = &pd.managed_terminals["deleted/shell/0"];
-        assert!(terminal.attachable_set_id.is_none(), "orphaned local set id should be stripped from terminal");
     }
 }

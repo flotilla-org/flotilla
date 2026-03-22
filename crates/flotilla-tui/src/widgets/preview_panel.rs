@@ -127,13 +127,12 @@ impl PreviewPanel {
 
             if !item.terminal_keys.is_empty() {
                 for key in &item.terminal_keys {
-                    let key_str = key.to_string();
-                    if let Some(terminal) = providers.managed_terminals.get(&key_str) {
+                    if let Some(terminal) = providers.managed_terminals.get(key) {
                         let status = format!("{:?}", terminal.status);
                         let cmd = if terminal.command.is_empty() { String::new() } else { format!(" ({})", terminal.command) };
-                        lines.push(format!("Terminal: {} [{}]{}", key.role, status, cmd));
+                        lines.push(format!("Terminal: {} [{}]{}", terminal.role, status, cmd));
                     } else {
-                        lines.push(format!("Terminal: {} [?]", key.role));
+                        lines.push(format!("Terminal: {} [?]", key));
                     }
                 }
             }

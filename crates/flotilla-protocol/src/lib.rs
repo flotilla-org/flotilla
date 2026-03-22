@@ -41,8 +41,8 @@ pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AheadBehind, AssociationKey, AttachableId,
     AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
-    IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus,
-    TerminalStatus, WorkingTreeStatus, Workspace,
+    IssueChangeset, IssuePage, ManagedTerminal, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus, TerminalStatus,
+    WorkingTreeStatus, Workspace,
 };
 pub use query::{
     DiscoveryEntry, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap, ProviderInfo,

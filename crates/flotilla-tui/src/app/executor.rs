@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn checkout_status_updates_delete_confirm_widget() {
         let mut app = stub_app();
-        let widget = DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None);
+        let widget = DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), None, None);
         assert!(widget.loading, "widget should start in loading state");
         app.screen.modal_stack.push(Box::new(widget));
 
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn error_pops_loading_delete_confirm_widget() {
         let mut app = stub_app();
-        let widget = DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None);
+        let widget = DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), None, None);
         assert!(widget.loading);
         app.screen.modal_stack.push(Box::new(widget));
 
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn error_does_not_pop_non_loading_delete_confirm_widget() {
         let mut app = stub_app();
-        let mut widget = DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None);
+        let mut widget = DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), None, None);
         widget.update_info(CheckoutStatus { branch: "feat/x".into(), ..CheckoutStatus::default() });
         assert!(!widget.loading);
         app.screen.modal_stack.push(Box::new(widget));
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn cancelled_pops_loading_delete_confirm_widget() {
         let mut app = stub_app();
-        let widget = DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None);
+        let widget = DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), None, None);
         app.screen.modal_stack.push(Box::new(widget));
 
         handle_result(CommandValue::Cancelled, &mut app);

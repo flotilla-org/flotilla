@@ -384,7 +384,6 @@ pub trait Factory: Send + Sync {
         config: &ConfigStore,
         repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
-        attachable_store: SharedAttachableStore,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>>;
 }
 
@@ -465,7 +464,6 @@ pub async fn run_host_detectors(detectors: &[Box<dyn HostDetector>], runner: &dy
     stream::iter(detectors).fold(EnvironmentBag::new(), |bag, det| async move { bag.extend(det.detect(runner, env).await) }).await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn discover_providers(
     host_bag: &EnvironmentBag,
     repo_root: &Path,
@@ -473,7 +471,6 @@ pub async fn discover_providers(
     factories: &FactoryRegistry,
     config: &ConfigStore,
     runner: Arc<dyn CommandRunner>,
-    attachable_store: SharedAttachableStore,
     env: &dyn EnvVars,
 ) -> DiscoveryResult {
     let runner_ref = &*runner;
@@ -487,21 +484,19 @@ pub async fn discover_providers(
     let mut registry = ProviderRegistry::new();
     let mut unmet = Vec::new();
 
-    #[allow(clippy::too_many_arguments)]
     async fn probe_all<T: ?Sized + Send + Sync + 'static, F>(
         factories: &[Box<dyn Factory<Output = T>>],
         env: &EnvironmentBag,
         config: &ConfigStore,
         repo_root: &Path,
         runner: &Arc<dyn CommandRunner>,
-        attachable_store: &SharedAttachableStore,
         unmet: &mut Vec<(String, UnmetRequirement)>,
         mut insert: F,
     ) where
         F: FnMut(ProviderDescriptor, Arc<T>),
     {
         for factory in factories {
-            match factory.probe(env, config, repo_root, runner.clone(), Arc::clone(attachable_store)).await {
+            match factory.probe(env, config, repo_root, runner.clone()).await {
                 Ok(provider) => insert(factory.descriptor(), provider),
                 Err(reqs) => {
                     let name = factory.descriptor().implementation.clone();
@@ -511,35 +506,35 @@ pub async fn discover_providers(
         }
     }
 
-    probe_all(&factories.vcs, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.vcs, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.vcs.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.checkout_managers, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.checkout_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.checkout_managers.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.change_requests, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.change_requests, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.change_requests.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.issue_trackers.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.cloud_agents, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.cloud_agents, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.cloud_agents.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.ai_utilities, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.ai_utilities, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.ai_utilities.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.workspace_managers, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.workspace_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.workspace_managers.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.terminal_pools, &combined, config, repo_root, &runner, &attachable_store, &mut unmet, |desc, provider| {
+    probe_all(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.terminal_pools.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
@@ -898,10 +893,6 @@ mod orchestrator_tests {
         )
     }
 
-    fn test_attachable_store(config: &ConfigStore) -> SharedAttachableStore {
-        shared_file_backed_attachable_store(config.base_path())
-    }
-
     #[tokio::test]
     async fn discover_providers_with_git_repo() {
         let dir = tempdir().expect("tempdir");
@@ -919,17 +910,7 @@ mod orchestrator_tests {
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result = discover_providers(
-            &host_bag,
-            repo_root,
-            &repo_dets,
-            &fact_reg,
-            &config,
-            runner,
-            test_attachable_store(&config),
-            &TestEnvVars::default(),
-        )
-        .await;
+        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // VCS should be registered (git factory)
         assert!(!result.registry.vcs.is_empty(), "expected at least one VCS provider");
@@ -956,17 +937,7 @@ mod orchestrator_tests {
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result = discover_providers(
-            &host_bag,
-            repo_root,
-            &repo_dets,
-            &fact_reg,
-            &config,
-            runner,
-            test_attachable_store(&config),
-            &TestEnvVars::default(),
-        )
-        .await;
+        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // All checkout managers now register (probe_all); config preferences choose the preferred one
         assert!(!result.registry.checkout_managers.is_empty(), "at least one checkout manager should be registered");
@@ -987,17 +958,7 @@ mod orchestrator_tests {
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result = discover_providers(
-            &host_bag,
-            repo_root,
-            &repo_dets,
-            &fact_reg,
-            &config,
-            runner,
-            test_attachable_store(&config),
-            &TestEnvVars::default(),
-        )
-        .await;
+        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // With no binaries and no assertions, factories should report unmet
         assert!(!result.unmet.is_empty(), "expected unmet requirements when no tools available");
@@ -1028,17 +989,7 @@ mod orchestrator_tests {
             terminal_pools: vec![],
         };
 
-        let result = discover_providers(
-            &host_bag,
-            repo_root,
-            &repo_dets,
-            &fact_reg,
-            &config,
-            runner,
-            test_attachable_store(&config),
-            &TestEnvVars::default(),
-        )
-        .await;
+        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // RemoteHostDetector should have parsed the git remote URL into a
         // RemoteHost assertion, yielding a repo_slug.
@@ -1066,17 +1017,7 @@ mod orchestrator_tests {
             terminal_pools: vec![],
         };
 
-        let result = discover_providers(
-            &host_bag,
-            repo_root,
-            &repo_dets,
-            &fact_reg,
-            &config,
-            runner,
-            test_attachable_store(&config),
-            &TestEnvVars::default(),
-        )
-        .await;
+        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         assert!(result.registry.vcs.is_empty());
         assert!(result.registry.checkout_managers.is_empty());

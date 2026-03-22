@@ -7,9 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::{
-    attachable::{
-        shared_in_memory_attachable_store, terminal_session_binding_ref, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose,
-    },
+    attachable::{shared_in_memory_attachable_store, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose},
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
@@ -31,8 +29,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, CorrelationKey, DaemonEvent,
-    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, ManagedTerminal, ManagedTerminalId, PeerConnectionState,
-    ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, TerminalStatus, ToolInventory, TopologyRoute, WorkItemKind,
+    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, PeerConnectionState, ProviderData, RepoIdentity,
+    RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use tokio::sync::Notify;
 
@@ -116,7 +114,6 @@ impl Factory for SlowCloudAgentFactory {
         _: &ConfigStore,
         _: &Path,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
-        _: flotilla_core::attachable::SharedAttachableStore,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.agent) as Arc<dyn CloudAgentService>)
     }
@@ -174,7 +171,6 @@ impl Factory for SlowAiUtilityFactory {
         _: &ConfigStore,
         _: &Path,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
-        _: flotilla_core::attachable::SharedAttachableStore,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
     }
@@ -1601,12 +1597,11 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
 }
 
 #[tokio::test]
-async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_checkout_item() {
+async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() {
     let remote_host = definitely_remote_host();
     let remote_checkout = HostPath::new(remote_host.clone(), "/home/robert/dev/flotilla.issue-356-watch");
     let set_id = AttachableSetId::new("set-issue-356-watch");
     let workspace_ref = "workspace:10".to_string();
-    let terminal_id = ManagedTerminalId { checkout: "issue-356-watch".into(), role: "main".into(), index: 0 };
     let workspace_manager = Arc::new(FakeWorkspaceManager::new());
     let terminal_pool = Arc::new(FakeTerminalPool::new());
     let attachable_store = shared_in_memory_attachable_store();
@@ -1618,17 +1613,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
             correlation_keys: vec![],
             attachable_set_id: None,
         })])
-        .await;
-    terminal_pool
-        .add_terminals(vec![ManagedTerminal {
-            id: terminal_id.clone(),
-            role: "main".into(),
-            command: "bash".into(),
-            working_directory: PathBuf::from("/Users/robert/dev/flotilla"),
-            status: TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
-        }])
         .await;
 
     {
@@ -1647,16 +1631,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
             object_id: set_id.to_string(),
             external_ref: workspace_ref.clone(),
         });
-        store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "fake-terminals",
-            &terminal_session_binding_ref(&terminal_id),
-            TerminalPurpose { checkout: terminal_id.checkout.clone(), role: terminal_id.role.clone(), index: terminal_id.index },
-            "bash",
-            PathBuf::from("/Users/robert/dev/flotilla"),
-            TerminalStatus::Running,
-        );
     }
 
     let discovery = fake_discovery_with_provider_set(
@@ -1695,8 +1669,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
     let _ = recv_event(&mut rx).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("merged state");
-    let projected_terminal = snapshot.providers.managed_terminals.get(&terminal_id.to_string()).expect("projected terminal");
-    assert_eq!(projected_terminal.attachable_set_id.as_ref(), Some(&set_id));
     assert_eq!(
         snapshot.providers.workspaces.get(&workspace_ref).and_then(|workspace| workspace.attachable_set_id.as_ref()),
         Some(&set_id),
@@ -1710,7 +1682,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
     assert_eq!(item.host, remote_host);
     assert_eq!(item.checkout.as_ref().map(|checkout| &checkout.key), Some(&remote_checkout));
     assert_eq!(item.workspace_refs, vec![workspace_ref]);
-    assert_eq!(item.terminal_keys, vec![terminal_id]);
 }
 
 #[tokio::test]
@@ -1816,7 +1787,7 @@ async fn remove_checkout_command_accepts_selector_queries() {
         .execute(Command {
             host: None,
             context_repo: None,
-            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()), terminal_keys: vec![] },
+            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()) },
         })
         .await
         .expect_err("missing checkout should fail cleanly");
@@ -2287,7 +2258,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
     let command = Command {
         host: None,
         context_repo: None,
-        action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-lifecycle".into()), terminal_keys: vec![] },
+        action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-lifecycle".into()) },
     };
     let command_id = daemon.execute(command).await.expect("execute RemoveCheckout should succeed");
 

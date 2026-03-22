@@ -17,7 +17,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset,
-    IssuePage, ManagedTerminal, ManagedTerminalId, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
+    IssuePage, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -674,8 +674,8 @@ impl WorkspaceManager for FakeWorkspaceManager {
 }
 
 pub struct FakeTerminalPool {
-    pub terminals: Arc<TokioMutex<Vec<ManagedTerminal>>>,
-    pub killed: Arc<TokioMutex<Vec<ManagedTerminalId>>>,
+    pub sessions: Arc<TokioMutex<Vec<super::super::terminal::TerminalSession>>>,
+    pub killed: Arc<TokioMutex<Vec<String>>>,
 }
 
 impl Default for FakeTerminalPool {
@@ -686,49 +686,46 @@ impl Default for FakeTerminalPool {
 
 impl FakeTerminalPool {
     pub fn new() -> Self {
-        Self { terminals: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
+        Self { sessions: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
     }
 
-    pub async fn add_terminals(&self, terminals: Vec<ManagedTerminal>) {
-        self.terminals.lock().await.extend(terminals);
+    pub async fn add_sessions(&self, sessions: Vec<super::super::terminal::TerminalSession>) {
+        self.sessions.lock().await.extend(sessions);
     }
 }
 
 #[async_trait::async_trait]
 impl TerminalPool for FakeTerminalPool {
-    async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
-        Ok(self.terminals.lock().await.clone())
+    async fn list_sessions(&self) -> Result<Vec<super::super::terminal::TerminalSession>, String> {
+        Ok(self.sessions.lock().await.clone())
     }
 
-    async fn ensure_running(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<(), String> {
-        let mut terminals = self.terminals.lock().await;
-        if terminals.iter().any(|terminal| &terminal.id == id) {
+    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.iter().any(|s| s.session_name == session_name) {
             return Ok(());
         }
-        terminals.push(ManagedTerminal {
-            id: id.clone(),
-            role: id.role.clone(),
-            command: command.to_string(),
-            working_directory: cwd.to_path_buf(),
+        sessions.push(super::super::terminal::TerminalSession {
+            session_name: session_name.to_string(),
             status: TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
+            command: Some(command.to_string()),
+            working_directory: Some(cwd.to_path_buf()),
         });
         Ok(())
     }
 
     async fn attach_command(
         &self,
-        id: &ManagedTerminalId,
+        session_name: &str,
         _command: &str,
         _cwd: &Path,
         _env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<String, String> {
-        Ok(format!("attach {id}"))
+        Ok(format!("attach {session_name}"))
     }
 
-    async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
-        self.killed.lock().await.push(id.clone());
+    async fn kill_session(&self, session_name: &str) -> Result<(), String> {
+        self.killed.lock().await.push(session_name.to_string());
         Ok(())
     }
 }
@@ -802,7 +799,6 @@ impl Factory for FakeIssueTrackerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -845,7 +841,6 @@ impl Factory for FakeVcsFactory {
         _config: &ConfigStore,
         repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
         let state = self.state.read().expect("FakeVcsFactory state poisoned");
         if repo_root == state.root {
@@ -890,7 +885,6 @@ impl Factory for FakeCheckoutManagerFactory {
         _config: &ConfigStore,
         repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         let state = self.state.read().expect("FakeCheckoutManagerFactory state poisoned");
         if repo_root == state.root {
@@ -918,7 +912,6 @@ impl Factory for FakeChangeRequestFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -947,7 +940,6 @@ impl Factory for FakeWorkspaceManagerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -976,7 +968,6 @@ impl Factory for FakeTerminalPoolFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -1044,7 +1035,6 @@ impl Factory for ArcCheckoutManagerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }

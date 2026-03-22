@@ -82,16 +82,17 @@ pub trait AttachableStoreApi: Send + Sync {
     ) -> bool;
     fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo>;
     fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId>;
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool;
     fn save(&self) -> Result<(), String>;
 }
 
-pub type SharedAttachableStore = Arc<Mutex<Box<dyn AttachableStoreApi>>>;
+pub type SharedAttachableStore = Arc<Mutex<dyn AttachableStoreApi>>;
 
 pub fn shared_attachable_store<S>(store: S) -> SharedAttachableStore
 where
     S: AttachableStoreApi + 'static,
 {
-    Arc::new(Mutex::new(Box::new(store)))
+    Arc::new(Mutex::new(store))
 }
 
 pub fn shared_file_backed_attachable_store(base: impl AsRef<Path>) -> SharedAttachableStore {
@@ -361,6 +362,19 @@ impl AttachableStoreState {
     fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
         self.registry.sets.values().filter(|set| set.checkout.as_ref() == Some(checkout)).map(|set| set.id.clone()).collect()
     }
+
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        if let Some(attachable) = self.registry.attachables.get_mut(id) {
+            // Irrefutable while AttachableContent has one variant; will become a
+            // compile error (forcing a decision) if a second variant is added.
+            let AttachableContent::Terminal(ref mut terminal) = attachable.content;
+            if terminal.status != status {
+                terminal.status = status;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub struct AttachableStore {
@@ -509,6 +523,10 @@ impl AttachableStore {
         self.state.sets_for_checkout(checkout)
     }
 
+    pub fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        self.state.update_terminal_status(id, status)
+    }
+
     pub fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create attachable dir: {e}"))?;
@@ -646,6 +664,10 @@ impl AttachableStoreApi for AttachableStore {
         self.state.sets_for_checkout(checkout)
     }
 
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        self.state.update_terminal_status(id, status)
+    }
+
     fn save(&self) -> Result<(), String> {
         AttachableStore::save(self)
     }
@@ -775,6 +797,10 @@ impl AttachableStoreApi for InMemoryAttachableStore {
 
     fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
         self.state.sets_for_checkout(checkout)
+    }
+
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        self.state.update_terminal_status(id, status)
     }
 
     fn save(&self) -> Result<(), String> {

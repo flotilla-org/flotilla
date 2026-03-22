@@ -34,17 +34,8 @@ async fn main() {
     let factories = FactoryRegistry::default_all();
     let attachable_store = shared_file_backed_attachable_store(config.base_path());
 
-    let result = discovery::discover_providers(
-        &host_bag,
-        &repo_root,
-        &repo_dets,
-        &factories,
-        &config,
-        Arc::clone(&runner),
-        Arc::clone(&attachable_store),
-        &ProcessEnvVars,
-    )
-    .await;
+    let result =
+        discovery::discover_providers(&host_bag, &repo_root, &repo_dets, &factories, &config, Arc::clone(&runner), &ProcessEnvVars).await;
     let registry = result.registry;
     let repo_slug = result.repo_slug;
     println!("  checkout_managers: {}", registry.checkout_managers.len());

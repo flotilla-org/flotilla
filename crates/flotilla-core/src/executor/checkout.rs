@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use flotilla_protocol::{CheckoutSelector, HostName, HostPath, ManagedTerminalId};
+use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
 
 use crate::{
-    attachable::{parse_terminal_session_binding_ref, SharedAttachableStore},
     provider_data::ProviderData,
     providers::{registry::ProviderRegistry, run, CommandRunner},
+    terminal_manager::TerminalManager,
 };
 
 #[derive(Clone, Copy)]
@@ -40,39 +40,17 @@ impl<'a> CheckoutService<'a> {
         &self,
         repo_root: &Path,
         branch: &str,
-        terminal_keys: &[ManagedTerminalId],
         deleted_checkout_paths: &[HostPath],
-        attachable_store: &SharedAttachableStore,
+        terminal_manager: Option<&TerminalManager>,
     ) -> Result<(), String> {
         let checkout_manager =
             self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
         checkout_manager.remove_checkout(repo_root, branch).await?;
 
-        // Cascade: remove attachable sets owned by the deleted checkout(s)
-        let cascade_session_refs = cascade_delete_attachable_sets(deleted_checkout_paths, attachable_store);
-
-        // Best-effort terminal teardown for cascade-removed sessions
-        if let Some(terminal_pool) = self.registry.terminal_pools.preferred() {
-            for session_ref in &cascade_session_refs {
-                if let Some(terminal_id) = parse_terminal_session_binding_ref(session_ref) {
-                    if let Err(err) = terminal_pool.kill_terminal(&terminal_id).await {
-                        warn!(
-                            session = %session_ref,
-                            err = %err,
-                            "failed to kill cascaded terminal session (best-effort)"
-                        );
-                    }
-                }
-            }
-            // Also kill explicitly-passed terminal keys
-            for terminal_id in terminal_keys {
-                if let Err(err) = terminal_pool.kill_terminal(terminal_id).await {
-                    warn!(
-                        terminal = %terminal_id,
-                        err = %err,
-                        "failed to kill terminal session (best-effort)"
-                    );
-                }
+        // Cascade: remove attachable sets and kill terminal sessions for deleted checkouts
+        if let Some(tm) = terminal_manager {
+            if let Err(err) = tm.cascade_delete(deleted_checkout_paths).await {
+                warn!(err = %err, "failed to cascade delete terminal sessions (best-effort)");
             }
         }
 
@@ -144,31 +122,4 @@ pub(super) async fn write_branch_issue_links(repo_root: &Path, branch: &str, iss
             warn!(err = %err, "failed to write issue link");
         }
     }
-}
-
-/// Remove attachable sets whose checkout matches any of the given paths,
-/// persist the registry, and return the terminal session binding refs
-/// for teardown.
-fn cascade_delete_attachable_sets(deleted_checkout_paths: &[HostPath], attachable_store: &SharedAttachableStore) -> Vec<String> {
-    let Ok(mut store) = attachable_store.lock() else {
-        warn!("attachable store lock poisoned during cascade delete");
-        return vec![];
-    };
-    let mut all_session_refs = Vec::new();
-    let mut any_removed = false;
-    for checkout_path in deleted_checkout_paths {
-        let set_ids = store.sets_for_checkout(checkout_path);
-        for set_id in set_ids {
-            if let Some(removed) = store.remove_set(&set_id) {
-                all_session_refs.extend(removed.member_binding_refs);
-                any_removed = true;
-            }
-        }
-    }
-    if any_removed {
-        if let Err(err) = store.save() {
-            warn!(err = %err, "failed to persist registry after cascade delete");
-        }
-    }
-    all_session_refs
 }
