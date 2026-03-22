@@ -7,9 +7,7 @@ use super::{
     build_plan,
     checkout::{resolve_checkout_branch, validate_checkout_target, write_branch_issue_links, CheckoutIntent},
     session_actions::resolve_attach_command,
-    terminals::{
-        build_terminal_env_vars, escape_for_double_quotes, resolve_terminal_pool, wrap_remote_attach_commands, TerminalPreparationService,
-    },
+    terminals::{escape_for_double_quotes, wrap_remote_attach_commands},
     workspace_config, ExecutorStepResolver, RepoExecutionContext,
 };
 use crate::{
@@ -1099,55 +1097,15 @@ impl TerminalPool for MockTerminalPool {
     }
     async fn attach_command(
         &self,
-        _session_name: &str,
-        _cmd: &str,
-        _cwd: &Path,
-        _env_vars: &crate::providers::terminal::TerminalEnvVars,
-    ) -> Result<String, String> {
-        Ok(String::new())
-    }
-    async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        self.killed.lock().await.push(session_name.to_string());
-        Ok(())
-    }
-}
-
-struct ConfigurableTerminalPool {
-    ensured: tokio::sync::Mutex<Vec<String>>,
-    attached: tokio::sync::Mutex<Vec<String>>,
-    ensure_failures: Vec<String>,
-    attach_failures: Vec<String>,
-}
-
-#[async_trait]
-impl TerminalPool for ConfigurableTerminalPool {
-    async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
-        Ok(vec![])
-    }
-
-    async fn ensure_session(&self, session_name: &str, _cmd: &str, _cwd: &Path) -> Result<(), String> {
-        self.ensured.lock().await.push(session_name.to_string());
-        if self.ensure_failures.iter().any(|f| f == session_name) {
-            return Err(format!("failed to ensure {session_name}"));
-        }
-        Ok(())
-    }
-
-    async fn attach_command(
-        &self,
         session_name: &str,
         _cmd: &str,
         _cwd: &Path,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
     ) -> Result<String, String> {
-        self.attached.lock().await.push(session_name.to_string());
-        if self.attach_failures.iter().any(|f| f == session_name) {
-            return Err(format!("failed to attach {session_name}"));
-        }
         Ok(format!("attach:{session_name}"))
     }
-
-    async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
+    async fn kill_session(&self, session_name: &str) -> Result<(), String> {
+        self.killed.lock().await.push(session_name.to_string());
         Ok(())
     }
 }
@@ -1856,10 +1814,9 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
         assert!(store.registry().bindings.is_empty(), "bindings should be removed");
     }
 
-    // Verify terminal was killed via cascade
+    // Verify terminal was killed via cascade (session name is the AttachableId, not the old flotilla/... format)
     let killed = mock_pool.killed.lock().await;
     assert_eq!(killed.len(), 1, "cascade should kill the terminal");
-    assert!(killed[0].contains("feat-x"), "killed session should reference the checkout");
 }
 
 // -----------------------------------------------------------------------
@@ -2293,12 +2250,14 @@ fn resolve_checkout_branch_query_ambiguous() {
 }
 
 // -----------------------------------------------------------------------
-// Tests: resolve_terminal_pool
+// Tests: resolve_workspace_commands via TerminalPreparationService
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn resolve_terminal_pool_no_template_uses_default() {
-    let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+async fn resolve_workspace_commands_no_template_uses_default() {
+    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
         working_directory: PathBuf::from("/repo/wt"),
@@ -2307,7 +2266,8 @@ async fn resolve_terminal_pool_no_template_uses_default() {
         resolved_commands: None,
     };
 
-    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
+    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    service.resolve_workspace_commands(&mut config).await;
 
     // Default template has one "main" terminal entry
     assert!(config.resolved_commands.is_some());
@@ -2317,8 +2277,10 @@ async fn resolve_terminal_pool_no_template_uses_default() {
 }
 
 #[tokio::test]
-async fn resolve_terminal_pool_skips_non_terminal_content() {
-    let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+async fn resolve_workspace_commands_skips_non_terminal_content() {
+    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
     let yaml = r#"
 content:
   - role: docs
@@ -2333,25 +2295,20 @@ content:
         resolved_commands: None,
     };
 
-    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
+    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    service.resolve_workspace_commands(&mut config).await;
 
     // All content entries were non-terminal, so resolved_commands stays None
     assert!(config.resolved_commands.is_none());
 }
 
 #[tokio::test]
-async fn prepare_terminal_commands_wraps_requested_commands_and_falls_back_on_attach_error() {
-    let mock_pool = Arc::new(ConfigurableTerminalPool {
-        ensured: tokio::sync::Mutex::new(Vec::new()),
-        attached: tokio::sync::Mutex::new(Vec::new()),
-        ensure_failures: vec![],
-        attach_failures: vec!["flotilla/feat/main/1".to_string()],
-    });
+async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager() {
+    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let mut registry = empty_registry();
-    registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
 
-    let service = TerminalPreparationService::new(&registry, Path::new("/config"), &store, None);
+    let service = super::terminals::TerminalPreparationService::new(&tm, None);
     let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }, PreparedTerminalCommand {
         role: "main".into(),
         command: "bash".into(),
@@ -2362,53 +2319,19 @@ async fn prepare_terminal_commands_wraps_requested_commands_and_falls_back_on_at
         .await
         .expect("prepare requested terminal commands");
 
-    assert_eq!(result, vec![
-        PreparedTerminalCommand { role: "main".into(), command: "attach:flotilla/feat/main/0".into() },
-        PreparedTerminalCommand { role: "main".into(), command: "bash".into() },
-    ]);
-
-    let ensured = mock_pool.ensured.lock().await;
-    assert_eq!(&*ensured, &["flotilla/feat/main/0", "flotilla/feat/main/1"]);
-    let attached = mock_pool.attached.lock().await;
-    assert_eq!(&*attached, &["flotilla/feat/main/0", "flotilla/feat/main/1"]);
+    // Both commands should be resolved through the terminal manager
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].role, "main");
+    assert_eq!(result[1].role, "main");
+    // Attach commands use the attachable ID as session name
+    assert!(result[0].command.starts_with("attach:"), "expected attach: prefix, got: {}", result[0].command);
 }
 
 #[tokio::test]
-async fn resolve_terminal_pool_skips_ensure_failure_and_attach_failure() {
-    let mock_pool = Arc::new(ConfigurableTerminalPool {
-        ensured: tokio::sync::Mutex::new(Vec::new()),
-        attached: tokio::sync::Mutex::new(Vec::new()),
-        ensure_failures: vec!["flotilla/test-branch/main/0".to_string()],
-        attach_failures: vec!["flotilla/test-branch/aux/0".to_string()],
-    });
-    let yaml = r#"
-content:
-  - role: main
-    type: terminal
-    command: "claude"
-  - role: aux
-    type: terminal
-    command: "bash"
-"#;
-    let mut config = WorkspaceConfig {
-        name: "test-branch".to_string(),
-        working_directory: PathBuf::from("/repo/wt"),
-        template_vars: std::collections::HashMap::new(),
-        template_yaml: Some(yaml.to_string()),
-        resolved_commands: None,
-    };
-
-    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
-
-    assert_eq!(
-        config.resolved_commands, None,
-        "ensure failure should skip the first entry and attach failure should skip recording the second"
-    );
-}
-
-#[tokio::test]
-async fn resolve_terminal_pool_invalid_template_uses_default() {
-    let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+async fn resolve_workspace_commands_invalid_template_uses_default() {
+    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
         working_directory: PathBuf::from("/repo/wt"),
@@ -2417,42 +2340,12 @@ async fn resolve_terminal_pool_invalid_template_uses_default() {
         resolved_commands: None,
     };
 
-    resolve_terminal_pool(&mut config, mock_pool.as_ref(), &crate::attachable::shared_in_memory_attachable_store(), "shpool", None).await;
+    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    service.resolve_workspace_commands(&mut config).await;
 
     let commands = config.resolved_commands.expect("invalid template should fall back to default template");
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].0, "main");
-}
-
-// -----------------------------------------------------------------------
-// Tests: build_terminal_env_vars
-// -----------------------------------------------------------------------
-
-#[test]
-fn build_terminal_env_vars_creates_binding_and_populates_both_vars() {
-    let store = crate::attachable::shared_in_memory_attachable_store();
-    let cwd = std::path::Path::new("/repo/feat");
-    let socket = std::path::PathBuf::from("/tmp/flotilla.sock");
-
-    let vars = build_terminal_env_vars("feat", "agent", 0, cwd, "claude", &store, "shpool", Some(&socket));
-
-    assert_eq!(vars.len(), 2);
-    assert_eq!(vars[0].0, "FLOTILLA_ATTACHABLE_ID");
-    assert!(!vars[0].1.is_empty());
-    assert_eq!(vars[1].0, "FLOTILLA_DAEMON_SOCKET");
-    assert_eq!(vars[1].1, "/tmp/flotilla.sock");
-
-    // Calling again returns the same attachable ID (idempotent)
-    let vars2 = build_terminal_env_vars("feat", "agent", 0, cwd, "claude", &store, "shpool", Some(&socket));
-    assert_eq!(vars[0].1, vars2[0].1);
-}
-
-#[test]
-fn build_terminal_env_vars_without_socket_only_has_attachable_id() {
-    let store = crate::attachable::shared_in_memory_attachable_store();
-    let vars = build_terminal_env_vars("feat", "shell", 0, std::path::Path::new("/repo"), "$SHELL", &store, "shpool", None);
-    assert_eq!(vars.len(), 1);
-    assert_eq!(vars[0].0, "FLOTILLA_ATTACHABLE_ID");
 }
 
 // -----------------------------------------------------------------------

@@ -11,6 +11,7 @@ use crate::{
         registry::ProviderRegistry,
         types::{CloudAgentSession, CorrelationKey},
     },
+    terminal_manager::TerminalManager,
 };
 
 pub(super) struct ReadOnlySessionActionService<'a> {
@@ -25,6 +26,7 @@ pub(super) struct TeleportSessionActionService<'a> {
     attachable_store: &'a SharedAttachableStore,
     daemon_socket_path: Option<&'a Path>,
     local_host: &'a HostName,
+    terminal_manager: Option<&'a TerminalManager>,
 }
 
 pub(super) struct TeleportFlow<'a> {
@@ -100,6 +102,7 @@ impl<'a> ReadOnlySessionActionService<'a> {
 }
 
 impl<'a> TeleportSessionActionService<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         repo_root: &'a Path,
         registry: &'a ProviderRegistry,
@@ -108,6 +111,7 @@ impl<'a> TeleportSessionActionService<'a> {
         attachable_store: &'a SharedAttachableStore,
         daemon_socket_path: Option<&'a Path>,
         local_host: &'a HostName,
+        terminal_manager: Option<&'a TerminalManager>,
     ) -> Self {
         Self {
             read_only: ReadOnlySessionActionService::new(registry, providers_data),
@@ -116,6 +120,7 @@ impl<'a> TeleportSessionActionService<'a> {
             attachable_store,
             daemon_socket_path,
             local_host,
+            terminal_manager,
         }
     }
 
@@ -157,6 +162,7 @@ impl<'a> TeleportSessionActionService<'a> {
             self.attachable_store,
             self.daemon_socket_path,
             self.local_host,
+            self.terminal_manager,
         );
         let name = branch.unwrap_or("session");
         workspace_orchestrator.create_workspace_for_teleport(checkout_path, name, teleport_cmd).await
@@ -193,6 +199,7 @@ impl<'a> TeleportFlow<'a> {
                 attachable_store,
                 daemon_socket_path,
                 local_host,
+                None,
             ),
             checkout_key,
         }

@@ -8,6 +8,7 @@ use crate::{
     attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
     providers::{registry::ProviderRegistry, workspace::WorkspaceManager},
     step::StepOutcome,
+    terminal_manager::TerminalManager,
 };
 
 pub(super) struct WorkspaceOrchestrator<'a> {
@@ -17,6 +18,7 @@ pub(super) struct WorkspaceOrchestrator<'a> {
     attachable_store: &'a SharedAttachableStore,
     daemon_socket_path: Option<&'a Path>,
     local_host: &'a HostName,
+    terminal_manager: Option<&'a TerminalManager>,
 }
 
 impl<'a> WorkspaceOrchestrator<'a> {
@@ -27,8 +29,9 @@ impl<'a> WorkspaceOrchestrator<'a> {
         attachable_store: &'a SharedAttachableStore,
         daemon_socket_path: Option<&'a Path>,
         local_host: &'a HostName,
+        terminal_manager: Option<&'a TerminalManager>,
     ) -> Self {
-        Self { repo_root, registry, config_base, attachable_store, daemon_socket_path, local_host }
+        Self { repo_root, registry, config_base, attachable_store, daemon_socket_path, local_host, terminal_manager }
     }
 
     pub(super) async fn create_workspace_for_checkout(&self, checkout_path: &Path, label: &str) -> Result<StepOutcome, String> {
@@ -40,10 +43,11 @@ impl<'a> WorkspaceOrchestrator<'a> {
             return Ok(StepOutcome::Completed);
         }
 
-        let terminal_preparation =
-            TerminalPreparationService::new(self.registry, self.config_base, self.attachable_store, self.daemon_socket_path);
         let mut config = workspace_config(self.repo_root, label, checkout_path, "claude", self.config_base);
-        terminal_preparation.resolve_workspace_commands(&mut config).await;
+        if let Some(tm) = self.terminal_manager {
+            let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
+            terminal_preparation.resolve_workspace_commands(&mut config).await;
+        }
 
         match ws_mgr.create_workspace(&config).await {
             Ok((ws_ref, _workspace)) => {
@@ -59,10 +63,11 @@ impl<'a> WorkspaceOrchestrator<'a> {
             return Ok(());
         };
 
-        let terminal_preparation =
-            TerminalPreparationService::new(self.registry, self.config_base, self.attachable_store, self.daemon_socket_path);
         let mut config = workspace_config(self.repo_root, label, checkout_path, teleport_cmd, self.config_base);
-        terminal_preparation.resolve_workspace_commands(&mut config).await;
+        if let Some(tm) = self.terminal_manager {
+            let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
+            terminal_preparation.resolve_workspace_commands(&mut config).await;
+        }
 
         match ws_mgr.create_workspace(&config).await {
             Ok((ws_ref, _workspace)) => {
@@ -85,9 +90,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             return Ok(());
         };
 
-        let terminal_preparation =
-            TerminalPreparationService::new(self.registry, self.config_base, self.attachable_store, self.daemon_socket_path);
-        let wrapped = terminal_preparation.wrap_remote_attach_commands(target_host, checkout_path, commands)?;
+        let wrapped = super::terminals::wrap_remote_attach_commands(target_host, checkout_path, commands, self.config_base)?;
 
         // The workspace itself is local to the presentation host, so its
         // working directory only needs to be a valid local directory.
