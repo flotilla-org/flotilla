@@ -154,8 +154,8 @@ impl RepoPage {
     /// Check whether the daemon data has changed since last reconciliation
     /// and, if so, rebuild the table and prune stale selections.
     pub fn reconcile_if_changed(&mut self) {
-        if self.repo_data.changed(&mut self.last_seen_generation).is_some() {
-            let data = self.repo_data.read().clone();
+        let data = self.repo_data.changed(&mut self.last_seen_generation).map(|guard| guard.clone());
+        if let Some(data) = data {
             self.rebuild_table(&data);
         }
     }
@@ -467,10 +467,10 @@ impl InteractiveWidget for RepoPage {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{ProviderData, RepoLabels, WorkItemIdentity};
+    use flotilla_protocol::{CloudAgentSession, ProviderData, RepoLabels, SessionStatus, WorkItemIdentity};
 
     use super::*;
-    use crate::app::test_support::{issue_item, TestWidgetHarness};
+    use crate::app::test_support::{issue_item, session_item, TestWidgetHarness};
 
     fn test_repo_identity() -> RepoIdentity {
         RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() }
@@ -496,6 +496,33 @@ mod tests {
         let mut page = RepoPage::new(test_repo_identity(), data, RepoViewLayout::Auto);
         page.reconcile_if_changed();
         page
+    }
+
+    /// Shared data containing one archived session ("s1") and one issue ("i1").
+    fn repo_data_with_archived_session() -> Shared<RepoData> {
+        let mut providers = ProviderData::default();
+        providers.sessions.insert("s1".into(), CloudAgentSession {
+            title: String::new(),
+            status: SessionStatus::Archived,
+            model: None,
+            updated_at: None,
+            correlation_keys: Vec::new(),
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
+        Shared::new(RepoData {
+            path: PathBuf::from("/tmp/test-repo"),
+            providers: Arc::new(providers),
+            labels: RepoLabels::default(),
+            provider_names: HashMap::new(),
+            provider_health: HashMap::new(),
+            work_items: vec![session_item("s1"), issue_item("i1")],
+            issue_has_more: false,
+            issue_total: None,
+            issue_search_active: false,
+            loading: false,
+        })
     }
 
     // ── reconcile_if_changed ──
@@ -798,35 +825,7 @@ mod tests {
 
     #[test]
     fn toggle_archived_rebuilds_table_immediately() {
-        use flotilla_protocol::{CloudAgentSession, SessionStatus};
-
-        // Create provider data with one archived session.
-        let mut providers = ProviderData::default();
-        providers.sessions.insert("s1".into(), CloudAgentSession {
-            title: String::new(),
-            status: SessionStatus::Archived,
-            model: None,
-            updated_at: None,
-            correlation_keys: Vec::new(),
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-            item_noun: String::new(),
-        });
-
-        let data = Shared::new(RepoData {
-            path: PathBuf::from("/tmp/test-repo"),
-            providers: Arc::new(providers),
-            labels: RepoLabels::default(),
-            provider_names: HashMap::new(),
-            provider_health: HashMap::new(),
-            work_items: vec![crate::app::test_support::session_item("s1"), issue_item("i1")],
-            issue_has_more: false,
-            issue_total: None,
-            issue_search_active: false,
-            loading: false,
-        });
-
-        let mut page = RepoPage::new(test_repo_identity(), data, RepoViewLayout::Auto);
+        let mut page = RepoPage::new(test_repo_identity(), repo_data_with_archived_session(), RepoViewLayout::Auto);
         page.reconcile_if_changed();
 
         // With show_archived=false, the archived session row is filtered out.
@@ -853,34 +852,7 @@ mod tests {
 
     #[test]
     fn dismiss_rebuilds_table_when_clearing_archived() {
-        use flotilla_protocol::{CloudAgentSession, SessionStatus};
-
-        let mut providers = ProviderData::default();
-        providers.sessions.insert("s1".into(), CloudAgentSession {
-            title: String::new(),
-            status: SessionStatus::Archived,
-            model: None,
-            updated_at: None,
-            correlation_keys: Vec::new(),
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-            item_noun: String::new(),
-        });
-
-        let data = Shared::new(RepoData {
-            path: PathBuf::from("/tmp/test-repo"),
-            providers: Arc::new(providers),
-            labels: RepoLabels::default(),
-            provider_names: HashMap::new(),
-            provider_health: HashMap::new(),
-            work_items: vec![crate::app::test_support::session_item("s1"), issue_item("i1")],
-            issue_has_more: false,
-            issue_total: None,
-            issue_search_active: false,
-            loading: false,
-        });
-
-        let mut page = RepoPage::new(test_repo_identity(), data, RepoViewLayout::Auto);
+        let mut page = RepoPage::new(test_repo_identity(), repo_data_with_archived_session(), RepoViewLayout::Auto);
         page.reconcile_if_changed();
 
         let hidden_count = page.table.grouped_items.selectable_indices.len();
