@@ -239,7 +239,7 @@ impl RepoPage {
 
     fn dismiss(&mut self, ctx: &mut WidgetContext) -> Outcome {
         // Cancellation takes priority while a command is running.
-        if let Some(&command_id) = ctx.in_flight.keys().next() {
+        if let Some(&command_id) = ctx.in_flight.keys().max() {
             ctx.app_actions.push(AppAction::CancelCommand(command_id));
             return Outcome::Consumed;
         }
@@ -580,6 +580,31 @@ mod tests {
         assert!(matches!(outcome, Outcome::Consumed));
         assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::CancelCommand(42))));
         assert!(!ctx.app_actions.iter().any(|a| matches!(a, AppAction::Quit)));
+    }
+
+    #[test]
+    fn dismiss_cancels_most_recent_command() {
+        let mut page = page_with_items(vec![issue_item("1")]);
+        let mut harness = TestWidgetHarness::new();
+        let repo_identity = harness.model.repo_order[0].clone();
+        harness.in_flight.insert(10, crate::app::InFlightCommand {
+            repo_identity: repo_identity.clone(),
+            repo: PathBuf::from("/tmp/test-repo"),
+            description: "older".into(),
+        });
+        harness.in_flight.insert(20, crate::app::InFlightCommand {
+            repo_identity,
+            repo: PathBuf::from("/tmp/test-repo"),
+            description: "newer".into(),
+        });
+        let mut ctx = harness.ctx();
+
+        let outcome = page.handle_action(Action::Dismiss, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert!(
+            ctx.app_actions.iter().any(|a| matches!(a, AppAction::CancelCommand(20))),
+            "should cancel the most recent command (highest ID)"
+        );
     }
 
     #[test]
