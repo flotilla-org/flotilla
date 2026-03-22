@@ -481,6 +481,7 @@ impl StepResolver for ExecutorStepResolver {
                     None => Ok(StepOutcome::Skipped),
                 }
             }
+<<<<<<< HEAD
             StepAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
                 let workspace_orchestrator = WorkspaceOrchestrator::new(
                     &self.repo.root,
@@ -545,10 +546,62 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::CheckoutImmediate { .. } => todo!("batch 2: task 4"),
             StepAction::FetchCheckoutStatus { .. } => todo!("batch 2: task 4"),
-            StepAction::OpenChangeRequest { .. } => todo!("batch 2: task 2"),
-            StepAction::CloseChangeRequest { .. } => todo!("batch 2: task 2"),
-            StepAction::OpenIssue { .. } => todo!("batch 2: task 2"),
-            StepAction::LinkIssuesToChangeRequest { .. } => todo!("batch 2: task 2"),
+            StepAction::OpenChangeRequest { id } => {
+                debug!(%id, "opening change request in browser");
+                if let Some(cr) = self.registry.change_requests.preferred() {
+                    let _ = cr.open_in_browser(&self.repo.root, &id).await;
+                }
+                Ok(StepOutcome::Completed)
+            }
+            StepAction::CloseChangeRequest { id } => {
+                debug!(%id, "closing change request");
+                if let Some(cr) = self.registry.change_requests.preferred() {
+                    let _ = cr.close_change_request(&self.repo.root, &id).await;
+                }
+                Ok(StepOutcome::Completed)
+            }
+            StepAction::OpenIssue { id } => {
+                debug!(%id, "opening issue in browser");
+                if let Some(it) = self.registry.issue_trackers.preferred() {
+                    let _ = it.open_in_browser(&self.repo.root, &id).await;
+                }
+                Ok(StepOutcome::Completed)
+            }
+            StepAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
+                info!(issue_ids = ?issue_ids, %change_request_id, "linking issues to change request");
+                let body_result = run!(
+                    self.runner.as_ref(),
+                    "gh",
+                    &["pr", "view", &change_request_id, "--json", "body", "--jq", ".body"],
+                    &self.repo.root
+                );
+                match body_result {
+                    Ok(current_body) => {
+                        let fixes_lines: Vec<String> = issue_ids.iter().map(|id| format!("Fixes #{id}")).collect();
+                        let new_body = if current_body.trim().is_empty() {
+                            fixes_lines.join("\n")
+                        } else {
+                            format!("{}\n\n{}", current_body.trim(), fixes_lines.join("\n"))
+                        };
+                        let result =
+                            run!(self.runner.as_ref(), "gh", &["pr", "edit", &change_request_id, "--body", &new_body], &self.repo.root);
+                        match result {
+                            Ok(_) => {
+                                info!(%change_request_id, "linked issues to change request");
+                                Ok(StepOutcome::Completed)
+                            }
+                            Err(e) => {
+                                error!(err = %e, "failed to edit change request");
+                                Err(e)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(err = %e, "failed to read change request body");
+                        Err(e)
+                    }
+                }
+            }
             #[cfg(test)]
             StepAction::Noop => Ok(StepOutcome::Completed),
         }
