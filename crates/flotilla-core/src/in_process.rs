@@ -4,7 +4,7 @@
 //! and broadcasts events — all within the same process.
 
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -16,9 +16,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostSnapshot, HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderError, ProviderInfo, RepoDelta,
-    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey,
-    SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
+    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -28,12 +27,13 @@ use crate::{
     config::ConfigStore,
     convert::snapshot_to_proto,
     daemon::DaemonHandle,
-    delta,
     executor::{self, ExecutionPlan},
+    host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
-    providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag, UnmetRequirement},
+    providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag},
     refresh::RefreshSnapshot,
+    repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     step::run_step_plan,
 };
 
@@ -179,24 +179,13 @@ fn inject_issues_from_entries(
     providers
 }
 
-/// Build a proto RepoSnapshot by injecting issues, re-correlating, and patching issue metadata.
-struct SnapshotBuildContext<'a> {
-    repo_identity: flotilla_protocol::RepoIdentity,
-    path: &'a Path,
-    seq: u64,
-    /// Local-only provider data — must NOT contain merged peer data.
-    /// Errors and health from the last snapshot are passed separately.
-    local_providers: &'a ProviderData,
-    errors: &'a [crate::data::RefreshError],
-    provider_health: &'a HashMap<(&'static str, String), bool>,
-    cache: &'a IssueCache,
-    search_results: &'a Option<Vec<(String, Issue)>>,
-    host_name: &'a HostName,
-}
-
 /// Build a proto RepoSnapshot, optionally merging peer provider data before correlation.
-fn build_repo_snapshot_with_peers(ctx: SnapshotBuildContext<'_>, peer_overlay: Option<&[(HostName, ProviderData)]>) -> RepoSnapshot {
-    let SnapshotBuildContext { repo_identity, path, seq, local_providers, errors, provider_health, cache, search_results, host_name } = ctx;
+fn build_repo_snapshot_with_peers(
+    ctx: SnapshotBuildContext<'_>,
+    seq: u64,
+    peer_overlay: Option<&[(HostName, ProviderData)]>,
+) -> RepoSnapshot {
+    let SnapshotBuildContext { repo_identity, path, local_providers, errors, provider_health, cache, search_results, host_name } = ctx;
     let local_providers = normalize_local_provider_hosts(inject_issues(local_providers, cache, search_results), host_name);
 
     // Merge peer provider data if any
@@ -259,318 +248,10 @@ fn choose_event(snapshot: RepoSnapshot, delta: DeltaEntry) -> DaemonEvent {
     }
 }
 
-/// Maximum number of delta entries retained per repo.
-const DELTA_LOG_CAPACITY: usize = 16;
-
-struct RepoRootState {
-    path: PathBuf,
-    model: RepoModel,
-    slug: Option<String>,
-    repo_bag: EnvironmentBag,
-    unmet: Vec<(String, UnmetRequirement)>,
-    is_local: bool,
-}
-
-struct RepoState {
-    identity: flotilla_protocol::RepoIdentity,
-    roots: Vec<RepoRootState>,
-    seq: u64,
-    last_local_providers: ProviderData,
-    last_snapshot: Arc<RefreshSnapshot>,
-    issue_cache: IssueCache,
-    search_results: Option<Vec<(String, Issue)>>,
-    /// Serializes issue fetch operations for this repo to prevent concurrent page skips.
-    issue_fetch_mutex: Arc<Mutex<()>>,
-    /// Last broadcast provider data (with injected issues), used for delta computation.
-    last_broadcast_providers: ProviderData,
-    /// Last broadcast provider health, used for delta computation.
-    last_broadcast_health: HashMap<String, HashMap<String, bool>>,
-    /// Last broadcast errors, used for delta computation.
-    last_broadcast_errors: Vec<ProviderError>,
-    /// Bounded delta log for replay on client reconnect.
-    delta_log: VecDeque<DeltaEntry>,
-    /// Incremented only when local provider data changes (not peer data merges).
-    /// Used by the outbound peer task to avoid re-sending unchanged local data.
-    local_data_version: u64,
-}
-
-impl RepoState {
-    fn new(identity: flotilla_protocol::RepoIdentity, root: RepoRootState) -> Self {
-        Self {
-            identity,
-            roots: vec![root],
-            seq: 0,
-            last_local_providers: ProviderData::default(),
-            last_snapshot: Arc::new(RefreshSnapshot::default()),
-            issue_cache: IssueCache::new(),
-            search_results: None,
-            issue_fetch_mutex: Arc::new(Mutex::new(())),
-            last_broadcast_providers: ProviderData::default(),
-            last_broadcast_health: HashMap::new(),
-            last_broadcast_errors: Vec::new(),
-            delta_log: VecDeque::new(),
-            local_data_version: 0,
-        }
-    }
-
-    fn preferred_root(&self) -> &RepoRootState {
-        self.roots.first().expect("repo state should always have at least one root")
-    }
-
-    fn preferred_root_mut(&mut self) -> &mut RepoRootState {
-        self.roots.first_mut().expect("repo state should always have at least one root")
-    }
-
-    fn preferred_path(&self) -> &Path {
-        &self.preferred_root().path
-    }
-
-    fn registry(&self) -> Arc<crate::providers::registry::ProviderRegistry> {
-        Arc::clone(&self.preferred_root().model.registry)
-    }
-
-    fn providers(&self) -> Arc<ProviderData> {
-        Arc::clone(&self.preferred_root().model.data.providers)
-    }
-
-    fn refresh_trigger(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.preferred_root().model.refresh_handle.refresh_trigger)
-    }
-
-    fn slug(&self) -> Option<&str> {
-        self.preferred_root().slug.as_deref()
-    }
-
-    fn repo_bag(&self) -> &EnvironmentBag {
-        &self.preferred_root().repo_bag
-    }
-
-    fn unmet(&self) -> &[(String, UnmetRequirement)] {
-        &self.preferred_root().unmet
-    }
-
-    fn labels(&self) -> &crate::model::RepoLabels {
-        &self.preferred_root().model.labels
-    }
-
-    fn provider_names(&self) -> HashMap<String, Vec<String>> {
-        provider_names_from_registry(&self.preferred_root().model.registry)
-    }
-
-    fn provider_health(&self) -> &HashMap<(&'static str, String), bool> {
-        &self.preferred_root().model.data.provider_health
-    }
-
-    fn loading(&self) -> bool {
-        self.preferred_root().model.data.loading
-    }
-
-    fn contains_path(&self, path: &Path) -> bool {
-        self.roots.iter().any(|root| root.path == path)
-    }
-
-    fn add_root(&mut self, root: RepoRootState) -> bool {
-        if self.contains_path(&root.path) {
-            return false;
-        }
-        // Keep local roots ahead of synthetic remote-only roots so
-        // preferred_root() remains the executable local instance whenever
-        // this identity is tracked on disk.
-        let preferred_changed = !self.preferred_root().is_local && root.is_local;
-        if preferred_changed {
-            self.roots.insert(0, root);
-        } else {
-            self.roots.push(root);
-        }
-        preferred_changed
-    }
-
-    fn remove_root(&mut self, path: &Path) -> bool {
-        let Some(idx) = self.roots.iter().position(|root| root.path == path) else {
-            return false;
-        };
-        self.roots.remove(idx);
-        true
-    }
-
-    fn local_paths(&self) -> Vec<PathBuf> {
-        self.roots.iter().filter(|root| root.is_local).map(|root| root.path.clone()).collect()
-    }
-
-    /// Compute a delta from the last broadcast state to the new state,
-    /// append to the delta log, and update tracking fields.
-    fn record_delta(
-        &mut self,
-        new_providers: &ProviderData,
-        new_health: &HashMap<String, HashMap<String, bool>>,
-        new_errors: &[ProviderError],
-        work_items: Vec<flotilla_protocol::snapshot::WorkItem>,
-    ) -> DeltaEntry {
-        let mut changes = delta::diff_provider_data(&self.last_broadcast_providers, new_providers);
-
-        // Diff provider health (nested: category → provider → bool)
-        for (category, providers) in new_health {
-            let old_providers = self.last_broadcast_health.get(category);
-            for (provider, &val) in providers {
-                let old_val = old_providers.and_then(|p| p.get(provider));
-                match old_val {
-                    Some(&prev) if prev == val => {}
-                    Some(_) => changes.push(flotilla_protocol::Change::ProviderHealth {
-                        category: category.clone(),
-                        provider: provider.clone(),
-                        op: flotilla_protocol::EntryOp::Updated(val),
-                    }),
-                    None => changes.push(flotilla_protocol::Change::ProviderHealth {
-                        category: category.clone(),
-                        provider: provider.clone(),
-                        op: flotilla_protocol::EntryOp::Added(val),
-                    }),
-                }
-            }
-        }
-        // Check for removed entries
-        for (category, old_providers) in &self.last_broadcast_health {
-            let new_providers = new_health.get(category);
-            for provider in old_providers.keys() {
-                if new_providers.and_then(|p| p.get(provider)).is_none() {
-                    changes.push(flotilla_protocol::Change::ProviderHealth {
-                        category: category.clone(),
-                        provider: provider.clone(),
-                        op: flotilla_protocol::EntryOp::Removed,
-                    });
-                }
-            }
-        }
-
-        // Diff errors
-        if let Some(error_change) = delta::diff_errors(&self.last_broadcast_errors, new_errors) {
-            changes.push(error_change);
-        }
-
-        let prev_seq = self.seq;
-        let entry = DeltaEntry { seq: self.seq + 1, prev_seq, changes, work_items };
-
-        // Append to bounded log
-        self.delta_log.push_back(entry.clone());
-        if self.delta_log.len() > DELTA_LOG_CAPACITY {
-            self.delta_log.pop_front();
-        }
-
-        // Update tracking state
-        self.last_broadcast_providers = new_providers.clone();
-        self.last_broadcast_health = new_health.clone();
-        self.last_broadcast_errors = new_errors.to_vec();
-
-        entry
-    }
-}
-
 /// Tracks a currently executing step-based command for cancellation.
 struct ActiveCommand {
     command_id: u64,
     token: CancellationToken,
-}
-
-#[derive(Debug, Clone)]
-struct HostState {
-    connection_status: PeerConnectionState,
-    summary: Option<HostSummary>,
-    seq: u64,
-    removed: bool,
-}
-
-fn default_host_summary(host_name: &HostName) -> HostSummary {
-    HostSummary { host_name: host_name.clone(), system: SystemInfo::default(), inventory: ToolInventory::default(), providers: vec![] }
-}
-
-fn ensure_remote_host_state<'a>(hosts: &'a mut HashMap<HostName, HostState>, host_name: &HostName) -> &'a mut HostState {
-    hosts.entry(host_name.clone()).or_insert_with(|| HostState {
-        connection_status: PeerConnectionState::Disconnected,
-        summary: None,
-        seq: 1,
-        removed: false,
-    })
-}
-
-fn build_host_snapshot(local_host: &HostName, host_name: &HostName, state: &HostState) -> HostSnapshot {
-    debug_assert!(!state.removed, "removed hosts should not be materialized as snapshots");
-    HostSnapshot {
-        seq: state.seq,
-        host_name: host_name.clone(),
-        is_local: *host_name == *local_host,
-        connection_status: state.connection_status.clone(),
-        summary: state.summary.clone().unwrap_or_else(|| default_host_summary(host_name)),
-    }
-}
-
-fn update_host_status(
-    local_host: &HostName,
-    hosts: &mut HashMap<HostName, HostState>,
-    host_name: &HostName,
-    status: PeerConnectionState,
-) -> Option<HostSnapshot> {
-    let state = ensure_remote_host_state(hosts, host_name);
-    if !state.removed && state.connection_status == status {
-        return None;
-    }
-    state.connection_status = status;
-    state.removed = false;
-    state.seq += 1;
-    Some(build_host_snapshot(local_host, host_name, state))
-}
-
-fn update_host_summary(
-    local_host: &HostName,
-    hosts: &mut HashMap<HostName, HostState>,
-    host_name: &HostName,
-    summary: HostSummary,
-) -> Option<HostSnapshot> {
-    let state = ensure_remote_host_state(hosts, host_name);
-    if !state.removed && state.summary.as_ref() == Some(&summary) {
-        return None;
-    }
-    state.summary = Some(summary);
-    state.removed = false;
-    state.seq += 1;
-    Some(build_host_snapshot(local_host, host_name, state))
-}
-
-fn clear_host_summary(local_host: &HostName, hosts: &mut HashMap<HostName, HostState>, host_name: &HostName) -> Option<HostSnapshot> {
-    if host_name == local_host {
-        return None;
-    }
-    let state = hosts.get_mut(host_name)?;
-    state.summary.as_ref()?;
-    state.summary = None;
-    state.removed = false;
-    state.seq += 1;
-    Some(build_host_snapshot(local_host, host_name, state))
-}
-
-fn should_present_host_state(
-    local_host: &HostName,
-    configured: &HashSet<HostName>,
-    remote_counts: &HashMap<HostName, crate::host_queries::HostCounts>,
-    host_name: &HostName,
-    state: &HostState,
-) -> bool {
-    host_name == local_host
-        || configured.contains(host_name)
-        || state.connection_status != PeerConnectionState::Disconnected
-        || state.summary.is_some()
-        || remote_counts.contains_key(host_name)
-}
-
-fn mark_host_removed(hosts: &mut HashMap<HostName, HostState>, host_name: &HostName) -> Option<u64> {
-    let state = hosts.get_mut(host_name)?;
-    if state.removed {
-        return None;
-    }
-    state.connection_status = PeerConnectionState::Disconnected;
-    state.summary = None;
-    state.removed = true;
-    state.seq += 1;
-    Some(state.seq)
 }
 
 pub struct InProcessDaemon {
@@ -585,7 +266,7 @@ pub struct InProcessDaemon {
     /// review, issue tracker, cloud agents, AI utilities) are skipped
     /// because the follower receives that data from the leader via PeerData.
     follower: bool,
-    /// Peer provider data overlay, keyed by local repo path.
+    /// Peer provider data overlay, keyed by repo identity.
     /// Set by the DaemonServer when peer snapshots arrive. Merged into
     /// the local snapshot during broadcast.
     peer_providers: RwLock<HashMap<flotilla_protocol::RepoIdentity, Vec<(HostName, ProviderData)>>>,
@@ -598,13 +279,7 @@ pub struct InProcessDaemon {
     // repos/repo_order; add_repo intentionally takes it last while already
     // holding those write locks.
     path_identities: RwLock<HashMap<PathBuf, flotilla_protocol::RepoIdentity>>,
-    /// Authoritative host replay/query state keyed by host name.
-    hosts: RwLock<HashMap<HostName, HostState>>,
-    /// Config-backed peer host names from `hosts.toml`, mirrored in by the
-    /// server/peer wiring so daemon queries can include disconnected peers.
-    configured_peer_names: RwLock<HashSet<HostName>>,
-    /// Current routing view mirrored in from the peer manager.
-    topology_routes: RwLock<Vec<TopologyRoute>>,
+    host_registry: crate::host_registry::HostRegistry,
     /// Host-level environment assertions, computed once at startup and
     /// reused for each repo discovery.
     host_bag: EnvironmentBag,
@@ -616,8 +291,6 @@ pub struct InProcessDaemon {
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
-    /// Static local host summary published to peers.
-    local_host_summary: HostSummary,
     agent_state_store: crate::agents::SharedAgentStateStore,
     /// Socket path for the daemon server — set by the daemon after startup.
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
@@ -698,19 +371,11 @@ impl InProcessDaemon {
             peer_providers: RwLock::new(HashMap::new()),
             peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
-            hosts: RwLock::new(HashMap::from([(host_name.clone(), HostState {
-                connection_status: PeerConnectionState::Connected,
-                summary: Some(local_host_summary.clone()),
-                seq: 1,
-                removed: false,
-            })])),
-            configured_peer_names: RwLock::new(HashSet::new()),
-            topology_routes: RwLock::new(Vec::new()),
+            host_registry: crate::host_registry::HostRegistry::new(host_name.clone(), local_host_summary),
             host_bag,
             discovery,
             active_command: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4(),
-            local_host_summary,
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
         });
@@ -747,7 +412,7 @@ impl InProcessDaemon {
     }
 
     pub fn local_host_summary(&self) -> &HostSummary {
-        &self.local_host_summary
+        self.host_registry.local_host_summary()
     }
 
     pub fn agent_state_store(&self) -> &crate::agents::SharedAgentStateStore {
@@ -764,172 +429,70 @@ impl InProcessDaemon {
 
     /// Returns the current connection status for a peer host.
     pub async fn peer_connection_status(&self, host: &HostName) -> PeerConnectionState {
-        self.hosts
-            .read()
-            .await
-            .get(host)
-            .filter(|state| !state.removed)
-            .map(|state| state.connection_status.clone())
-            .unwrap_or(PeerConnectionState::Disconnected)
+        self.host_registry.peer_connection_status(host).await
     }
 
     pub async fn set_configured_peer_names(&self, peers: Vec<HostName>) {
-        let mut configured = self.configured_peer_names.write().await;
-        *configured = peers.iter().cloned().collect();
-        drop(configured);
-
-        self.emit_host_membership_events(self.sync_host_membership().await);
+        let remote_counts = self.remote_host_counts().await;
+        self.host_registry
+            .set_configured_peer_names(peers, &remote_counts, &|e| {
+                let _ = self.event_tx.send(e);
+            })
+            .await;
     }
 
     pub async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>) {
-        let mut normalized = HashMap::new();
-        for (host_name, mut summary) in summaries {
-            summary.host_name = host_name.clone();
-            normalized.insert(host_name, summary);
-        }
-
-        let mut hosts = self.hosts.write().await;
-        let mut events = Vec::new();
-        let host_names: Vec<_> = hosts.keys().cloned().collect();
-        for host_name in host_names {
-            if !normalized.contains_key(&host_name) {
-                if let Some(snapshot) = clear_host_summary(&self.host_name, &mut hosts, &host_name) {
-                    events.push(DaemonEvent::HostSnapshot(Box::new(snapshot)));
-                }
-            }
-        }
-        for (host_name, summary) in normalized {
-            if let Some(snapshot) = update_host_summary(&self.host_name, &mut hosts, &host_name, summary) {
-                events.push(DaemonEvent::HostSnapshot(Box::new(snapshot)));
-            }
-        }
-        drop(hosts);
-
-        self.emit_host_membership_events(events);
-        self.emit_host_membership_events(self.sync_host_membership().await);
-    }
-
-    pub async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState) -> Option<HostSnapshot> {
-        let snapshot = {
-            let mut hosts = self.hosts.write().await;
-            update_host_status(&self.host_name, &mut hosts, host, status.clone())
-        };
-        if let Some(snapshot) = snapshot.as_ref() {
-            self.send_event(DaemonEvent::PeerStatusChanged { host: host.clone(), status });
-            self.send_event(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
-        }
-        self.emit_host_membership_events(self.sync_host_membership().await);
-        snapshot
-    }
-
-    pub async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary) -> Option<HostSnapshot> {
-        let mut summary = summary;
-        summary.host_name = host.clone();
-        let snapshot = {
-            let mut hosts = self.hosts.write().await;
-            update_host_summary(&self.host_name, &mut hosts, host, summary)
-        };
-        if let Some(snapshot) = snapshot.as_ref() {
-            self.send_event(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
-        }
-        snapshot
-    }
-
-    async fn sync_host_membership(&self) -> Vec<DaemonEvent> {
-        let configured = self.configured_peer_names.read().await.clone();
         let remote_counts = self.remote_host_counts().await;
-        let mut hosts = self.hosts.write().await;
-        let mut events = Vec::new();
-
-        for host_name in configured.iter().chain(remote_counts.keys()) {
-            if host_name != &self.host_name {
-                match hosts.entry(host_name.clone()) {
-                    Entry::Vacant(entry) => {
-                        let state = entry.insert(HostState {
-                            connection_status: PeerConnectionState::Disconnected,
-                            summary: None,
-                            seq: 1,
-                            removed: false,
-                        });
-                        events.push(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(&self.host_name, host_name, state))));
-                    }
-                    Entry::Occupied(mut entry) => {
-                        let state = entry.get_mut();
-                        if state.removed {
-                            state.removed = false;
-                            state.seq += 1;
-                            events.push(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(&self.host_name, host_name, state))));
-                        }
-                    }
-                }
-            }
-        }
-
-        let host_names: Vec<_> = hosts.keys().cloned().collect();
-        for host_name in host_names {
-            let Some(state) = hosts.get(&host_name) else {
-                continue;
-            };
-            if should_present_host_state(&self.host_name, &configured, &remote_counts, &host_name, state) {
-                continue;
-            }
-            if let Some(seq) = mark_host_removed(&mut hosts, &host_name) {
-                events.push(DaemonEvent::HostRemoved { host: host_name, seq });
-            }
-        }
-
-        events
+        self.host_registry
+            .set_peer_host_summaries(summaries, &remote_counts, &|e| {
+                let _ = self.event_tx.send(e);
+            })
+            .await;
     }
 
-    fn emit_host_membership_events(&self, events: Vec<DaemonEvent>) {
-        for event in events {
-            self.send_event(event);
-        }
+    pub async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState) {
+        let remote_counts = self.remote_host_counts().await;
+        self.host_registry
+            .publish_peer_connection_status(host, status, &remote_counts, &|e| {
+                let _ = self.event_tx.send(e);
+            })
+            .await;
     }
 
-    pub async fn set_topology_routes(&self, mut routes: Vec<TopologyRoute>) {
-        // Normalize ordering defensively so query output stays stable even if a
-        // future caller bypasses PeerManager's already-sorted route snapshot.
-        routes.sort_by(|a, b| a.target.cmp(&b.target));
-        let mut stored = self.topology_routes.write().await;
-        *stored = routes;
+    pub async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary) {
+        self.host_registry
+            .publish_peer_summary(host, summary, &|e| {
+                let _ = self.event_tx.send(e);
+            })
+            .await;
     }
 
-    async fn local_host_counts(&self) -> crate::host_queries::HostCounts {
+    pub async fn set_topology_routes(&self, routes: Vec<TopologyRoute>) {
+        self.host_registry.set_topology_routes(routes).await;
+    }
+
+    async fn local_host_counts(&self) -> HostCounts {
         let repos = self.repos.read().await;
         let repo_order = self.repo_order.read().await;
-        let mut counts = crate::host_queries::HostCounts::default();
+        let mut counts = HostCounts::default();
 
         for identity in repo_order.iter() {
             let Some(state) = repos.get(identity) else { continue };
             if !state.preferred_root().is_local {
                 continue;
             }
-
             counts.repo_count += 1;
-            let snapshot = build_repo_snapshot_with_peers(
-                SnapshotBuildContext {
-                    repo_identity: state.identity.clone(),
-                    path: state.preferred_path(),
-                    seq: state.seq,
-                    local_providers: &state.last_local_providers,
-                    errors: &state.last_snapshot.errors,
-                    provider_health: &state.last_snapshot.provider_health,
-                    cache: &state.issue_cache,
-                    search_results: &state.search_results,
-                    host_name: &self.host_name,
-                },
-                None,
-            );
-            counts.work_item_count += snapshot.work_items.len();
+            if let Some(snapshot) = state.cached_snapshot() {
+                counts.work_item_count += snapshot.work_items.len();
+            }
         }
 
         counts
     }
 
-    async fn remote_host_counts(&self) -> HashMap<HostName, crate::host_queries::HostCounts> {
+    async fn remote_host_counts(&self) -> HashMap<HostName, HostCounts> {
         let peer_providers = self.peer_providers.read().await;
-        let mut counts: HashMap<HostName, crate::host_queries::HostCounts> = HashMap::new();
+        let mut counts: HashMap<HostName, HostCounts> = HashMap::new();
 
         for peers in peer_providers.values() {
             for (host, providers) in peers {
@@ -1077,7 +640,7 @@ impl InProcessDaemon {
             inject_issues(&state.last_local_providers, &state.issue_cache, &state.search_results),
             &self.host_name,
         );
-        Some((providers, state.local_data_version))
+        Some((providers, state.local_data_version()))
     }
 
     /// Update the peer provider data overlay for a repo and trigger re-broadcast.
@@ -1104,7 +667,12 @@ impl InProcessDaemon {
                 pp.insert(identity.clone(), peers);
             }
         }
-        self.emit_host_membership_events(self.sync_host_membership().await);
+        let remote_counts = self.remote_host_counts().await;
+        self.host_registry
+            .sync_host_membership(&remote_counts, &|e| {
+                let _ = self.event_tx.send(e);
+            })
+            .await;
         self.broadcast_snapshot_inner(repo_path, false).await;
     }
 
@@ -1229,13 +797,13 @@ impl InProcessDaemon {
             state.preferred_root_mut().model.data.loading = false;
 
             let mut proto_snapshot =
-                snapshot_to_proto(state.identity.clone(), state.preferred_path(), state.seq + 1, &re_snapshot, &self.host_name);
+                snapshot_to_proto(state.identity().clone(), state.preferred_path(), state.seq() + 1, &re_snapshot, &self.host_name);
             proto_snapshot.provider_health = crate::convert::health_to_proto(&state.preferred_root().model.data.provider_health);
             proto_snapshot.issue_total = issue_total;
             proto_snapshot.issue_has_more = issue_has_more;
             proto_snapshot.issue_search_results = search_results;
 
-            // Compute and log delta before updating seq
+            // Compute and log delta (also advances seq)
             let delta_entry = state.record_delta(
                 &proto_snapshot.providers,
                 &proto_snapshot.provider_health,
@@ -1250,8 +818,7 @@ impl InProcessDaemon {
                 "recorded repo delta"
             );
 
-            state.seq += 1;
-            state.local_data_version += 1;
+            state.mark_local_change();
             state.last_local_providers = last_local_providers;
             // Store a local-only snapshot (errors + health from the refresh,
             // providers from last_local_providers). Callers that need peer data
@@ -1263,6 +830,7 @@ impl InProcessDaemon {
                 provider_health: re_snapshot.provider_health.clone(),
                 ..Default::default()
             });
+            state.set_cached_snapshot(proto_snapshot.clone());
 
             let event = choose_event(proto_snapshot, delta_entry);
             let _ = self.event_tx.send(event);
@@ -1287,7 +855,7 @@ impl InProcessDaemon {
         let mutex = {
             let repos = self.repos.read().await;
             match repos.get(&identity) {
-                Some(state) => Arc::clone(&state.issue_fetch_mutex),
+                Some(state) => state.issue_fetch_mutex(),
                 None => return,
             }
         };
@@ -1390,7 +958,7 @@ impl InProcessDaemon {
                     if missing.is_empty() {
                         return None;
                     }
-                    Some((identity.clone(), missing, state.registry(), Arc::clone(&state.issue_fetch_mutex)))
+                    Some((identity.clone(), missing, state.registry(), state.issue_fetch_mutex()))
                 })
                 .collect()
         };
@@ -1466,7 +1034,7 @@ impl InProcessDaemon {
                         state.preferred_path().to_path_buf(),
                         since.clone(),
                         state.registry(),
-                        Arc::clone(&state.issue_fetch_mutex),
+                        state.issue_fetch_mutex(),
                         state.issue_cache.len(),
                     ))
                 })
@@ -1578,15 +1146,19 @@ impl InProcessDaemon {
     /// an empty provider registry and an idle refresh handle.
     ///
     /// The `synthetic_path` serves as a stable key for tab identity (e.g.
-    /// `<remote>/desktop/home/dev/repo`). The `provider_data` is the
-    /// initial merged data from peer snapshots.
+    /// `<remote>/desktop/home/dev/repo`).
     ///
-    /// Emits `DaemonEvent::RepoTracked` so the TUI creates a tab.
+    /// `peers` and `overlay_version` seed the peer overlay so the repo
+    /// is immediately queryable — there is no window where the repo is
+    /// visible but has empty data.
+    ///
+    /// Emits `DaemonEvent::RepoTracked` followed by a snapshot broadcast.
     pub async fn add_virtual_repo(
         &self,
         identity: flotilla_protocol::RepoIdentity,
         synthetic_path: PathBuf,
-        provider_data: ProviderData,
+        peers: Vec<(HostName, ProviderData)>,
+        overlay_version: u64,
     ) -> Result<(), String> {
         // Check if already tracked
         {
@@ -1597,7 +1169,6 @@ impl InProcessDaemon {
         }
 
         let mut model = RepoModel::new_virtual();
-        model.data.providers = Arc::new(provider_data);
         model.data.loading = false;
 
         let repo_info = RepoInfo {
@@ -1639,6 +1210,10 @@ impl InProcessDaemon {
         info!(repo = %synthetic_path.display(), "added virtual repo");
         let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
 
+        // Set up the peer overlay and broadcast atomically — no window
+        // where the repo is visible but has empty data.
+        self.set_peer_providers(&synthetic_path, peers, overlay_version).await;
+
         Ok(())
     }
 
@@ -1665,32 +1240,20 @@ impl InProcessDaemon {
             return;
         };
 
-        let proto_snapshot = build_repo_snapshot_with_peers(
-            SnapshotBuildContext {
-                repo_identity: state.identity.clone(),
-                path: state.preferred_path(),
-                seq: state.seq + 1,
-                local_providers: &state.last_local_providers,
-                errors: &state.last_snapshot.errors,
-                provider_health: &state.last_snapshot.provider_health,
-                cache: &state.issue_cache,
-                search_results: &state.search_results,
-                host_name: &self.host_name,
-            },
-            peer_overlay.as_deref(),
-        );
+        let proto_snapshot =
+            build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq() + 1, peer_overlay.as_deref());
 
-        // Compute and log delta
+        // Compute and log delta (also advances seq)
         let delta_entry = state.record_delta(
             &proto_snapshot.providers,
             &proto_snapshot.provider_health,
             &proto_snapshot.errors,
             proto_snapshot.work_items.clone(),
         );
-        state.seq += 1;
         if is_local_change {
-            state.local_data_version += 1;
+            state.mark_local_change();
         }
+        state.set_cached_snapshot(proto_snapshot.clone());
 
         let event = choose_event(proto_snapshot, delta_entry);
         let _ = self.event_tx.send(event);
@@ -1705,55 +1268,7 @@ impl InProcessDaemon {
     /// which emits both a `PeerStatusChanged` and a `HostSnapshot` for live subscribers.
     /// Calling `send_event(PeerStatusChanged)` directly only updates replay state.
     pub fn send_event(&self, event: DaemonEvent) {
-        match &event {
-            DaemonEvent::PeerStatusChanged { host, status } => {
-                if let Ok(mut hosts) = self.hosts.try_write() {
-                    let _ = update_host_status(&self.host_name, &mut hosts, host, status.clone());
-                }
-            }
-            DaemonEvent::HostSnapshot(snap) => {
-                if let Ok(mut hosts) = self.hosts.try_write() {
-                    let mut summary = snap.summary.clone();
-                    summary.host_name = snap.host_name.clone();
-                    match hosts.get_mut(&snap.host_name) {
-                        Some(state) if state.seq == snap.seq => {
-                            state.connection_status = snap.connection_status.clone();
-                            state.removed = false;
-                        }
-                        Some(state) if state.seq < snap.seq => {
-                            *state = HostState {
-                                connection_status: snap.connection_status.clone(),
-                                summary: Some(summary),
-                                seq: snap.seq,
-                                removed: false,
-                            };
-                        }
-                        None => {
-                            hosts.insert(snap.host_name.clone(), HostState {
-                                connection_status: snap.connection_status.clone(),
-                                summary: Some(summary),
-                                seq: snap.seq,
-                                removed: false,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            DaemonEvent::HostRemoved { host, seq } => {
-                if let Ok(mut hosts) = self.hosts.try_write() {
-                    if let Some(state) = hosts.get_mut(host) {
-                        if state.seq <= *seq {
-                            state.connection_status = PeerConnectionState::Disconnected;
-                            state.summary = None;
-                            state.seq = *seq;
-                            state.removed = true;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        self.host_registry.apply_event(&event);
         let _ = self.event_tx.send(event);
     }
 }
@@ -1998,27 +1513,13 @@ impl DaemonHandle for InProcessDaemon {
         let repo_path = self.resolve_repo_selector(repo).await?;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
-        let peer_overlay = {
-            let pp = self.peer_providers.read().await;
-            pp.get(&identity).cloned()
-        };
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
         let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
-
-        Ok(build_repo_snapshot_with_peers(
-            SnapshotBuildContext {
-                repo_identity: state.identity.clone(),
-                path: state.preferred_path(),
-                seq: state.seq,
-                local_providers: &state.last_local_providers,
-                errors: &state.last_snapshot.errors,
-                provider_health: &state.last_snapshot.provider_health,
-                cache: &state.issue_cache,
-                search_results: &state.search_results,
-                host_name: &self.host_name,
-            },
-            peer_overlay.as_deref(),
-        ))
+        Ok(match state.cached_snapshot() {
+            Some(s) => (**s).clone(),
+            None => build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq(), peer_overlay.as_deref()),
+        })
     }
 
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
@@ -2028,7 +1529,7 @@ impl DaemonHandle for InProcessDaemon {
         for identity in order.iter() {
             if let Some(state) = repos.get(identity) {
                 result.push(RepoInfo {
-                    identity: state.identity.clone(),
+                    identity: state.identity().clone(),
                     path: state.preferred_path().to_path_buf(),
                     name: repo_name(state.preferred_path()),
                     labels: state.labels().clone(),
@@ -2206,7 +1707,7 @@ impl DaemonHandle for InProcessDaemon {
             let identity =
                 self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            (state.identity.clone(), state.registry(), state.providers(), state.refresh_trigger())
+            (state.identity().clone(), state.registry(), state.providers(), state.refresh_trigger())
         };
 
         // Broadcast started after repo validation (ensures no orphaned CommandStarted)
@@ -2340,85 +1841,43 @@ impl DaemonHandle for InProcessDaemon {
     async fn replay_since(&self, last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String> {
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
-        let peer_overlay = self.peer_providers.read().await;
-        let mut events = Vec::new();
-
-        for (host_name, state) in self.hosts.read().await.iter() {
-            let stream_key = StreamKey::Host { host_name: host_name.clone() };
-            let up_to_date = last_seen.get(&stream_key).is_some_and(|seq| *seq == state.seq);
-            if up_to_date {
-                continue;
-            }
-            if state.removed {
-                if last_seen.contains_key(&stream_key) {
-                    events.push(DaemonEvent::HostRemoved { host: host_name.clone(), seq: state.seq });
-                }
-            } else {
-                events.push(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(&self.host_name, host_name, state))));
-            }
-        }
+        let mut events = self.host_registry.replay_host_events(last_seen).await;
 
         // Emit repo events
         for identity in order.iter() {
             let Some(state) = repos.get(identity) else {
                 continue;
             };
-            // Skip repos that haven't completed their first refresh yet —
-            // broadcasting empty placeholder state would clear the loading indicator.
-            if state.seq == 0 {
+            let Some(snapshot) = state.cached_snapshot() else {
                 continue;
-            }
-            let peers = peer_overlay.get(identity);
-            let snapshot = || {
-                build_repo_snapshot_with_peers(
-                    SnapshotBuildContext {
-                        repo_identity: state.identity.clone(),
-                        path: state.preferred_path(),
-                        seq: state.seq,
-                        local_providers: &state.last_local_providers,
-                        errors: &state.last_snapshot.errors,
-                        provider_health: &state.last_snapshot.provider_health,
-                        cache: &state.issue_cache,
-                        search_results: &state.search_results,
-                        host_name: &self.host_name,
-                    },
-                    peers.map(|p| p.as_slice()),
-                )
             };
 
-            let repo_stream_key = StreamKey::Repo { identity: state.identity.clone() };
+            let repo_stream_key = StreamKey::Repo { identity: state.identity().clone() };
             match last_seen.get(&repo_stream_key) {
-                Some(&client_seq) => {
-                    // Try to find the client's seq in the delta log and replay from there
-                    let replay_start = state.delta_log.iter().position(|entry| entry.prev_seq == client_seq);
-
-                    if let Some(start_idx) = replay_start {
-                        // Capture issue metadata once — it doesn't change per-entry
-                        let issue_snapshot = snapshot();
-                        // Replay delta entries (each carries pre-correlated work_items)
-                        for entry in state.delta_log.iter().skip(start_idx) {
+                Some(&client_seq) => match state.deltas_since(client_seq) {
+                    Some(deltas) => {
+                        for entry in deltas {
                             events.push(DaemonEvent::RepoDelta(Box::new(RepoDelta {
                                 seq: entry.seq,
                                 prev_seq: entry.prev_seq,
-                                repo_identity: state.identity.clone(),
+                                repo_identity: state.identity().clone(),
                                 repo: state.preferred_path().to_path_buf(),
                                 changes: entry.changes.clone(),
                                 work_items: entry.work_items.clone(),
-                                issue_total: issue_snapshot.issue_total,
-                                issue_has_more: issue_snapshot.issue_has_more,
-                                issue_search_results: issue_snapshot.issue_search_results.clone(),
+                                issue_total: snapshot.issue_total,
+                                issue_has_more: snapshot.issue_has_more,
+                                issue_search_results: snapshot.issue_search_results.clone(),
                             })));
                         }
-                    } else if client_seq == state.seq {
-                        // Client is up to date — no replay needed
-                    } else {
-                        // Seq not in delta log — send full snapshot
-                        events.push(DaemonEvent::RepoSnapshot(Box::new(snapshot())));
                     }
-                }
+                    None => {
+                        // Seq not in delta log — send full snapshot
+                        events.push(DaemonEvent::RepoSnapshot(Box::new((**snapshot).clone())));
+                    }
+                },
                 None => {
                     // Client has never seen this repo — send full snapshot
-                    events.push(DaemonEvent::RepoSnapshot(Box::new(snapshot())));
+                    events.push(DaemonEvent::RepoSnapshot(Box::new((**snapshot).clone())));
                 }
             }
         }
@@ -2434,25 +1893,18 @@ impl DaemonHandle for InProcessDaemon {
 
         for identity in repo_order.iter() {
             let Some(state) = repos.get(identity) else { continue };
-            let peer_overlay = peer_providers.get(identity).cloned();
-            let snapshot = build_repo_snapshot_with_peers(
-                SnapshotBuildContext {
-                    repo_identity: state.identity.clone(),
-                    path: state.preferred_path(),
-                    seq: state.seq,
-                    local_providers: &state.last_local_providers,
-                    errors: &state.last_snapshot.errors,
-                    provider_health: &state.last_snapshot.provider_health,
-                    cache: &state.issue_cache,
-                    search_results: &state.search_results,
-                    host_name: &self.host_name,
-                },
-                peer_overlay.as_deref(),
-            );
+            let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+                Some(s) => std::borrow::Cow::Borrowed(s),
+                None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                    state.snapshot_context(&self.host_name),
+                    state.seq(),
+                    peer_providers.get(identity).map(|v| v.as_slice()),
+                )),
+            };
             summaries.push(RepoSummary {
                 path: state.preferred_path().to_path_buf(),
                 slug: state.slug().map(str::to_string),
-                provider_health: snapshot.provider_health,
+                provider_health: snapshot.provider_health.clone(),
                 work_item_count: snapshot.work_items.len(),
                 error_count: snapshot.errors.len(),
             });
@@ -2462,63 +1914,43 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn get_repo_detail(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
-        let repos = self.repos.read().await;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let peer_overlay = {
-            let pp = self.peer_providers.read().await;
-            pp.get(&identity).cloned()
-        };
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let path = state.preferred_path().to_path_buf();
-        let snapshot = build_repo_snapshot_with_peers(
-            SnapshotBuildContext {
-                repo_identity: state.identity.clone(),
-                path: state.preferred_path(),
-                seq: state.seq,
-                local_providers: &state.last_local_providers,
-                errors: &state.last_snapshot.errors,
-                provider_health: &state.last_snapshot.provider_health,
-                cache: &state.issue_cache,
-                search_results: &state.search_results,
-                host_name: &self.host_name,
-            },
-            peer_overlay.as_deref(),
-        );
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
         Ok(RepoDetailResponse {
-            path,
+            path: state.preferred_path().to_path_buf(),
             slug: state.slug().map(str::to_string),
-            provider_health: snapshot.provider_health,
-            work_items: snapshot.work_items,
-            errors: snapshot.errors,
+            provider_health: snapshot.provider_health.clone(),
+            work_items: snapshot.work_items.clone(),
+            errors: snapshot.errors.clone(),
         })
     }
 
     async fn get_repo_providers(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
-        let repos = self.repos.read().await;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let peer_overlay = {
-            let pp = self.peer_providers.read().await;
-            pp.get(&identity).cloned()
-        };
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let path = state.preferred_path().to_path_buf();
-        let snapshot = build_repo_snapshot_with_peers(
-            SnapshotBuildContext {
-                repo_identity: state.identity.clone(),
-                path: state.preferred_path(),
-                seq: state.seq,
-                local_providers: &state.last_local_providers,
-                errors: &state.last_snapshot.errors,
-                provider_health: &state.last_snapshot.provider_health,
-                cache: &state.issue_cache,
-                search_results: &state.search_results,
-                host_name: &self.host_name,
-            },
-            peer_overlay.as_deref(),
-        );
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
 
         let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
         let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
@@ -2539,7 +1971,7 @@ impl DaemonHandle for InProcessDaemon {
             state.unmet().iter().map(|(factory, req)| crate::convert::unmet_requirement_to_proto(factory, req)).collect();
 
         Ok(RepoProvidersResponse {
-            path,
+            path: state.preferred_path().to_path_buf(),
             slug: state.slug().map(str::to_string),
             host_discovery,
             repo_discovery,
@@ -2550,106 +1982,45 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn get_repo_work(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
-        let repos = self.repos.read().await;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let peer_overlay = {
-            let pp = self.peer_providers.read().await;
-            pp.get(&identity).cloned()
-        };
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let path = state.preferred_path().to_path_buf();
-        let snapshot = build_repo_snapshot_with_peers(
-            SnapshotBuildContext {
-                repo_identity: state.identity.clone(),
-                path: state.preferred_path(),
-                seq: state.seq,
-                local_providers: &state.last_local_providers,
-                errors: &state.last_snapshot.errors,
-                provider_health: &state.last_snapshot.provider_health,
-                cache: &state.issue_cache,
-                search_results: &state.search_results,
-                host_name: &self.host_name,
-            },
-            peer_overlay.as_deref(),
-        );
-        Ok(RepoWorkResponse { path, slug: state.slug().map(str::to_string), work_items: snapshot.work_items })
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
+        Ok(RepoWorkResponse {
+            path: state.preferred_path().to_path_buf(),
+            slug: state.slug().map(str::to_string),
+            work_items: snapshot.work_items.clone(),
+        })
     }
 
     async fn list_hosts(&self) -> Result<HostListResponse, String> {
-        let configured = self.configured_peer_names.read().await.clone();
-        let hosts: HashMap<_, _> =
-            self.hosts.read().await.iter().filter(|(_, state)| !state.removed).map(|(host, state)| (host.clone(), state.clone())).collect();
-        let statuses = hosts.iter().map(|(host, state)| (host.clone(), state.connection_status.clone())).collect();
-        let summaries = hosts.iter().filter_map(|(host, state)| state.summary.clone().map(|summary| (host.clone(), summary))).collect();
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
-
-        let hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts)
-            .into_iter()
-            .map(|host| {
-                crate::host_queries::build_host_list_entry(
-                    &host,
-                    &self.host_name,
-                    &configured,
-                    &statuses,
-                    &summaries,
-                    local_counts,
-                    &remote_counts,
-                )
-            })
-            .collect();
-
-        Ok(HostListResponse { hosts })
+        Ok(self.host_registry.list_hosts(local_counts, &remote_counts).await)
     }
 
     async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String> {
-        let configured = self.configured_peer_names.read().await.clone();
-        let hosts: HashMap<_, _> =
-            self.hosts.read().await.iter().filter(|(_, state)| !state.removed).map(|(host, state)| (host.clone(), state.clone())).collect();
-        let statuses = hosts.iter().map(|(host, state)| (host.clone(), state.connection_status.clone())).collect();
-        let summaries = hosts.iter().filter_map(|(host, state)| state.summary.clone().map(|summary| (host.clone(), summary))).collect();
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
-        let known_hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts);
-        let resolved =
-            known_hosts.into_iter().find(|candidate| candidate.as_str() == host).ok_or_else(|| format!("host not found: {host}"))?;
-        let summary = if resolved == self.host_name { Some(self.local_host_summary.clone()) } else { summaries.get(&resolved).cloned() };
-
-        Ok(crate::host_queries::build_host_status(
-            &resolved,
-            &self.host_name,
-            &configured,
-            &statuses,
-            summary,
-            local_counts,
-            &remote_counts,
-        ))
+        self.host_registry.get_host_status(host, local_counts, &remote_counts).await
     }
 
     async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String> {
-        let configured = self.configured_peer_names.read().await.clone();
-        let hosts: HashMap<_, _> =
-            self.hosts.read().await.iter().filter(|(_, state)| !state.removed).map(|(host, state)| (host.clone(), state.clone())).collect();
-        let statuses = hosts.iter().map(|(host, state)| (host.clone(), state.connection_status.clone())).collect();
-        let summaries = hosts.iter().filter_map(|(host, state)| state.summary.clone().map(|summary| (host.clone(), summary))).collect();
         let remote_counts = self.remote_host_counts().await;
-        let known_hosts = crate::host_queries::known_hosts(&self.host_name, &configured, &statuses, &summaries, &remote_counts);
-        let resolved =
-            known_hosts.into_iter().find(|candidate| candidate.as_str() == host).ok_or_else(|| format!("host not found: {host}"))?;
-        let summary = if resolved == self.host_name {
-            self.local_host_summary.clone()
-        } else {
-            summaries.get(&resolved).cloned().ok_or_else(|| format!("no summary available for host: {host}"))?
-        };
-
-        Ok(crate::host_queries::build_host_providers(&resolved, &self.host_name, &configured, &statuses, summary))
+        self.host_registry.get_host_providers(host, &remote_counts).await
     }
 
     async fn get_topology(&self) -> Result<TopologyResponse, String> {
-        let routes = self.topology_routes.read().await.clone();
-        let configured = self.configured_peer_names.read().await.clone();
-        Ok(crate::host_queries::build_topology(&self.host_name, &routes, &configured))
+        Ok(self.host_registry.get_topology().await)
     }
 }
 
@@ -2806,7 +2177,6 @@ mod tests {
             SnapshotBuildContext {
                 repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
                 path: Path::new("/tmp/repo"),
-                seq: 7,
                 local_providers: &default_snap.providers,
                 errors: &default_snap.errors,
                 provider_health: &default_snap.provider_health,
@@ -2814,6 +2184,7 @@ mod tests {
                 search_results: &None,
                 host_name: &HostName::local(),
             },
+            7,
             None,
         );
         assert_eq!(snap.seq, 7);
@@ -2883,7 +2254,6 @@ mod tests {
             SnapshotBuildContext {
                 repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
                 path: Path::new("/tmp/repo"),
-                seq: 1,
                 local_providers: &default_snap.providers,
                 errors: &default_snap.errors,
                 provider_health: &default_snap.provider_health,
@@ -2891,6 +2261,7 @@ mod tests {
                 search_results: &None,
                 host_name: &host_a,
             },
+            1,
             Some(&peers),
         );
 
@@ -2943,7 +2314,6 @@ mod tests {
             SnapshotBuildContext {
                 repo_identity: fallback_repo_identity(Path::new("/home/dev/repo")),
                 path: Path::new("/home/dev/repo"),
-                seq: 1,
                 local_providers: &local_providers,
                 errors: &default_snap.errors,
                 provider_health: &default_snap.provider_health,
@@ -2951,6 +2321,7 @@ mod tests {
                 search_results: &None,
                 host_name: &local_host,
             },
+            1,
             Some(&peers),
         );
         assert_eq!(first_snap.providers.checkouts.len(), 2, "first build should have local + peer checkout");
@@ -2966,7 +2337,6 @@ mod tests {
             SnapshotBuildContext {
                 repo_identity: fallback_repo_identity(Path::new("/home/dev/repo")),
                 path: Path::new("/home/dev/repo"),
-                seq: 2,
                 local_providers: &local_providers,
                 errors: &default_snap.errors,
                 provider_health: &default_snap.provider_health,
@@ -2974,6 +2344,7 @@ mod tests {
                 search_results: &None,
                 host_name: &local_host,
             },
+            2,
             Some(&peers),
         );
 
@@ -3041,7 +2412,6 @@ mod tests {
             SnapshotBuildContext {
                 repo_identity: fallback_repo_identity(Path::new("/Users/robert/dev/flotilla")),
                 path: Path::new("/Users/robert/dev/flotilla"),
-                seq: 1,
                 local_providers: &local_providers,
                 errors: &default_snap.errors,
                 provider_health: &default_snap.provider_health,
@@ -3049,6 +2419,7 @@ mod tests {
                 search_results: &None,
                 host_name: &local_host,
             },
+            1,
             Some(&peers),
         );
 
@@ -3071,198 +2442,5 @@ mod tests {
             !snapshot.providers.checkouts.contains_key(&ghost_checkout),
             "remote checkout path must not be duplicated under the local host"
         );
-    }
-
-    // --- RepoState::record_delta ---
-
-    /// Helper to create a minimal RepoState for delta testing.
-    fn make_repo_state() -> RepoState {
-        RepoState::new(fallback_repo_identity(Path::new("/virtual")), RepoRootState {
-            path: PathBuf::from("/virtual"),
-            model: crate::model::RepoModel::new_virtual(),
-            slug: None,
-            repo_bag: crate::providers::discovery::EnvironmentBag::new(),
-            unmet: Vec::new(),
-            is_local: false,
-        })
-    }
-
-    #[tokio::test]
-    async fn record_delta_detects_added_checkout() {
-        let mut state = make_repo_state();
-
-        let mut new_providers = ProviderData::default();
-        new_providers.checkouts.insert(flotilla_protocol::HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")), Checkout {
-            branch: "feat".into(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-        });
-
-        let entry = state.record_delta(&new_providers, &HashMap::new(), &[], vec![]);
-
-        assert_eq!(entry.prev_seq, 0);
-        assert_eq!(entry.seq, 1);
-        assert!(
-            entry.changes.iter().any(|c| matches!(c, flotilla_protocol::Change::Checkout { op: flotilla_protocol::EntryOp::Added(_), .. })),
-            "should have an Added checkout change"
-        );
-    }
-
-    #[tokio::test]
-    async fn record_delta_detects_provider_health_update() {
-        let mut state = make_repo_state();
-        state.last_broadcast_health = HashMap::from([("vcs".into(), HashMap::from([("git".into(), true)]))]);
-
-        // Change the health value from true to false
-        let new_health = HashMap::from([("vcs".into(), HashMap::from([("git".into(), false)]))]);
-        let entry = state.record_delta(&ProviderData::default(), &new_health, &[], vec![]);
-
-        assert!(
-            entry.changes.iter().any(|c| matches!(
-                c,
-                flotilla_protocol::Change::ProviderHealth {
-                    category,
-                    provider,
-                    op: flotilla_protocol::EntryOp::Updated(false),
-                } if category == "vcs" && provider == "git"
-            )),
-            "should have an Updated health change: {:?}",
-            entry.changes
-        );
-    }
-
-    #[tokio::test]
-    async fn record_delta_detects_provider_health_added() {
-        let mut state = make_repo_state();
-
-        // New health entry with no prior state
-        let new_health = HashMap::from([("change_request".into(), HashMap::from([("github".into(), true)]))]);
-        let entry = state.record_delta(&ProviderData::default(), &new_health, &[], vec![]);
-
-        assert!(
-            entry.changes.iter().any(|c| matches!(
-                c,
-                flotilla_protocol::Change::ProviderHealth {
-                    category,
-                    provider,
-                    op: flotilla_protocol::EntryOp::Added(true),
-                } if category == "change_request" && provider == "github"
-            )),
-            "should have an Added health change: {:?}",
-            entry.changes
-        );
-    }
-
-    #[tokio::test]
-    async fn record_delta_detects_provider_health_removed() {
-        let mut state = make_repo_state();
-        state.last_broadcast_health = HashMap::from([("vcs".into(), HashMap::from([("git".into(), true)]))]);
-
-        // Empty health means the old entry was removed
-        let entry = state.record_delta(&ProviderData::default(), &HashMap::new(), &[], vec![]);
-
-        assert!(
-            entry.changes.iter().any(|c| matches!(
-                c,
-                flotilla_protocol::Change::ProviderHealth {
-                    category,
-                    provider,
-                    op: flotilla_protocol::EntryOp::Removed,
-                } if category == "vcs" && provider == "git"
-            )),
-            "should have a Removed health change: {:?}",
-            entry.changes
-        );
-    }
-
-    #[tokio::test]
-    async fn record_delta_detects_error_change() {
-        let mut state = make_repo_state();
-
-        let new_errors = vec![ProviderError { category: "vcs".into(), provider: "git".into(), message: "failed".into() }];
-        let entry = state.record_delta(&ProviderData::default(), &HashMap::new(), &new_errors, vec![]);
-
-        assert!(
-            entry.changes.iter().any(|c| matches!(c, flotilla_protocol::Change::ErrorsChanged(_))),
-            "should have an ErrorsChanged entry: {:?}",
-            entry.changes
-        );
-    }
-
-    #[tokio::test]
-    async fn record_delta_log_bounded_at_capacity() {
-        let mut state = make_repo_state();
-
-        // Record more deltas than DELTA_LOG_CAPACITY
-        for i in 0..(DELTA_LOG_CAPACITY + 5) {
-            let mut providers = ProviderData::default();
-            // Change something each iteration so a delta is produced
-            providers.checkouts.insert(
-                flotilla_protocol::HostPath::new(HostName::new("host"), PathBuf::from(format!("/tmp/co-{i}"))),
-                Checkout {
-                    branch: format!("feat-{i}"),
-                    is_main: false,
-                    trunk_ahead_behind: None,
-                    remote_ahead_behind: None,
-                    working_tree: None,
-                    last_commit: None,
-                    correlation_keys: vec![],
-                    association_keys: vec![],
-                },
-            );
-            state.record_delta(&providers, &HashMap::new(), &[], vec![]);
-            // Update seq to match what record_delta expects
-            state.seq = state.delta_log.back().expect("delta log non-empty").seq;
-        }
-
-        assert_eq!(state.delta_log.len(), DELTA_LOG_CAPACITY, "delta log should be bounded at {DELTA_LOG_CAPACITY}");
-    }
-
-    #[tokio::test]
-    async fn record_delta_seq_increments_correctly() {
-        let mut state = make_repo_state();
-
-        let entry1 = state.record_delta(&ProviderData::default(), &HashMap::new(), &[], vec![]);
-        assert_eq!(entry1.prev_seq, 0, "first delta prev_seq should be 0");
-        assert_eq!(entry1.seq, 1, "first delta seq should be 1");
-
-        // Advance state.seq to match
-        state.seq = entry1.seq;
-
-        let entry2 = state.record_delta(&ProviderData::default(), &HashMap::new(), &[], vec![]);
-        assert_eq!(entry2.prev_seq, 1, "second delta prev_seq should be 1");
-        assert_eq!(entry2.seq, 2, "second delta seq should be 2");
-    }
-
-    #[tokio::test]
-    async fn record_delta_updates_tracking_state() {
-        let mut state = make_repo_state();
-
-        let new_health = HashMap::from([("vcs".into(), HashMap::from([("git".into(), true)]))]);
-        let new_errors = vec![ProviderError { category: "vcs".into(), provider: "git".into(), message: "oops".into() }];
-        let mut new_providers = ProviderData::default();
-        new_providers.checkouts.insert(flotilla_protocol::HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")), Checkout {
-            branch: "feat".into(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-        });
-
-        state.record_delta(&new_providers, &new_health, &new_errors, vec![]);
-
-        // After record_delta, the tracking state should be updated to the new values
-        assert_eq!(state.last_broadcast_providers, new_providers);
-        assert_eq!(state.last_broadcast_health, new_health);
-        assert_eq!(state.last_broadcast_errors, new_errors);
-        assert_eq!(state.delta_log.len(), 1);
     }
 }
