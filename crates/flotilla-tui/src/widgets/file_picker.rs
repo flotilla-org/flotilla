@@ -139,6 +139,8 @@ impl InteractiveWidget for FilePickerWidget {
     }
 
     fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
+        // Only reached for unresolved keys (typing) because FilePicker uses
+        // no_shared_fallback; navigation keys are handled via handle_action.
         self.input.handle_event(&crossterm::event::Event::Key(key));
         self.selected = 0;
         self.refresh_dir_listing(ctx.model);
