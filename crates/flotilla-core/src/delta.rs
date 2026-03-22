@@ -132,8 +132,8 @@ mod tests {
 
     use flotilla_protocol::{
         delta::{Branch, BranchStatus},
-        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, HostName, HostPath, Issue, ManagedTerminal, ManagedTerminalId,
-        ProviderError, SessionStatus, TerminalStatus, Workspace,
+        AttachableId, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, HostName, HostPath, Issue,
+        ManagedTerminal, ProviderError, SessionStatus, TerminalStatus, Workspace,
     };
 
     use super::*;
@@ -561,13 +561,11 @@ mod tests {
 
     fn terminal(role: &str, status: TerminalStatus) -> ManagedTerminal {
         ManagedTerminal {
-            id: ManagedTerminalId { checkout: "main".into(), role: role.into(), index: 0 },
+            set_id: AttachableSetId::new("set-1"),
             role: role.into(),
             command: "bash".into(),
             working_directory: PathBuf::from("/repo"),
             status,
-            attachable_id: None,
-            attachable_set_id: None,
         }
     }
 
@@ -575,41 +573,41 @@ mod tests {
     fn diff_terminal_added() {
         let prev = ProviderData::default();
         let mut curr = ProviderData::default();
-        curr.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
+        curr.managed_terminals.insert(AttachableId::new("t1"), terminal("editor", TerminalStatus::Running));
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Added(_) } if key == "t1"));
+        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Added(_) } if key.as_str() == "t1"));
     }
 
     #[test]
     fn diff_terminal_removed() {
         let mut prev = ProviderData::default();
-        prev.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
+        prev.managed_terminals.insert(AttachableId::new("t1"), terminal("editor", TerminalStatus::Running));
         let curr = ProviderData::default();
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Removed } if key == "t1"));
+        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Removed } if key.as_str() == "t1"));
     }
 
     #[test]
     fn diff_terminal_status_changed() {
         let mut prev = ProviderData::default();
-        prev.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
+        prev.managed_terminals.insert(AttachableId::new("t1"), terminal("editor", TerminalStatus::Running));
         let mut curr = ProviderData::default();
-        curr.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Disconnected));
+        curr.managed_terminals.insert(AttachableId::new("t1"), terminal("editor", TerminalStatus::Disconnected));
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Updated(_) } if key == "t1"));
+        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Updated(_) } if key.as_str() == "t1"));
     }
 
     #[test]
     fn roundtrip_terminal_changes() {
         let mut prev = ProviderData::default();
-        prev.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
+        prev.managed_terminals.insert(AttachableId::new("t1"), terminal("editor", TerminalStatus::Running));
 
         let mut curr = ProviderData::default();
-        curr.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Exited(0)));
-        curr.managed_terminals.insert("t2".into(), terminal("shell", TerminalStatus::Running));
+        curr.managed_terminals.insert(AttachableId::new("t1"), terminal("editor", TerminalStatus::Exited(0)));
+        curr.managed_terminals.insert(AttachableId::new("t2"), terminal("shell", TerminalStatus::Running));
 
         let changes = diff_provider_data(&prev, &curr);
         assert_eq!(changes.len(), 2);

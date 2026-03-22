@@ -33,7 +33,6 @@ impl Factory for CodexCodingAgentFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         if env.has_auth("codex") {
             let http = Arc::new(ReqwestHttpClient::new());
@@ -55,10 +54,7 @@ mod tests {
     use super::CodexCodingAgentFactory;
     use crate::{
         config::ConfigStore,
-        providers::discovery::{
-            test_support::{test_attachable_store, DiscoveryMockRunner},
-            EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement,
-        },
+        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
     fn bag_with_codex_auth() -> EnvironmentBag {
@@ -71,7 +67,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CodexCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
+        let result = CodexCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -81,7 +77,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CodexCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner, test_attachable_store(&config)).await;
+        let result = CodexCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without codex auth");
         assert!(unmet.contains(&UnmetRequirement::MissingAuth("codex".into())));
     }

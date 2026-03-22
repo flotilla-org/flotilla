@@ -5,7 +5,8 @@ use flotilla_protocol::{HostName, ProviderData};
 /// Host-scoped data is merged with ownership-aware rules:
 /// - checkouts are accepted only from the host that owns the `HostPath`
 /// - local-host checkouts are never overwritten by peer data
-/// - managed terminals and workspaces are namespaced by peer host to avoid collisions
+/// - managed terminals are namespaced by peer host to avoid collisions
+/// - workspaces are namespaced by peer host to avoid collisions
 ///
 /// Service-level data (change_requests, issues, sessions) comes only
 /// from the leader — followers don't poll external APIs, so there are no
@@ -30,8 +31,8 @@ pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &
         }
 
         // Merge managed terminals with host-namespaced keys
-        for (name, terminal) in &peer_data.managed_terminals {
-            let namespaced = format!("{}:{}", peer_host, name);
+        for (id, terminal) in &peer_data.managed_terminals {
+            let namespaced = flotilla_protocol::AttachableId::new(format!("{}:{}", peer_host, id));
             merged.managed_terminals.insert(namespaced, terminal.clone());
         }
 

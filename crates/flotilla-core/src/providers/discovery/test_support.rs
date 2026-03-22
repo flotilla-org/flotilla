@@ -10,14 +10,14 @@ use std::{
     process::Command as ProcessCommand,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
     },
 };
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId,
-    RepoIdentity, TerminalStatus, Workspace,
+    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset,
+    IssuePage, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -26,8 +26,14 @@ use crate::{
     attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
     providers::{
-        change_request::ChangeRequestTracker, discovery::EnvVars, issue_tracker::IssueTracker, terminal::TerminalPool,
-        vcs::CheckoutManager, workspace::WorkspaceManager, ChannelLabel, CommandOutput, CommandRunner,
+        change_request::ChangeRequestTracker,
+        discovery::EnvVars,
+        issue_tracker::IssueTracker,
+        terminal::TerminalPool,
+        types::BranchInfo,
+        vcs::{CheckoutManager, Vcs},
+        workspace::WorkspaceManager,
+        ChannelLabel, CommandOutput, CommandRunner,
     },
 };
 
@@ -336,12 +342,228 @@ impl IssueTracker for FakeIssueTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FakeVcsState — shared state for FakeVcs + FakeCheckoutManager
+// ---------------------------------------------------------------------------
+
+/// Shared in-memory VCS state for fake providers.
+///
+/// Construct with [`FakeVcsStateBuilder`] and share via `Arc<RwLock<FakeVcsState>>`.
+/// Both [`FakeVcs`] and [`FakeCheckoutManager`] read from (and write to) this state.
+pub struct FakeVcsState {
+    pub root: PathBuf,
+    pub branches: Vec<BranchInfo>,
+    pub remote_branches: Vec<String>,
+    pub checkouts: Vec<(PathBuf, Checkout)>,
+    pub commit_log: Vec<CommitInfo>,
+    /// Per-branch ahead/behind overrides. If absent for a branch, returns `Err`.
+    pub ahead_behind: std::collections::HashMap<String, AheadBehind>,
+    /// Per-checkout-path working tree overrides. If absent for a path, returns `Err`.
+    pub working_tree: std::collections::HashMap<PathBuf, WorkingTreeStatus>,
+}
+
+impl FakeVcsState {
+    pub fn builder(root: impl Into<PathBuf>) -> FakeVcsStateBuilder {
+        FakeVcsStateBuilder::new(root)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeVcsStateBuilder
+// ---------------------------------------------------------------------------
+
+pub struct FakeVcsStateBuilder {
+    root: PathBuf,
+    branches: Vec<BranchInfo>,
+    remote_branches: Vec<String>,
+    checkouts: Vec<(PathBuf, Checkout)>,
+    commit_log: Vec<CommitInfo>,
+    ahead_behind: std::collections::HashMap<String, AheadBehind>,
+    working_tree: std::collections::HashMap<PathBuf, WorkingTreeStatus>,
+}
+
+impl FakeVcsStateBuilder {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            branches: Vec::new(),
+            remote_branches: Vec::new(),
+            checkouts: Vec::new(),
+            commit_log: Vec::new(),
+            ahead_behind: std::collections::HashMap::new(),
+            working_tree: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root = root.into();
+        self
+    }
+
+    pub fn branch(mut self, name: impl Into<String>, is_trunk: bool) -> Self {
+        self.branches.push(BranchInfo { name: name.into(), is_trunk });
+        self
+    }
+
+    pub fn remote_branch(mut self, name: impl Into<String>) -> Self {
+        self.remote_branches.push(name.into());
+        self
+    }
+
+    pub fn checkout(self, branch: impl Into<String>) -> CheckoutBuilder {
+        CheckoutBuilder::new(self, branch.into())
+    }
+
+    /// Add a [`Checkout`] directly without going through the builder DSL.
+    ///
+    /// Useful when the test needs full control over `correlation_keys` and
+    /// `association_keys` (e.g. to replicate an existing fixture exactly).
+    pub fn checkout_raw(mut self, path: impl Into<PathBuf>, checkout: Checkout) -> Self {
+        self.checkouts.push((path.into(), checkout));
+        self
+    }
+
+    pub fn commit(mut self, info: CommitInfo) -> Self {
+        self.commit_log.push(info);
+        self
+    }
+
+    pub fn build(self) -> Arc<RwLock<FakeVcsState>> {
+        Arc::new(RwLock::new(FakeVcsState {
+            root: self.root,
+            branches: self.branches,
+            remote_branches: self.remote_branches,
+            checkouts: self.checkouts,
+            commit_log: self.commit_log,
+            ahead_behind: self.ahead_behind,
+            working_tree: self.working_tree,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CheckoutBuilder — fluent builder for individual Checkout entries
+// ---------------------------------------------------------------------------
+
+pub struct CheckoutBuilder {
+    parent: FakeVcsStateBuilder,
+    branch: String,
+    path: Option<PathBuf>,
+    is_main: bool,
+    correlation_keys: Vec<CorrelationKey>,
+    association_keys: Vec<AssociationKey>,
+}
+
+impl CheckoutBuilder {
+    fn new(parent: FakeVcsStateBuilder, branch: String) -> Self {
+        let correlation_keys = vec![CorrelationKey::Branch(branch.clone())];
+        Self { parent, branch, path: None, is_main: false, correlation_keys, association_keys: Vec::new() }
+    }
+
+    /// Override the checkout path. Without this, the path defaults to
+    /// `root.join(branch.replace('/', "-"))`.
+    pub fn path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn is_main(mut self, yes: bool) -> Self {
+        self.is_main = yes;
+        self
+    }
+
+    pub fn correlation_key(mut self, key: CorrelationKey) -> Self {
+        self.correlation_keys.push(key);
+        self
+    }
+
+    pub fn association_key(mut self, key: AssociationKey) -> Self {
+        self.association_keys.push(key);
+        self
+    }
+
+    pub fn build(mut self) -> FakeVcsStateBuilder {
+        let path = self.path.unwrap_or_else(|| self.parent.root.join(self.branch.replace('/', "-")));
+        let checkout = Checkout {
+            branch: self.branch,
+            is_main: self.is_main,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: self.correlation_keys,
+            association_keys: self.association_keys,
+        };
+        self.parent.checkouts.push((path, checkout));
+        self.parent
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeVcs
+// ---------------------------------------------------------------------------
+
+/// In-memory [`Vcs`] implementation backed by [`FakeVcsState`].
+pub struct FakeVcs {
+    state: Arc<RwLock<FakeVcsState>>,
+}
+
+impl FakeVcs {
+    pub fn new(state: Arc<RwLock<FakeVcsState>>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl Vcs for FakeVcs {
+    async fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
+        let state = self.state.read().expect("FakeVcs state poisoned");
+        if path.starts_with(&state.root) {
+            Some(state.root.clone())
+        } else {
+            None
+        }
+    }
+
+    async fn list_local_branches(&self, _repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
+        Ok(self.state.read().expect("FakeVcs state poisoned").branches.clone())
+    }
+
+    async fn list_remote_branches(&self, _repo_root: &Path) -> Result<Vec<String>, String> {
+        Ok(self.state.read().expect("FakeVcs state poisoned").remote_branches.clone())
+    }
+
+    async fn commit_log(&self, _repo_root: &Path, _branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
+        Ok(self.state.read().expect("FakeVcs state poisoned").commit_log.iter().take(limit).cloned().collect())
+    }
+
+    async fn ahead_behind(&self, _repo_root: &Path, branch: &str, _reference: &str) -> Result<AheadBehind, String> {
+        let state = self.state.read().expect("FakeVcs state poisoned");
+        state.ahead_behind.get(branch).cloned().ok_or_else(|| format!("FakeVcs: ahead_behind not configured for branch {branch:?}"))
+    }
+
+    async fn working_tree_status(&self, _repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String> {
+        let state = self.state.read().expect("FakeVcs state poisoned");
+        state
+            .working_tree
+            .get(checkout_path)
+            .cloned()
+            .ok_or_else(|| format!("FakeVcs: working_tree_status not configured for {}", checkout_path.display()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeCheckoutManager — state-backed, replaces the old TokioMutex version
+// ---------------------------------------------------------------------------
+
 /// A configurable fake checkout manager for integration and E2E tests.
 ///
-/// Pre-seed checkouts via `add_checkouts()`. Supports `create_checkout`
-/// and `remove_checkout` for tests that exercise the full lifecycle.
+/// Either construct standalone with [`FakeCheckoutManager::new`] and seed
+/// via [`add_checkouts`](FakeCheckoutManager::add_checkouts), or build from a
+/// [`FakeVcsState`] via [`FakeCheckoutManager::from_state`] to share state
+/// with a [`FakeVcs`].
 pub struct FakeCheckoutManager {
-    pub checkouts: Arc<TokioMutex<Vec<(PathBuf, Checkout)>>>,
+    state: Arc<RwLock<FakeVcsState>>,
 }
 
 impl Default for FakeCheckoutManager {
@@ -351,19 +573,27 @@ impl Default for FakeCheckoutManager {
 }
 
 impl FakeCheckoutManager {
+    /// Create a standalone instance backed by an anonymous root at `/fake-repo`.
     pub fn new() -> Self {
-        Self { checkouts: Arc::new(TokioMutex::new(Vec::new())) }
+        Self { state: FakeVcsState::builder("/fake-repo").build() }
     }
 
+    /// Create an instance sharing state with an existing [`FakeVcsState`].
+    pub fn from_state(state: Arc<RwLock<FakeVcsState>>) -> Self {
+        Self { state }
+    }
+
+    /// Pre-seed the checkout store. Compatible with tests that build
+    /// [`Checkout`] structs directly.
     pub async fn add_checkouts(&self, checkouts: Vec<(PathBuf, Checkout)>) {
-        self.checkouts.lock().await.extend(checkouts);
+        self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.extend(checkouts);
     }
 }
 
 #[async_trait::async_trait]
 impl CheckoutManager for FakeCheckoutManager {
     async fn list_checkouts(&self, _repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
-        Ok(self.checkouts.lock().await.clone())
+        Ok(self.state.read().expect("FakeCheckoutManager state poisoned").checkouts.clone())
     }
 
     async fn create_checkout(&self, repo_root: &Path, branch: &str, _create_branch: bool) -> Result<(PathBuf, Checkout), String> {
@@ -378,12 +608,12 @@ impl CheckoutManager for FakeCheckoutManager {
             correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
             association_keys: vec![],
         };
-        self.checkouts.lock().await.push((path.clone(), checkout.clone()));
+        self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.push((path.clone(), checkout.clone()));
         Ok((path, checkout))
     }
 
     async fn remove_checkout(&self, _repo_root: &Path, branch: &str) -> Result<(), String> {
-        self.checkouts.lock().await.retain(|(_, co)| co.branch != branch);
+        self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.retain(|(_, co)| co.branch != branch);
         Ok(())
     }
 }
@@ -444,8 +674,8 @@ impl WorkspaceManager for FakeWorkspaceManager {
 }
 
 pub struct FakeTerminalPool {
-    pub terminals: Arc<TokioMutex<Vec<ManagedTerminal>>>,
-    pub killed: Arc<TokioMutex<Vec<ManagedTerminalId>>>,
+    pub sessions: Arc<TokioMutex<Vec<super::super::terminal::TerminalSession>>>,
+    pub killed: Arc<TokioMutex<Vec<String>>>,
 }
 
 impl Default for FakeTerminalPool {
@@ -456,49 +686,46 @@ impl Default for FakeTerminalPool {
 
 impl FakeTerminalPool {
     pub fn new() -> Self {
-        Self { terminals: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
+        Self { sessions: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
     }
 
-    pub async fn add_terminals(&self, terminals: Vec<ManagedTerminal>) {
-        self.terminals.lock().await.extend(terminals);
+    pub async fn add_sessions(&self, sessions: Vec<super::super::terminal::TerminalSession>) {
+        self.sessions.lock().await.extend(sessions);
     }
 }
 
 #[async_trait::async_trait]
 impl TerminalPool for FakeTerminalPool {
-    async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
-        Ok(self.terminals.lock().await.clone())
+    async fn list_sessions(&self) -> Result<Vec<super::super::terminal::TerminalSession>, String> {
+        Ok(self.sessions.lock().await.clone())
     }
 
-    async fn ensure_running(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<(), String> {
-        let mut terminals = self.terminals.lock().await;
-        if terminals.iter().any(|terminal| &terminal.id == id) {
+    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.iter().any(|s| s.session_name == session_name) {
             return Ok(());
         }
-        terminals.push(ManagedTerminal {
-            id: id.clone(),
-            role: id.role.clone(),
-            command: command.to_string(),
-            working_directory: cwd.to_path_buf(),
+        sessions.push(super::super::terminal::TerminalSession {
+            session_name: session_name.to_string(),
             status: TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
+            command: Some(command.to_string()),
+            working_directory: Some(cwd.to_path_buf()),
         });
         Ok(())
     }
 
     async fn attach_command(
         &self,
-        id: &ManagedTerminalId,
+        session_name: &str,
         _command: &str,
         _cwd: &Path,
         _env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<String, String> {
-        Ok(format!("attach {id}"))
+        Ok(format!("attach {session_name}"))
     }
 
-    async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
-        self.killed.lock().await.push(id.clone());
+    async fn kill_session(&self, session_name: &str) -> Result<(), String> {
+        self.killed.lock().await.push(session_name.to_string());
         Ok(())
     }
 }
@@ -572,39 +799,99 @@ impl Factory for FakeIssueTrackerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
 }
 
-/// Factory that always returns a pre-constructed CheckoutManager.
-pub struct FakeCheckoutManagerFactory(pub Arc<dyn CheckoutManager>);
+// ---------------------------------------------------------------------------
+// FakeVcsFactory
+// ---------------------------------------------------------------------------
+
+/// Factory that always returns a [`FakeVcs`] backed by a [`FakeVcsState`].
+///
+/// The `name` is derived from the state's root path to avoid registry
+/// conflicts when multiple factories are registered side-by-side.
+pub struct FakeVcsFactory {
+    state: Arc<RwLock<FakeVcsState>>,
+    name: String,
+}
+
+impl FakeVcsFactory {
+    pub fn new(state: Arc<RwLock<FakeVcsState>>) -> Self {
+        let name = {
+            let s = state.read().expect("FakeVcsFactory state poisoned");
+            format!("fake-vcs-{}", s.root.display())
+        };
+        Self { state, name }
+    }
+}
 
 #[async_trait::async_trait]
-impl Factory for FakeCheckoutManagerFactory {
-    type Output = dyn CheckoutManager;
+impl Factory for FakeVcsFactory {
+    type Output = dyn Vcs;
 
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor::labeled_simple(
-            ProviderCategory::CheckoutManager,
-            "fake-checkouts",
-            "Fake Checkouts",
-            "CO",
-            "Checkouts",
-            "checkout",
-        )
+        ProviderDescriptor::labeled_simple(ProviderCategory::Vcs, &self.name, &self.name, "", "", "")
     }
 
     async fn probe(
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
+    ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
+        let state = self.state.read().expect("FakeVcsFactory state poisoned");
+        if repo_root == state.root {
+            Ok(Arc::new(FakeVcs::new(Arc::clone(&self.state))))
+        } else {
+            Err(vec![UnmetRequirement::NoVcsCheckout])
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeCheckoutManagerFactory
+// ---------------------------------------------------------------------------
+
+/// Factory that always returns a [`FakeCheckoutManager`] backed by a [`FakeVcsState`].
+pub struct FakeCheckoutManagerFactory {
+    state: Arc<RwLock<FakeVcsState>>,
+    name: String,
+}
+
+impl FakeCheckoutManagerFactory {
+    pub fn new(state: Arc<RwLock<FakeVcsState>>) -> Self {
+        let name = {
+            let s = state.read().expect("FakeCheckoutManagerFactory state poisoned");
+            format!("fake-checkouts-{}", s.root.display())
+        };
+        Self { state, name }
+    }
+}
+
+#[async_trait::async_trait]
+impl Factory for FakeCheckoutManagerFactory {
+    type Output = dyn CheckoutManager;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::labeled_simple(ProviderCategory::CheckoutManager, &self.name, "Fake Checkouts", "CO", "Checkouts", "checkout")
+    }
+
+    async fn probe(
+        &self,
+        _env: &EnvironmentBag,
+        _config: &ConfigStore,
+        repo_root: &Path,
+        _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
-        Ok(Arc::clone(&self.0))
+        let state = self.state.read().expect("FakeCheckoutManagerFactory state poisoned");
+        if repo_root == state.root {
+            Ok(Arc::new(FakeCheckoutManager::from_state(Arc::clone(&self.state))))
+        } else {
+            Err(vec![UnmetRequirement::NoVcsCheckout])
+        }
     }
 }
 
@@ -625,7 +912,6 @@ impl Factory for FakeChangeRequestFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -654,7 +940,6 @@ impl Factory for FakeWorkspaceManagerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -683,7 +968,6 @@ impl Factory for FakeTerminalPoolFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -725,13 +1009,44 @@ impl FakeDiscoveryProviders {
     }
 }
 
+/// Internal factory that wraps a pre-built `Arc<dyn CheckoutManager>`.
+/// Used by `fake_discovery_with_provider_set` when a caller supplies an
+/// `Arc<dyn CheckoutManager>` directly (e.g. from existing tests).
+struct ArcCheckoutManagerFactory(Arc<dyn CheckoutManager>);
+
+#[async_trait::async_trait]
+impl Factory for ArcCheckoutManagerFactory {
+    type Output = dyn CheckoutManager;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::labeled_simple(
+            ProviderCategory::CheckoutManager,
+            "fake-checkouts",
+            "Fake Checkouts",
+            "CO",
+            "Checkouts",
+            "checkout",
+        )
+    }
+
+    async fn probe(
+        &self,
+        _env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &Path,
+        _runner: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
+        Ok(Arc::clone(&self.0))
+    }
+}
+
 pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> DiscoveryRuntime {
     let runner: Arc<dyn CommandRunner> =
         Arc::new(DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build());
 
     let mut checkout_managers: Vec<Box<super::CheckoutManagerFactory>> = Vec::new();
     if let Some(cm) = providers.checkout_manager {
-        checkout_managers.push(Box::new(FakeCheckoutManagerFactory(cm)));
+        checkout_managers.push(Box::new(ArcCheckoutManagerFactory(cm)));
     }
 
     let mut change_request_factories: Vec<Box<super::ChangeRequestFactory>> = Vec::new();
@@ -776,6 +1091,18 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         },
         attachable_store,
     }
+}
+
+/// Build a [`DiscoveryRuntime`] with [`FakeVcs`] and [`FakeCheckoutManager`]
+/// both backed by the given [`FakeVcsState`].
+///
+/// This is the preferred way to set up a minimal runtime for tests that need
+/// VCS and checkout data without running real git processes.
+pub fn fake_vcs_discovery(state: Arc<RwLock<FakeVcsState>>) -> DiscoveryRuntime {
+    let mut runtime = fake_discovery(false);
+    runtime.factories.vcs = vec![Box::new(FakeVcsFactory::new(Arc::clone(&state)))];
+    runtime.factories.checkout_managers = vec![Box::new(FakeCheckoutManagerFactory::new(state))];
+    runtime
 }
 
 #[cfg(test)]

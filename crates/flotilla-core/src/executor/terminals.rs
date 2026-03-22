@@ -1,41 +1,80 @@
 use std::path::Path;
 
-use flotilla_protocol::{HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand};
+use flotilla_protocol::{HostName, HostPath, PreparedTerminalCommand};
 use tracing::{debug, info, warn};
 
 use crate::{
-    attachable::{terminal_session_binding_ref, SharedAttachableStore, TerminalPurpose},
-    providers::{
-        registry::ProviderRegistry,
-        terminal::{TerminalEnvVars, TerminalPool},
-        types::WorkspaceConfig,
-    },
+    providers::types::WorkspaceConfig,
     template::{self, WorkspaceTemplate},
+    terminal_manager::TerminalManager,
 };
 
 pub(super) struct TerminalPreparationService<'a> {
-    registry: &'a ProviderRegistry,
-    config_base: &'a Path,
-    attachable_store: &'a SharedAttachableStore,
+    terminal_manager: &'a TerminalManager,
     daemon_socket_path: Option<&'a Path>,
 }
 
 impl<'a> TerminalPreparationService<'a> {
-    pub(super) fn new(
-        registry: &'a ProviderRegistry,
-        config_base: &'a Path,
-        attachable_store: &'a SharedAttachableStore,
-        daemon_socket_path: Option<&'a Path>,
-    ) -> Self {
-        Self { registry, config_base, attachable_store, daemon_socket_path }
+    pub(super) fn new(terminal_manager: &'a TerminalManager, daemon_socket_path: Option<&'a Path>) -> Self {
+        Self { terminal_manager, daemon_socket_path }
     }
 
     pub(super) async fn resolve_workspace_commands(&self, config: &mut WorkspaceConfig) {
-        let Some((tp_desc, tp)) = self.registry.terminal_pools.preferred_with_desc() else {
-            return;
+        let rendered = parse_workspace_template(config).render(&config.template_vars);
+        info!(count = rendered.content.len(), "terminal manager: resolving content entries");
+        let host = HostName::local();
+        let checkout_path = HostPath::new(host.clone(), config.working_directory.clone());
+        let set_id = match self.terminal_manager.allocate_set(host, checkout_path) {
+            Ok(id) => id,
+            Err(err) => {
+                warn!(err = %err, "failed to allocate terminal set");
+                return;
+            }
         };
-
-        resolve_terminal_pool(config, tp.as_ref(), self.attachable_store, &tp_desc.implementation, self.daemon_socket_path).await;
+        let socket_str = self.daemon_socket_path.map(|p| p.display().to_string());
+        let mut resolved = Vec::new();
+        for entry in &rendered.content {
+            if entry.content_type != "terminal" {
+                debug!(
+                    role = %entry.role,
+                    content_type = %entry.content_type,
+                    "skipping non-terminal content",
+                );
+                continue;
+            }
+            let count = entry.count.unwrap_or(1);
+            for i in 0..count {
+                let attachable_id = match self.terminal_manager.allocate_terminal(
+                    set_id.clone(),
+                    &entry.role,
+                    i,
+                    &config.name,
+                    &entry.command,
+                    config.working_directory.clone(),
+                ) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        warn!(role = %entry.role, %i, err = %err, "failed to allocate terminal");
+                        continue;
+                    }
+                };
+                if let Err(err) = self.terminal_manager.ensure_running(&attachable_id).await {
+                    warn!(attachable_id = %attachable_id, err = %err, "failed to ensure terminal");
+                    continue;
+                }
+                match self.terminal_manager.attach_command(&attachable_id, socket_str.as_deref()).await {
+                    Ok(cmd) => {
+                        debug!(attachable_id = %attachable_id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
+                        resolved.push((entry.role.clone(), cmd));
+                    }
+                    Err(err) => warn!(attachable_id = %attachable_id, err = %err, "failed to get attach command"),
+                }
+            }
+        }
+        info!(count = resolved.len(), "terminal manager: resolved commands");
+        if !resolved.is_empty() {
+            config.resolved_commands = Some(resolved);
+        }
     }
 
     pub(super) async fn prepare_terminal_commands(
@@ -46,39 +85,47 @@ impl<'a> TerminalPreparationService<'a> {
         workspace_config: impl FnOnce() -> WorkspaceConfig,
     ) -> Result<Vec<PreparedTerminalCommand>, String> {
         if !requested_commands.is_empty() {
-            // The requesting host sent its template's role->command mappings.
-            // If a terminal pool is available, wrap each command through it
-            // for persistent sessions. Otherwise return as-is for passthrough.
-            if let Some((tp_desc, tp)) = self.registry.terminal_pools.preferred_with_desc() {
-                let terminal_pool_provider = tp_desc.implementation.as_str();
-                let mut resolved = Vec::new();
-                let mut role_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-                for cmd in requested_commands {
-                    let index = role_index.entry(cmd.role.clone()).or_insert(0);
-                    let id = ManagedTerminalId { checkout: branch.to_string(), role: cmd.role.clone(), index: *index };
-                    *role_index.get_mut(&cmd.role).expect("just inserted") += 1;
-                    if let Err(err) = tp.ensure_running(&id, &cmd.command, checkout_path).await {
-                        warn!(%id, err = %err, "failed to ensure terminal");
+            let host = HostName::local();
+            let hp = HostPath::new(host.clone(), checkout_path.to_path_buf());
+            let set_id = self.terminal_manager.allocate_set(host, hp)?;
+            let socket_str = self.daemon_socket_path.map(|p| p.display().to_string());
+
+            let mut resolved = Vec::new();
+            let mut role_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            for cmd in requested_commands {
+                let idx = {
+                    let entry = role_index.entry(cmd.role.clone()).or_insert(0);
+                    let current = *entry;
+                    *entry += 1;
+                    current
+                };
+                let attachable_id = match self.terminal_manager.allocate_terminal(
+                    set_id.clone(),
+                    &cmd.role,
+                    idx,
+                    branch,
+                    &cmd.command,
+                    checkout_path.to_path_buf(),
+                ) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        warn!(role = %cmd.role, err = %err, "failed to allocate terminal");
+                        resolved.push(cmd.clone());
+                        continue;
                     }
-                    let env_vars = build_terminal_env_vars(
-                        &id,
-                        checkout_path,
-                        &cmd.command,
-                        self.attachable_store,
-                        terminal_pool_provider,
-                        self.daemon_socket_path,
-                    );
-                    match tp.attach_command(&id, &cmd.command, checkout_path, &env_vars).await {
-                        Ok(attach_cmd) => resolved.push(PreparedTerminalCommand { role: cmd.role.clone(), command: attach_cmd }),
-                        Err(err) => {
-                            warn!(%id, err = %err, "failed to get attach command, using original");
-                            resolved.push(cmd.clone());
-                        }
+                };
+                if let Err(err) = self.terminal_manager.ensure_running(&attachable_id).await {
+                    warn!(attachable_id = %attachable_id, err = %err, "failed to ensure terminal");
+                }
+                match self.terminal_manager.attach_command(&attachable_id, socket_str.as_deref()).await {
+                    Ok(attach_cmd) => resolved.push(PreparedTerminalCommand { role: cmd.role.clone(), command: attach_cmd }),
+                    Err(err) => {
+                        warn!(attachable_id = %attachable_id, err = %err, "failed to get attach command, using original");
+                        resolved.push(cmd.clone());
                     }
                 }
-                return Ok(resolved);
             }
-            return Ok(requested_commands.to_vec());
+            return Ok(resolved);
         }
 
         let mut config = workspace_config();
@@ -88,118 +135,13 @@ impl<'a> TerminalPreparationService<'a> {
 
         Ok(commands.into_iter().map(|(role, command)| PreparedTerminalCommand { role, command }).collect())
     }
-
-    pub(super) fn wrap_remote_attach_commands(
-        &self,
-        target_host: &HostName,
-        checkout_path: &Path,
-        commands: &[PreparedTerminalCommand],
-    ) -> Result<Vec<PreparedTerminalCommand>, String> {
-        wrap_remote_attach_commands(target_host, checkout_path, commands, self.config_base)
-    }
 }
 
-/// Build the env vars to inject into a managed terminal session.
-/// Ensures the attachable binding exists (creates it if needed) so the
-/// env var is available on the very first attach.
-pub(super) fn build_terminal_env_vars(
-    id: &ManagedTerminalId,
-    cwd: &Path,
-    command: &str,
-    attachable_store: &SharedAttachableStore,
-    terminal_pool_provider: &str,
-    daemon_socket_path: Option<&Path>,
-) -> TerminalEnvVars {
-    let mut vars = Vec::new();
-
-    let session_name = terminal_session_binding_ref(id);
-    match attachable_store.lock() {
-        Ok(mut store) => {
-            // Ensure the attachable exists before looking up its ID.
-            // This creates the binding on first workspace creation so the
-            // env var is available immediately, not only after shpool's
-            // attach_command .inspect() runs.
-            let host = HostName::local();
-            let set_checkout = HostPath::new(host.clone(), cwd.to_path_buf());
-            let (set_id, changed_set) = store.ensure_terminal_set_with_change(Some(host), Some(set_checkout));
-            let (attachable_id, changed_attachable) = store.ensure_terminal_attachable_with_change(
-                &set_id,
-                "terminal_pool",
-                terminal_pool_provider,
-                &session_name,
-                TerminalPurpose { checkout: id.checkout.clone(), role: id.role.clone(), index: id.index },
-                command,
-                cwd.to_path_buf(),
-                flotilla_protocol::TerminalStatus::Disconnected,
-            );
-            vars.push(("FLOTILLA_ATTACHABLE_ID".to_string(), attachable_id.to_string()));
-            if changed_set || changed_attachable {
-                if let Err(err) = store.save() {
-                    warn!(err = %err, "failed to persist attachable store after env var injection");
-                }
-            }
-        }
-        Err(err) => {
-            warn!(err = %err, "attachable store lock poisoned in build_terminal_env_vars");
-        }
-    }
-
-    if let Some(socket) = daemon_socket_path {
-        vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.display().to_string()));
-    }
-
-    vars
-}
-
-/// Resolve terminal sessions through the pool. Each terminal content entry is
-/// ensured running and its attach command is stored in `config.resolved_commands`.
-pub(super) async fn resolve_terminal_pool(
-    config: &mut WorkspaceConfig,
-    terminal_pool: &dyn TerminalPool,
-    attachable_store: &SharedAttachableStore,
-    terminal_pool_provider: &str,
-    daemon_socket_path: Option<&Path>,
-) {
-    let rendered = parse_workspace_template(config).render(&config.template_vars);
-    info!(count = rendered.content.len(), "terminal pool: resolving content entries");
-    let mut resolved = Vec::new();
-    for entry in &rendered.content {
-        if entry.content_type != "terminal" {
-            debug!(
-                role = %entry.role,
-                content_type = %entry.content_type,
-                "skipping non-terminal content",
-            );
-            continue;
-        }
-        let count = entry.count.unwrap_or(1);
-        for i in 0..count {
-            let id = ManagedTerminalId { checkout: config.name.clone(), role: entry.role.clone(), index: i };
-            if let Err(err) = terminal_pool.ensure_running(&id, &entry.command, &config.working_directory).await {
-                warn!(%id, err = %err, "failed to ensure terminal");
-                continue;
-            }
-            let env_vars = build_terminal_env_vars(
-                &id,
-                &config.working_directory,
-                &entry.command,
-                attachable_store,
-                terminal_pool_provider,
-                daemon_socket_path,
-            );
-            match terminal_pool.attach_command(&id, &entry.command, &config.working_directory, &env_vars).await {
-                Ok(cmd) => {
-                    debug!(%id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
-                    resolved.push((entry.role.clone(), cmd));
-                }
-                Err(err) => warn!(%id, err = %err, "failed to get attach command"),
-            }
-        }
-    }
-    info!(count = resolved.len(), "terminal pool: resolved commands");
-    if !resolved.is_empty() {
-        config.resolved_commands = Some(resolved);
-    }
+/// Render template commands without terminal pool resolution.
+/// Used when no terminal pool is available.
+pub(super) fn render_fallback_commands(workspace_config: impl FnOnce() -> WorkspaceConfig) -> Vec<PreparedTerminalCommand> {
+    let config = workspace_config();
+    render_template_commands(&config).into_iter().map(|(role, command)| PreparedTerminalCommand { role, command }).collect()
 }
 
 fn render_template_commands(config: &WorkspaceConfig) -> Vec<(String, String)> {

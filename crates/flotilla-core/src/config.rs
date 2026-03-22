@@ -507,7 +507,7 @@ impl ConfigStore {
 
 /// Collect repo roots: persisted (in saved tab order) first, then CLI args, then auto-detect from cwd.
 /// Persists any new repos and saves tab order.
-pub fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBuf> {
+pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBuf> {
     use crate::providers::{
         vcs::{git::GitVcs, Vcs},
         ProcessCommandRunner,
@@ -546,7 +546,7 @@ pub fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<Pa
     let cwd = std::env::current_dir().ok();
     if let Some(ref cwd) = cwd {
         let git = GitVcs::new(Arc::new(ProcessCommandRunner));
-        if let Some(repo_root) = git.resolve_repo_root(cwd) {
+        if let Some(repo_root) = git.resolve_repo_root(cwd).await {
             if !repo_roots.contains(&repo_root) {
                 repo_roots.push(repo_root);
             }

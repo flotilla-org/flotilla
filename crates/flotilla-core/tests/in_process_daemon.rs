@@ -7,9 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::{
-    attachable::{
-        shared_in_memory_attachable_store, terminal_session_binding_ref, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose,
-    },
+    attachable::{shared_in_memory_attachable_store, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose},
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
@@ -19,9 +17,9 @@ use flotilla_core::{
         coding_agent::CloudAgentService,
         discovery::{
             test_support::{
-                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, git_process_discovery,
-                init_git_repo_with_remote, FakeCheckoutManager, FakeDiscoveryProviders, FakeIssueTracker, FakeTerminalPool,
-                FakeWorkspaceManager,
+                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_vcs_discovery, git_process_discovery,
+                init_git_repo_with_remote, FakeCheckoutManager, FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueTracker,
+                FakeTerminalPool, FakeVcsFactory, FakeVcsState, FakeWorkspaceManager,
             },
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostPlatform, ProviderCategory, ProviderDescriptor,
             RepoDetector, UnmetRequirement,
@@ -31,8 +29,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, CorrelationKey, DaemonEvent,
-    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, ManagedTerminal, ManagedTerminalId, PeerConnectionState,
-    ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, TerminalStatus, ToolInventory, TopologyRoute, WorkItemKind,
+    HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, Issue, PeerConnectionState, ProviderData, RepoIdentity,
+    RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use tokio::sync::Notify;
 
@@ -116,7 +114,6 @@ impl Factory for SlowCloudAgentFactory {
         _: &ConfigStore,
         _: &Path,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
-        _: flotilla_core::attachable::SharedAttachableStore,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.agent) as Arc<dyn CloudAgentService>)
     }
@@ -174,7 +171,6 @@ impl Factory for SlowAiUtilityFactory {
         _: &ConfigStore,
         _: &Path,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
-        _: flotilla_core::attachable::SharedAttachableStore,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
     }
@@ -286,33 +282,47 @@ fn init_git_repo_with_local_bare_remote(path: &Path, remote_path: &Path) -> Repo
     init_git_repo_with_remote(path, remote_path.to_str().expect("remote path utf8"))
 }
 
-async fn daemon_for_git_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, RepoIdentity) {
+async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, RepoIdentity) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
-    let remote = temp.path().join("origin.git");
-    init_git_repo_with_local_bare_remote(&repo, &remote);
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state =
+        FakeVcsState::builder(repo.clone()).branch("main", true).remote_branch("main").checkout("main").is_main(true).build().build();
+
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
+
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, local_bare_remote_discovery(), HostName::local()).await;
-    let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("repo identity should be detected");
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
     (temp, repo, daemon, identity)
 }
 
-async fn daemon_for_duplicate_git_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {
+async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo_a = temp.path().join("repo-a");
     let repo_b = temp.path().join("repo-b");
-    let remote = temp.path().join("origin.git");
-    init_bare_git_remote(&remote);
-    init_git_repo_with_remote(&repo_a, remote.to_str().expect("remote path utf8"));
-    init_git_repo_with_remote(&repo_b, remote.to_str().expect("remote path utf8"));
+    std::fs::create_dir_all(&repo_a).expect("create repo-a dir");
+    std::fs::create_dir_all(&repo_b).expect("create repo-b dir");
+
+    let state_a = FakeVcsState::builder(repo_a.clone()).branch("main", true).checkout("main").is_main(true).build().build();
+    let state_b = FakeVcsState::builder(repo_b.clone()).branch("main", true).checkout("main").is_main(true).build().build();
+
+    let mut discovery = fake_discovery(false);
+    discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(state_a.clone())), Box::new(FakeVcsFactory::new(state_b.clone()))];
+    discovery.factories.checkout_managers =
+        vec![Box::new(FakeCheckoutManagerFactory::new(state_a)), Box::new(FakeCheckoutManagerFactory::new(state_b))];
+    discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
+
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, local_bare_remote_discovery(), HostName::local()).await;
+    let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, discovery, HostName::local()).await;
     (temp, repo_a, repo_b, daemon)
 }
 
 #[tokio::test]
 async fn list_hosts_includes_local_and_configured_disconnected_peers() {
-    let (_temp, _repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, _repo, daemon, _identity) = daemon_for_fake_repo().await;
 
     daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
 
@@ -329,7 +339,7 @@ async fn list_hosts_includes_local_and_configured_disconnected_peers() {
 
 #[tokio::test]
 async fn get_host_providers_returns_local_summary_and_errors_for_unknown_remote_summary() {
-    let (_temp, _repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, _repo, daemon, _identity) = daemon_for_fake_repo().await;
 
     daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
 
@@ -344,7 +354,7 @@ async fn get_host_providers_returns_local_summary_and_errors_for_unknown_remote_
 
 #[tokio::test]
 async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored_routes() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
 
     daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
     daemon.set_peer_host_summaries(HashMap::from([(HostName::new("remote"), sample_remote_host_summary("remote"))])).await;
@@ -385,7 +395,7 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
 
 #[tokio::test]
 async fn get_topology_includes_configured_but_disconnected_peers() {
-    let (_temp, _repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, _repo, daemon, _identity) = daemon_for_fake_repo().await;
 
     // Configure two peers but only set routes for one
     daemon.set_configured_peer_names(vec![HostName::new("connected"), HostName::new("unreachable")]).await;
@@ -449,7 +459,7 @@ async fn daemon_broadcasts_snapshots() {
 
 #[tokio::test]
 async fn execute_broadcasts_lifecycle_events() {
-    let (_temp, repo, daemon, identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     // Execute a command that goes through the spawned task path.
@@ -506,7 +516,7 @@ async fn execute_broadcasts_lifecycle_events() {
 
 #[tokio::test]
 async fn fetch_checkout_status_accepts_identity_context_repo() {
-    let (_temp, _repo, daemon, identity) = daemon_for_git_repo().await;
+    let (_temp, _repo, daemon, identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     let command = Command {
@@ -842,7 +852,7 @@ async fn publish_peer_summary_normalizes_host_name() {
 
 #[tokio::test]
 async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
@@ -877,7 +887,7 @@ async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
 
 #[tokio::test]
 async fn replay_since_includes_overlay_only_hosts() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
@@ -907,7 +917,7 @@ async fn replay_since_includes_overlay_only_hosts() {
 
 #[tokio::test]
 async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
@@ -963,7 +973,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
 
 #[tokio::test]
 async fn clearing_summary_for_visible_host_emits_host_snapshot() {
-    let (_temp, _repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, _repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
     let peer_host = HostName::new("configured-peer");
 
@@ -1011,7 +1021,7 @@ async fn clearing_summary_for_visible_host_emits_host_snapshot() {
 /// client that was connected from the start.
 #[tokio::test]
 async fn replay_since_includes_peer_checkouts_with_correct_host() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     // Initial refresh
@@ -1066,7 +1076,7 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
 /// not just local provider data.
 #[tokio::test]
 async fn replay_since_unknown_seq_includes_peer_checkouts_with_correct_host() {
-    let (_temp, repo, daemon, identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     // Initial refresh so daemon has state
@@ -1121,7 +1131,7 @@ async fn replay_since_unknown_seq_includes_peer_checkouts_with_correct_host() {
 /// should reflect the peer-merged view.
 #[tokio::test]
 async fn replay_since_delta_replay_includes_peer_data() {
-    let (_temp, repo, daemon, identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     // First refresh — establishes seq in delta log
@@ -1199,8 +1209,7 @@ async fn replay_since_delta_replay_includes_peer_data() {
 async fn add_and_remove_repo_updates_state_and_emits_events() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("new-repo");
-    let remote = temp.path().join("origin.git");
-    init_git_repo_with_local_bare_remote(&repo, &remote);
+    std::fs::create_dir_all(&repo).expect("create repo dir");
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
@@ -1276,7 +1285,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
 
 #[tokio::test]
 async fn duplicate_local_roots_share_identity_but_remain_tracked() {
-    let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_git_repos().await;
+    let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_fake_repos().await;
 
     let identity_a = daemon.tracked_repo_identity_for_path(&repo_a).await.expect("identity for first repo");
     let identity_b = daemon.tracked_repo_identity_for_path(&repo_b).await.expect("identity for second repo");
@@ -1300,6 +1309,13 @@ async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     assert_eq!(daemon.tracked_repo_identity_for_path(&repo_b).await, Some(identity_b));
 }
 
+// TODO(task-9): Migrate to fake VCS — this test depends on real git for two reasons:
+// 1. `normalize_repo_path` uses `GitVcs` directly to canonicalize symlinked temp paths
+//    (e.g. /var → /private/var on macOS), so `tracked_path == canonical_repo` requires
+//    a real git process to resolve the canonical form.
+// 2. The identity match relies on git reading the remote URL; `local_bare_remote_discovery`
+//    uses a real git runner to detect `github.com/owner/repo` from the remote.
+// Skipping fake migration until `normalize_repo_path` uses an injectable Vcs.
 #[tokio::test]
 async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let temp = tempfile::tempdir().expect("create tempdir");
@@ -1327,7 +1343,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
 
 #[tokio::test]
 async fn removing_preferred_root_emits_snapshot_for_new_preferred_path() {
-    let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_git_repos().await;
+    let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_fake_repos().await;
     let mut rx = daemon.subscribe();
 
     daemon.refresh(&RepoSelector::Path(repo_a.clone())).await.expect("refresh first repo");
@@ -1354,7 +1370,7 @@ async fn removing_preferred_root_emits_snapshot_for_new_preferred_path() {
 
 #[tokio::test]
 async fn get_local_providers_excludes_peer_overlay_data() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
 
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh local repo");
 
@@ -1391,7 +1407,7 @@ async fn get_local_providers_excludes_peer_overlay_data() {
 /// the real peer checkouts again — duplicating them.
 #[tokio::test]
 async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     // Initial refresh — populates last_snapshot with local-only data
@@ -1439,7 +1455,7 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
 /// should not duplicate peer checkouts via the normalize-then-merge path.
 #[tokio::test]
 async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
-    let (_temp, repo, daemon, _identity) = daemon_for_git_repo().await;
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
     // Initial refresh
@@ -1581,12 +1597,11 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
 }
 
 #[tokio::test]
-async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_checkout_item() {
+async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() {
     let remote_host = definitely_remote_host();
     let remote_checkout = HostPath::new(remote_host.clone(), "/home/robert/dev/flotilla.issue-356-watch");
     let set_id = AttachableSetId::new("set-issue-356-watch");
     let workspace_ref = "workspace:10".to_string();
-    let terminal_id = ManagedTerminalId { checkout: "issue-356-watch".into(), role: "main".into(), index: 0 };
     let workspace_manager = Arc::new(FakeWorkspaceManager::new());
     let terminal_pool = Arc::new(FakeTerminalPool::new());
     let attachable_store = shared_in_memory_attachable_store();
@@ -1598,17 +1613,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
             correlation_keys: vec![],
             attachable_set_id: None,
         })])
-        .await;
-    terminal_pool
-        .add_terminals(vec![ManagedTerminal {
-            id: terminal_id.clone(),
-            role: "main".into(),
-            command: "bash".into(),
-            working_directory: PathBuf::from("/Users/robert/dev/flotilla"),
-            status: TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
-        }])
         .await;
 
     {
@@ -1627,16 +1631,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
             object_id: set_id.to_string(),
             external_ref: workspace_ref.clone(),
         });
-        store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "fake-terminals",
-            &terminal_session_binding_ref(&terminal_id),
-            TerminalPurpose { checkout: terminal_id.checkout.clone(), role: terminal_id.role.clone(), index: terminal_id.index },
-            "bash",
-            PathBuf::from("/Users/robert/dev/flotilla"),
-            TerminalStatus::Running,
-        );
     }
 
     let discovery = fake_discovery_with_provider_set(
@@ -1675,8 +1669,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
     let _ = recv_event(&mut rx).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("merged state");
-    let projected_terminal = snapshot.providers.managed_terminals.get(&terminal_id.to_string()).expect("projected terminal");
-    assert_eq!(projected_terminal.attachable_set_id.as_ref(), Some(&set_id));
     assert_eq!(
         snapshot.providers.workspaces.get(&workspace_ref).and_then(|workspace| workspace.attachable_set_id.as_ref()),
         Some(&set_id),
@@ -1690,7 +1682,6 @@ async fn in_process_daemon_correlates_workspace_and_terminal_into_one_remote_che
     assert_eq!(item.host, remote_host);
     assert_eq!(item.checkout.as_ref().map(|checkout| &checkout.key), Some(&remote_checkout));
     assert_eq!(item.workspace_refs, vec![workspace_ref]);
-    assert_eq!(item.terminal_keys, vec![terminal_id]);
 }
 
 #[tokio::test]
@@ -1796,7 +1787,7 @@ async fn remove_checkout_command_accepts_selector_queries() {
         .execute(Command {
             host: None,
             context_repo: None,
-            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()), terminal_keys: vec![] },
+            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()) },
         })
         .await
         .expect_err("missing checkout should fail cleanly");
@@ -2267,7 +2258,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
     let command = Command {
         host: None,
         context_repo: None,
-        action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-lifecycle".into()), terminal_keys: vec![] },
+        action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-lifecycle".into()) },
     };
     let command_id = daemon.execute(command).await.expect("execute RemoveCheckout should succeed");
 

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use flotilla_protocol::{
-    AttachableSetId, CommandValue, DaemonEvent, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand, RepoIdentity, StepStatus,
+    AttachableSetId, CommandValue, DaemonEvent, HostName, HostPath, PreparedTerminalCommand, RepoIdentity, StepStatus,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -45,7 +45,6 @@ pub enum StepAction {
     },
     RemoveCheckout {
         branch: String,
-        terminal_keys: Vec<ManagedTerminalId>,
         deleted_checkout_paths: Vec<HostPath>,
     },
 

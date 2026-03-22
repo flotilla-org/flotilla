@@ -75,8 +75,6 @@ pub enum CommandAction {
     },
     RemoveCheckout {
         checkout: CheckoutSelector,
-        #[serde(default)]
-        terminal_keys: Vec<crate::ManagedTerminalId>,
     },
     FetchCheckoutStatus {
         branch: String,
@@ -286,7 +284,7 @@ mod tests {
             Command {
                 host: None,
                 context_repo: None,
-                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()), terminal_keys: vec![] },
+                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()) },
             },
             Command {
                 host: None,
@@ -504,7 +502,7 @@ mod tests {
             Command {
                 host: None,
                 context_repo: None,
-                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("b".into()), terminal_keys: vec![] },
+                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("b".into()) },
             },
             Command {
                 host: None,

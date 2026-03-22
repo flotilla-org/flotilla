@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
-use flotilla_protocol::{
-    CheckoutSelector, CheckoutStatus, Command, CommandAction, HostName, ManagedTerminalId, RepoSelector, WorkItemIdentity,
-};
+use flotilla_protocol::{CheckoutSelector, CheckoutStatus, Command, CommandAction, HostName, RepoSelector, WorkItemIdentity};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -23,20 +21,14 @@ use crate::{
 pub struct DeleteConfirmWidget {
     pub info: Option<CheckoutStatus>,
     pub loading: bool,
-    pub terminal_keys: Vec<ManagedTerminalId>,
     pub identity: WorkItemIdentity,
     pub remote_host: Option<HostName>,
     pub checkout_path: Option<PathBuf>,
 }
 
 impl DeleteConfirmWidget {
-    pub fn new(
-        terminal_keys: Vec<ManagedTerminalId>,
-        identity: WorkItemIdentity,
-        remote_host: Option<HostName>,
-        checkout_path: Option<PathBuf>,
-    ) -> Self {
-        Self { info: None, loading: true, terminal_keys, identity, remote_host, checkout_path }
+    pub fn new(identity: WorkItemIdentity, remote_host: Option<HostName>, checkout_path: Option<PathBuf>) -> Self {
+        Self { info: None, loading: true, identity, remote_host, checkout_path }
     }
 
     /// Update the checkout status info after the async fetch completes.
@@ -63,7 +55,7 @@ impl InteractiveWidget for DeleteConfirmWidget {
                         Some(path) => CheckoutSelector::Path(path.clone()),
                         None => CheckoutSelector::Query(info.branch.clone()),
                     };
-                    let action = CommandAction::RemoveCheckout { checkout, terminal_keys: self.terminal_keys.clone() };
+                    let action = CommandAction::RemoveCheckout { checkout };
                     let command = Command {
                         host: self.remote_host.clone(),
                         context_repo: Some(RepoSelector::Identity(ctx.model.active_repo_identity().clone())),
@@ -191,7 +183,7 @@ mod tests {
     use crate::app::test_support::TestWidgetHarness;
 
     fn make_widget() -> DeleteConfirmWidget {
-        DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, None)
+        DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), None, None)
     }
 
     fn make_widget_with_info(branch: &str) -> DeleteConfirmWidget {
@@ -253,7 +245,7 @@ mod tests {
     #[test]
     fn delete_confirm_attaches_pending_context() {
         let identity = WorkItemIdentity::Session("custom-id".into());
-        let mut widget = DeleteConfirmWidget::new(vec![], identity.clone(), None, None);
+        let mut widget = DeleteConfirmWidget::new(identity.clone(), None, None);
         widget.update_info(CheckoutStatus {
             branch: "feat/a".into(),
             change_request_status: None,
@@ -276,7 +268,7 @@ mod tests {
     #[test]
     fn delete_confirm_routes_to_remote_host_when_set() {
         let hostname = HostName::new("feta");
-        let mut widget = DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), Some(hostname.clone()), None);
+        let mut widget = DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), Some(hostname.clone()), None);
         widget.update_info(CheckoutStatus {
             branch: "feat/x".into(),
             change_request_status: None,
@@ -344,8 +336,7 @@ mod tests {
 
     #[test]
     fn delete_confirm_uses_path_selector_when_checkout_path_set() {
-        let mut widget =
-            DeleteConfirmWidget::new(vec![], WorkItemIdentity::Session("test".into()), None, Some(PathBuf::from("/tmp/feat-x")));
+        let mut widget = DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), None, Some(PathBuf::from("/tmp/feat-x")));
         widget.update_info(CheckoutStatus {
             branch: "feat/x".into(),
             change_request_status: None,
