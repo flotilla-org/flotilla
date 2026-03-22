@@ -163,14 +163,17 @@ pub static BINDINGS: &[Binding] = &[
     hk(BindingModeId::IssueSearch, "enter", "ENT", Action::Confirm, "Apply"),
     hk(BindingModeId::IssueSearch, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── CommandPalette ──
-    // Keys are hardcoded in handle_key; these bindings are advisory for status bar hints.
+    // No shared fallback: typing keys must reach handle_raw_key for text input.
+    // Tab is handled by handle_raw_key for "fill" behavior (not bound here).
+    b(BindingModeId::CommandPalette, "up", Action::SelectPrev),
+    b(BindingModeId::CommandPalette, "down", Action::SelectNext),
     hk(BindingModeId::CommandPalette, "enter", "ENT", Action::Confirm, "Run"),
-    hk(BindingModeId::CommandPalette, "tab", "TAB", Action::Confirm, "Fill"),
     hk(BindingModeId::CommandPalette, "esc", "ESC", Action::Dismiss, "Close"),
     // ── FilePicker ──
-    h(BindingModeId::FilePicker, "j", Action::SelectNext, "Down"),
-    h(BindingModeId::FilePicker, "k", Action::SelectPrev, "Up"),
-    h(BindingModeId::FilePicker, "tab", Action::Confirm, "Complete"),
+    // No shared fallback: typing keys must reach handle_raw_key for text input.
+    // Tab is handled by handle_raw_key for directory completion (not bound here).
+    b(BindingModeId::FilePicker, "up", Action::SelectPrev),
+    b(BindingModeId::FilePicker, "down", Action::SelectNext),
     hk(BindingModeId::FilePicker, "enter", "ENT", Action::Confirm, "Select"),
     hk(BindingModeId::FilePicker, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── SearchActive ──

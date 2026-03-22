@@ -244,7 +244,12 @@ impl Keymap {
 
     /// Build the default keymap from the flat binding table.
     pub fn defaults() -> Self {
-        Self { compiled: CompiledBindings::from_table(BINDINGS) }
+        Self {
+            compiled: CompiledBindings::from_table_with_no_shared_fallback(BINDINGS, &[
+                BindingModeId::CommandPalette,
+                BindingModeId::FilePicker,
+            ]),
+        }
     }
 
     /// Build a keymap from defaults, then apply user overrides from `KeysConfig`.
@@ -527,8 +532,7 @@ mod tests {
     #[test]
     fn shared_bindings_work_across_modes() {
         let km = Keymap::defaults();
-        let modes =
-            [BindingModeId::Normal, BindingModeId::Help, BindingModeId::Overview, BindingModeId::ActionMenu, BindingModeId::FilePicker];
+        let modes = [BindingModeId::Normal, BindingModeId::Help, BindingModeId::Overview, BindingModeId::ActionMenu];
         for mode in modes {
             assert_eq!(
                 km.resolve(&KeyBindingMode::from(mode), crokey::key!(j)),
@@ -650,13 +654,51 @@ mod tests {
     }
 
     #[test]
-    fn file_picker_falls_through_to_shared() {
+    fn file_picker_no_shared_fallback() {
         let km = Keymap::defaults();
-        // FilePicker has mode-specific bindings that overlap shared, so they resolve directly
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(j)), Some(Action::SelectNext));
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(k)), Some(Action::SelectPrev));
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(enter)), Some(Action::Confirm));
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(esc)), Some(Action::Dismiss));
+        let mode = KeyBindingMode::from(BindingModeId::FilePicker);
+        // Mode-specific bindings resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&mode, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&mode, crokey::key!(up)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&mode, crokey::key!(down)), Some(Action::SelectNext));
+        // Typing keys do NOT resolve — no shared fallback
+        assert_eq!(km.resolve(&mode, crokey::key!(j)), None);
+        assert_eq!(km.resolve(&mode, crokey::key!(k)), None);
+    }
+
+    #[test]
+    fn command_palette_resolves_navigation_not_typing() {
+        let km = Keymap::defaults();
+        let mode = KeyBindingMode::from(BindingModeId::CommandPalette);
+        // Navigation keys resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&mode, crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&mode, crokey::key!(up)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&mode, crokey::key!(down)), Some(Action::SelectNext));
+        // Typing keys do NOT resolve (fall through to handle_raw_key)
+        assert_eq!(km.resolve(&mode, crokey::key!(j)), None);
+        assert_eq!(km.resolve(&mode, crokey::key!(k)), None);
+        assert_eq!(km.resolve(&mode, kc(KeyCode::Char('?'), KeyModifiers::NONE)), None);
+        // Tab does NOT resolve (handled by handle_raw_key for "fill" behavior)
+        assert_eq!(km.resolve(&mode, crokey::key!(tab)), None);
+    }
+
+    #[test]
+    fn file_picker_resolves_navigation_not_typing() {
+        let km = Keymap::defaults();
+        let mode = KeyBindingMode::from(BindingModeId::FilePicker);
+        // Navigation keys resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&mode, crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&mode, crokey::key!(up)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&mode, crokey::key!(down)), Some(Action::SelectNext));
+        // Typing keys do NOT resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(j)), None);
+        assert_eq!(km.resolve(&mode, crokey::key!(k)), None);
+        assert_eq!(km.resolve(&mode, kc(KeyCode::Char('?'), KeyModifiers::NONE)), None);
+        // Tab does NOT resolve (handled by handle_raw_key for completion)
+        assert_eq!(km.resolve(&mode, crokey::key!(tab)), None);
     }
 
     // ── from_config tests ──
