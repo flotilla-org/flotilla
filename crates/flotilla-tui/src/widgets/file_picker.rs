@@ -1,6 +1,6 @@
 use std::{any::Any, path::PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{Command, CommandAction};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -124,13 +124,7 @@ impl InteractiveWidget for FilePickerWidget {
             }
             Action::Confirm => self.activate_dir_entry(ctx),
             Action::Dismiss => Outcome::Finished,
-            _ => Outcome::Ignored,
-        }
-    }
-
-    fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
-        match key.code {
-            KeyCode::Tab => {
+            Action::FillSelected => {
                 if let Some(entry) = self.dir_entries.get(self.selected).cloned() {
                     let base = self.base_path();
                     let new_path = format!("{}{}/", base, entry.name);
@@ -140,13 +134,17 @@ impl InteractiveWidget for FilePickerWidget {
                 self.refresh_dir_listing(ctx.model);
                 Outcome::Consumed
             }
-            _ => {
-                self.input.handle_event(&crossterm::event::Event::Key(key));
-                self.selected = 0;
-                self.refresh_dir_listing(ctx.model);
-                Outcome::Consumed
-            }
+            _ => Outcome::Ignored,
         }
+    }
+
+    fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
+        // Only reached for unresolved keys (typing) because FilePicker uses
+        // no_shared_fallback; navigation keys are handled via handle_action.
+        self.input.handle_event(&crossterm::event::Event::Key(key));
+        self.selected = 0;
+        self.refresh_dir_listing(ctx.model);
+        Outcome::Consumed
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, ctx: &mut WidgetContext) -> Outcome {
@@ -249,15 +247,10 @@ impl InteractiveWidget for FilePickerWidget {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use flotilla_protocol::{Command, CommandAction};
 
     use super::*;
     use crate::app::test_support::TestWidgetHarness;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
 
     fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
         DirEntry { name: name.to_string(), is_dir: true, is_git_repo, is_added }
@@ -337,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_completes_directory_name() {
+    fn fill_selected_completes_directory_name() {
         let entries = vec![dir_entry("alpha", false, false), dir_entry("bar", false, false)];
         let mut widget = FilePickerWidget {
             input: Input::from("foo/"),
@@ -349,7 +342,7 @@ mod tests {
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
-        widget.handle_raw_key(key(KeyCode::Tab), &mut ctx);
+        widget.handle_action(Action::FillSelected, &mut ctx);
         assert_eq!(widget.input.value(), "foo/bar/");
         assert_eq!(widget.selected, 0);
     }

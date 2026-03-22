@@ -1,6 +1,6 @@
 // Binding table: flat declarative key binding definitions with hint annotations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crokey::KeyCombination;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -163,16 +163,19 @@ pub static BINDINGS: &[Binding] = &[
     hk(BindingModeId::IssueSearch, "enter", "ENT", Action::Confirm, "Apply"),
     hk(BindingModeId::IssueSearch, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── CommandPalette ──
-    // Keys are hardcoded in handle_key; these bindings are advisory for status bar hints.
+    // No shared fallback: typing keys must reach handle_raw_key for text input.
+    b(BindingModeId::CommandPalette, "up", Action::SelectPrev),
+    b(BindingModeId::CommandPalette, "down", Action::SelectNext),
     hk(BindingModeId::CommandPalette, "enter", "ENT", Action::Confirm, "Run"),
-    hk(BindingModeId::CommandPalette, "tab", "TAB", Action::Confirm, "Fill"),
     hk(BindingModeId::CommandPalette, "esc", "ESC", Action::Dismiss, "Close"),
+    hk(BindingModeId::CommandPalette, "tab", "TAB", Action::FillSelected, "Fill"),
     // ── FilePicker ──
-    h(BindingModeId::FilePicker, "j", Action::SelectNext, "Down"),
-    h(BindingModeId::FilePicker, "k", Action::SelectPrev, "Up"),
-    h(BindingModeId::FilePicker, "tab", Action::Confirm, "Complete"),
+    // No shared fallback: typing keys must reach handle_raw_key for text input.
+    b(BindingModeId::FilePicker, "up", Action::SelectPrev),
+    b(BindingModeId::FilePicker, "down", Action::SelectNext),
     hk(BindingModeId::FilePicker, "enter", "ENT", Action::Confirm, "Select"),
     hk(BindingModeId::FilePicker, "esc", "ESC", Action::Dismiss, "Cancel"),
+    hk(BindingModeId::FilePicker, "tab", "TAB", Action::FillSelected, "Complete"),
     // ── SearchActive ──
     h(BindingModeId::SearchActive, "esc", Action::Dismiss, "Clear"),
 ];
@@ -186,11 +189,21 @@ pub struct CompiledBindings {
     /// hints after user config overrides change the key_map.
     /// Each entry stores (original_key_combo, action, hint_label).
     hint_entries: HashMap<BindingModeId, Vec<(KeyCombination, Action, &'static str)>>,
+    no_shared_fallback: HashSet<BindingModeId>,
 }
 
 impl CompiledBindings {
     /// Parse key strings and build both the key map and hint maps.
     pub fn from_table(bindings: &[Binding]) -> Self {
+        Self::from_table_with_no_shared_fallback(bindings, &[])
+    }
+
+    /// Like `from_table`, but the given modes will not fall back to `Shared`
+    /// bindings when no mode-specific binding is found. Use this for text-input
+    /// modes (e.g. `CommandPalette`, `FilePicker`) so that characters like
+    /// `j`, `k`, `?` reach the widget's text handler instead of being
+    /// intercepted by shared navigation bindings.
+    pub fn from_table_with_no_shared_fallback(bindings: &[Binding], no_fallback: &[BindingModeId]) -> Self {
         let mut key_map: HashMap<BindingModeId, HashMap<KeyCombination, Action>> = HashMap::new();
         let mut hint_entries: HashMap<BindingModeId, Vec<(KeyCombination, Action, &'static str)>> = HashMap::new();
 
@@ -203,8 +216,9 @@ impl CompiledBindings {
             }
         }
 
+        let no_shared_fallback: HashSet<BindingModeId> = no_fallback.iter().copied().collect();
         let hints = Self::build_hints(&key_map, &hint_entries);
-        CompiledBindings { key_map, hints, hint_entries }
+        CompiledBindings { key_map, hints, hint_entries, no_shared_fallback }
     }
 
     /// Rebuild hints from the current key_map. Called after user config
@@ -248,21 +262,31 @@ impl CompiledBindings {
 
     /// Resolve a key combination against the given binding mode.
     ///
-    /// For `Single`: check the mode first, then fall back to `Shared`.
-    /// For `Composed`: check modes in reverse order (later wins), then `Shared`.
+    /// For `Single`: check the mode first, then fall back to `Shared` (unless
+    /// the mode is in `no_shared_fallback`).
+    /// For `Composed`: check modes in reverse order (later wins), then `Shared`
+    /// (unless any mode in the stack is in `no_shared_fallback`).
     pub fn resolve(&self, mode: &KeyBindingMode, key: KeyCombination) -> Option<Action> {
         match mode {
-            KeyBindingMode::Single(id) => self
-                .key_map
-                .get(id)
-                .and_then(|m| m.get(&key).copied())
-                .or_else(|| self.key_map.get(&BindingModeId::Shared).and_then(|m| m.get(&key).copied())),
+            KeyBindingMode::Single(id) => {
+                let mode_result = self.key_map.get(id).and_then(|m| m.get(&key).copied());
+                if mode_result.is_some() {
+                    return mode_result;
+                }
+                if self.no_shared_fallback.contains(id) {
+                    return None;
+                }
+                self.key_map.get(&BindingModeId::Shared).and_then(|m| m.get(&key).copied())
+            }
             KeyBindingMode::Composed(ids) => {
                 // Check in reverse order so later modes win.
                 for id in ids.iter().rev() {
                     if let Some(action) = self.key_map.get(id).and_then(|m| m.get(&key).copied()) {
                         return Some(action);
                     }
+                }
+                if ids.iter().any(|id| self.no_shared_fallback.contains(id)) {
+                    return None;
                 }
                 // Fall back to Shared.
                 self.key_map.get(&BindingModeId::Shared).and_then(|m| m.get(&key).copied())
@@ -274,14 +298,20 @@ impl CompiledBindings {
     ///
     /// For `Single`: Shared hints + mode hints (mode overrides by key).
     /// For `Composed`: merge all layers; later modes win by key.
+    ///
+    /// Shared hints are omitted entirely when the mode (or any mode in the
+    /// stack) is in `no_shared_fallback`.
     pub fn hints_for(&self, mode: &KeyBindingMode) -> Vec<KeyChip> {
         match mode {
             KeyBindingMode::Single(id) => {
+                let suppress_shared = self.no_shared_fallback.contains(id);
                 let mut by_key: HashMap<String, KeyChip> = HashMap::new();
-                // Start with Shared hints.
-                if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
-                    for chip in shared_hints {
-                        by_key.insert(chip.key.clone(), chip.clone());
+                // Start with Shared hints (unless suppressed).
+                if !suppress_shared {
+                    if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
+                        for chip in shared_hints {
+                            by_key.insert(chip.key.clone(), chip.clone());
+                        }
                     }
                 }
                 // Mode hints override by key.
@@ -292,10 +322,12 @@ impl CompiledBindings {
                 }
                 // Preserve insertion order: shared first, then mode-specific.
                 let mut result = Vec::new();
-                if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
-                    for chip in shared_hints {
-                        if let Some(c) = by_key.remove(&chip.key) {
-                            result.push(c);
+                if !suppress_shared {
+                    if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
+                        for chip in shared_hints {
+                            if let Some(c) = by_key.remove(&chip.key) {
+                                result.push(c);
+                            }
                         }
                     }
                 }
@@ -309,11 +341,14 @@ impl CompiledBindings {
                 result
             }
             KeyBindingMode::Composed(ids) => {
+                let suppress_shared = ids.iter().any(|id| self.no_shared_fallback.contains(id));
                 let mut by_key: HashMap<String, KeyChip> = HashMap::new();
-                // Start with Shared hints.
-                if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
-                    for chip in shared_hints {
-                        by_key.insert(chip.key.clone(), chip.clone());
+                // Start with Shared hints (unless suppressed).
+                if !suppress_shared {
+                    if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
+                        for chip in shared_hints {
+                            by_key.insert(chip.key.clone(), chip.clone());
+                        }
                     }
                 }
                 // Layer modes in order; later wins.
@@ -324,14 +359,16 @@ impl CompiledBindings {
                         }
                     }
                 }
-                // Preserve order: shared, then each mode layer.
+                // Preserve order: shared (unless suppressed), then each mode layer.
                 let mut result = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
-                    for chip in shared_hints {
-                        if seen.insert(chip.key.clone()) {
-                            if let Some(c) = by_key.get(&chip.key) {
-                                result.push(c.clone());
+                let mut seen = HashSet::new();
+                if !suppress_shared {
+                    if let Some(shared_hints) = self.hints.get(&BindingModeId::Shared) {
+                        for chip in shared_hints {
+                            if seen.insert(chip.key.clone()) {
+                                if let Some(c) = by_key.get(&chip.key) {
+                                    result.push(c.clone());
+                                }
                             }
                         }
                     }
@@ -563,5 +600,38 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].key, "C-Q");
         assert_eq!(hints[0].action, StatusBarAction::combo(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn no_shared_fallback_skips_shared_bindings() {
+        let table = &[
+            b(BindingModeId::Shared, "j", Action::SelectNext),
+            b(BindingModeId::Shared, "esc", Action::Dismiss),
+            b(BindingModeId::CommandPalette, "esc", Action::Dismiss),
+            b(BindingModeId::CommandPalette, "enter", Action::Confirm),
+        ];
+        let compiled = CompiledBindings::from_table_with_no_shared_fallback(table, &[BindingModeId::CommandPalette]);
+        let mode = KeyBindingMode::Single(BindingModeId::CommandPalette);
+        // esc resolves from mode-specific binding
+        assert_eq!(compiled.resolve(&mode, parse_key_string("esc")), Some(Action::Dismiss));
+        // j does NOT resolve — shared fallback is suppressed
+        assert_eq!(compiled.resolve(&mode, parse_key_string("j")), None);
+    }
+
+    #[test]
+    fn hints_for_no_shared_fallback_excludes_shared_hints() {
+        let table =
+            &[Binding { mode: BindingModeId::Shared, key: "?", action: Action::ToggleHelp, hint: Some("Help"), hint_key: None }, Binding {
+                mode: BindingModeId::CommandPalette,
+                key: "esc",
+                action: Action::Dismiss,
+                hint: Some("Close"),
+                hint_key: None,
+            }];
+        let compiled = CompiledBindings::from_table_with_no_shared_fallback(table, &[BindingModeId::CommandPalette]);
+        let hints = compiled.hints_for(&KeyBindingMode::Single(BindingModeId::CommandPalette));
+        let keys: Vec<&str> = hints.iter().map(|h| h.key.as_str()).collect();
+        assert!(!keys.contains(&"?"), "should NOT include shared hint '?' for no-fallback mode");
+        assert!(keys.contains(&"ESC"), "should include mode-specific hint");
     }
 }

@@ -41,6 +41,7 @@ pub enum Action {
     OpenIssueSearch,
     OpenFilePicker,
     OpenCommandPalette,
+    FillSelected,
     Dispatch(Intent),
 }
 
@@ -105,6 +106,7 @@ impl Action {
             "open_issue_search" => Action::OpenIssueSearch,
             "open_file_picker" => Action::OpenFilePicker,
             "open_command_palette" => Action::OpenCommandPalette,
+            "fill_selected" => Action::FillSelected,
             // Intent-wrapping actions
             "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
             "create_workspace" => Action::Dispatch(Intent::CreateWorkspace),
@@ -151,6 +153,7 @@ impl Action {
             Action::OpenIssueSearch => "open_issue_search",
             Action::OpenFilePicker => "open_file_picker",
             Action::OpenCommandPalette => "open_command_palette",
+            Action::FillSelected => "fill_selected",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "switch_to_workspace",
                 Intent::CreateWorkspace => "create_workspace",
@@ -194,6 +197,7 @@ impl Action {
             Action::OpenIssueSearch => "Search issues",
             Action::OpenFilePicker => "Open file picker",
             Action::OpenCommandPalette => "Open command palette",
+            Action::FillSelected => "Fill selected item",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",
                 Intent::CreateWorkspace => "Create workspace",
@@ -244,7 +248,12 @@ impl Keymap {
 
     /// Build the default keymap from the flat binding table.
     pub fn defaults() -> Self {
-        Self { compiled: CompiledBindings::from_table(BINDINGS) }
+        Self {
+            compiled: CompiledBindings::from_table_with_no_shared_fallback(BINDINGS, &[
+                BindingModeId::CommandPalette,
+                BindingModeId::FilePicker,
+            ]),
+        }
     }
 
     /// Build a keymap from defaults, then apply user overrides from `KeysConfig`.
@@ -260,6 +269,8 @@ impl Keymap {
             (&config.action_menu, BindingModeId::ActionMenu),
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
             (&config.close_confirm, BindingModeId::CloseConfirm),
+            (&config.command_palette, BindingModeId::CommandPalette),
+            (&config.file_picker, BindingModeId::FilePicker),
         ];
 
         // Apply shared overrides
@@ -419,6 +430,7 @@ mod tests {
             Action::OpenIssueSearch,
             Action::OpenFilePicker,
             Action::OpenCommandPalette,
+            Action::FillSelected,
         ];
         for action in actions {
             let s = action.as_config_str();
@@ -487,6 +499,7 @@ mod tests {
             Action::OpenIssueSearch,
             Action::OpenFilePicker,
             Action::OpenCommandPalette,
+            Action::FillSelected,
             Action::Dispatch(Intent::SwitchToWorkspace),
             Action::Dispatch(Intent::CreateWorkspace),
             Action::Dispatch(Intent::RemoveCheckout),
@@ -527,8 +540,7 @@ mod tests {
     #[test]
     fn shared_bindings_work_across_modes() {
         let km = Keymap::defaults();
-        let modes =
-            [BindingModeId::Normal, BindingModeId::Help, BindingModeId::Overview, BindingModeId::ActionMenu, BindingModeId::FilePicker];
+        let modes = [BindingModeId::Normal, BindingModeId::Help, BindingModeId::Overview, BindingModeId::ActionMenu];
         for mode in modes {
             assert_eq!(
                 km.resolve(&KeyBindingMode::from(mode), crokey::key!(j)),
@@ -650,13 +662,51 @@ mod tests {
     }
 
     #[test]
-    fn file_picker_falls_through_to_shared() {
+    fn file_picker_no_shared_fallback() {
         let km = Keymap::defaults();
-        // FilePicker has mode-specific bindings that overlap shared, so they resolve directly
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(j)), Some(Action::SelectNext));
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(k)), Some(Action::SelectPrev));
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(enter)), Some(Action::Confirm));
-        assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::FilePicker), crokey::key!(esc)), Some(Action::Dismiss));
+        let mode = KeyBindingMode::from(BindingModeId::FilePicker);
+        // Mode-specific bindings resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&mode, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&mode, crokey::key!(up)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&mode, crokey::key!(down)), Some(Action::SelectNext));
+        // Typing keys do NOT resolve — no shared fallback
+        assert_eq!(km.resolve(&mode, crokey::key!(j)), None);
+        assert_eq!(km.resolve(&mode, crokey::key!(k)), None);
+    }
+
+    #[test]
+    fn command_palette_resolves_navigation_not_typing() {
+        let km = Keymap::defaults();
+        let mode = KeyBindingMode::from(BindingModeId::CommandPalette);
+        // Navigation keys resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&mode, crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&mode, crokey::key!(up)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&mode, crokey::key!(down)), Some(Action::SelectNext));
+        // Typing keys do NOT resolve (fall through to handle_raw_key)
+        assert_eq!(km.resolve(&mode, crokey::key!(j)), None);
+        assert_eq!(km.resolve(&mode, crokey::key!(k)), None);
+        assert_eq!(km.resolve(&mode, kc(KeyCode::Char('?'), KeyModifiers::NONE)), None);
+        // Tab resolves to FillSelected
+        assert_eq!(km.resolve(&mode, crokey::key!(tab)), Some(Action::FillSelected));
+    }
+
+    #[test]
+    fn file_picker_resolves_navigation_not_typing() {
+        let km = Keymap::defaults();
+        let mode = KeyBindingMode::from(BindingModeId::FilePicker);
+        // Navigation keys resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(esc)), Some(Action::Dismiss));
+        assert_eq!(km.resolve(&mode, crokey::key!(enter)), Some(Action::Confirm));
+        assert_eq!(km.resolve(&mode, crokey::key!(up)), Some(Action::SelectPrev));
+        assert_eq!(km.resolve(&mode, crokey::key!(down)), Some(Action::SelectNext));
+        // Typing keys do NOT resolve
+        assert_eq!(km.resolve(&mode, crokey::key!(j)), None);
+        assert_eq!(km.resolve(&mode, crokey::key!(k)), None);
+        assert_eq!(km.resolve(&mode, kc(KeyCode::Char('?'), KeyModifiers::NONE)), None);
+        // Tab resolves to FillSelected
+        assert_eq!(km.resolve(&mode, crokey::key!(tab)), Some(Action::FillSelected));
     }
 
     // ── from_config tests ──
@@ -726,6 +776,19 @@ mod tests {
             keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(Action::Quit)
         );
+    }
+
+    #[test]
+    fn from_config_overrides_command_palette_binding() {
+        let mut keys = KeysConfig::default();
+        keys.command_palette.insert("ctrl-p".into(), "select_prev".into());
+        keys.command_palette.insert("ctrl-n".into(), "select_next".into());
+        let keymap = Keymap::from_config(&keys);
+        let mode = KeyBindingMode::from(BindingModeId::CommandPalette);
+        assert_eq!(keymap.resolve(&mode, kc(KeyCode::Char('p'), KeyModifiers::CONTROL)), Some(Action::SelectPrev));
+        assert_eq!(keymap.resolve(&mode, kc(KeyCode::Char('n'), KeyModifiers::CONTROL)), Some(Action::SelectNext));
+        // Default bindings still work
+        assert_eq!(keymap.resolve(&mode, crokey::key!(up)), Some(Action::SelectPrev));
     }
 
     // ── help_sections tests ──

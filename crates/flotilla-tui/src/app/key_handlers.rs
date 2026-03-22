@@ -71,25 +71,7 @@ impl App {
                 _ => None,
             }
         } else {
-            // Hybrid widgets (text input + action keys) need hardcoded
-            // resolution to prevent shared bindings (e.g. j/k → SelectNext/
-            // SelectPrev) from intercepting text input. Other non-capturing
-            // widgets use the normal keymap.
             match mode_id {
-                BindingModeId::CommandPalette => match key.code {
-                    KeyCode::Esc => Some(Action::Dismiss),
-                    KeyCode::Enter => Some(Action::Confirm),
-                    KeyCode::Up => Some(Action::SelectPrev),
-                    KeyCode::Down => Some(Action::SelectNext),
-                    _ => None,
-                },
-                BindingModeId::FilePicker => match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => Some(Action::SelectNext),
-                    KeyCode::Char('k') | KeyCode::Up => Some(Action::SelectPrev),
-                    KeyCode::Esc => Some(Action::Dismiss),
-                    KeyCode::Enter => Some(Action::Confirm),
-                    _ => None,
-                },
                 // When the top widget is the base layer (Normal mode_id),
                 // resolve using the actual UI mode. This ensures Config mode
                 // gets correct bindings (e.g. q → Dismiss, not Quit).
