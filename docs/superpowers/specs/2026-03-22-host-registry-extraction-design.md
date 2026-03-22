@@ -66,6 +66,10 @@ pub(crate) async fn set_configured_peer_names(
 pub(crate) async fn set_topology_routes(&self, routes: Vec<TopologyRoute>)
 
 // Mirror host state from an incoming DaemonEvent (no emit — state update only).
+// Uses try_write on the hosts lock — best-effort semantics.
+// If the lock is contended, the update is silently skipped.
+// This matches the current send_event behavior and is required because
+// apply_event is called from synchronous contexts in the daemon server.
 pub(crate) fn apply_event(&self, event: &DaemonEvent)
 ```
 
@@ -88,9 +92,16 @@ pub(crate) async fn get_host_status(
 pub(crate) async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String>
 
 pub(crate) async fn get_topology(&self) -> TopologyResponse
+
+// Replay host events for gap recovery (used by replay_since).
+pub(crate) async fn replay_host_events(
+    &self, last_seen: &HashMap<StreamKey, u64>,
+) -> Vec<DaemonEvent>
 ```
 
 Query methods that need repo/peer-derived counts (`local_counts`, `remote_counts`) receive them as parameters. InProcessDaemon computes these from `repos` and `peer_providers` before calling in.
+
+Query methods that use `local_host_summary` for the local host (e.g. `get_host_status`, `get_host_providers`) resolve the fallback internally — callers do not pass the summary in.
 
 ### Private internals
 
@@ -157,7 +168,22 @@ Initializes `hosts` with the local host entry (`Connected`, summary present, seq
 - `get_host_providers` → delegate
 - `get_topology` → delegate
 
-**`send_event` changes**: The host-state mirroring match arms (PeerStatusChanged, HostSnapshot, HostRemoved) delegate to `self.host_registry.apply_event(&event)` before broadcasting. The remaining `let _ = self.event_tx.send(event)` stays.
+**`send_event` changes**: The host-state mirroring match arms (PeerStatusChanged, HostSnapshot, HostRemoved) delegate to `self.host_registry.apply_event(&event)` before broadcasting via `event_tx`. Note: `apply_event` is only for events arriving through `send_event` (external sources, replay). HostRegistry mutation methods emit events directly through the emit closure, bypassing `send_event` — no double-application.
+
+**`replay_since` changes**: The host-event replay block delegates to `self.host_registry.replay_host_events(last_seen)`. Repo replay stays in InProcessDaemon.
+
+### Lock ordering
+
+`HostRegistry` holds three internal `RwLock`s (`hosts`, `configured_peer_names`, `topology_routes`). InProcessDaemon methods that call into `HostRegistry` sometimes read `peer_providers` first to compute `remote_counts`. The implicit ordering is:
+
+1. `peer_providers` (InProcessDaemon) — read to compute counts
+2. `HostRegistry` internal locks — acquired by registry methods
+
+Within `HostRegistry`, methods that call `sync_host_membership` release and re-acquire the `hosts` lock. This deliberate unlock-relock creates a window where another task could modify host state. This is safe because `sync_host_membership` is idempotent — it converges to the correct state regardless of interleaving.
+
+### `host_name` duplication
+
+Both `HostRegistry` and `InProcessDaemon` hold a `host_name: HostName`. InProcessDaemon uses its copy for non-host-registry purposes (snapshot building, command routing, provider normalization). HostRegistry uses its copy for host identity comparisons. Both copies are immutable after construction. This duplication is intentional — it avoids coupling the registry to its container.
 
 ### What doesn't change
 
@@ -175,8 +201,9 @@ Initializes `hosts` with the local host entry (`Connected`, summary present, seq
 
 ### Estimated impact
 
-- ~300 lines move out of `in_process.rs` (host state types, free functions, host_queries call sites, host-related DaemonHandle methods)
+- ~350 lines move out of `in_process.rs` (host state types, free functions, host_queries call sites, host-related DaemonHandle methods, replay_since host block)
 - ~100 lines from `host_queries.rs` absorbed into `host_registry.rs`
-- Net new file: ~450 lines
-- `in_process.rs` drops from ~3,268 to ~2,970 lines
+- Net new file: ~500 lines
+- `in_process.rs` drops from ~3,268 to ~2,920 lines
 - InProcessDaemon field count drops from 20 to 17
+- Import path changes: `crate::host_queries::HostCounts` → `crate::host_registry::HostCounts`
