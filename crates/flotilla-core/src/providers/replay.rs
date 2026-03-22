@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::{
     github_api::{GhApi, GhApiResponse},
@@ -405,17 +406,17 @@ impl ReplayMode {
 /// Read the `REPLAY` env var and return the active mode.
 /// `REPLAY=record` → record, `REPLAY=passthrough` → passthrough, absent → replay.
 pub fn replay_mode() -> ReplayMode {
-    ReplayMode::parse(&std::env::var("REPLAY").unwrap_or_default())
+    let val = std::env::var("REPLAY").unwrap_or_default();
+    let mode = ReplayMode::parse(&val);
+    if !val.is_empty() && mode == ReplayMode::Replay {
+        warn!(REPLAY = %val, "unrecognized REPLAY value, falling back to replay mode (expected: record, passthrough)");
+    }
+    mode
 }
 
 /// Returns `true` when real setup is needed (record or passthrough).
 pub fn is_live() -> bool {
     replay_mode().is_live()
-}
-
-/// Check whether `REPLAY=record` is set.
-pub fn is_recording() -> bool {
-    replay_mode() == ReplayMode::Record
 }
 
 /// Create a `Session` based on the `REPLAY` env var.
@@ -1770,10 +1771,11 @@ rounds:
 
     #[tokio::test]
     async fn test_runner_passthrough_returns_process_runner() {
-        // Passthrough session should return a real ProcessCommandRunner
+        // Runs a real subprocess unconditionally — `echo` is universally available
+        // and instant, so this is acceptable outside passthrough mode.  The test
+        // validates that Session::Passthrough produces a functional runner.
         let session = Session::Passthrough;
         let runner = test_runner(&session);
-        // Verify it's functional by running a real command
         let result = runner.run("echo", &["hello"], Path::new("/tmp"), &ChannelLabel::Noop).await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("hello"));
