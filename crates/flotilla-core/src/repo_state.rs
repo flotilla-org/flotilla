@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{DeltaEntry, HostName, Issue, ProviderData, ProviderError};
+use flotilla_protocol::{DeltaEntry, HostName, Issue, ProviderData, ProviderError, RepoSnapshot};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -32,7 +32,6 @@ pub(crate) const DELTA_LOG_CAPACITY: usize = 16;
 pub(crate) struct SnapshotBuildContext<'a> {
     pub(crate) repo_identity: flotilla_protocol::RepoIdentity,
     pub(crate) path: &'a Path,
-    pub(crate) seq: u64,
     /// Local-only provider data — must NOT contain merged peer data.
     /// Errors and health from the last snapshot are passed separately.
     pub(crate) local_providers: &'a ProviderData,
@@ -73,6 +72,10 @@ pub(crate) struct RepoState {
     /// Incremented only when local provider data changes (not peer data merges).
     /// Used by the outbound peer task to avoid re-sending unchanged local data.
     pub(crate) local_data_version: u64,
+    /// The last broadcast snapshot (merged local + peer data, fully correlated).
+    /// Populated by `poll_snapshots` and `broadcast_snapshot_inner` after each
+    /// broadcast. Query methods read from this instead of recomputing.
+    pub(crate) last_merged_snapshot: Option<Arc<RepoSnapshot>>,
 }
 
 impl RepoState {
@@ -91,6 +94,7 @@ impl RepoState {
             last_broadcast_errors: Vec::new(),
             delta_log: VecDeque::new(),
             local_data_version: 0,
+            last_merged_snapshot: None,
         }
     }
 
@@ -179,17 +183,10 @@ impl RepoState {
     }
 
     /// Build a [`SnapshotBuildContext`] from the current state.
-    ///
-    /// Uses `self.seq` as the sequence number. For the pre-increment
-    /// case in `broadcast_snapshot_inner`, use struct update syntax:
-    /// ```ignore
-    /// SnapshotBuildContext { seq: state.seq + 1, ..state.snapshot_context(host_name) }
-    /// ```
     pub(crate) fn snapshot_context<'a>(&'a self, host_name: &'a HostName) -> SnapshotBuildContext<'a> {
         SnapshotBuildContext {
             repo_identity: self.identity.clone(),
             path: self.preferred_path(),
-            seq: self.seq,
             local_providers: &self.last_local_providers,
             errors: &self.last_snapshot.errors,
             provider_health: &self.last_snapshot.provider_health,
