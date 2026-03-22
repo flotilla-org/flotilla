@@ -27,7 +27,7 @@ use crate::{
     config::ConfigStore,
     convert::snapshot_to_proto,
     daemon::DaemonHandle,
-    executor::{self, ExecutionPlan},
+    executor,
     host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
@@ -248,12 +248,6 @@ fn choose_event(snapshot: RepoSnapshot, delta: DeltaEntry) -> DaemonEvent {
     }
 }
 
-/// Tracks a currently executing step-based command for cancellation.
-struct ActiveCommand {
-    command_id: u64,
-    token: CancellationToken,
-}
-
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -286,8 +280,8 @@ pub struct InProcessDaemon {
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: DiscoveryRuntime,
-    /// The currently active step-based command, if any — for cancellation.
-    active_command: Arc<Mutex<Option<ActiveCommand>>>,
+    /// Running commands, keyed by command ID, for cancellation.
+    active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
@@ -373,7 +367,7 @@ impl InProcessDaemon {
             host_registry: crate::host_registry::HostRegistry::new(host_name.clone(), local_host_summary),
             host_bag,
             discovery,
-            active_command: Arc::new(Mutex::new(None)),
+            active_commands: Arc::new(Mutex::new(HashMap::new())),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
@@ -1324,35 +1318,26 @@ impl InProcessDaemon {
     /// Returns `(resolved_path, Some(original_path))` if normalization changed
     /// the path, or `(original_path, None)` if no change was needed.
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
-        use crate::providers::ChannelLabel;
-        let label = ChannelLabel::Command("git-rev-parse".into());
-        let result = self.discovery.runner.run("git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], path, &label).await;
-        match result {
-            Ok(output) => {
-                let git_common_dir = PathBuf::from(output.trim());
-                // The common dir is `<repo_root>/.git` — the repo root is its parent.
-                if let Some(repo_root) = git_common_dir.parent() {
-                    let repo_root = repo_root.to_path_buf();
-                    // Compare canonicalized paths to handle symlinks (e.g. /var -> /private/var on macOS)
-                    let canonical_root = std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
-                    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-                    if canonical_root != canonical_path {
-                        debug!(
-                            worktree = %path.display(),
-                            repo_root = %canonical_root.display(),
-                            "normalized worktree path to main repo root"
-                        );
-                        return (canonical_root, Some(path.to_path_buf()));
-                    }
-                    // Even if paths match, prefer the canonical form
-                    return (canonical_root, None);
+        use crate::providers::vcs::{git::GitVcs, Vcs};
+
+        let vcs = GitVcs::new(self.discovery.runner.clone());
+        match vcs.resolve_repo_root(path).await {
+            Some(repo_root) => {
+                // Canonicalize to handle symlinks (e.g. /var -> /private/var on macOS).
+                let canonical_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+                let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                if canonical_root != canonical_path {
+                    debug!(
+                        worktree = %path.display(),
+                        repo_root = %canonical_root.display(),
+                        "normalized worktree path to main repo root"
+                    );
+                    (canonical_root, Some(path.to_path_buf()))
+                } else {
+                    (canonical_root, None)
                 }
-                (path.to_path_buf(), None)
             }
-            Err(_) => {
-                // Not a git repo or git not available — use the path as-is
-                (path.to_path_buf(), None)
-            }
+            None => (path.to_path_buf(), None),
         }
     }
 
@@ -1708,10 +1693,19 @@ impl DaemonHandle for InProcessDaemon {
             (state.identity().clone(), state.registry(), state.providers(), state.refresh_trigger())
         };
 
-        // Broadcast started after repo validation (ensures no orphaned CommandStarted)
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
         let config_base = self.config.base_path().to_path_buf();
+
+        // Register the cancellation token before broadcasting CommandStarted
+        // so cancel(id) can find it the instant the TUI sees the event.
+        let active_ref = Arc::clone(&self.active_commands);
+        let token = CancellationToken::new();
+        {
+            let mut guard = active_ref.lock().await;
+            guard.insert(id, token.clone());
+        }
+
         let _ = self.event_tx.send(DaemonEvent::CommandStarted {
             command_id: id,
             host: self.host_name.clone(),
@@ -1721,10 +1715,7 @@ impl DaemonHandle for InProcessDaemon {
         });
 
         // Spawn the entire build_plan + execution so execute() returns the
-        // command_id immediately. This keeps the TUI event loop responsive —
-        // build_plan runs execute() inline for Immediate commands, which may
-        // do network I/O (e.g. GenerateBranchName, ArchiveSession).
-        let active_ref = Arc::clone(&self.active_command);
+        // command_id immediately. This keeps the TUI event loop responsive.
         let local_host = self.host_name.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
@@ -1743,7 +1734,6 @@ impl DaemonHandle for InProcessDaemon {
                 executor::RepoExecutionContext { identity: repo_identity.clone(), root: repo_path.clone() },
                 registry,
                 providers_data,
-                runner,
                 config_base,
                 attachable_store,
                 daemon_socket_path.clone(),
@@ -1753,7 +1743,11 @@ impl DaemonHandle for InProcessDaemon {
             .await;
 
             match plan {
-                ExecutionPlan::Immediate(result) => {
+                Err(result) => {
+                    {
+                        let mut guard = active_ref.lock().await;
+                        guard.remove(&id);
+                    }
                     refresh_trigger.notify_one();
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
@@ -1763,28 +1757,7 @@ impl DaemonHandle for InProcessDaemon {
                         result,
                     });
                 }
-                ExecutionPlan::Steps(step_plan) => {
-                    // Reject if another step command is already running.
-                    // Single-slot design: one step command at a time (global).
-                    // Hold the lock across check-and-set to avoid TOCTOU races.
-                    let token = CancellationToken::new();
-                    {
-                        let mut guard = active_ref.lock().await;
-                        if let Some(active) = &*guard {
-                            let _ = event_tx.send(DaemonEvent::CommandFinished {
-                                command_id: id,
-                                host: command_host.clone(),
-                                repo_identity: repo_identity.clone(),
-                                repo: repo_path,
-                                result: flotilla_protocol::CommandValue::Error {
-                                    message: format!("another command is already running (id {})", active.command_id),
-                                },
-                            });
-                            return;
-                        }
-                        *guard = Some(ActiveCommand { command_id: id, token: token.clone() });
-                    }
-
+                Ok(step_plan) => {
                     let resolver = executor::ExecutorStepResolver {
                         repo: resolver_repo,
                         registry: resolver_registry,
@@ -1808,9 +1781,7 @@ impl DaemonHandle for InProcessDaemon {
                     .await;
                     refresh_trigger.notify_one();
                     let mut guard = active_ref.lock().await;
-                    if guard.as_ref().map(|a| a.command_id) == Some(id) {
-                        *guard = None;
-                    }
+                    guard.remove(&id);
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
                         host: command_host,
@@ -1826,13 +1797,13 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn cancel(&self, command_id: u64) -> Result<(), String> {
-        let guard = self.active_command.lock().await;
-        match &*guard {
-            Some(active) if active.command_id == command_id => {
-                active.token.cancel();
+        let guard = self.active_commands.lock().await;
+        match guard.get(&command_id) {
+            Some(token) => {
+                token.cancel();
                 Ok(())
             }
-            _ => Err("no matching active command".into()),
+            None => Err("no matching active command".into()),
         }
     }
 

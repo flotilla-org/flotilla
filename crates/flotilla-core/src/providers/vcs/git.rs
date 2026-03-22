@@ -21,41 +21,16 @@ use super::TRUNK_NAMES;
 
 #[async_trait]
 impl super::Vcs for GitVcs {
-    fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
-        // git-common-dir points to the shared .git dir (same as .git for
-        // non-worktree repos, the main repo's .git for worktrees).
-        // --path-format=absolute requires git >= 2.31 (Feb 2021).
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .current_dir(path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    async fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
+        let output = run!(self.runner, "git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], path).ok()?;
+        let git_dir = PathBuf::from(output.trim());
 
-        // For bare repos, git-common-dir IS the repo directory itself (e.g.
-        // foo.git), so calling parent() would give the containing directory
-        // rather than the repo root.  Detect bare repos and return git_dir
-        // directly in that case.
-        let bare_output = std::process::Command::new("git")
-            .args(["rev-parse", "--is-bare-repository"])
-            .current_dir(path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        let is_bare = bare_output.status.success() && String::from_utf8_lossy(&bare_output.stdout).trim() == "true";
+        let is_bare =
+            run!(self.runner, "git", &["rev-parse", "--is-bare-repository"], path).ok().map(|s| s.trim() == "true").unwrap_or(false);
 
         if is_bare {
             Some(git_dir)
         } else {
-            // The repo root is the parent of the .git directory.
             git_dir.parent().map(|p| p.to_path_buf())
         }
     }

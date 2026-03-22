@@ -245,8 +245,9 @@ impl RepoPage {
     // ── Action helpers ──
 
     fn dismiss(&mut self, ctx: &mut WidgetContext) -> Outcome {
-        // Cancellation takes priority while a command is running.
-        if let Some(&command_id) = ctx.in_flight.keys().next() {
+        // Cancellation takes priority while a command is running for this repo.
+        let active_repo = &ctx.repo_order[ctx.active_repo];
+        if let Some(command_id) = ctx.in_flight.iter().filter(|(_, cmd)| &cmd.repo_identity == active_repo).map(|(id, _)| *id).max() {
             ctx.app_actions.push(AppAction::CancelCommand(command_id));
             return Outcome::Consumed;
         }
@@ -618,6 +619,49 @@ mod tests {
         assert!(matches!(outcome, Outcome::Consumed));
         assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::CancelCommand(42))));
         assert!(!ctx.app_actions.iter().any(|a| matches!(a, AppAction::Quit)));
+    }
+
+    #[test]
+    fn dismiss_cancels_most_recent_command() {
+        let mut page = page_with_items(vec![issue_item("1")]);
+        let mut harness = TestWidgetHarness::new();
+        let repo_identity = harness.model.repo_order[0].clone();
+        harness.in_flight.insert(10, crate::app::InFlightCommand {
+            repo_identity: repo_identity.clone(),
+            repo: PathBuf::from("/tmp/test-repo"),
+            description: "older".into(),
+        });
+        harness.in_flight.insert(20, crate::app::InFlightCommand {
+            repo_identity,
+            repo: PathBuf::from("/tmp/test-repo"),
+            description: "newer".into(),
+        });
+        let mut ctx = harness.ctx();
+
+        let outcome = page.handle_action(Action::Dismiss, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert!(
+            ctx.app_actions.iter().any(|a| matches!(a, AppAction::CancelCommand(20))),
+            "should cancel the most recent command (highest ID)"
+        );
+    }
+
+    #[test]
+    fn dismiss_ignores_commands_for_other_repos() {
+        let mut page = page_with_items(vec![issue_item("1")]);
+        let mut harness = TestWidgetHarness::new();
+        // Insert a command for a different repo — dismiss should not cancel it.
+        harness.in_flight.insert(42, crate::app::InFlightCommand {
+            repo_identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "other/repo".into() },
+            repo: PathBuf::from("/tmp/other-repo"),
+            description: "other repo command".into(),
+        });
+        let mut ctx = harness.ctx();
+
+        let outcome = page.handle_action(Action::Dismiss, &mut ctx);
+        // Should fall through to quit since no in-flight command matches active repo.
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert!(!ctx.app_actions.iter().any(|a| matches!(a, AppAction::CancelCommand(_))), "should not cancel other repo's command");
     }
 
     #[test]

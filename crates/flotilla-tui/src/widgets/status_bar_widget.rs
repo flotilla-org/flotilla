@@ -237,15 +237,15 @@ impl InteractiveWidget for StatusBarWidget {
 /// Resolve the active in-flight task description for the current repo.
 pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<TaskSection> {
     let active_repo = &model.repo_order[model.active_repo];
-    let active_cmds: Vec<&str> =
-        in_flight.values().filter(|cmd| &cmd.repo_identity == active_repo).map(|cmd| cmd.description.as_str()).collect();
+    let repo_cmds: Vec<(&u64, &InFlightCommand)> = in_flight.iter().filter(|(_, cmd)| &cmd.repo_identity == active_repo).collect();
 
-    if active_cmds.is_empty() {
-        return None;
-    }
-
-    let description =
-        if active_cmds.len() == 1 { active_cmds[0].to_string() } else { format!("{} (+{})", active_cmds[0], active_cmds.len() - 1) };
+    // Highest command ID = most recently started (IDs are monotonically increasing AtomicU64).
+    let (_, most_recent) = repo_cmds.iter().max_by_key(|(id, _)| *id)?;
+    let description = if repo_cmds.len() <= 1 {
+        most_recent.description.clone()
+    } else {
+        format!("{} (+{})", most_recent.description, repo_cmds.len() - 1)
+    };
 
     Some(TaskSection::new(&description, 0))
 }
@@ -301,10 +301,13 @@ pub(crate) fn resolve_task_from_fragment(fragment: &StatusFragment) -> Option<Ta
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use flotilla_protocol::RepoLabels;
     use ratatui::layout::Rect;
 
     use super::*;
-    use crate::status_bar::StatusBarAction;
+    use crate::{app::test_support::repo_info, status_bar::StatusBarAction};
 
     #[test]
     fn handle_click_returns_none_for_miss() {
@@ -336,5 +339,49 @@ mod tests {
         widget.key_targets.push(StatusBarTarget::new(Rect::new(5, 10, 10, 1), StatusBarAction::key(KeyCode::Char('q'))));
         let action = widget.handle_click(8, 10);
         assert_eq!(action, Some(StatusBarAction::ClearError(1)));
+    }
+
+    #[test]
+    fn active_task_shows_most_recent_command_with_count_suffix() {
+        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
+        let model = TuiModel::from_repo_info(vec![ri]);
+        let repo_identity = model.repo_order[0].clone();
+
+        let mut in_flight = HashMap::new();
+        in_flight.insert(10, InFlightCommand {
+            repo_identity: repo_identity.clone(),
+            repo: PathBuf::from("/tmp/test-repo"),
+            description: "older command".into(),
+        });
+        in_flight.insert(20, InFlightCommand { repo_identity, repo: PathBuf::from("/tmp/test-repo"), description: "newer command".into() });
+
+        let task = active_task(&model, &in_flight).expect("should have an active task");
+        assert!(
+            task.description.contains("newer command"),
+            "task description should show the most recent command, got: {}",
+            task.description
+        );
+        assert!(task.description.contains("(+1)"), "task description should show (+1) count suffix, got: {}", task.description);
+    }
+
+    #[test]
+    fn active_task_shows_single_command_without_suffix() {
+        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
+        let model = TuiModel::from_repo_info(vec![ri]);
+        let repo_identity = model.repo_order[0].clone();
+
+        let mut in_flight = HashMap::new();
+        in_flight.insert(42, InFlightCommand { repo_identity, repo: PathBuf::from("/tmp/test-repo"), description: "only command".into() });
+
+        let task = active_task(&model, &in_flight).expect("should have an active task");
+        assert_eq!(task.description, "only command");
+    }
+
+    #[test]
+    fn active_task_returns_none_when_no_commands() {
+        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
+        let model = TuiModel::from_repo_info(vec![ri]);
+        let in_flight: HashMap<u64, InFlightCommand> = HashMap::new();
+        assert!(active_task(&model, &in_flight).is_none());
     }
 }
