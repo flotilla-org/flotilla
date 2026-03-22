@@ -278,7 +278,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     // Resolve repos before splash (fast — just reads config files).
     let embedded = cli.embedded;
     let repo_roots = if embedded {
-        let roots = flotilla_core::config::resolve_repo_roots(&cli.repo_root, &config);
+        let roots = flotilla_core::config::resolve_repo_roots(&cli.repo_root, &config).await;
         if roots.is_empty() {
             flotilla_tui::terminal::restore_terminal();
             eprintln!("Error: no git repositories found (use --repo-root to specify)");

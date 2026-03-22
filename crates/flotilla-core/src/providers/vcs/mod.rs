@@ -15,7 +15,7 @@ pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 pub trait Vcs: Send + Sync {
     /// Given any path (possibly inside a worktree/checkout), resolve to the
     /// main repository root. Returns None if the path is not inside a repo.
-    fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf>;
+    async fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf>;
     async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String>;
     async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String>;
     async fn commit_log(&self, repo_root: &Path, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String>;
