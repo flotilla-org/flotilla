@@ -144,7 +144,7 @@ mod tests {
     struct StubVcs;
     #[async_trait]
     impl Vcs for StubVcs {
-        fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
+        async fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
             None
         }
         async fn list_local_branches(&self, _: &Path) -> Result<Vec<BranchInfo>, String> {

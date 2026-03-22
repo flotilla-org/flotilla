@@ -547,7 +547,7 @@ mod tests {
 
     #[async_trait]
     impl Vcs for MockVcs {
-        fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
+        async fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
             None
         }
 

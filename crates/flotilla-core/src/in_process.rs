@@ -1319,35 +1319,26 @@ impl InProcessDaemon {
     /// Returns `(resolved_path, Some(original_path))` if normalization changed
     /// the path, or `(original_path, None)` if no change was needed.
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
-        use crate::providers::ChannelLabel;
-        let label = ChannelLabel::Command("git-rev-parse".into());
-        let result = self.discovery.runner.run("git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], path, &label).await;
-        match result {
-            Ok(output) => {
-                let git_common_dir = PathBuf::from(output.trim());
-                // The common dir is `<repo_root>/.git` — the repo root is its parent.
-                if let Some(repo_root) = git_common_dir.parent() {
-                    let repo_root = repo_root.to_path_buf();
-                    // Compare canonicalized paths to handle symlinks (e.g. /var -> /private/var on macOS)
-                    let canonical_root = std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
-                    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-                    if canonical_root != canonical_path {
-                        debug!(
-                            worktree = %path.display(),
-                            repo_root = %canonical_root.display(),
-                            "normalized worktree path to main repo root"
-                        );
-                        return (canonical_root, Some(path.to_path_buf()));
-                    }
-                    // Even if paths match, prefer the canonical form
-                    return (canonical_root, None);
+        use crate::providers::vcs::{git::GitVcs, Vcs};
+
+        let vcs = GitVcs::new(self.discovery.runner.clone());
+        match vcs.resolve_repo_root(path).await {
+            Some(repo_root) => {
+                // Canonicalize to handle symlinks (e.g. /var -> /private/var on macOS).
+                let canonical_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+                let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                if canonical_root != canonical_path {
+                    debug!(
+                        worktree = %path.display(),
+                        repo_root = %canonical_root.display(),
+                        "normalized worktree path to main repo root"
+                    );
+                    (canonical_root, Some(path.to_path_buf()))
+                } else {
+                    (canonical_root, None)
                 }
-                (path.to_path_buf(), None)
             }
-            Err(_) => {
-                // Not a git repo or git not available — use the path as-is
-                (path.to_path_buf(), None)
-            }
+            None => (path.to_path_buf(), None),
         }
     }
 
