@@ -54,6 +54,7 @@ pub enum StepAction {
     /// Create a workspace for a checkout path produced by a prior step.
     CreateWorkspaceForCheckout {
         label: String,
+        checkout_path: Option<PathBuf>,
     },
 
     // Teleport

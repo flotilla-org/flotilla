@@ -2882,7 +2882,7 @@ async fn executor_step_resolver_creates_workspace() {
 
     let prior =
         vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
-    let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into() };
+    let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into(), checkout_path: None };
     let outcome = resolver.resolve("create workspace", action, &prior).await;
     assert!(outcome.is_ok(), "resolve should succeed: {outcome:?}");
 
@@ -2908,7 +2908,7 @@ async fn executor_step_resolver_skips_when_no_checkout_path() {
         local_host: local_host(),
     };
 
-    let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into() };
+    let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into(), checkout_path: None };
     let outcome = resolver.resolve("create workspace", action, &[]).await;
     assert!(matches!(outcome, Ok(StepOutcome::Skipped)), "should skip when no prior CheckoutCreated outcome: {outcome:?}");
 

@@ -272,7 +272,7 @@ fn build_create_checkout_plan(
     steps.push(Step {
         description: "Create workspace".to_string(),
         host: StepHost::Local,
-        action: StepAction::CreateWorkspaceForCheckout { label: branch },
+        action: StepAction::CreateWorkspaceForCheckout { label: branch, checkout_path: None },
     });
 
     ExecutionPlan::Steps(StepPlan::new(steps))
@@ -461,11 +461,20 @@ impl StepResolver for ExecutorStepResolver {
                 let session_actions = ReadOnlySessionActionService::new(self.registry.as_ref(), self.providers_data.as_ref());
                 Ok(StepOutcome::CompletedWith(session_actions.generate_branch_name_result(&issue_keys).await))
             }
-            StepAction::CreateWorkspaceForCheckout { label } => {
-                let path = prior.iter().find_map(|o| match o {
-                    StepOutcome::CompletedWith(CommandValue::CheckoutCreated { path, .. }) => Some(path.clone()),
-                    _ => None,
-                });
+            StepAction::CreateWorkspaceForCheckout { label, checkout_path: explicit_path } => {
+                let path = if let Some(p) = explicit_path {
+                    let host_key = HostPath::new(self.local_host.clone(), p.clone());
+                    if !self.providers_data.checkouts.contains_key(&host_key) {
+                        return Err(format!("checkout not found: {}", p.display()));
+                    }
+                    info!(%label, "entering workspace");
+                    Some(p)
+                } else {
+                    prior.iter().find_map(|o| match o {
+                        StepOutcome::CompletedWith(CommandValue::CheckoutCreated { path, .. }) => Some(path.clone()),
+                        _ => None,
+                    })
+                };
                 match path {
                     Some(p) => {
                         let workspace_orchestrator = WorkspaceOrchestrator::new(
@@ -481,7 +490,6 @@ impl StepResolver for ExecutorStepResolver {
                     None => Ok(StepOutcome::Skipped),
                 }
             }
-<<<<<<< HEAD
             StepAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
                 let workspace_orchestrator = WorkspaceOrchestrator::new(
                     &self.repo.root,
@@ -544,8 +552,41 @@ impl StepResolver for ExecutorStepResolver {
                     Err(format!("checkout not found: {}", checkout_path.display()))
                 }
             }
-            StepAction::CheckoutImmediate { .. } => todo!("batch 2: task 4"),
-            StepAction::FetchCheckoutStatus { .. } => todo!("batch 2: task 4"),
+            StepAction::CheckoutImmediate { target, issue_ids } => {
+                let (branch, create_branch, intent) = match target {
+                    CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
+                    CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
+                };
+                let checkout_flow = CheckoutFlow {
+                    branch: &branch,
+                    create_branch,
+                    intent,
+                    issue_ids: &issue_ids,
+                    repo_root: &self.repo.root,
+                    registry: self.registry.as_ref(),
+                    providers_data: self.providers_data.as_ref(),
+                    runner: self.runner.as_ref(),
+                    local_host: &self.local_host,
+                };
+                info!(%branch, "creating checkout (immediate)");
+                let result =
+                    checkout_flow.checkout_created_result(CheckoutExistingPolicy::AlwaysCreate, CheckoutIssueLinkPolicy::Inline).await?;
+                if let CommandValue::CheckoutCreated { path, .. } = &result {
+                    info!(checkout_path = %path.display(), "created checkout");
+                }
+                Ok(StepOutcome::CompletedWith(result))
+            }
+            StepAction::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
+                let info = data::fetch_checkout_status(
+                    &branch,
+                    checkout_path.as_deref(),
+                    change_request_id.as_deref(),
+                    &self.repo.root,
+                    self.runner.as_ref(),
+                )
+                .await;
+                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutStatus(info)))
+            }
             StepAction::OpenChangeRequest { id } => {
                 debug!(%id, "opening change request in browser");
                 if let Some(cr) = self.registry.change_requests.preferred() {
