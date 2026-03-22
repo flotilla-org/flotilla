@@ -1310,10 +1310,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![], config, local_bare_remote_discovery(), HostName::local()).await;
 
-    daemon
-        .add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), vec![], 0)
-        .await
-        .expect("add virtual repo");
+    daemon.add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), vec![], 0).await.expect("add virtual repo");
     let (tracked_path, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
     // Path may be canonicalized (e.g. /var -> /private/var on macOS)
     let canonical_repo = std::fs::canonicalize(&local_repo).unwrap_or_else(|_| local_repo.clone());
@@ -1945,19 +1942,16 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
     let peer_host = HostName::new("peer-a");
     let peer_checkout_path = PathBuf::from("/srv/peer-a/repo");
     let peers = vec![(peer_host.clone(), ProviderData {
-        checkouts: indexmap::IndexMap::from([(
-            HostPath::new(peer_host.clone(), peer_checkout_path.clone()),
-            Checkout {
-                branch: "feat-remote".into(),
-                is_main: false,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                correlation_keys: vec![CorrelationKey::Branch("feat-remote".into())],
-                association_keys: vec![],
-            },
-        )]),
+        checkouts: indexmap::IndexMap::from([(HostPath::new(peer_host.clone(), peer_checkout_path.clone()), Checkout {
+            branch: "feat-remote".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::Branch("feat-remote".into())],
+            association_keys: vec![],
+        })]),
         ..Default::default()
     })];
 
@@ -2017,10 +2011,7 @@ async fn add_virtual_repo_is_idempotent() {
     daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), vec![], 0).await.expect("first add should succeed");
 
     // Second add with same path should be a no-op
-    daemon
-        .add_virtual_repo(identity, synthetic_path.clone(), vec![], 0)
-        .await
-        .expect("second add should succeed (idempotent)");
+    daemon.add_virtual_repo(identity, synthetic_path.clone(), vec![], 0).await.expect("second add should succeed (idempotent)");
 
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1, "should still have exactly one repo");

@@ -166,8 +166,8 @@ impl PeerRuntime {
                                     let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
                                     if plan.was_active {
                                         daemon_for_cleanup
-                                        .publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected)
-                                        .await;
+                                            .publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected)
+                                            .await;
                                     }
                                 }
                                 Err(e) => {

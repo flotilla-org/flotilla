@@ -232,12 +232,7 @@ impl HostRegistry {
     /// Publish a peer host summary update. Normalizes the `host_name` field
     /// and emits a `HostSnapshot` if the summary changed. Does NOT call
     /// `sync_host_membership` (matches current behavior).
-    pub(crate) async fn publish_peer_summary(
-        &self,
-        host: &HostName,
-        summary: HostSummary,
-        emit: &impl Fn(DaemonEvent),
-    ) {
+    pub(crate) async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary, emit: &impl Fn(DaemonEvent)) {
         let mut summary = summary;
         summary.host_name = host.clone();
         let snapshot = {
