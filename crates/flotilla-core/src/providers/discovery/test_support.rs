@@ -16,8 +16,8 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset, IssuePage,
-    RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
+    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset,
+    IssuePage, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 use tokio::sync::Mutex as TokioMutex;
 

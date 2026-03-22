@@ -269,10 +269,7 @@ async fn refresh_providers(
 
 /// Update terminal statuses in the attachable store from live session data.
 /// Must run before `project_attachable_data` so it reads fresh statuses.
-fn reconcile_terminal_statuses(
-    sessions: &[crate::providers::terminal::TerminalSession],
-    attachable_store: &SharedAttachableStore,
-) {
+fn reconcile_terminal_statuses(sessions: &[crate::providers::terminal::TerminalSession], attachable_store: &SharedAttachableStore) {
     let live: std::collections::HashMap<&str, &crate::providers::terminal::TerminalSession> =
         sessions.iter().map(|s| (s.session_name.as_str(), s)).collect();
 
