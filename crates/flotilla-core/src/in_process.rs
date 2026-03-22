@@ -464,12 +464,6 @@ impl RepoState {
     }
 }
 
-/// Tracks a currently executing step-based command for cancellation.
-struct ActiveCommand {
-    command_id: u64,
-    token: CancellationToken,
-}
-
 #[derive(Debug, Clone)]
 struct HostState {
     connection_status: PeerConnectionState,
@@ -610,8 +604,8 @@ pub struct InProcessDaemon {
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: DiscoveryRuntime,
-    /// The currently active step-based command, if any — for cancellation.
-    active_command: Arc<Mutex<Option<ActiveCommand>>>,
+    /// Running commands, keyed by command ID, for cancellation.
+    active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
@@ -707,7 +701,7 @@ impl InProcessDaemon {
             topology_routes: RwLock::new(Vec::new()),
             host_bag,
             discovery,
-            active_command: Arc::new(Mutex::new(None)),
+            active_commands: Arc::new(Mutex::new(HashMap::new())),
             session_id: uuid::Uuid::new_v4(),
             local_host_summary,
             agent_state_store,
@@ -2222,7 +2216,7 @@ impl DaemonHandle for InProcessDaemon {
 
         // Spawn the entire build_plan + execution so the command_id is
         // returned immediately. This keeps the TUI event loop responsive.
-        let active_ref = Arc::clone(&self.active_command);
+        let active_ref = Arc::clone(&self.active_commands);
         let local_host = self.host_name.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
@@ -2262,25 +2256,10 @@ impl DaemonHandle for InProcessDaemon {
                     });
                 }
                 Ok(step_plan) => {
-                    // Reject if another step command is already running.
-                    // Single-slot design: one step command at a time (global).
-                    // Hold the lock across check-and-set to avoid TOCTOU races.
                     let token = CancellationToken::new();
                     {
                         let mut guard = active_ref.lock().await;
-                        if let Some(active) = &*guard {
-                            let _ = event_tx.send(DaemonEvent::CommandFinished {
-                                command_id: id,
-                                host: command_host.clone(),
-                                repo_identity: repo_identity.clone(),
-                                repo: repo_path,
-                                result: flotilla_protocol::CommandValue::Error {
-                                    message: format!("another command is already running (id {})", active.command_id),
-                                },
-                            });
-                            return;
-                        }
-                        *guard = Some(ActiveCommand { command_id: id, token: token.clone() });
+                        guard.insert(id, token.clone());
                     }
 
                     let resolver = executor::ExecutorStepResolver {
@@ -2306,9 +2285,7 @@ impl DaemonHandle for InProcessDaemon {
                     .await;
                     refresh_trigger.notify_one();
                     let mut guard = active_ref.lock().await;
-                    if guard.as_ref().map(|a| a.command_id) == Some(id) {
-                        *guard = None;
-                    }
+                    guard.remove(&id);
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
                         host: command_host,
@@ -2324,13 +2301,13 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn cancel(&self, command_id: u64) -> Result<(), String> {
-        let guard = self.active_command.lock().await;
-        match &*guard {
-            Some(active) if active.command_id == command_id => {
-                active.token.cancel();
+        let guard = self.active_commands.lock().await;
+        match guard.get(&command_id) {
+            Some(token) => {
+                token.cancel();
                 Ok(())
             }
-            _ => Err("no matching active command".into()),
+            None => Err("no matching active command".into()),
         }
     }
 

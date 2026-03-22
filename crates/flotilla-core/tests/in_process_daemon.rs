@@ -2419,3 +2419,95 @@ async fn issue_refresh_escalation_resets_cache_and_refetches() {
     assert_eq!(issue_56.title, "Issue 56");
     assert_eq!(issue_56.labels, vec!["new".to_string()]);
 }
+
+#[tokio::test]
+async fn two_commands_can_run_concurrently() {
+    // --- Arrange ---
+    // Set up a daemon with a SlowCloudAgent that blocks on archive_session.
+    // There is no AI utility, so GenerateBranchName falls back immediately.
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let agent = Arc::new(SlowCloudAgent::new());
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, slow_cloud_agent_discovery(Arc::clone(&agent)), HostName::local()).await;
+    let mut rx = daemon.subscribe();
+
+    // Refresh so the session appears in providers_data.
+    let refresh_event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+    match refresh_event {
+        DaemonEvent::RepoSnapshot(snap) => assert!(snap.providers.sessions.contains_key("sess-1"), "refresh should expose sess-1"),
+        DaemonEvent::RepoDelta(delta) => {
+            assert!(delta.work_items.iter().any(|item| item.session_key.as_deref() == Some("sess-1")), "refresh should expose sess-1")
+        }
+        other => panic!("expected snapshot event, got {other:?}"),
+    }
+
+    // --- Act: start first command (blocks inside archive_session) ---
+    let archive_cmd = Command {
+        host: None,
+        context_repo: Some(RepoSelector::Path(repo.clone())),
+        action: CommandAction::ArchiveSession { session_id: "sess-1".into() },
+    };
+    let archive_id = daemon.execute(archive_cmd).await.expect("execute ArchiveSession should return a command id");
+
+    // Wait for the first command to start.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandStarted { command_id: id, .. }) if id == archive_id => break,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ArchiveSession CommandStarted");
+
+    // Wait until the slow agent is actually inside archive_session.
+    agent.wait_for_archive_start().await;
+
+    // --- Act: start second command while first is still blocking ---
+    // GenerateBranchName with no AI utility completes immediately with a fallback result.
+    let branch_cmd = Command {
+        host: None,
+        context_repo: Some(RepoSelector::Path(repo.clone())),
+        action: CommandAction::GenerateBranchName { issue_keys: vec![] },
+    };
+    let branch_id = daemon.execute(branch_cmd).await.expect("execute GenerateBranchName should return a command id");
+
+    // --- Assert: second command completes successfully while first is still blocked ---
+    let branch_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == branch_id => break result,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for GenerateBranchName to finish — concurrent execution may be blocked");
+
+    assert!(!matches!(branch_result, CommandValue::Error { .. }), "GenerateBranchName should succeed concurrently, got: {branch_result:?}");
+
+    // --- Cleanup: release the first command and verify it finishes ---
+    agent.release_archive();
+
+    let archive_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == archive_id => break result,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ArchiveSession to finish");
+
+    assert!(
+        !matches!(archive_result, CommandValue::Error { .. }),
+        "ArchiveSession should complete successfully after release, got: {archive_result:?}"
+    );
+}
