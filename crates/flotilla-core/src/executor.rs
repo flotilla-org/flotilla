@@ -481,6 +481,15 @@ impl StepResolver for ExecutorStepResolver {
                     None => Ok(StepOutcome::Skipped),
                 }
             }
+            StepAction::CreateWorkspaceFromPreparedTerminal { .. } => todo!("batch 2: task 3"),
+            StepAction::SelectWorkspace { .. } => todo!("batch 2: task 3"),
+            StepAction::PrepareTerminalForCheckout { .. } => todo!("batch 2: task 3"),
+            StepAction::CheckoutImmediate { .. } => todo!("batch 2: task 4"),
+            StepAction::FetchCheckoutStatus { .. } => todo!("batch 2: task 4"),
+            StepAction::OpenChangeRequest { .. } => todo!("batch 2: task 2"),
+            StepAction::CloseChangeRequest { .. } => todo!("batch 2: task 2"),
+            StepAction::OpenIssue { .. } => todo!("batch 2: task 2"),
+            StepAction::LinkIssuesToChangeRequest { .. } => todo!("batch 2: task 2"),
             #[cfg(test)]
             StepAction::Noop => Ok(StepOutcome::Completed),
         }

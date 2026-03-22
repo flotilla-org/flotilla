@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use flotilla_protocol::{CommandValue, DaemonEvent, HostName, HostPath, ManagedTerminalId, RepoIdentity, StepStatus};
+use flotilla_protocol::{
+    AttachableSetId, CheckoutTarget, CommandValue, DaemonEvent, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
+    RepoIdentity, StepStatus,
+};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -75,6 +78,50 @@ pub enum StepAction {
     },
     GenerateBranchName {
         issue_keys: Vec<String>,
+    },
+
+    // Workspace lifecycle (new)
+    CreateWorkspaceFromPreparedTerminal {
+        target_host: HostName,
+        branch: String,
+        checkout_path: PathBuf,
+        attachable_set_id: Option<AttachableSetId>,
+        commands: Vec<PreparedTerminalCommand>,
+    },
+    SelectWorkspace {
+        ws_ref: String,
+    },
+    PrepareTerminalForCheckout {
+        checkout_path: PathBuf,
+        commands: Vec<PreparedTerminalCommand>,
+    },
+
+    // Checkout with AlwaysCreate/Inline policy (forwarded-command path)
+    CheckoutImmediate {
+        target: CheckoutTarget,
+        issue_ids: Vec<(String, String)>,
+    },
+
+    // Query
+    FetchCheckoutStatus {
+        branch: String,
+        checkout_path: Option<PathBuf>,
+        change_request_id: Option<String>,
+    },
+
+    // External interactions
+    OpenChangeRequest {
+        id: String,
+    },
+    CloseChangeRequest {
+        id: String,
+    },
+    OpenIssue {
+        id: String,
+    },
+    LinkIssuesToChangeRequest {
+        change_request_id: String,
+        issue_ids: Vec<String>,
     },
 
     /// Test-only no-op action resolved by test harness resolvers.
