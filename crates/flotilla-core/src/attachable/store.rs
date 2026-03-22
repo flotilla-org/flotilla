@@ -82,6 +82,7 @@ pub trait AttachableStoreApi: Send + Sync {
     ) -> bool;
     fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo>;
     fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId>;
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool;
     fn save(&self) -> Result<(), String>;
 }
 
@@ -361,6 +362,17 @@ impl AttachableStoreState {
     fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
         self.registry.sets.values().filter(|set| set.checkout.as_ref() == Some(checkout)).map(|set| set.id.clone()).collect()
     }
+
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        if let Some(attachable) = self.registry.attachables.get_mut(id) {
+            let AttachableContent::Terminal(ref mut terminal) = attachable.content;
+            if terminal.status != status {
+                terminal.status = status;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub struct AttachableStore {
@@ -509,6 +521,10 @@ impl AttachableStore {
         self.state.sets_for_checkout(checkout)
     }
 
+    pub fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        self.state.update_terminal_status(id, status)
+    }
+
     pub fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create attachable dir: {e}"))?;
@@ -646,6 +662,10 @@ impl AttachableStoreApi for AttachableStore {
         self.state.sets_for_checkout(checkout)
     }
 
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        self.state.update_terminal_status(id, status)
+    }
+
     fn save(&self) -> Result<(), String> {
         AttachableStore::save(self)
     }
@@ -775,6 +795,10 @@ impl AttachableStoreApi for InMemoryAttachableStore {
 
     fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
         self.state.sets_for_checkout(checkout)
+    }
+
+    fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
+        self.state.update_terminal_status(id, status)
     }
 
     fn save(&self) -> Result<(), String> {
