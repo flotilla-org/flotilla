@@ -248,7 +248,6 @@ fn choose_event(snapshot: RepoSnapshot, delta: DeltaEntry) -> DaemonEvent {
     }
 }
 
-
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -1705,10 +1704,19 @@ impl DaemonHandle for InProcessDaemon {
             (state.identity().clone(), state.registry(), state.providers(), state.refresh_trigger())
         };
 
-        // Broadcast started after repo validation (ensures no orphaned CommandStarted)
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
         let config_base = self.config.base_path().to_path_buf();
+
+        // Register the cancellation token before broadcasting CommandStarted
+        // so cancel(id) can find it the instant the TUI sees the event.
+        let active_ref = Arc::clone(&self.active_commands);
+        let token = CancellationToken::new();
+        {
+            let mut guard = active_ref.lock().await;
+            guard.insert(id, token.clone());
+        }
+
         let _ = self.event_tx.send(DaemonEvent::CommandStarted {
             command_id: id,
             host: self.host_name.clone(),
@@ -1718,10 +1726,7 @@ impl DaemonHandle for InProcessDaemon {
         });
 
         // Spawn the entire build_plan + execution so execute() returns the
-        // command_id immediately. This keeps the TUI event loop responsive —
-        // build_plan runs execute() inline for Immediate commands, which may
-        // do network I/O (e.g. GenerateBranchName, ArchiveSession).
-        let active_ref = Arc::clone(&self.active_commands);
+        // command_id immediately. This keeps the TUI event loop responsive.
         let local_host = self.host_name.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
@@ -1751,6 +1756,10 @@ impl DaemonHandle for InProcessDaemon {
 
             match plan {
                 Err(result) => {
+                    {
+                        let mut guard = active_ref.lock().await;
+                        guard.remove(&id);
+                    }
                     refresh_trigger.notify_one();
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
@@ -1761,12 +1770,6 @@ impl DaemonHandle for InProcessDaemon {
                     });
                 }
                 Ok(step_plan) => {
-                    let token = CancellationToken::new();
-                    {
-                        let mut guard = active_ref.lock().await;
-                        guard.insert(id, token.clone());
-                    }
-
                     let resolver = executor::ExecutorStepResolver {
                         repo: resolver_repo,
                         registry: resolver_registry,
