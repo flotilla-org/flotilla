@@ -795,7 +795,7 @@ impl FakeVcsFactory {
     pub fn new(state: Arc<RwLock<FakeVcsState>>) -> Self {
         let name = {
             let s = state.read().expect("FakeVcsFactory state poisoned");
-            format!("fake-{}", s.root.file_name().and_then(|n| n.to_str()).unwrap_or("repo"))
+            format!("fake-vcs-{}", s.root.display())
         };
         Self { state, name }
     }
@@ -813,11 +813,16 @@ impl Factory for FakeVcsFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
         _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
-        Ok(Arc::new(FakeVcs::new(Arc::clone(&self.state))))
+        let state = self.state.read().expect("FakeVcsFactory state poisoned");
+        if repo_root == state.root {
+            Ok(Arc::new(FakeVcs::new(Arc::clone(&self.state))))
+        } else {
+            Err(vec![UnmetRequirement::NoVcsCheckout])
+        }
     }
 }
 
@@ -835,7 +840,7 @@ impl FakeCheckoutManagerFactory {
     pub fn new(state: Arc<RwLock<FakeVcsState>>) -> Self {
         let name = {
             let s = state.read().expect("FakeCheckoutManagerFactory state poisoned");
-            format!("fake-checkouts-{}", s.root.file_name().and_then(|n| n.to_str()).unwrap_or("repo"))
+            format!("fake-checkouts-{}", s.root.display())
         };
         Self { state, name }
     }
@@ -853,11 +858,16 @@ impl Factory for FakeCheckoutManagerFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
         _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
-        Ok(Arc::new(FakeCheckoutManager::from_state(Arc::clone(&self.state))))
+        let state = self.state.read().expect("FakeCheckoutManagerFactory state poisoned");
+        if repo_root == state.root {
+            Ok(Arc::new(FakeCheckoutManager::from_state(Arc::clone(&self.state))))
+        } else {
+            Err(vec![UnmetRequirement::NoVcsCheckout])
+        }
     }
 }
 
