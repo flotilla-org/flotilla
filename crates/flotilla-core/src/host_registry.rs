@@ -217,17 +217,16 @@ impl HostRegistry {
         status: PeerConnectionState,
         remote_counts: &HashMap<HostName, HostCounts>,
         emit: &impl Fn(DaemonEvent),
-    ) -> Option<HostSnapshot> {
+    ) {
         let snapshot = {
             let mut hosts = self.hosts.write().await;
             update_host_status(&self.host_name, &mut hosts, host, status.clone())
         };
-        if let Some(snapshot) = snapshot.as_ref() {
+        if let Some(snapshot) = snapshot {
             emit(DaemonEvent::PeerStatusChanged { host: host.clone(), status });
-            emit(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
+            emit(DaemonEvent::HostSnapshot(Box::new(snapshot)));
         }
         self.sync_host_membership(remote_counts, emit).await;
-        snapshot
     }
 
     /// Publish a peer host summary update. Normalizes the `host_name` field
@@ -238,17 +237,16 @@ impl HostRegistry {
         host: &HostName,
         summary: HostSummary,
         emit: &impl Fn(DaemonEvent),
-    ) -> Option<HostSnapshot> {
+    ) {
         let mut summary = summary;
         summary.host_name = host.clone();
         let snapshot = {
             let mut hosts = self.hosts.write().await;
             update_host_summary(&self.host_name, &mut hosts, host, summary)
         };
-        if let Some(snapshot) = snapshot.as_ref() {
-            emit(DaemonEvent::HostSnapshot(Box::new(snapshot.clone())));
+        if let Some(snapshot) = snapshot {
+            emit(DaemonEvent::HostSnapshot(Box::new(snapshot)));
         }
-        snapshot
     }
 
     /// Update the set of configured peer names, then reconcile membership.
@@ -637,13 +635,7 @@ mod tests {
         let events = RefCell::new(Vec::new());
         let emit = |e: DaemonEvent| events.borrow_mut().push(e);
 
-        let result = registry.publish_peer_connection_status(&peer_name(), PeerConnectionState::Connected, &remote_counts, &emit).await;
-
-        assert!(result.is_some(), "first publish should return Some(snapshot)");
-        let snapshot = result.expect("checked above");
-        assert_eq!(snapshot.host_name, peer_name());
-        assert_eq!(snapshot.connection_status, PeerConnectionState::Connected);
-        assert!(!snapshot.is_local);
+        registry.publish_peer_connection_status(&peer_name(), PeerConnectionState::Connected, &remote_counts, &emit).await;
 
         let captured = events.borrow();
         let has_peer_status = captured.iter().any(|e| {
@@ -652,8 +644,14 @@ mod tests {
         });
         assert!(has_peer_status, "should emit PeerStatusChanged");
 
-        let has_host_snapshot = captured.iter().any(|e| matches!(e, DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_name()));
-        assert!(has_host_snapshot, "should emit HostSnapshot");
+        let snapshot = captured.iter().find_map(|e| match e {
+            DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_name() => Some(snap),
+            _ => None,
+        });
+        let snapshot = snapshot.expect("should emit HostSnapshot");
+        assert_eq!(snapshot.host_name, peer_name());
+        assert_eq!(snapshot.connection_status, PeerConnectionState::Connected);
+        assert!(!snapshot.is_local);
     }
 
     #[tokio::test]
@@ -665,12 +663,14 @@ mod tests {
         let emit = |e: DaemonEvent| events.borrow_mut().push(e);
 
         // First publish: establishes the status.
-        let _ = registry.publish_peer_connection_status(&peer_name(), PeerConnectionState::Connected, &remote_counts, &emit).await;
+        registry.publish_peer_connection_status(&peer_name(), PeerConnectionState::Connected, &remote_counts, &emit).await;
         events.borrow_mut().clear();
 
         // Second publish with the same status: should be a no-op.
-        let result = registry.publish_peer_connection_status(&peer_name(), PeerConnectionState::Connected, &remote_counts, &emit).await;
-        assert!(result.is_none(), "duplicate status should return None");
+        registry.publish_peer_connection_status(&peer_name(), PeerConnectionState::Connected, &remote_counts, &emit).await;
+        // Only sync_host_membership events may appear — no PeerStatusChanged or new HostSnapshot.
+        let has_status_change = events.borrow().iter().any(|e| matches!(e, DaemonEvent::PeerStatusChanged { .. }));
+        assert!(!has_status_change, "duplicate status should not emit PeerStatusChanged");
     }
 
     // -----------------------------------------------------------------------
@@ -678,23 +678,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn publish_peer_summary_emits_host_snapshot_and_returns_snapshot() {
+    async fn publish_peer_summary_emits_host_snapshot() {
         let registry = make_registry();
         let summary = minimal_summary(&peer_name());
 
         let events = RefCell::new(Vec::new());
         let emit = |e: DaemonEvent| events.borrow_mut().push(e);
 
-        let result = registry.publish_peer_summary(&peer_name(), summary.clone(), &emit).await;
-
-        assert!(result.is_some(), "first summary publish should return Some");
-        let snapshot = result.expect("checked above");
-        assert_eq!(snapshot.host_name, peer_name());
-        assert_eq!(snapshot.summary, summary);
+        registry.publish_peer_summary(&peer_name(), summary.clone(), &emit).await;
 
         let captured = events.borrow();
-        let has_host_snapshot = captured.iter().any(|e| matches!(e, DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_name()));
-        assert!(has_host_snapshot, "should emit HostSnapshot");
+        let snapshot = captured.iter().find_map(|e| match e {
+            DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_name() => Some(snap),
+            _ => None,
+        });
+        let snapshot = snapshot.expect("should emit HostSnapshot");
+        assert_eq!(snapshot.host_name, peer_name());
+        assert_eq!(snapshot.summary, summary);
     }
 
     #[tokio::test]
@@ -705,11 +705,10 @@ mod tests {
         let events = RefCell::new(Vec::new());
         let emit = |e: DaemonEvent| events.borrow_mut().push(e);
 
-        let _ = registry.publish_peer_summary(&peer_name(), summary.clone(), &emit).await;
+        registry.publish_peer_summary(&peer_name(), summary.clone(), &emit).await;
         events.borrow_mut().clear();
 
-        let result = registry.publish_peer_summary(&peer_name(), summary, &emit).await;
-        assert!(result.is_none(), "identical summary should return None");
+        registry.publish_peer_summary(&peer_name(), summary, &emit).await;
         assert!(events.borrow().is_empty(), "no events should be emitted for identical summary");
     }
 

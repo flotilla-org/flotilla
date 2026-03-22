@@ -819,7 +819,7 @@ async fn publish_peer_summary_normalizes_host_name() {
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let peer_host = HostName::new("remote-host");
-    let _ = daemon
+    daemon
         .publish_peer_summary(&peer_host, HostSummary {
             host_name: HostName::new("spoofed-host"),
             system: SystemInfo::default(),
@@ -925,7 +925,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
         association_keys: vec![],
     });
 
-    let _ = daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Connected).await;
+    daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Connected).await;
     daemon.set_peer_host_summaries(HashMap::from([(transient_host.clone(), sample_remote_host_summary("transient"))])).await;
     daemon.set_peer_providers(&repo, vec![(transient_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
@@ -933,7 +933,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
     let hosts = daemon.list_hosts().await.expect("list hosts");
     assert!(hosts.hosts.iter().any(|entry| entry.host == transient_host), "transient host should be visible while backed by state");
 
-    let _ = daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Disconnected).await;
+    daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Disconnected).await;
     daemon.set_peer_host_summaries(HashMap::new()).await;
     daemon.set_peer_providers(&repo, vec![], 1).await;
     let removed = tokio::time::timeout(std::time::Duration::from_secs(2), async {

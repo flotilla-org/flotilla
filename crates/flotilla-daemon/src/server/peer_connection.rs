@@ -98,7 +98,7 @@ impl PeerConnection {
             }
         }
         sync_peer_query_state(&self.peer_manager, &self.daemon).await;
-        let _ = self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Connected).await;
+        self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Connected).await;
         let _ = self.peer_connected_tx.send(PeerConnectedNotice { peer: host_name.clone(), generation });
 
         loop {
@@ -147,7 +147,7 @@ impl PeerConnection {
 
         let plan = disconnect_peer_and_rebuild(&self.peer_manager, &self.daemon, &host_name, generation).await;
         if plan.was_active {
-            let _ = self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Disconnected).await;
+            self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Disconnected).await;
         }
         relay_task.abort();
     }

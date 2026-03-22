@@ -16,7 +16,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostSnapshot, HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse,
+    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse,
     RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
     TopologyRoute,
 };
@@ -463,21 +463,21 @@ impl InProcessDaemon {
             .await;
     }
 
-    pub async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState) -> Option<HostSnapshot> {
+    pub async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState) {
         let remote_counts = self.remote_host_counts().await;
         self.host_registry
             .publish_peer_connection_status(host, status, &remote_counts, &|e| {
                 let _ = self.event_tx.send(e);
             })
-            .await
+            .await;
     }
 
-    pub async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary) -> Option<HostSnapshot> {
+    pub async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary) {
         self.host_registry
             .publish_peer_summary(host, summary, &|e| {
                 let _ = self.event_tx.send(e);
             })
-            .await
+            .await;
     }
 
     pub async fn set_topology_routes(&self, routes: Vec<TopologyRoute>) {

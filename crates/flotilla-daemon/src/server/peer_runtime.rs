@@ -66,12 +66,12 @@ impl PeerRuntime {
                 };
 
                 for name in &peer_names {
-                    let _ = peer_daemon.publish_peer_connection_status(name, PeerConnectionState::Connecting).await;
+                    peer_daemon.publish_peer_connection_status(name, PeerConnectionState::Connecting).await;
                 }
                 for name in &peer_names {
                     let status =
                         if initial_rx_map.contains_key(name) { PeerConnectionState::Connected } else { PeerConnectionState::Disconnected };
-                    let _ = peer_daemon.publish_peer_connection_status(name, status).await;
+                    peer_daemon.publish_peer_connection_status(name, status).await;
                 }
                 sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
 
@@ -111,8 +111,7 @@ impl PeerRuntime {
                             }
                             let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
                             if plan.was_active {
-                                let _ =
-                                    daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected).await;
+                                daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected).await;
                             }
                         }
 
@@ -127,7 +126,7 @@ impl PeerRuntime {
                                 attempt = 1;
                                 continue;
                             }
-                            let _ = daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Reconnecting).await;
+                            daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Reconnecting).await;
                             let delay = SshTransport::backoff_delay(attempt);
                             info!(peer = %peer_name, %attempt, delay_secs = delay.as_secs(), "reconnecting after backoff");
                             tokio::time::sleep(delay).await;
@@ -143,8 +142,7 @@ impl PeerRuntime {
                                     last_known_session_id =
                                         handle_remote_restart_if_needed(&pm, &daemon_for_cleanup, &peer_name, last_known_session_id).await;
                                     sync_peer_query_state(&pm, &daemon_for_cleanup).await;
-                                    let _ =
-                                        daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Connected).await;
+                                    daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Connected).await;
                                     let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
                                     attempt = 1;
                                     let sender = {
@@ -167,9 +165,9 @@ impl PeerRuntime {
                                     }
                                     let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
                                     if plan.was_active {
-                                        let _ = daemon_for_cleanup
-                                            .publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected)
-                                            .await;
+                                        daemon_for_cleanup
+                                        .publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected)
+                                        .await;
                                     }
                                 }
                                 Err(e) => {
@@ -203,7 +201,7 @@ impl PeerRuntime {
                             }
 
                             if let PeerWireMessage::HostSummary(summary) = &env.msg {
-                                let _ = peer_daemon.publish_peer_summary(&origin, summary.clone()).await;
+                                peer_daemon.publish_peer_summary(&origin, summary.clone()).await;
                             }
 
                             {
