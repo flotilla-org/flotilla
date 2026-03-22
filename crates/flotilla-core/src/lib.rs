@@ -15,6 +15,7 @@ pub mod model;
 pub mod provider_data;
 pub mod providers;
 pub mod refresh;
+pub(crate) mod repo_state;
 pub mod resolve;
 pub mod step;
 pub mod template;
