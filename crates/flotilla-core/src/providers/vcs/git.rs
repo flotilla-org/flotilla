@@ -206,8 +206,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_list_local_branches() {
-        let recording = replay::is_recording();
-        let temp = if recording { Some(setup_branches()) } else { None };
+        let live = replay::is_live();
+        let temp = if live { Some(setup_branches()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
@@ -233,8 +233,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_list_remote_branches() {
-        let recording = replay::is_recording();
-        let temp = if recording { Some(setup_remote_branches()) } else { None };
+        let live = replay::is_live();
+        let temp = if live { Some(setup_remote_branches()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
@@ -254,8 +254,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_commit_log() {
-        let recording = replay::is_recording();
-        let temp = if recording { Some(setup_branches()) } else { None };
+        let live = replay::is_live();
+        let temp = if live { Some(setup_branches()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
@@ -277,8 +277,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_ahead_behind() {
-        let recording = replay::is_recording();
-        let temp = if recording { Some(setup_ahead_behind()) } else { None };
+        let live = replay::is_live();
+        let temp = if live { Some(setup_ahead_behind()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
@@ -298,8 +298,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_working_tree_status() {
-        let recording = replay::is_recording();
-        let temp = if recording { Some(setup_working_tree()) } else { None };
+        let live = replay::is_live();
+        let temp = if live { Some(setup_working_tree()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
@@ -319,8 +319,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_list_remote_branches_no_remote() {
-        let recording = replay::is_recording();
-        let temp = if recording {
+        let live = replay::is_live();
+        let temp = if live {
             // Repo with no remote configured
             let dir = tempfile::tempdir().unwrap();
             let repo = dir.path().to_path_buf();

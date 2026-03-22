@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::{
     github_api::{GhApi, GhApiResponse},
@@ -296,11 +297,13 @@ impl Recorder {
     }
 }
 
-/// A test session that is either recording or replaying interactions.
+/// A test session that is either recording, replaying, or passing through to real execution.
 #[derive(Clone)]
 pub enum Session {
     Recording(Recorder),
     Replaying(Replayer),
+    /// Real execution, no recording, no fixtures.
+    Passthrough,
 }
 
 impl Session {
@@ -324,6 +327,7 @@ impl Session {
         match self {
             Session::Replaying(r) => r.next(label),
             Session::Recording(_) => panic!("next() called in recording mode — use record()"),
+            Session::Passthrough => panic!("next() called in passthrough mode — interactions are live"),
         }
     }
 
@@ -332,6 +336,7 @@ impl Session {
         match self {
             Session::Recording(r) => r.record(interaction),
             Session::Replaying(_) => panic!("record() called in replay mode"),
+            Session::Passthrough => {} // no-op: live execution, no recording
         }
     }
 
@@ -339,57 +344,102 @@ impl Session {
     pub fn barrier(&self) {
         match self {
             Session::Recording(r) => r.barrier(),
-            Session::Replaying(_) => {} // no-op in replay mode
+            Session::Replaying(_) | Session::Passthrough => {} // no-op
         }
     }
 
-    /// Returns true if this session is in recording mode.
+    /// Returns true if this session is in recording mode (will write fixtures).
     pub fn is_recording(&self) -> bool {
         matches!(self, Session::Recording(_))
+    }
+
+    /// Returns true if real setup is needed (record or passthrough).
+    pub fn is_live(&self) -> bool {
+        matches!(self, Session::Recording(_) | Session::Passthrough)
     }
 
     /// Check that all interactions were consumed (replay mode).
     pub fn assert_complete(&self) {
         match self {
             Session::Replaying(r) => r.assert_complete(),
-            Session::Recording(_) => {} // nothing to assert
+            Session::Recording(_) | Session::Passthrough => {} // nothing to assert
         }
     }
 
-    /// Save if recording, assert_complete if replaying.
+    /// Save if recording, assert_complete if replaying, no-op if passthrough.
     pub fn finish(&self) {
         match self {
             Session::Recording(r) => r.save(),
             Session::Replaying(r) => r.assert_complete(),
+            Session::Passthrough => {}
         }
     }
 }
 
-/// Check whether `RECORD=1` environment variable is set.
-/// Only the value "1" triggers recording; "0", "false", etc. do not.
-pub fn is_recording() -> bool {
-    std::env::var("RECORD").ok().as_deref() == Some("1")
+/// The three modes the replay system can operate in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayMode {
+    /// Default: serve canned interactions from YAML fixtures.
+    Replay,
+    /// Run real commands and record interactions to YAML fixtures.
+    Record,
+    /// Run real commands without recording — validates tests against live execution.
+    Passthrough,
 }
 
-/// Create a `Session` that either records or replays.
-/// In record mode: creates a recording session (fixture will be written on `finish()`).
-/// In replay mode: loads canned interactions from the fixture file.
+impl ReplayMode {
+    /// Parse a mode string (from the `REPLAY` env var).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "record" => Self::Record,
+            "passthrough" => Self::Passthrough,
+            _ => Self::Replay,
+        }
+    }
+
+    /// Returns `true` when real setup is needed (record or passthrough).
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Record | Self::Passthrough)
+    }
+}
+
+/// Read the `REPLAY` env var and return the active mode.
+/// `REPLAY=record` → record, `REPLAY=passthrough` → passthrough, absent → replay.
+pub fn replay_mode() -> ReplayMode {
+    let val = std::env::var("REPLAY").unwrap_or_default();
+    let mode = ReplayMode::parse(&val);
+    if !val.is_empty() && mode == ReplayMode::Replay {
+        warn!(REPLAY = %val, "unrecognized REPLAY value, falling back to replay mode (expected: record, passthrough)");
+    }
+    mode
+}
+
+/// Returns `true` when real setup is needed (record or passthrough).
+pub fn is_live() -> bool {
+    replay_mode().is_live()
+}
+
+/// Create a `Session` based on the `REPLAY` env var.
+/// - `REPLAY=record`: creates a recording session (fixture will be written on `finish()`).
+/// - `REPLAY=passthrough`: returns a passthrough session (real execution, no fixtures).
+/// - absent / other: loads canned interactions from the fixture file.
 pub fn test_session(fixture_path: &str, masks: Masks) -> Session {
-    if is_recording() {
-        Session::recording(fixture_path, masks)
-    } else {
-        Session::replaying(fixture_path, masks)
+    match replay_mode() {
+        ReplayMode::Record => Session::recording(fixture_path, masks),
+        ReplayMode::Passthrough => Session::Passthrough,
+        ReplayMode::Replay => Session::replaying(fixture_path, masks),
     }
 }
 
 /// Create a `CommandRunner` for a test session.
-/// In record mode: wraps `ProcessCommandRunner` with recording.
-/// In replay mode: returns a `ReplayRunner`.
+/// - Recording: wraps `ProcessCommandRunner` with recording.
+/// - Passthrough: returns a bare `ProcessCommandRunner`.
+/// - Replay: returns a `ReplayRunner`.
 pub fn test_runner(session: &Session) -> Arc<dyn CommandRunner> {
-    if session.is_recording() {
-        Arc::new(RecordingRunner::new(session.clone(), Arc::new(super::ProcessCommandRunner)))
-    } else {
-        Arc::new(ReplayRunner::new(session.clone()))
+    match session {
+        Session::Recording(_) => Arc::new(RecordingRunner::new(session.clone(), Arc::new(super::ProcessCommandRunner))),
+        Session::Passthrough => Arc::new(super::ProcessCommandRunner),
+        Session::Replaying(_) => Arc::new(ReplayRunner::new(session.clone())),
     }
 }
 
@@ -774,18 +824,24 @@ impl GhApi for RecordingGhApi {
 }
 
 /// Create a `GhApi` for a test session.
-/// In record mode: wraps a real `GhApiClient` with recording.
-/// In replay mode: returns a `ReplayGhApi`.
+/// - Recording: wraps a real `GhApiClient` with recording.
+/// - Passthrough: returns a bare `GhApiClient`.
+/// - Replay: returns a `ReplayGhApi`.
 pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
-    if session.is_recording() {
-        // Use a raw ProcessCommandRunner — NOT the passed-in runner, which is a
-        // RecordingRunner.  GhApiClient shells out via its runner, so using a
-        // RecordingRunner here would double-record (once as Command, once as GhApi).
-        let raw_runner = Arc::new(super::ProcessCommandRunner);
-        let real_api = Arc::new(super::github_api::GhApiClient::new(raw_runner));
-        Arc::new(RecordingGhApi::new(session.clone(), real_api))
-    } else {
-        Arc::new(ReplayGhApi::new(session.clone()))
+    match session {
+        Session::Recording(_) => {
+            // Use a raw ProcessCommandRunner — NOT the passed-in runner, which is a
+            // RecordingRunner.  GhApiClient shells out via its runner, so using a
+            // RecordingRunner here would double-record (once as Command, once as GhApi).
+            let raw_runner = Arc::new(super::ProcessCommandRunner);
+            let real_api = Arc::new(super::github_api::GhApiClient::new(raw_runner));
+            Arc::new(RecordingGhApi::new(session.clone(), real_api))
+        }
+        Session::Passthrough => {
+            let raw_runner = Arc::new(super::ProcessCommandRunner);
+            Arc::new(super::github_api::GhApiClient::new(raw_runner))
+        }
+        Session::Replaying(_) => Arc::new(ReplayGhApi::new(session.clone())),
     }
 }
 
@@ -850,14 +906,17 @@ impl super::HttpClient for RecordingHttpClient {
 }
 
 /// Create an `HttpClient` for a test session.
-/// In record mode: wraps a real `ReqwestHttpClient` with recording.
-/// In replay mode: returns a `ReplayHttpClient`.
+/// - Recording: wraps a real `ReqwestHttpClient` with recording.
+/// - Passthrough: returns a bare `ReqwestHttpClient`.
+/// - Replay: returns a `ReplayHttpClient`.
 pub fn test_http_client(session: &Session) -> Arc<dyn super::HttpClient> {
-    if session.is_recording() {
-        let real_client = Arc::new(super::ReqwestHttpClient::new());
-        Arc::new(RecordingHttpClient::new(session.clone(), real_client))
-    } else {
-        Arc::new(ReplayHttpClient::new(session.clone()))
+    match session {
+        Session::Recording(_) => {
+            let real_client = Arc::new(super::ReqwestHttpClient::new());
+            Arc::new(RecordingHttpClient::new(session.clone(), real_client))
+        }
+        Session::Passthrough => Arc::new(super::ReqwestHttpClient::new()),
+        Session::Replaying(_) => Arc::new(ReplayHttpClient::new(session.clone())),
     }
 }
 
@@ -1659,6 +1718,67 @@ rounds:
         assert_eq!(remote.unwrap().trim(), "0\t5");
         assert_eq!(trunk.unwrap().trim(), "2\t3");
         session.finish();
+    }
+
+    #[test]
+    fn replay_mode_defaults_to_replay() {
+        // With no env var set (or non-matching value), mode is Replay
+        assert_eq!(ReplayMode::parse(""), ReplayMode::Replay);
+        assert_eq!(ReplayMode::parse("nonsense"), ReplayMode::Replay);
+    }
+
+    #[test]
+    fn replay_mode_record() {
+        assert_eq!(ReplayMode::parse("record"), ReplayMode::Record);
+    }
+
+    #[test]
+    fn replay_mode_passthrough() {
+        assert_eq!(ReplayMode::parse("passthrough"), ReplayMode::Passthrough);
+    }
+
+    #[test]
+    fn is_live_true_for_record_and_passthrough() {
+        assert!(!ReplayMode::Replay.is_live());
+        assert!(ReplayMode::Record.is_live());
+        assert!(ReplayMode::Passthrough.is_live());
+    }
+
+    #[test]
+    fn session_passthrough_finish_is_noop() {
+        let session = Session::Passthrough;
+        // Should not panic
+        session.finish();
+    }
+
+    #[test]
+    fn session_passthrough_barrier_is_noop() {
+        let session = Session::Passthrough;
+        session.barrier();
+    }
+
+    #[test]
+    fn session_passthrough_is_not_recording() {
+        let session = Session::Passthrough;
+        assert!(!session.is_recording());
+    }
+
+    #[test]
+    fn session_passthrough_is_live() {
+        assert!(!Session::replaying_from_str("interactions: []", Masks::new()).is_live());
+        assert!(Session::Passthrough.is_live());
+    }
+
+    #[tokio::test]
+    async fn test_runner_passthrough_returns_process_runner() {
+        // Runs a real subprocess unconditionally — `echo` is universally available
+        // and instant, so this is acceptable outside passthrough mode.  The test
+        // validates that Session::Passthrough produces a functional runner.
+        let session = Session::Passthrough;
+        let runner = test_runner(&session);
+        let result = runner.run("echo", &["hello"], Path::new("/tmp"), &ChannelLabel::Noop).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("hello"));
     }
 
     #[tokio::test]

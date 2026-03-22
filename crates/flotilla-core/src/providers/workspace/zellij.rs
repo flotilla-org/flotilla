@@ -459,9 +459,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_create_and_switch_workspaces() {
-        let recording = replay::is_recording();
+        let live = replay::is_live();
 
-        if recording {
+        if live {
             setup_zellij_ws_session();
         }
 
@@ -509,7 +509,7 @@ mod tests {
         assert!(names.contains(&"feat-123"), "expected 'feat-123' in {names:?}");
         assert!(names.contains(&"fix-456"), "expected 'fix-456' in {names:?}");
 
-        if recording {
+        if live {
             teardown_zellij_ws_session();
         }
 
@@ -557,9 +557,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_list_workspaces() {
-        let recording = replay::is_recording();
+        let live = replay::is_live();
 
-        if recording {
+        if live {
             setup_zellij_session();
         }
 
@@ -580,7 +580,7 @@ mod tests {
             assert!(ws.correlation_keys.is_empty());
         }
 
-        if recording {
+        if live {
             teardown_zellij_session();
         }
 

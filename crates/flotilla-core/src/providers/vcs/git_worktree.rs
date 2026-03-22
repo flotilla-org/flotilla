@@ -376,8 +376,8 @@ branch refs/heads/feature
     async fn record_replay_create_checkout_tracks_remote_branch() {
         use crate::providers::{replay, vcs::checkout_test_support};
 
-        let recording = replay::is_recording();
-        let temp = if recording { Some(checkout_test_support::setup_remote_only_branch()) } else { None };
+        let live = replay::is_live();
+        let temp = if live { Some(checkout_test_support::setup_remote_only_branch()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
 
         let mut masks = replay::Masks::new();
