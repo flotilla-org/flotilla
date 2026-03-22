@@ -4,7 +4,7 @@ use std::{
 };
 
 use flotilla_core::data::{GroupEntry, GroupedWorkItems, SectionHeader};
-use flotilla_protocol::{HostName, ProviderData, WorkItem, WorkItemIdentity};
+use flotilla_protocol::{HostName, ProviderData, SessionStatus, WorkItem, WorkItemIdentity};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -412,6 +412,7 @@ fn build_item_row<'a>(
     home_dir: Option<&Path>,
 ) -> Row<'a> {
     let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
+    let is_archived = session_status.is_some_and(|s| matches!(s, SessionStatus::Archived | SessionStatus::Expired));
     let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status, theme);
 
     let source_display = match item.source.as_deref() {
@@ -534,18 +535,26 @@ fn build_item_row<'a>(
         }
     }
 
+    let style_for = |normal_color: Color| -> Style {
+        if is_archived {
+            Style::default().fg(theme.muted)
+        } else {
+            Style::default().fg(normal_color)
+        }
+    };
+
     Row::new(vec![
-        Cell::from(Span::styled(format!(" {icon}"), Style::default().fg(icon_color))),
-        Cell::from(Span::styled(source_display, Style::default().fg(theme.source))),
-        Cell::from(Span::styled(path_display, Style::default().fg(theme.path))),
-        Cell::from(Span::styled(description, Style::default().fg(theme.text))),
-        Cell::from(Span::styled(branch_display, Style::default().fg(theme.branch))),
-        Cell::from(Span::styled(wt_indicator.to_string(), Style::default().fg(theme.checkout))),
-        Cell::from(Span::styled(ws_indicator, Style::default().fg(theme.workspace))),
-        Cell::from(Span::styled(pr_display, Style::default().fg(theme.change_request))),
-        Cell::from(Span::styled(session_display, Style::default().fg(theme.session))),
-        Cell::from(Span::styled(issues_display, Style::default().fg(theme.issue))),
-        Cell::from(Span::styled(git_display, Style::default().fg(theme.git_status))),
+        Cell::from(Span::styled(format!(" {icon}"), style_for(icon_color))),
+        Cell::from(Span::styled(source_display, style_for(theme.source))),
+        Cell::from(Span::styled(path_display, style_for(theme.path))),
+        Cell::from(Span::styled(description, style_for(theme.text))),
+        Cell::from(Span::styled(branch_display, style_for(theme.branch))),
+        Cell::from(Span::styled(wt_indicator.to_string(), style_for(theme.checkout))),
+        Cell::from(Span::styled(ws_indicator, style_for(theme.workspace))),
+        Cell::from(Span::styled(pr_display, style_for(theme.change_request))),
+        Cell::from(Span::styled(session_display, style_for(theme.session))),
+        Cell::from(Span::styled(issues_display, style_for(theme.issue))),
+        Cell::from(Span::styled(git_display, style_for(theme.git_status))),
     ])
 }
 
