@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use flotilla_protocol::{CheckoutSelector, HostName, HostPath, ManagedTerminalId};
+use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
 
 use crate::{
-    attachable::{terminal_session_binding_ref, SharedAttachableStore},
+    attachable::SharedAttachableStore,
     provider_data::ProviderData,
     providers::{registry::ProviderRegistry, run, CommandRunner},
 };
@@ -40,7 +40,6 @@ impl<'a> CheckoutService<'a> {
         &self,
         repo_root: &Path,
         branch: &str,
-        terminal_keys: &[ManagedTerminalId],
         deleted_checkout_paths: &[HostPath],
         attachable_store: &SharedAttachableStore,
     ) -> Result<(), String> {
@@ -59,17 +58,6 @@ impl<'a> CheckoutService<'a> {
                         session = %session_ref,
                         err = %err,
                         "failed to kill cascaded terminal session (best-effort)"
-                    );
-                }
-            }
-            // Also kill explicitly-passed terminal keys
-            for terminal_id in terminal_keys {
-                let session_name = terminal_session_binding_ref(terminal_id);
-                if let Err(err) = terminal_pool.kill_session(&session_name).await {
-                    warn!(
-                        terminal = %terminal_id,
-                        err = %err,
-                        "failed to kill terminal session (best-effort)"
                     );
                 }
             }

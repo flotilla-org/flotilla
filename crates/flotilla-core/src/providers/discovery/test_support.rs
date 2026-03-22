@@ -16,8 +16,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, ManagedTerminal, ManagedTerminalId,
-    RepoIdentity, TerminalStatus, Workspace,
+    ChangeRequest, ChangeRequestStatus, Checkout, CorrelationKey, Issue, IssueChangeset, IssuePage, RepoIdentity, TerminalStatus, Workspace,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -444,8 +443,8 @@ impl WorkspaceManager for FakeWorkspaceManager {
 }
 
 pub struct FakeTerminalPool {
-    pub terminals: Arc<TokioMutex<Vec<ManagedTerminal>>>,
-    pub killed: Arc<TokioMutex<Vec<ManagedTerminalId>>>,
+    pub sessions: Arc<TokioMutex<Vec<super::super::terminal::TerminalSession>>>,
+    pub killed: Arc<TokioMutex<Vec<String>>>,
 }
 
 impl Default for FakeTerminalPool {
@@ -456,45 +455,31 @@ impl Default for FakeTerminalPool {
 
 impl FakeTerminalPool {
     pub fn new() -> Self {
-        Self { terminals: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
+        Self { sessions: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
     }
 
-    pub async fn add_terminals(&self, terminals: Vec<ManagedTerminal>) {
-        self.terminals.lock().await.extend(terminals);
+    pub async fn add_sessions(&self, sessions: Vec<super::super::terminal::TerminalSession>) {
+        self.sessions.lock().await.extend(sessions);
     }
 }
 
 #[async_trait::async_trait]
 impl TerminalPool for FakeTerminalPool {
     async fn list_sessions(&self) -> Result<Vec<super::super::terminal::TerminalSession>, String> {
-        let terminals = self.terminals.lock().await;
-        Ok(terminals
-            .iter()
-            .map(|t| super::super::terminal::TerminalSession {
-                session_name: crate::attachable::terminal_session_binding_ref(&t.id),
-                status: t.status.clone(),
-                command: Some(t.command.clone()),
-                working_directory: Some(t.working_directory.clone()),
-            })
-            .collect())
+        Ok(self.sessions.lock().await.clone())
     }
 
     async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path) -> Result<(), String> {
-        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
-            let mut terminals = self.terminals.lock().await;
-            if terminals.iter().any(|terminal| terminal.id == id) {
-                return Ok(());
-            }
-            terminals.push(ManagedTerminal {
-                id: id.clone(),
-                role: id.role.clone(),
-                command: command.to_string(),
-                working_directory: cwd.to_path_buf(),
-                status: TerminalStatus::Running,
-                attachable_id: None,
-                attachable_set_id: None,
-            });
+        let mut sessions = self.sessions.lock().await;
+        if sessions.iter().any(|s| s.session_name == session_name) {
+            return Ok(());
         }
+        sessions.push(super::super::terminal::TerminalSession {
+            session_name: session_name.to_string(),
+            status: TerminalStatus::Running,
+            command: Some(command.to_string()),
+            working_directory: Some(cwd.to_path_buf()),
+        });
         Ok(())
     }
 
@@ -509,9 +494,7 @@ impl TerminalPool for FakeTerminalPool {
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
-            self.killed.lock().await.push(id);
-        }
+        self.killed.lock().await.push(session_name.to_string());
         Ok(())
     }
 }

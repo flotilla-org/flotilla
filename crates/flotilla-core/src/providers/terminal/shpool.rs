@@ -4,13 +4,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{ManagedTerminal, ManagedTerminalId, TerminalStatus};
+use flotilla_protocol::TerminalStatus;
 
 use super::{TerminalEnvVars, TerminalPool, TerminalSession};
-use crate::{
-    attachable::terminal_session_binding_ref,
-    providers::{run, CommandRunner},
-};
+use crate::providers::{run, CommandRunner};
 
 pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
@@ -415,7 +412,7 @@ impl ShpoolTerminalPool {
     }
 
     /// Parse the JSON output of `shpool list --json`.
-    fn parse_list_json(json: &str) -> Result<Vec<ManagedTerminal>, String> {
+    fn parse_list_json(json: &str) -> Result<Vec<TerminalSession>, String> {
         let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("failed to parse shpool list: {e}"))?;
 
         let sessions = parsed["sessions"].as_array().ok_or("shpool list: no sessions array")?;
@@ -425,25 +422,24 @@ impl ShpoolTerminalPool {
             let name = session["name"].as_str().ok_or("shpool session missing name")?;
 
             // Only show flotilla-managed sessions (prefixed "flotilla/")
-            let Some(rest) = name.strip_prefix("flotilla/") else {
+            if !name.starts_with("flotilla/") {
                 continue;
-            };
+            }
 
-            // Parse "checkout/role/index" from the right — checkout may contain
-            // slashes (e.g. "feature/foo"), but role and index never do.
+            // Validate the session name has the expected structure:
+            // "flotilla/{checkout}/{role}/{index}"
+            let rest = &name["flotilla/".len()..];
             let Some((before_index, index_str)) = rest.rsplit_once('/') else {
                 continue;
             };
-            let Some((checkout, role)) = before_index.rsplit_once('/') else {
+            if before_index.rsplit_once('/').is_none() {
                 continue;
-            };
-            let index: u32 = match index_str.parse() {
-                Ok(index) => index,
-                Err(err) => {
-                    tracing::warn!(session = name, index = index_str, err = %err, "failed to parse managed terminal index, defaulting to 0");
-                    0
-                }
-            };
+            }
+            // Validate index is parseable
+            if index_str.parse::<u32>().is_err() {
+                tracing::warn!(session = name, index = index_str, "failed to parse managed terminal index, skipping");
+                continue;
+            }
 
             let status_str = session["status"].as_str().unwrap_or("").to_ascii_lowercase();
             let status = match status_str.as_str() {
@@ -452,14 +448,11 @@ impl ShpoolTerminalPool {
                 _ => TerminalStatus::Disconnected,
             };
 
-            terminals.push(ManagedTerminal {
-                id: ManagedTerminalId { checkout: checkout.into(), role: role.into(), index },
-                role: role.into(),
-                command: String::new(),            // shpool doesn't report the original command
-                working_directory: PathBuf::new(), // populated separately if needed
+            terminals.push(TerminalSession {
+                session_name: name.to_string(),
                 status,
-                attachable_id: None,
-                attachable_set_id: None,
+                command: None,           // shpool doesn't report the original command
+                working_directory: None, // shpool doesn't report cwd
             });
         }
 
@@ -475,21 +468,7 @@ impl TerminalPool for ShpoolTerminalPool {
         let result = run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "list", "--json"], Path::new("/"));
 
         match result {
-            Ok(json) => {
-                let parsed = Self::parse_list_json(&json)?;
-                Ok(parsed
-                    .into_iter()
-                    .map(|terminal| {
-                        let session_name = terminal_session_binding_ref(&terminal.id);
-                        TerminalSession {
-                            session_name,
-                            status: terminal.status,
-                            command: None,           // shpool doesn't report command
-                            working_directory: None, // shpool doesn't report cwd
-                        }
-                    })
-                    .collect())
-            }
+            Ok(json) => Self::parse_list_json(&json),
             Err(e) => {
                 tracing::debug!(err = %e, "shpool list failed (daemon may not be running)");
                 Ok(vec![])
@@ -607,17 +586,14 @@ mod tests {
             ]
         }"#;
 
-        let terminals = ShpoolTerminalPool::parse_list_json(json).unwrap();
-        assert_eq!(terminals.len(), 2); // user-manual-session filtered out
+        let sessions = ShpoolTerminalPool::parse_list_json(json).unwrap();
+        assert_eq!(sessions.len(), 2); // user-manual-session filtered out
 
-        assert_eq!(terminals[0].id.checkout, "my-feature");
-        assert_eq!(terminals[0].id.role, "shell");
-        assert_eq!(terminals[0].id.index, 0);
-        assert_eq!(terminals[0].status, TerminalStatus::Running);
+        assert_eq!(sessions[0].session_name, "flotilla/my-feature/shell/0");
+        assert_eq!(sessions[0].status, TerminalStatus::Running);
 
-        assert_eq!(terminals[1].id.checkout, "my-feature");
-        assert_eq!(terminals[1].id.role, "agent");
-        assert_eq!(terminals[1].status, TerminalStatus::Disconnected);
+        assert_eq!(sessions[1].session_name, "flotilla/my-feature/agent/0");
+        assert_eq!(sessions[1].status, TerminalStatus::Disconnected);
     }
 
     #[test]
@@ -637,23 +613,18 @@ mod tests {
             ]
         }"#;
 
-        let terminals = ShpoolTerminalPool::parse_list_json(json).unwrap();
-        assert_eq!(terminals.len(), 2);
+        let sessions = ShpoolTerminalPool::parse_list_json(json).unwrap();
+        assert_eq!(sessions.len(), 2);
 
-        assert_eq!(terminals[0].id.checkout, "feature/foo");
-        assert_eq!(terminals[0].id.role, "shell");
-        assert_eq!(terminals[0].id.index, 0);
-
-        assert_eq!(terminals[1].id.checkout, "feat/deep/nested");
-        assert_eq!(terminals[1].id.role, "agent");
-        assert_eq!(terminals[1].id.index, 1);
+        assert_eq!(sessions[0].session_name, "flotilla/feature/foo/shell/0");
+        assert_eq!(sessions[1].session_name, "flotilla/feat/deep/nested/agent/1");
     }
 
     #[test]
     fn parse_list_json_empty_sessions() {
         let json = r#"{"sessions": []}"#;
-        let terminals = ShpoolTerminalPool::parse_list_json(json).unwrap();
-        assert!(terminals.is_empty());
+        let sessions = ShpoolTerminalPool::parse_list_json(json).unwrap();
+        assert!(sessions.is_empty());
     }
 
     #[test]

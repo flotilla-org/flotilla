@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use flotilla_protocol::{HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand};
+use flotilla_protocol::{HostName, HostPath, PreparedTerminalCommand};
 use tracing::{debug, info, warn};
 
 use crate::{
-    attachable::{terminal_session_binding_ref, SharedAttachableStore, TerminalPurpose},
+    attachable::{SharedAttachableStore, TerminalPurpose},
     providers::{
         registry::ProviderRegistry,
         terminal::{TerminalEnvVars, TerminalPool},
@@ -12,6 +12,11 @@ use crate::{
     },
     template::{self, WorkspaceTemplate},
 };
+
+/// Build a session name for a managed terminal from its identity parts.
+fn session_name(checkout: &str, role: &str, index: u32) -> String {
+    format!("flotilla/{checkout}/{role}/{index}")
+}
 
 pub(super) struct TerminalPreparationService<'a> {
     registry: &'a ProviderRegistry,
@@ -54,25 +59,30 @@ impl<'a> TerminalPreparationService<'a> {
                 let mut resolved = Vec::new();
                 let mut role_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
                 for cmd in requested_commands {
-                    let index = role_index.entry(cmd.role.clone()).or_insert(0);
-                    let id = ManagedTerminalId { checkout: branch.to_string(), role: cmd.role.clone(), index: *index };
-                    *role_index.get_mut(&cmd.role).expect("just inserted") += 1;
-                    let session_name = terminal_session_binding_ref(&id);
-                    if let Err(err) = tp.ensure_session(&session_name, &cmd.command, checkout_path).await {
-                        warn!(%id, err = %err, "failed to ensure terminal");
+                    let idx = {
+                        let entry = role_index.entry(cmd.role.clone()).or_insert(0);
+                        let current = *entry;
+                        *entry += 1;
+                        current
+                    };
+                    let sn = session_name(branch, &cmd.role, idx);
+                    if let Err(err) = tp.ensure_session(&sn, &cmd.command, checkout_path).await {
+                        warn!(session = %sn, err = %err, "failed to ensure terminal");
                     }
                     let env_vars = build_terminal_env_vars(
-                        &id,
+                        branch,
+                        &cmd.role,
+                        idx,
                         checkout_path,
                         &cmd.command,
                         self.attachable_store,
                         terminal_pool_provider,
                         self.daemon_socket_path,
                     );
-                    match tp.attach_command(&session_name, &cmd.command, checkout_path, &env_vars).await {
+                    match tp.attach_command(&sn, &cmd.command, checkout_path, &env_vars).await {
                         Ok(attach_cmd) => resolved.push(PreparedTerminalCommand { role: cmd.role.clone(), command: attach_cmd }),
                         Err(err) => {
-                            warn!(%id, err = %err, "failed to get attach command, using original");
+                            warn!(session = %sn, err = %err, "failed to get attach command, using original");
                             resolved.push(cmd.clone());
                         }
                     }
@@ -103,8 +113,11 @@ impl<'a> TerminalPreparationService<'a> {
 /// Build the env vars to inject into a managed terminal session.
 /// Ensures the attachable binding exists (creates it if needed) so the
 /// env var is available on the very first attach.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_terminal_env_vars(
-    id: &ManagedTerminalId,
+    checkout: &str,
+    role: &str,
+    index: u32,
     cwd: &Path,
     command: &str,
     attachable_store: &SharedAttachableStore,
@@ -113,7 +126,7 @@ pub(super) fn build_terminal_env_vars(
 ) -> TerminalEnvVars {
     let mut vars = Vec::new();
 
-    let session_name = terminal_session_binding_ref(id);
+    let sn = session_name(checkout, role, index);
     match attachable_store.lock() {
         Ok(mut store) => {
             // Ensure the attachable exists before looking up its ID.
@@ -127,8 +140,8 @@ pub(super) fn build_terminal_env_vars(
                 &set_id,
                 "terminal_pool",
                 terminal_pool_provider,
-                &session_name,
-                TerminalPurpose { checkout: id.checkout.clone(), role: id.role.clone(), index: id.index },
+                &sn,
+                TerminalPurpose { checkout: checkout.to_string(), role: role.to_string(), index },
                 command,
                 cwd.to_path_buf(),
                 flotilla_protocol::TerminalStatus::Disconnected,
@@ -175,26 +188,27 @@ pub(super) async fn resolve_terminal_pool(
         }
         let count = entry.count.unwrap_or(1);
         for i in 0..count {
-            let id = ManagedTerminalId { checkout: config.name.clone(), role: entry.role.clone(), index: i };
-            let session_name = terminal_session_binding_ref(&id);
-            if let Err(err) = terminal_pool.ensure_session(&session_name, &entry.command, &config.working_directory).await {
-                warn!(%id, err = %err, "failed to ensure terminal");
+            let sn = session_name(&config.name, &entry.role, i);
+            if let Err(err) = terminal_pool.ensure_session(&sn, &entry.command, &config.working_directory).await {
+                warn!(session = %sn, err = %err, "failed to ensure terminal");
                 continue;
             }
             let env_vars = build_terminal_env_vars(
-                &id,
+                &config.name,
+                &entry.role,
+                i,
                 &config.working_directory,
                 &entry.command,
                 attachable_store,
                 terminal_pool_provider,
                 daemon_socket_path,
             );
-            match terminal_pool.attach_command(&session_name, &entry.command, &config.working_directory, &env_vars).await {
+            match terminal_pool.attach_command(&sn, &entry.command, &config.working_directory, &env_vars).await {
                 Ok(cmd) => {
-                    debug!(%id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
+                    debug!(session = %sn, command = ?entry.command, resolved = ?cmd, "terminal resolved");
                     resolved.push((entry.role.clone(), cmd));
                 }
-                Err(err) => warn!(%id, err = %err, "failed to get attach command"),
+                Err(err) => warn!(session = %sn, err = %err, "failed to get attach command"),
             }
         }
     }

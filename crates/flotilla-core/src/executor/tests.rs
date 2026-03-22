@@ -38,8 +38,8 @@ fn desc(name: &str) -> ProviderDescriptor {
 }
 use async_trait::async_trait;
 use flotilla_protocol::{
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
-    RepoSelector, TerminalStatus,
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PreparedTerminalCommand, RepoSelector,
+    TerminalStatus,
 };
 
 fn hp(path: &str) -> HostPath {
@@ -338,8 +338,8 @@ fn existing_branch_checkout_action(branch: &str) -> CommandAction {
     CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::Branch(branch.to_string()), issue_ids: vec![] }
 }
 
-fn remove_checkout_action(branch: &str, terminal_keys: Vec<ManagedTerminalId>) -> CommandAction {
-    CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(branch.to_string()), terminal_keys }
+fn remove_checkout_action(branch: &str) -> CommandAction {
+    CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(branch.to_string()) }
 }
 
 fn test_attachable_store(base: &Path) -> SharedAttachableStore {
@@ -1084,7 +1084,7 @@ async fn remove_checkout_no_manager() {
     data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
     let runner = runner_ok();
 
-    let result = run_execute(remove_checkout_action("old", vec![]), &registry, &data, &runner).await;
+    let result = run_execute(remove_checkout_action("old"), &registry, &data, &runner).await;
 
     assert_error_contains(result, "No checkout manager available");
 }
@@ -1097,7 +1097,7 @@ async fn remove_checkout_success() {
     data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
     let runner = runner_ok();
 
-    let result = run_execute(remove_checkout_action("old", vec![]), &registry, &data, &runner).await;
+    let result = run_execute(remove_checkout_action("old"), &registry, &data, &runner).await;
 
     assert_checkout_removed_branch(result, "old");
 }
@@ -1110,7 +1110,7 @@ async fn remove_checkout_failure() {
     data.checkouts.insert(hp("/repo/wt-main"), make_checkout("main", "/repo/wt-main"));
     let runner = runner_ok();
 
-    let result = run_execute(remove_checkout_action("main", vec![]), &registry, &data, &runner).await;
+    let result = run_execute(remove_checkout_action("main"), &registry, &data, &runner).await;
 
     assert_error_eq(result, "cannot remove trunk");
 }
@@ -1120,7 +1120,7 @@ async fn remove_checkout_failure() {
 // -----------------------------------------------------------------------
 
 struct MockTerminalPool {
-    killed: tokio::sync::Mutex<Vec<ManagedTerminalId>>,
+    killed: tokio::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -1141,18 +1141,16 @@ impl TerminalPool for MockTerminalPool {
         Ok(String::new())
     }
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
-            self.killed.lock().await.push(id);
-        }
+        self.killed.lock().await.push(session_name.to_string());
         Ok(())
     }
 }
 
 struct ConfigurableTerminalPool {
-    ensured: tokio::sync::Mutex<Vec<ManagedTerminalId>>,
-    attached: tokio::sync::Mutex<Vec<ManagedTerminalId>>,
-    ensure_failures: Vec<ManagedTerminalId>,
-    attach_failures: Vec<ManagedTerminalId>,
+    ensured: tokio::sync::Mutex<Vec<String>>,
+    attached: tokio::sync::Mutex<Vec<String>>,
+    ensure_failures: Vec<String>,
+    attach_failures: Vec<String>,
 }
 
 #[async_trait]
@@ -1162,11 +1160,9 @@ impl TerminalPool for ConfigurableTerminalPool {
     }
 
     async fn ensure_session(&self, session_name: &str, _cmd: &str, _cwd: &Path) -> Result<(), String> {
-        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
-            self.ensured.lock().await.push(id.clone());
-            if self.ensure_failures.contains(&id) {
-                return Err(format!("failed to ensure {id}"));
-            }
+        self.ensured.lock().await.push(session_name.to_string());
+        if self.ensure_failures.iter().any(|f| f == session_name) {
+            return Err(format!("failed to ensure {session_name}"));
         }
         Ok(())
     }
@@ -1178,12 +1174,9 @@ impl TerminalPool for ConfigurableTerminalPool {
         _cwd: &Path,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
     ) -> Result<String, String> {
-        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
-            self.attached.lock().await.push(id.clone());
-            if self.attach_failures.contains(&id) {
-                return Err(format!("failed to attach {id}"));
-            }
-            return Ok(format!("attach:{}:{}:{}", id.checkout, id.role, id.index));
+        self.attached.lock().await.push(session_name.to_string());
+        if self.attach_failures.iter().any(|f| f == session_name) {
+            return Err(format!("failed to attach {session_name}"));
         }
         Ok(format!("attach:{session_name}"))
     }
@@ -1194,8 +1187,7 @@ impl TerminalPool for ConfigurableTerminalPool {
 }
 
 #[tokio::test]
-async fn remove_checkout_kills_correlated_terminals() {
-    let terminal_id = ManagedTerminalId { checkout: "feat-x".into(), role: "shell".into(), index: 0 };
+async fn remove_checkout_succeeds_with_terminal_pool() {
     let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
 
     let mut registry = empty_registry();
@@ -1205,12 +1197,9 @@ async fn remove_checkout_kills_correlated_terminals() {
     data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
 
     let runner = runner_ok();
-    let result = run_execute(remove_checkout_action("feat-x", vec![terminal_id.clone()]), &registry, &data, &runner).await;
+    let result = run_execute(remove_checkout_action("feat-x"), &registry, &data, &runner).await;
 
     assert_checkout_removed_branch(result, "feat-x");
-    let killed = mock_pool.killed.lock().await;
-    assert_eq!(killed.len(), 1);
-    assert_eq!(killed[0], terminal_id);
 }
 
 // -----------------------------------------------------------------------
@@ -1860,9 +1849,7 @@ async fn checkout_create_plan_and_execute_return_same_checkout_created_result() 
 }
 
 #[tokio::test]
-async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
-    let terminal_id = ManagedTerminalId { checkout: "feat-x".into(), role: "shell".into(), index: 0 };
-
+async fn remove_checkout_plan_and_execute_both_succeed() {
     let execute_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let mut execute_registry = empty_registry();
     execute_registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
@@ -1870,13 +1857,9 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
     let mut execute_data = empty_data();
     execute_data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
 
-    let execute_result =
-        run_execute(remove_checkout_action("feat-x", vec![terminal_id.clone()]), &execute_registry, &execute_data, &runner_ok()).await;
+    let execute_result = run_execute(remove_checkout_action("feat-x"), &execute_registry, &execute_data, &runner_ok()).await;
 
     assert_checkout_removed_branch(execute_result, "feat-x");
-    let execute_killed = execute_pool.killed.lock().await;
-    assert_eq!(execute_killed.as_slice(), std::slice::from_ref(&terminal_id));
-    drop(execute_killed);
 
     let plan_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let mut plan_registry = empty_registry();
@@ -1885,13 +1868,9 @@ async fn remove_checkout_plan_and_execute_both_kill_correlated_terminals() {
     let mut plan_data = empty_data();
     plan_data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
 
-    let plan_result =
-        run_build_plan_to_completion(remove_checkout_action("feat-x", vec![terminal_id.clone()]), plan_registry, plan_data, runner_ok())
-            .await;
+    let plan_result = run_build_plan_to_completion(remove_checkout_action("feat-x"), plan_registry, plan_data, runner_ok()).await;
 
     assert_checkout_removed_branch(plan_result, "feat-x");
-    let plan_killed = plan_pool.killed.lock().await;
-    assert_eq!(plan_killed.as_slice(), &[terminal_id]);
 }
 
 #[tokio::test]
@@ -1927,8 +1906,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
     let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
     let runner = runner_ok();
     let result =
-        execute(remove_checkout_action("feat-x", vec![]), &repo, &registry, &data, &runner, &config_base, &attachable_store, None, &host)
-            .await;
+        execute(remove_checkout_action("feat-x"), &repo, &registry, &data, &runner, &config_base, &attachable_store, None, &host).await;
 
     assert_checkout_removed_branch(result, "feat-x");
 
@@ -1943,7 +1921,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
     // Verify terminal was killed via cascade
     let killed = mock_pool.killed.lock().await;
     assert_eq!(killed.len(), 1, "cascade should kill the terminal");
-    assert_eq!(killed[0].checkout, "feat-x");
+    assert!(killed[0].contains("feat-x"), "killed session should reference the checkout");
 }
 
 #[tokio::test]
@@ -2286,7 +2264,7 @@ async fn build_plan_remove_checkout_returns_steps() {
     data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
     let runner = runner_ok();
 
-    let plan = run_build_plan(remove_checkout_action("old", vec![]), registry, data, runner).await;
+    let plan = run_build_plan(remove_checkout_action("old"), registry, data, runner).await;
 
     match plan {
         ExecutionPlan::Steps(step_plan) => {
@@ -2512,7 +2490,7 @@ async fn prepare_terminal_commands_wraps_requested_commands_and_falls_back_on_at
         ensured: tokio::sync::Mutex::new(Vec::new()),
         attached: tokio::sync::Mutex::new(Vec::new()),
         ensure_failures: vec![],
-        attach_failures: vec![ManagedTerminalId { checkout: "feat".into(), role: "main".into(), index: 1 }],
+        attach_failures: vec!["flotilla/feat/main/1".to_string()],
     });
     let store = crate::attachable::shared_in_memory_attachable_store();
     let mut registry = empty_registry();
@@ -2530,22 +2508,14 @@ async fn prepare_terminal_commands_wraps_requested_commands_and_falls_back_on_at
         .expect("prepare requested terminal commands");
 
     assert_eq!(result, vec![
-        PreparedTerminalCommand { role: "main".into(), command: "attach:feat:main:0".into() },
+        PreparedTerminalCommand { role: "main".into(), command: "attach:flotilla/feat/main/0".into() },
         PreparedTerminalCommand { role: "main".into(), command: "bash".into() },
     ]);
 
     let ensured = mock_pool.ensured.lock().await;
-    assert_eq!(&*ensured, &[ManagedTerminalId { checkout: "feat".into(), role: "main".into(), index: 0 }, ManagedTerminalId {
-        checkout: "feat".into(),
-        role: "main".into(),
-        index: 1
-    },]);
+    assert_eq!(&*ensured, &["flotilla/feat/main/0", "flotilla/feat/main/1"]);
     let attached = mock_pool.attached.lock().await;
-    assert_eq!(&*attached, &[ManagedTerminalId { checkout: "feat".into(), role: "main".into(), index: 0 }, ManagedTerminalId {
-        checkout: "feat".into(),
-        role: "main".into(),
-        index: 1
-    },]);
+    assert_eq!(&*attached, &["flotilla/feat/main/0", "flotilla/feat/main/1"]);
 }
 
 #[tokio::test]
@@ -2553,8 +2523,8 @@ async fn resolve_terminal_pool_skips_ensure_failure_and_attach_failure() {
     let mock_pool = Arc::new(ConfigurableTerminalPool {
         ensured: tokio::sync::Mutex::new(Vec::new()),
         attached: tokio::sync::Mutex::new(Vec::new()),
-        ensure_failures: vec![ManagedTerminalId { checkout: "test-branch".into(), role: "main".into(), index: 0 }],
-        attach_failures: vec![ManagedTerminalId { checkout: "test-branch".into(), role: "aux".into(), index: 0 }],
+        ensure_failures: vec!["flotilla/test-branch/main/0".to_string()],
+        attach_failures: vec!["flotilla/test-branch/aux/0".to_string()],
     });
     let yaml = r#"
 content:
@@ -2606,11 +2576,10 @@ async fn resolve_terminal_pool_invalid_template_uses_default() {
 #[test]
 fn build_terminal_env_vars_creates_binding_and_populates_both_vars() {
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let id = ManagedTerminalId { checkout: "feat".into(), role: "agent".into(), index: 0 };
     let cwd = std::path::Path::new("/repo/feat");
     let socket = std::path::PathBuf::from("/tmp/flotilla.sock");
 
-    let vars = build_terminal_env_vars(&id, cwd, "claude", &store, "shpool", Some(&socket));
+    let vars = build_terminal_env_vars("feat", "agent", 0, cwd, "claude", &store, "shpool", Some(&socket));
 
     assert_eq!(vars.len(), 2);
     assert_eq!(vars[0].0, "FLOTILLA_ATTACHABLE_ID");
@@ -2619,15 +2588,14 @@ fn build_terminal_env_vars_creates_binding_and_populates_both_vars() {
     assert_eq!(vars[1].1, "/tmp/flotilla.sock");
 
     // Calling again returns the same attachable ID (idempotent)
-    let vars2 = build_terminal_env_vars(&id, cwd, "claude", &store, "shpool", Some(&socket));
+    let vars2 = build_terminal_env_vars("feat", "agent", 0, cwd, "claude", &store, "shpool", Some(&socket));
     assert_eq!(vars[0].1, vars2[0].1);
 }
 
 #[test]
 fn build_terminal_env_vars_without_socket_only_has_attachable_id() {
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let id = ManagedTerminalId { checkout: "feat".into(), role: "shell".into(), index: 0 };
-    let vars = build_terminal_env_vars(&id, std::path::Path::new("/repo"), "$SHELL", &store, "shpool", None);
+    let vars = build_terminal_env_vars("feat", "shell", 0, std::path::Path::new("/repo"), "$SHELL", &store, "shpool", None);
     assert_eq!(vars.len(), 1);
     assert_eq!(vars[0].0, "FLOTILLA_ATTACHABLE_ID");
 }

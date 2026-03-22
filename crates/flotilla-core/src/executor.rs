@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, ManagedTerminalId};
+use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath};
 use tracing::{debug, error, info};
 
 use self::{
@@ -104,7 +104,6 @@ impl<'a> CheckoutFlow<'a> {
 
 struct RemoveCheckoutFlow<'a> {
     checkout: &'a CheckoutSelector,
-    terminal_keys: &'a [ManagedTerminalId],
     repo_root: &'a Path,
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
@@ -130,7 +129,7 @@ impl<'a> RemoveCheckoutFlow<'a> {
     async fn remove_branch(&self, branch: &str) -> Result<(), String> {
         let checkout_service = CheckoutService::new(self.registry, self.runner);
         let deleted_paths = self.deleted_checkout_paths(branch);
-        checkout_service.remove_checkout(self.repo_root, branch, self.terminal_keys, &deleted_paths, self.attachable_store).await
+        checkout_service.remove_checkout(self.repo_root, branch, &deleted_paths, self.attachable_store).await
     }
 
     async fn execute(&self) -> CommandValue {
@@ -196,10 +195,9 @@ pub async fn build_plan(
             .await
         }
 
-        CommandAction::RemoveCheckout { checkout, terminal_keys } => {
+        CommandAction::RemoveCheckout { checkout } => {
             let remove_flow = RemoveCheckoutFlow {
                 checkout: &checkout,
-                terminal_keys: &terminal_keys,
                 repo_root: &repo.root,
                 registry: registry.as_ref(),
                 providers_data: providers_data.as_ref(),
@@ -210,7 +208,7 @@ pub async fn build_plan(
             match remove_flow.resolve_branch() {
                 Ok(branch) => {
                     let deleted_paths = remove_flow.deleted_checkout_paths(&branch);
-                    build_remove_checkout_plan(branch, terminal_keys, deleted_paths)
+                    build_remove_checkout_plan(branch, deleted_paths)
                 }
                 Err(message) => ExecutionPlan::Immediate(CommandValue::Error { message }),
             }
@@ -340,15 +338,11 @@ async fn build_teleport_session_plan(
 /// Steps:
 /// 1. Remove the checkout via the checkout manager
 /// 2. Clean up correlated terminal sessions (best-effort)
-fn build_remove_checkout_plan(
-    branch: String,
-    terminal_keys: Vec<ManagedTerminalId>,
-    deleted_checkout_paths: Vec<HostPath>,
-) -> ExecutionPlan {
+fn build_remove_checkout_plan(branch: String, deleted_checkout_paths: Vec<HostPath>) -> ExecutionPlan {
     ExecutionPlan::Steps(StepPlan::new(vec![Step {
         description: format!("Remove checkout for branch {branch}"),
         host: StepHost::Local,
-        action: StepAction::RemoveCheckout { branch, terminal_keys, deleted_checkout_paths },
+        action: StepAction::RemoveCheckout { branch, deleted_checkout_paths },
     }]))
 }
 
@@ -392,11 +386,9 @@ impl StepResolver for ExecutorStepResolver {
                 write_branch_issue_links(&self.repo.root, &branch, &issue_ids, &*self.runner).await;
                 Ok(StepOutcome::Completed)
             }
-            StepAction::RemoveCheckout { branch, terminal_keys, deleted_checkout_paths } => {
+            StepAction::RemoveCheckout { branch, deleted_checkout_paths } => {
                 let checkout_service = CheckoutService::new(self.registry.as_ref(), self.runner.as_ref());
-                checkout_service
-                    .remove_checkout(&self.repo.root, &branch, &terminal_keys, &deleted_checkout_paths, &self.attachable_store)
-                    .await?;
+                checkout_service.remove_checkout(&self.repo.root, &branch, &deleted_checkout_paths, &self.attachable_store).await?;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))
             }
             StepAction::ResolveAttachCommand { session_id } => {
@@ -634,10 +626,9 @@ pub async fn execute(
             }
         }
 
-        CommandAction::RemoveCheckout { checkout, terminal_keys } => {
+        CommandAction::RemoveCheckout { checkout } => {
             RemoveCheckoutFlow {
                 checkout: &checkout,
-                terminal_keys: &terminal_keys,
                 repo_root: &repo.root,
                 registry,
                 providers_data,

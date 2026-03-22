@@ -244,19 +244,6 @@ pub enum SessionStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ManagedTerminalId {
-    pub checkout: String,
-    pub role: String,
-    pub index: u32,
-}
-
-impl std::fmt::Display for ManagedTerminalId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}/{}", self.checkout, self.role, self.index)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AttachableSetId(String);
 
@@ -317,19 +304,6 @@ pub enum TerminalStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedTerminal {
-    pub id: ManagedTerminalId,
-    pub role: String,
-    pub command: String,
-    pub working_directory: PathBuf,
-    pub status: TerminalStatus,
-    #[serde(default)]
-    pub attachable_id: Option<AttachableId>,
-    #[serde(default)]
-    pub attachable_set_id: Option<AttachableSetId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub name: String,
     pub directories: Vec<PathBuf>,
@@ -348,7 +322,6 @@ pub struct ProviderData {
     pub sessions: IndexMap<String, CloudAgentSession>,
     pub branches: IndexMap<String, crate::delta::Branch>,
     pub workspaces: IndexMap<String, Workspace>,
-    pub managed_terminals: IndexMap<String, ManagedTerminal>,
     pub attachable_sets: IndexMap<AttachableSetId, AttachableSet>,
     #[serde(default)]
     pub agents: IndexMap<String, Agent>,
@@ -522,24 +495,9 @@ mod tests {
     }
 
     #[test]
-    fn managed_terminal_roundtrip() {
+    fn terminal_status_roundtrip() {
         use crate::test_helpers::assert_roundtrip;
 
-        let id = ManagedTerminalId { checkout: "my-feature".into(), role: "shell".into(), index: 0 };
-        assert_roundtrip(&id);
-
-        let terminal = ManagedTerminal {
-            id: id.clone(),
-            role: "shell".into(),
-            command: "$SHELL".into(),
-            working_directory: PathBuf::from("/Users/dev/project"),
-            status: TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
-        };
-        assert_roundtrip(&terminal);
-
-        // Test all status variants
         assert_roundtrip(&TerminalStatus::Running);
         assert_roundtrip(&TerminalStatus::Disconnected);
         assert_roundtrip(&TerminalStatus::Exited(0));
@@ -555,7 +513,6 @@ mod tests {
         assert!(pd.sessions.is_empty());
         assert!(pd.branches.is_empty());
         assert!(pd.workspaces.is_empty());
-        assert!(pd.managed_terminals.is_empty());
         assert!(pd.attachable_sets.is_empty());
     }
 

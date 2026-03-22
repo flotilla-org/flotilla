@@ -3,11 +3,7 @@ pub use flotilla_core::merge::merge_provider_data;
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use flotilla_protocol::{
-        ChangeRequest, ChangeRequestStatus, Checkout, HostName, HostPath, ManagedTerminal, ManagedTerminalId, ProviderData, TerminalStatus,
-    };
+    use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, Checkout, HostName, HostPath, ProviderData};
     use indexmap::IndexMap;
 
     use super::*;
@@ -22,18 +18,6 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
-        }
-    }
-
-    fn make_terminal(name: &str) -> ManagedTerminal {
-        ManagedTerminal {
-            id: ManagedTerminalId { checkout: "main".into(), role: "shell".into(), index: 0 },
-            role: "shell".into(),
-            command: "$SHELL".into(),
-            working_directory: PathBuf::from(format!("/home/dev/{name}")),
-            status: TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
         }
     }
 
@@ -65,16 +49,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_namespaces_terminal_names() {
-        let local = ProviderData::default();
-        let mut remote = ProviderData::default();
-        remote.managed_terminals.insert("session1".into(), make_terminal("session1"));
-        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
-        assert!(merged.managed_terminals.contains_key("desktop:session1"));
-        assert!(!merged.managed_terminals.contains_key("session1"));
-    }
-
-    #[test]
     fn merge_preserves_local_service_data() {
         let mut local = ProviderData::default();
         local.change_requests.insert("PR-1".into(), ChangeRequest {
@@ -91,27 +65,6 @@ mod tests {
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.change_requests.len(), 1);
         assert!(merged.change_requests.contains_key("PR-1"));
-    }
-
-    #[test]
-    fn merge_combines_terminals_from_multiple_peers() {
-        let mut local = ProviderData::default();
-        local.managed_terminals.insert("local-shell".into(), make_terminal("local"));
-
-        let mut peer_a = ProviderData::default();
-        peer_a.managed_terminals.insert("shell".into(), make_terminal("peer-a"));
-
-        let mut peer_b = ProviderData::default();
-        peer_b.managed_terminals.insert("shell".into(), make_terminal("peer-b"));
-
-        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[
-            (HostName::new("desktop"), &peer_a),
-            (HostName::new("server"), &peer_b),
-        ]);
-        assert_eq!(merged.managed_terminals.len(), 3);
-        assert!(merged.managed_terminals.contains_key("local-shell"));
-        assert!(merged.managed_terminals.contains_key("desktop:shell"));
-        assert!(merged.managed_terminals.contains_key("server:shell"));
     }
 
     #[test]

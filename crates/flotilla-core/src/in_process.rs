@@ -88,9 +88,6 @@ fn merge_local_provider_data(base: &mut ProviderData, other: &ProviderData) {
         // Preferred root data is merged first and remains authoritative on collisions.
         base.checkouts.entry(host_path.clone()).or_insert_with(|| checkout.clone());
     }
-    for (name, terminal) in &other.managed_terminals {
-        base.managed_terminals.entry(name.clone()).or_insert_with(|| terminal.clone());
-    }
     for (name, branch) in &other.branches {
         base.branches.entry(name.clone()).or_insert_with(|| branch.clone());
     }

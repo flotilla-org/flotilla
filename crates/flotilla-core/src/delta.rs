@@ -61,10 +61,6 @@ pub fn diff_provider_data(prev: &ProviderData, curr: &ProviderData) -> Vec<Chang
     for (key, op) in diff_indexmap(&prev.branches, &curr.branches) {
         changes.push(Change::Branch { key, op });
     }
-    for (key, op) in diff_indexmap(&prev.managed_terminals, &curr.managed_terminals) {
-        changes.push(Change::ManagedTerminal { key, op });
-    }
-
     changes
 }
 
@@ -94,7 +90,6 @@ pub fn apply_changes(pd: &mut ProviderData, changes: Vec<Change>) {
             Change::Workspace { key, op } => apply_op(&mut pd.workspaces, key, op),
             Change::AttachableSet { key, op } => apply_op(&mut pd.attachable_sets, key, op),
             Change::Branch { key, op } => apply_op(&mut pd.branches, key, op),
-            Change::ManagedTerminal { key, op } => apply_op(&mut pd.managed_terminals, key, op),
             // WorkItem and ProviderHealth are snapshot-level, not ProviderData-level.
             // They'll be handled at a higher layer.
             Change::WorkItem { .. } | Change::ProviderHealth { .. } | Change::ErrorsChanged(_) => {}
@@ -132,8 +127,8 @@ mod tests {
 
     use flotilla_protocol::{
         delta::{Branch, BranchStatus},
-        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, HostName, HostPath, Issue, ManagedTerminal, ManagedTerminalId,
-        ProviderError, SessionStatus, TerminalStatus, Workspace,
+        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, HostName, HostPath, Issue, ProviderError, SessionStatus,
+        Workspace,
     };
 
     use super::*;
@@ -555,67 +550,5 @@ mod tests {
             }
             other => panic!("expected ErrorsChanged, got {other:?}"),
         }
-    }
-
-    // --- managed terminal diff/apply tests ---
-
-    fn terminal(role: &str, status: TerminalStatus) -> ManagedTerminal {
-        ManagedTerminal {
-            id: ManagedTerminalId { checkout: "main".into(), role: role.into(), index: 0 },
-            role: role.into(),
-            command: "bash".into(),
-            working_directory: PathBuf::from("/repo"),
-            status,
-            attachable_id: None,
-            attachable_set_id: None,
-        }
-    }
-
-    #[test]
-    fn diff_terminal_added() {
-        let prev = ProviderData::default();
-        let mut curr = ProviderData::default();
-        curr.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
-        let changes = diff_provider_data(&prev, &curr);
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Added(_) } if key == "t1"));
-    }
-
-    #[test]
-    fn diff_terminal_removed() {
-        let mut prev = ProviderData::default();
-        prev.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
-        let curr = ProviderData::default();
-        let changes = diff_provider_data(&prev, &curr);
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Removed } if key == "t1"));
-    }
-
-    #[test]
-    fn diff_terminal_status_changed() {
-        let mut prev = ProviderData::default();
-        prev.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
-        let mut curr = ProviderData::default();
-        curr.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Disconnected));
-        let changes = diff_provider_data(&prev, &curr);
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::ManagedTerminal { key, op: EntryOp::Updated(_) } if key == "t1"));
-    }
-
-    #[test]
-    fn roundtrip_terminal_changes() {
-        let mut prev = ProviderData::default();
-        prev.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Running));
-
-        let mut curr = ProviderData::default();
-        curr.managed_terminals.insert("t1".into(), terminal("editor", TerminalStatus::Exited(0)));
-        curr.managed_terminals.insert("t2".into(), terminal("shell", TerminalStatus::Running));
-
-        let changes = diff_provider_data(&prev, &curr);
-        assert_eq!(changes.len(), 2);
-
-        let mut applied = prev.clone();
-        apply_changes(&mut applied, changes);
-        assert_eq!(applied.managed_terminals, curr.managed_terminals);
     }
 }

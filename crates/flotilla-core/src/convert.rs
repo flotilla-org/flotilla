@@ -101,7 +101,6 @@ fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
             CorItemKind::ChangeRequest => "CR",
             CorItemKind::CloudSession => "Session",
             CorItemKind::Workspace => "Workspace",
-            CorItemKind::ManagedTerminal => "Terminal",
             CorItemKind::Agent => "Agent",
         };
         lines.push(format!("  {}: {} [{:?}]", kind_label, ci.title, ci.source_key));

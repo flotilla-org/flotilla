@@ -72,7 +72,7 @@ pub struct CorrelatedWorkItem {
     pub correlation_group_idx: usize,
     pub host: Option<flotilla_protocol::HostName>,
     pub source: Option<String>,
-    pub terminal_ids: Vec<flotilla_protocol::ManagedTerminalId>,
+    pub terminal_ids: Vec<flotilla_protocol::AttachableId>,
     pub agent_keys: Vec<String>,
 }
 
@@ -184,7 +184,7 @@ impl CorrelationResult {
         }
     }
 
-    pub fn terminal_ids(&self) -> &[flotilla_protocol::ManagedTerminalId] {
+    pub fn terminal_ids(&self) -> &[flotilla_protocol::AttachableId] {
         match self {
             CorrelationResult::Correlated(c) => &c.terminal_ids,
             _ => &[],
@@ -348,7 +348,6 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
     let mut agent_key: Option<String> = None;
     let mut agent_keys: Vec<String> = Vec::new();
     let mut workspace_refs: Vec<String> = Vec::new();
-    let mut terminal_ids: Vec<flotilla_protocol::ManagedTerminalId> = Vec::new();
     let mut host: Option<flotilla_protocol::HostName> = None;
 
     for item in &group.items {
@@ -389,16 +388,6 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
                     if attachable_set_id.is_none() {
                         attachable_set_id = providers.workspaces.get(ws_ref).and_then(|ws| ws.attachable_set_id.clone());
                     }
-                }
-            }
-            (CorItemKind::ManagedTerminal, ProviderItemKey::ManagedTerminal(key)) => {
-                if let Some(terminal) = providers.managed_terminals.get(key.as_str()) {
-                    terminal_ids.push(terminal.id.clone());
-                    if attachable_set_id.is_none() {
-                        attachable_set_id = terminal.attachable_set_id.clone();
-                    }
-                } else {
-                    tracing::debug!(%key, "managed_terminals lookup miss in group_to_work_item");
                 }
             }
             _ => {}
@@ -473,7 +462,7 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         correlation_group_idx: group_idx,
         host,
         source,
-        terminal_ids,
+        terminal_ids: Vec::new(),
         agent_keys,
     }))
 }
@@ -539,20 +528,6 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
             title: ws.name.clone(),
             correlation_keys: ws.attachable_set_id.as_ref().map(|id| vec![CorrelationKey::AttachableSet(id.clone())]).unwrap_or_default(),
             source_key: ProviderItemKey::Workspace(ws_ref.clone()),
-        });
-    }
-
-    for (key, terminal) in &providers.managed_terminals {
-        items.push(CorrelatedItem {
-            provider_name: "terminal".to_string(),
-            kind: CorItemKind::ManagedTerminal,
-            title: format!("{} ({})", terminal.id, terminal.role),
-            correlation_keys: terminal
-                .attachable_set_id
-                .as_ref()
-                .map(|id| vec![CorrelationKey::AttachableSet(id.clone())])
-                .unwrap_or_default(),
-            source_key: ProviderItemKey::ManagedTerminal(key.clone()),
         });
     }
 
@@ -1501,17 +1476,6 @@ mod tests {
         let mut providers = new_providers();
         let set_id = flotilla_protocol::AttachableSetId::new("set-1");
 
-        // Terminal in set-1
-        providers.managed_terminals.insert("t1".to_string(), flotilla_protocol::ManagedTerminal {
-            id: flotilla_protocol::ManagedTerminalId { checkout: "feat".into(), role: "agent".into(), index: 0 },
-            role: "agent".into(),
-            command: "claude".into(),
-            working_directory: PathBuf::from("/repo/feat"),
-            status: flotilla_protocol::TerminalStatus::Running,
-            attachable_id: Some(flotilla_protocol::AttachableId::new("att-1")),
-            attachable_set_id: Some(set_id.clone()),
-        });
-
         // AttachableSet
         providers.attachable_sets.insert(set_id.clone(), make_attachable_set("set-1", "/repo/feat"));
 
@@ -2285,44 +2249,6 @@ mod tests {
         assert_eq!(grouped.selectable_indices.len(), 5);
     }
 
-    // -----------------------------------------------------------------------
-    // terminal_ids population tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn correlate_terminal_ids_populated_when_managed_terminal_shares_attachable_set() {
-        let mut providers = new_providers();
-
-        let co_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), "/tmp/feat-term");
-        let set_id = flotilla_protocol::AttachableSetId::new("set-term");
-        providers.checkouts.insert(co_path.clone(), make_checkout("feat-term", "/tmp/feat-term", false));
-        providers.attachable_sets.insert(set_id.clone(), make_attachable_set("set-term", "/tmp/feat-term"));
-
-        let terminal_id = flotilla_protocol::ManagedTerminalId { checkout: "feat-term".to_string(), role: "dev".to_string(), index: 0 };
-        let terminal_key = terminal_id.to_string();
-        providers.managed_terminals.insert(terminal_key.clone(), flotilla_protocol::ManagedTerminal {
-            id: terminal_id.clone(),
-            role: "dev".to_string(),
-            command: "bash".to_string(),
-            working_directory: PathBuf::from("/tmp/feat-term"),
-            status: flotilla_protocol::TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: Some(set_id.clone()),
-        });
-
-        let (items, _) = correlate(&providers);
-
-        // Should merge into a single checkout work item
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind(), WorkItemKind::Checkout);
-        assert_eq!(items[0].attachable_set_id(), Some(&set_id));
-        assert_eq!(items[0].checkout_key(), Some(&co_path));
-
-        let terminal_ids = items[0].terminal_ids();
-        assert!(!terminal_ids.is_empty(), "terminal_ids should be non-empty after correlation");
-        assert_eq!(terminal_ids[0], terminal_id);
-    }
-
     #[test]
     fn workspace_only_joins_checkout_through_attachable_set() {
         let mut providers = new_providers();
@@ -2387,16 +2313,6 @@ mod tests {
             correlation_keys: vec![],
             attachable_set_id: Some(set_id.clone()),
         });
-        providers.managed_terminals.insert("feat-set/dev/0".to_string(), flotilla_protocol::ManagedTerminal {
-            id: flotilla_protocol::ManagedTerminalId { checkout: "feat-set".to_string(), role: "dev".to_string(), index: 0 },
-            role: "dev".to_string(),
-            command: "bash".to_string(),
-            working_directory: PathBuf::from("/tmp/feat-set"),
-            status: flotilla_protocol::TerminalStatus::Running,
-            attachable_id: Some(flotilla_protocol::AttachableId::new("att-1")),
-            attachable_set_id: Some(set_id.clone()),
-        });
-
         let (items, _) = correlate(&providers);
 
         assert_eq!(items.len(), 1);
@@ -2404,10 +2320,5 @@ mod tests {
         assert_eq!(items[0].attachable_set_id(), Some(&set_id));
         assert_eq!(items[0].checkout_key(), Some(&co_path));
         assert_eq!(items[0].workspace_refs(), &["ws-1".to_string()]);
-        assert_eq!(items[0].terminal_ids(), &[flotilla_protocol::ManagedTerminalId {
-            checkout: "feat-set".to_string(),
-            role: "dev".to_string(),
-            index: 0
-        }]);
     }
 }

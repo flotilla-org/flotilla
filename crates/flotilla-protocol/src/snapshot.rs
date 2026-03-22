@@ -103,7 +103,7 @@ pub struct WorkItem {
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
-    pub terminal_keys: Vec<crate::ManagedTerminalId>,
+    pub terminal_keys: Vec<crate::AttachableId>,
     #[serde(default)]
     pub attachable_set_id: Option<AttachableSetId>,
     #[serde(default)]
