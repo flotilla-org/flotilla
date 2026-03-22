@@ -400,6 +400,12 @@ fn build_header_row(_header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
+/// Whether this row should render with muted/dimmed styling.
+/// Only session-kind rows with an archived or expired status are dimmed.
+fn is_archived_session_row(item: &WorkItem, session_status: Option<&SessionStatus>) -> bool {
+    item.kind == WorkItemKind::Session && session_status.is_some_and(|s| matches!(s, SessionStatus::Archived | SessionStatus::Expired))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_item_row<'a>(
     item: &WorkItem,
@@ -412,8 +418,7 @@ fn build_item_row<'a>(
     home_dir: Option<&Path>,
 ) -> Row<'a> {
     let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
-    let is_archived =
-        item.kind == WorkItemKind::Session && session_status.is_some_and(|s| matches!(s, SessionStatus::Archived | SessionStatus::Expired));
+    let is_archived = is_archived_session_row(item, session_status);
     let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status, theme);
 
     let source_display = match item.source.as_deref() {
@@ -695,52 +700,27 @@ mod tests {
         assert_eq!(table.table_state.selected(), Some(0));
     }
 
-    // ── archived dimming scoped to session-kind rows ──
+    // ── is_archived_session_row ──
+
+    #[test]
+    fn archived_session_row_is_dimmed() {
+        let ses = session_item("s1");
+        assert!(is_archived_session_row(&ses, Some(&SessionStatus::Archived)));
+        assert!(is_archived_session_row(&ses, Some(&SessionStatus::Expired)));
+    }
+
+    #[test]
+    fn active_session_row_is_not_dimmed() {
+        let ses = session_item("s1");
+        assert!(!is_archived_session_row(&ses, Some(&SessionStatus::Running)));
+        assert!(!is_archived_session_row(&ses, None));
+    }
 
     #[test]
     fn checkout_row_linked_to_archived_session_is_not_dimmed() {
-        use flotilla_protocol::CloudAgentSession;
-
-        let theme = crate::theme::Theme::classic();
-        let col_widths = vec![3, 8, 14, 15, 25, 3, 3, 8, 8, 8, 5];
-
-        let mut providers = ProviderData::default();
-        providers.sessions.insert(
-            "s1".into(),
-            CloudAgentSession {
-                title: String::new(),
-                status: SessionStatus::Archived,
-                model: None,
-                updated_at: None,
-                correlation_keys: Vec::new(),
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-                item_noun: String::new(),
-            },
-        );
-
-        // Checkout item correlated with the archived session.
         let mut co = checkout_item("feat/x", "/tmp/x", false);
         co.session_key = Some("s1".into());
-
-        let checkout_row = build_item_row(&co, &providers, &col_widths, Path::new("/tmp"), None, None, &theme, None);
-
-        // A session-kind item with the same archived key — this one SHOULD be dimmed.
-        let ses = session_item("s1");
-        let session_row = build_item_row(&ses, &providers, &col_widths, Path::new("/tmp"), None, None, &theme, None);
-
-        let checkout_debug = format!("{checkout_row:?}");
-        let session_debug = format!("{session_row:?}");
-
-        // The muted color (dark_gray in classic theme) should appear in the
-        // session row but NOT in the checkout row.
-        assert!(
-            session_debug.contains("dark_gray"),
-            "session row should use muted (dark_gray) style"
-        );
-        assert!(
-            !checkout_debug.contains("dark_gray"),
-            "checkout row linked to archived session should NOT be dimmed"
-        );
+        assert!(!is_archived_session_row(&co, Some(&SessionStatus::Archived)));
+        assert!(!is_archived_session_row(&co, Some(&SessionStatus::Expired)));
     }
 }
