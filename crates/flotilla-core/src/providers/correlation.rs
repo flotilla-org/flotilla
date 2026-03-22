@@ -194,13 +194,9 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use flotilla_protocol::test_support::hp;
 
     use super::*;
-
-    fn hp(path: &str) -> HostPath {
-        HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path))
-    }
 
     fn item(provider: &str, kind: ItemKind, title: &str, keys: Vec<CorrelationKey>, source_key: ProviderItemKey) -> CorrelatedItem {
         CorrelatedItem { provider_name: provider.to_string(), kind, title: title.to_string(), correlation_keys: keys, source_key }

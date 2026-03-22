@@ -147,11 +147,7 @@ pub struct CheckoutRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{host::HostName, provider_data::ProviderData, test_helpers::assert_json_roundtrip};
-
-    fn hp(path: &str) -> HostPath {
-        HostPath::new(HostName::new("test-host"), PathBuf::from(path))
-    }
+    use crate::{host::HostName, provider_data::ProviderData, test_helpers::assert_json_roundtrip, test_support::hp};
 
     #[test]
     fn category_labels_defaults_and_capitalization() {

@@ -888,12 +888,10 @@ pub async fn fetch_checkout_status(
 mod tests {
     use std::path::PathBuf;
 
+    use flotilla_protocol::test_support::hp;
+
     use super::*;
     use crate::{provider_data::ProviderData, providers::types::*};
-
-    fn hp(path: &str) -> flotilla_protocol::HostPath {
-        flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path))
-    }
 
     // -----------------------------------------------------------------------
     // Helper: build a minimal CorrelatedWorkItem with sensible defaults

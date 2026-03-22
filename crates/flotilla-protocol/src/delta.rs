@@ -95,12 +95,8 @@ mod tests {
     use super::*;
     use crate::{
         test_helpers::{assert_json_roundtrip, assert_roundtrip},
-        HostName,
+        test_support::hp,
     };
-
-    fn hp(path: &str) -> HostPath {
-        HostPath::new(HostName::new("test-host"), PathBuf::from(path))
-    }
 
     #[test]
     fn entry_op_added_roundtrip() {

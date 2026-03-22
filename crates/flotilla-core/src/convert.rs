@@ -219,7 +219,7 @@ pub fn snapshot_to_proto(
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{HostName, HostPath, HostProviderStatus, WorkItemIdentity, WorkItemKind};
+    use flotilla_protocol::{test_support::hp, HostName, HostPath, HostProviderStatus, WorkItemIdentity, WorkItemKind};
 
     use super::*;
     use crate::{
@@ -294,10 +294,6 @@ mod tests {
 
         assert!(statuses.contains(&HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }));
         assert!(statuses.contains(&HostProviderStatus { category: "cloud_agent".into(), name: "Claude".into(), healthy: false }));
-    }
-
-    fn hp(path: &str) -> HostPath {
-        HostPath::new(HostName::new("test-host"), PathBuf::from(path))
     }
 
     fn test_host() -> HostName {
