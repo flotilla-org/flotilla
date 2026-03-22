@@ -37,9 +37,13 @@ impl TerminalManager {
         Self { pool, store }
     }
 
-    /// Creates a new `AttachableSet` in the store for the given host and checkout path.
+    /// Returns the existing `AttachableSet` for the given checkout, or creates a new one.
     pub fn allocate_set(&self, host: HostName, checkout_path: HostPath) -> Result<AttachableSetId, String> {
         let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
+        let existing = store.sets_for_checkout(&checkout_path);
+        if let Some(id) = existing.into_iter().next() {
+            return Ok(id);
+        }
         let id = store.allocate_set_id();
         store.insert_set(AttachableSet {
             id: id.clone(),
@@ -51,7 +55,7 @@ impl TerminalManager {
         Ok(id)
     }
 
-    /// Creates a new terminal `Attachable` within an existing set.
+    /// Returns the existing terminal for the given purpose within a set, or creates a new one.
     pub fn allocate_terminal(
         &self,
         set_id: AttachableSetId,
@@ -62,18 +66,29 @@ impl TerminalManager {
         working_directory: PathBuf,
     ) -> Result<AttachableId, String> {
         let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
+        let target_purpose = TerminalPurpose { checkout: checkout.to_string(), role: role.to_string(), index };
+        // Return existing terminal if one matches the purpose within this set.
+        for (id, attachable) in store.registry().attachables.iter() {
+            if attachable.set_id != set_id {
+                continue;
+            }
+            let AttachableContent::Terminal(t) = &attachable.content;
+            if t.purpose == target_purpose {
+                return Ok(id.clone());
+            }
+        }
         let id = store.allocate_attachable_id();
         store.insert_attachable(Attachable {
             id: id.clone(),
             set_id: set_id.clone(),
             content: AttachableContent::Terminal(TerminalAttachable {
-                purpose: TerminalPurpose { checkout: checkout.to_string(), role: role.to_string(), index },
+                purpose: target_purpose,
                 command: command.to_string(),
                 working_directory,
                 status: TerminalStatus::Disconnected,
             }),
         });
-        // Add the member link to the set. We read the set, add the member, and re-insert.
+        // Add the member link to the set.
         let mut set = store.registry().sets.get(&set_id).cloned().ok_or_else(|| format!("set not found: {set_id}"))?;
         if !set.members.contains(&id) {
             set.members.push(id.clone());
@@ -131,10 +146,16 @@ impl TerminalManager {
             live_sessions.into_iter().map(|s| (s.session_name, s.status)).collect();
 
         let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
-        let attachable_ids: Vec<AttachableId> = store.registry().attachables.keys().cloned().collect();
+        let terminal_ids: Vec<AttachableId> = store
+            .registry()
+            .attachables
+            .iter()
+            .filter(|(_, a)| matches!(&a.content, AttachableContent::Terminal(_)))
+            .map(|(id, _)| id.clone())
+            .collect();
 
         let mut infos = Vec::new();
-        for id in &attachable_ids {
+        for id in &terminal_ids {
             let session_name = id.to_string();
             let new_status = if live_names.contains(&session_name) {
                 live_status.get(&session_name).cloned().unwrap_or(TerminalStatus::Running)
@@ -170,13 +191,21 @@ impl TerminalManager {
             let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let mut ids_to_kill = Vec::new();
 
+            let mut any_removed = false;
             for checkout in checkout_paths {
                 let set_ids = store.sets_for_checkout(checkout);
                 for set_id in set_ids {
                     if let Some(set) = store.registry().sets.get(&set_id) {
                         ids_to_kill.extend(set.members.iter().cloned());
                     }
-                    store.remove_set(&set_id);
+                    if store.remove_set(&set_id).is_some() {
+                        any_removed = true;
+                    }
+                }
+            }
+            if any_removed {
+                if let Err(e) = store.save() {
+                    warn!(error = %e, "failed to persist store after cascade delete");
                 }
             }
             ids_to_kill

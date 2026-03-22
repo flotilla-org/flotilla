@@ -365,6 +365,8 @@ impl AttachableStoreState {
 
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
         if let Some(attachable) = self.registry.attachables.get_mut(id) {
+            // Irrefutable while AttachableContent has one variant; will become a
+            // compile error (forcing a decision) if a second variant is added.
             let AttachableContent::Terminal(ref mut terminal) = attachable.content;
             if terminal.status != status {
                 terminal.status = status;
