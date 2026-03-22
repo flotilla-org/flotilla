@@ -1125,23 +1125,25 @@ struct MockTerminalPool {
 
 #[async_trait]
 impl TerminalPool for MockTerminalPool {
-    async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
+    async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
         Ok(vec![])
     }
-    async fn ensure_running(&self, _id: &ManagedTerminalId, _cmd: &str, _cwd: &Path) -> Result<(), String> {
+    async fn ensure_session(&self, _session_name: &str, _cmd: &str, _cwd: &Path) -> Result<(), String> {
         Ok(())
     }
     async fn attach_command(
         &self,
-        _id: &ManagedTerminalId,
+        _session_name: &str,
         _cmd: &str,
         _cwd: &Path,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
     ) -> Result<String, String> {
         Ok(String::new())
     }
-    async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
-        self.killed.lock().await.push(id.clone());
+    async fn kill_session(&self, session_name: &str) -> Result<(), String> {
+        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
+            self.killed.lock().await.push(id);
+        }
         Ok(())
     }
 }
@@ -1155,35 +1157,38 @@ struct ConfigurableTerminalPool {
 
 #[async_trait]
 impl TerminalPool for ConfigurableTerminalPool {
-    async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
+    async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
         Ok(vec![])
     }
 
-    async fn ensure_running(&self, id: &ManagedTerminalId, _cmd: &str, _cwd: &Path) -> Result<(), String> {
-        self.ensured.lock().await.push(id.clone());
-        if self.ensure_failures.contains(id) {
-            Err(format!("failed to ensure {id}"))
-        } else {
-            Ok(())
+    async fn ensure_session(&self, session_name: &str, _cmd: &str, _cwd: &Path) -> Result<(), String> {
+        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
+            self.ensured.lock().await.push(id.clone());
+            if self.ensure_failures.contains(&id) {
+                return Err(format!("failed to ensure {id}"));
+            }
         }
+        Ok(())
     }
 
     async fn attach_command(
         &self,
-        id: &ManagedTerminalId,
+        session_name: &str,
         _cmd: &str,
         _cwd: &Path,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
     ) -> Result<String, String> {
-        self.attached.lock().await.push(id.clone());
-        if self.attach_failures.contains(id) {
-            Err(format!("failed to attach {id}"))
-        } else {
-            Ok(format!("attach:{}:{}:{}", id.checkout, id.role, id.index))
+        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
+            self.attached.lock().await.push(id.clone());
+            if self.attach_failures.contains(&id) {
+                return Err(format!("failed to attach {id}"));
+            }
+            return Ok(format!("attach:{}:{}:{}", id.checkout, id.role, id.index));
         }
+        Ok(format!("attach:{session_name}"))
     }
 
-    async fn kill_terminal(&self, _id: &ManagedTerminalId) -> Result<(), String> {
+    async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
         Ok(())
     }
 }

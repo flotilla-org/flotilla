@@ -207,8 +207,28 @@ async fn refresh_providers(
     let tp_fut = async {
         if let Some((desc, tp)) = registry.terminal_pools.preferred_with_desc() {
             let name = desc.display_name.clone();
-            match tp.list_terminals().await {
-                Ok(entries) => (entries, vec![]),
+            match tp.list_sessions().await {
+                Ok(sessions) => {
+                    // Convert TerminalSession to ManagedTerminal for compatibility.
+                    // Task 4 will remove ManagedTerminal entirely.
+                    let terminals: Vec<flotilla_protocol::ManagedTerminal> = sessions
+                        .into_iter()
+                        .filter_map(|s| {
+                            crate::attachable::parse_terminal_session_binding_ref(&s.session_name).map(|id| {
+                                flotilla_protocol::ManagedTerminal {
+                                    role: id.role.clone(),
+                                    command: s.command.unwrap_or_default(),
+                                    working_directory: s.working_directory.unwrap_or_default(),
+                                    status: s.status,
+                                    attachable_id: None,
+                                    attachable_set_id: None,
+                                    id,
+                                }
+                            })
+                        })
+                        .collect();
+                    (terminals, vec![])
+                }
                 Err(e) => (vec![], vec![(name, e)]),
             }
         } else {
@@ -613,17 +633,28 @@ mod tests {
 
     #[async_trait]
     impl TerminalPool for MockTerminalPool {
-        async fn list_terminals(&self) -> Result<Vec<flotilla_protocol::ManagedTerminal>, String> {
-            self.result.clone()
+        async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
+            match &self.result {
+                Ok(terminals) => Ok(terminals
+                    .iter()
+                    .map(|t| crate::providers::terminal::TerminalSession {
+                        session_name: crate::attachable::terminal_session_binding_ref(&t.id),
+                        status: t.status.clone(),
+                        command: Some(t.command.clone()),
+                        working_directory: Some(t.working_directory.clone()),
+                    })
+                    .collect()),
+                Err(e) => Err(e.clone()),
+            }
         }
 
-        async fn ensure_running(&self, _id: &flotilla_protocol::ManagedTerminalId, _command: &str, _cwd: &Path) -> Result<(), String> {
+        async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path) -> Result<(), String> {
             Ok(())
         }
 
         async fn attach_command(
             &self,
-            _id: &flotilla_protocol::ManagedTerminalId,
+            _session_name: &str,
             _command: &str,
             _cwd: &Path,
             _env_vars: &crate::providers::terminal::TerminalEnvVars,
@@ -631,7 +662,7 @@ mod tests {
             Ok("mock attach".into())
         }
 
-        async fn kill_terminal(&self, _id: &flotilla_protocol::ManagedTerminalId) -> Result<(), String> {
+        async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
             Ok(())
         }
     }

@@ -466,39 +466,52 @@ impl FakeTerminalPool {
 
 #[async_trait::async_trait]
 impl TerminalPool for FakeTerminalPool {
-    async fn list_terminals(&self) -> Result<Vec<ManagedTerminal>, String> {
-        Ok(self.terminals.lock().await.clone())
+    async fn list_sessions(&self) -> Result<Vec<super::super::terminal::TerminalSession>, String> {
+        let terminals = self.terminals.lock().await;
+        Ok(terminals
+            .iter()
+            .map(|t| super::super::terminal::TerminalSession {
+                session_name: crate::attachable::terminal_session_binding_ref(&t.id),
+                status: t.status.clone(),
+                command: Some(t.command.clone()),
+                working_directory: Some(t.working_directory.clone()),
+            })
+            .collect())
     }
 
-    async fn ensure_running(&self, id: &ManagedTerminalId, command: &str, cwd: &Path) -> Result<(), String> {
-        let mut terminals = self.terminals.lock().await;
-        if terminals.iter().any(|terminal| &terminal.id == id) {
-            return Ok(());
+    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path) -> Result<(), String> {
+        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
+            let mut terminals = self.terminals.lock().await;
+            if terminals.iter().any(|terminal| terminal.id == id) {
+                return Ok(());
+            }
+            terminals.push(ManagedTerminal {
+                id: id.clone(),
+                role: id.role.clone(),
+                command: command.to_string(),
+                working_directory: cwd.to_path_buf(),
+                status: TerminalStatus::Running,
+                attachable_id: None,
+                attachable_set_id: None,
+            });
         }
-        terminals.push(ManagedTerminal {
-            id: id.clone(),
-            role: id.role.clone(),
-            command: command.to_string(),
-            working_directory: cwd.to_path_buf(),
-            status: TerminalStatus::Running,
-            attachable_id: None,
-            attachable_set_id: None,
-        });
         Ok(())
     }
 
     async fn attach_command(
         &self,
-        id: &ManagedTerminalId,
+        session_name: &str,
         _command: &str,
         _cwd: &Path,
         _env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<String, String> {
-        Ok(format!("attach {id}"))
+        Ok(format!("attach {session_name}"))
     }
 
-    async fn kill_terminal(&self, id: &ManagedTerminalId) -> Result<(), String> {
-        self.killed.lock().await.push(id.clone());
+    async fn kill_session(&self, session_name: &str) -> Result<(), String> {
+        if let Some(id) = crate::attachable::parse_terminal_session_binding_ref(session_name) {
+            self.killed.lock().await.push(id);
+        }
         Ok(())
     }
 }
@@ -572,7 +585,6 @@ impl Factory for FakeIssueTrackerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -602,7 +614,6 @@ impl Factory for FakeCheckoutManagerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -625,7 +636,6 @@ impl Factory for FakeChangeRequestFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -654,7 +664,6 @@ impl Factory for FakeWorkspaceManagerFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
@@ -683,7 +692,6 @@ impl Factory for FakeTerminalPoolFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         _runner: Arc<dyn CommandRunner>,
-        _attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }

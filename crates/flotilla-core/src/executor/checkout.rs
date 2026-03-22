@@ -4,7 +4,7 @@ use flotilla_protocol::{CheckoutSelector, HostName, HostPath, ManagedTerminalId}
 use tracing::warn;
 
 use crate::{
-    attachable::{parse_terminal_session_binding_ref, SharedAttachableStore},
+    attachable::{terminal_session_binding_ref, SharedAttachableStore},
     provider_data::ProviderData,
     providers::{registry::ProviderRegistry, run, CommandRunner},
 };
@@ -54,19 +54,18 @@ impl<'a> CheckoutService<'a> {
         // Best-effort terminal teardown for cascade-removed sessions
         if let Some(terminal_pool) = self.registry.terminal_pools.preferred() {
             for session_ref in &cascade_session_refs {
-                if let Some(terminal_id) = parse_terminal_session_binding_ref(session_ref) {
-                    if let Err(err) = terminal_pool.kill_terminal(&terminal_id).await {
-                        warn!(
-                            session = %session_ref,
-                            err = %err,
-                            "failed to kill cascaded terminal session (best-effort)"
-                        );
-                    }
+                if let Err(err) = terminal_pool.kill_session(session_ref).await {
+                    warn!(
+                        session = %session_ref,
+                        err = %err,
+                        "failed to kill cascaded terminal session (best-effort)"
+                    );
                 }
             }
             // Also kill explicitly-passed terminal keys
             for terminal_id in terminal_keys {
-                if let Err(err) = terminal_pool.kill_terminal(terminal_id).await {
+                let session_name = terminal_session_binding_ref(terminal_id);
+                if let Err(err) = terminal_pool.kill_session(&session_name).await {
                     warn!(
                         terminal = %terminal_id,
                         err = %err,

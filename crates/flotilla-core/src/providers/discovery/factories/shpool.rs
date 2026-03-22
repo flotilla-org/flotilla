@@ -29,11 +29,10 @@ impl Factory for ShpoolTerminalPoolFactory {
         _config: &ConfigStore,
         _repo_root: &Path,
         runner: Arc<dyn CommandRunner>,
-        attachable_store: crate::attachable::SharedAttachableStore,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if env.find_binary("shpool").is_some() {
             let socket_path = flotilla_config_dir().join("shpool/shpool.socket");
-            let pool = ShpoolTerminalPool::create(runner, socket_path, attachable_store).await;
+            let pool = ShpoolTerminalPool::create(runner, socket_path).await;
             Ok(Arc::new(pool))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("shpool".into())])
@@ -57,8 +56,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let attachable_store = crate::attachable::shared_file_backed_attachable_store(config.base_path());
-        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, attachable_store).await;
+        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -68,8 +66,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let attachable_store = crate::attachable::shared_file_backed_attachable_store(config.base_path());
-        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner, attachable_store).await;
+        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without shpool binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("shpool".into())));
     }

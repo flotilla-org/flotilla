@@ -328,7 +328,6 @@ impl InProcessDaemon {
                 &discovery.factories,
                 &config,
                 Arc::clone(&discovery.runner),
-                Arc::clone(&attachable_store),
                 &*discovery.env,
             )
             .await;
@@ -1381,7 +1380,6 @@ impl InProcessDaemon {
             &self.discovery.factories,
             &self.config,
             Arc::clone(&self.discovery.runner),
-            self.discovery.shared_attachable_store(&self.config),
             &*self.discovery.env,
         )
         .await;

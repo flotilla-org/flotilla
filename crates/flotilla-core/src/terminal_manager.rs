@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::{
     attachable::{Attachable, AttachableContent, SharedAttachableStore, TerminalAttachable, TerminalPurpose},
-    providers::terminal::{SessionPool, TerminalEnvVars},
+    providers::terminal::{TerminalEnvVars, TerminalPool},
 };
 
 /// Summary of a managed terminal for external consumers.
@@ -21,19 +21,19 @@ pub struct TerminalInfo {
     pub status: TerminalStatus,
 }
 
-/// Manages terminal session lifecycle using a `SessionPool` for CLI operations
+/// Manages terminal session lifecycle using a `TerminalPool` for CLI operations
 /// and an `AttachableStore` for identity and state persistence.
 ///
 /// The `TerminalManager` owns the mapping between `AttachableId`s (stable identities)
 /// and session names (opaque strings passed to the pool). Currently the session name
 /// is simply `attachable_id.to_string()`.
 pub struct TerminalManager {
-    pool: Box<dyn SessionPool>,
+    pool: Box<dyn TerminalPool>,
     store: SharedAttachableStore,
 }
 
 impl TerminalManager {
-    pub fn new(pool: Box<dyn SessionPool>, store: SharedAttachableStore) -> Self {
+    pub fn new(pool: Box<dyn TerminalPool>, store: SharedAttachableStore) -> Self {
         Self { pool, store }
     }
 
@@ -205,7 +205,7 @@ mod tests {
     use super::*;
     use crate::{
         attachable::{shared_in_memory_attachable_store, AttachableContent},
-        providers::terminal::{SessionPool, TerminalEnvVars, TerminalSession},
+        providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession},
     };
 
     #[derive(Debug, Clone)]
@@ -217,12 +217,12 @@ mod tests {
         KillSession { session_name: String },
     }
 
-    struct MockSessionPool {
+    struct MockTerminalPool {
         calls: Mutex<Vec<PoolCall>>,
         list_response: Mutex<Vec<TerminalSession>>,
     }
 
-    impl MockSessionPool {
+    impl MockTerminalPool {
         fn new() -> Self {
             Self { calls: Mutex::new(Vec::new()), list_response: Mutex::new(Vec::new()) }
         }
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl SessionPool for MockSessionPool {
+    impl TerminalPool for MockTerminalPool {
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             self.calls.lock().expect("lock calls").push(PoolCall::ListSessions);
             Ok(self.list_response.lock().expect("lock list_response").clone())
@@ -281,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn allocate_set_creates_store_entry() {
         let store = shared_in_memory_attachable_store();
-        let mgr = TerminalManager::new(Box::new(MockSessionPool::new()), store.clone());
+        let mgr = TerminalManager::new(Box::new(MockTerminalPool::new()), store.clone());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
 
@@ -295,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn allocate_terminal_creates_attachable() {
         let store = shared_in_memory_attachable_store();
-        let mgr = TerminalManager::new(Box::new(MockSessionPool::new()), store.clone());
+        let mgr = TerminalManager::new(Box::new(MockTerminalPool::new()), store.clone());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id =
@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_running_delegates_to_pool() {
         let store = shared_in_memory_attachable_store();
-        let pool = MockSessionPool::new();
+        let pool = MockTerminalPool::new();
         let mgr = TerminalManager::new(Box::new(pool), store.clone());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
@@ -334,10 +334,10 @@ mod tests {
     #[tokio::test]
     async fn ensure_running_uses_attachable_id_as_session_name() {
         let store = shared_in_memory_attachable_store();
-        let mock = std::sync::Arc::new(MockSessionPool::new());
+        let mock = std::sync::Arc::new(MockTerminalPool::new());
 
         // We need to use Arc to share the mock between the manager and our test.
-        // But TerminalManager takes Box<dyn SessionPool>. Let's use a different approach.
+        // But TerminalManager takes Box<dyn TerminalPool>. Let's use a different approach.
         // We'll create a wrapper that records calls via shared state.
         let calls: std::sync::Arc<Mutex<Vec<PoolCall>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
@@ -347,7 +347,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl SessionPool for SharedMock {
+        impl TerminalPool for SharedMock {
             async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
                 self.calls.lock().expect("lock").push(PoolCall::ListSessions);
                 Ok(Vec::new())
@@ -412,7 +412,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl SessionPool for SharedMock {
+        impl TerminalPool for SharedMock {
             async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
                 Ok(Vec::new())
             }
@@ -471,7 +471,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl SessionPool for SharedMock {
+        impl TerminalPool for SharedMock {
             async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
                 Ok(Vec::new())
             }
@@ -507,14 +507,14 @@ mod tests {
     #[tokio::test]
     async fn refresh_updates_statuses() {
         let store = shared_in_memory_attachable_store();
-        let mgr_for_setup = TerminalManager::new(Box::new(MockSessionPool::new()), store.clone());
+        let mgr_for_setup = TerminalManager::new(Box::new(MockTerminalPool::new()), store.clone());
 
         let set_id = mgr_for_setup.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id =
             mgr_for_setup.allocate_terminal(set_id, "shell", 0, "feat", "bash", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
 
         // Create a new manager with a pool that reports the session as running.
-        let pool = MockSessionPool::with_sessions(vec![TerminalSession {
+        let pool = MockTerminalPool::with_sessions(vec![TerminalSession {
             session_name: att_id.to_string(),
             status: TerminalStatus::Running,
             command: Some("bash".to_string()),
@@ -533,14 +533,14 @@ mod tests {
     #[tokio::test]
     async fn refresh_reports_disconnected_for_missing_sessions() {
         let store = shared_in_memory_attachable_store();
-        let mgr_for_setup = TerminalManager::new(Box::new(MockSessionPool::new()), store.clone());
+        let mgr_for_setup = TerminalManager::new(Box::new(MockTerminalPool::new()), store.clone());
 
         let set_id = mgr_for_setup.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id =
             mgr_for_setup.allocate_terminal(set_id, "shell", 0, "feat", "bash", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
 
         // Pool returns empty — no live sessions.
-        let pool = MockSessionPool::new();
+        let pool = MockTerminalPool::new();
         let mgr = TerminalManager::new(Box::new(pool), store.clone());
 
         let infos = mgr.refresh().await.expect("refresh");
@@ -560,7 +560,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl SessionPool for SharedMock {
+        impl TerminalPool for SharedMock {
             async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
                 Ok(Vec::new())
             }

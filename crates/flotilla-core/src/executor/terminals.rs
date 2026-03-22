@@ -57,7 +57,8 @@ impl<'a> TerminalPreparationService<'a> {
                     let index = role_index.entry(cmd.role.clone()).or_insert(0);
                     let id = ManagedTerminalId { checkout: branch.to_string(), role: cmd.role.clone(), index: *index };
                     *role_index.get_mut(&cmd.role).expect("just inserted") += 1;
-                    if let Err(err) = tp.ensure_running(&id, &cmd.command, checkout_path).await {
+                    let session_name = terminal_session_binding_ref(&id);
+                    if let Err(err) = tp.ensure_session(&session_name, &cmd.command, checkout_path).await {
                         warn!(%id, err = %err, "failed to ensure terminal");
                     }
                     let env_vars = build_terminal_env_vars(
@@ -68,7 +69,7 @@ impl<'a> TerminalPreparationService<'a> {
                         terminal_pool_provider,
                         self.daemon_socket_path,
                     );
-                    match tp.attach_command(&id, &cmd.command, checkout_path, &env_vars).await {
+                    match tp.attach_command(&session_name, &cmd.command, checkout_path, &env_vars).await {
                         Ok(attach_cmd) => resolved.push(PreparedTerminalCommand { role: cmd.role.clone(), command: attach_cmd }),
                         Err(err) => {
                             warn!(%id, err = %err, "failed to get attach command, using original");
@@ -175,7 +176,8 @@ pub(super) async fn resolve_terminal_pool(
         let count = entry.count.unwrap_or(1);
         for i in 0..count {
             let id = ManagedTerminalId { checkout: config.name.clone(), role: entry.role.clone(), index: i };
-            if let Err(err) = terminal_pool.ensure_running(&id, &entry.command, &config.working_directory).await {
+            let session_name = terminal_session_binding_ref(&id);
+            if let Err(err) = terminal_pool.ensure_session(&session_name, &entry.command, &config.working_directory).await {
                 warn!(%id, err = %err, "failed to ensure terminal");
                 continue;
             }
@@ -187,7 +189,7 @@ pub(super) async fn resolve_terminal_pool(
                 terminal_pool_provider,
                 daemon_socket_path,
             );
-            match terminal_pool.attach_command(&id, &entry.command, &config.working_directory, &env_vars).await {
+            match terminal_pool.attach_command(&session_name, &entry.command, &config.working_directory, &env_vars).await {
                 Ok(cmd) => {
                     debug!(%id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
                     resolved.push((entry.role.clone(), cmd));

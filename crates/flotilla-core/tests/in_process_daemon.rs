@@ -116,7 +116,6 @@ impl Factory for SlowCloudAgentFactory {
         _: &ConfigStore,
         _: &Path,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
-        _: flotilla_core::attachable::SharedAttachableStore,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.agent) as Arc<dyn CloudAgentService>)
     }
@@ -174,7 +173,6 @@ impl Factory for SlowAiUtilityFactory {
         _: &ConfigStore,
         _: &Path,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
-        _: flotilla_core::attachable::SharedAttachableStore,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
     }
