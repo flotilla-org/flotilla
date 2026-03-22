@@ -52,30 +52,30 @@ pub(crate) struct RepoRootState {
 }
 
 pub(crate) struct RepoState {
-    pub(crate) identity: flotilla_protocol::RepoIdentity,
+    identity: flotilla_protocol::RepoIdentity,
     pub(crate) roots: Vec<RepoRootState>,
-    pub(crate) seq: u64,
+    seq: u64,
     pub(crate) last_local_providers: ProviderData,
     pub(crate) last_snapshot: Arc<RefreshSnapshot>,
     pub(crate) issue_cache: IssueCache,
     pub(crate) search_results: Option<Vec<(String, Issue)>>,
     /// Serializes issue fetch operations for this repo to prevent concurrent page skips.
-    pub(crate) issue_fetch_mutex: Arc<Mutex<()>>,
+    issue_fetch_mutex: Arc<Mutex<()>>,
     /// Last broadcast provider data (with injected issues), used for delta computation.
-    pub(crate) last_broadcast_providers: ProviderData,
+    last_broadcast_providers: ProviderData,
     /// Last broadcast provider health, used for delta computation.
-    pub(crate) last_broadcast_health: HashMap<String, HashMap<String, bool>>,
+    last_broadcast_health: HashMap<String, HashMap<String, bool>>,
     /// Last broadcast errors, used for delta computation.
-    pub(crate) last_broadcast_errors: Vec<ProviderError>,
+    last_broadcast_errors: Vec<ProviderError>,
     /// Bounded delta log for replay on client reconnect.
-    pub(crate) delta_log: VecDeque<DeltaEntry>,
+    delta_log: VecDeque<DeltaEntry>,
     /// Incremented only when local provider data changes (not peer data merges).
     /// Used by the outbound peer task to avoid re-sending unchanged local data.
-    pub(crate) local_data_version: u64,
+    local_data_version: u64,
     /// The last broadcast snapshot (merged local + peer data, fully correlated).
     /// Populated by `poll_snapshots` and `broadcast_snapshot_inner` after each
     /// broadcast. Query methods read from this instead of recomputing.
-    pub(crate) last_merged_snapshot: Option<Arc<RepoSnapshot>>,
+    last_merged_snapshot: Option<Arc<RepoSnapshot>>,
 }
 
 impl RepoState {
@@ -182,6 +182,63 @@ impl RepoState {
         self.roots.iter().filter(|root| root.is_local).map(|root| root.path.clone()).collect()
     }
 
+    pub(crate) fn identity(&self) -> &flotilla_protocol::RepoIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub(crate) fn local_data_version(&self) -> u64 {
+        self.local_data_version
+    }
+
+    pub(crate) fn mark_local_change(&mut self) {
+        self.local_data_version += 1;
+    }
+
+    pub(crate) fn issue_fetch_mutex(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.issue_fetch_mutex)
+    }
+
+    pub(crate) fn cached_snapshot(&self) -> Option<&Arc<RepoSnapshot>> {
+        self.last_merged_snapshot.as_ref()
+    }
+
+    pub(crate) fn set_cached_snapshot(&mut self, snapshot: RepoSnapshot) {
+        self.last_merged_snapshot = Some(Arc::new(snapshot));
+    }
+
+    /// Return delta entries that replay state from `client_seq` to current.
+    ///
+    /// Returns `None` if `client_seq` is not in the delta log (caller should
+    /// fall back to a full snapshot). Returns `Some(empty slice)` if the
+    /// client is already up to date.
+    pub(crate) fn deltas_since(&self, client_seq: u64) -> Option<&[DeltaEntry]> {
+        if client_seq == self.seq {
+            return Some(&[]);
+        }
+        let start = self.delta_log.iter().position(|entry| entry.prev_seq == client_seq)?;
+        // VecDeque::make_contiguous guarantees a single slice, but we only
+        // have &self so we use the two-slice form and return the combined
+        // range. In practice the log is always contiguous after push_back.
+        let (front, back) = self.delta_log.as_slices();
+        if start < front.len() {
+            // All remaining entries are in front (common case when log hasn't wrapped)
+            if back.is_empty() {
+                Some(&front[start..])
+            } else {
+                // Spans both slices — fall back to None so caller sends full snapshot.
+                // This is rare (only when start is near the boundary) and correctness
+                // is more important than optimizing this edge case.
+                None
+            }
+        } else {
+            Some(&back[start - front.len()..])
+        }
+    }
+
     /// Build a [`SnapshotBuildContext`] from the current state.
     pub(crate) fn snapshot_context<'a>(&'a self, host_name: &'a HostName) -> SnapshotBuildContext<'a> {
         SnapshotBuildContext {
@@ -197,7 +254,7 @@ impl RepoState {
     }
 
     /// Compute a delta from the last broadcast state to the new state,
-    /// append to the delta log, and update tracking fields.
+    /// append to the delta log, update tracking fields, and advance `seq`.
     pub(crate) fn record_delta(
         &mut self,
         new_providers: &ProviderData,
@@ -256,6 +313,7 @@ impl RepoState {
         }
 
         // Update tracking state
+        self.seq += 1;
         self.last_broadcast_providers = new_providers.clone();
         self.last_broadcast_health = new_health.clone();
         self.last_broadcast_errors = new_errors.to_vec();

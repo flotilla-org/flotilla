@@ -222,17 +222,12 @@ impl PeerRuntime {
                                             peer_daemon.set_peer_providers(&local_path, peers, overlay_version).await;
                                         } else {
                                             let synthetic = crate::peer::synthetic_repo_path(&origin, &repo_path);
-                                            let merged = crate::peer::merge_provider_data(
-                                                &flotilla_protocol::ProviderData::default(),
-                                                peer_daemon.host_name(),
-                                                &peers.iter().map(|(h, d)| (h.clone(), d)).collect::<Vec<_>>(),
-                                            );
-                                            if let Err(e) =
-                                                peer_daemon.add_virtual_repo(updated_repo_id.clone(), synthetic.clone(), merged).await
+                                            if let Err(e) = peer_daemon
+                                                .add_virtual_repo(updated_repo_id.clone(), synthetic.clone(), peers, overlay_version)
+                                                .await
                                             {
                                                 warn!(repo = %updated_repo_id, err = %e, "failed to add virtual repo");
                                             } else {
-                                                peer_daemon.set_peer_providers(&synthetic, peers, overlay_version).await;
                                                 let mut pm2 = peer_manager_task.lock().await;
                                                 pm2.register_remote_repo(updated_repo_id.clone(), synthetic);
                                             }

@@ -381,18 +381,6 @@ impl InProcessDaemon {
             daemon_socket_path: RwLock::new(None),
         });
 
-        // Build initial merged snapshots so queries work immediately.
-        // Provider data is empty at this point (refresh hasn't run yet),
-        // but the snapshot structure is valid with correct identity/path/seq.
-        {
-            let mut repos = daemon.repos.write().await;
-            for state in repos.values_mut() {
-                let snapshot = build_repo_snapshot_with_peers(state.snapshot_context(&daemon.host_name), 1, None);
-                state.last_merged_snapshot = Some(Arc::new(snapshot));
-                state.seq = 1;
-            }
-        }
-
         // Spawn self-driving poll loop with a Weak reference.
         // The loop exits naturally when all external Arc owners drop.
         let weak = Arc::downgrade(&daemon);
@@ -495,7 +483,7 @@ impl InProcessDaemon {
                 continue;
             }
             counts.repo_count += 1;
-            if let Some(snapshot) = &state.last_merged_snapshot {
+            if let Some(snapshot) = state.cached_snapshot() {
                 counts.work_item_count += snapshot.work_items.len();
             }
         }
@@ -653,7 +641,7 @@ impl InProcessDaemon {
             inject_issues(&state.last_local_providers, &state.issue_cache, &state.search_results),
             &self.host_name,
         );
-        Some((providers, state.local_data_version))
+        Some((providers, state.local_data_version()))
     }
 
     /// Update the peer provider data overlay for a repo and trigger re-broadcast.
@@ -810,13 +798,13 @@ impl InProcessDaemon {
             state.preferred_root_mut().model.data.loading = false;
 
             let mut proto_snapshot =
-                snapshot_to_proto(state.identity.clone(), state.preferred_path(), state.seq + 1, &re_snapshot, &self.host_name);
+                snapshot_to_proto(state.identity().clone(), state.preferred_path(), state.seq() + 1, &re_snapshot, &self.host_name);
             proto_snapshot.provider_health = crate::convert::health_to_proto(&state.preferred_root().model.data.provider_health);
             proto_snapshot.issue_total = issue_total;
             proto_snapshot.issue_has_more = issue_has_more;
             proto_snapshot.issue_search_results = search_results;
 
-            // Compute and log delta before updating seq
+            // Compute and log delta (also advances seq)
             let delta_entry = state.record_delta(
                 &proto_snapshot.providers,
                 &proto_snapshot.provider_health,
@@ -831,8 +819,7 @@ impl InProcessDaemon {
                 "recorded repo delta"
             );
 
-            state.seq += 1;
-            state.local_data_version += 1;
+            state.mark_local_change();
             state.last_local_providers = last_local_providers;
             // Store a local-only snapshot (errors + health from the refresh,
             // providers from last_local_providers). Callers that need peer data
@@ -844,7 +831,7 @@ impl InProcessDaemon {
                 provider_health: re_snapshot.provider_health.clone(),
                 ..Default::default()
             });
-            state.last_merged_snapshot = Some(Arc::new(proto_snapshot.clone()));
+            state.set_cached_snapshot(proto_snapshot.clone());
 
             let event = choose_event(proto_snapshot, delta_entry);
             let _ = self.event_tx.send(event);
@@ -869,7 +856,7 @@ impl InProcessDaemon {
         let mutex = {
             let repos = self.repos.read().await;
             match repos.get(&identity) {
-                Some(state) => Arc::clone(&state.issue_fetch_mutex),
+                Some(state) => state.issue_fetch_mutex(),
                 None => return,
             }
         };
@@ -972,7 +959,7 @@ impl InProcessDaemon {
                     if missing.is_empty() {
                         return None;
                     }
-                    Some((identity.clone(), missing, state.registry(), Arc::clone(&state.issue_fetch_mutex)))
+                    Some((identity.clone(), missing, state.registry(), state.issue_fetch_mutex()))
                 })
                 .collect()
         };
@@ -1048,7 +1035,7 @@ impl InProcessDaemon {
                         state.preferred_path().to_path_buf(),
                         since.clone(),
                         state.registry(),
-                        Arc::clone(&state.issue_fetch_mutex),
+                        state.issue_fetch_mutex(),
                         state.issue_cache.len(),
                     ))
                 })
@@ -1160,15 +1147,19 @@ impl InProcessDaemon {
     /// an empty provider registry and an idle refresh handle.
     ///
     /// The `synthetic_path` serves as a stable key for tab identity (e.g.
-    /// `<remote>/desktop/home/dev/repo`). The `provider_data` is the
-    /// initial merged data from peer snapshots.
+    /// `<remote>/desktop/home/dev/repo`).
     ///
-    /// Emits `DaemonEvent::RepoTracked` so the TUI creates a tab.
+    /// `peers` and `overlay_version` seed the peer overlay so the repo
+    /// is immediately queryable — there is no window where the repo is
+    /// visible but has empty data.
+    ///
+    /// Emits `DaemonEvent::RepoTracked` followed by a snapshot broadcast.
     pub async fn add_virtual_repo(
         &self,
         identity: flotilla_protocol::RepoIdentity,
         synthetic_path: PathBuf,
-        provider_data: ProviderData,
+        peers: Vec<(HostName, ProviderData)>,
+        overlay_version: u64,
     ) -> Result<(), String> {
         // Check if already tracked
         {
@@ -1179,7 +1170,6 @@ impl InProcessDaemon {
         }
 
         let mut model = RepoModel::new_virtual();
-        model.data.providers = Arc::new(provider_data);
         model.data.loading = false;
 
         let repo_info = RepoInfo {
@@ -1221,6 +1211,10 @@ impl InProcessDaemon {
         info!(repo = %synthetic_path.display(), "added virtual repo");
         let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
 
+        // Set up the peer overlay and broadcast atomically — no window
+        // where the repo is visible but has empty data.
+        self.set_peer_providers(&synthetic_path, peers, overlay_version).await;
+
         Ok(())
     }
 
@@ -1248,20 +1242,19 @@ impl InProcessDaemon {
         };
 
         let proto_snapshot =
-            build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq + 1, peer_overlay.as_deref());
+            build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq() + 1, peer_overlay.as_deref());
 
-        // Compute and log delta
+        // Compute and log delta (also advances seq)
         let delta_entry = state.record_delta(
             &proto_snapshot.providers,
             &proto_snapshot.provider_health,
             &proto_snapshot.errors,
             proto_snapshot.work_items.clone(),
         );
-        state.seq += 1;
         if is_local_change {
-            state.local_data_version += 1;
+            state.mark_local_change();
         }
-        state.last_merged_snapshot = Some(Arc::new(proto_snapshot.clone()));
+        state.set_cached_snapshot(proto_snapshot.clone());
 
         let event = choose_event(proto_snapshot, delta_entry);
         let _ = self.event_tx.send(event);
@@ -1521,13 +1514,13 @@ impl DaemonHandle for InProcessDaemon {
         let repo_path = self.resolve_repo_selector(repo).await?;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
         let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
-        state
-            .last_merged_snapshot
-            .as_ref()
-            .map(|s| (**s).clone())
-            .ok_or_else(|| format!("repo not yet initialized: {}", repo_path.display()))
+        Ok(match state.cached_snapshot() {
+            Some(s) => (**s).clone(),
+            None => build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq(), peer_overlay.as_deref()),
+        })
     }
 
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
@@ -1537,7 +1530,7 @@ impl DaemonHandle for InProcessDaemon {
         for identity in order.iter() {
             if let Some(state) = repos.get(identity) {
                 result.push(RepoInfo {
-                    identity: state.identity.clone(),
+                    identity: state.identity().clone(),
                     path: state.preferred_path().to_path_buf(),
                     name: repo_name(state.preferred_path()),
                     labels: state.labels().clone(),
@@ -1715,7 +1708,7 @@ impl DaemonHandle for InProcessDaemon {
             let identity =
                 self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            (state.identity.clone(), state.registry(), state.providers(), state.refresh_trigger())
+            (state.identity().clone(), state.registry(), state.providers(), state.refresh_trigger())
         };
 
         // Broadcast started after repo validation (ensures no orphaned CommandStarted)
@@ -1856,23 +1849,19 @@ impl DaemonHandle for InProcessDaemon {
             let Some(state) = repos.get(identity) else {
                 continue;
             };
-            let Some(snapshot) = &state.last_merged_snapshot else {
+            let Some(snapshot) = state.cached_snapshot() else {
                 continue;
             };
 
-            let repo_stream_key = StreamKey::Repo { identity: state.identity.clone() };
+            let repo_stream_key = StreamKey::Repo { identity: state.identity().clone() };
             match last_seen.get(&repo_stream_key) {
-                Some(&client_seq) => {
-                    // Try to find the client's seq in the delta log and replay from there
-                    let replay_start = state.delta_log.iter().position(|entry| entry.prev_seq == client_seq);
-
-                    if let Some(start_idx) = replay_start {
-                        // Replay delta entries (each carries pre-correlated work_items)
-                        for entry in state.delta_log.iter().skip(start_idx) {
+                Some(&client_seq) => match state.deltas_since(client_seq) {
+                    Some(deltas) => {
+                        for entry in deltas {
                             events.push(DaemonEvent::RepoDelta(Box::new(RepoDelta {
                                 seq: entry.seq,
                                 prev_seq: entry.prev_seq,
-                                repo_identity: state.identity.clone(),
+                                repo_identity: state.identity().clone(),
                                 repo: state.preferred_path().to_path_buf(),
                                 changes: entry.changes.clone(),
                                 work_items: entry.work_items.clone(),
@@ -1881,13 +1870,12 @@ impl DaemonHandle for InProcessDaemon {
                                 issue_search_results: snapshot.issue_search_results.clone(),
                             })));
                         }
-                    } else if client_seq == state.seq {
-                        // Client is up to date — no replay needed
-                    } else {
+                    }
+                    None => {
                         // Seq not in delta log — send full snapshot
                         events.push(DaemonEvent::RepoSnapshot(Box::new((**snapshot).clone())));
                     }
-                }
+                },
                 None => {
                     // Client has never seen this repo — send full snapshot
                     events.push(DaemonEvent::RepoSnapshot(Box::new((**snapshot).clone())));
@@ -1899,32 +1887,47 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {
+        let peer_providers = self.peer_providers.read().await;
         let repos = self.repos.read().await;
         let repo_order = self.repo_order.read().await;
         let mut summaries = Vec::new();
 
         for identity in repo_order.iter() {
             let Some(state) = repos.get(identity) else { continue };
-            if let Some(snapshot) = &state.last_merged_snapshot {
-                summaries.push(RepoSummary {
-                    path: state.preferred_path().to_path_buf(),
-                    slug: state.slug().map(str::to_string),
-                    provider_health: snapshot.provider_health.clone(),
-                    work_item_count: snapshot.work_items.len(),
-                    error_count: snapshot.errors.len(),
-                });
-            }
+            let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+                Some(s) => std::borrow::Cow::Borrowed(s),
+                None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                    state.snapshot_context(&self.host_name),
+                    state.seq(),
+                    peer_providers.get(identity).map(|v| v.as_slice()),
+                )),
+            };
+            summaries.push(RepoSummary {
+                path: state.preferred_path().to_path_buf(),
+                slug: state.slug().map(str::to_string),
+                provider_health: snapshot.provider_health.clone(),
+                work_item_count: snapshot.work_items.len(),
+                error_count: snapshot.errors.len(),
+            });
         }
         Ok(StatusResponse { repos: summaries })
     }
 
     async fn get_repo_detail(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
-        let repos = self.repos.read().await;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let snapshot = state.last_merged_snapshot.as_ref().ok_or_else(|| format!("repo not yet initialized: {}", repo_path.display()))?;
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
         Ok(RepoDetailResponse {
             path: state.preferred_path().to_path_buf(),
             slug: state.slug().map(str::to_string),
@@ -1936,11 +1939,19 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn get_repo_providers(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
-        let repos = self.repos.read().await;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let snapshot = state.last_merged_snapshot.as_ref().ok_or_else(|| format!("repo not yet initialized: {}", repo_path.display()))?;
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
 
         let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
         let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
@@ -1972,11 +1983,19 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn get_repo_work(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
-        let repos = self.repos.read().await;
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let snapshot = state.last_merged_snapshot.as_ref().ok_or_else(|| format!("repo not yet initialized: {}", repo_path.display()))?;
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
         Ok(RepoWorkResponse {
             path: state.preferred_path().to_path_buf(),
             slug: state.slug().map(str::to_string),
