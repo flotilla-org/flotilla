@@ -36,21 +36,10 @@ pub struct RepoExecutionContext {
     pub root: PathBuf,
 }
 
-enum CheckoutExistingPolicy {
-    ReuseKnownCheckout,
-    AlwaysCreate,
-}
-
-enum CheckoutIssueLinkPolicy {
-    Inline,
-    Deferred,
-}
-
 struct CheckoutFlow<'a> {
     branch: &'a str,
     create_branch: bool,
     intent: CheckoutIntent,
-    issue_ids: &'a [(String, String)],
     repo_root: &'a Path,
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
@@ -69,27 +58,18 @@ impl<'a> CheckoutFlow<'a> {
         })
     }
 
-    async fn checkout_created_result(
-        &self,
-        existing_policy: CheckoutExistingPolicy,
-        issue_link_policy: CheckoutIssueLinkPolicy,
-    ) -> Result<CommandValue, String> {
+    async fn checkout_created_result(&self) -> Result<CommandValue, String> {
         let checkout_service = CheckoutService::new(self.registry, self.runner);
         checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
 
-        if matches!(existing_policy, CheckoutExistingPolicy::ReuseKnownCheckout) {
-            if let Some(path) = self.existing_checkout_path() {
-                if matches!(self.intent, CheckoutIntent::FreshBranch) {
-                    return Err(format!("branch already exists: {}", self.branch));
-                }
-                return Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path });
+        if let Some(path) = self.existing_checkout_path() {
+            if matches!(self.intent, CheckoutIntent::FreshBranch) {
+                return Err(format!("branch already exists: {}", self.branch));
             }
+            return Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path });
         }
 
         let path = checkout_service.create_checkout(self.repo_root, self.branch, self.create_branch).await?;
-        if !self.issue_ids.is_empty() && matches!(issue_link_policy, CheckoutIssueLinkPolicy::Inline) {
-            checkout_service.write_branch_issue_links(self.repo_root, self.branch, self.issue_ids).await;
-        }
         Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path })
     }
 }
@@ -105,7 +85,6 @@ pub async fn build_plan(
     repo: RepoExecutionContext,
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
-    _runner: Arc<dyn CommandRunner>,
     config_base: PathBuf,
     attachable_store: SharedAttachableStore,
     daemon_socket_path: Option<PathBuf>,
@@ -352,21 +331,18 @@ pub(crate) struct ExecutorStepResolver {
 impl StepResolver for ExecutorStepResolver {
     async fn resolve(&self, _description: &str, action: StepAction, prior: &[StepOutcome]) -> Result<StepOutcome, String> {
         match action {
-            StepAction::CreateCheckout { branch, create_branch, intent, issue_ids } => {
+            StepAction::CreateCheckout { branch, create_branch, intent, .. } => {
                 let checkout_flow = CheckoutFlow {
                     branch: &branch,
                     create_branch,
                     intent,
-                    issue_ids: &issue_ids,
                     repo_root: &self.repo.root,
                     registry: self.registry.as_ref(),
                     providers_data: self.providers_data.as_ref(),
                     runner: self.runner.as_ref(),
                     local_host: &self.local_host,
                 };
-                let result = checkout_flow
-                    .checkout_created_result(CheckoutExistingPolicy::ReuseKnownCheckout, CheckoutIssueLinkPolicy::Deferred)
-                    .await?;
+                let result = checkout_flow.checkout_created_result().await?;
                 if let CommandValue::CheckoutCreated { path, .. } = &result {
                     info!(checkout_path = %path.display(), "created checkout");
                 }
@@ -535,30 +511,6 @@ impl StepResolver for ExecutorStepResolver {
                 } else {
                     Err(format!("checkout not found: {}", checkout_path.display()))
                 }
-            }
-            StepAction::CheckoutImmediate { target, issue_ids } => {
-                let (branch, create_branch, intent) = match target {
-                    CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
-                    CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
-                };
-                let checkout_flow = CheckoutFlow {
-                    branch: &branch,
-                    create_branch,
-                    intent,
-                    issue_ids: &issue_ids,
-                    repo_root: &self.repo.root,
-                    registry: self.registry.as_ref(),
-                    providers_data: self.providers_data.as_ref(),
-                    runner: self.runner.as_ref(),
-                    local_host: &self.local_host,
-                };
-                info!(%branch, "creating checkout (immediate)");
-                let result =
-                    checkout_flow.checkout_created_result(CheckoutExistingPolicy::AlwaysCreate, CheckoutIssueLinkPolicy::Inline).await?;
-                if let CommandValue::CheckoutCreated { path, .. } = &result {
-                    info!(checkout_path = %path.display(), "created checkout");
-                }
-                Ok(StepOutcome::CompletedWith(result))
             }
             StepAction::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
                 let info = data::fetch_checkout_status(

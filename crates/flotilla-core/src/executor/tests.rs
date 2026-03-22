@@ -1727,7 +1727,7 @@ async fn run_build_plan(
     action: CommandAction,
     registry: ProviderRegistry,
     providers_data: ProviderData,
-    runner: MockRunner,
+    _runner: MockRunner,
 ) -> Result<crate::step::StepPlan, CommandValue> {
     let config_base = config_base();
     build_plan(
@@ -1738,7 +1738,6 @@ async fn run_build_plan(
         },
         Arc::new(registry),
         Arc::new(providers_data),
-        Arc::new(runner),
         config_base.clone(),
         test_attachable_store(&config_base),
         None,
@@ -1784,7 +1783,6 @@ async fn run_build_plan_to_completion_with(
         repo.clone(),
         Arc::clone(&registry),
         Arc::clone(&providers_data),
-        Arc::clone(&runner),
         config_base.clone(),
         attachable_store.clone(),
         None,
@@ -1958,7 +1956,6 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
         Arc::clone(&providers_data),
-        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2017,7 +2014,6 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
         Arc::clone(&providers_data),
-        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,
@@ -2075,7 +2071,6 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::clone(&registry),
         Arc::clone(&providers_data),
-        Arc::clone(&runner),
         cb.clone(),
         attachable.clone(),
         None,

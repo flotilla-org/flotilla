@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use flotilla_protocol::{
-    AttachableSetId, CheckoutTarget, CommandValue, DaemonEvent, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand,
-    RepoIdentity, StepStatus,
+    AttachableSetId, CommandValue, DaemonEvent, HostName, HostPath, ManagedTerminalId, PreparedTerminalCommand, RepoIdentity, StepStatus,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -95,12 +94,6 @@ pub enum StepAction {
     PrepareTerminalForCheckout {
         checkout_path: PathBuf,
         commands: Vec<PreparedTerminalCommand>,
-    },
-
-    // Checkout with AlwaysCreate/Inline policy (forwarded-command path)
-    CheckoutImmediate {
-        target: CheckoutTarget,
-        issue_ids: Vec<(String, String)>,
     },
 
     // Query

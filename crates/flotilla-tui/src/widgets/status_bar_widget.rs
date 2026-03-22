@@ -239,12 +239,9 @@ pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCom
     let active_repo = &model.repo_order[model.active_repo];
     let repo_cmds: Vec<(&u64, &InFlightCommand)> = in_flight.iter().filter(|(_, cmd)| &cmd.repo_identity == active_repo).collect();
 
-    if repo_cmds.is_empty() {
-        return None;
-    }
-
-    let most_recent = repo_cmds.iter().max_by_key(|(id, _)| *id).expect("non-empty").1;
-    let description = if repo_cmds.len() == 1 {
+    // Highest command ID = most recently started (IDs are monotonically increasing AtomicU64).
+    let (_, most_recent) = repo_cmds.iter().max_by_key(|(id, _)| *id)?;
+    let description = if repo_cmds.len() <= 1 {
         most_recent.description.clone()
     } else {
         format!("{} (+{})", most_recent.description, repo_cmds.len() - 1)

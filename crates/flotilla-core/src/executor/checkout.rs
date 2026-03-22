@@ -78,10 +78,6 @@ impl<'a> CheckoutService<'a> {
 
         Ok(())
     }
-
-    pub(super) async fn write_branch_issue_links(&self, repo_root: &Path, branch: &str, issue_ids: &[(String, String)]) {
-        write_branch_issue_links(repo_root, branch, issue_ids, self.runner).await;
-    }
 }
 
 pub(super) fn resolve_checkout_branch(

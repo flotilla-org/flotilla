@@ -1745,7 +1745,6 @@ impl DaemonHandle for InProcessDaemon {
                 executor::RepoExecutionContext { identity: repo_identity.clone(), root: repo_path.clone() },
                 registry,
                 providers_data,
-                runner,
                 config_base,
                 attachable_store,
                 daemon_socket_path.clone(),
