@@ -4,7 +4,7 @@ use std::{
 };
 
 use flotilla_core::data::{GroupEntry, GroupedWorkItems, SectionHeader};
-use flotilla_protocol::{HostName, ProviderData, SessionStatus, WorkItem, WorkItemIdentity};
+use flotilla_protocol::{HostName, ProviderData, SessionStatus, WorkItem, WorkItemIdentity, WorkItemKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -412,7 +412,8 @@ fn build_item_row<'a>(
     home_dir: Option<&Path>,
 ) -> Row<'a> {
     let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
-    let is_archived = session_status.is_some_and(|s| matches!(s, SessionStatus::Archived | SessionStatus::Expired));
+    let is_archived =
+        item.kind == WorkItemKind::Session && session_status.is_some_and(|s| matches!(s, SessionStatus::Archived | SessionStatus::Expired));
     let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status, theme);
 
     let source_display = match item.source.as_deref() {
@@ -561,7 +562,7 @@ fn build_item_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::{checkout_item, grouped_items, issue_item};
+    use crate::app::test_support::{checkout_item, grouped_items, issue_item, session_item};
 
     #[test]
     fn update_items_preserves_selection_by_identity() {
@@ -692,5 +693,54 @@ mod tests {
 
         assert_eq!(table.selected_selectable_idx, Some(0));
         assert_eq!(table.table_state.selected(), Some(0));
+    }
+
+    // ── archived dimming scoped to session-kind rows ──
+
+    #[test]
+    fn checkout_row_linked_to_archived_session_is_not_dimmed() {
+        use flotilla_protocol::CloudAgentSession;
+
+        let theme = crate::theme::Theme::classic();
+        let col_widths = vec![3, 8, 14, 15, 25, 3, 3, 8, 8, 8, 5];
+
+        let mut providers = ProviderData::default();
+        providers.sessions.insert(
+            "s1".into(),
+            CloudAgentSession {
+                title: String::new(),
+                status: SessionStatus::Archived,
+                model: None,
+                updated_at: None,
+                correlation_keys: Vec::new(),
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
+            },
+        );
+
+        // Checkout item correlated with the archived session.
+        let mut co = checkout_item("feat/x", "/tmp/x", false);
+        co.session_key = Some("s1".into());
+
+        let checkout_row = build_item_row(&co, &providers, &col_widths, Path::new("/tmp"), None, None, &theme, None);
+
+        // A session-kind item with the same archived key — this one SHOULD be dimmed.
+        let ses = session_item("s1");
+        let session_row = build_item_row(&ses, &providers, &col_widths, Path::new("/tmp"), None, None, &theme, None);
+
+        let checkout_debug = format!("{checkout_row:?}");
+        let session_debug = format!("{session_row:?}");
+
+        // The muted color (dark_gray in classic theme) should appear in the
+        // session row but NOT in the checkout row.
+        assert!(
+            session_debug.contains("dark_gray"),
+            "session row should use muted (dark_gray) style"
+        );
+        assert!(
+            !checkout_debug.contains("dark_gray"),
+            "checkout row linked to archived session should NOT be dimmed"
+        );
     }
 }
