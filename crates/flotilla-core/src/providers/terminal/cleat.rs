@@ -153,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_creates_session() {
-        let json = r#"{"id":"new-sess","cwd":"/repo","cmd":"bash","status":"Detached"}"#;
+        let json = r#"{"id":"my-session","cwd":"/repo","cmd":"bash","status":"Detached"}"#;
         let runner = Arc::new(MockRunner::new(vec![Ok(json.into())]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
