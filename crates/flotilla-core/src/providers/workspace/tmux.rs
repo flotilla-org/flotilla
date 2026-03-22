@@ -405,9 +405,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_create_and_switch_workspaces() {
-        let recording = replay::is_recording();
+        let live = replay::is_live();
 
-        if recording {
+        if live {
             setup_tmux_ws_session();
         }
 
@@ -460,7 +460,7 @@ mod tests {
         // At least 3: default zsh window + feat-123 + fix-456
         assert!(workspaces.len() >= 3, "expected at least 3 workspaces, got {}", workspaces.len());
 
-        if recording {
+        if live {
             teardown_tmux_ws_session();
         }
 
@@ -469,9 +469,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_replay_list_workspaces() {
-        let recording = replay::is_recording();
+        let live = replay::is_live();
 
-        if recording {
+        if live {
             setup_tmux_session();
         }
 
@@ -492,7 +492,7 @@ mod tests {
             assert!(ws.correlation_keys.is_empty());
         }
 
-        if recording {
+        if live {
             teardown_tmux_session();
         }
 

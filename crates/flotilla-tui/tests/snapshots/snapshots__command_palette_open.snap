@@ -1,5 +1,6 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 556
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
@@ -23,7 +24,7 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 │                                                                      ││                                              │
-/                            <ENT> RUN  <TAB> FILL  <ESC> CLOSE                                   ◫ auto   @local
+/                            <ENT> RUN  <ESC> CLOSE  <TAB> FILL                                   ◫ auto   @local
   search     filter items in view                                                                                 /
   refresh    refresh active repo                                                                                  r
   branch     create a new branch                                                                                  n

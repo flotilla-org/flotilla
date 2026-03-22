@@ -78,6 +78,7 @@ fn resolve_auto_preview_position(area: Rect) -> ResolvedPreviewPosition {
 /// Daemon-sourced data for a single repository. Written by the event loop
 /// via `Shared::mutate()` and read by `RepoPage` during reconciliation and
 /// rendering.
+#[derive(Clone)]
 pub struct RepoData {
     pub path: PathBuf,
     pub providers: Arc<ProviderData>,
@@ -153,31 +154,37 @@ impl RepoPage {
     /// Check whether the daemon data has changed since last reconciliation
     /// and, if so, rebuild the table and prune stale selections.
     pub fn reconcile_if_changed(&mut self) {
-        if let Some(data) = self.repo_data.changed(&mut self.last_seen_generation) {
-            let section_labels = SectionLabels {
-                checkouts: data.labels.checkouts.section.clone(),
-                change_requests: data.labels.change_requests.section.clone(),
-                issues: data.labels.issues.section.clone(),
-                sessions: data.labels.cloud_agents.section.clone(),
-            };
-            let grouped = flotilla_core::data::group_work_items(&data.work_items, &data.providers, &section_labels, &data.path);
-            let grouped = if self.show_archived { grouped } else { grouped.filter_archived_sessions(&data.providers) };
-            self.table.update_items(grouped);
-
-            // Prune stale multi_selected and pending_actions
-            let current_identities: HashSet<WorkItemIdentity> = self
-                .table
-                .grouped_items
-                .table_entries
-                .iter()
-                .filter_map(|e| match e {
-                    GroupEntry::Item(item) => Some(item.identity.clone()),
-                    _ => None,
-                })
-                .collect();
-            self.multi_selected.retain(|id| current_identities.contains(id));
-            self.pending_actions.retain(|id, _| current_identities.contains(id));
+        let data = self.repo_data.changed(&mut self.last_seen_generation).map(|guard| guard.clone());
+        if let Some(data) = data {
+            self.rebuild_table(&data);
         }
+    }
+
+    /// Rebuild the table from current data, applying the archived filter as needed.
+    fn rebuild_table(&mut self, data: &RepoData) {
+        let section_labels = SectionLabels {
+            checkouts: data.labels.checkouts.section.clone(),
+            change_requests: data.labels.change_requests.section.clone(),
+            issues: data.labels.issues.section.clone(),
+            sessions: data.labels.cloud_agents.section.clone(),
+        };
+        let grouped = flotilla_core::data::group_work_items(&data.work_items, &data.providers, &section_labels, &data.path);
+        let grouped = if self.show_archived { grouped } else { grouped.filter_archived_sessions(&data.providers) };
+        self.table.update_items(grouped);
+
+        // Prune stale multi_selected and pending_actions
+        let current_identities: HashSet<WorkItemIdentity> = self
+            .table
+            .grouped_items
+            .table_entries
+            .iter()
+            .filter_map(|e| match e {
+                GroupEntry::Item(item) => Some(item.identity.clone()),
+                _ => None,
+            })
+            .collect();
+        self.multi_selected.retain(|id| current_identities.contains(id));
+        self.pending_actions.retain(|id, _| current_identities.contains(id));
     }
 
     /// Cycle the per-page layout (Auto -> Zoom -> Right -> Below -> Auto).
@@ -260,6 +267,8 @@ impl RepoPage {
             self.show_providers = false;
         } else if self.show_archived {
             self.show_archived = false;
+            let data = self.repo_data.read().clone();
+            self.rebuild_table(&data);
         } else if !self.multi_selected.is_empty() {
             self.multi_selected.clear();
         } else {
@@ -313,6 +322,8 @@ impl InteractiveWidget for RepoPage {
             }
             Action::ToggleArchived => {
                 self.show_archived = !self.show_archived;
+                let data = self.repo_data.read().clone();
+                self.rebuild_table(&data);
                 Outcome::Consumed
             }
             Action::CycleLayout => {
@@ -456,10 +467,10 @@ impl InteractiveWidget for RepoPage {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{ProviderData, RepoLabels, WorkItemIdentity};
+    use flotilla_protocol::{CloudAgentSession, ProviderData, RepoLabels, SessionStatus, WorkItemIdentity};
 
     use super::*;
-    use crate::app::test_support::{issue_item, TestWidgetHarness};
+    use crate::app::test_support::{issue_item, session_item, TestWidgetHarness};
 
     fn test_repo_identity() -> RepoIdentity {
         RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() }
@@ -485,6 +496,33 @@ mod tests {
         let mut page = RepoPage::new(test_repo_identity(), data, RepoViewLayout::Auto);
         page.reconcile_if_changed();
         page
+    }
+
+    /// Shared data containing one archived session ("s1") and one issue ("i1").
+    fn repo_data_with_archived_session() -> Shared<RepoData> {
+        let mut providers = ProviderData::default();
+        providers.sessions.insert("s1".into(), CloudAgentSession {
+            title: String::new(),
+            status: SessionStatus::Archived,
+            model: None,
+            updated_at: None,
+            correlation_keys: Vec::new(),
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+            item_noun: String::new(),
+        });
+        Shared::new(RepoData {
+            path: PathBuf::from("/tmp/test-repo"),
+            providers: Arc::new(providers),
+            labels: RepoLabels::default(),
+            provider_names: HashMap::new(),
+            provider_health: HashMap::new(),
+            work_items: vec![session_item("s1"), issue_item("i1")],
+            issue_has_more: false,
+            issue_total: None,
+            issue_search_active: false,
+            loading: false,
+        })
     }
 
     // ── reconcile_if_changed ──
@@ -808,6 +846,58 @@ mod tests {
             page.handle_action(Action::ToggleArchived, &mut ctx);
         }
         assert!(!page.show_archived);
+    }
+
+    #[test]
+    fn toggle_archived_rebuilds_table_immediately() {
+        let mut page = RepoPage::new(test_repo_identity(), repo_data_with_archived_session(), RepoViewLayout::Auto);
+        page.reconcile_if_changed();
+
+        // With show_archived=false, the archived session row is filtered out.
+        let count_before = page.table.grouped_items.selectable_indices.len();
+
+        let mut harness = TestWidgetHarness::new();
+        {
+            let mut ctx = harness.ctx();
+            page.handle_action(Action::ToggleArchived, &mut ctx);
+        }
+
+        // After toggling on, the archived session should appear immediately.
+        let count_after = page.table.grouped_items.selectable_indices.len();
+        assert!(count_after > count_before, "toggle on should reveal archived session row");
+
+        {
+            let mut ctx = harness.ctx();
+            page.handle_action(Action::ToggleArchived, &mut ctx);
+        }
+
+        // After toggling off, the archived session should be hidden again.
+        assert_eq!(page.table.grouped_items.selectable_indices.len(), count_before, "toggle off should re-hide archived session row");
+    }
+
+    #[test]
+    fn dismiss_rebuilds_table_when_clearing_archived() {
+        let mut page = RepoPage::new(test_repo_identity(), repo_data_with_archived_session(), RepoViewLayout::Auto);
+        page.reconcile_if_changed();
+
+        let hidden_count = page.table.grouped_items.selectable_indices.len();
+
+        // Toggle archived on, then dismiss to turn it back off.
+        let mut harness = TestWidgetHarness::new();
+        {
+            let mut ctx = harness.ctx();
+            page.handle_action(Action::ToggleArchived, &mut ctx);
+        }
+        assert!(page.show_archived);
+        let visible_count = page.table.grouped_items.selectable_indices.len();
+        assert!(visible_count > hidden_count);
+
+        {
+            let mut ctx = harness.ctx();
+            page.handle_action(Action::Dismiss, &mut ctx);
+        }
+        assert!(!page.show_archived);
+        assert_eq!(page.table.grouped_items.selectable_indices.len(), hidden_count, "dismiss should re-hide archived session rows");
     }
 
     #[test]

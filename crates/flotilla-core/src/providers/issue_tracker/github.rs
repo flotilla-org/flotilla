@@ -193,7 +193,7 @@ mod tests {
         let repo_slug = "rjwittams/flotilla".to_string();
 
         let session = replay::test_session(&fixture("github_issues.yaml"), Masks::new());
-        let repo_root = if session.is_recording() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
+        let repo_root = if session.is_live() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
         let (api, runner) = build_api_and_runner(&session);
 
         let tracker = GitHubIssueTracker::new("github".into(), repo_slug, api, runner);

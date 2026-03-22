@@ -232,13 +232,23 @@ impl InteractiveWidget for CommandPaletteWidget {
             }
             Action::Confirm => self.confirm(ctx),
             Action::Dismiss => Outcome::Finished,
+            Action::FillSelected => {
+                let filtered = self.filtered();
+                if let Some(entry) = filtered.get(self.selected) {
+                    let filled = format!("{} ", entry.name);
+                    self.input = Input::from(filled.as_str());
+                    self.selected = 0;
+                    self.scroll_top = 0;
+                }
+                Outcome::Consumed
+            }
             _ => Outcome::Ignored,
         }
     }
 
     fn handle_raw_key(&mut self, key: KeyEvent, _ctx: &mut WidgetContext) -> Outcome {
-        // Tab / Right arrow: fill selected entry name into input
-        if matches!(key.code, KeyCode::Tab | KeyCode::Right) {
+        // Right arrow: fill selected entry name into input (Tab goes through handle_action)
+        if matches!(key.code, KeyCode::Right) {
             let filtered = self.filtered();
             if let Some(entry) = filtered.get(self.selected) {
                 let filled = format!("{} ", entry.name);
@@ -399,13 +409,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_fills_selected_entry_name() {
+    fn fill_selected_fills_entry_name() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
         // First entry is "search"
-        let outcome = widget.handle_raw_key(key(KeyCode::Tab), &mut ctx);
+        let outcome = widget.handle_action(Action::FillSelected, &mut ctx);
         assert!(matches!(outcome, Outcome::Consumed));
         assert_eq!(widget.input.value(), "search ");
         assert_eq!(widget.selected, 0);

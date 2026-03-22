@@ -226,7 +226,7 @@ async fn test_my_provider() {
 }
 ```
 
-In replay mode, fixtures load from disk and responses are deterministic. In record mode (`RECORD=1`), real interactions are captured and masking applies to the fixture before saving.
+In replay mode (the default), fixtures load from disk and responses are deterministic. In record mode (`REPLAY=record`), real interactions are captured and masking applies to the fixture before saving. In passthrough mode (`REPLAY=passthrough`), real commands execute without reading or writing fixtures — useful for validating that tests work against live execution.
 
 ### Fixture Format
 
@@ -281,10 +281,20 @@ Note: `{repo}` in `cwd` fields is a **mask placeholder** (see Masks section). It
 Capture real interactions:
 
 ```bash
-RECORD=1 cargo test -p flotilla-core test_my_provider
+REPLAY=record cargo test -p flotilla-core test_my_provider
 ```
 
 This runs your test against real systems (git, GitHub, Claude API, HTTP endpoints). The test must succeed. On exit, the fixture file is written with all interactions masked.
+
+### Passthrough
+
+Validate tests against live execution without writing fixtures:
+
+```bash
+REPLAY=passthrough cargo test -p flotilla-core test_my_provider
+```
+
+This is useful on properly-equipped CI runners (e.g. macOS for cmux/claude) to verify that replay fixtures haven't drifted from real behavior.
 
 ### Masks
 

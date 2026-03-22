@@ -109,9 +109,10 @@ pub fn default_checkout_path() -> String {
 /// Values are action names (parsed by `Action::from_config_str`).
 /// Empty maps mean "use defaults".
 ///
-/// Text input modes (branch_input, issue_search, file_picker) are excluded
-/// because they bypass the keymap — unrecognised keys pass through to `tui_input`
-/// for text editing.
+/// Text input modes (branch_input, issue_search) are excluded because they
+/// capture all keys via `captures_raw_keys()`. Command palette and file picker
+/// use `no_shared_fallback` to prevent shared bindings from intercepting typing,
+/// so their navigation keys are configurable here.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct KeysConfig {
     #[serde(default)]
@@ -128,6 +129,10 @@ pub struct KeysConfig {
     pub delete_confirm: HashMap<String, String>,
     #[serde(default)]
     pub close_confirm: HashMap<String, String>,
+    #[serde(default)]
+    pub command_palette: HashMap<String, String>,
+    #[serde(default)]
+    pub file_picker: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

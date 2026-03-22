@@ -819,7 +819,7 @@ async fn publish_peer_summary_normalizes_host_name() {
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let peer_host = HostName::new("remote-host");
-    let _ = daemon
+    daemon
         .publish_peer_summary(&peer_host, HostSummary {
             host_name: HostName::new("spoofed-host"),
             system: SystemInfo::default(),
@@ -925,7 +925,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
         association_keys: vec![],
     });
 
-    let _ = daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Connected).await;
+    daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Connected).await;
     daemon.set_peer_host_summaries(HashMap::from([(transient_host.clone(), sample_remote_host_summary("transient"))])).await;
     daemon.set_peer_providers(&repo, vec![(transient_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
@@ -933,7 +933,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
     let hosts = daemon.list_hosts().await.expect("list hosts");
     assert!(hosts.hosts.iter().any(|entry| entry.host == transient_host), "transient host should be visible while backed by state");
 
-    let _ = daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Disconnected).await;
+    daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Disconnected).await;
     daemon.set_peer_host_summaries(HashMap::new()).await;
     daemon.set_peer_providers(&repo, vec![], 1).await;
     let removed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1310,10 +1310,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     let daemon = InProcessDaemon::new(vec![], config, local_bare_remote_discovery(), HostName::local()).await;
 
-    daemon
-        .add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), ProviderData::default())
-        .await
-        .expect("add virtual repo");
+    daemon.add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), vec![], 0).await.expect("add virtual repo");
     let (tracked_path, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
     // Path may be canonicalized (e.g. /var -> /private/var on macOS)
     let canonical_repo = std::fs::canonicalize(&local_repo).unwrap_or_else(|_| local_repo.clone());
@@ -1935,39 +1932,73 @@ async fn follower_mode_skips_external_providers() {
 }
 
 #[tokio::test]
-async fn add_virtual_repo_emits_repo_added_and_appears_in_list() {
+async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
     let config = Arc::new(ConfigStore::new());
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
-    daemon
-        .add_virtual_repo(identity.clone(), synthetic_path.clone(), ProviderData::default())
-        .await
-        .expect("add_virtual_repo should succeed");
+    let peer_host = HostName::new("peer-a");
+    let peer_checkout_path = PathBuf::from("/srv/peer-a/repo");
+    let peers = vec![(peer_host.clone(), ProviderData {
+        checkouts: indexmap::IndexMap::from([(HostPath::new(peer_host.clone(), peer_checkout_path.clone()), Checkout {
+            branch: "feat-remote".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::Branch("feat-remote".into())],
+            association_keys: vec![],
+        })]),
+        ..Default::default()
+    })];
 
-    // Should receive a RepoTracked event
-    let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), peers, 0).await.expect("add_virtual_repo should succeed");
+
+    // Collect events: expect RepoTracked followed by a snapshot.
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut collected = Vec::new();
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::RepoTracked(info)) => break *info,
+                Ok(e @ DaemonEvent::RepoTracked(_)) => collected.push(e),
+                Ok(e @ DaemonEvent::RepoSnapshot(_)) => {
+                    collected.push(e);
+                    break;
+                }
+                Ok(e @ DaemonEvent::RepoDelta(_)) => {
+                    collected.push(e);
+                    break;
+                }
                 Ok(_) => {}
                 Err(e) => panic!("unexpected recv error: {e:?}"),
             }
         }
+        collected
     })
     .await
-    .expect("timeout waiting for RepoTracked");
-    assert_eq!(added.identity, identity);
-    assert_eq!(added.path, synthetic_path);
-    assert!(!added.loading, "virtual repos should not be in loading state");
+    .expect("timeout waiting for events");
 
-    // Should appear in list_repos
+    // RepoTracked must come first.
+    assert!(matches!(&events[0], DaemonEvent::RepoTracked(info) if info.identity == identity));
+    // Followed by a snapshot (not a delta — there's no previous baseline).
+    assert!(matches!(&events[1], DaemonEvent::RepoSnapshot(_)), "second event should be a full snapshot, got {:?}", events[1]);
+
+    // Should appear in list_repos.
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].path, synthetic_path);
     assert!(!repos[0].loading);
+
+    // get_state() should return the peer checkout data immediately.
+    let state = daemon.get_state(&RepoSelector::Identity(identity.clone())).await.expect("get_state should succeed");
+    assert!(!state.providers.checkouts.is_empty(), "peer checkout should be present in snapshot");
+    let has_remote_checkout = state.providers.checkouts.values().any(|co| co.branch == "feat-remote");
+    assert!(has_remote_checkout, "snapshot should contain the peer's feat-remote checkout");
+
+    // Work items should include the correlated peer checkout.
+    assert!(!state.work_items.is_empty(), "work items should be populated from peer data");
 }
 
 #[tokio::test]
@@ -1977,13 +2008,10 @@ async fn add_virtual_repo_is_idempotent() {
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
-    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), ProviderData::default()).await.expect("first add should succeed");
+    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), vec![], 0).await.expect("first add should succeed");
 
     // Second add with same path should be a no-op
-    daemon
-        .add_virtual_repo(identity, synthetic_path.clone(), ProviderData::default())
-        .await
-        .expect("second add should succeed (idempotent)");
+    daemon.add_virtual_repo(identity, synthetic_path.clone(), vec![], 0).await.expect("second add should succeed (idempotent)");
 
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1, "should still have exactly one repo");

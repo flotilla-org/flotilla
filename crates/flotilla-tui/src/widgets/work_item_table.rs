@@ -4,7 +4,7 @@ use std::{
 };
 
 use flotilla_core::data::{GroupEntry, GroupedWorkItems, SectionHeader};
-use flotilla_protocol::{HostName, ProviderData, SessionStatus, WorkItem, WorkItemIdentity};
+use flotilla_protocol::{HostName, ProviderData, SessionStatus, WorkItem, WorkItemIdentity, WorkItemKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -400,6 +400,12 @@ fn build_header_row(_header: &SectionHeader) -> Row<'static> {
     .height(1)
 }
 
+/// Whether this row should render with muted/dimmed styling.
+/// Only session-kind rows with an archived or expired status are dimmed.
+fn is_archived_session_row(item: &WorkItem, session_status: Option<&SessionStatus>) -> bool {
+    item.kind == WorkItemKind::Session && session_status.is_some_and(|s| matches!(s, SessionStatus::Archived | SessionStatus::Expired))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_item_row<'a>(
     item: &WorkItem,
@@ -412,7 +418,7 @@ fn build_item_row<'a>(
     home_dir: Option<&Path>,
 ) -> Row<'a> {
     let session_status = item.session_key.as_deref().and_then(|k| providers.sessions.get(k)).map(|s| &s.status);
-    let is_archived = session_status.is_some_and(|s| matches!(s, SessionStatus::Archived | SessionStatus::Expired));
+    let is_archived = is_archived_session_row(item, session_status);
     let (icon, icon_color) = ui_helpers::work_item_icon(&item.kind, !item.workspace_refs.is_empty(), session_status, theme);
 
     let source_display = match item.source.as_deref() {
@@ -561,7 +567,7 @@ fn build_item_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::{checkout_item, grouped_items, issue_item};
+    use crate::app::test_support::{checkout_item, grouped_items, issue_item, session_item};
 
     #[test]
     fn update_items_preserves_selection_by_identity() {
@@ -692,5 +698,29 @@ mod tests {
 
         assert_eq!(table.selected_selectable_idx, Some(0));
         assert_eq!(table.table_state.selected(), Some(0));
+    }
+
+    // ── is_archived_session_row ──
+
+    #[test]
+    fn archived_session_row_is_dimmed() {
+        let ses = session_item("s1");
+        assert!(is_archived_session_row(&ses, Some(&SessionStatus::Archived)));
+        assert!(is_archived_session_row(&ses, Some(&SessionStatus::Expired)));
+    }
+
+    #[test]
+    fn active_session_row_is_not_dimmed() {
+        let ses = session_item("s1");
+        assert!(!is_archived_session_row(&ses, Some(&SessionStatus::Running)));
+        assert!(!is_archived_session_row(&ses, None));
+    }
+
+    #[test]
+    fn checkout_row_linked_to_archived_session_is_not_dimmed() {
+        let mut co = checkout_item("feat/x", "/tmp/x", false);
+        co.session_key = Some("s1".into());
+        assert!(!is_archived_session_row(&co, Some(&SessionStatus::Archived)));
+        assert!(!is_archived_session_row(&co, Some(&SessionStatus::Expired)));
     }
 }

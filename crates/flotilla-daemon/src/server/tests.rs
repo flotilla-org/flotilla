@@ -1503,23 +1503,10 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
     }
 
     let synthetic = crate::peer::synthetic_repo_path(&HostName::new("peer-a"), &repo_path);
-    let merged = {
-        let pm = peer_manager.lock().await;
-        let peers: Vec<(HostName, ProviderData)> = pm
-            .get_peer_data()
-            .iter()
-            .filter_map(|(host, repos)| repos.get(&repo_identity).map(|state| (host.clone(), state.provider_data.clone())))
-            .collect();
-        crate::peer::merge_provider_data(
-            &ProviderData::default(),
-            daemon.host_name(),
-            &peers.iter().map(|(h, d)| (h.clone(), d)).collect::<Vec<_>>(),
-        )
-    };
-    daemon.add_virtual_repo(repo_identity.clone(), synthetic.clone(), merged).await.expect("add virtual repo");
     daemon
-        .set_peer_providers(
-            &synthetic,
+        .add_virtual_repo(
+            repo_identity.clone(),
+            synthetic.clone(),
             vec![
                 (HostName::new("peer-a"), ProviderData {
                     checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
@@ -1532,7 +1519,8 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
             ],
             0,
         )
-        .await;
+        .await
+        .expect("add virtual repo");
     let old_session_id = uuid::Uuid::new_v4();
     let new_session_id = uuid::Uuid::new_v4();
     {
@@ -1852,23 +1840,10 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
     }
 
     let synthetic = crate::peer::synthetic_repo_path(&HostName::new("peer-a"), &repo_path);
-    let merged = {
-        let pm = peer_manager.lock().await;
-        let peers: Vec<(HostName, ProviderData)> = pm
-            .get_peer_data()
-            .iter()
-            .filter_map(|(host, repos)| repos.get(&repo_identity).map(|state| (host.clone(), state.provider_data.clone())))
-            .collect();
-        crate::peer::merge_provider_data(
-            &ProviderData::default(),
-            daemon.host_name(),
-            &peers.iter().map(|(h, d)| (h.clone(), d)).collect::<Vec<_>>(),
-        )
-    };
-    daemon.add_virtual_repo(repo_identity.clone(), synthetic.clone(), merged).await.expect("add virtual repo");
     daemon
-        .set_peer_providers(
-            &synthetic,
+        .add_virtual_repo(
+            repo_identity.clone(),
+            synthetic.clone(),
             vec![
                 (HostName::new("peer-a"), ProviderData {
                     checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
@@ -1881,7 +1856,8 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
             ],
             0,
         )
-        .await;
+        .await
+        .expect("add virtual repo");
     {
         let mut pm = peer_manager.lock().await;
         pm.register_remote_repo(repo_identity.clone(), synthetic.clone());
