@@ -84,25 +84,30 @@ enum ImageSource {
 }
 ```
 
-`EnvironmentHandle` represents a running environment instance:
+`EnvironmentHandle` is a live reference to a running environment, not a frozen snapshot:
 
 ```rust
-struct EnvironmentHandle {
-    id: EnvironmentId,
-    image: ImageId,
-    status: EnvironmentStatus,
-    env_snapshot: EnvironmentBag,
-}
+type EnvironmentHandle = Arc<dyn ProvisionedEnvironment>;
 
-impl EnvironmentHandle {
+trait ProvisionedEnvironment: Send + Sync {
+    fn id(&self) -> &EnvironmentId;
+    fn image(&self) -> &ImageId;
+
+    // Live queries — implementation decides caching strategy
+    async fn status(&self) -> Result<EnvironmentStatus, String>;
+    async fn env_snapshot(&self) -> Result<EnvironmentBag, String>;
+
+    // Execution context — composes with host runner (decorator pattern)
     fn runner(&self, host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner>;
+
+    // Lifecycle
     async fn destroy(&self) -> Result<(), String>;
 }
 ```
 
-The handle provides a `CommandRunner` that composes with the host runner (decorator pattern). This runner wraps commands via `docker exec` (or equivalent). The same runner feeds back into standard provider discovery — the `FactoryRegistry` probes inside the environment using the environment's runner, producing a per-environment provider tree identical in shape to a host-level one.
+The handle is opaque — callers interact through the trait. The Docker implementation holds the container ID and queries status, env vars, etc. on demand. `env_snapshot()` captures the interior environment via login shell invocation (`docker exec <container> sh -lc env`), reflecting the real environment a process sees inside — image defaults, profile scripts, and injected vars. The implementation may cache the snapshot and invalidate on restart; that's an internal detail.
 
-The `env_snapshot` captures the interior environment's variables via login shell invocation (`docker exec <container> sh -lc env`). This reflects the real environment a process sees inside — including image defaults, profile scripts, and injected vars. The snapshot feeds into `Factory::probe()` as the `EnvironmentBag` parameter, so interior discovery sees the container's env, not the host's. Captured at create time; re-captured on restart (mounts and profiles may change).
+The runner returned by the handle wraps commands via `docker exec` (or equivalent). The same runner feeds back into standard provider discovery — the `FactoryRegistry` probes inside the environment using the environment's runner and env snapshot, producing a per-environment provider tree identical in shape to a host-level one.
 
 **Phase 1 implementation:** `DockerEnvironment`.
 
