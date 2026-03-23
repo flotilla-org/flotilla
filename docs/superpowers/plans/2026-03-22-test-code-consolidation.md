@@ -1,6 +1,6 @@
 # Test Code Consolidation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Eliminate duplicate test helpers, consolidate identical mocks, extract large inline test modules, and parameterize repetitive tests.
 
@@ -59,7 +59,7 @@
 - Modify: `crates/flotilla-protocol/Cargo.toml`
 - Modify: `crates/flotilla-protocol/src/lib.rs`
 
-- [ ] **Step 1: Add `test-support` feature to protocol Cargo.toml**
+- [x] **Step 1: Add `test-support` feature to protocol Cargo.toml**
 
 In `crates/flotilla-protocol/Cargo.toml`, add a `[features]` section after `[package]`:
 
@@ -69,7 +69,7 @@ default = []
 test-support = []
 ```
 
-- [ ] **Step 2: Add feature-gated module declaration to lib.rs**
+- [x] **Step 2: Add feature-gated module declaration to lib.rs**
 
 In `crates/flotilla-protocol/src/lib.rs`, after line 10 (`pub mod snapshot;`), add:
 
@@ -78,7 +78,7 @@ In `crates/flotilla-protocol/src/lib.rs`, after line 10 (`pub mod snapshot;`), a
 pub mod test_support;
 ```
 
-- [ ] **Step 3: Create `test_support.rs` with `hp()` and all builders**
+- [x] **Step 3: Create `test_support.rs` with `hp()` and all builders**
 
 Create `crates/flotilla-protocol/src/test_support.rs`:
 
@@ -281,17 +281,17 @@ impl TestIssue {
 }
 ```
 
-- [ ] **Step 4: Verify protocol crate compiles**
+- [x] **Step 4: Verify protocol crate compiles**
 
 Run: `cargo build -p flotilla-protocol --features test-support`
 Expected: compiles cleanly.
 
-- [ ] **Step 5: Run protocol tests**
+- [x] **Step 5: Run protocol tests**
 
 Run: `cargo test -p flotilla-protocol`
 Expected: all existing tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/flotilla-protocol/
@@ -307,7 +307,7 @@ git commit -m "feat: add test-support feature with shared test builders to floti
 - Modify: `crates/flotilla-daemon/Cargo.toml`
 - Modify: `crates/flotilla-tui/Cargo.toml`
 
-- [ ] **Step 1: Forward `test-support` in flotilla-core**
+- [x] **Step 1: Forward `test-support` in flotilla-core**
 
 In `crates/flotilla-core/Cargo.toml`, change line 10:
 
@@ -321,7 +321,7 @@ to:
 test-support = ["flotilla-protocol/test-support"]
 ```
 
-- [ ] **Step 2: Forward `test-support` in flotilla-daemon**
+- [x] **Step 2: Forward `test-support` in flotilla-daemon**
 
 In `crates/flotilla-daemon/Cargo.toml`, change line 10:
 
@@ -341,7 +341,7 @@ Also update the existing `flotilla-protocol` dev-dependency (line 31) to enable 
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 ```
 
-- [ ] **Step 3: Add protocol dev-dependency with feature to flotilla-tui**
+- [x] **Step 3: Add protocol dev-dependency with feature to flotilla-tui**
 
 In `crates/flotilla-tui/Cargo.toml`, add to the `[dev-dependencies]` section:
 
@@ -349,12 +349,12 @@ In `crates/flotilla-tui/Cargo.toml`, add to the `[dev-dependencies]` section:
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 ```
 
-- [ ] **Step 4: Verify full workspace builds**
+- [x] **Step 4: Verify full workspace builds**
 
 Run: `cargo build --workspace`
 Expected: compiles cleanly.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/flotilla-core/Cargo.toml crates/flotilla-daemon/Cargo.toml crates/flotilla-tui/Cargo.toml
@@ -377,13 +377,13 @@ git commit -m "chore: wire test-support feature through to flotilla-protocol"
 - Modify: `crates/flotilla-core/src/executor/tests.rs:42` (inline test `hp()`)
 - Modify: `crates/flotilla-tui/src/app/key_handlers.rs:356` (inline test `hp()`)
 
-- [ ] **Step 1: Replace hp() in protocol crate's own test modules**
+- [x] **Step 1: Replace hp() in protocol crate's own test modules**
 
 In each of the 4 protocol files (`lib.rs`, `delta.rs`, `snapshot.rs`, `provider_data.rs`), find the local `fn hp()` definition inside the `#[cfg(test)] mod tests` block and delete it. Add `use crate::test_support::hp;` to the test module's imports instead.
 
 For protocol-internal test modules, `crate::test_support` is available because the module is gated with `#[cfg(any(test, feature = "test-support"))]` and tests always have `cfg(test)`.
 
-- [ ] **Step 2: Replace hp() in flotilla-core test modules**
+- [x] **Step 2: Replace hp() in flotilla-core test modules**
 
 In each of the 5 core files (`data.rs`, `delta.rs`, `convert.rs`, `correlation.rs`, `executor/tests.rs`), find the local `fn hp()` definition and delete it. Add `use flotilla_protocol::test_support::hp;` to the test module's imports.
 
@@ -395,16 +395,16 @@ fn hp(path: &str) -> HostPath {
 }
 ```
 
-- [ ] **Step 3: Replace hp() in flotilla-tui**
+- [x] **Step 3: Replace hp() in flotilla-tui**
 
 In `key_handlers.rs` (line 357-359), the existing `hp()` uses `HostName::local()`. Check whether any test in this file depends on the hostname matching `HostName::local()` (e.g. via assertions that compare against an `App` that uses `HostName::local()` internally). If so, keep a local wrapper like executor/tests.rs. If not, replace with `use flotilla_protocol::test_support::hp;`.
 
-- [ ] **Step 4: Run full workspace tests**
+- [x] **Step 4: Run full workspace tests**
 
 Run: `cargo test --workspace --locked`
 Expected: all tests pass. If any fail due to hostname mismatch, keep a local `hp()` wrapper in that file.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git commit -am "refactor: replace 10 local hp() copies with shared flotilla_protocol::test_support::hp"
@@ -422,38 +422,38 @@ git commit -am "refactor: replace 10 local hp() copies with shared flotilla_prot
 - Modify: `crates/flotilla-daemon/tests/multi_host.rs:102-112`
 - Modify: `crates/flotilla-tui/tests/support/mod.rs:221-234`
 
-- [ ] **Step 1: Replace make_checkout() in core/data.rs**
+- [x] **Step 1: Replace make_checkout() in core/data.rs**
 
 Delete the `make_checkout` function (lines 963-974). Add `use flotilla_protocol::test_support::TestCheckout;` to imports. Update all call sites in the test module:
 - `make_checkout(branch, path, is_main)` becomes `TestCheckout::new(branch).at(path).is_main(is_main).with_branch_key().build()`
 
 The existing version adds both `Branch` and `CheckoutPath` correlation keys.
 
-- [ ] **Step 2: Replace make_checkout() in core/refresh.rs**
+- [x] **Step 2: Replace make_checkout() in core/refresh.rs**
 
 Delete the `make_checkout` function (lines 630-641). Add `use flotilla_protocol::test_support::TestCheckout;` to imports. Update call sites:
 - `make_checkout(branch)` becomes `TestCheckout::new(branch).with_branch_key().build()`
 
 The existing version adds a `Branch` correlation key.
 
-- [ ] **Step 3: Replace make_checkout() in core/executor/tests.rs**
+- [x] **Step 3: Replace make_checkout() in core/executor/tests.rs**
 
 Delete the `make_checkout` function (lines 274-285). Add `use flotilla_protocol::test_support::TestCheckout;` to imports. Update call sites:
 - `make_checkout(branch, _path)` becomes `TestCheckout::new(branch).build()`
 
 The existing version adds no correlation keys.
 
-- [ ] **Step 4: Replace make_checkout() in daemon/peer/merge.rs**
+- [x] **Step 4: Replace make_checkout() in daemon/peer/merge.rs**
 
 Delete the `make_checkout` function (lines 11-21). Add `use flotilla_protocol::test_support::TestCheckout;` to imports. Update call sites:
 - `make_checkout(branch)` becomes `TestCheckout::new(branch).build()`
 
-- [ ] **Step 5: Replace make_checkout() in daemon/tests/multi_host.rs**
+- [x] **Step 5: Replace make_checkout() in daemon/tests/multi_host.rs**
 
 Delete the `make_checkout` function (lines 102-112). Add `use flotilla_protocol::test_support::TestCheckout;` to imports. Update call sites:
 - `make_checkout(branch)` becomes `TestCheckout::new(branch).build()`
 
-- [ ] **Step 6: Update tui/tests/support/mod.rs make_checkout()**
+- [x] **Step 6: Update tui/tests/support/mod.rs make_checkout()**
 
 In `crates/flotilla-tui/tests/support/mod.rs` (lines 221-234), rewrite `make_checkout` to delegate to `TestCheckout`:
 
@@ -467,12 +467,12 @@ pub fn make_checkout(branch: &str, path: &str, is_main: bool) -> (flotilla_proto
 
 This keeps the tuple return signature that snapshot tests depend on.
 
-- [ ] **Step 7: Run workspace tests**
+- [x] **Step 7: Run workspace tests**
 
 Run: `cargo test --workspace --locked`
 Expected: all pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git commit -am "refactor: replace 6 make_checkout() copies with TestCheckout builder"
@@ -489,15 +489,15 @@ git commit -am "refactor: replace 6 make_checkout() copies with TestCheckout bui
 - Modify: `crates/flotilla-core/tests/in_process_daemon.rs` — `make_issue` (line 2309)
 - Modify: `crates/flotilla-tui/tests/support/mod.rs` — `make_change_request` (line 236), `make_issue` (line 250), `make_session` (line 261)
 
-- [ ] **Step 1: Replace make_change_request() in core/data.rs**
+- [x] **Step 1: Replace make_change_request() in core/data.rs**
 
 Delete the function. Update call sites to use `TestChangeRequest::new(title, branch).with_branch_key().build()`. The existing version adds a `Branch` correlation key.
 
-- [ ] **Step 2: Replace make_change_request() in core/refresh.rs**
+- [x] **Step 2: Replace make_change_request() in core/refresh.rs**
 
 Delete the function. Update call sites. The existing version adds a `Branch` correlation key: `TestChangeRequest::new(title, branch).with_branch_key().build()`.
 
-- [ ] **Step 3: Update make_change_request() in tui/tests/support/mod.rs**
+- [x] **Step 3: Update make_change_request() in tui/tests/support/mod.rs**
 
 Rewrite to delegate:
 
@@ -507,28 +507,28 @@ pub fn make_change_request(id: &str, title: &str, branch: &str) -> (String, Chan
 }
 ```
 
-- [ ] **Step 4: Replace make_session() in core/data.rs**
+- [x] **Step 4: Replace make_session() in core/data.rs**
 
 Delete the function. Update call sites. The existing version optionally adds `Branch` and always adds `SessionRef` keys:
 - `make_session(id, title, Some(branch))` → `TestSession::new(title).with_session_ref("claude", id).with_branch_key(branch).build()`
 - `make_session(id, title, None)` → `TestSession::new(title).with_session_ref("claude", id).build()`
 
-- [ ] **Step 5: Replace make_session() in core/refresh.rs**
+- [x] **Step 5: Replace make_session() in core/refresh.rs**
 
 Delete the function. The existing version adds a `SessionRef("mock", session_id)`:
 - `make_session(title, session_id)` → `TestSession::new(title).with_session_ref("mock", session_id).build()`
 
-- [ ] **Step 6: Replace make_session_for() in core/executor/tests.rs**
+- [x] **Step 6: Replace make_session_for() in core/executor/tests.rs**
 
 Delete the function. Update call sites:
 - `make_session_for(provider, id)` → `TestSession::new("test session").with_session_ref(provider, id).build()`
 
-- [ ] **Step 7: Replace make_issue() in core/data.rs, core/executor/tests.rs**
+- [x] **Step 7: Replace make_issue() in core/data.rs, core/executor/tests.rs**
 
 Delete both copies. Update call sites:
 - `make_issue(_id, title)` → `TestIssue::new(title).build()`
 
-- [ ] **Step 8: Replace make_issue() in core/tests/in_process_daemon.rs**
+- [x] **Step 8: Replace make_issue() in core/tests/in_process_daemon.rs**
 
 Delete the function. The existing version sets `provider_name` and `provider_display_name`. The `TestIssue` builder defaults those to empty strings. Check whether the tests assert on those fields. If so, add `.with_provider("fake-issues", "Fake Issues")` to `TestIssue`, or keep a local helper that sets those fields after building:
 
@@ -541,7 +541,7 @@ fn make_issue(n: u32) -> (String, Issue) {
 }
 ```
 
-- [ ] **Step 9: Update make_issue() and make_session() in tui/tests/support/mod.rs**
+- [x] **Step 9: Update make_issue() and make_session() in tui/tests/support/mod.rs**
 
 Rewrite to delegate:
 
@@ -555,12 +555,12 @@ pub fn make_session(id: &str, title: &str, status: SessionStatus) -> (String, Cl
 }
 ```
 
-- [ ] **Step 10: Run workspace tests**
+- [x] **Step 10: Run workspace tests**
 
 Run: `cargo test --workspace --locked`
 Expected: all pass.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git commit -am "refactor: replace make_change_request/session/issue copies with shared builders"
@@ -577,7 +577,7 @@ git commit -am "refactor: replace make_change_request/session/issue copies with 
 - Modify: `crates/flotilla-daemon/src/server/tests.rs:51-89,229-241`
 - Modify: `crates/flotilla-daemon/tests/multi_host.rs:37-92,129-141`
 
-- [ ] **Step 1: Gate `test_support` module with feature flag**
+- [x] **Step 1: Gate `test_support` module with feature flag**
 
 In `crates/flotilla-daemon/src/peer/mod.rs`, change line 5 from:
 
@@ -592,7 +592,7 @@ to:
 pub mod test_support;
 ```
 
-- [ ] **Step 2: Add MockPeerSender to test_support.rs**
+- [x] **Step 2: Add MockPeerSender to test_support.rs**
 
 In `crates/flotilla-daemon/src/peer/test_support.rs`, add at the top (after existing imports). Use `Mutex` (not aliased) to match the majority pattern in consumer test modules:
 
@@ -635,7 +635,7 @@ impl PeerSender for MockPeerSender {
 
 The `sent` field is `pub` so callers can construct via struct literal (`MockPeerSender { sent: Arc::clone(&existing) }`) — this matches the 40+ existing call sites in manager.rs and server/tests.rs that pass a pre-existing `Arc`. The `new()` constructor is a convenience for sites that don't need to share a buffer.
 
-- [ ] **Step 3: Add BlockingPeerSender to test_support.rs**
+- [x] **Step 3: Add BlockingPeerSender to test_support.rs**
 
 ```rust
 pub struct BlockingPeerSender {
@@ -662,7 +662,7 @@ impl PeerSender for BlockingPeerSender {
 }
 ```
 
-- [ ] **Step 4: Add MockTransport to test_support.rs**
+- [x] **Step 4: Add MockTransport to test_support.rs**
 
 ```rust
 use crate::peer::transport::{PeerConnectionStatus, PeerTransport};
@@ -712,7 +712,7 @@ impl PeerTransport for MockTransport {
 }
 ```
 
-- [ ] **Step 5: Add wait_for_command_result() to test_support.rs**
+- [x] **Step 5: Add wait_for_command_result() to test_support.rs**
 
 ```rust
 use flotilla_protocol::DaemonEvent;
@@ -736,7 +736,7 @@ pub async fn wait_for_command_result(
 }
 ```
 
-- [ ] **Step 6: Delete MockPeerSender and MockTransport from peer/manager.rs test module**
+- [x] **Step 6: Delete MockPeerSender and MockTransport from peer/manager.rs test module**
 
 In `crates/flotilla-daemon/src/peer/manager.rs`, delete lines 1324-1384 (the `MockPeerSender` struct+impl and `MockTransport` struct+impl+impl). Replace with imports from test_support:
 
@@ -746,7 +746,7 @@ use crate::peer::test_support::{MockPeerSender, MockTransport};
 
 Update any call sites that construct `MockPeerSender` or `MockTransport` to use the new `::new()` / `::with_sender()` constructors. The existing code constructs them inline (`MockPeerSender { sent: Arc::clone(&sent) }`) — these become `MockPeerSender::new()` which returns the tuple.
 
-- [ ] **Step 7: Delete CapturePeerSender, BlockingPeerSender, wait_for_command_result from server/tests.rs**
+- [x] **Step 7: Delete CapturePeerSender, BlockingPeerSender, wait_for_command_result from server/tests.rs**
 
 In `crates/flotilla-daemon/src/server/tests.rs`, delete lines 51-89 (both struct+impl blocks) and lines 229-241 (`wait_for_command_result`). Add imports:
 
@@ -756,7 +756,7 @@ use crate::peer::test_support::{BlockingPeerSender, MockPeerSender, wait_for_com
 
 Update construction sites — `CapturePeerSender { sent }` becomes `MockPeerSender { sent }` (or use `MockPeerSender::new()`). Update `wait_for_command_result(rx, id)` calls to pass a timeout: `wait_for_command_result(rx, id, StdDuration::from_secs(5))`.
 
-- [ ] **Step 8: Delete MockPeerSender, MockTransport, make_checkout, wait_for_command_result from multi_host.rs**
+- [x] **Step 8: Delete MockPeerSender, MockTransport, make_checkout, wait_for_command_result from multi_host.rs**
 
 In `crates/flotilla-daemon/tests/multi_host.rs`, delete the `MockTransport` (lines 37-92), `MockPeerSender` (lines 51-66), `make_checkout` (lines 102-112), and `wait_for_command_result` (lines 129-141) definitions. Add imports:
 
@@ -767,12 +767,12 @@ use flotilla_protocol::test_support::TestCheckout;
 
 Update `make_checkout(branch)` calls to `TestCheckout::new(branch).build()`. Update `wait_for_command_result(rx, id)` calls to pass timeout: `wait_for_command_result(rx, id, Duration::from_secs(10))`.
 
-- [ ] **Step 9: Run workspace tests**
+- [x] **Step 9: Run workspace tests**
 
 Run: `cargo test --workspace --locked`
 Expected: all pass.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git commit -am "refactor: consolidate MockPeerSender, MockTransport, BlockingPeerSender into peer/test_support"
@@ -786,7 +786,7 @@ git commit -am "refactor: consolidate MockPeerSender, MockTransport, BlockingPee
 - Modify: `crates/flotilla-core/src/providers/mod.rs:355-395`
 - Modify: `crates/flotilla-core/src/providers/terminal/cleat.rs:106-131`
 
-- [ ] **Step 1: Add call tracking to the existing MockRunner in providers/mod.rs**
+- [x] **Step 1: Add call tracking to the existing MockRunner in providers/mod.rs**
 
 In `crates/flotilla-core/src/providers/mod.rs` (lines 355-395), the `testing` module contains `MockRunner`. Add a `calls` field:
 
@@ -825,7 +825,7 @@ async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel
 
 Keep the existing `run_output()` implementation from `providers/mod.rs` (which maps `Ok` → success, `Err` → `CommandOutput` with `success: false`). The cleat.rs version is less precise (always returns `Ok(CommandOutput)`) — verify cleat tests still pass with the providers/mod.rs behavior.
 
-- [ ] **Step 2: Replace cleat.rs MockRunner with import**
+- [x] **Step 2: Replace cleat.rs MockRunner with import**
 
 In `crates/flotilla-core/src/providers/terminal/cleat.rs`, delete the local `MockRunner` struct and impl (lines 106-131). Replace with:
 
@@ -835,12 +835,12 @@ use crate::providers::testing::MockRunner;
 
 Update any test code that accesses `runner.calls.lock()` directly to use the new `runner.calls()` method instead.
 
-- [ ] **Step 3: Run core tests**
+- [x] **Step 3: Run core tests**
 
 Run: `cargo test -p flotilla-core --locked`
 Expected: all pass.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git commit -am "refactor: consolidate CommandRunner mocks into providers::testing::MockRunner"
@@ -854,15 +854,15 @@ git commit -am "refactor: consolidate CommandRunner mocks into providers::testin
 - Modify: `crates/flotilla-core/src/data.rs:887-2371`
 - Create: `crates/flotilla-core/src/data/tests.rs`
 
-- [ ] **Step 1: Create the directory**
+- [x] **Step 1: Create the directory**
 
 Run: `mkdir -p crates/flotilla-core/src/data`
 
-- [ ] **Step 2: Move the test module body**
+- [x] **Step 2: Move the test module body**
 
 Cut the *contents* of `mod tests { ... }` — everything between the opening `{` (line 888) and the closing `}` (last line of file). Write these contents to `crates/flotilla-core/src/data/tests.rs`. The extracted file should start with the `use` imports that were inside the module (e.g. `use super::*;`) and contain all test functions and helpers. Do not include the `mod tests {` or closing `}` lines — those are replaced by the `#[path]` declaration.
 
-- [ ] **Step 3: Replace inline module with path declaration**
+- [x] **Step 3: Replace inline module with path declaration**
 
 In `crates/flotilla-core/src/data.rs`, replace the entire `#[cfg(test)] mod tests { ... }` block with:
 
@@ -872,12 +872,12 @@ In `crates/flotilla-core/src/data.rs`, replace the entire `#[cfg(test)] mod test
 mod tests;
 ```
 
-- [ ] **Step 4: Run data.rs tests**
+- [x] **Step 4: Run data.rs tests**
 
 Run: `cargo test -p flotilla-core --locked -- data::tests`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/flotilla-core/src/data.rs crates/flotilla-core/src/data/
@@ -896,7 +896,7 @@ git commit -m "refactor: extract data.rs test module to data/tests.rs"
 - Modify: `crates/flotilla-daemon/src/peer/manager.rs:1314-2529`
 - Create: `crates/flotilla-daemon/src/peer/manager/tests.rs`
 
-- [ ] **Step 1: Create directories**
+- [x] **Step 1: Create directories**
 
 ```bash
 mkdir -p crates/flotilla-tui/src/app/key_handlers
@@ -904,7 +904,7 @@ mkdir -p crates/flotilla-tui/src/app/intent
 mkdir -p crates/flotilla-daemon/src/peer/manager
 ```
 
-- [ ] **Step 2: Extract key_handlers.rs tests**
+- [x] **Step 2: Extract key_handlers.rs tests**
 
 Move the test module body from `key_handlers.rs` (line 335 onward) to `key_handlers/tests.rs`. Replace inline module with:
 
@@ -914,12 +914,12 @@ Move the test module body from `key_handlers.rs` (line 335 onward) to `key_handl
 mod tests;
 ```
 
-- [ ] **Step 3: Verify key_handlers tests**
+- [x] **Step 3: Verify key_handlers tests**
 
 Run: `cargo test -p flotilla-tui --locked -- app::key_handlers::tests`
 Expected: all pass.
 
-- [ ] **Step 4: Extract intent.rs tests**
+- [x] **Step 4: Extract intent.rs tests**
 
 Move the test module body from `intent.rs` (line 231 onward) to `intent/tests.rs`. Replace inline module with:
 
@@ -929,12 +929,12 @@ Move the test module body from `intent.rs` (line 231 onward) to `intent/tests.rs
 mod tests;
 ```
 
-- [ ] **Step 5: Verify intent tests**
+- [x] **Step 5: Verify intent tests**
 
 Run: `cargo test -p flotilla-tui --locked -- app::intent::tests`
 Expected: all pass.
 
-- [ ] **Step 6: Extract manager.rs tests**
+- [x] **Step 6: Extract manager.rs tests**
 
 Move the test module body from `manager.rs` (line 1315 onward) to `manager/tests.rs`. The `MockPeerSender` and `MockTransport` definitions were already removed in Task 6 — they're imported from `test_support`. Replace inline module with:
 
@@ -944,12 +944,12 @@ Move the test module body from `manager.rs` (line 1315 onward) to `manager/tests
 mod tests;
 ```
 
-- [ ] **Step 7: Verify manager tests**
+- [x] **Step 7: Verify manager tests**
 
 Run: `cargo test -p flotilla-daemon --locked -- peer::manager::tests`
 Expected: all pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/flotilla-tui/src/app/key_handlers.rs crates/flotilla-tui/src/app/key_handlers/ \
@@ -965,11 +965,11 @@ git commit -m "refactor: extract key_handlers, intent, and manager test modules 
 **Files:**
 - Modify: `crates/flotilla-core/src/data/tests.rs` (created in Task 8)
 
-- [ ] **Step 1: Identify which accessor test groups are parameterizable**
+- [x] **Step 1: Identify which accessor test groups are parameterizable**
 
 Read through the extracted `data/tests.rs`. For each group delimited by `// ---` comment separators, check whether all tests in the group follow the pattern: create item → call accessor → assert single value. Skip tests that have custom setup (e.g. constructing `CorrelatedWorkItem` directly).
 
-- [ ] **Step 2: Parameterize `kind()` tests**
+- [x] **Step 2: Parameterize `kind()` tests**
 
 Replace the five individual `kind_*` tests (lines ~1130-1158 in the original) with a single test:
 
@@ -989,7 +989,7 @@ fn kind_returns_correct_variant() {
 }
 ```
 
-- [ ] **Step 3: Parameterize `description()` tests**
+- [x] **Step 3: Parameterize `description()` tests**
 
 Replace the three `description_*` tests with:
 
@@ -1007,16 +1007,16 @@ fn description_returns_expected_value() {
 }
 ```
 
-- [ ] **Step 4: Parameterize remaining accessor groups**
+- [x] **Step 4: Parameterize remaining accessor groups**
 
 Apply the same pattern to other groups where all tests follow the create→access→assert pattern. For groups where some tests have custom setup (like `branch_from_change_request_correlated`), keep those as individual tests and parameterize only the mechanical ones.
 
-- [ ] **Step 5: Run data tests**
+- [x] **Step 5: Run data tests**
 
 Run: `cargo test -p flotilla-core --locked -- data::tests`
 Expected: all pass. Same number of logical assertions, fewer test functions.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/flotilla-core/src/data/tests.rs
@@ -1027,7 +1027,7 @@ git commit -m "refactor: parameterize data.rs accessor tests into table-driven t
 
 ## Task 11: Final verification
 
-- [ ] **Step 1: Run full CI checks**
+- [x] **Step 1: Run full CI checks**
 
 ```bash
 cargo +nightly-2026-03-12 fmt --check
@@ -1037,11 +1037,11 @@ cargo test --workspace --locked
 
 Expected: all three pass.
 
-- [ ] **Step 2: Fix any formatting or clippy issues**
+- [x] **Step 2: Fix any formatting or clippy issues**
 
 Run `cargo +nightly-2026-03-12 fmt` if formatting check fails. Fix any clippy warnings introduced by the refactoring.
 
-- [ ] **Step 3: Commit fixes if needed**
+- [x] **Step 3: Commit fixes if needed**
 
 ```bash
 git commit -am "chore: fix formatting and clippy warnings from test consolidation"
