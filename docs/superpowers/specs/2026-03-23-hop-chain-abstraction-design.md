@@ -34,28 +34,28 @@ struct HopPlan(Vec<Hop>);
 /// Structured shell command fragments for shell-backed consumers.
 /// This is intentionally not a universal argv representation.
 enum Arg {
-    Bare(String),               // emitted verbatim at the current shell depth
+    Literal(String),            // emitted verbatim at the current shell depth
     Quoted(String),             // shell-quoted at flatten time
     NestedCommand(Vec<Arg>),    // subtree rendered as a single shell-quoted argument
 }
 ```
 
-`Arg` is a shell-oriented tree: it models the command that will eventually be rendered for a POSIX shell consumer. `Bare` can therefore include shell syntax tokens that are intentionally emitted verbatim at the current depth (`&&`, `$SHELL`, `exec`). This keeps Phase A aligned with the actual consumers while still centralizing quoting in one place.
+`Arg` is a shell-oriented tree: it models the command that will eventually be rendered for a POSIX shell consumer. `Literal` emits verbatim at the current depth — this includes intentional shell syntax (`&&`, `$SHELL`, `exec`). `Quoted` values are always single-quoted (no expansion); use `Literal` for tokens where shell expansion is intentional (e.g., `Literal("$SHELL")`).
 
-**Safety invariant:** `Bare` is raw shell injection at the current depth. Only resolvers (trusted code) construct `Arg` values — never from user input or untrusted external data. This invariant must be maintained by all code that creates `Arg` trees.
+**Safety invariant:** `Literal` is raw shell injection at the current depth. Only resolvers (trusted code) construct `Arg` values — never from user input or untrusted external data. When `Arg` values cross the wire (serialized in `PreparedTerminalCommand`), this invariant extends to a protocol-level trust assumption: peer hosts in the mesh are trusted not to send malicious `Literal` values. This concern diminishes once `flotilla attach` exists at each hop, since the wire format becomes an opaque ID rather than shell fragments.
 
 `NestedCommand` means "render this entire subtree into a single shell-quoted argument." It exists because some transports (SSH, `docker exec ... bash -lc`, future environment wrappers) need to pass the inner command as a single string argument to another shell layer. The per-hop resolver decides which wrapper shape to use:
 
 - **SSH wraps via `NestedCommand`:** the inner command becomes a single string argument to SSH, potentially with further nesting for `$SHELL -l -c "..."`:
   ```
-  [Bare("ssh"), Bare("-t"), Quoted("user@feta"),
-    NestedCommand([Bare("$SHELL"), Bare("-l"), Bare("-c"),
-      NestedCommand([Bare("cd"), Quoted("/repo"), Bare("&&"), ...inner...])])]
+  [Literal("ssh"), Literal("-t"), Quoted("user@feta"),
+    NestedCommand([Literal("$SHELL"), Literal("-l"), Literal("-c"),
+      NestedCommand([Literal("cd"), Quoted("/repo"), Literal("&&"), ...inner...])])]
   ```
 - **Docker exec stays shell-backed in Phase A:** the wrapper still drops into a shell and passes the inner command as a single string:
   ```
-  [Bare("docker"), Bare("exec"), Bare("-it"), Quoted("abc"),
-    Bare("bash"), Bare("-lc"), NestedCommand([...inner...])]
+  [Literal("docker"), Literal("exec"), Literal("-it"), Quoted("abc"),
+    Literal("bash"), Literal("-lc"), NestedCommand([...inner...])]
   ```
 
 The resolver implementation knows the right structure for its transport. `flatten()` handles shell quoting only: `NestedCommand` triggers depth-aware quoting, flat args are quoted at the current depth. The tree is also useful for debug rendering — pretty-print with indentation and color-coding per nesting depth.
@@ -115,7 +115,7 @@ trait CombineStrategy: Send + Sync {
 The resolver consults this strategy at each hop before deciding wrap vs sendkeys. Phase A implementations:
 
 - **`AlwaysWrap`** — always nests commands as arguments. Matches current SSH wrapping behavior. Default.
-- **`AlwaysSendKeys`** — always creates execution boundaries. Exercises the sendkeys path for testing.
+- **`AlwaysSendKeys`** — always creates execution boundaries. Phase A defines but does not consume `SendKeys` end-to-end — the workspace pane consumer can only handle `Command` actions. `AlwaysSendKeys` is for resolution-level testing only: assert on the resolved plan shape, verify the pop-wrap-push mechanics produce correct boundaries. End-to-end `SendKeys` execution is deferred to a future interactive CLI consumer (#368).
 
 Future strategies (depth-based, per-transport, capability-aware) are additional trait implementations. The plan stays pure data — it declares what needs to happen. The strategy is a runtime decision made during resolution based on current context.
 
@@ -162,6 +162,8 @@ impl HopPlanBuilder<'_> {
 
 `build_for_prepared_command()` is for the existing Phase A workspace flow. `PrepareTerminalForCheckout` already returns one prepared pane command per role/count entry. The local presentation host does not have enough state to rebuild those commands from an `AttachableId`, so it builds a plan from the structured prepared command leaf instead: `[RemoteToHost(target_host), RunCommand(command.clone())]`.
 
+The working directory for the remote host is not on the plan — it's on the `ResolutionContext`. The caller (`CreateWorkspaceFromPreparedTerminal`, which has `checkout_path`) initializes `ResolutionContext.working_directory` before calling `resolve()`. The `RemoteHopResolver` reads it for the `cd` prefix. Note: the pool's `attach_args()` already produces `--cwd <path>` in its args, so the SSH `cd` prefix may be redundant for pool-based attaches — verify during implementation and remove if so.
+
 Phase C adds `EnterEnvironment` hops to both entry points.
 
 ### HopResolver
@@ -190,7 +192,7 @@ A single pure function that converts `Vec<Arg>` to a shell command string for sh
 fn flatten(args: &[Arg], depth: usize) -> String;
 ```
 
-Walks the `Arg` tree. `Bare` values pass through. `Quoted` values get shell-quoted appropriate to the current depth. `NestedCommand` recurses at `depth + 1`. This is the only place quoting logic lives for shell-backed attach paths.
+Walks the `Arg` tree. `Literal` values pass through verbatim. `Quoted` values get shell-quoted appropriate to the current depth. `NestedCommand` recurses at `depth + 1`. This is the only place quoting logic lives for shell-backed attach paths.
 
 ### TerminalPool Changes
 
@@ -213,33 +215,37 @@ trait TerminalPool: Send + Sync {
 }
 ```
 
-Each pool implementation (cleat, shpool, passthrough) adds `attach_args()` returning `[Bare("cleat"), Bare("attach"), Quoted(session_name), ...]`. The existing `attach_command()` stays as a convenience wrapper for any callers that just need a flat string.
+Each pool implementation (cleat, shpool, passthrough) adds `attach_args()` returning `[Literal("cleat"), Literal("attach"), Quoted(session_name), ...]`. The existing `attach_command()` stays as a convenience wrapper for any callers that just need a flat string.
 
 ### Protocol / Step Data Changes
 
-The distributed workspace flow currently serializes pane attach commands as already-flattened strings:
+The distributed workspace flow uses `PreparedTerminalCommand` for two distinct purposes:
 
 ```rust
+// Request: "here's the startup command I want" (e.g., "bash", "claude")
+// Passed INTO prepare_terminal_commands() — also used as fallback when allocation fails
 struct PreparedTerminalCommand {
     role: String,
     command: String,
 }
 ```
 
-That is exactly where the current double-escaping problem crosses the host boundary. Phase A should change this payload to carry structured shell args instead:
+This type stays as-is for the request path and fallback semantics. A new type carries structured resolved commands from the target host to the presentation host:
 
 ```rust
-struct PreparedTerminalCommand {
+// Response: "here's the resolved attach command with structured args"
+// Produced by terminal preparation, consumed by workspace creation
+struct ResolvedPaneCommand {
     role: String,
-    command: Vec<Arg>,
+    args: Vec<Arg>,
 }
 ```
 
-`PrepareTerminalForCheckout` on the target host produces these structured commands after allocating terminals and calling `attach_args()`. `CreateWorkspaceFromPreparedTerminal` carries them to the presentation host, which wraps them through the hop chain and flattens once at the edge when building workspace pane config.
+`PrepareTerminalForCheckout` on the target host produces `ResolvedPaneCommand`s after allocating terminals and calling `attach_args()`. `CreateWorkspaceFromPreparedTerminal` receives these on the presentation host, wraps each through the hop chain, and flattens once at the edge when building workspace pane config. If allocation fails, the fallback path still uses the original `PreparedTerminalCommand.command` string.
 
-`Arg` needs serde support since it crosses the host boundary. Use adjacently tagged representation (`{"type": "Quoted", "value": "..."}`) for debuggability — the serialized form should be readable in logs and protocol traces.
+`Arg` needs serde support since `ResolvedPaneCommand` crosses the host boundary. Use adjacently tagged representation (`#[serde(tag = "type", content = "value")]`) for debuggability — the serialized form should be readable in logs and protocol traces.
 
-**Coordinated deployment:** changing `PreparedTerminalCommand.command` from `String` to `Vec<Arg>` means both the producing host (step 5) and consuming host (step 9) must be at the same version. In a multi-host mesh, deploy steps 4-5 and 9 together across all hosts. Acceptable in the current "no backwards compatibility" phase.
+**Coordinated deployment:** introducing `ResolvedPaneCommand` means both the producing host and consuming host must understand the new type. In a multi-host mesh, deploy together. Acceptable in the current "no backwards compatibility" phase.
 
 ### Consumers
 
@@ -263,8 +269,8 @@ Each step keeps the system working:
 1. Introduce types (`Hop`, `Arg`, `ResolvedAction`, etc.) in new `hop_chain` module
 2. Implement `flatten()` with tests for depth-0, depth-1, depth-2 quoting
 3. Add `attach_args()` to `TerminalPool` trait — implement for cleat, shpool, passthrough
-4. Change `PreparedTerminalCommand.command` from `String` to `Vec<Arg>` in protocol + step plumbing
-5. Update terminal preparation so `PrepareTerminalForCheckout` produces structured pane commands using `attach_args()` instead of flattening early
+4. Introduce `ResolvedPaneCommand { role, args: Vec<Arg> }` in protocol. `PreparedTerminalCommand` stays as-is for request/fallback path.
+5. Update terminal preparation so `PrepareTerminalForCheckout` produces `ResolvedPaneCommand`s using `attach_args()` instead of flattening early. Deploy steps 4-5 atomically.
 6. Build `RemoteHopResolver` — extract from `wrap_remote_attach_commands()` and `remote_ssh_info()`
 7. Build `HopResolver` — compose per-hop resolvers, add direct `RunCommand` leaf handling, implement pop-wrap-push
 8. Build `HopPlanBuilder` entry points for both `AttachableId` and prepared pane commands
@@ -276,18 +282,18 @@ Each step keeps the system working:
 
 The tree structure makes each layer independently testable:
 
-- **`flatten()` unit tests** — depth-0/1/2 quoting, mixed Bare/Quoted/Nested, edge cases (quotes in values, spaces, special chars)
+- **`flatten()` unit tests** — depth-0/1/2 quoting, mixed Literal/Quoted/Nested, edge cases (quotes in values, spaces, special chars)
 - **Per-hop resolver tests** — given config, produce expected `Vec<Arg>` tree. Pure functions, no I/O.
 - **Protocol / step-data tests** — `PreparedTerminalCommand` serde round-trip with nested args, and step resolver tests proving structured pane commands survive the remote-to-local handoff without flattening.
 - **`HopResolver` tests** — given plan and context, produce expected `ResolvedPlan`. Test collapse, wrapping, sendkeys boundaries, pop-wrap-push mechanics. Run the same plans through `AlwaysWrap` and `AlwaysSendKeys` strategies to verify both paths produce valid output. Include a collapse test: local-only attach where `RemoteToHost(local_host)` is a no-op.
 - **`HopPlanBuilder` tests** — given attachables and hosts, produce expected `HopPlan` for `build_for_attachable()`, and verify `build_for_prepared_command()` produces the expected remote wrapper shape.
 - **End-to-end flatten tests** — given a structured prepared command with known host affinity, final flattened string matches expected output (regression against old `wrap_remote_attach_commands()` behavior).
 - **Snapshot tests** — pretty-printed `Arg` trees for common scenarios (local attach, remote attach, future 3-hop).
-- **Debug rendering tests** — verify the tree pretty-prints readably for tracing output. Format: indented by nesting depth, `Bare` values unadorned, `Quoted` values in quotes, `NestedCommand` children indented one level. Useful for `debug!()` traces when diagnosing attach failures.
+- **Debug rendering tests** — verify the tree pretty-prints readably for tracing output. Format: indented by nesting depth, `Literal` values unadorned, `Quoted` values in quotes, `NestedCommand` children indented one level. Useful for `debug!()` traces when diagnosing attach failures.
 
 ## Open Questions
 
 - **`CloudAgentService::attach_command()`** — teleport commands (`claude --teleport`, `agent --resume`) are a separate attach path that doesn't go through `TerminalPool`. For Phase A these stay as strings — they're single commands with no nesting. Phase C may revisit if environment hops need to wrap agent attach commands.
-- **Depth-aware quoting strategy** — should `flatten()` use single quotes at depth 0 and double quotes at depth 1 (matching current behavior), or adopt a uniform strategy? Need to verify compatibility with `ssh` and `docker exec` argument passing.
+- **Depth-aware quoting detail** — `Quoted` values are always single-quoted (no expansion, safest default). `Literal` is used for intentional shell expansion tokens (`$SHELL`, `&&`). Verify during implementation that single-quoting at all depths is compatible with SSH and `docker exec` argument passing — the current code uses single quotes at depth 0 and double quotes at depth 1, which may be necessary for `$SHELL` expansion inside `NestedCommand`. If so, `flatten()` may need depth-aware quoting for the `NestedCommand` boundary specifically.
 - **Non-shell transports** — once a transport cannot be faithfully represented as a shell command string, add a richer `ResolvedAction` variant (e.g. argv exec / delegated remote execution) instead of stretching `Arg` beyond shell-backed use.
-- **`nesting_depth` on `ResolutionContext`** — used by resolvers to inform strategy decisions (e.g., prefer sendkeys over wrapping at deep nesting) and for debug rendering. Exact thresholds to be determined during implementation.
+- **`nesting_depth` on `ResolutionContext`** — incremented during resolution each time a hop wraps (pop-combine-push), so `CombineStrategy` can use it. `flatten()` has its own separate `depth` parameter for rendering. Exact strategy thresholds to be determined during implementation.
