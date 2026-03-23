@@ -175,6 +175,20 @@ impl RemoteHopResolver for SshRemoteHopResolver {
     }
 }
 
+/// No-op remote hop resolver that always errors. Used when the hop plan
+/// contains no `RemoteToHost` hops (e.g. local-only attach).
+pub struct NoopRemoteHopResolver;
+
+impl RemoteHopResolver for NoopRemoteHopResolver {
+    fn resolve_wrap(&self, host: &HostName, _context: &mut ResolutionContext) -> Result<(), String> {
+        Err(format!("no remote transport available to reach host: {host}"))
+    }
+
+    fn resolve_enter(&self, host: &HostName, _context: &mut ResolutionContext) -> Result<(), String> {
+        Err(format!("no remote transport available to reach host: {host}"))
+    }
+}
+
 /// Create an `SshRemoteHopResolver` by loading hosts config from disk.
 pub fn ssh_resolver_from_config(config_base: &Path) -> Result<SshRemoteHopResolver, String> {
     let config = crate::config::ConfigStore::with_base(config_base);

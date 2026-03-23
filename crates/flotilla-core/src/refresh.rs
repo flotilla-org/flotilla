@@ -205,7 +205,8 @@ async fn refresh_providers(
     };
 
     let terminal_manager = registry.terminal_pools.preferred_with_desc().map(|(desc, tp)| {
-        let tm = crate::terminal_manager::TerminalManager::new(Arc::clone(tp), attachable_store.clone());
+        let tm =
+            crate::terminal_manager::TerminalManager::new(Arc::clone(tp), attachable_store.clone(), flotilla_protocol::HostName::local());
         (desc.display_name.clone(), tm)
     });
     let tp_fut = async {

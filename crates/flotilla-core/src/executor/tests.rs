@@ -2257,7 +2257,7 @@ fn resolve_checkout_branch_query_ambiguous() {
 async fn resolve_workspace_commands_no_template_uses_default() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
         working_directory: PathBuf::from("/repo/wt"),
@@ -2280,7 +2280,7 @@ async fn resolve_workspace_commands_no_template_uses_default() {
 async fn resolve_workspace_commands_skips_non_terminal_content() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
     let yaml = r#"
 content:
   - role: docs
@@ -2306,7 +2306,7 @@ content:
 async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
 
     let service = super::terminals::TerminalPreparationService::new(&tm, None);
     let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }, PreparedTerminalCommand {
@@ -2332,7 +2332,7 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
 async fn resolve_workspace_commands_invalid_template_uses_default() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store);
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
         working_directory: PathBuf::from("/repo/wt"),

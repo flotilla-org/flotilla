@@ -1,10 +1,17 @@
 use std::{path::PathBuf, sync::Arc};
 
-use flotilla_protocol::{AttachableId, AttachableSet, AttachableSetId, HostName, HostPath, TerminalStatus};
+use flotilla_protocol::{arg, AttachableId, AttachableSet, AttachableSetId, HostName, HostPath, TerminalStatus};
 use tracing::warn;
 
 use crate::{
     attachable::{Attachable, AttachableContent, SharedAttachableStore, TerminalAttachable, TerminalPurpose},
+    hop_chain::{
+        builder::HopPlanBuilder,
+        remote::NoopRemoteHopResolver,
+        resolver::{AlwaysWrap, HopResolver},
+        terminal::PoolTerminalHopResolver,
+        ResolutionContext, ResolvedAction,
+    },
     providers::terminal::{TerminalEnvVars, TerminalPool},
 };
 
@@ -30,11 +37,12 @@ pub struct TerminalInfo {
 pub struct TerminalManager {
     pool: Arc<dyn TerminalPool>,
     store: SharedAttachableStore,
+    local_host: HostName,
 }
 
 impl TerminalManager {
-    pub fn new(pool: Arc<dyn TerminalPool>, store: SharedAttachableStore) -> Self {
-        Self { pool, store }
+    pub fn new(pool: Arc<dyn TerminalPool>, store: SharedAttachableStore, local_host: HostName) -> Self {
+        Self { pool, store, local_host }
     }
 
     /// Returns the existing `AttachableSet` for the given checkout, or creates a new one.
@@ -113,22 +121,39 @@ impl TerminalManager {
     }
 
     /// Returns the command string needed to attach to a terminal session.
-    /// Injects `FLOTILLA_ATTACHABLE_ID` and optionally `FLOTILLA_DAEMON_SOCKET` env vars.
+    ///
+    /// Uses the hop chain internally: builds a `HopPlan` via `HopPlanBuilder::build_for_attachable()`,
+    /// resolves it with `PoolTerminalHopResolver` + `AlwaysWrap`, and flattens to a string.
+    /// For local attach (same-host), the plan is just `[AttachTerminal(id)]` with no remote hop.
     pub async fn attach_command(&self, attachable_id: &AttachableId, daemon_socket_path: Option<&str>) -> Result<String, String> {
-        let (command, cwd) = {
+        let plan = {
             let store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
-            let attachable =
-                store.registry().attachables.get(attachable_id).ok_or_else(|| format!("attachable not found: {attachable_id}"))?;
-            match &attachable.content {
-                AttachableContent::Terminal(t) => (t.command.clone(), t.working_directory.clone()),
-            }
+            let builder = HopPlanBuilder::new(&self.local_host);
+            builder.build_for_attachable(attachable_id, &*store)?
         };
-        let mut env_vars: TerminalEnvVars = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), attachable_id.to_string())];
-        if let Some(socket) = daemon_socket_path {
-            env_vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.to_string()));
-        }
-        let session_name = attachable_id.to_string();
-        self.pool.attach_command(&session_name, &command, &cwd, &env_vars).await
+
+        let terminal_resolver =
+            PoolTerminalHopResolver::new(Arc::clone(&self.pool), self.store.clone(), daemon_socket_path.map(|s| s.to_string()));
+        let hop_resolver =
+            HopResolver { remote: Arc::new(NoopRemoteHopResolver), terminal: Arc::new(terminal_resolver), strategy: Arc::new(AlwaysWrap) };
+
+        let mut context = ResolutionContext {
+            current_host: self.local_host.clone(),
+            current_environment: None,
+            working_directory: None,
+            actions: Vec::new(),
+            nesting_depth: 0,
+        };
+        let resolved = hop_resolver.resolve(&plan, &mut context)?;
+
+        resolved
+            .0
+            .into_iter()
+            .find_map(|action| match action {
+                ResolvedAction::Command(args) => Some(arg::flatten(&args, 0)),
+                _ => None,
+            })
+            .ok_or_else(|| "hop chain resolution produced no Command action for attach".to_string())
     }
 
     /// Returns a structured `Arg` tree for attaching to a terminal session.
@@ -333,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn allocate_set_creates_store_entry() {
         let store = shared_in_memory_attachable_store();
-        let mgr = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone());
+        let mgr = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
 
@@ -347,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn allocate_terminal_creates_attachable() {
         let store = shared_in_memory_attachable_store();
-        let mgr = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone());
+        let mgr = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id =
@@ -372,7 +397,7 @@ mod tests {
     async fn ensure_running_delegates_to_pool() {
         let store = shared_in_memory_attachable_store();
         let pool = MockTerminalPool::new();
-        let mgr = TerminalManager::new(Arc::new(pool), store.clone());
+        let mgr = TerminalManager::new(Arc::new(pool), store.clone(), test_host());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id = mgr.allocate_terminal(set_id, "shell", 0, "feat", "bash", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
@@ -433,7 +458,7 @@ mod tests {
             }
         }
 
-        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone());
+        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone(), test_host());
         let _ = mock; // silence unused warning
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
@@ -491,7 +516,7 @@ mod tests {
             }
         }
 
-        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone());
+        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone(), test_host());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id =
@@ -539,7 +564,7 @@ mod tests {
             }
         }
 
-        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone());
+        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone(), test_host());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id = mgr.allocate_terminal(set_id, "shell", 0, "feat", "bash", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
@@ -559,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_updates_statuses() {
         let store = shared_in_memory_attachable_store();
-        let mgr_for_setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone());
+        let mgr_for_setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
 
         let set_id = mgr_for_setup.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id =
@@ -572,7 +597,7 @@ mod tests {
             command: Some("bash".to_string()),
             working_directory: Some(PathBuf::from("/repo/wt-feat")),
         }]);
-        let mgr = TerminalManager::new(Arc::new(pool), store.clone());
+        let mgr = TerminalManager::new(Arc::new(pool), store.clone(), test_host());
 
         let infos = mgr.refresh().await.expect("refresh");
         assert_eq!(infos.len(), 1);
@@ -585,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_reports_disconnected_for_missing_sessions() {
         let store = shared_in_memory_attachable_store();
-        let mgr_for_setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone());
+        let mgr_for_setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
 
         let set_id = mgr_for_setup.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id =
@@ -593,7 +618,7 @@ mod tests {
 
         // Pool returns empty — no live sessions.
         let pool = MockTerminalPool::new();
-        let mgr = TerminalManager::new(Arc::new(pool), store.clone());
+        let mgr = TerminalManager::new(Arc::new(pool), store.clone(), test_host());
 
         let infos = mgr.refresh().await.expect("refresh");
         assert_eq!(infos.len(), 1);
@@ -628,7 +653,7 @@ mod tests {
             }
         }
 
-        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone());
+        let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone(), test_host());
 
         let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
         let att_id_1 =

@@ -337,7 +337,10 @@ pub(crate) struct ExecutorStepResolver {
 impl ExecutorStepResolver {
     /// Construct a `TerminalManager` from the registry's preferred terminal pool, if one exists.
     fn terminal_manager(&self) -> Option<TerminalManager> {
-        self.registry.terminal_pools.preferred().map(|pool| TerminalManager::new(Arc::clone(pool), self.attachable_store.clone()))
+        self.registry
+            .terminal_pools
+            .preferred()
+            .map(|pool| TerminalManager::new(Arc::clone(pool), self.attachable_store.clone(), self.local_host.clone()))
     }
 }
 
