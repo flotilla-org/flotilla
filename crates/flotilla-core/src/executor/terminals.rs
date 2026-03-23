@@ -175,6 +175,11 @@ fn parse_workspace_template(config: &WorkspaceConfig) -> WorkspaceTemplate {
     }
 }
 
+// Legacy string-based SSH wrapping. No longer used in production code (replaced
+// by the hop chain in Task 11). Retained for existing unit tests until Task 13
+// removes them entirely.
+
+#[cfg(test)]
 pub(super) fn wrap_remote_attach_commands(
     target_host: &HostName,
     checkout_path: &Path,
@@ -215,11 +220,13 @@ pub(super) fn wrap_remote_attach_commands(
         .collect())
 }
 
+#[cfg(test)]
 struct RemoteSshInfo {
     target: String,
     multiplex: bool,
 }
 
+#[cfg(test)]
 fn remote_ssh_info(target_host: &HostName, config_base: &Path) -> Result<RemoteSshInfo, String> {
     let config = crate::config::ConfigStore::with_base(config_base);
     let hosts = config.load_hosts()?;
@@ -236,10 +243,12 @@ fn remote_ssh_info(target_host: &HostName, config_base: &Path) -> Result<RemoteS
     Ok(RemoteSshInfo { target, multiplex })
 }
 
+#[cfg(test)]
 fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
 }
 
+#[cfg(test)]
 pub(super) fn escape_for_double_quotes(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {

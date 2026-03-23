@@ -1,11 +1,18 @@
 use std::{path::Path, sync::Arc};
 
-use flotilla_protocol::{AttachableSetId, HostName, HostPath, PreparedTerminalCommand};
+use flotilla_protocol::{arg, AttachableSetId, HostName, HostPath, ResolvedPaneCommand};
 use tracing::{info, warn};
 
 use super::{local_workspace_directory, terminals::TerminalPreparationService, workspace_config};
 use crate::{
     attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
+    hop_chain::{
+        builder::HopPlanBuilder,
+        remote::ssh_resolver_from_config,
+        resolver::{AlwaysWrap, HopResolver},
+        terminal::NoopTerminalHopResolver,
+        ResolutionContext, ResolvedAction,
+    },
     providers::{registry::ProviderRegistry, workspace::WorkspaceManager},
     step::StepOutcome,
     terminal_manager::TerminalManager,
@@ -84,21 +91,22 @@ impl<'a> WorkspaceOrchestrator<'a> {
         branch: &str,
         checkout_path: &Path,
         attachable_set_id: Option<&AttachableSetId>,
-        commands: &[PreparedTerminalCommand],
+        commands: &[ResolvedPaneCommand],
     ) -> Result<(), String> {
         let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
             return Ok(());
         };
 
-        let wrapped = super::terminals::wrap_remote_attach_commands(target_host, checkout_path, commands, self.config_base)?;
+        let resolved_commands =
+            resolve_prepared_commands_via_hop_chain(target_host, checkout_path, commands, self.config_base, self.local_host)?;
 
         // The workspace itself is local to the presentation host, so its
         // working directory only needs to be a valid local directory.
-        // The wrapped attach commands handle entering the remote checkout path.
+        // The resolved commands handle entering the remote checkout path.
         let working_dir = local_workspace_directory(self.repo_root, self.config_base);
         let remote_name = format!("{branch}@{target_host}");
         let mut config = workspace_config(self.repo_root, &remote_name, &working_dir, "claude", self.config_base);
-        config.resolved_commands = Some(wrapped.into_iter().map(|cmd| (cmd.role, cmd.command)).collect());
+        config.resolved_commands = Some(resolved_commands);
 
         match ws_mgr.create_workspace(&config).await {
             Ok((ws_ref, _workspace)) => {
@@ -220,4 +228,48 @@ impl<'a> WorkspaceOrchestrator<'a> {
             }
         }
     }
+}
+
+/// Resolve prepared pane commands through the hop chain, producing `(role, command_string)` pairs
+/// suitable for workspace manager consumption.
+///
+/// For each `ResolvedPaneCommand`, builds a `HopPlan` via `HopPlanBuilder::build_for_prepared_command`,
+/// resolves it with `SshRemoteHopResolver` + `AlwaysWrap`, and flattens the resulting `Command` to a string.
+fn resolve_prepared_commands_via_hop_chain(
+    target_host: &HostName,
+    checkout_path: &Path,
+    commands: &[ResolvedPaneCommand],
+    config_base: &Path,
+    local_host: &HostName,
+) -> Result<Vec<(String, String)>, String> {
+    let ssh_resolver = ssh_resolver_from_config(config_base)?;
+    let hop_resolver =
+        HopResolver { remote: Arc::new(ssh_resolver), terminal: Arc::new(NoopTerminalHopResolver), strategy: Arc::new(AlwaysWrap) };
+    let plan_builder = HopPlanBuilder::new(local_host);
+
+    let mut result = Vec::with_capacity(commands.len());
+    for cmd in commands {
+        let plan = plan_builder.build_for_prepared_command(target_host, &cmd.args);
+        let mut context = ResolutionContext {
+            current_host: local_host.clone(),
+            current_environment: None,
+            working_directory: Some(checkout_path.to_path_buf()),
+            actions: Vec::new(),
+            nesting_depth: 0,
+        };
+        let resolved = hop_resolver.resolve(&plan, &mut context)?;
+
+        // The resolved plan should contain exactly one Command action for wrap mode
+        let command_string = resolved
+            .0
+            .into_iter()
+            .find_map(|action| match action {
+                ResolvedAction::Command(args) => Some(arg::flatten(&args, 0)),
+                _ => None,
+            })
+            .ok_or_else(|| format!("hop chain resolution produced no Command action for role '{}'", cmd.role))?;
+
+        result.push((cmd.role.clone(), command_string));
+    }
+    Ok(result)
 }

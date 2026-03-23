@@ -470,15 +470,6 @@ impl StepResolver for ExecutorStepResolver {
                 }
             }
             StepAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
-                // Temporary bridge: flatten ResolvedPaneCommand args back to strings
-                // for the existing workspace orchestrator. Task 11 will wire in the hop chain.
-                let flat_commands: Vec<flotilla_protocol::PreparedTerminalCommand> = commands
-                    .into_iter()
-                    .map(|cmd| flotilla_protocol::PreparedTerminalCommand {
-                        role: cmd.role,
-                        command: flotilla_protocol::arg::flatten(&cmd.args, 0),
-                    })
-                    .collect();
                 let tm = self.terminal_manager();
                 let workspace_orchestrator = WorkspaceOrchestrator::new(
                     &self.repo.root,
@@ -490,13 +481,7 @@ impl StepResolver for ExecutorStepResolver {
                     tm.as_ref(),
                 );
                 workspace_orchestrator
-                    .create_workspace_from_prepared_terminal(
-                        &target_host,
-                        &branch,
-                        &checkout_path,
-                        attachable_set_id.as_ref(),
-                        &flat_commands,
-                    )
+                    .create_workspace_from_prepared_terminal(&target_host, &branch, &checkout_path, attachable_set_id.as_ref(), &commands)
                     .await?;
                 Ok(StepOutcome::Completed)
             }

@@ -52,3 +52,14 @@ impl TerminalHopResolver for PoolTerminalHopResolver {
         Ok(())
     }
 }
+
+/// No-op terminal hop resolver that always errors. Used when the hop plan
+/// contains no `AttachTerminal` hops (e.g. prepared command plans that only
+/// have `RemoteToHost` + `RunCommand`).
+pub struct NoopTerminalHopResolver;
+
+impl TerminalHopResolver for NoopTerminalHopResolver {
+    fn resolve(&self, attachable_id: &AttachableId, _context: &mut ResolutionContext) -> Result<(), String> {
+        Err(format!("no terminal pool available to resolve attachable: {attachable_id}"))
+    }
+}
