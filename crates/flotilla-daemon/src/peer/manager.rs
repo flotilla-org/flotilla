@@ -1315,73 +1315,11 @@ impl PeerManager {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use tokio::sync::mpsc;
-
-    use super::{super::transport::PeerConnectionStatus, *};
-    use crate::peer::test_support::{ensure_test_connection_generation, handle_test_peer_data};
-
-    struct MockPeerSender {
-        sent: Arc<Mutex<Vec<PeerWireMessage>>>,
-    }
-
-    #[async_trait]
-    impl PeerSender for MockPeerSender {
-        async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
-            self.sent.lock().expect("lock poisoned").push(msg);
-            Ok(())
-        }
-
-        async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
-            self.sent.lock().expect("lock poisoned").push(PeerWireMessage::Goodbye { reason });
-            Ok(())
-        }
-    }
-
-    /// Mock transport that tracks connection status and optionally exposes a sender.
-    struct MockTransport {
-        status: PeerConnectionStatus,
-        sender: Option<Arc<dyn PeerSender>>,
-    }
-
-    impl MockTransport {
-        fn new() -> Self {
-            Self { status: PeerConnectionStatus::Connected, sender: None }
-        }
-
-        fn with_sender() -> (Self, Arc<Mutex<Vec<PeerWireMessage>>>) {
-            let sent = Arc::new(Mutex::new(Vec::new()));
-            let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
-            let transport = Self { status: PeerConnectionStatus::Connected, sender: Some(sender) };
-            (transport, sent)
-        }
-    }
-
-    #[async_trait]
-    impl PeerTransport for MockTransport {
-        async fn connect(&mut self) -> Result<(), String> {
-            self.status = PeerConnectionStatus::Connected;
-            Ok(())
-        }
-
-        async fn disconnect(&mut self) -> Result<(), String> {
-            self.status = PeerConnectionStatus::Disconnected;
-            Ok(())
-        }
-
-        fn status(&self) -> PeerConnectionStatus {
-            self.status.clone()
-        }
-
-        async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
-            let (_tx, rx) = mpsc::channel(1);
-            Ok(rx)
-        }
-
-        fn sender(&self) -> Option<Arc<dyn PeerSender>> {
-            self.sender.clone()
-        }
-    }
+    use super::*;
+    use crate::peer::{
+        test_support::{ensure_test_connection_generation, handle_test_peer_data, MockPeerSender, MockTransport},
+        PeerConnectionStatus,
+    };
 
     fn test_repo() -> RepoIdentity {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }

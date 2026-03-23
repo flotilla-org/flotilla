@@ -8,7 +8,6 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use async_trait::async_trait;
 use flotilla_core::{
     agents::AgentEntry,
     config::ConfigStore,
@@ -18,9 +17,9 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
-    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, GoodbyeReason, HostName, HostPath, HostSummary, Message, PeerConnectionState,
-    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, Request, Response, ResponseResult,
-    RoutedPeerMessage, StreamKey, VectorClock, PROTOCOL_VERSION,
+    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, HostName, HostPath, HostSummary, Message, PeerConnectionState, PeerDataKind,
+    PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage,
+    StreamKey, VectorClock, PROTOCOL_VERSION,
 };
 use indexmap::IndexMap;
 use tokio::{
@@ -44,49 +43,9 @@ use super::{
     DaemonServer, PeerConnectedNotice,
 };
 use crate::peer::{
-    test_support::{ensure_test_connection_generation, handle_test_peer_data},
+    test_support::{ensure_test_connection_generation, handle_test_peer_data, wait_for_command_result, BlockingPeerSender, MockPeerSender},
     PeerManager, PeerSender,
 };
-
-struct CapturePeerSender {
-    sent: Arc<StdMutex<Vec<PeerWireMessage>>>,
-}
-
-#[async_trait]
-impl PeerSender for CapturePeerSender {
-    async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
-        self.sent.lock().expect("lock").push(msg);
-        Ok(())
-    }
-
-    async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
-        self.sent.lock().expect("lock").push(PeerWireMessage::Goodbye { reason });
-        Ok(())
-    }
-}
-
-struct BlockingPeerSender {
-    started: Arc<Notify>,
-    release: Arc<Notify>,
-    sent: Arc<StdMutex<Vec<PeerWireMessage>>>,
-}
-
-#[async_trait]
-impl PeerSender for BlockingPeerSender {
-    async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
-        self.started.notify_waiters();
-        self.release.notified().await;
-        self.sent.lock().expect("lock").push(msg);
-        Ok(())
-    }
-
-    async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
-        self.started.notify_waiters();
-        self.release.notified().await;
-        self.sent.lock().expect("lock").push(PeerWireMessage::Goodbye { reason });
-        Ok(())
-    }
-}
 
 fn ok_response(msg: Message, expected_id: u64) -> Response {
     match msg {
@@ -224,20 +183,6 @@ fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, che
             seq: 1,
         },
     }
-}
-
-async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
-    tokio::time::timeout(StdDuration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => return result,
-                Ok(_) => continue,
-                Err(e) => panic!("recv error: {e:?}"),
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for command result")
 }
 
 #[tokio::test]
@@ -509,7 +454,7 @@ async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
         });
 
         ensure_test_connection_generation(&mut pm, &HostName::new("remote"), || {
-            Arc::new(CapturePeerSender { sent: Arc::new(StdMutex::new(Vec::new())) })
+            Arc::new(MockPeerSender { sent: Arc::new(StdMutex::new(Vec::new())) })
         });
     }
 
@@ -531,7 +476,7 @@ async fn dispatch_request_execute_remote_routes_command_through_peer_manager() {
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(HostName::new("feta"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.register_sender(HostName::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
     let remote_command_router = make_remote_command_router(
         &daemon,
@@ -582,7 +527,7 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(HostName::new("feta"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.register_sender(HostName::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
 
     pending_remote_commands.lock().await.insert(91, PendingRemoteCommand {
         command_id: 1u64 << 62,
@@ -677,7 +622,7 @@ async fn cancel_forwarded_command_waits_for_launching_registration() {
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -731,7 +676,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -823,7 +768,7 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
         })
         .await
         .expect("dispatch checkout");
-    let checkout_result = wait_for_command_result(&mut setup_rx, checkout_id).await;
+    let checkout_result = wait_for_command_result(&mut setup_rx, checkout_id, StdDuration::from_secs(5)).await;
     match checkout_result {
         CommandValue::CheckoutCreated { branch, path } => {
             assert_eq!(branch, "feat-remote");
@@ -849,7 +794,7 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -972,7 +917,7 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -1364,7 +1309,7 @@ async fn send_local_to_peer_sends_host_summary_for_empty_daemon() {
     let peer = HostName::new("remote-host");
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    let sender: Arc<dyn PeerSender> = Arc::new(CapturePeerSender { sent: Arc::clone(&sent) });
+    let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
     let generation = {
         let mut pm = peer_manager.lock().await;
         ensure_test_connection_generation(&mut pm, &peer, || Arc::clone(&sender))
@@ -1384,7 +1329,7 @@ async fn forward_with_keepalive_times_out_after_silence() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(4);
     let (_inbound_tx, mut inbound_rx) = mpsc::channel(4);
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    let sender: Arc<dyn PeerSender> = Arc::new(CapturePeerSender { sent: Arc::clone(&sent) });
+    let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -1528,7 +1473,7 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
         pm.register_remote_repo(repo_identity.clone(), synthetic.clone());
         let peer = HostName::new("peer-a");
         let previous_generation = pm.current_generation(&peer).expect("peer-a should already have an active test connection");
-        let second_sender: Arc<dyn PeerSender> = Arc::new(CapturePeerSender { sent: Arc::new(StdMutex::new(Vec::new())) });
+        let second_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::new(StdMutex::new(Vec::new())) });
         match pm.activate_connection_with_session(
             peer.clone(),
             second_sender,
@@ -1933,7 +1878,7 @@ async fn cancel_before_execute_registration_finds_entry() {
         &next_remote_command_id,
     );
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(CapturePeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.register_sender(HostName::new("relay"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
 
     // Pre-insert the Launching entry, mirroring the dispatch-loop fix.
     let ready = Arc::new(Notify::new());

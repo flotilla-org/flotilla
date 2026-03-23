@@ -2,6 +2,7 @@ pub mod channel_transport;
 pub mod manager;
 pub mod merge;
 pub mod ssh_transport;
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod transport;
 

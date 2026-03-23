@@ -10,9 +10,9 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
-use async_trait::async_trait;
 use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
@@ -20,76 +20,16 @@ use flotilla_core::{
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo},
 };
 use flotilla_daemon::peer::{
-    channel_transport_pair, merge::merge_provider_data, test_support::handle_test_peer_data, HandleResult, PeerConnectionStatus,
-    PeerManager, PeerSender, PeerTransport,
+    channel_transport_pair,
+    merge::merge_provider_data,
+    test_support::{handle_test_peer_data, wait_for_command_result, MockPeerSender, MockTransport},
+    HandleResult, PeerManager, PeerSender, PeerTransport,
 };
 use flotilla_protocol::{
-    test_support::TestCheckout, CheckoutTarget, Command, CommandAction, CommandValue, DaemonEvent, GoodbyeReason, HostName, HostPath,
-    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, VectorClock,
+    test_support::TestCheckout, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PeerDataKind, PeerDataMessage,
+    PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, VectorClock,
 };
 use indexmap::IndexMap;
-use tokio::sync::mpsc;
-
-// ---------------------------------------------------------------------------
-// Mock transport
-// ---------------------------------------------------------------------------
-
-struct MockTransport {
-    status: PeerConnectionStatus,
-    sender: Option<Arc<dyn PeerSender>>,
-}
-
-impl MockTransport {
-    fn with_sender() -> (Self, Arc<Mutex<Vec<PeerWireMessage>>>) {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
-        let transport = Self { status: PeerConnectionStatus::Connected, sender: Some(sender) };
-        (transport, sent)
-    }
-}
-
-struct MockPeerSender {
-    sent: Arc<Mutex<Vec<PeerWireMessage>>>,
-}
-
-#[async_trait]
-impl PeerSender for MockPeerSender {
-    async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
-        self.sent.lock().expect("lock poisoned").push(msg);
-        Ok(())
-    }
-
-    async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
-        self.sent.lock().expect("lock poisoned").push(PeerWireMessage::Goodbye { reason });
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl PeerTransport for MockTransport {
-    async fn connect(&mut self) -> Result<(), String> {
-        self.status = PeerConnectionStatus::Connected;
-        Ok(())
-    }
-
-    async fn disconnect(&mut self) -> Result<(), String> {
-        self.status = PeerConnectionStatus::Disconnected;
-        Ok(())
-    }
-
-    fn status(&self) -> PeerConnectionStatus {
-        self.status.clone()
-    }
-
-    async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok(rx)
-    }
-
-    fn sender(&self) -> Option<Arc<dyn PeerSender>> {
-        self.sender.clone()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -111,20 +51,6 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(data), seq },
     }
-}
-
-async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            match rx.recv().await {
-                Ok(DaemonEvent::CommandFinished { command_id: finished_id, result, .. }) if finished_id == command_id => return result,
-                Ok(_) => {}
-                Err(e) => panic!("recv error: {e:?}"),
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for command result")
 }
 
 async fn wait_for_local_checkout(daemon: &Arc<InProcessDaemon>, repo: &std::path::Path, branch: &str) -> ProviderData {
@@ -337,7 +263,7 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
         .await
         .expect("dispatch follower checkout");
 
-    let result = wait_for_command_result(&mut follower_rx, command_id).await;
+    let result = wait_for_command_result(&mut follower_rx, command_id, Duration::from_secs(10)).await;
     assert!(
         matches!(result, CommandValue::CheckoutCreated { ref branch, .. } if branch == "feat-remote"),
         "expected checkout creation on follower, got {result:?}"
