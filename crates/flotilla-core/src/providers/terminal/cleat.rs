@@ -98,37 +98,8 @@ impl TerminalPool for CleatTerminalPool {
 mod tests {
     use std::{path::Path, sync::Arc};
 
-    use async_trait::async_trait;
-
     use super::*;
-    use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
-
-    struct MockRunner {
-        responses: std::sync::Mutex<Vec<Result<String, String>>>,
-        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
-    }
-
-    impl MockRunner {
-        fn new(responses: Vec<Result<String, String>>) -> Self {
-            Self { responses: std::sync::Mutex::new(responses), calls: std::sync::Mutex::new(vec![]) }
-        }
-    }
-
-    #[async_trait]
-    impl CommandRunner for MockRunner {
-        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            self.calls.lock().expect("calls").push((cmd.into(), args.iter().map(|arg| (*arg).into()).collect()));
-            self.responses.lock().expect("responses").remove(0)
-        }
-
-        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), success: true })
-        }
-
-        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-            true
-        }
-    }
+    use crate::providers::{testing::MockRunner, CommandRunner};
 
     #[tokio::test]
     async fn list_sessions_parses_json() {
@@ -159,7 +130,7 @@ mod tests {
 
         pool.ensure_session("my-session", "bash", Path::new("/repo")).await.expect("ensure session");
 
-        let calls = runner.calls.lock().expect("calls");
+        let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cleat");
         assert_eq!(calls[0].1, vec!["create", "--json", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
@@ -183,7 +154,7 @@ mod tests {
 
         pool.kill_session("my-session").await.expect("kill session");
 
-        let calls = runner.calls.lock().expect("calls");
+        let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cleat");
         assert_eq!(calls[0].1, vec!["kill", "my-session"]);

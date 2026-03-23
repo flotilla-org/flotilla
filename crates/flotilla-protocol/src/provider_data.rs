@@ -341,11 +341,7 @@ pub struct ProviderData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_helpers::assert_roundtrip, HostName};
-
-    fn hp(path: &str) -> HostPath {
-        HostPath::new(HostName::new("test-host"), PathBuf::from(path))
-    }
+    use crate::{test_helpers::assert_roundtrip, test_support::hp};
 
     #[test]
     fn key_types_roundtrip_all_variants() {

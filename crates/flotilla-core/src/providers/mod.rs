@@ -363,22 +363,29 @@ pub(crate) mod testing {
     /// Each call to `run()` pops the next response from the queue.
     pub struct MockRunner {
         responses: std::sync::Mutex<VecDeque<Result<String, String>>>,
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl MockRunner {
         pub fn new(responses: Vec<Result<String, String>>) -> Self {
-            Self { responses: std::sync::Mutex::new(responses.into()) }
+            Self { responses: std::sync::Mutex::new(responses.into()), calls: std::sync::Mutex::new(vec![]) }
         }
 
         /// Returns the number of unconsumed canned responses.
         pub fn remaining(&self) -> usize {
             self.responses.lock().expect("MockRunner responses mutex not poisoned").len()
         }
+
+        /// Returns a snapshot of all recorded (cmd, args) calls made so far.
+        pub fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().expect("calls").clone()
+        }
     }
 
     #[async_trait]
     impl CommandRunner for MockRunner {
-        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.calls.lock().expect("calls").push((cmd.into(), args.iter().map(|a| (*a).into()).collect()));
             self.responses.lock().unwrap().pop_front().expect("MockRunner: no more responses")
         }
 

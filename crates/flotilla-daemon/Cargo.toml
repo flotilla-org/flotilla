@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = []
 skip-no-sandbox-tests = []
-test-support = []
+test-support = ["flotilla-protocol/test-support"]
 
 [dependencies]
 flotilla-core = { path = "../flotilla-core" }
@@ -28,4 +28,4 @@ tempfile = "3"
 flotilla-client = { path = "../flotilla-client" }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
-flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }

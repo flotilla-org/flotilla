@@ -9,6 +9,9 @@ pub mod provider_data;
 pub mod query;
 pub mod snapshot;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, SystemInfo, ToolInventory};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
@@ -245,10 +248,7 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
     use super::*;
-
-    fn hp(path: &str) -> HostPath {
-        HostPath::new(HostName::new("test-host"), PathBuf::from(path))
-    }
+    use crate::test_support::hp;
 
     fn sample_command() -> Command {
         Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/my-repo") } }

@@ -132,15 +132,12 @@ mod tests {
 
     use flotilla_protocol::{
         delta::{Branch, BranchStatus},
-        AttachableId, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, HostName, HostPath, Issue,
-        ManagedTerminal, ProviderError, SessionStatus, TerminalStatus, Workspace,
+        test_support::hp,
+        AttachableId, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, Issue, ManagedTerminal,
+        ProviderError, SessionStatus, TerminalStatus, Workspace,
     };
 
     use super::*;
-
-    fn hp(path: &str) -> HostPath {
-        HostPath::new(HostName::new("test-host"), PathBuf::from(path))
-    }
 
     fn checkout(branch: &str) -> Checkout {
         Checkout {

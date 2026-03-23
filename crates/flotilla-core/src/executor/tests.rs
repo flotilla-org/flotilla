@@ -35,6 +35,7 @@ fn desc(name: &str) -> ProviderDescriptor {
 }
 use async_trait::async_trait;
 use flotilla_protocol::{
+    test_support::{TestCheckout, TestIssue, TestSession},
     CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PreparedTerminalCommand, RepoSelector,
     TerminalStatus,
 };
@@ -271,42 +272,6 @@ fn config_base() -> PathBuf {
     PathBuf::from("/tmp/test-config")
 }
 
-fn make_checkout(branch: &str, _path: &str) -> Checkout {
-    Checkout {
-        branch: branch.to_string(),
-        is_main: false,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        correlation_keys: vec![],
-        association_keys: vec![],
-    }
-}
-
-fn make_session_for(provider: &str, id: &str) -> CloudAgentSession {
-    CloudAgentSession {
-        title: "test session".to_string(),
-        status: SessionStatus::Running,
-        model: None,
-        updated_at: None,
-        correlation_keys: vec![CorrelationKey::SessionRef(provider.to_string(), id.to_string())],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-        item_noun: String::new(),
-    }
-}
-
-fn make_issue(_id: &str, title: &str) -> Issue {
-    Issue {
-        title: title.to_string(),
-        labels: vec![],
-        association_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-    }
-}
-
 fn runner_ok() -> MockRunner {
     MockRunner::new(vec![])
 }
@@ -428,7 +393,7 @@ async fn create_workspace_for_checkout_not_found() {
 async fn create_workspace_for_checkout_success_without_ws_manager() {
     let registry = empty_registry();
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let path = PathBuf::from("/repo/wt-feat");
     let runner = runner_ok();
 
@@ -449,7 +414,7 @@ async fn archive_session_uses_provider_from_session_ref() {
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("wrong provider")));
     registry.cloud_agents.insert("cursor", desc("cursor"), Arc::new(MockCloudAgent::succeeding()));
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("cursor", "sess-1"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("cursor", "sess-1").build());
     let runner = runner_ok();
 
     let result =
@@ -463,7 +428,7 @@ async fn create_workspace_for_checkout_success_with_ws_manager() {
     let mut registry = empty_registry();
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let path = PathBuf::from("/repo/wt-feat");
     let runner = runner_ok();
 
@@ -485,7 +450,7 @@ async fn create_workspace_for_checkout_persists_workspace_binding() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
     let mut data = empty_data();
     let checkout_path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
     let attachable_store = test_attachable_store(temp.path());
@@ -515,7 +480,7 @@ async fn create_workspace_for_checkout_ws_manager_fails() {
     let mut registry = empty_registry();
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws creation failed")));
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let path = PathBuf::from("/repo/wt-feat");
     let runner = runner_ok();
 
@@ -534,7 +499,7 @@ async fn prepare_terminal_for_checkout_returns_terminal_commands() {
     let registry = empty_registry();
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -563,7 +528,7 @@ async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present()
     let registry = empty_registry();
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
     let attachable_store = test_attachable_store(temp.path());
@@ -603,7 +568,7 @@ async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
     let registry = empty_registry();
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
     let attachable_store = test_attachable_store(temp.path());
@@ -770,7 +735,7 @@ async fn create_workspace_for_checkout_selects_existing_workspace() {
     let mut registry = empty_registry();
     registry.workspace_managers.insert("cmux", desc("cmux"), ws_mgr.clone());
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -869,8 +834,8 @@ async fn teleport_session_creates_workspace_even_when_one_exists() {
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     registry.workspace_managers.insert("cmux", desc("cmux"), ws_mgr.clone());
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -898,8 +863,8 @@ async fn teleport_session_persists_workspace_binding() {
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
     let attachable_store = test_attachable_store(temp.path());
@@ -1045,7 +1010,7 @@ async fn create_checkout_success_ws_manager_fails_still_returns_created() {
 async fn remove_checkout_no_manager() {
     let registry = empty_registry();
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
+    data.checkouts.insert(hp("/repo/wt-old"), TestCheckout::new("old").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(remove_checkout_action("old"), registry, data, runner).await;
@@ -1058,7 +1023,7 @@ async fn remove_checkout_success() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
+    data.checkouts.insert(hp("/repo/wt-old"), TestCheckout::new("old").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(remove_checkout_action("old"), registry, data, runner).await;
@@ -1071,7 +1036,7 @@ async fn remove_checkout_failure() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("cannot remove trunk")));
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-main"), make_checkout("main", "/repo/wt-main"));
+    data.checkouts.insert(hp("/repo/wt-main"), TestCheckout::new("main").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(remove_checkout_action("main"), registry, data, runner).await;
@@ -1118,7 +1083,7 @@ async fn remove_checkout_succeeds_with_terminal_pool() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+    data.checkouts.insert(hp("/repo/wt-feat-x"), TestCheckout::new("feat-x").build());
 
     let runner = runner_ok();
     let result = run_build_plan_to_completion(remove_checkout_action("feat-x"), registry, data, runner).await;
@@ -1366,7 +1331,7 @@ async fn archive_session_not_found() {
 async fn archive_session_no_agent_provider() {
     let registry = empty_registry();
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result =
@@ -1380,7 +1345,7 @@ async fn archive_session_success() {
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result =
@@ -1394,7 +1359,7 @@ async fn archive_session_agent_fails() {
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("archive failed")));
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result =
@@ -1413,7 +1378,7 @@ async fn generate_branch_name_ai_success() {
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login")));
     registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueTracker));
     let mut data = empty_data();
-    data.issues.insert("42".to_string(), make_issue("42", "Add login feature"));
+    data.issues.insert("42".to_string(), TestIssue::new("Add login feature").build());
     let runner = runner_ok();
 
     let result =
@@ -1428,7 +1393,7 @@ async fn generate_branch_name_ai_failure_uses_fallback() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::failing("API error")));
     let mut data = empty_data();
-    data.issues.insert("42".to_string(), make_issue("42", "Add login"));
+    data.issues.insert("42".to_string(), TestIssue::new("Add login").build());
     let runner = runner_ok();
 
     let result =
@@ -1442,7 +1407,7 @@ async fn generate_branch_name_ai_failure_uses_fallback() {
 async fn generate_branch_name_no_ai_provider_uses_fallback() {
     let registry = empty_registry();
     let mut data = empty_data();
-    data.issues.insert("7".to_string(), make_issue("7", "Fix bug"));
+    data.issues.insert("7".to_string(), TestIssue::new("Fix bug").build());
     let runner = runner_ok();
 
     let result =
@@ -1458,8 +1423,8 @@ async fn generate_branch_name_multiple_issues() {
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/login-and-signup")));
     registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueTracker));
     let mut data = empty_data();
-    data.issues.insert("1".to_string(), make_issue("1", "Login feature"));
-    data.issues.insert("2".to_string(), make_issue("2", "Signup feature"));
+    data.issues.insert("1".to_string(), TestIssue::new("Login feature").build());
+    data.issues.insert("2".to_string(), TestIssue::new("Signup feature").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -1506,8 +1471,8 @@ async fn teleport_session_with_checkout_key() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -1529,8 +1494,8 @@ async fn teleport_session_uses_provider_specific_attach_command() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
-    data.sessions.insert("sess-1".to_string(), make_session_for("cursor", "sess-1"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("cursor", "sess-1").build());
     let runner = runner_ok();
 
     let attach = resolve_attach_command("sess-1", &registry, &data).await.expect("resolve attach command");
@@ -1554,7 +1519,7 @@ async fn teleport_session_with_branch_creates_checkout() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")));
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -1573,7 +1538,7 @@ async fn teleport_session_no_path_no_branch() {
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -1594,8 +1559,8 @@ async fn teleport_session_ws_manager_fails() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed")));
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -1617,8 +1582,8 @@ async fn teleport_session_uses_session_as_name_when_no_branch() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -1790,7 +1755,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+    data.checkouts.insert(hp("/repo/wt-feat-x"), TestCheckout::new("feat-x").build());
 
     let runner = runner_ok();
     let result = run_build_plan_to_completion_with(
@@ -1850,7 +1815,7 @@ async fn build_plan_create_checkout_skips_existing() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
     // Pre-populate with an existing checkout for the branch
-    data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+    data.checkouts.insert(hp("/repo/wt-feat-x"), TestCheckout::new("feat-x").build());
     let runner = runner_ok();
 
     let plan = run_build_plan(fresh_checkout_action("feat-x"), registry, data, runner).await;
@@ -1953,7 +1918,7 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     // validate_checkout_target needs 2 responses: local ref check (Ok), remote ref check
     let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Ok("".into()), Err("missing".into())]));
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat-x"), make_checkout("feat-x", "/repo/wt-feat-x"));
+    data.checkouts.insert(hp("/repo/wt-feat-x"), TestCheckout::new("feat-x").build());
     let providers_data = Arc::new(data);
     let cb = config_base();
     let attachable = test_attachable_store(&cb);
@@ -2057,8 +2022,8 @@ async fn build_plan_teleport_session_returns_steps() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat", "/repo/wt-feat"));
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let plan = run_build_plan(
@@ -2083,7 +2048,7 @@ async fn build_plan_remove_checkout_returns_steps() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-old"), make_checkout("old", "/repo/wt-old"));
+    data.checkouts.insert(hp("/repo/wt-old"), TestCheckout::new("old").build());
     let runner = runner_ok();
 
     let plan = run_build_plan(remove_checkout_action("old"), registry, data, runner).await;
@@ -2102,7 +2067,7 @@ async fn build_plan_archive_session_returns_steps() {
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), make_session_for("claude", "sess-1"));
+    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
 
     let plan = run_build_plan(CommandAction::ArchiveSession { session_id: "sess-1".to_string() }, registry, data, runner).await;
@@ -2121,7 +2086,7 @@ async fn build_plan_generate_branch_name_returns_steps() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login")));
     let mut data = empty_data();
-    data.issues.insert("42".to_string(), make_issue("42", "Add login feature"));
+    data.issues.insert("42".to_string(), TestIssue::new("Add login feature").build());
     let runner = runner_ok();
 
     let plan = run_build_plan(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, registry, data, runner).await;
@@ -2150,7 +2115,7 @@ async fn build_plan_archive_session_missing_session_returns_error() {
 #[tokio::test]
 async fn build_plan_generate_branch_name_without_ai_returns_fallback() {
     let mut data = empty_data();
-    data.issues.insert("42".to_string(), make_issue("42", "Add login feature"));
+    data.issues.insert("42".to_string(), TestIssue::new("Add login feature").build());
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -2183,7 +2148,7 @@ async fn build_plan_simple_command_returns_ok() {
 #[test]
 fn resolve_checkout_branch_path_found() {
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-branch", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-branch").build());
     let local_host = HostName::local();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/repo/wt-feat")), &data, &local_host);
@@ -2205,7 +2170,7 @@ fn resolve_checkout_branch_path_not_found() {
 #[test]
 fn resolve_checkout_branch_query_exact_match() {
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-login", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-login").build());
     let local_host = HostName::local();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("feat-login".to_string()), &data, &local_host);
@@ -2216,7 +2181,7 @@ fn resolve_checkout_branch_query_exact_match() {
 #[test]
 fn resolve_checkout_branch_query_substring_match() {
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-login-page", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-login-page").build());
     let local_host = HostName::local();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("login".to_string()), &data, &local_host);
@@ -2227,7 +2192,7 @@ fn resolve_checkout_branch_query_substring_match() {
 #[test]
 fn resolve_checkout_branch_query_not_found() {
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat"), make_checkout("feat-login", "/repo/wt-feat"));
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-login").build());
     let local_host = HostName::local();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("nonexistent".to_string()), &data, &local_host);
@@ -2239,8 +2204,8 @@ fn resolve_checkout_branch_query_not_found() {
 #[test]
 fn resolve_checkout_branch_query_ambiguous() {
     let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat-a"), make_checkout("feat-a", "/repo/wt-feat-a"));
-    data.checkouts.insert(hp("/repo/wt-feat-b"), make_checkout("feat-b", "/repo/wt-feat-b"));
+    data.checkouts.insert(hp("/repo/wt-feat-a"), TestCheckout::new("feat-a").build());
+    data.checkouts.insert(hp("/repo/wt-feat-b"), TestCheckout::new("feat-b").build());
     let local_host = HostName::local();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("feat".to_string()), &data, &local_host);

@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = []
 replay = []
-test-support = []
+test-support = ["flotilla-protocol/test-support"]
 
 [dependencies]
 flotilla-protocol = { path = "../flotilla-protocol" }
@@ -37,6 +37,7 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
 [dev-dependencies]
+flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 tempfile = "3"
 
 [[test]]
