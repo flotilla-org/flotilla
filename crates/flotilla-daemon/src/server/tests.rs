@@ -453,9 +453,7 @@ async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
             providers: vec![],
         });
 
-        ensure_test_connection_generation(&mut pm, &HostName::new("remote"), || {
-            Arc::new(MockPeerSender { sent: Arc::new(StdMutex::new(Vec::new())) })
-        });
+        ensure_test_connection_generation(&mut pm, &HostName::new("remote"), MockPeerSender::discard);
     }
 
     sync_peer_query_state(&peer_manager, &daemon).await;
@@ -1473,7 +1471,7 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
         pm.register_remote_repo(repo_identity.clone(), synthetic.clone());
         let peer = HostName::new("peer-a");
         let previous_generation = pm.current_generation(&peer).expect("peer-a should already have an active test connection");
-        let second_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::new(StdMutex::new(Vec::new())) });
+        let second_sender = MockPeerSender::discard();
         match pm.activate_connection_with_session(
             peer.clone(),
             second_sender,

@@ -168,6 +168,12 @@ impl MockPeerSender {
         let sent = Arc::new(Mutex::new(Vec::new()));
         (Self { sent: Arc::clone(&sent) }, sent)
     }
+
+    /// Create a throw-away sender whose messages are discarded.
+    /// Use when a `PeerSender` is required but the test doesn't inspect what was sent.
+    pub fn discard() -> Arc<dyn PeerSender> {
+        Arc::new(Self { sent: Arc::new(Mutex::new(Vec::new())) })
+    }
 }
 
 #[async_trait::async_trait]

@@ -7,11 +7,7 @@
 //! - Host attribution appears correctly on work items via InProcessDaemon
 //! - Peer data relay excludes the origin host
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{
     config::ConfigStore,
@@ -23,7 +19,7 @@ use flotilla_daemon::peer::{
     channel_transport_pair,
     merge::merge_provider_data,
     test_support::{handle_test_peer_data, wait_for_command_result, MockPeerSender, MockTransport},
-    HandleResult, PeerManager, PeerSender, PeerTransport,
+    HandleResult, PeerManager, PeerTransport,
 };
 use flotilla_protocol::{
     test_support::TestCheckout, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PeerDataKind, PeerDataMessage,
@@ -85,9 +81,7 @@ async fn peer_manager_stores_snapshot_and_returns_updated() {
     follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/home/dev/repo"), TestCheckout::new("feature-branch").build());
 
     let msg = snapshot_msg("follower", 1, follower_data);
-    let result =
-        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
-            .await;
+    let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
 
     // Should return Updated with the repo identity
     assert_eq!(result, HandleResult::Updated(test_repo()));
@@ -159,9 +153,7 @@ async fn peer_manager_to_merge_end_to_end() {
     follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/opt/code/repo"), TestCheckout::new("experiment").build());
 
     let msg = snapshot_msg("follower", 1, follower_data);
-    let result =
-        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
-            .await;
+    let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
     assert_eq!(result, HandleResult::Updated(test_repo()));
 
     // Leader has its own local data
@@ -466,9 +458,7 @@ async fn peer_manager_ignores_messages_from_self() {
     let mut mgr = PeerManager::new(HostName::new("leader"));
 
     let msg = snapshot_msg("leader", 1, ProviderData::default());
-    let result =
-        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
-            .await;
+    let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
 
     assert_eq!(result, HandleResult::Ignored);
     assert!(mgr.get_peer_data().is_empty(), "no data should be stored for messages from self");
@@ -492,20 +482,8 @@ async fn peer_manager_handles_multiple_peers_and_repos() {
     data_b.checkouts.insert(HostPath::new(HostName::new("follower-b"), "/home/b/repo"), TestCheckout::new("branch-b").build());
     let msg_b = snapshot_msg("follower-b", 2, data_b);
 
-    assert_eq!(
-        handle_test_peer_data(&mut mgr, msg_a, || {
-            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
-        })
-        .await,
-        HandleResult::Updated(test_repo())
-    );
-    assert_eq!(
-        handle_test_peer_data(&mut mgr, msg_b, || {
-            Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
-        })
-        .await,
-        HandleResult::Updated(test_repo())
-    );
+    assert_eq!(handle_test_peer_data(&mut mgr, msg_a, MockPeerSender::discard).await, HandleResult::Updated(test_repo()));
+    assert_eq!(handle_test_peer_data(&mut mgr, msg_b, MockPeerSender::discard).await, HandleResult::Updated(test_repo()));
 
     let peer_data = mgr.get_peer_data();
     assert_eq!(peer_data.len(), 2, "should have data from two peers");
@@ -581,9 +559,7 @@ async fn delta_message_returns_needs_resync() {
         },
     };
 
-    let result =
-        handle_test_peer_data(&mut mgr, msg, || Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>)
-            .await;
+    let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
     assert_eq!(
         result,
         HandleResult::NeedsResync { from: HostName::new("follower"), repo: test_repo() },
@@ -632,18 +608,12 @@ async fn peer_snapshot_update_overwrites_previous() {
     // First snapshot from follower with branch "old-branch"
     let mut data1 = ProviderData::default();
     data1.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), TestCheckout::new("old-branch").build());
-    handle_test_peer_data(&mut mgr, snapshot_msg("follower", 1, data1), || {
-        Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
-    })
-    .await;
+    handle_test_peer_data(&mut mgr, snapshot_msg("follower", 1, data1), MockPeerSender::discard).await;
 
     // Second snapshot with branch "new-branch"
     let mut data2 = ProviderData::default();
     data2.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), TestCheckout::new("new-branch").build());
-    let result = handle_test_peer_data(&mut mgr, snapshot_msg("follower", 2, data2), || {
-        Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
-    })
-    .await;
+    let result = handle_test_peer_data(&mut mgr, snapshot_msg("follower", 2, data2), MockPeerSender::discard).await;
     assert_eq!(result, HandleResult::Updated(test_repo()));
 
     // Verify the data was updated
