@@ -1,6 +1,6 @@
 # Hop Chain Abstraction
 
-**Issue:** #471 (Phase A of #442, also delivers #368)
+**Issue:** #471 (Phase A of #442, partial #368 — terminal pool attach surface only, not cloud agent teleport)
 **Date:** 2026-03-23
 
 ## Problem
@@ -28,11 +28,26 @@ struct HopPlan(Vec<Hop>);
 ```rust
 /// Structured command arguments — a tree, not flat strings
 enum Arg {
-    Bare(String),               // literal flag or subcommand, no quoting
+    Bare(String),               // literal flag or subcommand, no quoting needed
     Quoted(String),             // value, quoting applied at flatten time
-    NestedCommand(Vec<Arg>),    // an entire command that becomes one argument
+    NestedCommand(Vec<Arg>),    // subtree rendered as a single quoted argument
 }
 ```
+
+`NestedCommand` means "render this entire subtree into a single shell-quoted argument." It exists because some transports (SSH) pass the inner command as a string argument to a remote shell, while others (Docker exec) pass argv directly. The per-hop resolver decides which to use:
+
+- **SSH wraps via `NestedCommand`:** the inner command becomes a single string argument to SSH, potentially with further nesting for `$SHELL -l -c "..."`:
+  ```
+  [Bare("ssh"), Bare("-t"), Quoted("user@feta"),
+    NestedCommand([Bare("$SHELL"), Bare("-l"), Bare("-c"),
+      NestedCommand([Bare("cd"), Quoted("/repo"), Bare("&&"), ...inner...])])]
+  ```
+- **Docker exec wraps via argv extension:** no `NestedCommand` — inner args are concatenated directly:
+  ```
+  [Bare("docker"), Bare("exec"), Bare("-it"), Quoted("abc"), ...inner args flat...]
+  ```
+
+The resolver implementation knows the right structure for its transport. `flatten()` handles both: `NestedCommand` triggers depth-aware quoting, flat args are quoted at the current depth. The tree is also useful for debug rendering — pretty-print with indentation and color-coding per nesting depth.
 
 ```rust
 /// Resolved actions — what the consumer actually executes
@@ -49,8 +64,6 @@ enum SendKeyStep {
 struct ResolvedPlan(Vec<ResolvedAction>);
 ```
 
-`Arg` as a tree means quoting happens once, in a single `flatten()` function, not sprinkled across resolvers. The tree structure is also useful for debug rendering — pretty-print with indentation and color-coding per nesting depth.
-
 ### Resolution: Pop, Wrap, Push
 
 Resolution walks the hop plan inside-out. A mutable `ResolutionContext` accumulates a stack of `ResolvedAction`s:
@@ -59,6 +72,7 @@ Resolution walks the hop plan inside-out. A mutable `ResolutionContext` accumula
 struct ResolutionContext {
     current_host: HostName,
     current_environment: Option<EnvironmentId>,
+    working_directory: Option<PathBuf>,  // remote cwd, used by SSH wrapper for cd prefix
     actions: Vec<ResolvedAction>,
     nesting_depth: usize,
 }
@@ -66,8 +80,13 @@ struct ResolutionContext {
 
 Each per-hop resolver takes `&mut ResolutionContext` and decides:
 
-- **Wrap:** peek at top of action stack. If it's a `Command`, pop it, wrap its `Vec<Arg>` in a `NestedCommand`, prepend own args, push the combined `Command` back. This merges two hops into one action. For SSH: `ssh -t user@feta <inner command as args>`. For Docker: `docker exec -it abc <inner command as args>`.
-- **SendKeys:** push a new `SendKeys` action. Creates an execution boundary — the consumer must run everything above first, then type this into the resulting shell. For SSH: `ssh -t user@feta` (no command arg, drops into shell). For Docker: `docker exec -it abc bash` (drops into shell). A subsequent hop that wants to wrap will find a `SendKeys` on top and cannot merge, so it pushes a new `Command` entry instead.
+- **Wrap:** peek at top of action stack. If it's a `Command`, pop it, combine with own args, push the combined `Command` back. This merges two hops into one action. *How* the combination works depends on the transport — the per-hop resolver knows its own template:
+  - SSH: wraps inner args in `NestedCommand` (inner becomes a single shell-string argument): `ssh -t host NestedCommand($SHELL -l -c NestedCommand(cd dir && inner))`
+  - Docker exec: concatenates inner args directly (argv extension, no nesting): `docker exec -it container ...inner_args...`
+- **SendKeys:** push a new `SendKeys` action. Creates an execution boundary — the consumer must run everything above first, then type into the resulting shell. The resolver knows the "enter" command for its transport:
+  - SSH: `ssh -t user@feta` (no command arg, drops into remote shell)
+  - Docker exec: `docker exec -it abc bash` (drops into container shell)
+  - A subsequent hop that wants to wrap will find a `SendKeys` on top and cannot merge, so it pushes a new `Command` entry instead.
 - **Collapse:** current context shows we're already at this point (e.g., `RemoteToHost(feta)` when `context.current_host == feta`). Do nothing.
 
 N hops produce M actions where M <= N. The final stack reads top-to-bottom as execution order.
@@ -106,7 +125,7 @@ trait TerminalHopResolver: Send + Sync {
 // trait EnvironmentHopResolver: Send + Sync { ... }
 ```
 
-**`RemoteHopResolver`** — provided by the transport layer (PeerTransport or transport config). Knows SSH connection details, multiplex settings, host aliases. Today this knowledge lives in `remote_ssh_info()` and `wrap_remote_attach_commands()` — it migrates here. Future transports (HTTPS, etc.) provide alternative resolvers.
+**`RemoteHopResolver`** — provided by the transport layer (PeerTransport or transport config). The trait implementation encapsulates all transport-specific knowledge: how to wrap (SSH uses `NestedCommand` with login shell; a future transport might use argv extension or HTTP), how to enter for sendkeys (SSH drops command arg), connection details (multiplex settings, host aliases). Today this knowledge lives in `remote_ssh_info()` and `wrap_remote_attach_commands()` — it migrates here. The `CombineStrategy` tells the resolver *whether* to wrap or sendkeys; the resolver knows *how* for its transport. Future transports (HTTPS, etc.) are alternative implementations of the same trait.
 
 **`TerminalHopResolver`** — uses the pool's new structured method (`attach_args()`) to get an `Arg` tree rather than a pre-escaped string.
 
@@ -204,7 +223,7 @@ Each step keeps the system working:
 7. Build `HopResolver` — composes per-hop resolvers, implements pop-wrap-push
 8. Wire into `TerminalManager::attach_command()` — use hop chain internally, flatten to string
 9. Delete `wrap_remote_attach_commands()` and related code
-10. Wire into step system — `StepAction::ResolveAttachCommand` uses hop chain
+10. Wire into step system — `CreateWorkspaceFromPreparedTerminal` and `PrepareTerminalForCheckout` use hop chain for remote terminal workspace creation (NOT `ResolveAttachCommand`, which is the cloud-agent teleport path and out of scope)
 
 ## Testing
 
