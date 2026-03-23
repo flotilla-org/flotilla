@@ -176,33 +176,17 @@ fn section_header_display() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn kind_checkout() {
-    let wi = checkout_item("/tmp/foo", None, false);
-    assert_eq!(wi.kind(), WorkItemKind::Checkout);
-}
-
-#[test]
-fn kind_change_request() {
-    let wi = cr_item("42", "PR title");
-    assert_eq!(wi.kind(), WorkItemKind::ChangeRequest);
-}
-
-#[test]
-fn kind_session() {
-    let wi = session_item("sess-1", "Session title");
-    assert_eq!(wi.kind(), WorkItemKind::Session);
-}
-
-#[test]
-fn kind_issue() {
-    let wi = issue_item("7", "Fix bug");
-    assert_eq!(wi.kind(), WorkItemKind::Issue);
-}
-
-#[test]
-fn kind_remote_branch() {
-    let wi = remote_branch_item("feature/x");
-    assert_eq!(wi.kind(), WorkItemKind::RemoteBranch);
+fn kind_returns_correct_variant() {
+    let cases = [
+        ("checkout", checkout_item("/tmp/foo", None, false), WorkItemKind::Checkout),
+        ("change_request", cr_item("42", "PR title"), WorkItemKind::ChangeRequest),
+        ("session", session_item("sess-1", "Session title"), WorkItemKind::Session),
+        ("issue", issue_item("7", "Fix bug"), WorkItemKind::Issue),
+        ("remote_branch", remote_branch_item("feature/x"), WorkItemKind::RemoteBranch),
+    ];
+    for (label, item, expected) in cases {
+        assert_eq!(item.kind(), expected, "failed for {label}");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -210,27 +194,16 @@ fn kind_remote_branch() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn branch_from_checkout_with_branch() {
-    let wi = checkout_item("/tmp/wt", Some("feat-x"), false);
-    assert_eq!(wi.branch(), Some("feat-x"));
-}
-
-#[test]
-fn branch_from_checkout_without_branch() {
-    let wi = checkout_item("/tmp/wt", None, false);
-    assert_eq!(wi.branch(), None);
-}
-
-#[test]
-fn branch_from_remote_branch() {
-    let wi = remote_branch_item("origin/develop");
-    assert_eq!(wi.branch(), Some("origin/develop"));
-}
-
-#[test]
-fn branch_from_issue_is_none() {
-    let wi = issue_item("1", "desc");
-    assert_eq!(wi.branch(), None);
+fn branch_returns_expected_value() {
+    let cases: [(&str, CorrelationResult, Option<&str>); 4] = [
+        ("checkout_with_branch", checkout_item("/tmp/wt", Some("feat-x"), false), Some("feat-x")),
+        ("checkout_without_branch", checkout_item("/tmp/wt", None, false), None),
+        ("remote_branch", remote_branch_item("origin/develop"), Some("origin/develop")),
+        ("issue", issue_item("1", "desc"), None),
+    ];
+    for (label, item, expected) in cases {
+        assert_eq!(item.branch(), expected, "failed for {label}");
+    }
 }
 
 #[test]
@@ -247,21 +220,15 @@ fn branch_from_change_request_correlated() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn description_from_correlated() {
-    let wi = cr_item("1", "Fix login flow");
-    assert_eq!(wi.description(), "Fix login flow");
-}
-
-#[test]
-fn description_from_standalone_issue() {
-    let wi = issue_item("5", "Add caching");
-    assert_eq!(wi.description(), "Add caching");
-}
-
-#[test]
-fn description_from_remote_branch_is_branch_name() {
-    let wi = remote_branch_item("feature/auth");
-    assert_eq!(wi.description(), "feature/auth");
+fn description_returns_expected_value() {
+    let cases = [
+        ("correlated", cr_item("1", "Fix login flow"), "Fix login flow"),
+        ("standalone_issue", issue_item("5", "Add caching"), "Add caching"),
+        ("remote_branch", remote_branch_item("feature/auth"), "feature/auth"),
+    ];
+    for (label, item, expected) in cases {
+        assert_eq!(item.description(), expected, "failed for {label}");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -278,21 +245,23 @@ fn checkout_returns_some_for_checkout_anchor() {
 
 #[test]
 fn checkout_returns_none_for_non_checkout() {
-    assert!(cr_item("1", "d").checkout().is_none());
-    assert!(session_item("s", "d").checkout().is_none());
-    assert!(issue_item("i", "d").checkout().is_none());
-    assert!(remote_branch_item("b").checkout().is_none());
+    let cases: [(&str, CorrelationResult); 4] = [
+        ("change_request", cr_item("1", "d")),
+        ("session", session_item("s", "d")),
+        ("issue", issue_item("i", "d")),
+        ("remote_branch", remote_branch_item("b")),
+    ];
+    for (label, item) in cases {
+        assert!(item.checkout().is_none(), "checkout() should be None for {label}");
+        assert!(item.checkout_key().is_none(), "checkout_key() should be None for {label}");
+        assert!(!item.is_main_checkout(), "is_main_checkout() should be false for {label}");
+    }
 }
 
 #[test]
 fn checkout_key_returns_path() {
     let wi = checkout_item("/repos/proj", None, false);
     assert_eq!(wi.checkout_key(), Some(&hp("/repos/proj")));
-}
-
-#[test]
-fn checkout_key_none_for_standalone() {
-    assert!(issue_item("1", "d").checkout_key().is_none());
 }
 
 #[test]
@@ -307,19 +276,20 @@ fn is_main_checkout_false_for_non_main() {
     assert!(!wi.is_main_checkout());
 }
 
-#[test]
-fn is_main_checkout_false_for_non_checkout() {
-    assert!(!cr_item("1", "d").is_main_checkout());
-}
-
 // -----------------------------------------------------------------------
 // Accessor tests: change_request_key()
 // -----------------------------------------------------------------------
 
 #[test]
-fn change_request_key_from_cr_anchor() {
-    let wi = cr_item("42", "PR");
-    assert_eq!(wi.change_request_key(), Some("42"));
+fn change_request_key_returns_expected_value() {
+    let cases: [(&str, CorrelationResult, Option<&str>); 3] = [
+        ("cr_anchor", cr_item("42", "PR"), Some("42")),
+        ("issue", issue_item("1", "d"), None),
+        ("remote_branch", remote_branch_item("b"), None),
+    ];
+    for (label, item, expected) in cases {
+        assert_eq!(item.change_request_key(), expected, "failed for {label}");
+    }
 }
 
 #[test]
@@ -331,20 +301,17 @@ fn change_request_key_from_linked_on_checkout() {
     assert_eq!(wi.change_request_key(), Some("99"));
 }
 
-#[test]
-fn change_request_key_none_for_standalone() {
-    assert!(issue_item("1", "d").change_request_key().is_none());
-    assert!(remote_branch_item("b").change_request_key().is_none());
-}
-
 // -----------------------------------------------------------------------
 // Accessor tests: session_key()
 // -----------------------------------------------------------------------
 
 #[test]
-fn session_key_from_session_anchor() {
-    let wi = session_item("sess-x", "title");
-    assert_eq!(wi.session_key(), Some("sess-x"));
+fn session_key_returns_expected_value() {
+    let cases: [(&str, CorrelationResult, Option<&str>); 2] =
+        [("session_anchor", session_item("sess-x", "title"), Some("sess-x")), ("issue", issue_item("1", "d"), None)];
+    for (label, item, expected) in cases {
+        assert_eq!(item.session_key(), expected, "failed for {label}");
+    }
 }
 
 #[test]
@@ -354,11 +321,6 @@ fn session_key_from_linked_on_checkout() {
         ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
     });
     assert_eq!(wi.session_key(), Some("linked-sess"));
-}
-
-#[test]
-fn session_key_none_for_standalone() {
-    assert!(issue_item("1", "d").session_key().is_none());
 }
 
 // -----------------------------------------------------------------------
@@ -375,15 +337,12 @@ fn issue_keys_from_correlated_with_linked_issues() {
 }
 
 #[test]
-fn issue_keys_from_standalone_issue_returns_single() {
-    let wi = issue_item("42", "desc");
-    assert_eq!(wi.issue_keys(), &["42".to_string()]);
-}
-
-#[test]
-fn issue_keys_empty_for_remote_branch() {
-    let wi = remote_branch_item("b");
-    assert!(wi.issue_keys().is_empty());
+fn issue_keys_returns_expected_value() {
+    let cases: [(&str, CorrelationResult, &[String]); 2] =
+        [("standalone_issue", issue_item("42", "desc"), &["42".to_string()]), ("remote_branch", remote_branch_item("b"), &[])];
+    for (label, item, expected) in cases {
+        assert_eq!(item.issue_keys(), expected, "failed for {label}");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -401,8 +360,10 @@ fn workspace_refs_from_correlated() {
 
 #[test]
 fn workspace_refs_empty_for_standalone() {
-    assert!(issue_item("1", "d").workspace_refs().is_empty());
-    assert!(remote_branch_item("b").workspace_refs().is_empty());
+    let cases: [(&str, CorrelationResult); 2] = [("issue", issue_item("1", "d")), ("remote_branch", remote_branch_item("b"))];
+    for (label, item) in cases {
+        assert!(item.workspace_refs().is_empty(), "workspace_refs() should be empty for {label}");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -420,8 +381,10 @@ fn correlation_group_idx_from_correlated() {
 
 #[test]
 fn correlation_group_idx_none_for_standalone() {
-    assert!(issue_item("1", "d").correlation_group_idx().is_none());
-    assert!(remote_branch_item("b").correlation_group_idx().is_none());
+    let cases: [(&str, CorrelationResult); 2] = [("issue", issue_item("1", "d")), ("remote_branch", remote_branch_item("b"))];
+    for (label, item) in cases {
+        assert!(item.correlation_group_idx().is_none(), "correlation_group_idx() should be None for {label}");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -443,37 +406,21 @@ fn as_correlated_mut_returns_none_for_standalone() {
 }
 
 // -----------------------------------------------------------------------
-// Identity tests (existing)
+// Identity tests
 // -----------------------------------------------------------------------
 
 #[test]
-fn identity_checkout() {
-    let wi = checkout_item("/tmp/foo", None, false);
-    assert_eq!(wi.identity(), WorkItemIdentity::Checkout(hp("/tmp/foo")));
-}
-
-#[test]
-fn identity_pr() {
-    let wi = cr_item("42", "PR");
-    assert_eq!(wi.identity(), WorkItemIdentity::ChangeRequest("42".to_string()));
-}
-
-#[test]
-fn identity_session() {
-    let wi = session_item("sess-1", "title");
-    assert_eq!(wi.identity(), WorkItemIdentity::Session("sess-1".to_string()));
-}
-
-#[test]
-fn identity_issue() {
-    let wi = issue_item("7", "desc");
-    assert_eq!(wi.identity(), WorkItemIdentity::Issue("7".to_string()));
-}
-
-#[test]
-fn identity_remote_branch() {
-    let wi = remote_branch_item("feature/x");
-    assert_eq!(wi.identity(), WorkItemIdentity::RemoteBranch("feature/x".to_string()));
+fn identity_returns_correct_variant() {
+    let cases = [
+        ("checkout", checkout_item("/tmp/foo", None, false), WorkItemIdentity::Checkout(hp("/tmp/foo"))),
+        ("change_request", cr_item("42", "PR"), WorkItemIdentity::ChangeRequest("42".to_string())),
+        ("session", session_item("sess-1", "title"), WorkItemIdentity::Session("sess-1".to_string())),
+        ("issue", issue_item("7", "desc"), WorkItemIdentity::Issue("7".to_string())),
+        ("remote_branch", remote_branch_item("feature/x"), WorkItemIdentity::RemoteBranch("feature/x".to_string())),
+    ];
+    for (label, item, expected) in cases {
+        assert_eq!(item.identity(), expected, "failed for {label}");
+    }
 }
 
 // -----------------------------------------------------------------------
