@@ -1,13 +1,24 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
-use flotilla_protocol::{arg::flatten, HostName};
+use flotilla_protocol::{arg::flatten, HostName, TerminalStatus};
 
 use super::{
     remote::{RemoteHopResolver, SshRemoteHopResolver},
     resolver::{AlwaysSendKeys, AlwaysWrap, CombineStrategy},
+    terminal::TerminalHopResolver,
     Arg, Hop, ResolutionContext, ResolvedAction, SendKeyStep,
 };
-use crate::config::{HostsConfig, RemoteHostConfig, SshConfig};
+use crate::{
+    attachable::{
+        shared_in_memory_attachable_store, AttachableContent, AttachableId, SharedAttachableStore, TerminalAttachable, TerminalPurpose,
+    },
+    config::{HostsConfig, RemoteHostConfig, SshConfig},
+    providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession},
+};
 
 fn minimal_context() -> ResolutionContext {
     ResolutionContext {
@@ -589,4 +600,185 @@ fn regression_multiplex_args_in_flatten() {
     assert!(flat.starts_with("ssh -t -o ControlMaster=auto -o "), "should have multiplex args: {flat}");
     assert!(flat.contains("ControlPersist=60"), "should have ControlPersist: {flat}");
     assert!(flat.contains("'alice@feta.local'"), "should have quoted target: {flat}");
+}
+
+// ── PoolTerminalHopResolver tests ────────────────────────────────────
+
+/// A fake TerminalPool that records attach_args calls and returns a predictable Arg vector.
+struct FakeTerminalPool {
+    calls: Mutex<Vec<FakePoolCall>>,
+}
+
+#[derive(Debug, Clone)]
+struct FakePoolCall {
+    session_name: String,
+    command: String,
+    cwd: PathBuf,
+    env_vars: TerminalEnvVars,
+}
+
+impl FakeTerminalPool {
+    fn new() -> Self {
+        Self { calls: Mutex::new(Vec::new()) }
+    }
+
+    fn recorded_calls(&self) -> Vec<FakePoolCall> {
+        self.calls.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl TerminalPool for FakeTerminalPool {
+    async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn attach_args(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &Path,
+        env_vars: &TerminalEnvVars,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        self.calls.lock().expect("lock").push(FakePoolCall {
+            session_name: session_name.to_string(),
+            command: command.to_string(),
+            cwd: cwd.to_path_buf(),
+            env_vars: env_vars.clone(),
+        });
+        Ok(vec![Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Literal(session_name.to_string())])
+    }
+
+    async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Helper: create an in-memory store with one terminal attachable pre-inserted.
+fn store_with_terminal(attachable_id: &AttachableId, command: &str, cwd: &Path) -> SharedAttachableStore {
+    use flotilla_protocol::HostName;
+
+    use crate::attachable::{Attachable, AttachableSet};
+
+    let store = shared_in_memory_attachable_store();
+    {
+        let mut s = store.lock().expect("lock");
+        let set_id = s.allocate_set_id();
+        s.insert_set(AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(HostName::new("test-host")),
+            checkout: None,
+            template_identity: None,
+            members: vec![attachable_id.clone()],
+        });
+        s.insert_attachable(Attachable {
+            id: attachable_id.clone(),
+            set_id,
+            content: AttachableContent::Terminal(TerminalAttachable {
+                purpose: TerminalPurpose { checkout: "feat".to_string(), role: "shell".to_string(), index: 0 },
+                command: command.to_string(),
+                working_directory: cwd.to_path_buf(),
+                status: TerminalStatus::Disconnected,
+            }),
+        });
+    }
+    store
+}
+
+#[test]
+fn terminal_resolve_pushes_command_onto_context() {
+    use super::terminal::PoolTerminalHopResolver;
+
+    let att_id = AttachableId::new("term-1");
+    let pool = Arc::new(FakeTerminalPool::new());
+    let store = store_with_terminal(&att_id, "bash", Path::new("/repo/wt-feat"));
+    let resolver = PoolTerminalHopResolver::new(pool.clone(), store, Some("/tmp/flotilla.sock".to_string()));
+
+    let mut context = minimal_context();
+    resolver.resolve(&att_id, &mut context).expect("resolve should succeed");
+
+    // Verify a Command was pushed onto the context
+    assert_eq!(context.actions.len(), 1);
+    match &context.actions[0] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("cleat".into()));
+            assert_eq!(args[1], Arg::Literal("attach".into()));
+            assert_eq!(args[2], Arg::Literal(att_id.to_string()));
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    // Verify the pool received the correct arguments
+    let calls = pool.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].session_name, att_id.to_string());
+    assert_eq!(calls[0].command, "bash");
+    assert_eq!(calls[0].cwd, PathBuf::from("/repo/wt-feat"));
+}
+
+#[test]
+fn terminal_resolve_unknown_attachable_returns_error() {
+    use super::terminal::PoolTerminalHopResolver;
+
+    let pool = Arc::new(FakeTerminalPool::new());
+    let store = shared_in_memory_attachable_store();
+    let resolver = PoolTerminalHopResolver::new(pool, store, None);
+
+    let mut context = minimal_context();
+    let err = resolver.resolve(&AttachableId::new("nonexistent"), &mut context).expect_err("should fail for unknown attachable");
+    assert!(err.contains("attachable not found"), "error should mention not found: {err}");
+    assert!(context.actions.is_empty(), "no actions should be pushed on error");
+}
+
+#[test]
+fn terminal_resolve_injects_env_vars_with_socket() {
+    use super::terminal::PoolTerminalHopResolver;
+
+    let att_id = AttachableId::new("term-env");
+    let pool = Arc::new(FakeTerminalPool::new());
+    let store = store_with_terminal(&att_id, "claude", Path::new("/repo/wt-feat"));
+    let resolver = PoolTerminalHopResolver::new(pool.clone(), store, Some("/run/flotilla.sock".to_string()));
+
+    let mut context = minimal_context();
+    resolver.resolve(&att_id, &mut context).expect("resolve should succeed");
+
+    let calls = pool.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    let env_vars = &calls[0].env_vars;
+
+    assert!(
+        env_vars.iter().any(|(k, v)| k == "FLOTILLA_ATTACHABLE_ID" && v == att_id.as_str()),
+        "should have FLOTILLA_ATTACHABLE_ID: {env_vars:?}"
+    );
+    assert!(
+        env_vars.iter().any(|(k, v)| k == "FLOTILLA_DAEMON_SOCKET" && v == "/run/flotilla.sock"),
+        "should have FLOTILLA_DAEMON_SOCKET: {env_vars:?}"
+    );
+}
+
+#[test]
+fn terminal_resolve_omits_socket_env_var_when_none() {
+    use super::terminal::PoolTerminalHopResolver;
+
+    let att_id = AttachableId::new("term-nosock");
+    let pool = Arc::new(FakeTerminalPool::new());
+    let store = store_with_terminal(&att_id, "bash", Path::new("/repo/wt-feat"));
+    let resolver = PoolTerminalHopResolver::new(pool.clone(), store, None);
+
+    let mut context = minimal_context();
+    resolver.resolve(&att_id, &mut context).expect("resolve should succeed");
+
+    let calls = pool.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    let env_vars = &calls[0].env_vars;
+
+    assert!(env_vars.iter().any(|(k, _)| k == "FLOTILLA_ATTACHABLE_ID"), "should have FLOTILLA_ATTACHABLE_ID: {env_vars:?}");
+    assert!(
+        !env_vars.iter().any(|(k, _)| k == "FLOTILLA_DAEMON_SOCKET"),
+        "should NOT have FLOTILLA_DAEMON_SOCKET when daemon_socket_path is None: {env_vars:?}"
+    );
 }
