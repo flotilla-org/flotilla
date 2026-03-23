@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::TerminalStatus;
+use flotilla_protocol::{arg::Arg, TerminalStatus};
 
 use super::{TerminalEnvVars, TerminalPool, TerminalSession};
 use crate::providers::{run, CommandRunner};
@@ -481,36 +481,35 @@ impl TerminalPool for ShpoolTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<String, String> {
-        let socket_path_str = self.socket_path.display().to_string();
-        let config_path_str = self.config_path.display().to_string();
-        let cwd_str = cwd.display().to_string();
-        fn sq(s: &str) -> String {
-            format!("'{}'", s.replace('\'', "'\\''"))
+    fn attach_args(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
+        let mut args = vec![
+            Arg::Literal("shpool".into()),
+            Arg::Literal("--socket".into()),
+            Arg::Quoted(self.socket_path.display().to_string()),
+            Arg::Literal("-c".into()),
+            Arg::Quoted(self.config_path.display().to_string()),
+            Arg::Literal("attach".into()),
+        ];
+        if !command.is_empty() || !env_vars.is_empty() {
+            let mut cmd_inner: Vec<Arg> = Vec::new();
+            if !env_vars.is_empty() {
+                cmd_inner.push(Arg::Literal("env".into()));
+                for (k, v) in env_vars {
+                    cmd_inner.push(Arg::Literal(format!("{k}={}", flotilla_protocol::arg::shell_quote(v))));
+                }
+            }
+            cmd_inner.push(Arg::Literal("$SHELL".into()));
+            if !command.is_empty() {
+                cmd_inner.push(Arg::Literal("-lic".into()));
+                cmd_inner.push(Arg::Quoted(command.into()));
+            }
+            args.push(Arg::Literal("--cmd".into()));
+            args.push(Arg::NestedCommand(cmd_inner));
         }
-        let env_prefix = if env_vars.is_empty() {
-            String::new()
-        } else {
-            let pairs: Vec<String> = env_vars.iter().map(|(k, v)| format!("{k}={}", sq(v))).collect();
-            format!("env {} ", pairs.join(" "))
-        };
-        let cmd_part = if command.is_empty() && env_vars.is_empty() {
-            String::new()
-        } else {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            let escaped_cmd = command.replace('\'', "'\\''");
-            let inner =
-                if command.is_empty() { format!("{env_prefix}{shell}") } else { format!("{env_prefix}{shell} -lic '{escaped_cmd}'") };
-            format!(" --cmd {}", sq(&inner))
-        };
-        Ok(format!(
-            "shpool --socket {} -c {} attach{} --dir {} {}",
-            sq(&socket_path_str),
-            sq(&config_path_str),
-            cmd_part,
-            sq(&cwd_str),
-            sq(session_name),
-        ))
+        args.push(Arg::Literal("--dir".into()));
+        args.push(Arg::Quoted(cwd.display().to_string()));
+        args.push(Arg::Quoted(session_name.into()));
+        Ok(args)
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
@@ -681,5 +680,93 @@ mod tests {
         TerminalPool::kill_session(&pool, "flotilla/feat/shell/0").await.expect("kill session");
 
         assert_eq!(runner.remaining(), 0, "kill command should have consumed the response");
+    }
+
+    // ── attach_args tests ──────────────────────────────────────────
+
+    #[test]
+    fn attach_args_with_command_no_env() {
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let socket = pool.socket_path.display().to_string();
+        let config = pool.config_path.display().to_string();
+        let args = pool.attach_args("flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).expect("attach_args");
+
+        assert_eq!(args, vec![
+            Arg::Literal("shpool".into()),
+            Arg::Literal("--socket".into()),
+            Arg::Quoted(socket),
+            Arg::Literal("-c".into()),
+            Arg::Quoted(config),
+            Arg::Literal("attach".into()),
+            Arg::Literal("--cmd".into()),
+            Arg::NestedCommand(vec![Arg::Literal("$SHELL".into()), Arg::Literal("-lic".into()), Arg::Quoted("bash".into()),]),
+            Arg::Literal("--dir".into()),
+            Arg::Quoted("/home/dev".into()),
+            Arg::Quoted("flotilla/feat/shell/0".into()),
+        ]);
+    }
+
+    #[test]
+    fn attach_args_flatten_with_command_no_env() {
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let args = pool.attach_args("flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).expect("attach_args");
+        let flat = flotilla_protocol::arg::flatten(&args, 0);
+
+        assert!(flat.starts_with("shpool --socket "), "should start with shpool: {flat}");
+        assert!(flat.contains("attach"), "should include attach: {flat}");
+        assert!(flat.contains("--cmd"), "should include --cmd: {flat}");
+        assert!(flat.contains("-lic"), "should use login interactive shell: {flat}");
+        assert!(flat.contains("bash"), "should contain original command: {flat}");
+        assert!(flat.contains("--dir"), "should include --dir: {flat}");
+        assert!(flat.contains("'/home/dev'"), "should include cwd: {flat}");
+        assert!(flat.ends_with("'flotilla/feat/shell/0'"), "session name should be last: {flat}");
+    }
+
+    #[test]
+    fn attach_args_empty_command_no_env() {
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let args = pool.attach_args("sess", "", Path::new("/wd"), &vec![]).expect("attach_args");
+
+        // No --cmd when both command and env_vars are empty
+        assert!(!args.iter().any(|a| matches!(a, Arg::Literal(s) if s == "--cmd")), "no --cmd for empty command+env");
+        // Should end with --dir, quoted cwd, quoted session name
+        let len = args.len();
+        assert_eq!(args[len - 3], Arg::Literal("--dir".into()));
+        assert_eq!(args[len - 2], Arg::Quoted("/wd".into()));
+        assert_eq!(args[len - 1], Arg::Quoted("sess".into()));
+    }
+
+    #[test]
+    fn attach_args_with_env_vars() {
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let args = pool.attach_args("sess", "cmd", Path::new("/wd"), &env).expect("attach_args");
+
+        // Verify the inner command structure via the NestedCommand
+        let nested = args.iter().find(|a| matches!(a, Arg::NestedCommand(_)));
+        assert!(nested.is_some(), "should have NestedCommand for --cmd");
+        if let Some(Arg::NestedCommand(inner)) = nested {
+            let inner_flat = flotilla_protocol::arg::flatten(inner, 0);
+            assert!(inner_flat.contains("FOO='bar'"), "inner should contain env assignment: {inner_flat}");
+            assert!(inner_flat.contains("$SHELL"), "inner should reference $SHELL: {inner_flat}");
+            assert!(inner_flat.contains("-lic"), "inner should have -lic: {inner_flat}");
+        }
+    }
+
+    #[test]
+    fn attach_args_with_env_vars_empty_command() {
+        let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
+        let env = vec![("KEY".to_string(), "val".to_string())];
+        let args = pool.attach_args("sess", "", Path::new("/wd"), &env).expect("attach_args");
+
+        // Should have --cmd with env prefix and $SHELL but no -lic
+        let nested = args.iter().find(|a| matches!(a, Arg::NestedCommand(_)));
+        assert!(nested.is_some(), "should have NestedCommand for --cmd");
+        if let Some(Arg::NestedCommand(inner)) = nested {
+            let inner_flat = flotilla_protocol::arg::flatten(inner, 0);
+            assert!(inner_flat.contains("env KEY='val'"), "inner should contain env: {inner_flat}");
+            assert!(inner_flat.contains("$SHELL"), "inner should contain $SHELL: {inner_flat}");
+            assert!(!inner_flat.contains("-lic"), "inner should not have -lic for empty command: {inner_flat}");
+        }
     }
 }

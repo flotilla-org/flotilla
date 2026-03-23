@@ -277,20 +277,20 @@ mod tests {
             Ok(())
         }
 
-        async fn attach_command(
+        fn attach_args(
             &self,
             session_name: &str,
             command: &str,
             cwd: &Path,
             env_vars: &TerminalEnvVars,
-        ) -> Result<String, String> {
+        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
             self.calls.lock().expect("lock calls").push(PoolCall::AttachCommand {
                 session_name: session_name.to_string(),
                 command: command.to_string(),
                 cwd: cwd.to_path_buf(),
                 env_vars: env_vars.clone(),
             });
-            Ok(format!("attach {session_name}"))
+            Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
         }
 
         async fn kill_session(&self, session_name: &str) -> Result<(), String> {
@@ -389,20 +389,20 @@ mod tests {
                 });
                 Ok(())
             }
-            async fn attach_command(
+            fn attach_args(
                 &self,
                 session_name: &str,
                 command: &str,
                 cwd: &Path,
                 env_vars: &TerminalEnvVars,
-            ) -> Result<String, String> {
+            ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
                 self.calls.lock().expect("lock").push(PoolCall::AttachCommand {
                     session_name: session_name.to_string(),
                     command: command.to_string(),
                     cwd: cwd.to_path_buf(),
                     env_vars: env_vars.clone(),
                 });
-                Ok(format!("attach {session_name}"))
+                Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
             }
             async fn kill_session(&self, session_name: &str) -> Result<(), String> {
                 self.calls.lock().expect("lock").push(PoolCall::KillSession { session_name: session_name.to_string() });
@@ -448,20 +448,20 @@ mod tests {
             async fn ensure_session(&self, _: &str, _: &str, _: &Path) -> Result<(), String> {
                 Ok(())
             }
-            async fn attach_command(
+            fn attach_args(
                 &self,
                 session_name: &str,
                 command: &str,
                 cwd: &Path,
                 env_vars: &TerminalEnvVars,
-            ) -> Result<String, String> {
+            ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
                 self.calls.lock().expect("lock").push(PoolCall::AttachCommand {
                     session_name: session_name.to_string(),
                     command: command.to_string(),
                     cwd: cwd.to_path_buf(),
                     env_vars: env_vars.clone(),
                 });
-                Ok(format!("attach {session_name}"))
+                Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
             }
             async fn kill_session(&self, _: &str) -> Result<(), String> {
                 Ok(())
@@ -507,8 +507,8 @@ mod tests {
             async fn ensure_session(&self, _: &str, _: &str, _: &Path) -> Result<(), String> {
                 Ok(())
             }
-            async fn attach_command(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<String, String> {
-                Ok(String::new())
+            fn attach_args(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+                Ok(vec![])
             }
             async fn kill_session(&self, session_name: &str) -> Result<(), String> {
                 self.calls.lock().expect("lock").push(PoolCall::KillSession { session_name: session_name.to_string() });
@@ -596,8 +596,8 @@ mod tests {
             async fn ensure_session(&self, _: &str, _: &str, _: &Path) -> Result<(), String> {
                 Ok(())
             }
-            async fn attach_command(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<String, String> {
-                Ok(String::new())
+            fn attach_args(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+                Ok(vec![])
             }
             async fn kill_session(&self, session_name: &str) -> Result<(), String> {
                 self.calls.lock().expect("lock").push(PoolCall::KillSession { session_name: session_name.to_string() });

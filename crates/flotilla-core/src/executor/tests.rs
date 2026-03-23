@@ -1095,14 +1095,14 @@ impl TerminalPool for MockTerminalPool {
     async fn ensure_session(&self, _session_name: &str, _cmd: &str, _cwd: &Path) -> Result<(), String> {
         Ok(())
     }
-    async fn attach_command(
+    fn attach_args(
         &self,
         session_name: &str,
         _cmd: &str,
         _cwd: &Path,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
-    ) -> Result<String, String> {
-        Ok(format!("attach:{session_name}"))
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach:{session_name}"))])
     }
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
         self.killed.lock().await.push(session_name.to_string());

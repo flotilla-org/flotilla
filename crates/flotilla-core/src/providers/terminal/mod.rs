@@ -5,7 +5,7 @@ pub mod shpool;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use flotilla_protocol::TerminalStatus;
+use flotilla_protocol::{arg::Arg, TerminalStatus};
 
 /// Environment variables to inject into the terminal session.
 pub type TerminalEnvVars = Vec<(String, String)>;
@@ -27,6 +27,17 @@ pub struct TerminalSession {
 pub trait TerminalPool: Send + Sync {
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String>;
     async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path) -> Result<(), String>;
-    async fn attach_command(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<String, String>;
+
+    /// Returns a structured `Arg` tree representing the attach command.
+    /// Callers that need a flat string can use `flatten(&args, 0)`.
+    fn attach_args(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String>;
+
+    /// Returns the attach command as a flat shell string.
+    /// Default implementation calls `attach_args()` + `flatten()`.
+    async fn attach_command(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<String, String> {
+        let args = self.attach_args(session_name, command, cwd, env_vars)?;
+        Ok(flotilla_protocol::arg::flatten(&args, 0))
+    }
+
     async fn kill_session(&self, session_name: &str) -> Result<(), String>;
 }

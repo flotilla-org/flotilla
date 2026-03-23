@@ -714,14 +714,14 @@ impl TerminalPool for FakeTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(
+    fn attach_args(
         &self,
         session_name: &str,
         _command: &str,
         _cwd: &Path,
         _env_vars: &super::super::terminal::TerminalEnvVars,
-    ) -> Result<String, String> {
-        Ok(format!("attach {session_name}"))
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {

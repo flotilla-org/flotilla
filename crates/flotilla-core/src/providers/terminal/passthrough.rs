@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use flotilla_protocol::arg::Arg;
 
 use super::{TerminalEnvVars, TerminalPool, TerminalSession};
 
@@ -14,28 +15,27 @@ impl TerminalPool for PassthroughTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(
+    fn attach_args(
         &self,
         _session_name: &str,
         command: &str,
         _cwd: &std::path::Path,
         env_vars: &TerminalEnvVars,
-    ) -> Result<String, String> {
-        if env_vars.is_empty() {
-            Ok(command.to_string())
-        } else {
-            let prefix: Vec<String> = env_vars.iter().map(|(k, v)| format!("{k}={}", shell_escape(v))).collect();
-            Ok(format!("env {} {command}", prefix.join(" ")))
+    ) -> Result<Vec<Arg>, String> {
+        let mut args = Vec::new();
+        if !env_vars.is_empty() {
+            args.push(Arg::Literal("env".into()));
+            for (k, v) in env_vars {
+                args.push(Arg::Literal(format!("{k}={}", flotilla_protocol::arg::shell_quote(v))));
+            }
         }
+        args.push(Arg::Literal(command.into()));
+        Ok(args)
     }
 
     async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
         Ok(())
     }
-}
-
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -76,5 +76,65 @@ mod tests {
     async fn kill_is_noop() {
         let pool = PassthroughTerminalPool;
         assert!(pool.kill_session("my-session").await.is_ok());
+    }
+
+    // ── attach_args tests ──────────────────────────────────────────
+
+    #[test]
+    fn attach_args_simple_command() {
+        let pool = PassthroughTerminalPool;
+        let args = pool.attach_args("my-session", "bash", "/tmp".as_ref(), &vec![]).expect("attach_args");
+
+        assert_eq!(args, vec![Arg::Literal("bash".into())]);
+    }
+
+    #[test]
+    fn attach_args_flatten_simple_command() {
+        let pool = PassthroughTerminalPool;
+        let args = pool.attach_args("my-session", "bash", "/tmp".as_ref(), &vec![]).expect("attach_args");
+        let flat = flotilla_protocol::arg::flatten(&args, 0);
+
+        assert_eq!(flat, "bash");
+    }
+
+    #[test]
+    fn attach_args_with_env_vars() {
+        let pool = PassthroughTerminalPool;
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let args = pool.attach_args("my-session", "bash", "/tmp".as_ref(), &env).expect("attach_args");
+
+        assert_eq!(args, vec![Arg::Literal("env".into()), Arg::Literal("FOO='bar'".into()), Arg::Literal("bash".into()),]);
+    }
+
+    #[test]
+    fn attach_args_flatten_with_env_vars() {
+        let pool = PassthroughTerminalPool;
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let args = pool.attach_args("my-session", "bash", "/tmp".as_ref(), &env).expect("attach_args");
+        let flat = flotilla_protocol::arg::flatten(&args, 0);
+
+        assert_eq!(flat, "env FOO='bar' bash");
+    }
+
+    #[test]
+    fn attach_args_flatten_matches_attach_command() {
+        // Regression: flatten(attach_args()) should produce the same string as attach_command()
+        let pool = PassthroughTerminalPool;
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let args = pool.attach_args("my-session", "bash", "/tmp".as_ref(), &env).expect("attach_args");
+        let flat = flotilla_protocol::arg::flatten(&args, 0);
+
+        // The old attach_command produced: "env FOO='bar' bash"
+        assert_eq!(flat, "env FOO='bar' bash");
+    }
+
+    #[test]
+    fn attach_args_env_value_with_single_quote() {
+        let pool = PassthroughTerminalPool;
+        let env = vec![("KEY".to_string(), "it's".to_string())];
+        let args = pool.attach_args("s", "cmd", "/tmp".as_ref(), &env).expect("attach_args");
+        let flat = flotilla_protocol::arg::flatten(&args, 0);
+
+        assert_eq!(flat, "env KEY='it'\\''s' cmd");
     }
 }

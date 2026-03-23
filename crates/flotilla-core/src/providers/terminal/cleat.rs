@@ -1,6 +1,7 @@
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
+use flotilla_protocol::arg::Arg;
 use serde::Deserialize;
 
 use super::{TerminalEnvVars, TerminalPool, TerminalSession};
@@ -63,29 +64,33 @@ impl TerminalPool for CleatTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<String, String> {
-        fn sq(s: &str) -> String {
-            format!("'{}'", s.replace('\'', "'\\''"))
-        }
-
-        let mut parts = vec![sq(&self.binary), "attach".into(), sq(session_name), "--cwd".into(), sq(&cwd.display().to_string())];
+    fn attach_args(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
+        let mut args = vec![
+            Arg::Quoted(self.binary.clone()),
+            Arg::Literal("attach".into()),
+            Arg::Quoted(session_name.into()),
+            Arg::Literal("--cwd".into()),
+            Arg::Quoted(cwd.display().to_string()),
+        ];
         if !command.is_empty() || !env_vars.is_empty() {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            let env_prefix = if env_vars.is_empty() {
-                String::new()
-            } else {
-                let pairs: Vec<String> = env_vars.iter().map(|(k, v)| format!("{k}={}", sq(v))).collect();
-                format!("env {} ", pairs.join(" "))
-            };
-            let wrapped = if command.is_empty() {
-                format!("{env_prefix}{shell}")
-            } else {
-                format!("{env_prefix}{shell} -lc '{}'", command.replace('\'', "'\\''"))
-            };
-            parts.push("--cmd".into());
-            parts.push(sq(&wrapped));
+            let mut cmd_inner: Vec<Arg> = Vec::new();
+            if !env_vars.is_empty() {
+                cmd_inner.push(Arg::Literal("env".into()));
+                for (k, v) in env_vars {
+                    // KEY='value' as a single shell token — key is a safe identifier,
+                    // value is single-quoted using the same quoting as Arg::Quoted.
+                    cmd_inner.push(Arg::Literal(format!("{k}={}", flotilla_protocol::arg::shell_quote(v))));
+                }
+            }
+            cmd_inner.push(Arg::Literal("$SHELL".into()));
+            if !command.is_empty() {
+                cmd_inner.push(Arg::Literal("-lc".into()));
+                cmd_inner.push(Arg::Quoted(command.into()));
+            }
+            args.push(Arg::Literal("--cmd".into()));
+            args.push(Arg::NestedCommand(cmd_inner));
         }
-        Ok(parts.join(" "))
+        Ok(args)
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
@@ -187,5 +192,110 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cleat");
         assert_eq!(calls[0].1, vec!["kill", "my-session"]);
+    }
+
+    // ── attach_args tests ──────────────────────────────────────────
+
+    #[test]
+    fn attach_args_with_command_no_env() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let args = pool.attach_args("my-session", "bash", Path::new("/repo"), &vec![]).expect("attach_args");
+
+        assert_eq!(args, vec![
+            Arg::Quoted("cleat".into()),
+            Arg::Literal("attach".into()),
+            Arg::Quoted("my-session".into()),
+            Arg::Literal("--cwd".into()),
+            Arg::Quoted("/repo".into()),
+            Arg::Literal("--cmd".into()),
+            Arg::NestedCommand(vec![Arg::Literal("$SHELL".into()), Arg::Literal("-lc".into()), Arg::Quoted("bash".into()),]),
+        ]);
+    }
+
+    #[test]
+    fn attach_args_flatten_with_command_no_env() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let args = pool.attach_args("my-session", "bash", Path::new("/repo"), &vec![]).expect("attach_args");
+        let flat = flotilla_protocol::arg::flatten(&args, 0);
+
+        assert_eq!(flat, "'cleat' attach 'my-session' --cwd '/repo' --cmd '$SHELL -lc '\\''bash'\\'''");
+    }
+
+    #[test]
+    fn attach_args_empty_command_no_env() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let args = pool.attach_args("sess-1", "", Path::new("/home/dev"), &vec![]).expect("attach_args");
+
+        // No --cmd when both command and env_vars are empty
+        assert_eq!(args, vec![
+            Arg::Quoted("cleat".into()),
+            Arg::Literal("attach".into()),
+            Arg::Quoted("sess-1".into()),
+            Arg::Literal("--cwd".into()),
+            Arg::Quoted("/home/dev".into()),
+        ]);
+    }
+
+    #[test]
+    fn attach_args_with_env_vars() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let env = vec![("FOO".to_string(), "bar".to_string()), ("BAZ".to_string(), "qu'x".to_string())];
+        let args = pool.attach_args("sess", "cmd", Path::new("/wd"), &env).expect("attach_args");
+
+        assert_eq!(args, vec![
+            Arg::Quoted("cleat".into()),
+            Arg::Literal("attach".into()),
+            Arg::Quoted("sess".into()),
+            Arg::Literal("--cwd".into()),
+            Arg::Quoted("/wd".into()),
+            Arg::Literal("--cmd".into()),
+            Arg::NestedCommand(vec![
+                Arg::Literal("env".into()),
+                Arg::Literal("FOO='bar'".into()),
+                Arg::Literal("BAZ='qu'\\''x'".into()),
+                Arg::Literal("$SHELL".into()),
+                Arg::Literal("-lc".into()),
+                Arg::Quoted("cmd".into()),
+            ]),
+        ]);
+    }
+
+    #[test]
+    fn attach_args_with_env_vars_empty_command() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let env = vec![("KEY".to_string(), "val".to_string())];
+        let args = pool.attach_args("sess", "", Path::new("/wd"), &env).expect("attach_args");
+
+        // Empty command with env vars: spawns $SHELL with env prefix, no -lc
+        assert_eq!(args, vec![
+            Arg::Quoted("cleat".into()),
+            Arg::Literal("attach".into()),
+            Arg::Quoted("sess".into()),
+            Arg::Literal("--cwd".into()),
+            Arg::Quoted("/wd".into()),
+            Arg::Literal("--cmd".into()),
+            Arg::NestedCommand(vec![Arg::Literal("env".into()), Arg::Literal("KEY='val'".into()), Arg::Literal("$SHELL".into()),]),
+        ]);
+    }
+
+    #[test]
+    fn attach_args_flatten_roundtrip_env_vars() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let args = pool.attach_args("sess", "bash", Path::new("/wd"), &env).expect("attach_args");
+        let flat = flotilla_protocol::arg::flatten(&args, 0);
+
+        // --cmd value is a NestedCommand, so the inner string is shell-quoted.
+        // The inner flattened string is: env FOO='bar' $SHELL -lc 'bash'
+        // After outer shell-quoting, single quotes are escaped as '\''.
+        assert!(flat.contains("--cmd"), "should have --cmd: {flat}");
+        // Verify the inner command structure by checking the NestedCommand directly
+        let nested = args.iter().find(|a| matches!(a, Arg::NestedCommand(_)));
+        assert!(nested.is_some(), "should have NestedCommand for --cmd: {args:?}");
+        if let Some(Arg::NestedCommand(inner)) = nested {
+            let inner_flat = flotilla_protocol::arg::flatten(inner, 0);
+            assert!(inner_flat.contains("FOO='bar'"), "inner should contain env assignment: {inner_flat}");
+            assert!(inner_flat.contains("$SHELL"), "inner should reference $SHELL: {inner_flat}");
+        }
     }
 }

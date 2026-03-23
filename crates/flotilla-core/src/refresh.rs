@@ -604,14 +604,14 @@ mod tests {
             Ok(())
         }
 
-        async fn attach_command(
+        fn attach_args(
             &self,
             _session_name: &str,
             _command: &str,
             _cwd: &Path,
             _env_vars: &crate::providers::terminal::TerminalEnvVars,
-        ) -> Result<String, String> {
-            Ok("mock attach".into())
+        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+            Ok(vec![flotilla_protocol::arg::Arg::Literal("mock attach".into())])
         }
 
         async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
