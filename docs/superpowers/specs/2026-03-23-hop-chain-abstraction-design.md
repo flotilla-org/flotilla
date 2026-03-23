@@ -66,11 +66,28 @@ struct ResolutionContext {
 
 Each per-hop resolver takes `&mut ResolutionContext` and decides:
 
-- **Wrap:** peek at top of action stack. If it's a `Command`, pop it, wrap its `Vec<Arg>` in a `NestedCommand`, prepend own args, push the combined `Command` back. This merges two hops into one action.
-- **SendKeys:** push a new `SendKeys` action. Creates an execution boundary — the consumer must run everything above first, then type this into the resulting shell. A subsequent hop that wants to wrap will find a `SendKeys` on top and cannot merge, so it pushes a new `Command` entry instead.
+- **Wrap:** peek at top of action stack. If it's a `Command`, pop it, wrap its `Vec<Arg>` in a `NestedCommand`, prepend own args, push the combined `Command` back. This merges two hops into one action. For SSH: `ssh -t user@feta <inner command as args>`. For Docker: `docker exec -it abc <inner command as args>`.
+- **SendKeys:** push a new `SendKeys` action. Creates an execution boundary — the consumer must run everything above first, then type this into the resulting shell. For SSH: `ssh -t user@feta` (no command arg, drops into shell). For Docker: `docker exec -it abc bash` (drops into shell). A subsequent hop that wants to wrap will find a `SendKeys` on top and cannot merge, so it pushes a new `Command` entry instead.
 - **Collapse:** current context shows we're already at this point (e.g., `RemoteToHost(feta)` when `context.current_host == feta`). Do nothing.
 
 N hops produce M actions where M <= N. The final stack reads top-to-bottom as execution order.
+
+### Combine Strategy
+
+The choice between wrap and sendkeys at each combination point is made by a `CombineStrategy` injected into the `HopResolver`:
+
+```rust
+trait CombineStrategy: Send + Sync {
+    fn should_wrap(&self, hop: &Hop, context: &ResolutionContext) -> bool;
+}
+```
+
+The resolver consults this strategy at each hop before deciding wrap vs sendkeys. Phase A implementations:
+
+- **`AlwaysWrap`** — always nests commands as arguments. Matches current SSH wrapping behavior. Default.
+- **`AlwaysSendKeys`** — always creates execution boundaries. Exercises the sendkeys path for testing.
+
+Future strategies (depth-based, per-transport, capability-aware) are additional trait implementations. The plan stays pure data — it declares what needs to happen. The strategy is a runtime decision made during resolution based on current context.
 
 ### Per-Hop Resolvers
 
@@ -118,6 +135,7 @@ Composes per-hop resolvers and drives the resolution:
 struct HopResolver {
     remote: Arc<dyn RemoteHopResolver>,
     terminal: Arc<dyn TerminalHopResolver>,
+    strategy: Arc<dyn CombineStrategy>,
 }
 
 impl HopResolver {
@@ -194,7 +212,7 @@ The tree structure makes each layer independently testable:
 
 - **`flatten()` unit tests** — depth-0/1/2 quoting, mixed Bare/Quoted/Nested, edge cases (quotes in values, spaces, special chars)
 - **Per-hop resolver tests** — given config, produce expected `Vec<Arg>` tree. Pure functions, no I/O.
-- **`HopResolver` tests** — given plan and context, produce expected `ResolvedPlan`. Test collapse, wrapping, sendkeys boundaries, pop-wrap-push mechanics.
+- **`HopResolver` tests** — given plan and context, produce expected `ResolvedPlan`. Test collapse, wrapping, sendkeys boundaries, pop-wrap-push mechanics. Run the same plans through `AlwaysWrap` and `AlwaysSendKeys` strategies to verify both paths produce valid output.
 - **`HopPlanBuilder` tests** — given attachables and hosts, produce expected `HopPlan`.
 - **End-to-end flatten tests** — given an `AttachableId` with known host affinity, final flattened string matches expected output (regression against old `wrap_remote_attach_commands()` behavior).
 - **Snapshot tests** — pretty-printed `Arg` trees for common scenarios (local attach, remote attach, future 3-hop).
