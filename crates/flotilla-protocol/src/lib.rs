@@ -1,3 +1,4 @@
+pub mod arg;
 pub mod commands;
 pub mod delta;
 pub mod framing;
