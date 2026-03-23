@@ -8,9 +8,9 @@ use flotilla_protocol::{arg::flatten, HostName, TerminalStatus};
 
 use super::{
     remote::{RemoteHopResolver, SshRemoteHopResolver},
-    resolver::{AlwaysSendKeys, AlwaysWrap, CombineStrategy},
+    resolver::{AlwaysSendKeys, AlwaysWrap, CombineStrategy, HopResolver},
     terminal::TerminalHopResolver,
-    Arg, Hop, ResolutionContext, ResolvedAction, SendKeyStep,
+    Arg, Hop, HopPlan, ResolutionContext, ResolvedAction, SendKeyStep,
 };
 use crate::{
     attachable::{
@@ -781,4 +781,390 @@ fn terminal_resolve_omits_socket_env_var_when_none() {
         !env_vars.iter().any(|(k, _)| k == "FLOTILLA_DAEMON_SOCKET"),
         "should NOT have FLOTILLA_DAEMON_SOCKET when daemon_socket_path is None: {env_vars:?}"
     );
+}
+
+// ── Mock resolvers for HopResolver tests ─────────────────────────────
+
+/// Records which methods were called on the remote hop resolver.
+#[derive(Debug, Clone)]
+enum MockRemoteCall {
+    Wrap(HostName),
+    Enter(HostName),
+}
+
+/// A mock RemoteHopResolver that records calls and produces predictable outputs.
+///
+/// - `resolve_wrap`: pops the inner Command, prepends `[Literal("ssh"), Quoted(host)]`,
+///   pushes back a single `Command` with `NestedCommand(inner)`.
+/// - `resolve_enter`: pops the inner Command, pushes an SSH Command, then converts
+///   the inner to SendKeys.
+struct MockRemoteHopResolver {
+    calls: Mutex<Vec<MockRemoteCall>>,
+}
+
+impl MockRemoteHopResolver {
+    fn new() -> Self {
+        Self { calls: Mutex::new(Vec::new()) }
+    }
+
+    fn recorded_calls(&self) -> Vec<MockRemoteCall> {
+        self.calls.lock().expect("lock").clone()
+    }
+}
+
+impl RemoteHopResolver for MockRemoteHopResolver {
+    fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
+        self.calls.lock().expect("lock").push(MockRemoteCall::Wrap(host.clone()));
+
+        let inner_action = context.actions.pop().ok_or("mock resolve_wrap: no inner action")?;
+        let inner_args = match inner_action {
+            ResolvedAction::Command(args) => args,
+            other => return Err(format!("mock resolve_wrap: expected Command, got {other:?}")),
+        };
+
+        let mut ssh_args = vec![Arg::Literal("ssh".into()), Arg::Quoted(host.as_str().to_string())];
+        ssh_args.push(Arg::NestedCommand(inner_args));
+        context.actions.push(ResolvedAction::Command(ssh_args));
+        Ok(())
+    }
+
+    fn resolve_enter(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
+        self.calls.lock().expect("lock").push(MockRemoteCall::Enter(host.clone()));
+
+        let inner_action = context.actions.pop().ok_or("mock resolve_enter: no inner action")?;
+        let inner_args = match inner_action {
+            ResolvedAction::Command(args) => args,
+            other => return Err(format!("mock resolve_enter: expected Command, got {other:?}")),
+        };
+
+        // Convert inner to SendKeys
+        if !inner_args.is_empty() {
+            let text = flotilla_protocol::arg::flatten(&inner_args, 0);
+            context.actions.push(ResolvedAction::SendKeys { steps: vec![SendKeyStep::Type(text), SendKeyStep::WaitForPrompt] });
+        }
+
+        // Push SSH enter command
+        let ssh_args = vec![Arg::Literal("ssh".into()), Arg::Quoted(host.as_str().to_string())];
+        context.actions.push(ResolvedAction::Command(ssh_args));
+        Ok(())
+    }
+}
+
+/// A mock TerminalHopResolver that pushes a simple attach command.
+struct MockTerminalHopResolver {
+    calls: Mutex<Vec<AttachableId>>,
+}
+
+impl MockTerminalHopResolver {
+    fn new() -> Self {
+        Self { calls: Mutex::new(Vec::new()) }
+    }
+
+    fn recorded_calls(&self) -> Vec<AttachableId> {
+        self.calls.lock().expect("lock").clone()
+    }
+}
+
+impl TerminalHopResolver for MockTerminalHopResolver {
+    fn resolve(&self, attachable_id: &AttachableId, context: &mut ResolutionContext) -> Result<(), String> {
+        self.calls.lock().expect("lock").push(attachable_id.clone());
+        context.actions.push(ResolvedAction::Command(vec![Arg::Literal("mock-attach".into()), Arg::Quoted(attachable_id.to_string())]));
+        Ok(())
+    }
+}
+
+fn mock_hop_resolver(strategy: Arc<dyn CombineStrategy>) -> (HopResolver, Arc<MockRemoteHopResolver>, Arc<MockTerminalHopResolver>) {
+    let remote = Arc::new(MockRemoteHopResolver::new());
+    let terminal = Arc::new(MockTerminalHopResolver::new());
+    let resolver = HopResolver { remote: remote.clone(), terminal: terminal.clone(), strategy };
+    (resolver, remote, terminal)
+}
+
+// ── HopResolver tests ────────────────────────────────────────────────
+
+#[test]
+fn hop_resolver_remote_run_command_with_always_wrap() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+
+    let plan = HopPlan(vec![Hop::RemoteToHost { host: HostName::new("feta") }, Hop::RunCommand {
+        command: vec![Arg::Literal("echo".into()), Arg::Literal("hello".into())],
+    }]);
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Should have 1 action: the wrapped Command
+    assert_eq!(resolved.0.len(), 1);
+    match &resolved.0[0] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("ssh".into()));
+            assert_eq!(args[1], Arg::Quoted("feta".into()));
+            match &args[2] {
+                Arg::NestedCommand(inner) => {
+                    assert_eq!(inner[0], Arg::Literal("echo".into()));
+                    assert_eq!(inner[1], Arg::Literal("hello".into()));
+                }
+                other => panic!("expected NestedCommand, got {other:?}"),
+            }
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    // Verify resolve_wrap was called
+    let remote_calls = remote.recorded_calls();
+    assert_eq!(remote_calls.len(), 1);
+    assert!(matches!(&remote_calls[0], MockRemoteCall::Wrap(h) if h.as_str() == "feta"));
+
+    // Terminal resolver should not have been called
+    assert!(terminal.recorded_calls().is_empty());
+}
+
+#[test]
+fn hop_resolver_remote_run_command_with_always_send_keys() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysSendKeys));
+    let mut context = minimal_context();
+
+    let plan = HopPlan(vec![Hop::RemoteToHost { host: HostName::new("feta") }, Hop::RunCommand {
+        command: vec![Arg::Literal("echo".into()), Arg::Literal("hello".into())],
+    }]);
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Should have 2 actions: SendKeys (bottom) + SSH Command (top)
+    assert_eq!(resolved.0.len(), 2);
+
+    match &resolved.0[0] {
+        ResolvedAction::SendKeys { steps } => {
+            assert_eq!(steps.len(), 2);
+            match &steps[0] {
+                SendKeyStep::Type(text) => {
+                    assert!(text.contains("echo"), "SendKeys should contain inner command: {text}");
+                    assert!(text.contains("hello"), "SendKeys should contain inner command args: {text}");
+                }
+                other => panic!("expected Type step, got {other:?}"),
+            }
+            assert_eq!(steps[1], SendKeyStep::WaitForPrompt);
+        }
+        other => panic!("expected SendKeys, got {other:?}"),
+    }
+
+    match &resolved.0[1] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("ssh".into()));
+            assert_eq!(args[1], Arg::Quoted("feta".into()));
+            assert_eq!(args.len(), 2, "SSH enter command should not have nested command");
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    // Verify resolve_enter was called
+    let remote_calls = remote.recorded_calls();
+    assert_eq!(remote_calls.len(), 1);
+    assert!(matches!(&remote_calls[0], MockRemoteCall::Enter(h) if h.as_str() == "feta"));
+
+    assert!(terminal.recorded_calls().is_empty());
+}
+
+#[test]
+fn hop_resolver_collapses_remote_to_local_host() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+    // context.current_host is "test-host"
+
+    let plan =
+        HopPlan(vec![Hop::RemoteToHost { host: HostName::new("test-host") }, Hop::RunCommand { command: vec![Arg::Literal("ls".into())] }]);
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Should have just the RunCommand action — remote hop collapsed
+    assert_eq!(resolved.0.len(), 1);
+    match &resolved.0[0] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("ls".into()));
+            assert_eq!(args.len(), 1);
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    // SSH resolver should NOT have been called
+    assert!(remote.recorded_calls().is_empty());
+    assert!(terminal.recorded_calls().is_empty());
+}
+
+#[test]
+fn hop_resolver_remote_attach_terminal_with_always_wrap() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+    let att_id = AttachableId::new("sess-1");
+
+    let plan = HopPlan(vec![Hop::RemoteToHost { host: HostName::new("feta") }, Hop::AttachTerminal { attachable_id: att_id.clone() }]);
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Terminal resolver pushes Command(mock-attach, sess-1)
+    // Then remote resolver wraps it: ssh feta <NestedCommand(mock-attach, sess-1)>
+    assert_eq!(resolved.0.len(), 1);
+    match &resolved.0[0] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("ssh".into()));
+            assert_eq!(args[1], Arg::Quoted("feta".into()));
+            match &args[2] {
+                Arg::NestedCommand(inner) => {
+                    assert_eq!(inner[0], Arg::Literal("mock-attach".into()));
+                    assert_eq!(inner[1], Arg::Quoted("sess-1".into()));
+                }
+                other => panic!("expected NestedCommand, got {other:?}"),
+            }
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    // Terminal resolver was called first (inside-out), then remote resolver wrapped
+    assert_eq!(terminal.recorded_calls().len(), 1);
+    assert_eq!(terminal.recorded_calls()[0], att_id);
+
+    let remote_calls = remote.recorded_calls();
+    assert_eq!(remote_calls.len(), 1);
+    assert!(matches!(&remote_calls[0], MockRemoteCall::Wrap(h) if h.as_str() == "feta"));
+}
+
+#[test]
+fn hop_resolver_empty_plan() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+
+    let plan = HopPlan(vec![]);
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    assert!(resolved.0.is_empty(), "empty plan should produce empty resolved plan");
+    assert!(remote.recorded_calls().is_empty());
+    assert!(terminal.recorded_calls().is_empty());
+}
+
+#[test]
+fn hop_resolver_run_command_only() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+
+    let plan = HopPlan(vec![Hop::RunCommand { command: vec![Arg::Literal("cargo".into()), Arg::Literal("build".into())] }]);
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    assert_eq!(resolved.0.len(), 1);
+    match &resolved.0[0] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("cargo".into()));
+            assert_eq!(args[1], Arg::Literal("build".into()));
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    // No resolvers should have been called
+    assert!(remote.recorded_calls().is_empty());
+    assert!(terminal.recorded_calls().is_empty());
+}
+
+#[test]
+fn hop_resolver_nesting_depth_incremented_for_remote_hops() {
+    let (resolver, _remote, _terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+    assert_eq!(context.nesting_depth, 0);
+
+    let plan =
+        HopPlan(vec![Hop::RemoteToHost { host: HostName::new("feta") }, Hop::RunCommand { command: vec![Arg::Literal("ls".into())] }]);
+
+    resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    assert_eq!(context.nesting_depth, 1, "nesting_depth should be incremented for remote hop");
+}
+
+#[test]
+fn hop_resolver_collapsed_hop_does_not_increment_nesting_depth() {
+    let (resolver, _remote, _terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+    assert_eq!(context.nesting_depth, 0);
+
+    let plan = HopPlan(vec![
+        Hop::RemoteToHost { host: HostName::new("test-host") }, // same as current_host
+        Hop::RunCommand { command: vec![Arg::Literal("ls".into())] },
+    ]);
+
+    resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    assert_eq!(context.nesting_depth, 0, "nesting_depth should not change when hop is collapsed");
+}
+
+#[test]
+fn hop_resolver_current_host_updated_after_remote_hop() {
+    let (resolver, _remote, _terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+    assert_eq!(context.current_host.as_str(), "test-host");
+
+    let plan =
+        HopPlan(vec![Hop::RemoteToHost { host: HostName::new("feta") }, Hop::RunCommand { command: vec![Arg::Literal("ls".into())] }]);
+
+    resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    assert_eq!(context.current_host.as_str(), "feta", "current_host should be updated to remote host");
+}
+
+#[test]
+fn hop_resolver_attach_terminal_only() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+    let mut context = minimal_context();
+    let att_id = AttachableId::new("term-local");
+
+    let plan = HopPlan(vec![Hop::AttachTerminal { attachable_id: att_id.clone() }]);
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    assert_eq!(resolved.0.len(), 1);
+    match &resolved.0[0] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("mock-attach".into()));
+            assert_eq!(args[1], Arg::Quoted("term-local".into()));
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    assert_eq!(terminal.recorded_calls().len(), 1);
+    assert!(remote.recorded_calls().is_empty(), "remote resolver should not be called for local terminal attach");
+}
+
+#[test]
+fn hop_resolver_remote_attach_terminal_with_always_send_keys() {
+    let (resolver, remote, terminal) = mock_hop_resolver(Arc::new(AlwaysSendKeys));
+    let mut context = minimal_context();
+    let att_id = AttachableId::new("sess-2");
+
+    let plan = HopPlan(vec![Hop::RemoteToHost { host: HostName::new("feta") }, Hop::AttachTerminal { attachable_id: att_id.clone() }]);
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Terminal resolver pushes Command(mock-attach, sess-2)
+    // Remote resolve_enter pops it, converts to SendKeys, pushes SSH Command
+    assert_eq!(resolved.0.len(), 2);
+
+    match &resolved.0[0] {
+        ResolvedAction::SendKeys { steps } => match &steps[0] {
+            SendKeyStep::Type(text) => {
+                assert!(text.contains("mock-attach"), "SendKeys should contain terminal command: {text}");
+            }
+            other => panic!("expected Type step, got {other:?}"),
+        },
+        other => panic!("expected SendKeys, got {other:?}"),
+    }
+
+    match &resolved.0[1] {
+        ResolvedAction::Command(args) => {
+            assert_eq!(args[0], Arg::Literal("ssh".into()));
+            assert_eq!(args[1], Arg::Quoted("feta".into()));
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+
+    assert_eq!(terminal.recorded_calls().len(), 1);
+    let remote_calls = remote.recorded_calls();
+    assert_eq!(remote_calls.len(), 1);
+    assert!(matches!(&remote_calls[0], MockRemoteCall::Enter(h) if h.as_str() == "feta"));
 }
