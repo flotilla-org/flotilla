@@ -1,8 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, ProviderData, RepoIdentity,
-    RepoLabels, SessionStatus, WorkItem,
+    CategoryLabels, ChangeRequest, Checkout, CloudAgentSession, Issue, ProviderData, RepoIdentity, RepoLabels, SessionStatus, WorkItem,
 };
 // Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
 pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
@@ -220,56 +219,21 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
 
 pub fn make_checkout(branch: &str, path: &str, is_main: bool) -> (flotilla_protocol::HostPath, Checkout) {
     let key = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from(path));
-    let checkout = Checkout {
-        branch: branch.to_string(),
-        is_main,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        correlation_keys: vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(key.clone())],
-        association_keys: vec![],
-    };
+    let mut checkout = flotilla_protocol::test_support::TestCheckout::new(branch).is_main(is_main).with_branch_key().build();
+    checkout.correlation_keys.push(flotilla_protocol::CorrelationKey::CheckoutPath(key.clone()));
     (key, checkout)
 }
 
 pub fn make_change_request(id: &str, title: &str, branch: &str) -> (String, ChangeRequest) {
-    let cr = ChangeRequest {
-        title: title.to_string(),
-        branch: branch.to_string(),
-        status: ChangeRequestStatus::Open,
-        body: None,
-        correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
-        association_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-    };
-    (id.to_string(), cr)
+    (id.to_string(), flotilla_protocol::test_support::TestChangeRequest::new(title, branch).with_branch_key().build())
 }
 
 pub fn make_issue(id: &str, title: &str) -> (String, Issue) {
-    let issue = Issue {
-        title: title.to_string(),
-        labels: vec![],
-        association_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-    };
-    (id.to_string(), issue)
+    (id.to_string(), flotilla_protocol::test_support::TestIssue::new(title).build())
 }
 
 pub fn make_session(id: &str, title: &str, status: SessionStatus) -> (String, CloudAgentSession) {
-    let session = CloudAgentSession {
-        title: title.to_string(),
-        status,
-        model: None,
-        updated_at: None,
-        correlation_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-        item_noun: String::new(),
-    };
-    (id.to_string(), session)
+    (id.to_string(), flotilla_protocol::test_support::TestSession::new(title).with_status(status).build())
 }
 
 // ── WorkItem builders (thin wrappers over test_support where possible) ──

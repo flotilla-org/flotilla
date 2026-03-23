@@ -2307,13 +2307,10 @@ async fn issue_refresh_escalation_resets_cache_and_refetches() {
     // `cache.len() (50) < desired_count (55)` and fetches page 2 — proving
     // multi-page continuation works.
     fn make_issue(n: u32) -> (String, Issue) {
-        (n.to_string(), Issue {
-            title: format!("Issue {n}"),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: "fake-issues".into(),
-            provider_display_name: "Fake Issues".into(),
-        })
+        let mut issue = flotilla_protocol::test_support::TestIssue::new(&format!("Issue {n}")).build();
+        issue.provider_name = "fake-issues".into();
+        issue.provider_display_name = "Fake Issues".into();
+        (n.to_string(), issue)
     }
 
     let issue_tracker = Arc::new(FakeIssueTracker::new());

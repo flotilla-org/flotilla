@@ -394,6 +394,7 @@ mod tests {
     use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
     use async_trait::async_trait;
+    use flotilla_protocol::test_support::{TestChangeRequest, TestCheckout, TestSession};
 
     use super::*;
     use crate::providers::{
@@ -627,45 +628,6 @@ mod tests {
         RepoCriteria::default()
     }
 
-    fn make_checkout(branch: &str) -> Checkout {
-        Checkout {
-            branch: branch.to_string(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
-            association_keys: vec![],
-        }
-    }
-
-    fn make_change_request(title: &str, branch: &str) -> ChangeRequest {
-        ChangeRequest {
-            title: title.to_string(),
-            branch: branch.to_string(),
-            status: ChangeRequestStatus::Open,
-            body: None,
-            correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
-            association_keys: vec![],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        }
-    }
-
-    fn make_session(title: &str, session_id: &str) -> CloudAgentSession {
-        CloudAgentSession {
-            title: title.to_string(),
-            status: SessionStatus::Running,
-            model: None,
-            updated_at: None,
-            correlation_keys: vec![CorrelationKey::SessionRef("mock".to_string(), session_id.to_string())],
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-            item_noun: String::new(),
-        }
-    }
-
     fn make_workspace(name: &str) -> Workspace {
         Workspace { name: name.to_string(), directories: vec![], correlation_keys: vec![], attachable_set_id: None }
     }
@@ -773,19 +735,26 @@ mod tests {
         registry.checkout_managers.insert(
             "wt",
             desc("wt"),
-            Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))])),
+            Arc::new(MockCheckoutManager::ok(vec![(
+                PathBuf::from("/tmp/wt/feat-a"),
+                TestCheckout::new("feat-a").with_branch_key().build(),
+            )])),
         );
         registry.change_requests.insert(
             "github",
             desc("github"),
-            Arc::new(MockChangeRequestTracker::ok(vec![("42".to_string(), make_change_request("Add feature", "feat-a"))], vec![
-                "shared".to_string()
-            ])),
+            Arc::new(MockChangeRequestTracker::ok(
+                vec![("42".to_string(), TestChangeRequest::new("Add feature", "feat-a").with_branch_key().build())],
+                vec!["shared".to_string()],
+            )),
         );
         registry.cloud_agents.insert(
             "claude",
             desc("claude"),
-            Arc::new(MockCloudAgent::ok(vec![("sess-1".to_string(), make_session("Debug", "sess-1"))])),
+            Arc::new(MockCloudAgent::ok(vec![(
+                "sess-1".to_string(),
+                TestSession::new("Debug").with_session_ref("mock", "sess-1").build(),
+            )])),
         );
         registry.vcs.insert("git", desc("git"), Arc::new(MockVcs::ok(vec!["remote-only".to_string(), "shared".to_string()])));
         registry.workspace_managers.insert(
@@ -884,7 +853,10 @@ mod tests {
         registry.checkout_managers.insert(
             "wt",
             desc("wt"),
-            Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), make_checkout("feat-a"))])),
+            Arc::new(MockCheckoutManager::ok(vec![(
+                PathBuf::from("/tmp/wt/feat-a"),
+                TestCheckout::new("feat-a").with_branch_key().build(),
+            )])),
         );
         registry.change_requests.insert("github", desc("github"), Arc::new(MockChangeRequestTracker::failing("pr fail", "merged fail")));
         registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("sessions fail")));

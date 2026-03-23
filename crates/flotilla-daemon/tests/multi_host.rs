@@ -24,8 +24,8 @@ use flotilla_daemon::peer::{
     PeerManager, PeerSender, PeerTransport,
 };
 use flotilla_protocol::{
-    Checkout, CheckoutTarget, Command, CommandAction, CommandValue, DaemonEvent, GoodbyeReason, HostName, HostPath, PeerDataKind,
-    PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, VectorClock,
+    test_support::TestCheckout, CheckoutTarget, Command, CommandAction, CommandValue, DaemonEvent, GoodbyeReason, HostName, HostPath,
+    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepoSelector, VectorClock,
 };
 use indexmap::IndexMap;
 use tokio::sync::mpsc;
@@ -99,19 +99,6 @@ fn test_repo() -> RepoIdentity {
     RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
 }
 
-fn make_checkout(branch: &str) -> Checkout {
-    Checkout {
-        branch: branch.to_string(),
-        is_main: false,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        correlation_keys: vec![],
-        association_keys: vec![],
-    }
-}
-
 fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
     let mut clock = VectorClock::default();
     for _ in 0..seq {
@@ -169,7 +156,7 @@ async fn peer_manager_stores_snapshot_and_returns_updated() {
 
     // Build provider data with a checkout from the follower
     let mut follower_data = ProviderData::default();
-    follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/home/dev/repo"), make_checkout("feature-branch"));
+    follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/home/dev/repo"), TestCheckout::new("feature-branch").build());
 
     let msg = snapshot_msg("follower", 1, follower_data);
     let result =
@@ -203,14 +190,14 @@ fn merge_combines_checkouts_from_leader_and_follower() {
     // Leader has a checkout on "laptop"
     let local_host = HostName::new("laptop");
     let local = ProviderData {
-        checkouts: IndexMap::from([(HostPath::new(local_host.clone(), "/home/dev/repo/main"), make_checkout("main"))]),
+        checkouts: IndexMap::from([(HostPath::new(local_host.clone(), "/home/dev/repo/main"), TestCheckout::new("main").build())]),
         ..Default::default()
     };
 
     // Follower has a checkout on "desktop"
     let peer_host = HostName::new("desktop");
     let peer_data = ProviderData {
-        checkouts: IndexMap::from([(HostPath::new(peer_host.clone(), "/home/dev/repo/feature"), make_checkout("feature-x"))]),
+        checkouts: IndexMap::from([(HostPath::new(peer_host.clone(), "/home/dev/repo/feature"), TestCheckout::new("feature-x").build())]),
         ..Default::default()
     };
 
@@ -243,7 +230,7 @@ async fn peer_manager_to_merge_end_to_end() {
 
     // Follower sends its checkout data
     let mut follower_data = ProviderData::default();
-    follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/opt/code/repo"), make_checkout("experiment"));
+    follower_data.checkouts.insert(HostPath::new(HostName::new("follower"), "/opt/code/repo"), TestCheckout::new("experiment").build());
 
     let msg = snapshot_msg("follower", 1, follower_data);
     let result =
@@ -253,7 +240,7 @@ async fn peer_manager_to_merge_end_to_end() {
 
     // Leader has its own local data
     let mut local_data = ProviderData::default();
-    local_data.checkouts.insert(HostPath::new(leader_host.clone(), "/home/dev/repo"), make_checkout("main"));
+    local_data.checkouts.insert(HostPath::new(leader_host.clone(), "/home/dev/repo"), TestCheckout::new("main").build());
 
     // Collect peer data in the format merge_provider_data expects
     let peer_data = mgr.get_peer_data();
@@ -404,7 +391,7 @@ async fn daemon_snapshot_includes_follower_checkout_overlay() {
     );
 
     let mut follower_data = ProviderData::default();
-    follower_data.checkouts.insert(follower_checkout.clone(), make_checkout("feature-x"));
+    follower_data.checkouts.insert(follower_checkout.clone(), TestCheckout::new("feature-x").build());
 
     // `set_peer_providers` updates the overlay and rebuilds the snapshot synchronously,
     // so `get_state` can assert on the merged view immediately.
@@ -501,7 +488,7 @@ async fn relay_excludes_origin_and_sends_to_other_peers() {
 
     // Data arrives from follower-a
     let mut data = ProviderData::default();
-    data.checkouts.insert(HostPath::new(HostName::new("follower-a"), "/home/dev/repo"), make_checkout("feature"));
+    data.checkouts.insert(HostPath::new(HostName::new("follower-a"), "/home/dev/repo"), TestCheckout::new("feature").build());
     let msg = snapshot_msg("follower-a", 1, data);
 
     // prepare_relay should return targets for b and c, but not a
@@ -571,12 +558,12 @@ async fn peer_manager_handles_multiple_peers_and_repos() {
 
     // Follower A sends data
     let mut data_a = ProviderData::default();
-    data_a.checkouts.insert(HostPath::new(HostName::new("follower-a"), "/home/a/repo"), make_checkout("branch-a"));
+    data_a.checkouts.insert(HostPath::new(HostName::new("follower-a"), "/home/a/repo"), TestCheckout::new("branch-a").build());
     let msg_a = snapshot_msg("follower-a", 1, data_a);
 
     // Follower B sends data
     let mut data_b = ProviderData::default();
-    data_b.checkouts.insert(HostPath::new(HostName::new("follower-b"), "/home/b/repo"), make_checkout("branch-b"));
+    data_b.checkouts.insert(HostPath::new(HostName::new("follower-b"), "/home/b/repo"), TestCheckout::new("branch-b").build());
     let msg_b = snapshot_msg("follower-b", 2, data_b);
 
     assert_eq!(
@@ -615,7 +602,7 @@ fn merge_preserves_local_service_data_with_peer_checkouts() {
 
     let local_host = HostName::new("leader");
     let mut local = ProviderData::default();
-    local.checkouts.insert(HostPath::new(local_host.clone(), "/home/dev/repo"), make_checkout("main"));
+    local.checkouts.insert(HostPath::new(local_host.clone(), "/home/dev/repo"), TestCheckout::new("main").build());
     local.change_requests.insert("PR-42".into(), ChangeRequest {
         title: "Add feature".into(),
         branch: "feature".into(),
@@ -630,7 +617,7 @@ fn merge_preserves_local_service_data_with_peer_checkouts() {
     // Follower only has checkouts (no service data — as expected in follower mode)
     let peer_host = HostName::new("follower");
     let peer_data = ProviderData {
-        checkouts: IndexMap::from([(HostPath::new(peer_host.clone(), "/opt/repo"), make_checkout("feature"))]),
+        checkouts: IndexMap::from([(HostPath::new(peer_host.clone(), "/opt/repo"), TestCheckout::new("feature").build())]),
         ..Default::default()
     };
 
@@ -718,7 +705,7 @@ async fn peer_snapshot_update_overwrites_previous() {
 
     // First snapshot from follower with branch "old-branch"
     let mut data1 = ProviderData::default();
-    data1.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), make_checkout("old-branch"));
+    data1.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), TestCheckout::new("old-branch").build());
     handle_test_peer_data(&mut mgr, snapshot_msg("follower", 1, data1), || {
         Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
     })
@@ -726,7 +713,7 @@ async fn peer_snapshot_update_overwrites_previous() {
 
     // Second snapshot with branch "new-branch"
     let mut data2 = ProviderData::default();
-    data2.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), make_checkout("new-branch"));
+    data2.checkouts.insert(HostPath::new(HostName::new("follower"), "/repo"), TestCheckout::new("new-branch").build());
     let result = handle_test_peer_data(&mut mgr, snapshot_msg("follower", 2, data2), || {
         Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) }) as Arc<dyn PeerSender>
     })
