@@ -75,7 +75,6 @@ trait EnvironmentProvider {
 struct EnvironmentSpec {
     image: ImageSource,                 // Dockerfile path or registry image
     token_requirements: Vec<String>,    // e.g. ["github", "claude"]
-    checkout_strategy: CodebaseAccessStrategy,
 }
 
 enum ImageSource {
@@ -95,7 +94,7 @@ trait ProvisionedEnvironment: Send + Sync {
 
     // Live queries — implementation decides caching strategy
     async fn status(&self) -> Result<EnvironmentStatus, String>;
-    async fn env_snapshot(&self) -> Result<EnvironmentBag, String>;
+    async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
 
     // Execution context — composes with host runner (decorator pattern)
     fn runner(&self, host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner>;
@@ -105,9 +104,13 @@ trait ProvisionedEnvironment: Send + Sync {
 }
 ```
 
-The handle is opaque — callers interact through the trait. The Docker implementation holds the container ID and queries status, env vars, etc. on demand. `env_snapshot()` captures the interior environment via login shell invocation (`docker exec <container> sh -lc env`), reflecting the real environment a process sees inside — image defaults, profile scripts, and injected vars. The implementation may cache the snapshot and invalidate on restart; that's an internal detail.
+The handle is opaque — callers interact through the trait. The Docker implementation holds the container ID and queries status, env vars, etc. on demand. `env_vars()` captures the raw shell environment via login shell invocation (`docker exec <container> sh -lc env`), returning a `HashMap<String, String>` of what processes inside the container actually see — `PATH`, `HOME`, `SHELL`, injected tokens, etc. The implementation may cache and invalidate on restart; that's an internal detail.
 
-The runner returned by the handle wraps commands via `docker exec` (or equivalent). The same runner feeds back into standard provider discovery — the `FactoryRegistry` probes inside the environment using the environment's runner and env snapshot, producing a per-environment provider tree identical in shape to a host-level one.
+**Important distinction:** raw env vars (`HashMap<String, String>`) are not the same as `EnvironmentBag` (the assertion-based discovered facts used by `Factory::probe()`). The raw env vars feed *into* the discovery pipeline which builds the `EnvironmentBag` — same as on a host today. The handle provides the raw vars; the discovery pipeline derives the assertions.
+
+`EnvironmentId` is a filesystem-safe newtype (UUID or slug) since it appears in socket paths (`env-{id}.sock`), container names, and replicated data.
+
+The runner returned by the handle wraps commands via `docker exec` (or equivalent). The same runner feeds back into standard provider discovery — the `FactoryRegistry` probes inside the environment using the environment's runner and the raw env vars (to build the `EnvironmentBag`), producing a per-environment provider tree identical in shape to a host-level one.
 
 **Phase 1 implementation:** `DockerEnvironment`.
 
@@ -172,7 +175,7 @@ git clone --reference /ref/repo <remote-url> /workspace/<branch>
 
 This avoids git worktree symlink problems entirely. The clone is fast (shared objects via `--reference`), has clean ownership (container user owns it), and independent git state (pushes directly with injected token). Shallow clone (`--depth 1`) is available for large repos.
 
-The Vcs provider handles the clone — no git-specific logic in the environment provider. `CodebaseAccessStrategy` sits at the orchestration level, telling the step plan builder what to ask the Vcs provider to do.
+The Vcs provider handles the clone — no git-specific logic in the environment provider. `CodebaseAccessStrategy` sits at the orchestration level (in `CreateOpts` or the step plan), not in `EnvironmentSpec`. The environment spec describes what the environment *provides*; how codebase access works is a deployment-time decision made by the step plan builder.
 
 Future strategies (mount worktree, bidirectional sync) are additional enum variants.
 
@@ -249,7 +252,7 @@ Phase 1: env vars at container launch. `CreateOpts` carries token key-value pair
 
 Long-lived tokens, manually configured. The environment spec declares what it *needs* ("requires: github, claude"); the provisioning system resolves requirements to actual tokens from config. Secrets stay out of the project-level spec file.
 
-Full credential management (#443) is deferred: rotation, revocation, API proxying, vault integration, audit trails.
+**Known limitation:** env vars injected at container launch are visible to all processes inside the container, including agent sub-processes. This is acceptable for phase 1 where the container runs a single trusted agent, but is not suitable for multi-tenant or untrusted workloads. Full credential management (#443) is deferred: rotation, revocation, API proxying, vault integration, audit trails.
 
 ## Implementation Phases
 
@@ -260,6 +263,8 @@ Introduce `Hop`, `HopExecution`, `HopResolver`. Migrate existing remote terminal
 ### Phase B: Provider Audit + Execution Context Cleanup
 
 Audit every provider factory for direct host assumptions. Ensure all discovery and runtime operations go through injected `CommandRunner` and `EnvironmentBag`. Review `ConfigStore` projection and `repo_root` handling. This phase is research-heavy — its output is a detailed map of what needs changing and the changes themselves.
+
+**Factories in scope:** git, cleat, shpool, passthrough, cmux, tmux, zellij, claude, codex, cursor, github. **Done means:** no `std::env::var()` calls outside test-gated paths, no `Command::new()` bypassing the injected runner, no hardcoded host paths. Each factory's `probe()` and the resulting provider's runtime methods must work when the injected `CommandRunner` and env vars describe a container interior rather than the host.
 
 ### Phase C: EnvironmentProvider Trait + Docker Implementation
 
@@ -272,7 +277,7 @@ Audit every provider factory for direct host assumptions. Ensure all discovery a
 ## Open Questions for Nested Brainstorms
 
 - **ConfigStore projection:** what config subset does an environment need? How does `repo_root` work before checkout exists?
-- **Environment lifecycle management:** garbage collection, idle timeout, resource limits
+- **Environment lifecycle management:** start/stop (pause without destroying interior state), garbage collection, idle timeout, resource limits
 - **Image caching:** per-host image cache, cross-host image distribution
 - **DirectHost-as-Environment unification:** should bare-host execution eventually become a degenerate environment for a uniform model?
 - **Agent awareness:** should agents inside environments know they're sandboxed? How does this affect their workflow?
