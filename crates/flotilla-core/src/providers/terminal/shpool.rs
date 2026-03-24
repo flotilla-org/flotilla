@@ -411,6 +411,24 @@ impl ShpoolTerminalPool {
         true
     }
 
+    /// Check whether a session with the given name exists in the shpool daemon.
+    /// Unlike `list_sessions()`, this checks ALL sessions (no `flotilla/` prefix filter).
+    async fn session_exists(&self, session_name: &str) -> bool {
+        let socket_str = self.socket_path.display().to_string();
+        let config_str = self.config_path.display().to_string();
+        let result = run!(self.runner, "shpool", &["--socket", &socket_str, "-c", &config_str, "list", "--json"], Path::new("/"));
+        match result {
+            Ok(json) => {
+                let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                parsed["sessions"]
+                    .as_array()
+                    .map(|sessions| sessions.iter().any(|s| s["name"].as_str() == Some(session_name)))
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Parse the JSON output of `shpool list --json`.
     fn parse_list_json(json: &str) -> Result<Vec<TerminalSession>, String> {
         let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("failed to parse shpool list: {e}"))?;
@@ -477,21 +495,30 @@ impl TerminalPool for ShpoolTerminalPool {
     }
 
     async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
+        // If the session already exists, leave it alone — don't disrupt a
+        // live attach by re-running attach+detach. We can't use list_sessions()
+        // here because it filters to flotilla/-prefixed names, but session
+        // names are UUIDs (attachable IDs). Query the raw shpool list instead.
+        if self.session_exists(session_name).await {
+            return Ok(());
+        }
+
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
-        // Build --cmd value. shpool uses shell-words for tokenization (no variable
-        // expansion), so all values must be literal.
+        // Build --cmd value. shpool uses shell-words for tokenization (no
+        // variable expansion), so all values must be literal. Quote values
+        // so paths with spaces are handled correctly.
         let mut cmd_parts: Vec<String> = Vec::new();
         if !env_vars.is_empty() {
             cmd_parts.push("env".to_string());
             for (k, v) in env_vars {
-                cmd_parts.push(format!("{k}={v}"));
+                cmd_parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
             }
         }
-        cmd_parts.push(shell);
+        cmd_parts.push(flotilla_protocol::arg::shell_quote(&shell));
         if !command.is_empty() {
             cmd_parts.push("-lic".to_string());
-            cmd_parts.push(command.to_string());
+            cmd_parts.push(flotilla_protocol::arg::shell_quote(command));
         }
         let cmd_str = cmd_parts.join(" ");
 

@@ -60,7 +60,7 @@ impl TerminalPool for CleatTerminalPool {
         } else {
             let mut parts = vec!["env".to_string()];
             for (k, v) in env_vars {
-                parts.push(format!("{k}={v}"));
+                parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
             }
             parts.push(command.to_string());
             parts.join(" ")
@@ -148,7 +148,7 @@ mod tests {
         let cmd_idx = calls[0].1.iter().position(|a| a == "--cmd").expect("--cmd present");
         let cmd_val = &calls[0].1[cmd_idx + 1];
         assert!(cmd_val.starts_with("env "), "should prefix with env: {cmd_val}");
-        assert!(cmd_val.contains("FOO=bar"), "should contain env var: {cmd_val}");
+        assert!(cmd_val.contains("FOO='bar'"), "should contain quoted env var: {cmd_val}");
         assert!(cmd_val.ends_with("claude"), "should end with command: {cmd_val}");
     }
 

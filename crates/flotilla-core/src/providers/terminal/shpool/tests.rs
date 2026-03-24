@@ -228,11 +228,15 @@ fn attach_args_with_env_vars_empty_command() {
 
 // ── ensure_session tests ───────────────────────────────────────
 
+/// Empty list response for ensure_session tests (session doesn't exist yet).
+const EMPTY_LIST_JSON: &str = r#"{"sessions": []}"#;
+
 #[tokio::test]
 async fn ensure_session_creates_via_attach_then_detach() {
     let runner = Arc::new(MockRunner::new(vec![
-        Ok(String::new()), // attach response
-        Ok(String::new()), // detach response
+        Ok(EMPTY_LIST_JSON.into()), // list_sessions: session doesn't exist
+        Ok(String::new()),          // attach response
+        Ok(String::new()),          // detach response
     ]));
     let (pool, _dir) = test_pool(runner.clone());
     let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
@@ -240,11 +244,10 @@ async fn ensure_session_creates_via_attach_then_detach() {
     pool.ensure_session("test-session", "claude", Path::new("/repo"), &env).await.expect("ensure_session");
 
     let calls = runner.calls();
-    assert_eq!(calls.len(), 2, "should call attach then detach: {calls:?}");
+    assert_eq!(calls.len(), 3, "should call list, attach, detach: {calls:?}");
 
-    // First call: shpool attach with --cmd
-    assert_eq!(calls[0].0, "shpool");
-    let attach_args = &calls[0].1;
+    // Second call (index 1): shpool attach with --cmd
+    let attach_args = &calls[1].1;
     assert!(attach_args.contains(&"attach".to_string()));
     assert!(attach_args.contains(&"--cmd".to_string()));
     assert!(attach_args.contains(&"test-session".to_string()));
@@ -255,22 +258,42 @@ async fn ensure_session_creates_via_attach_then_detach() {
     assert!(!cmd_val.contains("${SHELL"), "should not contain unresolved shell variable: {cmd_val}");
     assert!(cmd_val.contains("FLOTILLA_ATTACHABLE_ID"), "should contain env var: {cmd_val}");
 
-    // Second call: shpool detach
-    assert_eq!(calls[1].0, "shpool");
-    let detach_args = &calls[1].1;
+    // Third call (index 2): shpool detach
+    let detach_args = &calls[2].1;
     assert!(detach_args.contains(&"detach".to_string()));
     assert!(detach_args.contains(&"test-session".to_string()));
 }
 
 #[tokio::test]
+async fn ensure_session_skips_if_session_exists() {
+    let existing_list = r#"{"sessions": [{"name": "test-session", "started_at_unix_ms": 1709900000000, "status": "Attached"}]}"#;
+    let runner = Arc::new(MockRunner::new(vec![
+        Ok(existing_list.into()), // session_exists: session found
+    ]));
+    let (pool, _dir) = test_pool(runner.clone());
+    let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
+
+    pool.ensure_session("test-session", "claude", Path::new("/repo"), &env).await.expect("ensure_session");
+
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1, "should only call list (session_exists), not attach: {calls:?}");
+    // The single call should be shpool list --json
+    assert!(calls[0].1.contains(&"list".to_string()), "should be a list call: {:?}", calls[0].1);
+}
+
+#[tokio::test]
 async fn ensure_session_empty_command_starts_login_shell() {
-    let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new())]));
+    let runner = Arc::new(MockRunner::new(vec![
+        Ok(EMPTY_LIST_JSON.into()), // list_sessions
+        Ok(String::new()),          // attach
+        Ok(String::new()),          // detach
+    ]));
     let (pool, _dir) = test_pool(runner.clone());
 
     pool.ensure_session("test-session", "", Path::new("/repo"), &vec![]).await.expect("ensure_session");
 
     let calls = runner.calls();
-    let cmd_idx = calls[0].1.iter().position(|a| a == "--cmd").expect("--cmd present");
-    let cmd_val = &calls[0].1[cmd_idx + 1];
+    let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
+    let cmd_val = &calls[1].1[cmd_idx + 1];
     assert!(!cmd_val.contains("-lic"), "empty command should not have -lic: {cmd_val}");
 }
