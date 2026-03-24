@@ -26,7 +26,13 @@ pub struct TerminalSession {
 #[async_trait]
 pub trait TerminalPool: Send + Sync {
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String>;
-    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &ExecutionEnvironmentPath) -> Result<(), String>;
+    async fn ensure_session(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+    ) -> Result<(), String>;
 
     /// Returns a structured `Arg` tree representing the attach command.
     /// Callers that need a flat string can use `flatten(&args, 0)`.

@@ -487,7 +487,13 @@ impl TerminalPool for FakeTerminalPool {
         Ok(Vec::new())
     }
 
-    async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &ExecutionEnvironmentPath) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        _session_name: &str,
+        _command: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &TerminalEnvVars,
+    ) -> Result<(), String> {
         Ok(())
     }
 

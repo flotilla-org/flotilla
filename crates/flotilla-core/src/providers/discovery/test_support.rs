@@ -717,7 +717,13 @@ impl TerminalPool for FakeTerminalPool {
         Ok(self.sessions.lock().await.clone())
     }
 
-    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &ExecutionEnvironmentPath) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        _env_vars: &super::super::terminal::TerminalEnvVars,
+    ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.iter().any(|s| s.session_name == session_name) {
             return Ok(());
