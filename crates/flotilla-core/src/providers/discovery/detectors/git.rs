@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
-                assert_eq!(root, dir.path());
+                assert_eq!(root.as_path(), dir.path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(*is_main_checkout);
             }
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
-                assert_eq!(root, dir.path());
+                assert_eq!(root.as_path(), dir.path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(!*is_main_checkout);
             }

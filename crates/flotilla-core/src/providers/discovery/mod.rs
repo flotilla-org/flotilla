@@ -23,6 +23,7 @@ use futures::stream;
 use crate::{
     attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
@@ -54,21 +55,21 @@ pub enum HostPlatform {
 
 #[derive(Debug, Clone)]
 pub enum EnvironmentAssertion {
-    BinaryAvailable { name: String, path: PathBuf, version: Option<String> },
+    BinaryAvailable { name: String, path: ExecutionEnvironmentPath, version: Option<String> },
     EnvVarSet { key: String, value: String },
-    VcsCheckoutDetected { root: PathBuf, kind: VcsKind, is_main_checkout: bool },
+    VcsCheckoutDetected { root: ExecutionEnvironmentPath, kind: VcsKind, is_main_checkout: bool },
     RemoteHost { platform: HostPlatform, owner: String, repo: String, remote_name: String },
-    AuthFileExists { provider: String, path: PathBuf },
-    SocketAvailable { name: String, path: PathBuf },
+    AuthFileExists { provider: String, path: ExecutionEnvironmentPath },
+    SocketAvailable { name: String, path: DaemonHostPath },
 }
 
 impl EnvironmentAssertion {
     pub fn binary(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self::BinaryAvailable { name: name.into(), path: path.into(), version: None }
+        Self::BinaryAvailable { name: name.into(), path: ExecutionEnvironmentPath::new(path.into()), version: None }
     }
 
     pub fn versioned_binary(name: impl Into<String>, path: impl Into<PathBuf>, version: impl Into<String>) -> Self {
-        Self::BinaryAvailable { name: name.into(), path: path.into(), version: Some(version.into()) }
+        Self::BinaryAvailable { name: name.into(), path: ExecutionEnvironmentPath::new(path.into()), version: Some(version.into()) }
     }
 
     pub fn env_var(key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -76,7 +77,7 @@ impl EnvironmentAssertion {
     }
 
     pub fn vcs_checkout(root: impl Into<PathBuf>, kind: VcsKind, is_main_checkout: bool) -> Self {
-        Self::VcsCheckoutDetected { root: root.into(), kind, is_main_checkout }
+        Self::VcsCheckoutDetected { root: ExecutionEnvironmentPath::new(root.into()), kind, is_main_checkout }
     }
 
     pub fn remote_host(platform: HostPlatform, owner: impl Into<String>, repo: impl Into<String>, remote_name: impl Into<String>) -> Self {
@@ -84,11 +85,11 @@ impl EnvironmentAssertion {
     }
 
     pub fn auth_file(provider: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self::AuthFileExists { provider: provider.into(), path: path.into() }
+        Self::AuthFileExists { provider: provider.into(), path: ExecutionEnvironmentPath::new(path.into()) }
     }
 
     pub fn socket(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self::SocketAvailable { name: name.into(), path: path.into() }
+        Self::SocketAvailable { name: name.into(), path: DaemonHostPath::new(path.into()) }
     }
 }
 
@@ -121,7 +122,7 @@ impl EnvironmentBag {
         self
     }
 
-    pub fn find_binary(&self, name: &str) -> Option<&PathBuf> {
+    pub fn find_binary(&self, name: &str) -> Option<&ExecutionEnvironmentPath> {
         self.assertions.iter().find_map(|a| match a {
             EnvironmentAssertion::BinaryAvailable { name: n, path, .. } if n == name => Some(path),
             _ => None,
@@ -167,18 +168,16 @@ impl EnvironmentBag {
         })
     }
 
-    pub fn find_socket(&self, name: &str) -> Option<&PathBuf> {
+    pub fn find_socket(&self, name: &str) -> Option<&DaemonHostPath> {
         self.assertions.iter().find_map(|a| match a {
             EnvironmentAssertion::SocketAvailable { name: n, path, .. } if n == name => Some(path),
             _ => None,
         })
     }
 
-    pub fn find_vcs_checkout(&self, kind: VcsKind) -> Option<(&Path, bool)> {
+    pub fn find_vcs_checkout(&self, kind: VcsKind) -> Option<(&ExecutionEnvironmentPath, bool)> {
         self.assertions.iter().find_map(|a| match a {
-            EnvironmentAssertion::VcsCheckoutDetected { root, kind: k, is_main_checkout } if *k == kind => {
-                Some((root.as_path(), *is_main_checkout))
-            }
+            EnvironmentAssertion::VcsCheckoutDetected { root, kind: k, is_main_checkout } if *k == kind => Some((root, *is_main_checkout)),
             _ => None,
         })
     }

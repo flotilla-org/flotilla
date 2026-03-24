@@ -31,7 +31,7 @@ impl Factory for CleatTerminalPoolFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if let Some(binary) = env.find_binary("cleat") {
-            Ok(Arc::new(CleatTerminalPool::new(runner, binary.display().to_string())))
+            Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string())))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("cleat".into())])
         }

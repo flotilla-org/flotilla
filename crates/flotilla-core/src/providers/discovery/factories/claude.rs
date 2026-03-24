@@ -96,7 +96,7 @@ impl Factory for ClaudeCliAiUtilityFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
         if let Some(path) = env.find_binary("claude") {
-            let claude_bin = path.to_string_lossy().to_string();
+            let claude_bin = path.as_path().to_string_lossy().to_string();
             Ok(Arc::new(ClaudeCliAiUtility::new(claude_bin, runner)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("claude".into())])
