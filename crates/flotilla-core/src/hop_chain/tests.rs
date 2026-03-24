@@ -929,6 +929,7 @@ fn builder_store_with_host(attachable_id: &AttachableId, host_affinity: Option<H
 #[test]
 fn build_for_attachable_host_routing() {
     let local_host = HostName::new("my-host");
+    // AttachableId("") is a placeholder — the match loop below substitutes the real att_id for AttachTerminal hops.
     let cases: &[(&str, Option<HostName>, &[Hop])] = &[
         ("local host → attach only", Some(HostName::new("my-host")), &[Hop::AttachTerminal { attachable_id: AttachableId::new("") }]),
         ("remote host → remote + attach", Some(HostName::new("feta")), &[
