@@ -234,12 +234,12 @@ impl tracing::field::Visit for MessageVisitor {
 }
 
 /// Initialize tracing: file appender + TUI in-memory layer.
-/// Call once at startup.
-pub fn init() {
-    let log_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".config/flotilla");
-    let _ = std::fs::create_dir_all(&log_dir);
+/// Call once at startup. `log_dir` is typically `PathPolicy::state_dir`
+/// (logs are runtime state, not config).
+pub fn init_with_dir(log_dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(log_dir);
 
-    let file_appender = tracing_appender::rolling::never(&log_dir, "flotilla.log");
+    let file_appender = tracing_appender::rolling::never(log_dir, "flotilla.log");
 
     let file_layer = tracing_subscriber::fmt::layer().with_writer(file_appender).with_ansi(false).with_target(false);
 

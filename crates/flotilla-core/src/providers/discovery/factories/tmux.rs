@@ -27,12 +27,12 @@ impl Factory for TmuxWorkspaceManagerFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("TMUX").is_some() {
-            Ok(Arc::new(TmuxWorkspaceManager::new(runner)))
+            Ok(Arc::new(TmuxWorkspaceManager::new(runner, config.state_dir().clone())))
         } else {
             Err(vec![UnmetRequirement::MissingEnvVar("TMUX".into())])
         }

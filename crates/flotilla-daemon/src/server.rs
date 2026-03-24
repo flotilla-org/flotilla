@@ -75,7 +75,13 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
                 "peer config uses same name as local host — messages will be ignored"
             );
         }
-        match SshTransport::new(host_name.clone(), ConfigLabel(name.clone()), host_config, daemon.session_id()) {
+        match SshTransport::new(
+            host_name.clone(),
+            ConfigLabel(name.clone()),
+            host_config,
+            daemon.session_id(),
+            config.state_dir().as_path(),
+        ) {
             Ok(transport) => {
                 peer_manager.add_peer(peer_host, Box::new(transport));
             }

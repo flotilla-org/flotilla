@@ -13,10 +13,7 @@ use super::types::{
     Attachable, AttachableContent, AttachableId, AttachableSet, AttachableSetId, BindingObjectKind, ProviderBinding, TerminalAttachable,
     TerminalPurpose,
 };
-use crate::{
-    config::flotilla_config_dir,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-};
+use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 type BindingKey = (String, String, BindingObjectKind, String);
 
@@ -386,10 +383,6 @@ pub struct AttachableStore {
 }
 
 impl AttachableStore {
-    pub fn new() -> Self {
-        Self::with_path(flotilla_config_dir().join("attachables").join("registry.json"))
-    }
-
     pub fn with_base(base: &DaemonHostPath) -> Self {
         Self::with_path(base.join("attachables").join("registry.json"))
     }
@@ -546,12 +539,6 @@ impl AttachableStore {
             Err(e) => return Err(format!("failed to read attachable registry: {e}")),
         };
         serde_json::from_str(&contents).map_err(|e| format!("failed to parse attachable registry: {e}"))
-    }
-}
-
-impl Default for AttachableStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -1,11 +1,11 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
-use flotilla_core::{config::ConfigStore, providers::discovery::DiscoveryRuntime};
+use flotilla_core::{config::ConfigStore, path_context::DaemonHostPath, providers::discovery::DiscoveryRuntime};
 use tracing::info;
 
 use crate::server::DaemonServer;
 
-pub async fn run(socket_path: &Path, timeout_secs: u64) -> Result<(), String> {
+pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeout_secs: u64) -> Result<(), String> {
     // Hardcoded directives are appended after RUST_LOG and take precedence,
     // so these noisy crates stay at INFO even if RUST_LOG sets them to DEBUG.
     let filter = ["h2=info", "hyper=info", "reqwest=info", "rustls=info"].into_iter().fold(
@@ -18,7 +18,7 @@ pub async fn run(socket_path: &Path, timeout_secs: u64) -> Result<(), String> {
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
 
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::new(DaemonHostPath::new(config_dir), DaemonHostPath::new(state_dir)));
     let repo_roots = config.load_repos();
     info!(repo_count = repo_roots.len(), "starting daemon");
 

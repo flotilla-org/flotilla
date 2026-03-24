@@ -2,7 +2,9 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
-use flotilla_core::{agents, config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_core::{
+    agents, config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, path_context::DaemonHostPath, path_policy::PathPolicy,
+};
 use flotilla_protocol::{
     output::OutputFormat, AgentHookEvent, AttachableId, CheckoutSelector, CheckoutTarget, Command, CommandAction, HostName, RepoSelector,
 };
@@ -156,7 +158,7 @@ enum CheckoutSubCommand {
 
 impl Cli {
     fn config_dir(&self) -> PathBuf {
-        self.config_dir.clone().unwrap_or_else(|| flotilla_core::config::flotilla_config_dir().into_path_buf())
+        self.config_dir.clone().unwrap_or_else(|| PathPolicy::from_process_env().config_dir.into_path_buf())
     }
 
     fn socket_path(&self) -> PathBuf {
@@ -264,9 +266,11 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
 }
 
 async fn run_tui(cli: Cli) -> Result<()> {
-    event_log::init();
+    let paths = PathPolicy::from_process_env();
+    event_log::init_with_dir(paths.state_dir.as_path());
     let startup = std::time::Instant::now();
-    let config = Arc::new(ConfigStore::new());
+    let resolved_config_dir = cli.config_dir();
+    let config = Arc::new(ConfigStore::new(DaemonHostPath::new(&resolved_config_dir), paths.state_dir.clone()));
 
     // Initialize terminal and show splash immediately for fast visual feedback.
     // Mouse capture is enabled AFTER the splash so mouse events don't cut it short.
@@ -299,7 +303,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
 
     // Spawn daemon init on a separate task so it runs concurrently with the splash
     // (show_splash uses blocking crossterm::event::poll calls).
-    let daemon_log_path = cli.config_dir().join("daemon.log");
+    let daemon_log_path = resolved_config_dir.join("daemon.log");
     let config_clone = Arc::clone(&config);
     let daemon_task = tokio::spawn(async move {
         let daemon: Result<Arc<dyn DaemonHandle>, String> = if embedded {
@@ -321,7 +325,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
             Ok(d as Arc<dyn DaemonHandle>)
         } else {
             let socket_path = cli.socket_path();
-            flotilla_tui::socket::connect_or_spawn(&socket_path, &cli.config_dir(), cli.config_dir.as_deref(), cli.socket.as_deref())
+            flotilla_tui::socket::connect_or_spawn(&socket_path, &resolved_config_dir, cli.config_dir.as_deref(), cli.socket.as_deref())
                 .await
                 .map(|d| d as Arc<dyn DaemonHandle>)
         };
@@ -378,7 +382,10 @@ async fn run_tui(cli: Cli) -> Result<()> {
 }
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
-    flotilla_daemon::cli::run(&cli.socket_path(), timeout_secs).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    let paths = PathPolicy::from_process_env();
+    flotilla_daemon::cli::run(&cli.socket_path(), &cli.config_dir(), paths.state_dir.as_path(), timeout_secs)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 /// Reset SIGPIPE so piped CLI commands (e.g. `watch | head`) exit cleanly.

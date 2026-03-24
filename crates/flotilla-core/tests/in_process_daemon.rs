@@ -1721,7 +1721,7 @@ async fn inline_issue_command_returns_zero_and_skips_lifecycle_events() {
 
 #[tokio::test]
 async fn execute_on_untracked_repo_returns_error_without_started_event() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
@@ -1883,7 +1883,7 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
 
 #[tokio::test]
 async fn follower_mode_flag_is_stored() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let leader = InProcessDaemon::new(vec![], config.clone(), fake_discovery(false), HostName::local()).await;
     assert!(!leader.is_follower(), "default daemon should not be follower");
 
@@ -1925,7 +1925,7 @@ async fn follower_mode_skips_external_providers() {
 
 #[tokio::test]
 async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
@@ -1995,7 +1995,7 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
 
 #[tokio::test]
 async fn add_virtual_repo_is_idempotent() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");

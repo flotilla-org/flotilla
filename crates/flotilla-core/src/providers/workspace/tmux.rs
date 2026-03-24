@@ -28,11 +28,12 @@ struct WindowState {
 
 pub struct TmuxWorkspaceManager {
     runner: Arc<dyn CommandRunner>,
+    state_dir: DaemonHostPath,
 }
 
 impl TmuxWorkspaceManager {
-    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+    pub fn new(runner: Arc<dyn CommandRunner>, state_dir: DaemonHostPath) -> Self {
+        Self { runner, state_dir }
     }
 
     /// Run a tmux command and return stdout, or an error on failure.
@@ -45,18 +46,14 @@ impl TmuxWorkspaceManager {
         self.tmux_cmd(&["display-message", "-p", "#{session_name}"]).await
     }
 
-    /// Return the state file path: `~/.config/flotilla/tmux/{session}/state.toml`.
-    fn state_path(session: &str) -> Result<DaemonHostPath, String> {
-        let config_dir = dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
-        Ok(DaemonHostPath::new(config_dir.join("flotilla").join("tmux").join(session).join("state.toml")))
+    /// Return the state file path for the given tmux session.
+    fn state_path(&self, session: &str) -> DaemonHostPath {
+        self.state_dir.join("tmux").join(session).join("state.toml")
     }
 
     /// Load persisted state for the given session. Returns default on any error.
-    fn load_state(session: &str) -> TmuxState {
-        let path = match Self::state_path(session) {
-            Ok(p) => p,
-            Err(_) => return TmuxState::default(),
-        };
+    fn load_state(&self, session: &str) -> TmuxState {
+        let path = self.state_path(session);
         let contents = match std::fs::read_to_string(path.as_path()) {
             Ok(c) => c,
             Err(_) => return TmuxState::default(),
@@ -71,11 +68,8 @@ impl TmuxWorkspaceManager {
     }
 
     /// Save state for the given session. Silently ignores errors.
-    fn save_state(session: &str, state: &TmuxState) {
-        let path = match Self::state_path(session) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
+    fn save_state(&self, session: &str, state: &TmuxState) {
+        let path = self.state_path(session);
         if let Some(parent) = path.as_path().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -107,7 +101,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         // Load state for enrichment, pruning stale entries
         let (session, mut state) = match self.session_name().await {
             Ok(s) => {
-                let st = Self::load_state(&s);
+                let st = self.load_state(&s);
                 (Some(s), st)
             }
             Err(_) => (None, TmuxState::default()),
@@ -118,7 +112,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         state.windows.retain(|name, _| live_names.contains(name.as_str()));
         if state.windows.len() != before_len {
             if let Some(ref session) = session {
-                Self::save_state(session, &state);
+                self.save_state(session, &state);
             }
         }
 
@@ -225,10 +219,10 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
 
         // Save state
         if let Ok(session) = self.session_name().await {
-            let mut state = Self::load_state(&session);
+            let mut state = self.load_state(&session);
             let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default();
             state.windows.insert(config.name.clone(), WindowState { working_directory: working_dir.clone(), created_at: timestamp });
-            Self::save_state(&session, &state);
+            self.save_state(&session, &state);
         }
 
         let directories = vec![config.working_directory.clone().into_path_buf()];
@@ -258,15 +252,27 @@ mod tests {
         assert_eq!(TmuxWorkspaceManager::split_flag(""), "-h");
     }
 
+    fn test_mgr(state_dir: DaemonHostPath) -> TmuxWorkspaceManager {
+        use crate::providers::testing::MockRunner;
+        let runner = Arc::new(MockRunner::new(vec![]));
+        TmuxWorkspaceManager::new(runner, state_dir)
+    }
+
     #[test]
     fn state_path_contains_session_name() {
-        let path = TmuxWorkspaceManager::state_path("my-session").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = DaemonHostPath::new(dir.path().join("flotilla"));
+        let mgr = test_mgr(state_dir);
+        let path = mgr.state_path("my-session");
         assert!(path.as_path().ends_with("flotilla/tmux/my-session/state.toml"));
     }
 
     #[test]
     fn load_state_returns_default_for_missing_file() {
-        let state = TmuxWorkspaceManager::load_state("nonexistent-session-xyz");
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = DaemonHostPath::new(dir.path().join("flotilla"));
+        let mgr = test_mgr(state_dir);
+        let state = mgr.load_state("nonexistent-session-xyz");
         assert!(state.windows.is_empty());
     }
 
@@ -418,7 +424,9 @@ mod tests {
         let session = replay::test_session(&fixture("tmux_workspaces.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = TmuxWorkspaceManager::new(runner.clone());
+        let state_tmp = tempfile::tempdir().expect("tempdir for state");
+        let state_dir = DaemonHostPath::new(state_tmp.path());
+        let mgr = TmuxWorkspaceManager::new(runner.clone(), state_dir);
 
         // Create workspace "feat-123"
         let config1 = WorkspaceConfig {
@@ -482,7 +490,9 @@ mod tests {
         let session = replay::test_session(&fixture("tmux_list.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = TmuxWorkspaceManager::new(runner);
+        let state_tmp = tempfile::tempdir().expect("tempdir for state");
+        let state_dir = DaemonHostPath::new(state_tmp.path());
+        let mgr = TmuxWorkspaceManager::new(runner, state_dir);
         let workspaces = mgr.list_workspaces().await.unwrap();
 
         assert_eq!(workspaces.len(), 2);

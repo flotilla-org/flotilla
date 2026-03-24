@@ -694,23 +694,5 @@ pub(crate) fn workspace_config(
     }
 }
 
-/// Resolve a local workspace directory for the presentation host.
-///
-/// NOTE: Returns `ExecutionEnvironmentPath` but the `dirs::home_dir()` fallback
-/// resolves from the daemon host's HOME — not the execution environment.
-/// Needs Phase B PR 2 fix for proper remote execution support.
-fn local_workspace_directory(repo_root: &Path, config_base: &Path) -> ExecutionEnvironmentPath {
-    if repo_root.exists() {
-        return ExecutionEnvironmentPath::new(repo_root);
-    }
-    if let Some(home) = dirs::home_dir() {
-        return ExecutionEnvironmentPath::new(home);
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        return ExecutionEnvironmentPath::new(cwd);
-    }
-    ExecutionEnvironmentPath::new(config_base)
-}
-
 #[cfg(test)]
 mod tests;
