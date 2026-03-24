@@ -220,10 +220,7 @@ fn environment_bag_assertions_accessor() {
             path: PathBuf::from("/usr/bin/git"),
             version: Some("2.40".into()),
         })
-        .with(EnvironmentAssertion::AuthFileExists {
-            provider: "github".into(),
-            path: PathBuf::from("/home/user/.config/gh/hosts.yml"),
-        });
+        .with(EnvironmentAssertion::AuthFileExists { provider: "github".into(), path: PathBuf::from("/home/user/.config/gh/hosts.yml") });
     assert_eq!(bag.assertions().len(), 2);
     assert!(matches!(bag.assertions()[0], EnvironmentAssertion::BinaryAvailable { ref name, .. } if name == "git"));
 }

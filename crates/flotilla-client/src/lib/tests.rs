@@ -101,9 +101,7 @@ async fn send_request_writes_message_and_returns_pending_response() {
     tx.send(ResponseResult::Ok { response: Box::new(Response::ListRepos(vec![])) }).expect("send response");
 
     let response = request_task.await.expect("join").expect("send_request");
-    assert!(
-        matches!(response, ResponseResult::Ok { response } if matches!(&*response, Response::ListRepos(repos) if repos.is_empty()))
-    );
+    assert!(matches!(response, ResponseResult::Ok { response } if matches!(&*response, Response::ListRepos(repos) if repos.is_empty())));
 }
 
 #[tokio::test]
@@ -113,8 +111,7 @@ async fn send_request_returns_cancelled_when_sender_is_dropped() {
     let request_writer = Arc::clone(&harness.writer);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task =
-        tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetTopology).await });
+    let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetTopology).await });
 
     let (id, request) = read_request(&mut harness.lines).await;
     assert_eq!(request, Request::GetTopology);
@@ -490,15 +487,7 @@ async fn handle_event_forwards_host_removed_and_tracks_seq() {
     let (writer, pending, next_id, _server) = event_harness();
     let host = flotilla_protocol::HostName::new("peer-1");
 
-    handle_event(
-        DaemonEvent::HostRemoved { host: host.clone(), seq: 9 },
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &writer,
-        &pending,
-        &next_id,
-    );
+    handle_event(DaemonEvent::HostRemoved { host: host.clone(), seq: 9 }, &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
 
     let event = event_rx.try_recv().expect("should receive HostRemoved");
     assert!(matches!(event, DaemonEvent::HostRemoved { seq: 9, .. }));
@@ -560,8 +549,7 @@ async fn recover_from_gap_handles_parse_error_gracefully() {
 
     // Respond with the wrong success variant.
     let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-    tx.send(ResponseResult::Ok { response: Box::new(Response::ListHosts(HostListResponse { hosts: vec![] })) })
-        .expect("send bad response");
+    tx.send(ResponseResult::Ok { response: Box::new(Response::ListHosts(HostListResponse { hosts: vec![] })) }).expect("send bad response");
 
     // Should complete without panic.
     recover_task.await.expect("recover_from_gap should not panic on unexpected response variant");

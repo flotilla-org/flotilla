@@ -135,8 +135,7 @@ async fn list_sessions_parses_json() {
 async fn attach_builds_command() {
     let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
 
-    let cmd =
-        TerminalPool::attach_command(&pool, "flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).await.expect("attach");
+    let cmd = TerminalPool::attach_command(&pool, "flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).await.expect("attach");
 
     assert!(cmd.contains("shpool"), "should reference shpool binary: {cmd}");
     assert!(cmd.contains("attach"), "should include attach subcommand: {cmd}");

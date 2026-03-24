@@ -42,8 +42,7 @@ mod status_human {
 
     use super::*;
     use crate::cli::{
-        format_host_list_human, format_host_providers_human, format_host_status_human, format_status_response_human,
-        format_topology_human,
+        format_host_list_human, format_host_providers_human, format_host_status_human, format_status_response_human, format_topology_human,
     };
 
     #[test]
@@ -358,10 +357,8 @@ mod command_result_human {
 
     #[test]
     fn repo_tracked_with_resolved_from() {
-        let result = CommandValue::RepoTracked {
-            path: PathBuf::from("/tmp/my-repo"),
-            resolved_from: Some(PathBuf::from("/tmp/my-repo/wt-feat")),
-        };
+        let result =
+            CommandValue::RepoTracked { path: PathBuf::from("/tmp/my-repo"), resolved_from: Some(PathBuf::from("/tmp/my-repo/wt-feat")) };
         let output = format_command_result(&result);
         assert!(output.contains("repo tracked"), "should say repo tracked");
         assert!(output.contains("/tmp/my-repo/wt-feat"), "should include original path");
@@ -408,8 +405,7 @@ mod command_result_human {
 
     #[test]
     fn branch_name_generated() {
-        let result =
-            CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("github".into(), "42".into())] };
+        let result = CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("github".into(), "42".into())] };
         let output = format_command_result(&result);
         assert!(output.contains("branch name"), "should say branch name");
         assert!(output.contains("feat/cool-thing"), "should include generated name");
@@ -581,11 +577,7 @@ mod repo_detail_human {
             slug: None,
             provider_health: HashMap::new(),
             work_items: vec![],
-            errors: vec![ProviderError {
-                category: "change_request".into(),
-                provider: "GitHub".into(),
-                message: "rate limited".into(),
-            }],
+            errors: vec![ProviderError { category: "change_request".into(), provider: "GitHub".into(), message: "rate limited".into() }],
         };
         let output = format_repo_detail_human(&detail);
         assert!(output.contains("Errors:"), "should have errors header");

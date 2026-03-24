@@ -189,10 +189,7 @@ fn normal_mode_specific_bindings() {
         km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('D'), KeyModifiers::SHIFT)),
         Some(Action::ToggleDebug)
     );
-    assert_eq!(
-        km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(d)),
-        Some(Action::Dispatch(Intent::RemoveCheckout))
-    );
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(d)), Some(Action::Dispatch(Intent::RemoveCheckout)));
     assert_eq!(
         km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(p)),
         Some(Action::Dispatch(Intent::OpenChangeRequest))

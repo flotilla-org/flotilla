@@ -226,8 +226,7 @@ fn select_next_triggers_fetch_when_near_bottom() {
     assert!(entry.is_some(), "expected FetchMoreIssues command");
     match entry.unwrap().0 {
         flotilla_protocol::Command {
-            action: flotilla_protocol::CommandAction::FetchMoreIssues { repo: cmd_repo, desired_count },
-            ..
+            action: flotilla_protocol::CommandAction::FetchMoreIssues { repo: cmd_repo, desired_count }, ..
         } => {
             assert_eq!(cmd_repo, flotilla_protocol::RepoSelector::Path(app.model.repos[&repo].path.clone()));
             // providers.issues is empty (default), so desired = 0 + 50

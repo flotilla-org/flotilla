@@ -40,10 +40,8 @@ fn message_response_roundtrip() {
         other => panic!("expected Response, got {:?}", other),
     }
 
-    let msg = Message::Response {
-        id: 2,
-        response: Box::new(ResponseResult::Ok { response: Box::new(Response::Execute { command_id: 99 }) }),
-    };
+    let msg =
+        Message::Response { id: 2, response: Box::new(ResponseResult::Ok { response: Box::new(Response::Execute { command_id: 99 }) }) };
     let json = serde_json::to_string(&msg).expect("serialize");
     let deserialized: Message = serde_json::from_str(&json).expect("deserialize");
     match deserialized {

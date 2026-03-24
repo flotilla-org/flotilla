@@ -4,8 +4,7 @@ use super::*;
 use crate::attachable::types::{TerminalAttachable, TerminalPurpose};
 
 fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl AttachableStoreApi) {
-    let set_id =
-        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+    let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
 
     let first = store.ensure_terminal_attachable(
         &set_id,
@@ -77,8 +76,7 @@ fn contract_ensure_terminal_set_groups_members_by_host_and_checkout(store: &mut 
 }
 
 fn contract_ensure_terminal_attachable_uses_binding_as_primary_identity(store: &mut impl AttachableStoreApi) {
-    let set_id =
-        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+    let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
 
     let first = store.ensure_terminal_attachable(
         &set_id,
@@ -239,10 +237,7 @@ fn registry_roundtrip_rebuilds_binding_index() {
 
     let reloaded = AttachableStore::with_base(dir.path());
     assert_eq!(reloaded.registry(), store.registry());
-    assert_eq!(
-        reloaded.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0"),
-        Some("att-1")
-    );
+    assert_eq!(reloaded.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0"), Some("att-1"));
     assert_eq!(reloaded.lookup_binding("workspace_manager", "tmux", BindingObjectKind::AttachableSet, "workspace:7"), Some("set-1"));
 }
 
@@ -308,9 +303,7 @@ fn in_memory_contract_replacing_binding_is_deterministic() {
 #[test]
 fn file_backed_contract_roundtrip_preserves_stable_ids() {
     let dir = tempfile::tempdir().expect("tempdir");
-    contract_roundtrip_preserves_stable_ids(AttachableStore::with_base(dir.path()), |_| {
-        Box::new(AttachableStore::with_base(dir.path()))
-    });
+    contract_roundtrip_preserves_stable_ids(AttachableStore::with_base(dir.path()), |_| Box::new(AttachableStore::with_base(dir.path())));
 }
 
 #[test]
@@ -325,8 +318,7 @@ fn provider_local_state_is_not_identity_source() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("attachables").join("registry.json");
     let mut store = AttachableStore::with_base(dir.path());
-    let set_id =
-        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+    let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
     let attachable_id = store.ensure_terminal_attachable(
         &set_id,
         "terminal_pool",
@@ -401,9 +393,7 @@ fn contract_remove_set_returns_none_for_unknown_id(store: &mut impl AttachableSt
 
 #[test]
 fn file_backed_contract_remove_set_deletes_set_and_members_and_bindings() {
-    contract_remove_set_deletes_set_and_members_and_bindings(&mut AttachableStore::with_base(
-        tempfile::tempdir().expect("tempdir").path(),
-    ));
+    contract_remove_set_deletes_set_and_members_and_bindings(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
 }
 
 #[test]

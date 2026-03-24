@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use flotilla_protocol::{
     delta::{Branch, BranchStatus},
     test_support::hp,
-    AttachableId, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, Issue, ManagedTerminal,
-    ProviderError, SessionStatus, TerminalStatus, Workspace,
+    AttachableId, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, Issue, ManagedTerminal, ProviderError,
+    SessionStatus, TerminalStatus, Workspace,
 };
 
 use super::*;
@@ -357,10 +357,8 @@ fn roundtrip_identical() {
 #[test]
 fn apply_added_then_removed() {
     let mut pd = ProviderData::default();
-    let changes = vec![Change::Issue { key: "1".into(), op: EntryOp::Added(issue("task")) }, Change::Issue {
-        key: "1".into(),
-        op: EntryOp::Removed,
-    }];
+    let changes =
+        vec![Change::Issue { key: "1".into(), op: EntryOp::Added(issue("task")) }, Change::Issue { key: "1".into(), op: EntryOp::Removed }];
     apply_changes(&mut pd, changes);
     assert!(pd.issues.is_empty());
 }

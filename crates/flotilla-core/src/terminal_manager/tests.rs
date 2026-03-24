@@ -52,13 +52,7 @@ impl TerminalPool for MockTerminalPool {
         Ok(())
     }
 
-    async fn attach_command(
-        &self,
-        session_name: &str,
-        command: &str,
-        cwd: &Path,
-        env_vars: &TerminalEnvVars,
-    ) -> Result<String, String> {
+    async fn attach_command(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<String, String> {
         self.calls.lock().expect("lock calls").push(PoolCall::AttachCommand {
             session_name: session_name.to_string(),
             command: command.to_string(),
@@ -246,8 +240,7 @@ async fn attach_command_includes_env_vars() {
     let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone());
 
     let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
-    let att_id =
-        mgr.allocate_terminal(set_id, "agent", 1, "feat", "claude", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id = mgr.allocate_terminal(set_id, "agent", 1, "feat", "claude", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
 
     let result = mgr.attach_command(&att_id, Some("/tmp/flotilla.sock")).await.expect("attach_command");
     assert!(result.contains("attach"));
@@ -385,8 +378,7 @@ async fn cascade_delete_removes_sets_and_kills_sessions() {
     let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
     let att_id_1 =
         mgr.allocate_terminal(set_id.clone(), "shell", 0, "feat", "bash", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
-    let att_id_2 =
-        mgr.allocate_terminal(set_id, "agent", 0, "feat", "claude", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id_2 = mgr.allocate_terminal(set_id, "agent", 0, "feat", "claude", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
 
     mgr.cascade_delete(&[test_checkout()]).await.expect("cascade_delete");
 

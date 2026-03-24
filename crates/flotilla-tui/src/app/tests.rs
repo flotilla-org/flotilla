@@ -805,11 +805,7 @@ fn local_checkout_created_does_not_queue_workspace() {
     let repo_identity = app.model.repo_order[0].clone();
     let repo_path = app.model.repos[&repo_identity].path.clone();
 
-    app.in_flight.insert(42, InFlightCommand {
-        repo_identity: repo_identity.clone(),
-        repo: repo_path.clone(),
-        description: "test".into(),
-    });
+    app.in_flight.insert(42, InFlightCommand { repo_identity: repo_identity.clone(), repo: repo_path.clone(), description: "test".into() });
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,
@@ -829,11 +825,7 @@ fn remote_checkout_created_does_not_queue_workspace() {
     let repo_identity = app.model.repo_order[0].clone();
     let repo_path = app.model.repos[&repo_identity].path.clone();
 
-    app.in_flight.insert(42, InFlightCommand {
-        repo_identity: repo_identity.clone(),
-        repo: repo_path.clone(),
-        description: "test".into(),
-    });
+    app.in_flight.insert(42, InFlightCommand { repo_identity: repo_identity.clone(), repo: repo_path.clone(), description: "test".into() });
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,

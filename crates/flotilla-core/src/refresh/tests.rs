@@ -342,10 +342,7 @@ async fn refresh_populates_all_provider_data_and_merged_wins_branch_conflict() {
     registry.checkout_managers.insert(
         "wt",
         desc("wt"),
-        Arc::new(MockCheckoutManager::ok(vec![(
-            PathBuf::from("/tmp/wt/feat-a"),
-            TestCheckout::new("feat-a").with_branch_key().build(),
-        )])),
+        Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), TestCheckout::new("feat-a").with_branch_key().build())])),
     );
     registry.change_requests.insert(
         "github",
@@ -358,10 +355,7 @@ async fn refresh_populates_all_provider_data_and_merged_wins_branch_conflict() {
     registry.cloud_agents.insert(
         "claude",
         desc("claude"),
-        Arc::new(MockCloudAgent::ok(vec![(
-            "sess-1".to_string(),
-            TestSession::new("Debug").with_session_ref("mock", "sess-1").build(),
-        )])),
+        Arc::new(MockCloudAgent::ok(vec![("sess-1".to_string(), TestSession::new("Debug").with_session_ref("mock", "sess-1").build())])),
     );
     registry.vcs.insert("git", desc("git"), Arc::new(MockVcs::ok(vec!["remote-only".to_string(), "shared".to_string()])));
     registry.workspace_managers.insert(
@@ -419,19 +413,16 @@ fn project_attachable_data_populates_sets_and_ids() {
     };
 
     let mut pd = ProviderData::default();
-    pd.checkouts.insert(
-        flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")),
-        Checkout {
-            branch: "feat".into(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-        },
-    );
+    pd.checkouts.insert(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")), Checkout {
+        branch: "feat".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+    });
     pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
 
     project_attachable_data(&mut pd, &registry, &attachable_store);
@@ -460,10 +451,7 @@ async fn refresh_collects_multiple_errors_and_preserves_successful_providers() {
     registry.checkout_managers.insert(
         "wt",
         desc("wt"),
-        Arc::new(MockCheckoutManager::ok(vec![(
-            PathBuf::from("/tmp/wt/feat-a"),
-            TestCheckout::new("feat-a").with_branch_key().build(),
-        )])),
+        Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), TestCheckout::new("feat-a").with_branch_key().build())])),
     );
     registry.change_requests.insert("github", desc("github"), Arc::new(MockChangeRequestTracker::failing("pr fail", "merged fail")));
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("sessions fail")));
