@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use super::WorkspaceOrchestrator;
 use crate::{
     attachable::SharedAttachableStore,
+    path_context::ExecutionEnvironmentPath,
     provider_data::ProviderData,
     providers::{
         registry::ProviderRegistry,
@@ -142,8 +143,9 @@ impl<'a> TeleportSessionActionService<'a> {
                     .preferred()
                     .cloned()
                     .ok_or_else(|| "No checkout manager available".to_string())?;
-                let (path, _checkout) = checkout_manager.create_checkout(self.repo_root, branch_name, false).await?;
-                Ok(Some(path))
+                let ee_root = ExecutionEnvironmentPath::new(self.repo_root);
+                let (path, _checkout) = checkout_manager.create_checkout(&ee_root, branch_name, false).await?;
+                Ok(Some(path.into_path_buf()))
             }
             None => Ok(None),
         }

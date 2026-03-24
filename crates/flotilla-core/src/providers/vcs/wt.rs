@@ -1,13 +1,13 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::providers::{run, types::*, CommandRunner};
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{run, types::*, CommandRunner},
+};
 
 pub struct WtCheckoutManager {
     runner: Arc<dyn CommandRunner>,
@@ -65,11 +65,11 @@ struct WtCommit {
 }
 
 impl WtWorktree {
-    fn into_checkout(self) -> (PathBuf, Checkout) {
-        let path = self.path;
-        let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), path.clone());
+    fn into_checkout(self) -> (ExecutionEnvironmentPath, Checkout) {
+        let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), &self.path);
         let correlation_keys = vec![CorrelationKey::Branch(self.branch.clone()), CorrelationKey::CheckoutPath(host_path)];
-        (path, Checkout {
+        let ee_path = ExecutionEnvironmentPath::new(self.path);
+        (ee_path, Checkout {
             branch: self.branch,
             is_main: self.is_main,
             trunk_ahead_behind: self.main.map(|m| AheadBehind { ahead: m.ahead, behind: m.behind }),
@@ -102,15 +102,15 @@ impl WtCheckoutManager {
 
 #[async_trait]
 impl super::CheckoutManager for WtCheckoutManager {
-    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
-        let output = run!(self.runner, "wt", &["list", "--format=json"], repo_root)?;
+    async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        let root = repo_root.as_path();
+        let output = run!(self.runner, "wt", &["list", "--format=json"], root)?;
         let json = Self::strip_to_json(&output);
         let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let mut checkouts: Vec<(PathBuf, Checkout)> = worktrees.into_iter().map(|wt| wt.into_checkout()).collect();
+        let mut checkouts: Vec<(ExecutionEnvironmentPath, Checkout)> = worktrees.into_iter().map(|wt| wt.into_checkout()).collect();
 
         // Enrich with issue links from git config
-        let futures: Vec<_> =
-            checkouts.iter().map(|(_, co)| super::read_branch_issue_links(repo_root, &co.branch, &*self.runner)).collect();
+        let futures: Vec<_> = checkouts.iter().map(|(_, co)| super::read_branch_issue_links(root, &co.branch, &*self.runner)).collect();
         let all_links = futures::future::join_all(futures).await;
         for ((_, co), links) in checkouts.iter_mut().zip(all_links) {
             co.association_keys = links;
@@ -119,26 +119,32 @@ impl super::CheckoutManager for WtCheckoutManager {
         Ok(checkouts)
     }
 
-    async fn create_checkout(&self, repo_root: &Path, branch: &str, create_branch: bool) -> Result<(PathBuf, Checkout), String> {
+    async fn create_checkout(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        let root = repo_root.as_path();
         info!(%branch, %create_branch, "wt: creating worktree");
 
         // Check if a remote-tracking branch exists. If so, use `wt switch`
         // (without --create) so wt tracks the remote branch instead of
         // creating a brand new one from the default branch.
         let remote_exists = if create_branch {
-            run!(self.runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}"),], repo_root,).is_ok()
+            run!(self.runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}"),], root,).is_ok()
         } else {
             false
         };
 
         if create_branch && !remote_exists {
-            run!(self.runner, "wt", &["switch", "--create", branch, "--no-cd"], repo_root)?;
+            run!(self.runner, "wt", &["switch", "--create", branch, "--no-cd"], root)?;
         } else {
-            run!(self.runner, "wt", &["switch", branch, "--no-cd", "--yes"], repo_root)?;
+            run!(self.runner, "wt", &["switch", branch, "--no-cd", "--yes"], root)?;
         }
 
         // Look up the path of the newly created worktree
-        let list_output = run!(self.runner, "wt", &["list", "--format=json"], repo_root)?;
+        let list_output = run!(self.runner, "wt", &["list", "--format=json"], root)?;
         let json = Self::strip_to_json(&list_output);
         let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
 
@@ -152,15 +158,18 @@ impl super::CheckoutManager for WtCheckoutManager {
         Err("Could not find worktree path after creation".to_string())
     }
 
-    async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
+        let root = repo_root.as_path();
         info!(%branch, "wt: removing worktree");
-        run!(self.runner, "wt", &["remove", branch], repo_root)?;
+        run!(self.runner, "wt", &["remove", branch], root)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
     use crate::providers::{
         replay,
@@ -256,9 +265,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_list()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("wt_list.yaml"), masks);
         let runner = replay::test_runner(&session);
 
@@ -283,9 +293,9 @@ mod tests {
         assert!(!co_feat.is_main);
         // The worktree path should be a sibling of the repo
         assert!(
-            path_feat.to_str().unwrap().contains("feature-foo"),
+            path_feat.as_path().to_str().unwrap().contains("feature-foo"),
             "feature worktree path should contain feature-foo: {}",
-            path_feat.display()
+            path_feat
         );
         // trunk ahead/behind should be present
         let trunk_ab = co_feat.trunk_ahead_behind.as_ref().expect("feature should have trunk ahead/behind");
@@ -304,7 +314,7 @@ mod tests {
         assert!(co_feat.correlation_keys.contains(&CorrelationKey::Branch("feature/foo".to_string())));
         assert!(co_feat.correlation_keys.contains(&CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
             flotilla_protocol::HostName::local(),
-            path_feat.clone()
+            path_feat.as_path()
         ),)));
 
         session.finish();
@@ -315,16 +325,17 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_base_repo()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("wt_create.yaml"), masks);
         let runner = replay::test_runner(&session);
 
         let mgr = WtCheckoutManager::new(runner);
         let (path, checkout) = mgr.create_checkout(&repo_path, "new-feature", true).await.unwrap();
 
-        assert!(path.to_str().unwrap().contains("new-feature"), "created worktree path should contain new-feature: {}", path.display());
+        assert!(path.as_path().to_str().unwrap().contains("new-feature"), "created worktree path should contain new-feature: {}", path);
         assert_eq!(checkout.branch, "new-feature");
         assert!(!checkout.is_main);
         let trunk_ab = checkout.trunk_ahead_behind.as_ref().expect("new branch should have trunk ahead/behind");
@@ -344,9 +355,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_remove()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("wt_remove.yaml"), masks);
         let runner = replay::test_runner(&session);
 
@@ -363,9 +375,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(checkout_test_support::setup_remote_only_branch()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().expect("repo path is valid UTF-8"), "{repo}");
+        masks.add(repo_path.as_path().to_str().expect("repo path is valid UTF-8"), "{repo}");
         let session = replay::test_session(&fixture("wt_create_remote_branch.yaml"), masks);
         let runner = replay::test_runner(&session);
 

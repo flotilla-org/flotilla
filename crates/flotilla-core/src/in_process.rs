@@ -1321,13 +1321,18 @@ impl InProcessDaemon {
     /// Returns `(resolved_path, Some(original_path))` if normalization changed
     /// the path, or `(original_path, None)` if no change was needed.
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
-        use crate::providers::vcs::{git::GitVcs, Vcs};
+        use crate::{
+            path_context::ExecutionEnvironmentPath,
+            providers::vcs::{git::GitVcs, Vcs},
+        };
 
         let vcs = GitVcs::new(self.discovery.runner.clone());
-        match vcs.resolve_repo_root(path).await {
+        let ee_path = ExecutionEnvironmentPath::new(path);
+        match vcs.resolve_repo_root(&ee_path).await {
             Some(repo_root) => {
+                let repo_root_raw = repo_root.into_path_buf();
                 // Canonicalize to handle symlinks (e.g. /var -> /private/var on macOS).
-                let canonical_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+                let canonical_root = std::fs::canonicalize(&repo_root_raw).unwrap_or(repo_root_raw);
                 let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
                 if canonical_root != canonical_path {
                     debug!(

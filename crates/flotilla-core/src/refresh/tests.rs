@@ -4,14 +4,17 @@ use async_trait::async_trait;
 use flotilla_protocol::test_support::{TestChangeRequest, TestCheckout, TestSession};
 
 use super::*;
-use crate::providers::{
-    change_request::ChangeRequestTracker,
-    coding_agent::CloudAgentService,
-    discovery::{ProviderCategory, ProviderDescriptor},
-    terminal::TerminalPool,
-    types::*,
-    vcs::{CheckoutManager, Vcs},
-    workspace::WorkspaceManager,
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{
+        change_request::ChangeRequestTracker,
+        coding_agent::CloudAgentService,
+        discovery::{ProviderCategory, ProviderDescriptor},
+        terminal::TerminalPool,
+        types::*,
+        vcs::{CheckoutManager, Vcs},
+        workspace::WorkspaceManager,
+    },
 };
 
 fn desc(name: &str) -> ProviderDescriptor {
@@ -34,15 +37,23 @@ impl MockCheckoutManager {
 
 #[async_trait]
 impl CheckoutManager for MockCheckoutManager {
-    async fn list_checkouts(&self, _repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
-        self.result.clone()
+    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        self.result
+            .as_ref()
+            .map(|v| v.iter().map(|(p, co)| (ExecutionEnvironmentPath::new(p), co.clone())).collect())
+            .map_err(|e| e.clone())
     }
 
-    async fn create_checkout(&self, _repo_root: &Path, _branch: &str, _create_branch: bool) -> Result<(PathBuf, Checkout), String> {
+    async fn create_checkout(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
         Err("not implemented".to_string())
     }
 
-    async fn remove_checkout(&self, _repo_root: &Path, _branch: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str) -> Result<(), String> {
         Err("not implemented".to_string())
     }
 }
@@ -138,27 +149,31 @@ impl MockVcs {
 
 #[async_trait]
 impl Vcs for MockVcs {
-    async fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
+    async fn resolve_repo_root(&self, _path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
         None
     }
 
-    async fn list_local_branches(&self, _repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
+    async fn list_local_branches(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<BranchInfo>, String> {
         Ok(vec![])
     }
 
-    async fn list_remote_branches(&self, _repo_root: &Path) -> Result<Vec<String>, String> {
+    async fn list_remote_branches(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<String>, String> {
         self.result.clone()
     }
 
-    async fn commit_log(&self, _repo_root: &Path, _branch: &str, _limit: usize) -> Result<Vec<CommitInfo>, String> {
+    async fn commit_log(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str, _limit: usize) -> Result<Vec<CommitInfo>, String> {
         Ok(vec![])
     }
 
-    async fn ahead_behind(&self, _repo_root: &Path, _branch: &str, _reference: &str) -> Result<AheadBehind, String> {
+    async fn ahead_behind(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str, _reference: &str) -> Result<AheadBehind, String> {
         Ok(AheadBehind { ahead: 0, behind: 0 })
     }
 
-    async fn working_tree_status(&self, _repo_root: &Path, _checkout_path: &Path) -> Result<WorkingTreeStatus, String> {
+    async fn working_tree_status(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _checkout_path: &ExecutionEnvironmentPath,
+    ) -> Result<WorkingTreeStatus, String> {
         Ok(WorkingTreeStatus::default())
     }
 }

@@ -4,6 +4,7 @@ use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
 
 use crate::{
+    path_context::ExecutionEnvironmentPath,
     provider_data::ProviderData,
     providers::{registry::ProviderRegistry, run, CommandRunner},
     terminal_manager::TerminalManager,
@@ -32,8 +33,9 @@ impl<'a> CheckoutService<'a> {
     pub(super) async fn create_checkout(&self, repo_root: &Path, branch: &str, create_branch: bool) -> Result<PathBuf, String> {
         let checkout_manager =
             self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        let (path, _checkout) = checkout_manager.create_checkout(repo_root, branch, create_branch).await?;
-        Ok(path)
+        let ee_root = ExecutionEnvironmentPath::new(repo_root);
+        let (path, _checkout) = checkout_manager.create_checkout(&ee_root, branch, create_branch).await?;
+        Ok(path.into_path_buf())
     }
 
     pub(super) async fn remove_checkout(
@@ -45,7 +47,8 @@ impl<'a> CheckoutService<'a> {
     ) -> Result<(), String> {
         let checkout_manager =
             self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        checkout_manager.remove_checkout(repo_root, branch).await?;
+        let ee_root = ExecutionEnvironmentPath::new(repo_root);
+        checkout_manager.remove_checkout(&ee_root, branch).await?;
 
         // Cascade: remove attachable sets and kill terminal sessions for deleted checkouts
         if let Some(tm) = terminal_manager {

@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     attachable::{AttachableStore, BindingObjectKind, SharedAttachableStore},
+    path_context::ExecutionEnvironmentPath,
     provider_data::ProviderData,
     providers::{
         ai_utility::AiUtility,
@@ -81,13 +82,23 @@ impl MockCheckoutManager {
 
 #[async_trait]
 impl CheckoutManager for MockCheckoutManager {
-    async fn list_checkouts(&self, _repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
+    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(vec![])
     }
-    async fn create_checkout(&self, _repo_root: &Path, _branch: &str, _create_branch: bool) -> Result<(PathBuf, Checkout), String> {
-        self.create_result.lock().await.take().expect("create_checkout called more than expected")
+    async fn create_checkout(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        self.create_result
+            .lock()
+            .await
+            .take()
+            .expect("create_checkout called more than expected")
+            .map(|(p, co)| (ExecutionEnvironmentPath::new(p), co))
     }
-    async fn remove_checkout(&self, _repo_root: &Path, _branch: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str) -> Result<(), String> {
         self.remove_result.lock().await.take().expect("remove_checkout called more than expected")
     }
 }

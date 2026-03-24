@@ -14,6 +14,7 @@ use tokio::{
 use crate::{
     attachable::{BindingObjectKind, SharedAttachableStore},
     data::{self, CorrelationResult, RefreshError},
+    path_context::ExecutionEnvironmentPath,
     provider_data::ProviderData,
     providers::{correlation::CorrelatedGroup, registry::ProviderRegistry, types::RepoCriteria},
 };
@@ -163,11 +164,12 @@ async fn refresh_providers(
     agent_state_store: &crate::agents::SharedAgentStateStore,
 ) -> Vec<RefreshError> {
     let mut errors = Vec::new();
+    let ee_root = ExecutionEnvironmentPath::new(repo_root);
 
     let checkouts_fut = async {
         if let Some((desc, cm)) = registry.checkout_managers.preferred_with_desc() {
             let name = desc.display_name.clone();
-            match cm.list_checkouts(repo_root).await {
+            match cm.list_checkouts(&ee_root).await {
                 Ok(entries) => (entries, vec![]),
                 Err(e) => (vec![], vec![(name, e)]),
             }
@@ -185,7 +187,7 @@ async fn refresh_providers(
     );
 
     let branches_fut = collect_named_results(
-        registry.vcs.iter().map(|(desc, vcs)| (desc.display_name.clone(), vcs.list_remote_branches(repo_root))).collect(),
+        registry.vcs.iter().map(|(desc, vcs)| (desc.display_name.clone(), vcs.list_remote_branches(&ee_root))).collect(),
     );
 
     let merged_fut = collect_named_results(
@@ -236,7 +238,8 @@ async fn refresh_providers(
     }
 
     let local_host = flotilla_protocol::HostName::local();
-    pd.checkouts = checkouts.into_iter().map(|(path, co)| (flotilla_protocol::HostPath::new(local_host.clone(), path), co)).collect();
+    pd.checkouts =
+        checkouts.into_iter().map(|(path, co)| (flotilla_protocol::HostPath::new(local_host.clone(), path.as_path()), co)).collect();
     collect_errors(&mut errors, "checkouts", checkout_errors);
 
     pd.change_requests = crs.into_iter().collect();

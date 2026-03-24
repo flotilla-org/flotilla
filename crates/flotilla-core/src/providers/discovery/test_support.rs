@@ -517,39 +517,43 @@ impl FakeVcs {
 
 #[async_trait::async_trait]
 impl Vcs for FakeVcs {
-    async fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
+    async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
         let state = self.state.read().expect("FakeVcs state poisoned");
-        if path.starts_with(&state.root) {
-            Some(state.root.clone())
+        if path.as_path().starts_with(&state.root) {
+            Some(ExecutionEnvironmentPath::new(&state.root))
         } else {
             None
         }
     }
 
-    async fn list_local_branches(&self, _repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
+    async fn list_local_branches(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<BranchInfo>, String> {
         Ok(self.state.read().expect("FakeVcs state poisoned").branches.clone())
     }
 
-    async fn list_remote_branches(&self, _repo_root: &Path) -> Result<Vec<String>, String> {
+    async fn list_remote_branches(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<String>, String> {
         Ok(self.state.read().expect("FakeVcs state poisoned").remote_branches.clone())
     }
 
-    async fn commit_log(&self, _repo_root: &Path, _branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    async fn commit_log(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
         Ok(self.state.read().expect("FakeVcs state poisoned").commit_log.iter().take(limit).cloned().collect())
     }
 
-    async fn ahead_behind(&self, _repo_root: &Path, branch: &str, _reference: &str) -> Result<AheadBehind, String> {
+    async fn ahead_behind(&self, _repo_root: &ExecutionEnvironmentPath, branch: &str, _reference: &str) -> Result<AheadBehind, String> {
         let state = self.state.read().expect("FakeVcs state poisoned");
         state.ahead_behind.get(branch).cloned().ok_or_else(|| format!("FakeVcs: ahead_behind not configured for branch {branch:?}"))
     }
 
-    async fn working_tree_status(&self, _repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String> {
+    async fn working_tree_status(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        checkout_path: &ExecutionEnvironmentPath,
+    ) -> Result<WorkingTreeStatus, String> {
         let state = self.state.read().expect("FakeVcs state poisoned");
         state
             .working_tree
-            .get(checkout_path)
+            .get(checkout_path.as_path())
             .cloned()
-            .ok_or_else(|| format!("FakeVcs: working_tree_status not configured for {}", checkout_path.display()))
+            .ok_or_else(|| format!("FakeVcs: working_tree_status not configured for {}", checkout_path))
     }
 }
 
@@ -593,12 +597,24 @@ impl FakeCheckoutManager {
 
 #[async_trait::async_trait]
 impl CheckoutManager for FakeCheckoutManager {
-    async fn list_checkouts(&self, _repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
-        Ok(self.state.read().expect("FakeCheckoutManager state poisoned").checkouts.clone())
+    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        Ok(self
+            .state
+            .read()
+            .expect("FakeCheckoutManager state poisoned")
+            .checkouts
+            .iter()
+            .map(|(p, co)| (ExecutionEnvironmentPath::new(p), co.clone()))
+            .collect())
     }
 
-    async fn create_checkout(&self, repo_root: &Path, branch: &str, _create_branch: bool) -> Result<(PathBuf, Checkout), String> {
-        let path = repo_root.join(branch);
+    async fn create_checkout(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        _create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        let path = repo_root.as_path().join(branch);
         let checkout = Checkout {
             branch: branch.to_string(),
             is_main: false,
@@ -610,10 +626,10 @@ impl CheckoutManager for FakeCheckoutManager {
             association_keys: vec![],
         };
         self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.push((path.clone(), checkout.clone()));
-        Ok((path, checkout))
+        Ok((ExecutionEnvironmentPath::new(path), checkout))
     }
 
-    async fn remove_checkout(&self, _repo_root: &Path, branch: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
         self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.retain(|(_, co)| co.branch != branch);
         Ok(())
     }

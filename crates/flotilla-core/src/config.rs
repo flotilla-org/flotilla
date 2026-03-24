@@ -549,8 +549,8 @@ pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> 
     let cwd = std::env::current_dir().ok();
     if let Some(ref cwd) = cwd {
         let git = GitVcs::new(Arc::new(ProcessCommandRunner));
-        if let Some(repo_root) = git.resolve_repo_root(cwd).await {
-            let repo_root = ExecutionEnvironmentPath::new(repo_root);
+        let ee_cwd = ExecutionEnvironmentPath::new(cwd);
+        if let Some(repo_root) = git.resolve_repo_root(&ee_cwd).await {
             if !repo_roots.contains(&repo_root) {
                 repo_roots.push(repo_root);
             }
