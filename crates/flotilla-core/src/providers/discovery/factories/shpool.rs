@@ -32,7 +32,7 @@ impl Factory for ShpoolTerminalPoolFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if env.find_binary("shpool").is_some() {
-            let socket_path = flotilla_config_dir().join("shpool/shpool.socket");
+            let socket_path = flotilla_config_dir().join("shpool/shpool.socket").into_path_buf();
             let pool = ShpoolTerminalPool::create(runner, socket_path).await;
             Ok(Arc::new(pool))
         } else {

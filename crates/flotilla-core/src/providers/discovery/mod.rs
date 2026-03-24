@@ -605,7 +605,7 @@ pub async fn discover_providers(
     );
 
     // Checkout strategy — resolved per-repo, nested under vcs.git
-    let checkout_config = config.resolve_checkout_config(repo_root.as_path());
+    let checkout_config = config.resolve_checkout_config(repo_root);
     if checkout_config.strategy != "auto" && !registry.checkout_managers.prefer_by_implementation(&checkout_config.strategy) {
         unmet.push((ProviderCategory::CheckoutManager.slug().into(), UnmetRequirement::UnknownProviderPreference {
             category: ProviderCategory::CheckoutManager,

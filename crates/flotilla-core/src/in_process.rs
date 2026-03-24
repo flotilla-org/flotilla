@@ -31,6 +31,7 @@ use crate::{
     host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
+    path_context::ExecutionEnvironmentPath,
     providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag},
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
@@ -1417,11 +1418,14 @@ impl InProcessDaemon {
         }
 
         // Persist to config
-        self.config.save_repo(&path);
+        self.config.save_repo(&ExecutionEnvironmentPath::new(&path));
         let tab_order = {
             let repos = self.repos.read().await;
             let order = self.repo_order.read().await;
-            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
+            order
+                .iter()
+                .filter_map(|id| repos.get(id).map(|state| ExecutionEnvironmentPath::new(state.preferred_path())))
+                .collect::<Vec<_>>()
         };
         self.config.save_tab_order(&tab_order);
 
@@ -1470,11 +1474,14 @@ impl InProcessDaemon {
         }
 
         // Persist to config
-        self.config.remove_repo(&path);
+        self.config.remove_repo(&ExecutionEnvironmentPath::new(&path));
         let tab_order = {
             let repos = self.repos.read().await;
             let order = self.repo_order.read().await;
-            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
+            order
+                .iter()
+                .filter_map(|id| repos.get(id).map(|state| ExecutionEnvironmentPath::new(state.preferred_path())))
+                .collect::<Vec<_>>()
         };
         self.config.save_tab_order(&tab_order);
 
@@ -1698,7 +1705,7 @@ impl DaemonHandle for InProcessDaemon {
 
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
-        let config_base = self.config.base_path().to_path_buf();
+        let config_base = self.config.base_path().as_path().to_path_buf();
 
         // Register the cancellation token before broadcasting CommandStarted
         // so cancel(id) can find it the instant the TUI sees the event.

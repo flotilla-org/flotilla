@@ -119,7 +119,7 @@ pub struct AgentStateStore {
 
 impl AgentStateStore {
     pub fn new() -> Self {
-        Self::with_path(flotilla_config_dir().join("agents").join("state.json"))
+        Self::with_path(flotilla_config_dir().join("agents").join("state.json").into_path_buf())
     }
 
     pub fn with_base(base: impl AsRef<Path>) -> Self {

@@ -384,7 +384,7 @@ pub struct AttachableStore {
 
 impl AttachableStore {
     pub fn new() -> Self {
-        Self::with_path(flotilla_config_dir().join("attachables").join("registry.json"))
+        Self::with_path(flotilla_config_dir().join("attachables").join("registry.json").into_path_buf())
     }
 
     pub fn with_base(base: impl AsRef<Path>) -> Self {

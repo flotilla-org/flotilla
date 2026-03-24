@@ -348,7 +348,7 @@ impl SshTransport {
 
 /// Returns the `~/.config/flotilla/peers/` directory path.
 fn peers_dir() -> PathBuf {
-    flotilla_config_dir().join("peers")
+    flotilla_config_dir().join("peers").into_path_buf()
 }
 
 #[async_trait]

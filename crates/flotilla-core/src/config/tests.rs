@@ -8,6 +8,10 @@ fn make_dir(base: &Path, name: &str) -> PathBuf {
     path
 }
 
+fn ee(path: impl Into<PathBuf>) -> ExecutionEnvironmentPath {
+    ExecutionEnvironmentPath::new(path.into())
+}
+
 fn write_repo_file(base: &Path, filename: &str, content: &str) {
     let repos_dir = base.join("repos");
     std::fs::create_dir_all(&repos_dir).unwrap();
@@ -35,13 +39,14 @@ fn save_repo_roundtrip_is_idempotent_and_removable() {
     let dir = tempdir().unwrap();
     let base = dir.path();
     let repo = make_dir(base, "repo");
+    let repo_ee = ee(&repo);
 
     let store = ConfigStore::with_base(base);
-    store.save_repo(&repo);
-    store.save_repo(&repo);
-    assert_eq!(store.load_repos(), vec![repo.clone()]);
+    store.save_repo(&repo_ee);
+    store.save_repo(&repo_ee);
+    assert_eq!(store.load_repos(), vec![repo_ee.clone()]);
 
-    store.remove_repo(&repo);
+    store.remove_repo(&repo_ee);
     assert!(store.load_repos().is_empty());
 }
 
@@ -50,12 +55,13 @@ fn save_repo_creates_repos_dir_if_missing() {
     let dir = tempdir().unwrap();
     let base = dir.path().join("deep/nested/config");
     let repo = make_dir(dir.path(), "myrepo");
+    let repo_ee = ee(&repo);
 
     let store = ConfigStore::with_base(&base);
-    store.save_repo(&repo);
+    store.save_repo(&repo_ee);
 
     assert!(base.join("repos").exists());
-    assert_eq!(store.load_repos(), vec![repo]);
+    assert_eq!(store.load_repos(), vec![repo_ee]);
 }
 
 #[test]
@@ -66,15 +72,15 @@ fn load_repos_sorts_and_skips_invalid_entries() {
     let repo_b = make_dir(base, "bravo");
 
     let store = ConfigStore::with_base(base);
-    store.save_repo(&repo_b);
-    store.save_repo(&repo_a);
+    store.save_repo(&ee(&repo_b));
+    store.save_repo(&ee(&repo_a));
 
     std::fs::write(base.join("repos").join("notes.txt"), "ignore me").unwrap();
     write_repo_file(base, "broken.toml", "not valid toml");
     write_repo_file(base, "missing-path.toml", "[section]\nkey = \"value\"\n");
     write_repo_file(base, "ghost.toml", "path = \"/nonexistent/ghost\"\n");
 
-    assert_eq!(store.load_repos(), vec![repo_a, repo_b]);
+    assert_eq!(store.load_repos(), vec![ee(repo_a), ee(repo_b)]);
 }
 
 #[test]
@@ -92,7 +98,7 @@ fn tab_order_roundtrip_and_parse_failures() {
 
     assert!(store.load_tab_order().is_none());
 
-    let order = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+    let order = vec![ee("/a"), ee("/b")];
     store.save_tab_order(&order);
     assert_eq!(store.load_tab_order(), Some(order));
 
@@ -112,7 +118,7 @@ fn save_tab_order_creates_base_dir() {
     let base = dir.path().join("new/config/dir");
     let store = ConfigStore::with_base(&base);
 
-    store.save_tab_order(&[PathBuf::from("/a")]);
+    store.save_tab_order(&[ee("/a")]);
     assert!(base.join("tab-order.json").exists());
 }
 
@@ -211,15 +217,16 @@ fn resolve_checkout_config_uses_global_when_repo_file_missing_or_invalid() {
     std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_path = \"/global/path\"\ncheckout_strategy = \"wt\"\n").unwrap();
 
     let repo = make_dir(base, "repo");
+    let repo_ee = ee(&repo);
     let store = ConfigStore::with_base(base);
 
-    let from_global = store.resolve_checkout_config(&repo);
+    let from_global = store.resolve_checkout_config(&repo_ee);
     assert_eq!(from_global.path, "/global/path");
     assert_eq!(from_global.strategy, "wt");
 
     let slug = path_to_slug(&repo);
     write_repo_file(base, &format!("{slug}.toml"), "{{invalid toml!!!");
-    let from_invalid = store.resolve_checkout_config(&repo);
+    let from_invalid = store.resolve_checkout_config(&repo_ee);
     assert_eq!(from_invalid.path, "/global/path");
     assert_eq!(from_invalid.strategy, "wt");
 }
@@ -231,27 +238,28 @@ fn resolve_checkout_config_repo_override_merges_with_global() {
     std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_path = \"/global/path\"\ncheckout_strategy = \"wt\"\n").unwrap();
 
     let repo = make_dir(base, "repo");
+    let repo_ee = ee(&repo);
     let store = ConfigStore::with_base(base);
     let slug = path_to_slug(&repo);
 
     // Override path only — strategy inherited from global
     let repo_toml = format!("path = \"{}\"\n[vcs.git]\ncheckout_path = \"/repo/path\"\n", repo.display());
     write_repo_file(base, &format!("{slug}.toml"), &repo_toml);
-    let resolved = store.resolve_checkout_config(&repo);
+    let resolved = store.resolve_checkout_config(&repo_ee);
     assert_eq!(resolved.path, "/repo/path");
     assert_eq!(resolved.strategy, "wt");
 
     // Override strategy only — path inherited from global
     let repo_toml = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"git\"\n", repo.display());
     write_repo_file(base, &format!("{slug}.toml"), &repo_toml);
-    let resolved = store.resolve_checkout_config(&repo);
+    let resolved = store.resolve_checkout_config(&repo_ee);
     assert_eq!(resolved.path, "/global/path");
     assert_eq!(resolved.strategy, "git");
 
     // No overrides — both from global
     let repo_toml = format!("path = \"{}\"\n", repo.display());
     write_repo_file(base, &format!("{slug}.toml"), &repo_toml);
-    let resolved = store.resolve_checkout_config(&repo);
+    let resolved = store.resolve_checkout_config(&repo_ee);
     assert_eq!(resolved.path, "/global/path");
     assert_eq!(resolved.strategy, "wt");
 }
@@ -268,7 +276,7 @@ fn defaults_have_expected_values_and_base_path_roundtrips() {
 
     let dir = tempdir().unwrap();
     let store = ConfigStore::with_base(dir.path());
-    assert_eq!(store.base_path(), dir.path());
+    assert_eq!(store.base_path().as_path(), dir.path());
 }
 
 #[test]
