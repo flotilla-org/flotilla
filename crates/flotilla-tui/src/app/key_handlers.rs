@@ -332,5 +332,4 @@ impl App {
 }
 
 #[cfg(test)]
-#[path = "key_handlers/tests.rs"]
 mod tests;

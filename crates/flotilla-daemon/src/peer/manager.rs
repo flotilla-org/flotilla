@@ -1312,5 +1312,4 @@ impl PeerManager {
 }
 
 #[cfg(test)]
-#[path = "manager/tests.rs"]
 mod tests;

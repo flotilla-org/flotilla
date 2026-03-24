@@ -228,5 +228,4 @@ impl Intent {
 }
 
 #[cfg(test)]
-#[path = "intent/tests.rs"]
 mod tests;

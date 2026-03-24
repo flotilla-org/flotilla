@@ -885,5 +885,4 @@ pub async fn fetch_checkout_status(
 }
 
 #[cfg(test)]
-#[path = "data/tests.rs"]
 mod tests;
