@@ -17,24 +17,37 @@ pub enum Resolved {
     HostStatus { host: String },
     /// Query: show host providers.
     HostProviders { host: String },
+    /// Query: show repo details on a specific host.
+    HostRepoDetail { host: String, slug: String },
+    /// Query: show repo providers on a specific host.
+    HostRepoProviders { host: String, slug: String },
+    /// Query: show repo work items on a specific host.
+    HostRepoWork { host: String, slug: String },
 }
 
 impl Resolved {
     /// Set the target host on a resolved command or query.
     /// For Command variants, sets Command.host.
-    /// For query variants that carry a host field, this is a no-op
-    /// (the host is already populated by the noun's resolve).
+    /// For host query variants, this is a no-op (already populated).
+    /// For repo query variants, promotes them to host-targeted variants.
     pub fn set_host(&mut self, host: String) {
-        match self {
-            Resolved::Command(cmd) => {
+        *self = match std::mem::replace(self, Resolved::HostList) {
+            Resolved::Command(mut cmd) => {
                 cmd.host = Some(HostName::new(&host));
+                Resolved::Command(cmd)
             }
-            // Query variants with host are already populated
-            Resolved::HostStatus { .. } | Resolved::HostProviders { .. } | Resolved::HostList => {}
-            // Repo queries routed through a host become commands instead
-            // (handled in HostNoun::resolve, not here)
-            Resolved::RepoDetail { .. } | Resolved::RepoProviders { .. } | Resolved::RepoWork { .. } => {}
-        }
+            // Repo queries become host-targeted repo queries
+            Resolved::RepoDetail { slug } => Resolved::HostRepoDetail { host, slug },
+            Resolved::RepoProviders { slug } => Resolved::HostRepoProviders { host, slug },
+            Resolved::RepoWork { slug } => Resolved::HostRepoWork { host, slug },
+            // Host query variants are already populated
+            other @ (Resolved::HostList
+            | Resolved::HostStatus { .. }
+            | Resolved::HostProviders { .. }
+            | Resolved::HostRepoDetail { .. }
+            | Resolved::HostRepoProviders { .. }
+            | Resolved::HostRepoWork { .. }) => other,
+        };
     }
 }
 

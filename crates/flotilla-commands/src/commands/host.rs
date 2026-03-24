@@ -248,4 +248,31 @@ mod tests {
         let partial = HostNounPartial::try_parse_from(["host", "alpha", "refresh", "my-repo"]).expect("should parse");
         assert_eq!(format!("{partial}"), "host alpha refresh my-repo");
     }
+
+    #[test]
+    fn host_routed_repo_query_becomes_host_targeted() {
+        // `host feta repo myslug providers` should NOT silently drop the host
+        let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "providers"]);
+        assert_eq!(resolved, Resolved::HostRepoProviders { host: "feta".into(), slug: "myslug".into() });
+    }
+
+    #[test]
+    fn host_routed_repo_detail_becomes_host_targeted() {
+        let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug"]);
+        assert_eq!(resolved, Resolved::HostRepoDetail { host: "feta".into(), slug: "myslug".into() });
+    }
+
+    #[test]
+    fn host_routed_repo_work_becomes_host_targeted() {
+        let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "work"]);
+        assert_eq!(resolved, Resolved::HostRepoWork { host: "feta".into(), slug: "myslug".into() });
+    }
+
+    #[test]
+    fn host_routes_pr_alias() {
+        // `host alpha pr 42 open` should work via the pr alias on NounCommand::Cr
+        let partial = HostNounPartial::try_parse_from(["host", "alpha", "pr", "42", "open"]).expect("should parse");
+        let resolved = partial.refine().expect("should refine").resolve().expect("should resolve");
+        assert!(matches!(resolved, Resolved::Command(cmd) if cmd.host.is_some()));
+    }
 }

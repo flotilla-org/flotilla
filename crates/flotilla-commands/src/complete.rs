@@ -59,15 +59,27 @@ fn walk_for_completions(tokens: &[&str], cmd: &Command, pos: usize, partial: &st
     walk_for_completions(tokens, cmd, pos + 1, partial)
 }
 
-/// Collect every subcommand name (with description) that is valid at this point
-/// in the command tree. For commands that accept external subcommands (like host
-/// routing), also include the routable noun names.
+/// Collect every subcommand name, flag, and option (with description) that is valid
+/// at this point in the command tree. For commands that accept external subcommands
+/// (like host routing), also include the routable noun names.
 fn valid_next_tokens(cmd: &Command) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = cmd
         .get_subcommands()
         .filter(|sub| !sub.is_hide_set())
         .map(|sub| CompletionItem { value: sub.get_name().to_string(), description: sub.get_about().map(|a| a.to_string()) })
         .collect();
+
+    // Add flags and options (--long forms only).
+    for arg in cmd.get_arguments() {
+        if arg.is_hide_set() {
+            continue;
+        }
+        if let Some(long) = arg.get_long() {
+            let flag = format!("--{long}");
+            let desc = arg.get_help().map(|h| h.to_string());
+            items.push(CompletionItem { value: flag, description: desc });
+        }
+    }
 
     // If the command allows external subcommands (host routing position),
     // also offer the routable noun names.
@@ -179,5 +191,19 @@ mod tests {
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"checkout"));
         assert!(!values.contains(&"repo"));
+    }
+
+    #[test]
+    fn flags_complete_after_verb() {
+        let completions = complete(&test_root(), "repo myslug checkout --", 24);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--fresh"));
+    }
+
+    #[test]
+    fn partial_flag_completes() {
+        let completions = complete(&test_root(), "repo myslug checkout --fr", 26);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--fresh"));
     }
 }

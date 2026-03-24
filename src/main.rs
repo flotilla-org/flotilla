@@ -407,6 +407,15 @@ async fn dispatch(mut resolved: flotilla_commands::Resolved, cli: &Cli, format: 
             let daemon = connect_daemon(cli).await?;
             flotilla_tui::cli::run_host_providers(&*daemon, &host, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
         }
+        Resolved::HostRepoDetail { host, slug } => {
+            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug}"))
+        }
+        Resolved::HostRepoProviders { host, slug } => {
+            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug} providers"))
+        }
+        Resolved::HostRepoWork { host, slug } => {
+            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug} work"))
+        }
     }
 }
 
