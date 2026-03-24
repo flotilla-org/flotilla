@@ -1,14 +1,16 @@
-# Shpool ensure_session Implementation Plan
+# Terminal Pool ensure_session Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make shpool's `ensure_session` actually create the session (attach + detach), so `attach_args` becomes a simple reattach — fixing the `${SHELL:-/bin/sh}` expansion bug and aligning shpool's model with cleat's.
+**Goal:** Move session setup (env vars, shell resolution, command) into `ensure_session` for both shpool and cleat, so `attach_args` becomes a simple reattach. Fixes the `${SHELL:-/bin/sh}` expansion bug in shpool, and fixes silently-ignored env vars in cleat.
 
-**Architecture:** Add `env_vars` parameter to the `TerminalPool::ensure_session` trait method. Shpool's `ensure_session` resolves `$SHELL` in Rust, builds a `--cmd` string with env vars and the resolved shell path, spawns `shpool attach` to create the session, then calls `shpool detach` to disconnect. Shpool's `attach_args` simplifies to a plain reattach (no `--cmd`, no env, no shell expansion).
+**Architecture:** Add `env_vars` parameter to the `TerminalPool::ensure_session` trait method. Both shpool and cleat bake env vars and the command into the session at creation time. `attach_args` for both simplifies to a plain reattach (no `--cmd`, no env, no shell expansion). For shpool, `ensure_session` spawns `shpool attach --cmd ...` then `shpool detach` to create-and-release. For cleat, `ensure_session` passes env vars into `cleat create --cmd`.
 
-**Tech Stack:** Rust, async-trait, tokio, shpool CLI
+**Tech Stack:** Rust, async-trait, tokio, shpool CLI, cleat CLI
 
 **Key design note — PTY requirement:** Shpool `attach` may require a TTY on the attaching process. If `ensure_session` runs from the daemon (piped I/O, no TTY), shpool might reject the attach. The plan includes an early verification step. If it fails, we'll need to allocate a PTY via the `pty-process` crate or use `script -q /dev/null` as a wrapper.
+
+**Key design note — cleat `--cmd` on attach:** Investigation of the cleat codebase confirms that `--cmd` on `cleat attach` to an existing session is silently ignored. The command and env vars must be set at `cleat create` time. The current flotilla code's `attach_args` with `--cmd` + env vars was dead code for cleat all along.
 
 ---
 
@@ -19,16 +21,17 @@
 | `crates/flotilla-core/src/providers/terminal/mod.rs` | Modify | Add `env_vars` to `ensure_session` trait |
 | `crates/flotilla-core/src/providers/terminal/shpool.rs` | Modify | Implement real `ensure_session`, simplify `attach_args` |
 | `crates/flotilla-core/src/providers/terminal/shpool/tests.rs` | Modify | Update tests for new behavior |
-| `crates/flotilla-core/src/providers/terminal/cleat.rs` | Modify | Accept new `env_vars` param (no behavioral change) |
+| `crates/flotilla-core/src/providers/terminal/cleat.rs` | Modify | Inject env vars in `ensure_session`, simplify `attach_args` |
 | `crates/flotilla-core/src/providers/terminal/passthrough.rs` | Modify | Accept new `env_vars` param (no behavioral change) |
 | `crates/flotilla-core/src/terminal_manager.rs` | Modify | Thread `daemon_socket_path` into `ensure_running` |
 | `crates/flotilla-core/src/terminal_manager/tests.rs` | Modify | Update `ensure_running` call sites |
 | `crates/flotilla-core/src/executor/terminals.rs` | Modify | Pass `daemon_socket_path` to `ensure_running` |
 | `crates/flotilla-core/src/executor/tests.rs` | Modify | Update test call sites |
 | `crates/flotilla-core/src/hop_chain/tests.rs` | Modify | Update mock `ensure_session` signatures |
-| `crates/flotilla-core/src/hop_chain/snapshots/*.snap` | Modify | Snapshots may change if local attach args change |
+| `crates/flotilla-core/src/hop_chain/snapshots/*.snap` | Modify | Snapshots will change for simplified attach args |
 | `crates/flotilla-core/src/providers/discovery/test_support.rs` | Modify | Update mock `ensure_session` signature |
-| `crates/flotilla-core/src/refresh/tests.rs` | Check | May have mock TerminalPool that needs updating |
+| `crates/flotilla-core/src/refresh/tests.rs` | Modify | Update mock `ensure_session` signature |
+| `crates/flotilla-core/tests/in_process_daemon.rs` | Modify | Update mock `ensure_session` signature |
 
 ---
 
@@ -75,15 +78,7 @@ async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, en
 Run: `cargo check -p flotilla-core 2>&1 | head -30`
 Expected: compilation errors in all `TerminalPool` implementations (shpool, cleat, passthrough) and mocks.
 
-- [ ] **Step 3: Fix cleat — accept new param, no behavioral change**
-
-In `crates/flotilla-core/src/providers/terminal/cleat.rs`, update `ensure_session` signature to accept `env_vars: &TerminalEnvVars`. Don't use the parameter yet — cleat's `create` command doesn't need it for now. Add `_` prefix:
-
-```rust
-async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<(), String> {
-```
-
-- [ ] **Step 4: Fix passthrough — accept new param**
+- [ ] **Step 3: Fix passthrough — accept new param**
 
 In `crates/flotilla-core/src/providers/terminal/passthrough.rs`:
 
@@ -91,9 +86,9 @@ In `crates/flotilla-core/src/providers/terminal/passthrough.rs`:
 async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &std::path::Path, _env_vars: &TerminalEnvVars) -> Result<(), String> {
 ```
 
-Add the import for `TerminalEnvVars` if not already present (it's imported via `super::` in cleat/passthrough).
+Add the import for `TerminalEnvVars` if not already present.
 
-- [ ] **Step 5: Fix shpool — accept new param temporarily**
+- [ ] **Step 4: Fix shpool — accept new param temporarily**
 
 In `crates/flotilla-core/src/providers/terminal/shpool.rs`, update the no-op `ensure_session` to accept the new param (we'll implement it fully in Task 4):
 
@@ -102,6 +97,14 @@ async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path,
     // No-op: shpool creates sessions on first `attach`.
     Ok(())
 }
+```
+
+- [ ] **Step 5: Fix cleat — accept new param temporarily**
+
+In `crates/flotilla-core/src/providers/terminal/cleat.rs`, update `ensure_session` to accept `_env_vars: &TerminalEnvVars`. No behavioral change yet (Task 5 handles that):
+
+```rust
+async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<(), String> {
 ```
 
 - [ ] **Step 6: Fix all mock implementations**
@@ -138,19 +141,19 @@ feat: add env_vars parameter to TerminalPool::ensure_session
 
 **Files:**
 - Modify: `crates/flotilla-core/src/terminal_manager.rs:110-121`
-- Modify: `crates/flotilla-core/src/executor/terminals.rs:61`
+- Modify: `crates/flotilla-core/src/executor/terminals.rs:61,118`
 - Modify: `crates/flotilla-core/src/terminal_manager/tests.rs`
 - Modify: `crates/flotilla-core/src/executor/tests.rs`
 
 - [ ] **Step 1: Write failing test — ensure_running passes env vars to pool**
 
-In `crates/flotilla-core/src/terminal_manager/tests.rs`, update the `ensure_running_uses_attachable_id_as_session_name` test. The SharedMock's `ensure_session` should now record env_vars. Update `PoolCall::EnsureSession` to include env_vars:
+In `crates/flotilla-core/src/terminal_manager/tests.rs`, update the `ensure_running_uses_attachable_id_as_session_name` test. Update `PoolCall::EnsureSession` to include env_vars:
 
 ```rust
 EnsureSession { session_name: String, command: String, cwd: PathBuf, env_vars: TerminalEnvVars },
 ```
 
-And update the SharedMock impl to record them. Then assert that env_vars contains `FLOTILLA_ATTACHABLE_ID` when `ensure_running` is called with a socket path.
+Update the SharedMock impl to record them. Then assert that env_vars contains `FLOTILLA_ATTACHABLE_ID` when `ensure_running` is called with a socket path.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -275,11 +278,11 @@ In `crates/flotilla-core/src/providers/terminal/shpool.rs`, replace the no-op:
 
 ```rust
 async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
-    // Resolve $SHELL from the process environment — avoids shell expansion
-    // issues with shpool's shell-words tokenizer.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
     // Build the --cmd value: env K=V ... /resolved/shell [-lic command]
+    // shpool uses the shell-words crate to tokenize --cmd, so no shell
+    // expansion occurs — all values must be literal.
     let mut cmd_parts: Vec<String> = Vec::new();
     if !env_vars.is_empty() {
         cmd_parts.push("env".to_string());
@@ -317,8 +320,6 @@ async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, en
     Ok(())
 }
 ```
-
-**Note:** The `run!` macro calls `runner.run_output()` which captures stdout/stderr. The attach call may fail if shpool requires a TTY — Task 1 should have verified this. If it does require a TTY, we'll need to spawn it differently (e.g., with a PTY or via `script`).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -361,7 +362,92 @@ feat: implement shpool ensure_session — create session via attach + detach
 
 ---
 
-### Task 5: Simplify shpool's `attach_args` to plain reattach
+### Task 5: Implement cleat's `ensure_session` with env vars
+
+**Files:**
+- Modify: `crates/flotilla-core/src/providers/terminal/cleat.rs:57-65`
+
+Cleat's `ensure_session` currently calls `cleat create --cmd <command>`. We need to bake env vars and the resolved shell into the command, matching what cleat's daemon actually executes: `$SHELL -lc <cmd>`. Since cleat resolves `$SHELL` internally, we just need to prefix env vars.
+
+- [ ] **Step 1: Write failing test — ensure_session passes env vars in --cmd**
+
+In `crates/flotilla-core/src/providers/terminal/cleat.rs` tests section:
+
+```rust
+#[tokio::test]
+async fn ensure_session_includes_env_vars_in_cmd() {
+    let json = r#"{"id":"my-session","cwd":"/repo","cmd":"env FOO=bar claude","status":"Detached"}"#;
+    let runner = Arc::new(MockRunner::new(vec![Ok(json.into())]));
+    let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+    let env = vec![("FOO".to_string(), "bar".to_string())];
+
+    pool.ensure_session("my-session", "claude", Path::new("/repo"), &env).await.expect("ensure session");
+
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "cleat");
+    let cmd_idx = calls[0].1.iter().position(|a| a == "--cmd").expect("--cmd present");
+    let cmd_val = &calls[0].1[cmd_idx + 1];
+    assert!(cmd_val.starts_with("env "), "should prefix with env: {cmd_val}");
+    assert!(cmd_val.contains("FOO=bar"), "should contain env var: {cmd_val}");
+    assert!(cmd_val.ends_with("claude"), "should end with command: {cmd_val}");
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p flotilla-core ensure_session_includes_env 2>&1 | tail -10`
+Expected: FAIL — current `ensure_session` passes raw command without env vars.
+
+- [ ] **Step 3: Update cleat's `ensure_session` to inject env vars**
+
+```rust
+async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
+    // Build effective command with env vars baked in.
+    // Cleat resolves $SHELL internally, so we just need to prefix env vars.
+    let effective_cmd = if env_vars.is_empty() {
+        command.to_string()
+    } else {
+        let mut parts = vec!["env".to_string()];
+        for (k, v) in env_vars {
+            parts.push(format!("{k}={v}"));
+        }
+        parts.push(command.to_string());
+        parts.join(" ")
+    };
+
+    let cmd_arg = if effective_cmd.is_empty() { command } else { &effective_cmd };
+    run!(
+        self.runner,
+        &self.binary,
+        &["create", "--json", session_name, "--cwd", &cwd.display().to_string(), "--cmd", cmd_arg],
+        Path::new("/")
+    )?;
+    Ok(())
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p flotilla-core ensure_session_includes_env 2>&1 | tail -10`
+Expected: PASS
+
+- [ ] **Step 5: Update existing `ensure_creates_session` test**
+
+The existing test passes empty env vars — it should still work as-is since empty env means no prefix. Verify:
+
+Run: `cargo test -p flotilla-core ensure_creates_session 2>&1 | tail -10`
+Expected: PASS
+
+- [ ] **Step 6: Commit**
+
+```
+feat: inject env vars into cleat ensure_session at create time
+```
+
+---
+
+### Task 6: Simplify shpool's `attach_args` to plain reattach
 
 **Files:**
 - Modify: `crates/flotilla-core/src/providers/terminal/shpool.rs:484-513`
@@ -369,7 +455,7 @@ feat: implement shpool ensure_session — create session via attach + detach
 
 - [ ] **Step 1: Write failing test — attach_args produces simple reattach**
 
-In `crates/flotilla-core/src/providers/terminal/shpool/tests.rs`, add a new test:
+In `crates/flotilla-core/src/providers/terminal/shpool/tests.rs`:
 
 ```rust
 #[test]
@@ -399,11 +485,11 @@ fn attach_args_simple_reattach() {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p flotilla-core attach_args_simple_reattach 2>&1 | tail -10`
-Expected: FAIL — current `attach_args` still produces `--cmd` with NestedCommand.
+Expected: FAIL
 
 - [ ] **Step 3: Simplify `attach_args`**
 
-Replace the current `attach_args` implementation in `shpool.rs`:
+Replace the current `attach_args` in `shpool.rs`:
 
 ```rust
 fn attach_args(&self, session_name: &str, _command: &str, cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
@@ -422,24 +508,14 @@ fn attach_args(&self, session_name: &str, _command: &str, cwd: &Path, _env_vars:
 }
 ```
 
-The `command` and `env_vars` parameters are now unused — they were baked in during `ensure_session`. `--force` ensures we can reattach even if another process is already attached.
-
 - [ ] **Step 4: Run new test**
 
 Run: `cargo test -p flotilla-core attach_args_simple_reattach 2>&1 | tail -10`
 Expected: PASS
 
-- [ ] **Step 5: Update existing shpool attach_args tests**
+- [ ] **Step 5: Replace old attach_args tests with new ones**
 
-The old tests (`attach_args_with_command_no_env`, `attach_args_flatten_with_command_no_env`, `attach_args_empty_command_no_env`, `attach_args_with_env_vars`, `attach_args_with_env_vars_empty_command`) all expect the old `--cmd` + NestedCommand structure. Replace them with tests that verify the new simple reattach behavior:
-
-- `attach_args_with_command_no_env` → verify no `--cmd`, has `--force`
-- `attach_args_flatten_with_command_no_env` → verify flattened string is simple
-- `attach_args_empty_command_no_env` → verify same structure (no difference now)
-- `attach_args_with_env_vars` → verify env_vars are ignored (no NestedCommand)
-- `attach_args_with_env_vars_empty_command` → verify same
-
-Also update `attach_builds_command` which checks for `--cmd` and `-lic`.
+Replace the old tests that expected `--cmd` + NestedCommand with tests verifying the simplified reattach. All variations (with/without command, with/without env vars) should produce the same simple structure. Also update `attach_builds_command`.
 
 - [ ] **Step 6: Run all shpool tests**
 
@@ -454,7 +530,82 @@ feat: simplify shpool attach_args to plain reattach
 
 ---
 
-### Task 6: Update hop chain snapshots and remaining tests
+### Task 7: Simplify cleat's `attach_args` to plain reattach
+
+**Files:**
+- Modify: `crates/flotilla-core/src/providers/terminal/cleat.rs:67-94`
+
+Since env vars and the command are now baked in at `ensure_session` / `cleat create` time, `attach_args` no longer needs `--cmd` with env + shell wrapping.
+
+- [ ] **Step 1: Write failing test — cleat attach_args is simple reattach**
+
+```rust
+#[test]
+fn attach_args_simple_reattach() {
+    let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+    let env = vec![("FOO".to_string(), "bar".to_string())];
+    let args = pool.attach_args("my-session", "bash", Path::new("/repo"), &env).expect("attach_args");
+
+    // No --cmd, no NestedCommand — env vars were baked in at create time
+    assert_eq!(args, vec![
+        Arg::Quoted("cleat".into()),
+        Arg::Literal("attach".into()),
+        Arg::Quoted("my-session".into()),
+        Arg::Literal("--cwd".into()),
+        Arg::Quoted("/repo".into()),
+    ]);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p flotilla-core attach_args_simple_reattach 2>&1 | tail -10`
+Expected: FAIL — current `attach_args` still builds `--cmd` with NestedCommand.
+
+- [ ] **Step 3: Simplify cleat's `attach_args`**
+
+```rust
+fn attach_args(&self, session_name: &str, _command: &str, cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
+    Ok(vec![
+        Arg::Quoted(self.binary.clone()),
+        Arg::Literal("attach".into()),
+        Arg::Quoted(session_name.into()),
+        Arg::Literal("--cwd".into()),
+        Arg::Quoted(cwd.display().to_string()),
+    ])
+}
+```
+
+- [ ] **Step 4: Run new test**
+
+Run: `cargo test -p flotilla-core attach_args_simple_reattach 2>&1 | tail -10`
+Expected: PASS
+
+- [ ] **Step 5: Replace old cleat attach_args tests**
+
+Replace all old tests that expected `--cmd` + `${SHELL:-/bin/sh}` + NestedCommand with tests verifying the simplified structure. Key tests to rewrite:
+- `attach_args_with_command_no_env` → simple reattach
+- `attach_args_flatten_with_command_no_env` → flat string without --cmd
+- `attach_args_empty_command_no_env` → same simple structure
+- `attach_args_with_env_vars` → env vars ignored in attach_args
+- `attach_args_with_env_vars_empty_command` → same
+- `attach_args_flatten_roundtrip_env_vars` → remove or simplify
+- `attach_wraps_command` → update to verify no --cmd
+
+- [ ] **Step 6: Run all cleat tests**
+
+Run: `cargo test -p flotilla-core cleat 2>&1 | tail -20`
+Expected: all pass
+
+- [ ] **Step 7: Commit**
+
+```
+feat: simplify cleat attach_args to plain reattach
+```
+
+---
+
+### Task 8: Update hop chain snapshots and remaining tests
 
 **Files:**
 - Modify: `crates/flotilla-core/src/hop_chain/tests.rs`
@@ -465,13 +616,13 @@ feat: simplify shpool attach_args to plain reattach
 
 Run: `cargo test --workspace --locked 2>&1 | grep 'FAILED\|failures'`
 
-Identify all failing tests. The hop chain snapshots that reference shpool attach args may need updating. The executor tests that check for `--cmd` may need updating.
+Identify all failing tests. The hop chain snapshots for local workspace (which use cleat) will change. Executor tests that check for `--cmd` may need updating.
 
 - [ ] **Step 2: Fix each failing test**
 
 For each failure, investigate whether the change is an intended consequence of the new behavior. If yes, update the test/snapshot. If no, investigate the bug.
 
-**Remember:** Never blindly accept snapshot changes. Each changed snapshot should be explainable by the design change.
+**Remember:** Never blindly accept snapshot changes. Each changed snapshot should be explainable by the design change. The `e2e_local_workspace_flattened` snapshot should change from `'cleat' attach 'main__shell__0' --cwd '/home/alice/dev/my-repo'` to the same (actually this one was already simple — verify it stays unchanged).
 
 - [ ] **Step 3: Run full test suite**
 
@@ -486,20 +637,22 @@ Expected: no errors
 - [ ] **Step 5: Commit**
 
 ```
-test: update snapshots and tests for shpool ensure_session model
+test: update snapshots and tests for ensure_session model
 ```
 
 ---
 
-### Task 7: Remove `${SHELL:-/bin/sh}` from shpool entirely
+### Task 9: Remove `${SHELL:-/bin/sh}` from both shpool and cleat
 
 **Files:**
 - Modify: `crates/flotilla-core/src/providers/terminal/shpool.rs`
+- Modify: `crates/flotilla-core/src/providers/terminal/shpool/tests.rs`
+- Modify: `crates/flotilla-core/src/providers/terminal/cleat.rs`
 
-- [ ] **Step 1: Verify no remaining references to `${SHELL:-/bin/sh}` in shpool code**
+- [ ] **Step 1: Verify no remaining references to `${SHELL:-/bin/sh}` in shpool and cleat code**
 
-Run: `grep -n 'SHELL:-' crates/flotilla-core/src/providers/terminal/shpool.rs crates/flotilla-core/src/providers/terminal/shpool/tests.rs`
-Expected: no matches (all removed by Task 4+5)
+Run: `grep -rn 'SHELL:-' crates/flotilla-core/src/providers/terminal/`
+Expected: no matches (all removed by Tasks 4-7)
 
 If any remain, remove them.
 
@@ -511,5 +664,5 @@ Expected: all pass
 - [ ] **Step 3: Commit (if changes were made)**
 
 ```
-chore: remove residual ${SHELL:-/bin/sh} references from shpool
+chore: remove residual ${SHELL:-/bin/sh} references from terminal pools
 ```
