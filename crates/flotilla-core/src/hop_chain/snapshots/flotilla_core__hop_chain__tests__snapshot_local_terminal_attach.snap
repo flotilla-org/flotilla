@@ -1,5 +1,6 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
+assertion_line: 1293
 expression: resolved
 ---
 ResolvedPlan(

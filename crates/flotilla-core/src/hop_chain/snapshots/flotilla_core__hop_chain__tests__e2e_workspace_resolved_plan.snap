@@ -1,5 +1,6 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
+assertion_line: 1413
 expression: "&resolved"
 ---
 ResolvedPlan(
@@ -18,7 +19,7 @@ ResolvedPlan(
                 NestedCommand(
                     [
                         Literal(
-                            "$SHELL",
+                            "${SHELL:-/bin/sh}",
                         ),
                         Literal(
                             "-l",
@@ -37,7 +38,7 @@ ResolvedPlan(
                                 Literal(
                                     "&&",
                                 ),
-                                Quoted(
+                                Literal(
                                     "cleat",
                                 ),
                                 Literal(
@@ -67,7 +68,7 @@ ResolvedPlan(
                                             "FLOTILLA_DAEMON_SOCKET='/tmp/flotilla.sock'",
                                         ),
                                         Literal(
-                                            "$SHELL",
+                                            "${SHELL:-/bin/sh}",
                                         ),
                                         Literal(
                                             "-lc",

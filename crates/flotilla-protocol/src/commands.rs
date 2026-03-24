@@ -62,7 +62,7 @@ pub enum CommandAction {
         checkout_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attachable_set_id: Option<AttachableSetId>,
-        commands: Vec<PreparedTerminalCommand>,
+        commands: Vec<ResolvedPaneCommand>,
     },
     SelectWorkspace {
         ws_ref: String,
@@ -244,7 +244,7 @@ pub struct CheckoutStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_helpers::assert_json_roundtrip, AttachableSetId, HostName, RepoIdentity};
+    use crate::{arg::Arg, test_helpers::assert_json_roundtrip, AttachableSetId, HostName, RepoIdentity};
 
     fn repo_identity() -> RepoIdentity {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
@@ -267,7 +267,7 @@ mod tests {
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
                     attachable_set_id: Some(AttachableSetId::new("set-1")),
-                    commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
+                    commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
                 },
             },
             Command {
@@ -494,7 +494,7 @@ mod tests {
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
                     attachable_set_id: None,
-                    commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
+                    commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
                 },
             },
             Command { host: None, context_repo: None, action: CommandAction::SelectWorkspace { ws_ref: "x".into() } },

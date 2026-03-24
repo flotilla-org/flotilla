@@ -77,14 +77,14 @@ impl SshRemoteHopResolver {
 }
 
 impl RemoteHopResolver for SshRemoteHopResolver {
-    /// Wrap case: pop the inner Command, wrap it in SSH + $SHELL -l -c, push back.
+    /// Wrap case: pop the inner Command, wrap it in SSH + ${SHELL:-/bin/sh} -l -c, push back.
     ///
     /// Produces an Arg tree equivalent to:
-    ///   ssh -t [multiplex_args] 'user@host' '$SHELL -l -c "cd /dir && inner_cmd"'
+    ///   ssh -t [multiplex_args] 'user@host' '${SHELL:-/bin/sh} -l -c "cd /dir && inner_cmd"'
     ///
     /// In Arg terms (single-quote model):
     ///   [Literal("ssh"), Literal("-t"), ...multiplex..., Quoted("user@host"),
-    ///     NestedCommand([Literal("$SHELL"), Literal("-l"), Literal("-c"),
+    ///     NestedCommand([Literal("${SHELL:-/bin/sh}"), Literal("-l"), Literal("-c"),
     ///       NestedCommand([Literal("cd"), Quoted("/dir"), Literal("&&"), ...inner...])])]
     fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
         let info = self.ssh_info(host)?;
@@ -102,7 +102,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
             if inner_args.is_empty() {
                 // Empty inner command = open a login shell at the remote directory
                 cd_args.push(Arg::Literal("exec".into()));
-                cd_args.push(Arg::Literal("$SHELL".into()));
+                cd_args.push(Arg::Literal("${SHELL:-/bin/sh}".into()));
                 cd_args.push(Arg::Literal("-l".into()));
             } else {
                 cd_args.extend(inner_args);
@@ -110,14 +110,18 @@ impl RemoteHopResolver for SshRemoteHopResolver {
             cd_args
         } else if inner_args.is_empty() {
             // No working directory, no inner command — just a login shell
-            vec![Arg::Literal("exec".into()), Arg::Literal("$SHELL".into()), Arg::Literal("-l".into())]
+            vec![Arg::Literal("exec".into()), Arg::Literal("${SHELL:-/bin/sh}".into()), Arg::Literal("-l".into())]
         } else {
             inner_args
         };
 
-        // Build: $SHELL -l -c <NestedCommand(shell_inner_args)>
-        let login_wrapper =
-            vec![Arg::Literal("$SHELL".into()), Arg::Literal("-l".into()), Arg::Literal("-c".into()), Arg::NestedCommand(shell_inner_args)];
+        // Build: ${SHELL:-/bin/sh} -l -c <NestedCommand(shell_inner_args)>
+        let login_wrapper = vec![
+            Arg::Literal("${SHELL:-/bin/sh}".into()),
+            Arg::Literal("-l".into()),
+            Arg::Literal("-c".into()),
+            Arg::NestedCommand(shell_inner_args),
+        ];
 
         // Build: ssh -t [multiplex] target <NestedCommand(login_wrapper)>
         let mut ssh_args = self.ssh_prefix_args(&info);

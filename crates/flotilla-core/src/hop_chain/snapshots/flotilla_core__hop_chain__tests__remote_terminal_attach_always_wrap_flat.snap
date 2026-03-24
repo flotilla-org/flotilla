@@ -1,5 +1,6 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
+assertion_line: 1314
 expression: flat
 ---
 ssh 'feta' 'mock-attach '\''remote-shell-0'\'''

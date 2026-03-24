@@ -146,7 +146,7 @@ fn wrap_with_working_directory_and_inner_command() {
     // The outer NestedCommand wraps $SHELL -l -c <inner>
     match &args[3] {
         Arg::NestedCommand(shell_args) => {
-            assert_eq!(shell_args[0], Arg::Literal("$SHELL".into()));
+            assert_eq!(shell_args[0], Arg::Literal("${SHELL:-/bin/sh}".into()));
             assert_eq!(shell_args[1], Arg::Literal("-l".into()));
             assert_eq!(shell_args[2], Arg::Literal("-c".into()));
             // The inner NestedCommand has cd + inner command
@@ -217,7 +217,7 @@ fn wrap_empty_command_with_working_directory_produces_login_shell() {
                 assert_eq!(inner_args[1], Arg::Quoted("/home/alice/dev/my-repo".into()));
                 assert_eq!(inner_args[2], Arg::Literal("&&".into()));
                 assert_eq!(inner_args[3], Arg::Literal("exec".into()));
-                assert_eq!(inner_args[4], Arg::Literal("$SHELL".into()));
+                assert_eq!(inner_args[4], Arg::Literal("${SHELL:-/bin/sh}".into()));
                 assert_eq!(inner_args[5], Arg::Literal("-l".into()));
             }
             other => panic!("expected NestedCommand, got {other:?}"),
@@ -511,7 +511,7 @@ fn regression_flatten_matches_old_ssh_wrap_pattern() {
     // Verify structural properties of the flattened output
     assert!(flat.starts_with("ssh -t "), "should start with ssh -t: {flat}");
     assert!(flat.contains("'alice@feta.local'"), "should contain quoted target: {flat}");
-    assert!(flat.contains("$SHELL -l -c"), "should contain $SHELL -l -c: {flat}");
+    assert!(flat.contains("${SHELL:-/bin/sh} -l -c"), "should contain ${{SHELL:-/bin/sh}} -l -c: {flat}");
     assert!(flat.contains("/home/alice/dev/my-repo"), "should contain checkout dir: {flat}");
     assert!(flat.contains("cleat attach sess-1"), "should contain inner command: {flat}");
 
@@ -527,7 +527,7 @@ fn regression_flatten_matches_old_ssh_wrap_pattern() {
         Arg::Literal("-t".into()),
         Arg::Quoted("alice@feta.local".into()),
         Arg::NestedCommand(vec![
-            Arg::Literal("$SHELL".into()),
+            Arg::Literal("${SHELL:-/bin/sh}".into()),
             Arg::Literal("-l".into()),
             Arg::Literal("-c".into()),
             Arg::NestedCommand(vec![
@@ -565,7 +565,7 @@ fn regression_flatten_empty_command_matches_login_shell_pattern() {
         Arg::Literal("-t".into()),
         Arg::Quoted("alice@feta.local".into()),
         Arg::NestedCommand(vec![
-            Arg::Literal("$SHELL".into()),
+            Arg::Literal("${SHELL:-/bin/sh}".into()),
             Arg::Literal("-l".into()),
             Arg::Literal("-c".into()),
             Arg::NestedCommand(vec![
@@ -573,7 +573,7 @@ fn regression_flatten_empty_command_matches_login_shell_pattern() {
                 Arg::Quoted("/home/alice/dev/my-repo".into()),
                 Arg::Literal("&&".into()),
                 Arg::Literal("exec".into()),
-                Arg::Literal("$SHELL".into()),
+                Arg::Literal("${SHELL:-/bin/sh}".into()),
                 Arg::Literal("-l".into()),
             ]),
         ]),
@@ -581,9 +581,9 @@ fn regression_flatten_empty_command_matches_login_shell_pattern() {
 
     assert_eq!(args, &expected_args, "empty command should produce login shell pattern");
 
-    // Verify the flattened form contains the exec $SHELL -l pattern
+    // Verify the flattened form contains the exec ${SHELL:-/bin/sh} -l pattern
     let flat = flatten(args, 0);
-    assert!(flat.contains("exec $SHELL -l"), "flattened should contain exec $SHELL -l: {flat}");
+    assert!(flat.contains("exec ${SHELL:-/bin/sh} -l"), "flattened should contain exec ${{SHELL:-/bin/sh}} -l: {flat}");
 }
 
 #[test]
@@ -1347,7 +1347,7 @@ fn snapshot_collapse_remote_to_local() {
 #[test]
 fn snapshot_arg_display_multi_level() {
     let arg = Arg::NestedCommand(vec![
-        Arg::Literal("$SHELL".into()),
+        Arg::Literal("${SHELL:-/bin/sh}".into()),
         Arg::Literal("-l".into()),
         Arg::Literal("-c".into()),
         Arg::NestedCommand(vec![
@@ -1374,7 +1374,7 @@ fn snapshot_arg_display_multi_level() {
 fn snapshot_e2e_workspace_creation_flow() {
     // Step 1: Build cleat-style attach args matching what CleatTerminalPool produces
     let cleat_args = vec![
-        Arg::Quoted("cleat".into()),
+        Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("feat__shell__0".into()),
         Arg::Literal("--cwd".into()),
@@ -1384,7 +1384,7 @@ fn snapshot_e2e_workspace_creation_flow() {
             Arg::Literal("env".into()),
             Arg::Literal("FLOTILLA_ATTACHABLE_ID='feat__shell__0'".into()),
             Arg::Literal("FLOTILLA_DAEMON_SOCKET='/tmp/flotilla.sock'".into()),
-            Arg::Literal("$SHELL".into()),
+            Arg::Literal("${SHELL:-/bin/sh}".into()),
             Arg::Literal("-lc".into()),
             Arg::Quoted("bash".into()),
         ]),
@@ -1429,7 +1429,7 @@ fn snapshot_e2e_workspace_creation_flow() {
 #[test]
 fn snapshot_e2e_local_workspace_creation() {
     let cleat_args = vec![
-        Arg::Quoted("cleat".into()),
+        Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("main__shell__0".into()),
         Arg::Literal("--cwd".into()),
@@ -1469,7 +1469,7 @@ fn snapshot_e2e_local_workspace_creation() {
 #[test]
 fn snapshot_e2e_remote_workspace_send_keys() {
     let cleat_args = vec![
-        Arg::Quoted("cleat".into()),
+        Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("feat__shell__0".into()),
         Arg::Literal("--cwd".into()),

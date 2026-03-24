@@ -132,6 +132,15 @@ impl TerminalManager {
             builder.build_for_attachable(attachable_id, &*store)?
         };
 
+        // Guard: attach_command only supports local attachables.
+        // Remote terminals should use the workspace flow which routes through
+        // the hop chain with a real SSH resolver.
+        if plan.0.iter().any(|hop| matches!(hop, crate::hop_chain::Hop::RemoteToHost { .. })) {
+            return Err(
+                "attach_command does not support remote attachables — use the workspace flow for remote terminal attach".to_string()
+            );
+        }
+
         let terminal_resolver =
             PoolTerminalHopResolver::new(Arc::clone(&self.pool), self.store.clone(), daemon_socket_path.map(|s| s.to_string()));
         let hop_resolver =
@@ -535,6 +544,50 @@ mod tests {
             }
             other => panic!("expected AttachCommand, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn attach_command_rejects_remote_attachable() {
+        use flotilla_protocol::AttachableSet;
+
+        use crate::attachable::{Attachable, AttachableContent, TerminalAttachable, TerminalPurpose};
+
+        let store = shared_in_memory_attachable_store();
+        let local_host = HostName::new("my-laptop");
+        let remote_host = HostName::new("remote-server");
+
+        // Insert an attachable set with a remote host affinity.
+        {
+            let mut s = store.lock().expect("lock");
+            let set_id = s.allocate_set_id();
+            let att_id = s.allocate_attachable_id();
+            s.insert_set(AttachableSet {
+                id: set_id.clone(),
+                host_affinity: Some(remote_host),
+                checkout: None,
+                template_identity: None,
+                members: vec![att_id.clone()],
+            });
+            s.insert_attachable(Attachable {
+                id: att_id,
+                set_id,
+                content: AttachableContent::Terminal(TerminalAttachable {
+                    purpose: TerminalPurpose { checkout: "feat".to_string(), role: "shell".to_string(), index: 0 },
+                    command: "bash".to_string(),
+                    working_directory: PathBuf::from("/remote/wt-feat"),
+                    status: flotilla_protocol::TerminalStatus::Disconnected,
+                }),
+            });
+        }
+
+        let att_id = {
+            let s = store.lock().expect("lock");
+            s.registry().attachables.keys().next().expect("should have one attachable").clone()
+        };
+
+        let mgr = TerminalManager::new(Arc::new(MockTerminalPool::new()), store, local_host);
+        let err = mgr.attach_command(&att_id, None).await.expect_err("should reject remote attachable");
+        assert!(err.contains("does not support remote attachables"), "error should mention remote attachables not supported: {err}");
     }
 
     #[tokio::test]

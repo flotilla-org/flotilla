@@ -19,19 +19,27 @@ pub enum Arg {
     NestedCommand(Vec<Arg>),
 }
 
-impl fmt::Display for Arg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Arg {
+    fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+        let indent = "  ".repeat(depth);
         match self {
-            Arg::Literal(s) => write!(f, "{s}"),
-            Arg::Quoted(s) => write!(f, "\"{s}\""),
+            Arg::Literal(s) => write!(f, "{indent}{s}"),
+            Arg::Quoted(s) => write!(f, "{indent}\"{s}\""),
             Arg::NestedCommand(inner) => {
-                writeln!(f, "NestedCommand(")?;
+                writeln!(f, "{indent}NestedCommand(")?;
                 for arg in inner {
-                    writeln!(f, "  {arg}")?;
+                    arg.fmt_indented(f, depth + 1)?;
+                    writeln!(f)?;
                 }
-                write!(f, ")")
+                write!(f, "{indent})")
             }
         }
+    }
+}
+
+impl fmt::Display for Arg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_indented(f, 0)
     }
 }
 
@@ -292,6 +300,12 @@ mod tests {
         assert!(output.contains("  tmux"));
         assert!(output.contains("  attach"));
         assert!(output.ends_with(')'));
+
+        // Verify nested indentation increases per depth
+        let nested = Arg::NestedCommand(vec![Arg::Literal("ssh".into()), Arg::NestedCommand(vec![Arg::Literal("inner".into())])]);
+        let output = format!("{nested}");
+        assert!(output.contains("  NestedCommand("), "inner NestedCommand should be indented: {output}");
+        assert!(output.contains("    inner"), "inner args should be double-indented: {output}");
     }
 
     // ── shell_quote tests ────────────────────────────────────────────

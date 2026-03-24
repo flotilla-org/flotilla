@@ -651,7 +651,7 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: None,
-            commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
+            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }],
         },
         registry,
         empty_data(),
@@ -673,7 +673,7 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
     assert!(resolved[0].1.contains("desktop.local"));
     assert!(resolved[0].1.contains("/remote/feat"));
     assert!(resolved[0].1.contains("bash -l"));
-    assert!(resolved[0].1.contains("$SHELL -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
+    assert!(resolved[0].1.contains("${SHELL:-/bin/sh} -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
 }
 
 #[tokio::test]
@@ -698,7 +698,7 @@ async fn create_workspace_from_prepared_terminal_prefixes_name_with_host() {
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: None,
-            commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
+            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
         },
         registry,
         empty_data(),
@@ -738,7 +738,7 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: Some(set_id.clone()),
-            commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash".into() }],
+            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
         },
         registry,
         empty_data(),
@@ -834,7 +834,7 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: None,
-            commands: vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }],
+            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }],
         },
         registry,
         empty_data(),
@@ -851,7 +851,7 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
     assert!(!created[0].working_directory.to_string_lossy().starts_with("<remote>/"));
     assert!(created[0].working_directory.exists(), "fallback working directory should exist");
     let resolved = created[0].resolved_commands.as_ref().expect("resolved commands");
-    assert!(resolved[0].1.contains("$SHELL -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
+    assert!(resolved[0].1.contains("${SHELL:-/bin/sh} -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
 }
 
 #[tokio::test]

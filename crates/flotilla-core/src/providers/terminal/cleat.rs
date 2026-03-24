@@ -66,7 +66,7 @@ impl TerminalPool for CleatTerminalPool {
 
     fn attach_args(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
         let mut args = vec![
-            Arg::Quoted(self.binary.clone()),
+            Arg::Literal(self.binary.clone()),
             Arg::Literal("attach".into()),
             Arg::Quoted(session_name.into()),
             Arg::Literal("--cwd".into()),
@@ -82,7 +82,7 @@ impl TerminalPool for CleatTerminalPool {
                     cmd_inner.push(Arg::Literal(format!("{k}={}", flotilla_protocol::arg::shell_quote(v))));
                 }
             }
-            cmd_inner.push(Arg::Literal("$SHELL".into()));
+            cmd_inner.push(Arg::Literal("${SHELL:-/bin/sh}".into()));
             if !command.is_empty() {
                 cmd_inner.push(Arg::Literal("-lc".into()));
                 cmd_inner.push(Arg::Quoted(command.into()));
@@ -176,7 +176,7 @@ mod tests {
 
         let cmd = pool.attach_command("my-session", "bash", Path::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert!(cmd.contains("'cleat' attach 'my-session'"));
+        assert!(cmd.contains("cleat attach 'my-session'"));
         assert!(cmd.contains("--cwd '/repo'"));
         assert!(cmd.contains("--cmd"));
     }
@@ -202,13 +202,13 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", Path::new("/repo"), &vec![]).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("my-session".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/repo".into()),
             Arg::Literal("--cmd".into()),
-            Arg::NestedCommand(vec![Arg::Literal("$SHELL".into()), Arg::Literal("-lc".into()), Arg::Quoted("bash".into()),]),
+            Arg::NestedCommand(vec![Arg::Literal("${SHELL:-/bin/sh}".into()), Arg::Literal("-lc".into()), Arg::Quoted("bash".into()),]),
         ]);
     }
 
@@ -218,7 +218,7 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", Path::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-        assert_eq!(flat, "'cleat' attach 'my-session' --cwd '/repo' --cmd '$SHELL -lc '\\''bash'\\'''");
+        assert_eq!(flat, "cleat attach 'my-session' --cwd '/repo' --cmd '${SHELL:-/bin/sh} -lc '\\''bash'\\'''");
     }
 
     #[test]
@@ -228,7 +228,7 @@ mod tests {
 
         // No --cmd when both command and env_vars are empty
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("sess-1".into()),
             Arg::Literal("--cwd".into()),
@@ -243,7 +243,7 @@ mod tests {
         let args = pool.attach_args("sess", "cmd", Path::new("/wd"), &env).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("sess".into()),
             Arg::Literal("--cwd".into()),
@@ -253,7 +253,7 @@ mod tests {
                 Arg::Literal("env".into()),
                 Arg::Literal("FOO='bar'".into()),
                 Arg::Literal("BAZ='qu'\\''x'".into()),
-                Arg::Literal("$SHELL".into()),
+                Arg::Literal("${SHELL:-/bin/sh}".into()),
                 Arg::Literal("-lc".into()),
                 Arg::Quoted("cmd".into()),
             ]),
@@ -268,13 +268,17 @@ mod tests {
 
         // Empty command with env vars: spawns $SHELL with env prefix, no -lc
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("sess".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/wd".into()),
             Arg::Literal("--cmd".into()),
-            Arg::NestedCommand(vec![Arg::Literal("env".into()), Arg::Literal("KEY='val'".into()), Arg::Literal("$SHELL".into()),]),
+            Arg::NestedCommand(vec![
+                Arg::Literal("env".into()),
+                Arg::Literal("KEY='val'".into()),
+                Arg::Literal("${SHELL:-/bin/sh}".into()),
+            ]),
         ]);
     }
 
@@ -295,7 +299,7 @@ mod tests {
         if let Some(Arg::NestedCommand(inner)) = nested {
             let inner_flat = flotilla_protocol::arg::flatten(inner, 0);
             assert!(inner_flat.contains("FOO='bar'"), "inner should contain env assignment: {inner_flat}");
-            assert!(inner_flat.contains("$SHELL"), "inner should reference $SHELL: {inner_flat}");
+            assert!(inner_flat.contains("${SHELL:-/bin/sh}"), "inner should reference $SHELL: {inner_flat}");
         }
     }
 }

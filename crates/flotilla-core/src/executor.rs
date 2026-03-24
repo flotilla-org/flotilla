@@ -147,18 +147,10 @@ pub async fn build_plan(
         }])),
 
         CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
-            let resolved_commands =
-                commands.into_iter().map(|cmd| ResolvedPaneCommand { role: cmd.role, args: vec![Arg::Literal(cmd.command)] }).collect();
             Ok(StepPlan::new(vec![Step {
                 description: format!("Create workspace from prepared terminal for {branch}"),
                 host: StepHost::Local,
-                action: StepAction::CreateWorkspaceFromPreparedTerminal {
-                    target_host,
-                    branch,
-                    checkout_path,
-                    attachable_set_id,
-                    commands: resolved_commands,
-                },
+                action: StepAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands },
             }]))
         }
 

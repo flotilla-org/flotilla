@@ -498,7 +498,7 @@ impl TerminalPool for ShpoolTerminalPool {
                     cmd_inner.push(Arg::Literal(format!("{k}={}", flotilla_protocol::arg::shell_quote(v))));
                 }
             }
-            cmd_inner.push(Arg::Literal("$SHELL".into()));
+            cmd_inner.push(Arg::Literal("${SHELL:-/bin/sh}".into()));
             if !command.is_empty() {
                 cmd_inner.push(Arg::Literal("-lic".into()));
                 cmd_inner.push(Arg::Quoted(command.into()));
@@ -699,7 +699,7 @@ mod tests {
             Arg::Quoted(config),
             Arg::Literal("attach".into()),
             Arg::Literal("--cmd".into()),
-            Arg::NestedCommand(vec![Arg::Literal("$SHELL".into()), Arg::Literal("-lic".into()), Arg::Quoted("bash".into()),]),
+            Arg::NestedCommand(vec![Arg::Literal("${SHELL:-/bin/sh}".into()), Arg::Literal("-lic".into()), Arg::Quoted("bash".into()),]),
             Arg::Literal("--dir".into()),
             Arg::Quoted("/home/dev".into()),
             Arg::Quoted("flotilla/feat/shell/0".into()),
@@ -748,7 +748,7 @@ mod tests {
         if let Some(Arg::NestedCommand(inner)) = nested {
             let inner_flat = flotilla_protocol::arg::flatten(inner, 0);
             assert!(inner_flat.contains("FOO='bar'"), "inner should contain env assignment: {inner_flat}");
-            assert!(inner_flat.contains("$SHELL"), "inner should reference $SHELL: {inner_flat}");
+            assert!(inner_flat.contains("${SHELL:-/bin/sh}"), "inner should reference $SHELL: {inner_flat}");
             assert!(inner_flat.contains("-lic"), "inner should have -lic: {inner_flat}");
         }
     }
@@ -765,7 +765,7 @@ mod tests {
         if let Some(Arg::NestedCommand(inner)) = nested {
             let inner_flat = flotilla_protocol::arg::flatten(inner, 0);
             assert!(inner_flat.contains("env KEY='val'"), "inner should contain env: {inner_flat}");
-            assert!(inner_flat.contains("$SHELL"), "inner should contain $SHELL: {inner_flat}");
+            assert!(inner_flat.contains("${SHELL:-/bin/sh}"), "inner should contain $SHELL: {inner_flat}");
             assert!(!inner_flat.contains("-lic"), "inner should not have -lic for empty command: {inner_flat}");
         }
     }

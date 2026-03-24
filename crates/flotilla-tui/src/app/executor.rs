@@ -100,21 +100,12 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         }
         CommandValue::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
             if app.repo_path_for_identity(&repo_identity).is_some() {
-                // Convert ResolvedPaneCommand back to PreparedTerminalCommand for the CommandAction wire type.
-                // The executor plan builder will convert back to ResolvedPaneCommand for the step system.
-                let flat_commands: Vec<flotilla_protocol::PreparedTerminalCommand> = commands
-                    .into_iter()
-                    .map(|cmd| flotilla_protocol::PreparedTerminalCommand {
-                        role: cmd.role,
-                        command: flotilla_protocol::arg::flatten(&cmd.args, 0),
-                    })
-                    .collect();
                 app.proto_commands.push(app.repo_command_for_identity(repo_identity, CommandAction::CreateWorkspaceFromPreparedTerminal {
                     target_host,
                     branch,
                     checkout_path,
                     attachable_set_id,
-                    commands: flat_commands,
+                    commands,
                 }));
             } else {
                 app.model.status_message = Some(format!("repo not found for terminal result: {repo_identity}"));
@@ -154,9 +145,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{
-        arg::Arg, CheckoutStatus, CommandAction, HostName, PreparedTerminalCommand, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity,
-    };
+    use flotilla_protocol::{arg::Arg, CheckoutStatus, CommandAction, HostName, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity};
 
     use super::*;
     use crate::app::{test_support::stub_app, ui_state::BranchInputKind};
@@ -185,7 +174,7 @@ mod tests {
                 assert_eq!(branch, "feat-x");
                 assert_eq!(checkout_path, PathBuf::from("/remote/feat-x"));
                 assert_eq!(attachable_set_id, Some(flotilla_protocol::AttachableSetId::new("set-1")));
-                assert_eq!(commands, vec![PreparedTerminalCommand { role: "main".into(), command: "bash -l".into() }]);
+                assert_eq!(commands, vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }]);
             }
             other => panic!("expected CreateWorkspaceFromPreparedTerminal, got {other:?}"),
         }
