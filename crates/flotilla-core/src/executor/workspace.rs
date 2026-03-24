@@ -13,6 +13,7 @@ use crate::{
         terminal::NoopTerminalHopResolver,
         ResolutionContext, ResolvedAction,
     },
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{registry::ProviderRegistry, workspace::WorkspaceManager},
     step::StepOutcome,
     terminal_manager::TerminalManager,
@@ -105,7 +106,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         // The resolved commands handle entering the remote checkout path.
         let working_dir = local_workspace_directory(self.repo_root, self.config_base);
         let remote_name = format!("{branch}@{target_host}");
-        let mut config = workspace_config(self.repo_root, &remote_name, &working_dir, "claude", self.config_base);
+        let mut config = workspace_config(self.repo_root, &remote_name, working_dir.as_path(), "claude", self.config_base);
         config.resolved_commands = Some(resolved_commands);
 
         match ws_mgr.create_workspace(&config).await {
@@ -242,7 +243,7 @@ fn resolve_prepared_commands_via_hop_chain(
     config_base: &Path,
     local_host: &HostName,
 ) -> Result<Vec<(String, String)>, String> {
-    let ssh_resolver = ssh_resolver_from_config(config_base)?;
+    let ssh_resolver = ssh_resolver_from_config(&DaemonHostPath::new(config_base))?;
     let hop_resolver =
         HopResolver { remote: Arc::new(ssh_resolver), terminal: Arc::new(NoopTerminalHopResolver), strategy: Arc::new(AlwaysWrap) };
     let plan_builder = HopPlanBuilder::new(local_host);
@@ -253,7 +254,7 @@ fn resolve_prepared_commands_via_hop_chain(
         let mut context = ResolutionContext {
             current_host: local_host.clone(),
             current_environment: None,
-            working_directory: Some(checkout_path.to_path_buf()),
+            working_directory: Some(ExecutionEnvironmentPath::new(checkout_path)),
             actions: Vec::new(),
             nesting_depth: 0,
         };

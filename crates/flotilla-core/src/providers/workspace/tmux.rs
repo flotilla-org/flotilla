@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::providers::{run, types::*, CommandRunner};
+use crate::{
+    path_context::DaemonHostPath,
+    providers::{run, types::*, CommandRunner},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TmuxState {
@@ -43,9 +46,9 @@ impl TmuxWorkspaceManager {
     }
 
     /// Return the state file path: `~/.config/flotilla/tmux/{session}/state.toml`.
-    fn state_path(session: &str) -> Result<PathBuf, String> {
+    fn state_path(session: &str) -> Result<DaemonHostPath, String> {
         let config_dir = dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
-        Ok(config_dir.join("flotilla").join("tmux").join(session).join("state.toml"))
+        Ok(DaemonHostPath::new(config_dir.join("flotilla").join("tmux").join(session).join("state.toml")))
     }
 
     /// Load persisted state for the given session. Returns default on any error.
@@ -54,7 +57,7 @@ impl TmuxWorkspaceManager {
             Ok(p) => p,
             Err(_) => return TmuxState::default(),
         };
-        let contents = match std::fs::read_to_string(&path) {
+        let contents = match std::fs::read_to_string(path.as_path()) {
             Ok(c) => c,
             Err(_) => return TmuxState::default(),
         };
@@ -73,11 +76,11 @@ impl TmuxWorkspaceManager {
             Ok(p) => p,
             Err(_) => return,
         };
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.as_path().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(contents) = toml::to_string(state) {
-            let _ = std::fs::write(&path, contents);
+            let _ = std::fs::write(path.as_path(), contents);
         }
     }
 
@@ -139,7 +142,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         info!(workspace = %config.name, "tmux: creating workspace");
 
         let rendered = super::resolve_template(config);
-        let working_dir = config.working_directory.display().to_string();
+        let working_dir = config.working_directory.as_path().display().to_string();
 
         // Create new window
         self.tmux_cmd(&["new-window", "-n", &config.name, "-c", &working_dir]).await?;
@@ -228,7 +231,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
             Self::save_state(&session, &state);
         }
 
-        let directories = vec![config.working_directory.clone()];
+        let directories = vec![config.working_directory.clone().into_path_buf()];
         info!(workspace = %config.name, "tmux: workspace ready");
         Ok((config.name.clone(), Workspace { name: config.name.clone(), directories, correlation_keys: vec![], attachable_set_id: None }))
     }
@@ -243,6 +246,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_context::ExecutionEnvironmentPath;
 
     #[test]
     fn split_flag_maps_directions() {
@@ -257,7 +261,7 @@ mod tests {
     #[test]
     fn state_path_contains_session_name() {
         let path = TmuxWorkspaceManager::state_path("my-session").unwrap();
-        assert!(path.ends_with("flotilla/tmux/my-session/state.toml"));
+        assert!(path.as_path().ends_with("flotilla/tmux/my-session/state.toml"));
     }
 
     #[test]
@@ -419,7 +423,7 @@ mod tests {
         // Create workspace "feat-123"
         let config1 = WorkspaceConfig {
             name: "feat-123".to_string(),
-            working_directory: PathBuf::from("/tmp"),
+            working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
             resolved_commands: None,
@@ -431,7 +435,7 @@ mod tests {
         // Create workspace "fix-456"
         let config2 = WorkspaceConfig {
             name: "fix-456".to_string(),
-            working_directory: PathBuf::from("/tmp"),
+            working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
             resolved_commands: None,

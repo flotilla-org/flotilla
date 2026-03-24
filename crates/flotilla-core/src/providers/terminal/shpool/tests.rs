@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::providers::testing::MockRunner;
+use crate::{
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    providers::testing::MockRunner,
+};
 
 /// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
 fn test_pool(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("create tempdir for shpool test");
-    let socket_path = dir.path().join("shpool.socket");
+    let socket_path = DaemonHostPath::new(dir.path().join("shpool.socket"));
     let pool = ShpoolTerminalPool::new(runner, socket_path);
     (pool, dir)
 }
@@ -135,7 +138,8 @@ async fn list_sessions_parses_json() {
 async fn attach_builds_command() {
     let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
 
-    let cmd = TerminalPool::attach_command(&pool, "flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).await.expect("attach");
+    let cwd = ExecutionEnvironmentPath::new("/home/dev");
+    let cmd = TerminalPool::attach_command(&pool, "flotilla/feat/shell/0", "bash", &cwd, &vec![]).await.expect("attach");
 
     assert!(cmd.contains("shpool"), "should reference shpool binary: {cmd}");
     assert!(cmd.contains("attach"), "should include attach subcommand: {cmd}");
@@ -161,9 +165,10 @@ async fn kill_calls_cli() {
 #[test]
 fn attach_args_with_command_no_env() {
     let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
-    let socket = pool.socket_path.display().to_string();
-    let config = pool.config_path.display().to_string();
-    let args = pool.attach_args("flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).expect("attach_args");
+    let socket = pool.socket_path.as_path().display().to_string();
+    let config = pool.config_path.as_path().display().to_string();
+    let args =
+        pool.attach_args("flotilla/feat/shell/0", "bash", &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
 
     assert_eq!(args, vec![
         Arg::Quoted("shpool".into()),
@@ -182,7 +187,8 @@ fn attach_args_with_command_no_env() {
 #[test]
 fn attach_args_flatten_with_command_no_env() {
     let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
-    let args = pool.attach_args("flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).expect("attach_args");
+    let args =
+        pool.attach_args("flotilla/feat/shell/0", "bash", &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
     let flat = flotilla_protocol::arg::flatten(&args, 0);
 
     assert!(flat.starts_with("'shpool' --socket "), "should start with shpool: {flat}");
@@ -197,7 +203,7 @@ fn attach_args_flatten_with_command_no_env() {
 #[test]
 fn attach_args_empty_command_no_env() {
     let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
-    let args = pool.attach_args("sess", "", Path::new("/wd"), &vec![]).expect("attach_args");
+    let args = pool.attach_args("sess", "", &ExecutionEnvironmentPath::new("/wd"), &vec![]).expect("attach_args");
 
     // Same structure as with command — command was baked in at ensure_session time
     assert!(args.iter().any(|a| matches!(a, Arg::Literal(s) if s == "--force")), "should have --force");
@@ -208,7 +214,7 @@ fn attach_args_empty_command_no_env() {
 fn attach_args_with_env_vars() {
     let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
     let env = vec![("FOO".to_string(), "bar".to_string())];
-    let args = pool.attach_args("sess", "cmd", Path::new("/wd"), &env).expect("attach_args");
+    let args = pool.attach_args("sess", "cmd", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
     // Env vars are baked in at ensure_session time — not in attach_args
     assert!(!args.iter().any(|a| matches!(a, Arg::NestedCommand(_))), "should have no NestedCommand");
@@ -219,7 +225,7 @@ fn attach_args_with_env_vars() {
 fn attach_args_with_env_vars_empty_command() {
     let (pool, _dir) = test_pool(Arc::new(MockRunner::new(vec![])));
     let env = vec![("KEY".to_string(), "val".to_string())];
-    let args = pool.attach_args("sess", "", Path::new("/wd"), &env).expect("attach_args");
+    let args = pool.attach_args("sess", "", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
     // Same as above — env vars ignored in attach_args
     assert!(!args.iter().any(|a| matches!(a, Arg::NestedCommand(_))), "should have no NestedCommand");
@@ -241,7 +247,7 @@ async fn ensure_session_creates_via_attach_then_detach() {
     let (pool, _dir) = test_pool(runner.clone());
     let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
 
-    pool.ensure_session("test-session", "claude", Path::new("/repo"), &env).await.expect("ensure_session");
+    pool.ensure_session("test-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env).await.expect("ensure_session");
 
     let calls = runner.calls();
     assert_eq!(calls.len(), 3, "should call list, attach, detach: {calls:?}");
@@ -273,7 +279,7 @@ async fn ensure_session_skips_if_session_exists() {
     let (pool, _dir) = test_pool(runner.clone());
     let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
 
-    pool.ensure_session("test-session", "claude", Path::new("/repo"), &env).await.expect("ensure_session");
+    pool.ensure_session("test-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env).await.expect("ensure_session");
 
     let calls = runner.calls();
     assert_eq!(calls.len(), 1, "should only call list (session_exists), not attach: {calls:?}");
@@ -290,7 +296,7 @@ async fn ensure_session_empty_command_starts_login_shell() {
     ]));
     let (pool, _dir) = test_pool(runner.clone());
 
-    pool.ensure_session("test-session", "", Path::new("/repo"), &vec![]).await.expect("ensure_session");
+    pool.ensure_session("test-session", "", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("ensure_session");
 
     let calls = runner.calls();
     let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");

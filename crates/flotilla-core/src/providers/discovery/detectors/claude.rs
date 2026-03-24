@@ -47,10 +47,11 @@ impl HostDetector for ClaudeDetector {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+    };
 
     #[tokio::test]
     async fn claude_detector_found_on_path() {
@@ -60,7 +61,7 @@ mod tests {
         match &assertions[0] {
             EnvironmentAssertion::BinaryAvailable { name, path, version } => {
                 assert_eq!(name, "claude");
-                assert_eq!(path, &PathBuf::from("claude"));
+                assert_eq!(*path, ExecutionEnvironmentPath::new("claude"));
                 assert_eq!(version.as_deref(), Some("1.0.20"));
             }
             other => panic!("expected BinaryAvailable, got {other:?}"),
@@ -78,7 +79,7 @@ mod tests {
             match a {
                 EnvironmentAssertion::BinaryAvailable { path, .. } => {
                     // If something was found, it shouldn't be the bare "claude" name
-                    assert_ne!(path, &PathBuf::from("claude"));
+                    assert_ne!(*path, ExecutionEnvironmentPath::new("claude"));
                 }
                 _ => panic!("unexpected assertion type"),
             }

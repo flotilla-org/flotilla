@@ -1,11 +1,12 @@
 //! Workspace manager factory for tmux.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         workspace::{tmux::TmuxWorkspaceManager, WorkspaceManager},
@@ -27,7 +28,7 @@ impl Factory for TmuxWorkspaceManagerFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("TMUX").is_some() {
@@ -40,11 +41,12 @@ impl Factory for TmuxWorkspaceManagerFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use super::TmuxWorkspaceManagerFactory;
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
@@ -54,7 +56,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = TmuxWorkspaceManagerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = TmuxWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -64,7 +66,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = TmuxWorkspaceManagerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = TmuxWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without TMUX env var");
         assert!(unmet.contains(&UnmetRequirement::MissingEnvVar("TMUX".into())));
     }

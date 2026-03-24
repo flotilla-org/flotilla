@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::providers::{run, types::*, CommandRunner};
+use crate::{
+    path_context::DaemonHostPath,
+    providers::{run, types::*, CommandRunner},
+};
 
 /// Timeout for individual `zellij action` calls.  Combined with the 1-permit
 /// semaphore this limits the blast radius when Zellij is unresponsive: at most
@@ -109,9 +112,9 @@ impl ZellijWorkspaceManager {
     }
 
     /// Return the state file path: `~/.config/flotilla/zellij/{session}/state.toml`.
-    pub fn state_path(session: &str) -> Result<PathBuf, String> {
+    pub fn state_path(session: &str) -> Result<DaemonHostPath, String> {
         let config_dir = dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
-        Ok(config_dir.join("flotilla").join("zellij").join(session).join("state.toml"))
+        Ok(DaemonHostPath::new(config_dir.join("flotilla").join("zellij").join(session).join("state.toml")))
     }
 
     /// Load persisted state for the given session. Returns default on any error.
@@ -120,7 +123,7 @@ impl ZellijWorkspaceManager {
             Ok(p) => p,
             Err(_) => return ZellijState::default(),
         };
-        let contents = match std::fs::read_to_string(&path) {
+        let contents = match std::fs::read_to_string(path.as_path()) {
             Ok(c) => c,
             Err(_) => return ZellijState::default(),
         };
@@ -139,11 +142,11 @@ impl ZellijWorkspaceManager {
             Ok(p) => p,
             Err(_) => return,
         };
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.as_path().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(contents) = toml::to_string(state) {
-            let _ = std::fs::write(&path, contents);
+            let _ = std::fs::write(path.as_path(), contents);
         }
     }
 
@@ -200,7 +203,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         info!(workspace = %config.name, "zellij: creating workspace");
 
         let rendered = super::resolve_template(config);
-        let working_dir = config.working_directory.display().to_string();
+        let working_dir = config.working_directory.as_path().display().to_string();
 
         // Create new tab
         self.zellij_action(&["new-tab", "--name", &config.name, "--cwd", &working_dir]).await?;
@@ -276,7 +279,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
             Self::save_state(&session, &state);
         }
 
-        let directories = vec![config.working_directory.clone()];
+        let directories = vec![config.working_directory.clone().into_path_buf()];
         info!(workspace = %config.name, "zellij: workspace ready");
         Ok((config.name.clone(), Workspace { name: config.name.clone(), directories, correlation_keys: vec![], attachable_set_id: None }))
     }
@@ -291,11 +294,12 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_context::ExecutionEnvironmentPath;
 
     #[test]
     fn state_path_contains_session_name() {
         let path = ZellijWorkspaceManager::state_path("my-session").unwrap();
-        assert!(path.ends_with("flotilla/zellij/my-session/state.toml"));
+        assert!(path.as_path().ends_with("flotilla/zellij/my-session/state.toml"));
     }
 
     #[test]
@@ -473,7 +477,7 @@ mod tests {
         // Create workspace "feat-123"
         let config1 = WorkspaceConfig {
             name: "feat-123".to_string(),
-            working_directory: PathBuf::from("/tmp"),
+            working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
             resolved_commands: None,
@@ -485,7 +489,7 @@ mod tests {
         // Create workspace "fix-456"
         let config2 = WorkspaceConfig {
             name: "fix-456".to_string(),
-            working_directory: PathBuf::from("/tmp"),
+            working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
             resolved_commands: None,

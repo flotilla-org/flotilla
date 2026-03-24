@@ -6,6 +6,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+
 /// Per-category provider preference.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProviderPreference {
@@ -290,8 +292,8 @@ struct RepoConfig {
 }
 
 /// Default flotilla config directory (used for socket path defaults etc.)
-pub fn flotilla_config_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla")
+pub fn flotilla_config_dir() -> DaemonHostPath {
+    DaemonHostPath::new(dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla"))
 }
 
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
@@ -317,7 +319,7 @@ pub fn path_to_slug(path: &Path) -> String {
 
 /// Owns the config base path and caches the global `FlotillaConfig`.
 pub struct ConfigStore {
-    base: PathBuf,
+    base: DaemonHostPath,
     global_config: OnceLock<Mutex<FlotillaConfig>>,
 }
 
@@ -330,34 +332,37 @@ impl Default for ConfigStore {
 impl ConfigStore {
     /// Production constructor — uses ~/.config/flotilla/
     pub fn new() -> Self {
-        Self { base: dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla"), global_config: OnceLock::new() }
+        Self {
+            base: DaemonHostPath::new(dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla")),
+            global_config: OnceLock::new(),
+        }
     }
 
     /// Test constructor — uses provided base path
     pub fn with_base(base: impl Into<PathBuf>) -> Self {
-        Self { base: base.into(), global_config: OnceLock::new() }
+        Self { base: DaemonHostPath::new(base.into()), global_config: OnceLock::new() }
     }
 
     /// The base config directory path.
-    pub fn base_path(&self) -> &Path {
+    pub fn base_path(&self) -> &DaemonHostPath {
         &self.base
     }
 
-    fn repos_dir(&self) -> PathBuf {
+    fn repos_dir(&self) -> DaemonHostPath {
         self.base.join("repos")
     }
 
-    fn tab_order_file(&self) -> PathBuf {
+    fn tab_order_file(&self) -> DaemonHostPath {
         self.base.join("tab-order.json")
     }
 
     /// Load all persisted repo paths from config dir, sorted alphabetically by slug.
-    pub fn load_repos(&self) -> Vec<PathBuf> {
+    pub fn load_repos(&self) -> Vec<ExecutionEnvironmentPath> {
         let dir = self.repos_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
-        let mut repos: Vec<(String, PathBuf)> = entries
+        let mut repos: Vec<(String, ExecutionEnvironmentPath)> = entries
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
             .filter_map(|e| {
@@ -365,7 +370,7 @@ impl ConfigStore {
                 let config: RepoConfig = toml::from_str(&content).ok()?;
                 let path = PathBuf::from(&config.path);
                 if path.is_dir() {
-                    Some((e.file_name().to_string_lossy().to_string(), path))
+                    Some((e.file_name().to_string_lossy().to_string(), ExecutionEnvironmentPath::new(path)))
                 } else {
                     None
                 }
@@ -376,41 +381,41 @@ impl ConfigStore {
     }
 
     /// Persist a repo path to config. No-op if already persisted.
-    pub fn save_repo(&self, path: &Path) {
+    pub fn save_repo(&self, path: &ExecutionEnvironmentPath) {
         let dir = self.repos_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let slug = path_to_slug(path);
+        let slug = path_to_slug(path.as_path());
         let file = dir.join(format!("{slug}.toml"));
-        if file.exists() {
+        if file.as_path().exists() {
             return;
         }
-        let config = RepoConfig { path: path.to_string_lossy().to_string() };
+        let config = RepoConfig { path: path.as_path().to_string_lossy().to_string() };
         if let Ok(content) = toml::to_string(&config) {
-            let _ = std::fs::write(file, content);
+            let _ = std::fs::write(file.as_path(), content);
         }
     }
 
     /// Remove a repo's config file.
-    pub fn remove_repo(&self, path: &Path) {
+    pub fn remove_repo(&self, path: &ExecutionEnvironmentPath) {
         let dir = self.repos_dir();
-        let slug = path_to_slug(path);
+        let slug = path_to_slug(path.as_path());
         let file = dir.join(format!("{slug}.toml"));
-        let _ = std::fs::remove_file(file);
+        let _ = std::fs::remove_file(file.as_path());
     }
 
     /// Load persisted tab order. Returns None if file doesn't exist or is invalid.
-    pub fn load_tab_order(&self) -> Option<Vec<PathBuf>> {
-        let content = std::fs::read_to_string(self.tab_order_file()).ok()?;
+    pub fn load_tab_order(&self) -> Option<Vec<ExecutionEnvironmentPath>> {
+        let content = std::fs::read_to_string(self.tab_order_file().as_path()).ok()?;
         let paths: Vec<String> = serde_json::from_str(&content).ok()?;
-        Some(paths.into_iter().map(PathBuf::from).collect())
+        Some(paths.into_iter().map(|s| ExecutionEnvironmentPath::new(PathBuf::from(s))).collect())
     }
 
     /// Save tab order to disk.
-    pub fn save_tab_order(&self, order: &[PathBuf]) {
-        let _ = std::fs::create_dir_all(&self.base);
-        let paths: Vec<&str> = order.iter().filter_map(|p| p.to_str()).collect();
+    pub fn save_tab_order(&self, order: &[ExecutionEnvironmentPath]) {
+        let _ = std::fs::create_dir_all(self.base.as_path());
+        let paths: Vec<&str> = order.iter().filter_map(|p| p.as_path().to_str()).collect();
         if let Ok(content) = serde_json::to_string_pretty(&paths) {
-            let _ = std::fs::write(self.tab_order_file(), content);
+            let _ = std::fs::write(self.tab_order_file().as_path(), content);
         }
     }
 
@@ -420,11 +425,9 @@ impl ConfigStore {
             .get_or_init(|| {
                 Mutex::new({
                     let path = self.base.join("config.toml");
-                    std::fs::read_to_string(&path)
+                    std::fs::read_to_string(path.as_path())
                         .ok()
-                        .and_then(|content| {
-                            toml::from_str(&content).map_err(|e| tracing::warn!(path = %path.display(), err = %e, "failed to parse")).ok()
-                        })
+                        .and_then(|content| toml::from_str(&content).map_err(|e| tracing::warn!(%path, err = %e, "failed to parse")).ok())
                         .unwrap_or_default()
                 })
             })
@@ -438,21 +441,21 @@ impl ConfigStore {
         let mut config = self.load_config();
         config.ui.preview.layout = layout;
 
-        if let Err(err) = std::fs::create_dir_all(&self.base) {
-            tracing::warn!(path = %self.base.display(), err = %err, "failed to create config dir");
+        if let Err(err) = std::fs::create_dir_all(self.base.as_path()) {
+            tracing::warn!(base = %self.base, err = %err, "failed to create config dir");
             return;
         }
 
         let content = match toml::to_string_pretty(&config) {
             Ok(content) => content,
             Err(err) => {
-                tracing::warn!(path = %path.display(), err = %err, "failed to serialize config");
+                tracing::warn!(%path, err = %err, "failed to serialize config");
                 return;
             }
         };
 
-        if let Err(err) = std::fs::write(&path, content) {
-            tracing::warn!(path = %path.display(), err = %err, "failed to write config");
+        if let Err(err) = std::fs::write(path.as_path(), content) {
+            tracing::warn!(%path, err = %err, "failed to write config");
             return;
         }
 
@@ -464,9 +467,9 @@ impl ConfigStore {
     /// Load remote hosts config from `~/.config/flotilla/hosts.toml`.
     pub fn load_hosts(&self) -> Result<HostsConfig, String> {
         let path = self.base_path().join("hosts.toml");
-        if path.exists() {
-            let content = std::fs::read_to_string(&path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-            toml::from_str(&content).map_err(|err| format!("failed to parse {}: {err}", path.display()))
+        if path.as_path().exists() {
+            let content = std::fs::read_to_string(path.as_path()).map_err(|err| format!("failed to read {path}: {err}"))?;
+            toml::from_str(&content).map_err(|err| format!("failed to parse {path}: {err}"))
         } else {
             Ok(HostsConfig::default())
         }
@@ -475,8 +478,8 @@ impl ConfigStore {
     /// Load daemon config from `~/.config/flotilla/daemon.toml`.
     pub fn load_daemon_config(&self) -> DaemonConfig {
         let path = self.base_path().join("daemon.toml");
-        if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
+        if path.as_path().exists() {
+            let content = std::fs::read_to_string(path.as_path()).unwrap_or_default();
             toml::from_str(&content).unwrap_or_default()
         } else {
             DaemonConfig::default()
@@ -484,11 +487,11 @@ impl ConfigStore {
     }
 
     /// Resolve checkout config for a repo: per-repo override > global > defaults.
-    pub fn resolve_checkout_config(&self, repo_root: &Path) -> ResolvedCheckoutConfig {
+    pub fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
         let global = self.load_config();
-        let slug = path_to_slug(repo_root);
+        let slug = path_to_slug(repo_root.as_path());
         let repo_file = self.repos_dir().join(format!("{slug}.toml"));
-        if let Ok(content) = std::fs::read_to_string(&repo_file) {
+        if let Ok(content) = std::fs::read_to_string(repo_file.as_path()) {
             match toml::from_str::<RepoFileConfig>(&content) {
                 Ok(repo_cfg) => {
                     return ResolvedCheckoutConfig {
@@ -497,7 +500,7 @@ impl ConfigStore {
                     };
                 }
                 Err(e) => {
-                    tracing::warn!(path = %repo_file.display(), err = %e, "failed to parse");
+                    tracing::warn!(path = %repo_file, err = %e, "failed to parse");
                 }
             }
         }
@@ -507,13 +510,13 @@ impl ConfigStore {
 
 /// Collect repo roots: persisted (in saved tab order) first, then CLI args, then auto-detect from cwd.
 /// Persists any new repos and saves tab order.
-pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<PathBuf> {
+pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<ExecutionEnvironmentPath> {
     use crate::providers::{
         vcs::{git::GitVcs, Vcs},
         ProcessCommandRunner,
     };
 
-    let mut repo_roots: Vec<PathBuf> = Vec::new();
+    let mut repo_roots: Vec<ExecutionEnvironmentPath> = Vec::new();
 
     // 1. Persisted repos in saved tab order
     let persisted = config.load_repos();
@@ -536,7 +539,7 @@ pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> 
 
     // 2. CLI args (appended after persisted)
     for root in cli_roots {
-        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let canonical = ExecutionEnvironmentPath::new(std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()));
         if !repo_roots.contains(&canonical) {
             repo_roots.push(canonical);
         }
@@ -546,7 +549,8 @@ pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> 
     let cwd = std::env::current_dir().ok();
     if let Some(ref cwd) = cwd {
         let git = GitVcs::new(Arc::new(ProcessCommandRunner));
-        if let Some(repo_root) = git.resolve_repo_root(cwd).await {
+        let ee_cwd = ExecutionEnvironmentPath::new(cwd);
+        if let Some(repo_root) = git.resolve_repo_root(&ee_cwd).await {
             if !repo_roots.contains(&repo_root) {
                 repo_roots.push(repo_root);
             }

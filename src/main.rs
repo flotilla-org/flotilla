@@ -156,7 +156,7 @@ enum CheckoutSubCommand {
 
 impl Cli {
     fn config_dir(&self) -> PathBuf {
-        self.config_dir.clone().unwrap_or_else(flotilla_core::config::flotilla_config_dir)
+        self.config_dir.clone().unwrap_or_else(|| flotilla_core::config::flotilla_config_dir().into_path_buf())
     }
 
     fn socket_path(&self) -> PathBuf {
@@ -306,7 +306,8 @@ async fn run_tui(cli: Cli) -> Result<()> {
             let daemon_config = config_clone.load_daemon_config();
             let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
             let discovery = flotilla_core::providers::discovery::DiscoveryRuntime::for_process(daemon_config.follower);
-            let d = InProcessDaemon::new(repo_roots, Arc::clone(&config_clone), discovery, host_name).await;
+            let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
+            let d = InProcessDaemon::new(repo_root_paths, Arc::clone(&config_clone), discovery, host_name).await;
 
             match flotilla_daemon::server::spawn_embedded_peer_networking(Arc::clone(&d), &config_clone) {
                 Ok(_peer_networking) => {

@@ -13,7 +13,7 @@ pub mod factories;
 pub mod test_support;
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, OnceLock},
 };
 
@@ -23,6 +23,7 @@ use futures::stream;
 use crate::{
     attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
@@ -54,21 +55,21 @@ pub enum HostPlatform {
 
 #[derive(Debug, Clone)]
 pub enum EnvironmentAssertion {
-    BinaryAvailable { name: String, path: PathBuf, version: Option<String> },
+    BinaryAvailable { name: String, path: ExecutionEnvironmentPath, version: Option<String> },
     EnvVarSet { key: String, value: String },
-    VcsCheckoutDetected { root: PathBuf, kind: VcsKind, is_main_checkout: bool },
+    VcsCheckoutDetected { root: ExecutionEnvironmentPath, kind: VcsKind, is_main_checkout: bool },
     RemoteHost { platform: HostPlatform, owner: String, repo: String, remote_name: String },
-    AuthFileExists { provider: String, path: PathBuf },
-    SocketAvailable { name: String, path: PathBuf },
+    AuthFileExists { provider: String, path: ExecutionEnvironmentPath },
+    SocketAvailable { name: String, path: DaemonHostPath },
 }
 
 impl EnvironmentAssertion {
     pub fn binary(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self::BinaryAvailable { name: name.into(), path: path.into(), version: None }
+        Self::BinaryAvailable { name: name.into(), path: ExecutionEnvironmentPath::new(path.into()), version: None }
     }
 
     pub fn versioned_binary(name: impl Into<String>, path: impl Into<PathBuf>, version: impl Into<String>) -> Self {
-        Self::BinaryAvailable { name: name.into(), path: path.into(), version: Some(version.into()) }
+        Self::BinaryAvailable { name: name.into(), path: ExecutionEnvironmentPath::new(path.into()), version: Some(version.into()) }
     }
 
     pub fn env_var(key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -76,7 +77,7 @@ impl EnvironmentAssertion {
     }
 
     pub fn vcs_checkout(root: impl Into<PathBuf>, kind: VcsKind, is_main_checkout: bool) -> Self {
-        Self::VcsCheckoutDetected { root: root.into(), kind, is_main_checkout }
+        Self::VcsCheckoutDetected { root: ExecutionEnvironmentPath::new(root.into()), kind, is_main_checkout }
     }
 
     pub fn remote_host(platform: HostPlatform, owner: impl Into<String>, repo: impl Into<String>, remote_name: impl Into<String>) -> Self {
@@ -84,11 +85,11 @@ impl EnvironmentAssertion {
     }
 
     pub fn auth_file(provider: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self::AuthFileExists { provider: provider.into(), path: path.into() }
+        Self::AuthFileExists { provider: provider.into(), path: ExecutionEnvironmentPath::new(path.into()) }
     }
 
     pub fn socket(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self::SocketAvailable { name: name.into(), path: path.into() }
+        Self::SocketAvailable { name: name.into(), path: DaemonHostPath::new(path.into()) }
     }
 }
 
@@ -121,7 +122,7 @@ impl EnvironmentBag {
         self
     }
 
-    pub fn find_binary(&self, name: &str) -> Option<&PathBuf> {
+    pub fn find_binary(&self, name: &str) -> Option<&ExecutionEnvironmentPath> {
         self.assertions.iter().find_map(|a| match a {
             EnvironmentAssertion::BinaryAvailable { name: n, path, .. } if n == name => Some(path),
             _ => None,
@@ -167,18 +168,16 @@ impl EnvironmentBag {
         })
     }
 
-    pub fn find_socket(&self, name: &str) -> Option<&PathBuf> {
+    pub fn find_socket(&self, name: &str) -> Option<&DaemonHostPath> {
         self.assertions.iter().find_map(|a| match a {
             EnvironmentAssertion::SocketAvailable { name: n, path, .. } if n == name => Some(path),
             _ => None,
         })
     }
 
-    pub fn find_vcs_checkout(&self, kind: VcsKind) -> Option<(&Path, bool)> {
+    pub fn find_vcs_checkout(&self, kind: VcsKind) -> Option<(&ExecutionEnvironmentPath, bool)> {
         self.assertions.iter().find_map(|a| match a {
-            EnvironmentAssertion::VcsCheckoutDetected { root, kind: k, is_main_checkout } if *k == kind => {
-                Some((root.as_path(), *is_main_checkout))
-            }
+            EnvironmentAssertion::VcsCheckoutDetected { root, kind: k, is_main_checkout } if *k == kind => Some((root, *is_main_checkout)),
             _ => None,
         })
     }
@@ -365,7 +364,12 @@ pub trait HostDetector: Send + Sync {
 
 #[async_trait]
 pub trait RepoDetector: Send + Sync {
-    async fn detect(&self, repo_root: &Path, runner: &dyn CommandRunner, env: &dyn EnvVars) -> Vec<EnvironmentAssertion>;
+    async fn detect(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        runner: &dyn CommandRunner,
+        env: &dyn EnvVars,
+    ) -> Vec<EnvironmentAssertion>;
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +386,7 @@ pub trait Factory: Send + Sync {
         &self,
         env: &EnvironmentBag,
         config: &ConfigStore,
-        repo_root: &Path,
+        repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>>;
 }
@@ -466,7 +470,7 @@ pub async fn run_host_detectors(detectors: &[Box<dyn HostDetector>], runner: &dy
 
 pub async fn discover_providers(
     host_bag: &EnvironmentBag,
-    repo_root: &Path,
+    repo_root: &ExecutionEnvironmentPath,
     repo_detectors: &[Box<dyn RepoDetector>],
     factories: &FactoryRegistry,
     config: &ConfigStore,
@@ -488,7 +492,7 @@ pub async fn discover_providers(
         factories: &[Box<dyn Factory<Output = T>>],
         env: &EnvironmentBag,
         config: &ConfigStore,
-        repo_root: &Path,
+        repo_root: &ExecutionEnvironmentPath,
         runner: &Arc<dyn CommandRunner>,
         unmet: &mut Vec<(String, UnmetRequirement)>,
         mut insert: F,
@@ -632,6 +636,7 @@ mod orchestrator_tests {
     use super::*;
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{
             detectors,
             test_support::{DiscoveryMockRunner, TestEnvVars},
@@ -665,6 +670,7 @@ mod orchestrator_tests {
 
         let runner = runner_with_git_repo(repo_root);
         let config = ConfigStore::with_base(dir.path().join("config"));
+        let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Build host bag with git binary assertion
         let host_bag = EnvironmentBag::new()
@@ -674,7 +680,7 @@ mod orchestrator_tests {
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
+        let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // VCS should be registered (git factory)
         assert!(!result.registry.vcs.is_empty(), "expected at least one VCS provider");
@@ -692,6 +698,7 @@ mod orchestrator_tests {
 
         let runner = runner_with_git_repo(repo_root);
         let config = ConfigStore::with_base(dir.path().join("config"));
+        let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Host bag with both git and wt binaries
         let host_bag = EnvironmentBag::new()
@@ -701,7 +708,7 @@ mod orchestrator_tests {
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
+        let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // All checkout managers now register (probe_all); config preferences choose the preferred one
         assert!(!result.registry.checkout_managers.is_empty(), "at least one checkout manager should be registered");
@@ -716,13 +723,14 @@ mod orchestrator_tests {
         // Runner with NO tool_exists — everything will fail
         let runner: Arc<DiscoveryMockRunner> = Arc::new(DiscoveryMockRunner::builder().build());
         let config = ConfigStore::with_base(dir.path().join("config"));
+        let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Empty host bag — no binaries detected
         let host_bag = EnvironmentBag::new();
         let repo_dets = detectors::default_repo_detectors();
         let fact_reg = FactoryRegistry::default_all();
 
-        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
+        let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // With no binaries and no assertions, factories should report unmet
         assert!(!result.unmet.is_empty(), "expected unmet requirements when no tools available");
@@ -736,6 +744,7 @@ mod orchestrator_tests {
 
         let runner = runner_with_git_repo(repo_root);
         let config = ConfigStore::with_base(dir.path().join("config"));
+        let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Host bag with git binary
         let host_bag = EnvironmentBag::new().with(EnvironmentAssertion::versioned_binary("git", "/usr/bin/git", "2.40.0"));
@@ -753,7 +762,7 @@ mod orchestrator_tests {
             terminal_pools: vec![],
         };
 
-        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
+        let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // RemoteHostDetector should have parsed the git remote URL into a
         // RemoteHost assertion, yielding a repo_slug.
@@ -763,7 +772,7 @@ mod orchestrator_tests {
     #[tokio::test]
     async fn discover_providers_empty_factories() {
         let dir = tempdir().expect("tempdir");
-        let repo_root = dir.path();
+        let repo_root = ExecutionEnvironmentPath::new(dir.path());
 
         let runner: Arc<DiscoveryMockRunner> = Arc::new(DiscoveryMockRunner::builder().build());
         let config = ConfigStore::with_base(dir.path().join("config"));
@@ -781,7 +790,7 @@ mod orchestrator_tests {
             terminal_pools: vec![],
         };
 
-        let result = discover_providers(&host_bag, repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
+        let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         assert!(result.registry.vcs.is_empty());
         assert!(result.registry.checkout_managers.is_empty());

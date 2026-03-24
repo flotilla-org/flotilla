@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -13,7 +13,10 @@ use super::types::{
     Attachable, AttachableContent, AttachableId, AttachableSet, AttachableSetId, BindingObjectKind, ProviderBinding, TerminalAttachable,
     TerminalPurpose,
 };
-use crate::config::flotilla_config_dir;
+use crate::{
+    config::flotilla_config_dir,
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+};
 
 type BindingKey = (String, String, BindingObjectKind, String);
 
@@ -49,7 +52,7 @@ pub trait AttachableStoreApi: Send + Sync {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> AttachableId;
     fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool);
@@ -62,7 +65,7 @@ pub trait AttachableStoreApi: Send + Sync {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> (AttachableId, bool);
     fn replace_binding(&mut self, binding: ProviderBinding) -> bool;
@@ -95,7 +98,7 @@ where
     Arc::new(Mutex::new(store))
 }
 
-pub fn shared_file_backed_attachable_store(base: impl AsRef<Path>) -> SharedAttachableStore {
+pub fn shared_file_backed_attachable_store(base: &DaemonHostPath) -> SharedAttachableStore {
     shared_attachable_store(AttachableStore::with_base(base))
 }
 
@@ -152,7 +155,7 @@ impl AttachableStoreState {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> AttachableId {
         self.ensure_terminal_attachable_with_change(
@@ -187,7 +190,7 @@ impl AttachableStoreState {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> (AttachableId, bool) {
         let new_content = AttachableContent::Terminal(TerminalAttachable {
@@ -378,7 +381,7 @@ impl AttachableStoreState {
 }
 
 pub struct AttachableStore {
-    path: PathBuf,
+    path: DaemonHostPath,
     state: AttachableStoreState,
 }
 
@@ -387,23 +390,22 @@ impl AttachableStore {
         Self::with_path(flotilla_config_dir().join("attachables").join("registry.json"))
     }
 
-    pub fn with_base(base: impl AsRef<Path>) -> Self {
-        Self::with_path(base.as_ref().join("attachables").join("registry.json"))
+    pub fn with_base(base: &DaemonHostPath) -> Self {
+        Self::with_path(base.join("attachables").join("registry.json"))
     }
 
-    pub fn with_path(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let registry = match Self::load_registry(&path) {
+    pub fn with_path(path: DaemonHostPath) -> Self {
+        let registry = match Self::load_registry(path.as_path()) {
             Ok(registry) => registry,
             Err(err) => {
-                tracing::warn!(path = %path.display(), err = %err, "failed to load attachable registry, starting empty");
+                tracing::warn!(%path, err = %err, "failed to load attachable registry, starting empty");
                 AttachableRegistry::default()
             }
         };
         Self { path, state: AttachableStoreState::from_registry(registry) }
     }
 
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> &DaemonHostPath {
         &self.path
     }
 
@@ -452,7 +454,7 @@ impl AttachableStore {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> AttachableId {
         self.state.ensure_terminal_attachable(
@@ -476,7 +478,7 @@ impl AttachableStore {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> (AttachableId, bool) {
         self.state.ensure_terminal_attachable_with_change(
@@ -528,12 +530,12 @@ impl AttachableStore {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self.path.as_path().parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create attachable dir: {e}"))?;
         }
         let json =
             serde_json::to_string_pretty(self.state.registry()).map_err(|e| format!("failed to serialize attachable registry: {e}"))?;
-        std::fs::write(&self.path, json).map_err(|e| format!("failed to write attachable registry: {e}"))?;
+        std::fs::write(self.path.as_path(), json).map_err(|e| format!("failed to write attachable registry: {e}"))?;
         Ok(())
     }
 
@@ -594,7 +596,7 @@ impl AttachableStoreApi for AttachableStore {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> AttachableId {
         self.state.ensure_terminal_attachable(
@@ -617,7 +619,7 @@ impl AttachableStoreApi for AttachableStore {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> (AttachableId, bool) {
         self.state.ensure_terminal_attachable_with_change(
@@ -729,7 +731,7 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> AttachableId {
         self.state.ensure_terminal_attachable(
@@ -752,7 +754,7 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         external_ref: &str,
         terminal_purpose: TerminalPurpose,
         command: &str,
-        working_directory: PathBuf,
+        working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> (AttachableId, bool) {
         self.state.ensure_terminal_attachable_with_change(

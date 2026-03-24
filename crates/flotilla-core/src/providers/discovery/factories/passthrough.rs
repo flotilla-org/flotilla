@@ -1,11 +1,12 @@
 //! Terminal pool factory for passthrough (unconditional fallback).
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         terminal::{passthrough::PassthroughTerminalPool, TerminalPool},
@@ -27,7 +28,7 @@ impl Factory for PassthroughTerminalPoolFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         Ok(Arc::new(PassthroughTerminalPool))
@@ -36,11 +37,12 @@ impl Factory for PassthroughTerminalPoolFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use super::PassthroughTerminalPoolFactory;
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentBag, Factory},
     };
 
@@ -50,7 +52,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = PassthroughTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = PassthroughTerminalPoolFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 

@@ -34,8 +34,10 @@ async fn main() {
     let factories = FactoryRegistry::default_all();
     let attachable_store = shared_file_backed_attachable_store(config.base_path());
 
+    let ee_repo_root = flotilla_core::path_context::ExecutionEnvironmentPath::new(&repo_root);
     let result =
-        discovery::discover_providers(&host_bag, &repo_root, &repo_dets, &factories, &config, Arc::clone(&runner), &ProcessEnvVars).await;
+        discovery::discover_providers(&host_bag, &ee_repo_root, &repo_dets, &factories, &config, Arc::clone(&runner), &ProcessEnvVars)
+            .await;
     let registry = result.registry;
     let repo_slug = result.repo_slug;
     println!("  checkout_managers: {}", registry.checkout_managers.len());

@@ -1,20 +1,21 @@
-use std::path::PathBuf;
-
 use async_trait::async_trait;
 
 use super::*;
-use crate::providers::{
-    ai_utility::AiUtility,
-    change_request::ChangeRequestTracker,
-    coding_agent::CloudAgentService,
-    discovery::{ProviderCategory, ProviderDescriptor},
-    issue_tracker::IssueTracker,
-    types::{
-        AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
-        WorkspaceConfig,
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{
+        ai_utility::AiUtility,
+        change_request::ChangeRequestTracker,
+        coding_agent::CloudAgentService,
+        discovery::{ProviderCategory, ProviderDescriptor},
+        issue_tracker::IssueTracker,
+        types::{
+            AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
+            WorkspaceConfig,
+        },
+        vcs::{CheckoutManager, Vcs},
+        workspace::WorkspaceManager,
     },
-    vcs::{CheckoutManager, Vcs},
-    workspace::WorkspaceManager,
 };
 
 fn named_desc(category: ProviderCategory, name: &str) -> ProviderDescriptor {
@@ -37,22 +38,22 @@ fn labeled_desc(
 struct StubVcs;
 #[async_trait]
 impl Vcs for StubVcs {
-    async fn resolve_repo_root(&self, _path: &Path) -> Option<PathBuf> {
+    async fn resolve_repo_root(&self, _path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
         None
     }
-    async fn list_local_branches(&self, _: &Path) -> Result<Vec<BranchInfo>, String> {
+    async fn list_local_branches(&self, _: &ExecutionEnvironmentPath) -> Result<Vec<BranchInfo>, String> {
         Ok(vec![])
     }
-    async fn list_remote_branches(&self, _: &Path) -> Result<Vec<String>, String> {
+    async fn list_remote_branches(&self, _: &ExecutionEnvironmentPath) -> Result<Vec<String>, String> {
         Ok(vec![])
     }
-    async fn commit_log(&self, _: &Path, _: &str, _: usize) -> Result<Vec<CommitInfo>, String> {
+    async fn commit_log(&self, _: &ExecutionEnvironmentPath, _: &str, _: usize) -> Result<Vec<CommitInfo>, String> {
         Ok(vec![])
     }
-    async fn ahead_behind(&self, _: &Path, _: &str, _: &str) -> Result<AheadBehind, String> {
+    async fn ahead_behind(&self, _: &ExecutionEnvironmentPath, _: &str, _: &str) -> Result<AheadBehind, String> {
         Ok(AheadBehind { ahead: 0, behind: 0 })
     }
-    async fn working_tree_status(&self, _: &Path, _: &Path) -> Result<WorkingTreeStatus, String> {
+    async fn working_tree_status(&self, _: &ExecutionEnvironmentPath, _: &ExecutionEnvironmentPath) -> Result<WorkingTreeStatus, String> {
         Ok(WorkingTreeStatus { staged: 0, modified: 0, untracked: 0 })
     }
 }
@@ -60,13 +61,18 @@ impl Vcs for StubVcs {
 struct StubCheckoutManager;
 #[async_trait]
 impl CheckoutManager for StubCheckoutManager {
-    async fn list_checkouts(&self, _: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
+    async fn list_checkouts(&self, _: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(vec![])
     }
-    async fn create_checkout(&self, _: &Path, _: &str, _: bool) -> Result<(PathBuf, Checkout), String> {
+    async fn create_checkout(
+        &self,
+        _: &ExecutionEnvironmentPath,
+        _: &str,
+        _: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
         Err("stub".into())
     }
-    async fn remove_checkout(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _: &ExecutionEnvironmentPath, _: &str) -> Result<(), String> {
         Ok(())
     }
 }
@@ -314,7 +320,7 @@ async fn repo_model_new_initializes_state_and_uses_registry_data() {
         PathBuf::from("/tmp/test-repo"),
         reg,
         Some("owner/repo".to_string()),
-        crate::attachable::shared_file_backed_attachable_store("/tmp"),
+        crate::attachable::shared_file_backed_attachable_store(&crate::path_context::DaemonHostPath::new("/tmp")),
         crate::agents::shared_in_memory_agent_state_store(),
     );
 
@@ -340,7 +346,7 @@ async fn repo_model_new_with_empty_registry_uses_default_labels() {
         PathBuf::from("/tmp/empty"),
         reg,
         None,
-        crate::attachable::shared_file_backed_attachable_store("/tmp"),
+        crate::attachable::shared_file_backed_attachable_store(&crate::path_context::DaemonHostPath::new("/tmp")),
         crate::agents::shared_in_memory_agent_state_store(),
     );
     assert_eq!(model.labels.checkouts.section, "\u{2014}");

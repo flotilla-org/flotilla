@@ -60,7 +60,7 @@ mod tests {
         match &assertions[0] {
             EnvironmentAssertion::AuthFileExists { provider, path } => {
                 assert_eq!(provider, "codex");
-                assert_eq!(path, &tmp.path().join("auth.json"));
+                assert_eq!(path.as_path(), tmp.path().join("auth.json"));
             }
             other => panic!("expected AuthFileExists, got {other:?}"),
         }

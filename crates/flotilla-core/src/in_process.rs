@@ -31,6 +31,7 @@ use crate::{
     host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag},
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
@@ -308,16 +309,17 @@ impl InProcessDaemon {
 
         // Run host detection once before the repo loop
         let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
-        let agent_state_store = crate::agents::shared_file_backed_agent_state_store(crate::config::flotilla_config_dir());
+        let agent_state_store = crate::agents::shared_file_backed_agent_state_store(&crate::config::flotilla_config_dir());
 
         for path in repo_paths {
             if path_identities.contains_key(&path) {
                 continue;
             }
             let attachable_store = discovery.shared_attachable_store(&config);
+            let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
             let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discovery::discover_providers(
                 &host_bag,
-                &path,
+                &ee_path,
                 &discovery.repo_detectors,
                 &discovery.factories,
                 &config,
@@ -517,8 +519,9 @@ impl InProcessDaemon {
         let mut repo_bag = EnvironmentBag::new();
         let runner = &*self.discovery.runner;
         let env = &*self.discovery.env;
+        let ee_path = crate::path_context::ExecutionEnvironmentPath::new(repo_path);
         for detector in &self.discovery.repo_detectors {
-            repo_bag = repo_bag.extend(detector.detect(repo_path, runner, env).await);
+            repo_bag = repo_bag.extend(detector.detect(&ee_path, runner, env).await);
         }
         let combined = self.host_bag.merge(&repo_bag);
         repo_identity_from_bag_or_path(repo_path, &combined)
@@ -1318,13 +1321,18 @@ impl InProcessDaemon {
     /// Returns `(resolved_path, Some(original_path))` if normalization changed
     /// the path, or `(original_path, None)` if no change was needed.
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
-        use crate::providers::vcs::{git::GitVcs, Vcs};
+        use crate::{
+            path_context::ExecutionEnvironmentPath,
+            providers::vcs::{git::GitVcs, Vcs},
+        };
 
         let vcs = GitVcs::new(self.discovery.runner.clone());
-        match vcs.resolve_repo_root(path).await {
+        let ee_path = ExecutionEnvironmentPath::new(path);
+        match vcs.resolve_repo_root(&ee_path).await {
             Some(repo_root) => {
+                let repo_root_raw = repo_root.into_path_buf();
                 // Canonicalize to handle symlinks (e.g. /var -> /private/var on macOS).
-                let canonical_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+                let canonical_root = std::fs::canonicalize(&repo_root_raw).unwrap_or(repo_root_raw);
                 let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
                 if canonical_root != canonical_path {
                     debug!(
@@ -1358,9 +1366,10 @@ impl InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
+        let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
         let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
             &self.host_bag,
-            &path,
+            &ee_path,
             &self.discovery.repo_detectors,
             &self.discovery.factories,
             &self.config,
@@ -1414,11 +1423,14 @@ impl InProcessDaemon {
         }
 
         // Persist to config
-        self.config.save_repo(&path);
+        self.config.save_repo(&ExecutionEnvironmentPath::new(&path));
         let tab_order = {
             let repos = self.repos.read().await;
             let order = self.repo_order.read().await;
-            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
+            order
+                .iter()
+                .filter_map(|id| repos.get(id).map(|state| ExecutionEnvironmentPath::new(state.preferred_path())))
+                .collect::<Vec<_>>()
         };
         self.config.save_tab_order(&tab_order);
 
@@ -1467,11 +1479,14 @@ impl InProcessDaemon {
         }
 
         // Persist to config
-        self.config.remove_repo(&path);
+        self.config.remove_repo(&ExecutionEnvironmentPath::new(&path));
         let tab_order = {
             let repos = self.repos.read().await;
             let order = self.repo_order.read().await;
-            order.iter().filter_map(|id| repos.get(id).map(|state| state.preferred_path().to_path_buf())).collect::<Vec<_>>()
+            order
+                .iter()
+                .filter_map(|id| repos.get(id).map(|state| ExecutionEnvironmentPath::new(state.preferred_path())))
+                .collect::<Vec<_>>()
         };
         self.config.save_tab_order(&tab_order);
 
@@ -1695,7 +1710,7 @@ impl DaemonHandle for InProcessDaemon {
 
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
-        let config_base = self.config.base_path().to_path_buf();
+        let config_base = DaemonHostPath::new(self.config.base_path().as_path());
 
         // Register the cancellation token before broadcasting CommandStarted
         // so cancel(id) can find it the instant the TUI sees the event.
@@ -1727,16 +1742,18 @@ impl DaemonHandle for InProcessDaemon {
             let resolver_config_base = config_base.clone();
             let resolver_attachable_store = attachable_store.clone();
             let resolver_local_host = local_host.clone();
-            let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: repo_path.clone() };
+            let ee_repo_path = ExecutionEnvironmentPath::new(&repo_path);
+            let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path.clone() };
+            let daemon_socket_dhp = daemon_socket_path.map(DaemonHostPath::new);
 
             let plan = executor::build_plan(
                 command,
-                executor::RepoExecutionContext { identity: repo_identity.clone(), root: repo_path.clone() },
+                executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
                 registry,
                 providers_data,
                 config_base,
                 attachable_store,
-                daemon_socket_path.clone(),
+                daemon_socket_dhp.clone(),
                 local_host,
                 None,
             )
@@ -1765,7 +1782,7 @@ impl DaemonHandle for InProcessDaemon {
                         runner: resolver_runner,
                         config_base: resolver_config_base,
                         attachable_store: resolver_attachable_store,
-                        daemon_socket_path: daemon_socket_path.clone(),
+                        daemon_socket_path: daemon_socket_dhp.clone(),
                         local_host: resolver_local_host,
                     };
                     let result = run_step_plan(
@@ -1773,7 +1790,7 @@ impl DaemonHandle for InProcessDaemon {
                         id,
                         command_host.clone(),
                         repo_identity.clone(),
-                        repo_path.clone(),
+                        ExecutionEnvironmentPath::new(&repo_path),
                         token,
                         event_tx.clone(),
                         &resolver,

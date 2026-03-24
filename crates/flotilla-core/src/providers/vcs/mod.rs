@@ -2,11 +2,14 @@ pub mod git;
 pub mod git_worktree;
 pub mod wt;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::providers::{run, types::*, CommandRunner};
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{run, types::*, CommandRunner},
+};
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
@@ -15,19 +18,28 @@ pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 pub trait Vcs: Send + Sync {
     /// Given any path (possibly inside a worktree/checkout), resolve to the
     /// main repository root. Returns None if the path is not inside a repo.
-    async fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf>;
-    async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String>;
-    async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String>;
-    async fn commit_log(&self, repo_root: &Path, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String>;
-    async fn ahead_behind(&self, repo_root: &Path, branch: &str, reference: &str) -> Result<AheadBehind, String>;
-    async fn working_tree_status(&self, repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String>;
+    async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath>;
+    async fn list_local_branches(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<BranchInfo>, String>;
+    async fn list_remote_branches(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<String>, String>;
+    async fn commit_log(&self, repo_root: &ExecutionEnvironmentPath, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String>;
+    async fn ahead_behind(&self, repo_root: &ExecutionEnvironmentPath, branch: &str, reference: &str) -> Result<AheadBehind, String>;
+    async fn working_tree_status(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        checkout_path: &ExecutionEnvironmentPath,
+    ) -> Result<WorkingTreeStatus, String>;
 }
 
 #[async_trait]
 pub trait CheckoutManager: Send + Sync {
-    async fn list_checkouts(&self, repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String>;
-    async fn create_checkout(&self, repo_root: &Path, branch: &str, create_branch: bool) -> Result<(PathBuf, Checkout), String>;
-    async fn remove_checkout(&self, repo_root: &Path, branch: &str) -> Result<(), String>;
+    async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
+    async fn create_checkout(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
+    async fn remove_checkout(&self, repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String>;
 }
 
 #[allow(dead_code)]
@@ -199,7 +211,10 @@ pub(crate) mod checkout_test_support {
         sync::Arc,
     };
 
-    use crate::providers::{vcs::CheckoutManager, ChannelLabel, CommandRunner};
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::{vcs::CheckoutManager, ChannelLabel, CommandRunner},
+    };
 
     /// Run a git command, panicking on failure.
     pub fn git(cwd: &Path, args: &[&str]) {
@@ -249,7 +264,11 @@ pub(crate) mod checkout_test_support {
     ///
     /// The worktree should end up on the remote branch's commit ("remote-only work"),
     /// not on main's HEAD ("Initial commit").
-    pub async fn assert_checkout_tracks_remote_branch(mgr: &dyn CheckoutManager, runner: &Arc<dyn CommandRunner>, repo_path: &Path) {
+    pub async fn assert_checkout_tracks_remote_branch(
+        mgr: &dyn CheckoutManager,
+        runner: &Arc<dyn CommandRunner>,
+        repo_path: &ExecutionEnvironmentPath,
+    ) {
         let (wt_path, checkout) =
             mgr.create_checkout(repo_path, "feature/remote-only", true).await.expect("create_checkout should succeed");
 
@@ -261,7 +280,7 @@ pub(crate) mod checkout_test_support {
 
         // Verify via direct git command through the runner
         let label = ChannelLabel::Command("verify-commit".into());
-        let log_output = runner.run("git", &["log", "-1", "--format=%s"], &wt_path, &label).await.expect("git log should succeed");
+        let log_output = runner.run("git", &["log", "-1", "--format=%s"], wt_path.as_path(), &label).await.expect("git log should succeed");
         assert_eq!(log_output.trim(), "remote-only work", "worktree HEAD should be the remote branch's tip");
     }
 }

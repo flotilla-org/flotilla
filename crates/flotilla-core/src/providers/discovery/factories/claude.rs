@@ -1,11 +1,12 @@
 //! Cloud agent and AI utility factories for Claude-based providers.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         ai_utility::{claude_api::ClaudeApiAiUtility, claude_cli::ClaudeCliAiUtility, AiUtility},
         coding_agent::{claude::ClaudeCodingAgent, CloudAgentService},
@@ -32,7 +33,7 @@ impl Factory for ClaudeCodingAgentFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         if env.find_binary("claude").is_some() {
@@ -62,7 +63,7 @@ impl Factory for ClaudeApiAiUtilityFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
         if let Some(api_key) = env.find_env_var("ANTHROPIC_API_KEY") {
@@ -92,11 +93,11 @@ impl Factory for ClaudeCliAiUtilityFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
         if let Some(path) = env.find_binary("claude") {
-            let claude_bin = path.to_string_lossy().to_string();
+            let claude_bin = path.as_path().to_string_lossy().to_string();
             Ok(Arc::new(ClaudeCliAiUtility::new(claude_bin, runner)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("claude".into())])
@@ -110,11 +111,12 @@ impl Factory for ClaudeCliAiUtilityFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory, ClaudeCodingAgentFactory};
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
@@ -134,7 +136,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ClaudeCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -144,7 +146,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ClaudeCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without claude binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("claude".into())));
     }
@@ -168,7 +170,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -178,7 +180,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without API key");
         assert!(unmet.contains(&UnmetRequirement::MissingEnvVar("ANTHROPIC_API_KEY".into())));
     }
@@ -199,7 +201,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -209,7 +211,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without claude binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("claude".into())));
     }

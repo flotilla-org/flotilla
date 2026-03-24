@@ -1,9 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
 
 use crate::{
+    path_context::ExecutionEnvironmentPath,
     provider_data::ProviderData,
     providers::{registry::ProviderRegistry, run, CommandRunner},
     terminal_manager::TerminalManager,
@@ -29,7 +30,12 @@ impl<'a> CheckoutService<'a> {
         validate_checkout_target(repo_root, branch, intent, self.runner).await
     }
 
-    pub(super) async fn create_checkout(&self, repo_root: &Path, branch: &str, create_branch: bool) -> Result<PathBuf, String> {
+    pub(super) async fn create_checkout(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        create_branch: bool,
+    ) -> Result<ExecutionEnvironmentPath, String> {
         let checkout_manager =
             self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
         let (path, _checkout) = checkout_manager.create_checkout(repo_root, branch, create_branch).await?;
@@ -38,7 +44,7 @@ impl<'a> CheckoutService<'a> {
 
     pub(super) async fn remove_checkout(
         &self,
-        repo_root: &Path,
+        repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         deleted_checkout_paths: &[HostPath],
         terminal_manager: Option<&TerminalManager>,

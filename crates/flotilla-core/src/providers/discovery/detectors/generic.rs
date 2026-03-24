@@ -97,10 +97,11 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+    };
 
     #[test]
     fn parse_first_dotted_version_handles_supported_outputs() {
@@ -144,7 +145,7 @@ mod tests {
             assertions.as_slice(),
             [EnvironmentAssertion::BinaryAvailable { name, path, version }]
             if name == "gh"
-                && path == &PathBuf::from("gh")
+                && *path == ExecutionEnvironmentPath::new("gh")
                 && version.as_deref() == Some("2.49.0")
         ));
     }

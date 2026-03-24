@@ -1,11 +1,11 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::providers::{run, types::*, CommandRunner};
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{run, types::*, CommandRunner},
+};
 
 pub struct GitVcs {
     runner: Arc<dyn CommandRunner>,
@@ -21,22 +21,24 @@ use super::TRUNK_NAMES;
 
 #[async_trait]
 impl super::Vcs for GitVcs {
-    async fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
-        let output = run!(self.runner, "git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], path).ok()?;
+    async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
+        let output = run!(self.runner, "git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], path.as_path()).ok()?;
         let git_dir = PathBuf::from(output.trim());
 
-        let is_bare =
-            run!(self.runner, "git", &["rev-parse", "--is-bare-repository"], path).ok().map(|s| s.trim() == "true").unwrap_or(false);
+        let is_bare = run!(self.runner, "git", &["rev-parse", "--is-bare-repository"], path.as_path())
+            .ok()
+            .map(|s| s.trim() == "true")
+            .unwrap_or(false);
 
         if is_bare {
-            Some(git_dir)
+            Some(ExecutionEnvironmentPath::new(git_dir))
         } else {
-            git_dir.parent().map(|p| p.to_path_buf())
+            git_dir.parent().map(ExecutionEnvironmentPath::new)
         }
     }
 
-    async fn list_local_branches(&self, repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
-        let output = run!(self.runner, "git", &["branch", "--list", "--format=%(refname:short)"], repo_root)?;
+    async fn list_local_branches(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<BranchInfo>, String> {
+        let output = run!(self.runner, "git", &["branch", "--list", "--format=%(refname:short)"], repo_root.as_path())?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -48,14 +50,14 @@ impl super::Vcs for GitVcs {
             .collect())
     }
 
-    async fn list_remote_branches(&self, repo_root: &Path) -> Result<Vec<String>, String> {
+    async fn list_remote_branches(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<String>, String> {
         // Check if any remote exists; return empty if not (local-only repo).
-        let remotes = run!(self.runner, "git", &["remote"], repo_root).unwrap_or_default();
+        let remotes = run!(self.runner, "git", &["remote"], repo_root.as_path()).unwrap_or_default();
         if remotes.trim().is_empty() {
             return Ok(vec![]);
         }
         let remote = remotes.lines().next().unwrap_or("origin");
-        let output = run!(self.runner, "git", &["ls-remote", "--heads", remote], repo_root)?;
+        let output = run!(self.runner, "git", &["ls-remote", "--heads", remote], repo_root.as_path())?;
         // Output format: "<sha>\trefs/heads/<branch>"
         Ok(output
             .lines()
@@ -63,9 +65,9 @@ impl super::Vcs for GitVcs {
             .collect())
     }
 
-    async fn commit_log(&self, repo_root: &Path, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    async fn commit_log(&self, repo_root: &ExecutionEnvironmentPath, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
         let limit_arg = format!("-{}", limit);
-        let output = run!(self.runner, "git", &["log", branch, "--oneline", &limit_arg], repo_root)?;
+        let output = run!(self.runner, "git", &["log", branch, "--oneline", &limit_arg], repo_root.as_path())?;
         Ok(output
             .lines()
             .filter(|l| !l.is_empty())
@@ -78,20 +80,26 @@ impl super::Vcs for GitVcs {
             .collect())
     }
 
-    async fn ahead_behind(&self, repo_root: &Path, branch: &str, reference: &str) -> Result<AheadBehind, String> {
+    async fn ahead_behind(&self, repo_root: &ExecutionEnvironmentPath, branch: &str, reference: &str) -> Result<AheadBehind, String> {
         let range = format!("{}...{}", branch, reference);
-        let output = run!(self.runner, "git", &["rev-list", "--count", "--left-right", &range], repo_root)?;
+        let output = run!(self.runner, "git", &["rev-list", "--count", "--left-right", &range], repo_root.as_path())?;
         super::parse_ahead_behind(&output).ok_or_else(|| format!("failed to parse ahead/behind from: {output:?}"))
     }
 
-    async fn working_tree_status(&self, _repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String> {
-        let output = run!(self.runner, "git", &["status", "--porcelain"], checkout_path)?;
+    async fn working_tree_status(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        checkout_path: &ExecutionEnvironmentPath,
+    ) -> Result<WorkingTreeStatus, String> {
+        let output = run!(self.runner, "git", &["status", "--porcelain"], checkout_path.as_path())?;
         Ok(super::parse_porcelain_status(&output))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::providers::{
         replay,
@@ -184,9 +192,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_branches()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("git_branches.yaml"), masks);
         let runner = replay::test_runner(&session);
 
@@ -211,9 +220,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_remote_branches()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("git_remote_branches.yaml"), masks);
         let runner = replay::test_runner(&session);
 
@@ -232,9 +242,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_branches()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("git_log.yaml"), masks);
         let runner = replay::test_runner(&session);
 
@@ -255,9 +266,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_ahead_behind()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("git_ahead_behind.yaml"), masks);
         let runner = replay::test_runner(&session);
 
@@ -276,9 +288,10 @@ mod tests {
         let live = replay::is_live();
         let temp = if live { Some(setup_working_tree()) } else { None };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("git_working_tree.yaml"), masks);
         let runner = replay::test_runner(&session);
 
@@ -308,9 +321,10 @@ mod tests {
             None
         };
         let repo_path = temp.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| PathBuf::from("/test/repo"));
+        let repo_path = ExecutionEnvironmentPath::new(repo_path);
 
         let mut masks = replay::Masks::new();
-        masks.add(repo_path.to_str().unwrap(), "{repo}");
+        masks.add(repo_path.as_path().to_str().unwrap(), "{repo}");
         let session = replay::test_session(&fixture("git_no_remote.yaml"), masks);
         let runner = replay::test_runner(&session);
 

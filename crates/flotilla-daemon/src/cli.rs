@@ -24,7 +24,8 @@ pub async fn run(socket_path: &Path, timeout_secs: u64) -> Result<(), String> {
 
     let daemon_config = config.load_daemon_config();
     let discovery = DiscoveryRuntime::for_process(daemon_config.follower);
-    let server = DaemonServer::new(repo_roots, config, discovery, socket_path.to_path_buf(), timeout).await?;
+    let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
+    let server = DaemonServer::new(repo_root_paths, config, discovery, socket_path.to_path_buf(), timeout).await?;
 
     server.run().await
 }

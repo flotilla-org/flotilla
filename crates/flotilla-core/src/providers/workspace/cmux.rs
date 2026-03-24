@@ -128,7 +128,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         let mut active_surfaces: Vec<(String, String, usize)> = Vec::new();
         let mut focus_pane: Option<String> = None;
 
-        let working_dir = &config.working_directory;
+        let working_dir_path = config.working_directory.as_path();
 
         for (i, pane) in rendered.panes.iter().enumerate() {
             let (split_surface_ref, pane_ref) = if i == 0 {
@@ -168,7 +168,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
                     Self::parse_ok_ref(&output)
                 };
 
-                let quoted_dir = Self::shell_quote(&working_dir.display().to_string());
+                let quoted_dir = Self::shell_quote(&working_dir_path.display().to_string());
                 let cmd = if surface.command.is_empty() {
                     format!("cd {}", quoted_dir)
                 } else {
@@ -204,7 +204,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
             self.cmux_cmd(&["focus-pane", "--pane", pane_ref, "--workspace", &ws_ref]).await?;
         }
 
-        let directories = vec![config.working_directory.clone()];
+        let directories = vec![config.working_directory.clone().into_path_buf()];
         info!(workspace = %config.name, %ws_ref, "cmux: workspace ready");
         Ok((ws_ref, Workspace { name: config.name.clone(), directories, correlation_keys: vec![], attachable_set_id: None }))
     }
@@ -221,7 +221,10 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
 
     use super::*;
-    use crate::providers::{testing::MockRunner, workspace::WorkspaceManager};
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::{testing::MockRunner, workspace::WorkspaceManager},
+    };
 
     #[test]
     fn shell_quote_escapes_single_quotes() {
@@ -305,7 +308,7 @@ mod tests {
         let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
         let config = WorkspaceConfig {
             name: "demo".into(),
-            working_directory: PathBuf::from("/tmp/repo"),
+            working_directory: ExecutionEnvironmentPath::new("/tmp/repo"),
             template_vars: std::collections::HashMap::new(),
             template_yaml: None,
             resolved_commands: None,

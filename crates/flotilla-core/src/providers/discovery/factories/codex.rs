@@ -1,11 +1,12 @@
 //! Cloud agent factory for Codex-based provider.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         coding_agent::{codex::CodexCodingAgent, CloudAgentService},
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
@@ -31,7 +32,7 @@ impl Factory for CodexCodingAgentFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         if env.has_auth("codex") {
@@ -49,11 +50,12 @@ impl Factory for CodexCodingAgentFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use super::CodexCodingAgentFactory;
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
@@ -67,7 +69,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CodexCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = CodexCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -77,7 +79,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CodexCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = CodexCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without codex auth");
         assert!(unmet.contains(&UnmetRequirement::MissingAuth("codex".into())));
     }

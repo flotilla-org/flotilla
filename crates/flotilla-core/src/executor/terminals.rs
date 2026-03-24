@@ -4,6 +4,7 @@ use flotilla_protocol::{arg::Arg, HostName, HostPath, PreparedTerminalCommand, R
 use tracing::{debug, info, warn};
 
 use crate::{
+    path_context::ExecutionEnvironmentPath,
     providers::types::WorkspaceConfig,
     template::{self, WorkspaceTemplate},
     terminal_manager::TerminalManager,
@@ -23,7 +24,7 @@ impl<'a> TerminalPreparationService<'a> {
         let rendered = parse_workspace_template(config).render(&config.template_vars);
         info!(count = rendered.content.len(), "terminal manager: resolving content entries");
         let host = HostName::local();
-        let checkout_path = HostPath::new(host.clone(), config.working_directory.clone());
+        let checkout_path = HostPath::new(host.clone(), config.working_directory.clone().into_path_buf());
         let set_id = match self.terminal_manager.allocate_set(host, checkout_path) {
             Ok(id) => id,
             Err(err) => {
@@ -105,7 +106,7 @@ impl<'a> TerminalPreparationService<'a> {
                     idx,
                     branch,
                     &cmd.command,
-                    checkout_path.to_path_buf(),
+                    ExecutionEnvironmentPath::new(checkout_path),
                 ) {
                     Ok(id) => id,
                     Err(err) => {

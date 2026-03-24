@@ -48,10 +48,11 @@ impl HostDetector for CmuxDetector {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use crate::{
+        path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+    };
 
     #[tokio::test]
     async fn cmux_detector_with_socket_and_binary() {
@@ -72,12 +73,12 @@ mod tests {
         assert!(matches!(
             &assertions[1],
             EnvironmentAssertion::SocketAvailable { name, path }
-            if name == "cmux" && path == Path::new(socket_path)
+            if name == "cmux" && *path == DaemonHostPath::new(socket_path)
         ));
         assert!(matches!(
             &assertions[2],
             EnvironmentAssertion::BinaryAvailable { name, path, .. }
-            if name == "cmux" && path == &PathBuf::from("cmux")
+            if name == "cmux" && *path == ExecutionEnvironmentPath::new("cmux")
         ));
     }
 
@@ -90,7 +91,7 @@ mod tests {
         assert!(matches!(
             &assertions[0],
             EnvironmentAssertion::BinaryAvailable { name, path, .. }
-            if name == "cmux" && path == &PathBuf::from("cmux")
+            if name == "cmux" && *path == ExecutionEnvironmentPath::new("cmux")
         ));
     }
 
@@ -112,7 +113,7 @@ mod tests {
             match a {
                 EnvironmentAssertion::BinaryAvailable { name, path, .. } => {
                     assert_eq!(name, "cmux");
-                    assert_eq!(path, &PathBuf::from(CMUX_APP_BUNDLE_BIN));
+                    assert_eq!(*path, ExecutionEnvironmentPath::new(CMUX_APP_BUNDLE_BIN));
                 }
                 other => panic!("unexpected assertion: {other:?}"),
             }
