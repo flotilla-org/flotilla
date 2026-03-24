@@ -89,6 +89,27 @@ Two completely different categories of "path" exist in the system, and the curre
 
 **Execution context (environment-side):** Where is git? Where is HOME? Where is cleat? These are discovered by running commands *inside* the execution environment via the injected `CommandRunner` and `EnvironmentBag`. They come from the environment, not from config.
 
+**Enforce with newtypes:** introduce `DaemonHostPath` and `ExecutionEnvironmentPath` to make the type system catch conflation at compile time:
+
+```rust
+/// A path on the daemon host's filesystem. Config, state, sockets.
+/// Never valid inside an execution environment.
+pub struct DaemonHostPath(PathBuf);
+
+/// A path inside an execution environment. Repo roots, binary locations, working dirs.
+/// Resolved via CommandRunner + EnvVars.
+pub struct ExecutionEnvironmentPath(PathBuf);
+```
+
+Wrap as early as possible — at the point where a path is created or received. Key placements:
+- `ConfigStore` internals, `PathPolicy`, store paths → `DaemonHostPath`
+- `repo_root` in `Factory::probe()` → `ExecutionEnvironmentPath`
+- `EnvironmentBag` binary locations → `ExecutionEnvironmentPath`
+- Provider struct fields (binary paths, working dirs) → `ExecutionEnvironmentPath`
+- Hop chain working directories → `ExecutionEnvironmentPath`
+
+The crossing point is mount boundaries: a daemon socket is a `DaemonHostPath` when created, but becomes accessible at an `ExecutionEnvironmentPath` inside the container. The mount configuration explicitly maps between the two domains.
+
 When discovery runs inside a container:
 - ConfigStore stays on the daemon host, serves preferences to whoever asks (which backend to use, checkout strategy, etc.)
 - The runner + env vars point inside the container
