@@ -208,7 +208,13 @@ impl TerminalPool for MockTerminalPool {
         self.result.clone()
     }
 
-    async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        _session_name: &str,
+        _command: &str,
+        _cwd: &Path,
+        _env_vars: &crate::providers::terminal::TerminalEnvVars,
+    ) -> Result<(), String> {
         Ok(())
     }
 

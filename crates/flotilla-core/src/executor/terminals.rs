@@ -58,7 +58,7 @@ impl<'a> TerminalPreparationService<'a> {
                         continue;
                     }
                 };
-                if let Err(err) = self.terminal_manager.ensure_running(&attachable_id).await {
+                if let Err(err) = self.terminal_manager.ensure_running(&attachable_id, socket_str.as_deref()).await {
                     warn!(attachable_id = %attachable_id, err = %err, "failed to ensure terminal");
                     continue;
                 }
@@ -115,7 +115,7 @@ impl<'a> TerminalPreparationService<'a> {
                         continue;
                     }
                 };
-                if let Err(err) = self.terminal_manager.ensure_running(&attachable_id).await {
+                if let Err(err) = self.terminal_manager.ensure_running(&attachable_id, socket_str.as_deref()).await {
                     warn!(attachable_id = %attachable_id, err = %err, "failed to ensure terminal");
                 }
                 match self.terminal_manager.attach_args(&attachable_id, socket_str.as_deref()) {

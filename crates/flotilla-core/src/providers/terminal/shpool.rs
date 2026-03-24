@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, TerminalStatus};
 
 use super::{TerminalEnvVars, TerminalPool, TerminalSession};
-use crate::providers::{run, CommandRunner};
+use crate::providers::{run, run_output, CommandRunner};
 
 pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
@@ -411,6 +411,24 @@ impl ShpoolTerminalPool {
         true
     }
 
+    /// Check whether a session with the given name exists in the shpool daemon.
+    /// Unlike `list_sessions()`, this checks ALL sessions (no `flotilla/` prefix filter).
+    async fn session_exists(&self, session_name: &str) -> bool {
+        let socket_str = self.socket_path.display().to_string();
+        let config_str = self.config_path.display().to_string();
+        let result = run!(self.runner, "shpool", &["--socket", &socket_str, "-c", &config_str, "list", "--json"], Path::new("/"));
+        match result {
+            Ok(json) => {
+                let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                parsed["sessions"]
+                    .as_array()
+                    .map(|sessions| sessions.iter().any(|s| s["name"].as_str() == Some(session_name)))
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Parse the JSON output of `shpool list --json`.
     fn parse_list_json(json: &str) -> Result<Vec<TerminalSession>, String> {
         let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("failed to parse shpool list: {e}"))?;
@@ -476,40 +494,76 @@ impl TerminalPool for ShpoolTerminalPool {
         }
     }
 
-    async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path) -> Result<(), String> {
-        // No-op: shpool creates sessions on first `attach`.
+    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
+        // If the session already exists, leave it alone — don't disrupt a
+        // live attach by re-running attach+detach. We can't use list_sessions()
+        // here because it filters to flotilla/-prefixed names, but session
+        // names are UUIDs (attachable IDs). Query the raw shpool list instead.
+        if self.session_exists(session_name).await {
+            return Ok(());
+        }
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+        // Build --cmd value. shpool uses shell-words for tokenization (no
+        // variable expansion), so all values must be literal. Quote values
+        // so paths with spaces are handled correctly.
+        let mut cmd_parts: Vec<String> = Vec::new();
+        if !env_vars.is_empty() {
+            cmd_parts.push("env".to_string());
+            for (k, v) in env_vars {
+                cmd_parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
+            }
+        }
+        cmd_parts.push(flotilla_protocol::arg::shell_quote(&shell));
+        if !command.is_empty() {
+            cmd_parts.push("-lic".to_string());
+            cmd_parts.push(flotilla_protocol::arg::shell_quote(command));
+        }
+        let cmd_str = cmd_parts.join(" ");
+
+        let socket_str = self.socket_path.display().to_string();
+        let config_str = self.config_path.display().to_string();
+        let cwd_str = cwd.display().to_string();
+
+        // Create the session by attaching. Without a TTY, shpool creates the
+        // session and the attach process exits on its own with a non-zero
+        // status. We use run_output! to tolerate non-zero exit and only
+        // fail if the process couldn't be spawned at all.
+        let output = run_output!(
+            self.runner,
+            "shpool",
+            &["--socket", &socket_str, "-c", &config_str, "attach", "--cmd", &cmd_str, "--dir", &cwd_str, session_name],
+            Path::new("/")
+        )?;
+        if !output.success {
+            tracing::debug!(
+                %session_name,
+                stderr = %output.stderr,
+                "shpool attach exited non-zero (expected without TTY)",
+            );
+        }
+
+        // Detach for robustness — ensures session is disconnected even if
+        // the attach process didn't exit cleanly.
+        let _ = run_output!(self.runner, "shpool", &["--socket", &socket_str, "-c", &config_str, "detach", session_name], Path::new("/"));
+
         Ok(())
     }
 
-    fn attach_args(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
-        let mut args = vec![
+    fn attach_args(&self, session_name: &str, _command: &str, cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
+        Ok(vec![
             Arg::Quoted("shpool".into()),
             Arg::Literal("--socket".into()),
             Arg::Quoted(self.socket_path.display().to_string()),
             Arg::Literal("-c".into()),
             Arg::Quoted(self.config_path.display().to_string()),
             Arg::Literal("attach".into()),
-        ];
-        if !command.is_empty() || !env_vars.is_empty() {
-            let mut cmd_inner: Vec<Arg> = Vec::new();
-            if !env_vars.is_empty() {
-                cmd_inner.push(Arg::Literal("env".into()));
-                for (k, v) in env_vars {
-                    cmd_inner.push(Arg::Literal(format!("{k}={}", flotilla_protocol::arg::shell_quote(v))));
-                }
-            }
-            cmd_inner.push(Arg::Literal("${SHELL:-/bin/sh}".into()));
-            if !command.is_empty() {
-                cmd_inner.push(Arg::Literal("-lic".into()));
-                cmd_inner.push(Arg::Quoted(command.into()));
-            }
-            args.push(Arg::Literal("--cmd".into()));
-            args.push(Arg::NestedCommand(cmd_inner));
-        }
-        args.push(Arg::Literal("--dir".into()));
-        args.push(Arg::Quoted(cwd.display().to_string()));
-        args.push(Arg::Quoted(session_name.into()));
-        Ok(args)
+            Arg::Literal("--force".into()),
+            Arg::Literal("--dir".into()),
+            Arg::Quoted(cwd.display().to_string()),
+            Arg::Quoted(session_name.into()),
+        ])
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {

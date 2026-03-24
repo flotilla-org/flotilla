@@ -11,7 +11,13 @@ impl TerminalPool for PassthroughTerminalPool {
         Ok(vec![])
     }
 
-    async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &std::path::Path) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        _session_name: &str,
+        _command: &str,
+        _cwd: &std::path::Path,
+        _env_vars: &TerminalEnvVars,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -52,7 +58,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_is_noop() {
         let pool = PassthroughTerminalPool;
-        assert!(pool.ensure_session("my-session", "bash", "/tmp".as_ref()).await.is_ok());
+        assert!(pool.ensure_session("my-session", "bash", "/tmp".as_ref(), &vec![]).await.is_ok());
     }
 
     #[tokio::test]

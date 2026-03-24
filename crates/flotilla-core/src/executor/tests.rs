@@ -1057,7 +1057,13 @@ impl TerminalPool for MockTerminalPool {
     async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
         Ok(vec![])
     }
-    async fn ensure_session(&self, _session_name: &str, _cmd: &str, _cwd: &Path) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        _session_name: &str,
+        _cmd: &str,
+        _cwd: &Path,
+        _env_vars: &crate::providers::terminal::TerminalEnvVars,
+    ) -> Result<(), String> {
         Ok(())
     }
     fn attach_args(

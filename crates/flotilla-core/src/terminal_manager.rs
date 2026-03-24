@@ -107,7 +107,7 @@ impl TerminalManager {
 
     /// Ensures the terminal session is running in the pool.
     /// Reads command and working directory from the stored attachable.
-    pub async fn ensure_running(&self, attachable_id: &AttachableId) -> Result<(), String> {
+    pub async fn ensure_running(&self, attachable_id: &AttachableId, daemon_socket_path: Option<&str>) -> Result<(), String> {
         let (command, cwd) = {
             let store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let attachable =
@@ -116,8 +116,12 @@ impl TerminalManager {
                 AttachableContent::Terminal(t) => (t.command.clone(), t.working_directory.clone()),
             }
         };
+        let mut env_vars: TerminalEnvVars = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), attachable_id.to_string())];
+        if let Some(socket) = daemon_socket_path {
+            env_vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.to_string()));
+        }
         let session_name = attachable_id.to_string();
-        self.pool.ensure_session(&session_name, &command, &cwd).await
+        self.pool.ensure_session(&session_name, &command, &cwd, &env_vars).await
     }
 
     /// Returns the command string needed to attach to a terminal session.

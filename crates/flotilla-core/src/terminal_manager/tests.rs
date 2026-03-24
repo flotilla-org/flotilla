@@ -16,7 +16,7 @@ use crate::{
 #[allow(dead_code)] // Fields used for test assertions via Debug matching
 enum PoolCall {
     ListSessions,
-    EnsureSession { session_name: String, command: String, cwd: PathBuf },
+    EnsureSession { session_name: String, command: String, cwd: PathBuf, env_vars: TerminalEnvVars },
     AttachCommand { session_name: String, command: String, cwd: PathBuf, env_vars: TerminalEnvVars },
     KillSession { session_name: String },
 }
@@ -43,11 +43,12 @@ impl TerminalPool for MockTerminalPool {
         Ok(self.list_response.lock().expect("lock list_response").clone())
     }
 
-    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path) -> Result<(), String> {
+    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
         self.calls.lock().expect("lock calls").push(PoolCall::EnsureSession {
             session_name: session_name.to_string(),
             command: command.to_string(),
             cwd: cwd.to_path_buf(),
+            env_vars: env_vars.clone(),
         });
         Ok(())
     }
@@ -129,7 +130,7 @@ async fn ensure_running_delegates_to_pool() {
     let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
     let att_id = mgr.allocate_terminal(set_id, "shell", 0, "feat", "bash", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
 
-    mgr.ensure_running(&att_id).await.expect("ensure_running");
+    mgr.ensure_running(&att_id, None).await.expect("ensure_running");
 
     // We can't access the pool directly after moving it, so we verify through the store
     // that the method completed successfully (no error returned).
@@ -156,11 +157,12 @@ async fn ensure_running_uses_attachable_id_as_session_name() {
             self.calls.lock().expect("lock").push(PoolCall::ListSessions);
             Ok(Vec::new())
         }
-        async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path) -> Result<(), String> {
+        async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
             self.calls.lock().expect("lock").push(PoolCall::EnsureSession {
                 session_name: session_name.to_string(),
                 command: command.to_string(),
                 cwd: cwd.to_path_buf(),
+                env_vars: env_vars.clone(),
             });
             Ok(())
         }
@@ -191,15 +193,17 @@ async fn ensure_running_uses_attachable_id_as_session_name() {
     let set_id = mgr.allocate_set(test_host(), test_checkout()).expect("allocate_set");
     let att_id = mgr.allocate_terminal(set_id, "shell", 0, "feat", "bash", PathBuf::from("/repo/wt-feat")).expect("allocate_terminal");
 
-    mgr.ensure_running(&att_id).await.expect("ensure_running");
+    mgr.ensure_running(&att_id, Some("/tmp/flotilla.sock")).await.expect("ensure_running");
 
     let recorded = calls.lock().expect("lock");
     assert_eq!(recorded.len(), 1);
     match &recorded[0] {
-        PoolCall::EnsureSession { session_name, command, cwd } => {
+        PoolCall::EnsureSession { session_name, command, cwd, env_vars } => {
             assert_eq!(session_name, &att_id.to_string());
             assert_eq!(command, "bash");
             assert_eq!(cwd, &PathBuf::from("/repo/wt-feat"));
+            assert!(env_vars.iter().any(|(k, v)| k == "FLOTILLA_ATTACHABLE_ID" && v == att_id.as_str()));
+            assert!(env_vars.iter().any(|(k, v)| k == "FLOTILLA_DAEMON_SOCKET" && v == "/tmp/flotilla.sock"));
         }
         other => panic!("expected EnsureSession, got {other:?}"),
     }
@@ -220,7 +224,7 @@ async fn attach_command_includes_env_vars() {
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             Ok(Vec::new())
         }
-        async fn ensure_session(&self, _: &str, _: &str, _: &Path) -> Result<(), String> {
+        async fn ensure_session(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<(), String> {
             Ok(())
         }
         fn attach_args(
@@ -322,7 +326,7 @@ async fn kill_terminal_delegates_to_pool() {
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             Ok(Vec::new())
         }
-        async fn ensure_session(&self, _: &str, _: &str, _: &Path) -> Result<(), String> {
+        async fn ensure_session(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<(), String> {
             Ok(())
         }
         fn attach_args(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
@@ -411,7 +415,7 @@ async fn cascade_delete_removes_sets_and_kills_sessions() {
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             Ok(Vec::new())
         }
-        async fn ensure_session(&self, _: &str, _: &str, _: &Path) -> Result<(), String> {
+        async fn ensure_session(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<(), String> {
             Ok(())
         }
         fn attach_args(&self, _: &str, _: &str, _: &Path, _: &TerminalEnvVars) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
