@@ -259,15 +259,20 @@ fn resolve_prepared_commands_via_hop_chain(
         };
         let resolved = hop_resolver.resolve(&plan, &mut context)?;
 
-        // The resolved plan should contain exactly one Command action for wrap mode
-        let command_string = resolved
-            .0
-            .into_iter()
-            .find_map(|action| match action {
-                ResolvedAction::Command(args) => Some(arg::flatten(&args, 0)),
-                _ => None,
-            })
-            .ok_or_else(|| format!("hop chain resolution produced no Command action for role '{}'", cmd.role))?;
+        // AlwaysWrap should produce exactly one Command action. Assert this invariant
+        // so multi-action plans don't silently lose actions.
+        if resolved.0.len() != 1 {
+            return Err(format!(
+                "hop chain resolution produced {} actions for role '{}', expected exactly 1 (AlwaysWrap)",
+                resolved.0.len(),
+                cmd.role
+            ));
+        }
+        let command_string = match resolved.0.into_iter().next() {
+            Some(ResolvedAction::Command(args)) => arg::flatten(&args, 0),
+            Some(_) => return Err(format!("hop chain resolution produced a non-Command action for role '{}'", cmd.role)),
+            None => unreachable!("len checked above"),
+        };
 
         result.push((cmd.role.clone(), command_string));
     }

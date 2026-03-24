@@ -19,8 +19,9 @@ pub trait RemoteHopResolver: Send + Sync {
 /// SSH-based remote hop resolver. Extracts the SSH wrapping knowledge previously
 /// hardcoded in `wrap_remote_attach_commands()` into the hop chain model.
 pub struct SshRemoteHopResolver {
-    config_base: PathBuf,
     hosts: HostsConfig,
+    /// Pre-resolved multiplex control path, if the directory was created successfully.
+    multiplex_ctrl_path: Option<PathBuf>,
 }
 
 /// Resolved SSH connection info for a single host.
@@ -31,8 +32,17 @@ struct SshInfo {
 
 impl SshRemoteHopResolver {
     /// Create from pre-loaded hosts config and a config base path (for SSH control socket dir).
+    /// The control socket directory is created eagerly here, not during arg building.
     pub fn new(config_base: PathBuf, hosts: HostsConfig) -> Self {
-        Self { config_base, hosts }
+        let ctrl_dir = config_base.join("ssh");
+        let multiplex_ctrl_path = match std::fs::create_dir_all(&ctrl_dir) {
+            Ok(()) => Some(ctrl_dir.join("ctrl-%r@%h-%p")),
+            Err(err) => {
+                warn!(err = %err, "failed to create SSH control socket directory, multiplexing disabled");
+                None
+            }
+        };
+        Self { hosts, multiplex_ctrl_path }
     }
 
     /// Look up SSH connection info for a given HostName.
@@ -57,11 +67,7 @@ impl SshRemoteHopResolver {
         let mut args = vec![Arg::Literal("ssh".into()), Arg::Literal("-t".into())];
 
         if info.multiplex {
-            let ctrl_dir = self.config_base.join("ssh");
-            if let Err(err) = std::fs::create_dir_all(&ctrl_dir) {
-                warn!(err = %err, "failed to create SSH control socket directory, disabling multiplexing");
-            } else {
-                let ctrl_path = ctrl_dir.join("ctrl-%r@%h-%p");
+            if let Some(ref ctrl_path) = self.multiplex_ctrl_path {
                 args.push(Arg::Literal("-o".into()));
                 args.push(Arg::Literal("ControlMaster=auto".into()));
                 args.push(Arg::Literal("-o".into()));
