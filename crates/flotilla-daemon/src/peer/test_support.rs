@@ -124,6 +124,7 @@ impl TestNetwork {
 
             let env = InboundPeerEnvelope { msg, connection_generation: generation, connection_peer };
             results.push(peer.manager.handle_inbound(env).await);
+            dispatch_pending_sends(&mut peer.manager).await;
         }
 
         results
@@ -152,6 +153,12 @@ impl TestNetwork {
 
     pub fn manager_mut(&mut self, peer_idx: usize) -> &mut PeerManager {
         &mut self.peers[peer_idx].manager
+    }
+}
+
+async fn dispatch_pending_sends(manager: &mut PeerManager) {
+    for pending in manager.take_pending_sends() {
+        let _ = pending.sender.send(pending.msg).await;
     }
 }
 
