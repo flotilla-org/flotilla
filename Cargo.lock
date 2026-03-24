@@ -1080,6 +1080,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "color-eyre",
+ "flotilla-commands",
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-protocol",
@@ -1103,6 +1104,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "flotilla-commands"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "flotilla-protocol",
 ]
 
 [[package]]
