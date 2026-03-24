@@ -7,7 +7,7 @@ use std::{
 use flotilla_protocol::{AgentHarness, AgentStatus, AttachableId};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::flotilla_config_dir, path_context::DaemonHostPath};
+use crate::path_context::DaemonHostPath;
 
 /// Persisted state for a single agent instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,10 +118,6 @@ pub struct AgentStateStore {
 }
 
 impl AgentStateStore {
-    pub fn new() -> Self {
-        Self::with_path(flotilla_config_dir().join("agents").join("state.json"))
-    }
-
     pub fn with_base(base: &DaemonHostPath) -> Self {
         Self::with_path(base.join("agents").join("state.json"))
     }
@@ -144,12 +140,6 @@ impl AgentStateStore {
             Err(e) => return Err(format!("failed to read agent state: {e}")),
         };
         serde_json::from_str(&contents).map_err(|e| format!("failed to parse agent state: {e}"))
-    }
-}
-
-impl Default for AgentStateStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

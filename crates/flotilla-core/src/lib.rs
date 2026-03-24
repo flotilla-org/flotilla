@@ -14,6 +14,7 @@ pub mod issue_cache;
 pub mod merge;
 pub mod model;
 pub mod path_context;
+pub mod path_policy;
 pub mod provider_data;
 pub mod providers;
 pub mod refresh;

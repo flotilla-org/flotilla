@@ -309,7 +309,7 @@ impl InProcessDaemon {
 
         // Run host detection once before the repo loop
         let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
-        let agent_state_store = crate::agents::shared_file_backed_agent_state_store(&crate::config::flotilla_config_dir());
+        let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
 
         for path in repo_paths {
             if path_identities.contains_key(&path) {

@@ -291,11 +291,6 @@ struct RepoConfig {
     path: String,
 }
 
-/// Default flotilla config directory (used for socket path defaults etc.)
-pub fn flotilla_config_dir() -> DaemonHostPath {
-    DaemonHostPath::new(dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla"))
-}
-
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
 pub fn path_to_slug(path: &Path) -> String {
     let raw = path.to_string_lossy().to_lowercase();
@@ -317,30 +312,32 @@ pub fn path_to_slug(path: &Path) -> String {
     slug.trim_matches('-').to_string()
 }
 
-/// Owns the config base path and caches the global `FlotillaConfig`.
+/// Owns daemon-side paths and caches the global `FlotillaConfig`.
+///
+/// NOTE: This struct is accumulating path responsibilities beyond pure config.
+/// A future refactor should split config, state, and data storage properly.
 pub struct ConfigStore {
     base: DaemonHostPath,
+    state_dir: DaemonHostPath,
     global_config: OnceLock<Mutex<FlotillaConfig>>,
 }
 
-impl Default for ConfigStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ConfigStore {
-    /// Production constructor — uses ~/.config/flotilla/
-    pub fn new() -> Self {
-        Self {
-            base: DaemonHostPath::new(dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config/flotilla")),
-            global_config: OnceLock::new(),
-        }
+    /// Create a ConfigStore with explicit config and state directories.
+    /// Production callers should pass paths from `PathPolicy`.
+    pub fn new(base: DaemonHostPath, state_dir: DaemonHostPath) -> Self {
+        Self { base, state_dir, global_config: OnceLock::new() }
     }
 
-    /// Test constructor — uses provided base path
+    /// Test constructor — uses provided base path for both config and state.
     pub fn with_base(base: impl Into<PathBuf>) -> Self {
-        Self { base: DaemonHostPath::new(base.into()), global_config: OnceLock::new() }
+        let p = base.into();
+        Self::new(DaemonHostPath::new(p.clone()), DaemonHostPath::new(p))
+    }
+
+    /// The runtime state directory (workspace state, shpool sockets, etc.).
+    pub fn state_dir(&self) -> &DaemonHostPath {
+        &self.state_dir
     }
 
     /// The base config directory path.

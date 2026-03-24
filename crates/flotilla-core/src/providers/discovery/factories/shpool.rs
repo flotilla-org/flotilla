@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::{
-    config::{flotilla_config_dir, ConfigStore},
+    config::ConfigStore,
     path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
@@ -27,12 +27,12 @@ impl Factory for ShpoolTerminalPoolFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if env.find_binary("shpool").is_some() {
-            let socket_path = flotilla_config_dir().join("shpool/shpool.socket");
+            let socket_path = config.state_dir().join("shpool/shpool.socket");
             let pool = ShpoolTerminalPool::create(runner, socket_path).await;
             Ok(Arc::new(pool))
         } else {

@@ -9,6 +9,7 @@ use flotilla_core::{
     config::ConfigStore,
     convert::correlation_result_to_work_item,
     data,
+    path_policy::PathPolicy,
     providers::{
         discovery::{self, detectors, FactoryRegistry, ProcessEnvVars},
         types::RepoCriteria,
@@ -25,7 +26,8 @@ async fn main() {
 
     // Step 1: Build registry (same as app startup)
     println!("\n=== Step 1: Build ProviderRegistry ===");
-    let config = ConfigStore::new();
+    let paths = PathPolicy::from_process_env();
+    let config = ConfigStore::new(paths.config_dir, paths.state_dir);
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
 
     let host_dets = detectors::default_host_detectors();

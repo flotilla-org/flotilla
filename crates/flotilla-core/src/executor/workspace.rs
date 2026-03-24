@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use flotilla_protocol::{arg, AttachableSetId, HostName, HostPath, ResolvedPaneCommand};
 use tracing::{info, warn};
 
-use super::{local_workspace_directory, terminals::TerminalPreparationService, workspace_config};
+use super::{terminals::TerminalPreparationService, workspace_config};
 use crate::{
     attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
     hop_chain::{
@@ -104,7 +104,17 @@ impl<'a> WorkspaceOrchestrator<'a> {
         // The workspace itself is local to the presentation host, so its
         // working directory only needs to be a valid local directory.
         // The resolved commands handle entering the remote checkout path.
-        let working_dir = local_workspace_directory(self.repo_root, self.config_base);
+        // For remote-only repos (synthetic path like "<remote>/..."), fall
+        // back to the user's home or cwd since the path doesn't exist locally.
+        let working_dir = if self.repo_root.exists() {
+            ExecutionEnvironmentPath::new(self.repo_root)
+        } else if let Some(home) = dirs::home_dir() {
+            ExecutionEnvironmentPath::new(home)
+        } else if let Ok(cwd) = std::env::current_dir() {
+            ExecutionEnvironmentPath::new(cwd)
+        } else {
+            ExecutionEnvironmentPath::new(self.config_base)
+        };
         let remote_name = format!("{branch}@{target_host}");
         let mut config = workspace_config(self.repo_root, &remote_name, working_dir.as_path(), "claude", self.config_base);
         config.resolved_commands = Some(resolved_commands);
