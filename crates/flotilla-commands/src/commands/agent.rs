@@ -66,7 +66,7 @@ impl fmt::Display for AgentNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fmt, path::PathBuf};
 
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction};
@@ -76,6 +76,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> AgentNoun {
         AgentNoun::try_parse_from(args).expect("should parse")
+    }
+
+    fn assert_round_trip(args: &[&str])
+    where
+        AgentNoun: fmt::Display + PartialEq + fmt::Debug,
+    {
+        let parsed = AgentNoun::try_parse_from(args).expect("initial parse");
+        let displayed = parsed.to_string();
+        let tokens: Vec<&str> = displayed.split_whitespace().collect();
+        let reparsed = AgentNoun::try_parse_from(&tokens).expect("re-parse from display");
+        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -132,5 +143,20 @@ mod tests {
                 action: CommandAction::ArchiveSession { session_id: "claude-1".into() },
             })
         );
+    }
+
+    #[test]
+    fn round_trip_teleport() {
+        assert_round_trip(&["agent", "claude-1", "teleport"]);
+    }
+
+    #[test]
+    fn round_trip_teleport_with_branch() {
+        assert_round_trip(&["agent", "claude-1", "teleport", "--branch", "feat"]);
+    }
+
+    #[test]
+    fn round_trip_archive() {
+        assert_round_trip(&["agent", "claude-1", "archive"]);
     }
 }

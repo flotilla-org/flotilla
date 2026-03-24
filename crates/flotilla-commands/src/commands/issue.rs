@@ -72,6 +72,8 @@ impl fmt::Display for IssueNoun {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction, RepoSelector};
 
@@ -80,6 +82,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> IssueNoun {
         IssueNoun::try_parse_from(args).expect("should parse")
+    }
+
+    fn assert_round_trip(args: &[&str])
+    where
+        IssueNoun: fmt::Display + PartialEq + fmt::Debug,
+    {
+        let parsed = IssueNoun::try_parse_from(args).expect("initial parse");
+        let displayed = parsed.to_string();
+        let tokens: Vec<&str> = displayed.split_whitespace().collect();
+        let reparsed = IssueNoun::try_parse_from(&tokens).expect("re-parse from display");
+        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -121,5 +134,15 @@ mod tests {
     fn issue_open_no_subject_errors() {
         let noun = IssueNoun { subject: None, verb: Some(super::IssueVerb::Open) };
         assert!(noun.resolve().is_err());
+    }
+
+    #[test]
+    fn round_trip_open() {
+        assert_round_trip(&["issue", "1", "open"]);
+    }
+
+    #[test]
+    fn round_trip_suggest_branch() {
+        assert_round_trip(&["issue", "1,5,7", "suggest-branch"]);
     }
 }

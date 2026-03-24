@@ -45,6 +45,8 @@ impl fmt::Display for WorkspaceNoun {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction};
 
@@ -53,6 +55,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> WorkspaceNoun {
         WorkspaceNoun::try_parse_from(args).expect("should parse")
+    }
+
+    fn assert_round_trip(args: &[&str])
+    where
+        WorkspaceNoun: fmt::Display + PartialEq + fmt::Debug,
+    {
+        let parsed = WorkspaceNoun::try_parse_from(args).expect("initial parse");
+        let displayed = parsed.to_string();
+        let tokens: Vec<&str> = displayed.split_whitespace().collect();
+        let reparsed = WorkspaceNoun::try_parse_from(&tokens).expect("re-parse from display");
+        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -66,5 +79,10 @@ mod tests {
                 action: CommandAction::SelectWorkspace { ws_ref: "feat-ws".into() },
             })
         );
+    }
+
+    #[test]
+    fn round_trip_select() {
+        assert_round_trip(&["workspace", "feat-ws", "select"]);
     }
 }

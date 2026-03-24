@@ -96,7 +96,7 @@ impl fmt::Display for CheckoutNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fmt, path::PathBuf};
 
     use clap::Parser;
     use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, RepoSelector};
@@ -106,6 +106,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> CheckoutNoun {
         CheckoutNoun::try_parse_from(args).expect("should parse")
+    }
+
+    fn assert_round_trip(args: &[&str])
+    where
+        CheckoutNoun: fmt::Display + PartialEq + fmt::Debug,
+    {
+        let parsed = CheckoutNoun::try_parse_from(args).expect("initial parse");
+        let displayed = parsed.to_string();
+        let tokens: Vec<&str> = displayed.split_whitespace().collect();
+        let reparsed = CheckoutNoun::try_parse_from(&tokens).expect("re-parse from display");
+        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -189,5 +200,25 @@ mod tests {
     fn checkout_remove_no_subject_errors() {
         let noun = CheckoutNoun { subject: None, verb: Some(super::CheckoutVerb::Remove) };
         assert!(noun.resolve().is_err());
+    }
+
+    #[test]
+    fn round_trip_remove() {
+        assert_round_trip(&["checkout", "my-feature", "remove"]);
+    }
+
+    #[test]
+    fn round_trip_create_branch() {
+        assert_round_trip(&["checkout", "create", "--branch", "feat-x"]);
+    }
+
+    #[test]
+    fn round_trip_create_branch_fresh() {
+        assert_round_trip(&["checkout", "create", "--branch", "feat-x", "--fresh"]);
+    }
+
+    #[test]
+    fn round_trip_status() {
+        assert_round_trip(&["checkout", "my-feature", "status"]);
     }
 }
