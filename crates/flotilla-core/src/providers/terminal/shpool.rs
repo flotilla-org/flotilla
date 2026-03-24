@@ -483,7 +483,7 @@ impl TerminalPool for ShpoolTerminalPool {
 
     fn attach_args(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
         let mut args = vec![
-            Arg::Literal("shpool".into()),
+            Arg::Quoted("shpool".into()),
             Arg::Literal("--socket".into()),
             Arg::Quoted(self.socket_path.display().to_string()),
             Arg::Literal("-c".into()),
@@ -692,7 +692,7 @@ mod tests {
         let args = pool.attach_args("flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Literal("shpool".into()),
+            Arg::Quoted("shpool".into()),
             Arg::Literal("--socket".into()),
             Arg::Quoted(socket),
             Arg::Literal("-c".into()),
@@ -712,7 +712,7 @@ mod tests {
         let args = pool.attach_args("flotilla/feat/shell/0", "bash", Path::new("/home/dev"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-        assert!(flat.starts_with("shpool --socket "), "should start with shpool: {flat}");
+        assert!(flat.starts_with("'shpool' --socket "), "should start with shpool: {flat}");
         assert!(flat.contains("attach"), "should include attach: {flat}");
         assert!(flat.contains("--cmd"), "should include --cmd: {flat}");
         assert!(flat.contains("-lic"), "should use login interactive shell: {flat}");

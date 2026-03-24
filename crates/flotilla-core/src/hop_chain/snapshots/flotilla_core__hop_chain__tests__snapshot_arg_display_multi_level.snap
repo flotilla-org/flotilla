@@ -11,7 +11,7 @@ NestedCommand(
     cd
     "/home/alice/dev/my-repo"
     &&
-    cleat
+    "cleat"
     attach
     sess-1
   )

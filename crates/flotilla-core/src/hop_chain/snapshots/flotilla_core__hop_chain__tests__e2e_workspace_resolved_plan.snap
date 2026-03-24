@@ -38,7 +38,7 @@ ResolvedPlan(
                                 Literal(
                                     "&&",
                                 ),
-                                Literal(
+                                Quoted(
                                     "cleat",
                                 ),
                                 Literal(

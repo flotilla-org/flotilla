@@ -65,7 +65,7 @@ impl SshRemoteHopResolver {
                 args.push(Arg::Literal("-o".into()));
                 args.push(Arg::Literal("ControlMaster=auto".into()));
                 args.push(Arg::Literal("-o".into()));
-                args.push(Arg::Literal(format!("ControlPath={}", ctrl_path.display())));
+                args.push(Arg::Quoted(format!("ControlPath={}", ctrl_path.display())));
                 args.push(Arg::Literal("-o".into()));
                 args.push(Arg::Literal("ControlPersist=60".into()));
             }

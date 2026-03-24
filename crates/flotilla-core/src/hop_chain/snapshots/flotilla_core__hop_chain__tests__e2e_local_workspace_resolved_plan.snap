@@ -7,7 +7,7 @@ ResolvedPlan(
     [
         Command(
             [
-                Literal(
+                Quoted(
                     "cleat",
                 ),
                 Literal(

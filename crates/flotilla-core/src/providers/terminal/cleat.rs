@@ -66,7 +66,7 @@ impl TerminalPool for CleatTerminalPool {
 
     fn attach_args(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
         let mut args = vec![
-            Arg::Literal(self.binary.clone()),
+            Arg::Quoted(self.binary.clone()),
             Arg::Literal("attach".into()),
             Arg::Quoted(session_name.into()),
             Arg::Literal("--cwd".into()),
@@ -176,7 +176,7 @@ mod tests {
 
         let cmd = pool.attach_command("my-session", "bash", Path::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert!(cmd.contains("cleat attach 'my-session'"));
+        assert!(cmd.contains("'cleat' attach 'my-session'"));
         assert!(cmd.contains("--cwd '/repo'"));
         assert!(cmd.contains("--cmd"));
     }
@@ -202,7 +202,7 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", Path::new("/repo"), &vec![]).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
+            Arg::Quoted("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("my-session".into()),
             Arg::Literal("--cwd".into()),
@@ -218,7 +218,7 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", Path::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-        assert_eq!(flat, "cleat attach 'my-session' --cwd '/repo' --cmd '${SHELL:-/bin/sh} -lc '\\''bash'\\'''");
+        assert_eq!(flat, "'cleat' attach 'my-session' --cwd '/repo' --cmd '${SHELL:-/bin/sh} -lc '\\''bash'\\'''");
     }
 
     #[test]
@@ -228,7 +228,7 @@ mod tests {
 
         // No --cmd when both command and env_vars are empty
         assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
+            Arg::Quoted("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("sess-1".into()),
             Arg::Literal("--cwd".into()),
@@ -243,7 +243,7 @@ mod tests {
         let args = pool.attach_args("sess", "cmd", Path::new("/wd"), &env).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
+            Arg::Quoted("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("sess".into()),
             Arg::Literal("--cwd".into()),
@@ -268,7 +268,7 @@ mod tests {
 
         // Empty command with env vars: spawns $SHELL with env prefix, no -lc
         assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
+            Arg::Quoted("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Quoted("sess".into()),
             Arg::Literal("--cwd".into()),

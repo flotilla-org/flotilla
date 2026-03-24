@@ -122,7 +122,7 @@ fn wrap_with_working_directory_and_inner_command() {
     let mut context = minimal_context();
     context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
-        Arg::Literal("cleat".into()),
+        Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Literal("sess-1".into()),
     ]));
@@ -155,7 +155,7 @@ fn wrap_with_working_directory_and_inner_command() {
                     assert_eq!(inner_args[0], Arg::Literal("cd".into()));
                     assert_eq!(inner_args[1], Arg::Quoted("/home/alice/dev/my-repo".into()));
                     assert_eq!(inner_args[2], Arg::Literal("&&".into()));
-                    assert_eq!(inner_args[3], Arg::Literal("cleat".into()));
+                    assert_eq!(inner_args[3], Arg::Quoted("cleat".into()));
                     assert_eq!(inner_args[4], Arg::Literal("attach".into()));
                     assert_eq!(inner_args[5], Arg::Literal("sess-1".into()));
                 }
@@ -248,8 +248,8 @@ fn wrap_with_multiplex_includes_control_args() {
     assert_eq!(args[4], Arg::Literal("-o".into()));
     // args[5] is ControlPath=<path> — just check it starts correctly
     match &args[5] {
-        Arg::Literal(s) => assert!(s.starts_with("ControlPath="), "expected ControlPath, got {s}"),
-        other => panic!("expected Literal ControlPath, got {other:?}"),
+        Arg::Quoted(s) => assert!(s.starts_with("ControlPath="), "expected ControlPath, got {s}"),
+        other => panic!("expected Quoted ControlPath, got {other:?}"),
     }
     assert_eq!(args[6], Arg::Literal("-o".into()));
     assert_eq!(args[7], Arg::Literal("ControlPersist=60".into()));
@@ -362,7 +362,7 @@ fn enter_produces_ssh_command_and_sendkeys() {
     let mut context = minimal_context();
     context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
-        Arg::Literal("cleat".into()),
+        Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Literal("sess-1".into()),
     ]));
@@ -380,7 +380,7 @@ fn enter_produces_ssh_command_and_sendkeys() {
                 SendKeyStep::Type(text) => {
                     assert!(text.contains("cd"), "should include cd: {text}");
                     assert!(text.contains("/home/alice/dev/my-repo"), "should include dir: {text}");
-                    assert!(text.contains("cleat attach sess-1"), "should include inner cmd: {text}");
+                    assert!(text.contains("'cleat' attach sess-1"), "should include inner cmd: {text}");
                 }
                 other => panic!("expected Type step, got {other:?}"),
             }
@@ -494,7 +494,7 @@ fn regression_flatten_matches_old_ssh_wrap_pattern() {
     let mut context = minimal_context();
     context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
-        Arg::Literal("cleat".into()),
+        Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Literal("sess-1".into()),
     ]));
@@ -513,10 +513,13 @@ fn regression_flatten_matches_old_ssh_wrap_pattern() {
     assert!(flat.contains("'alice@feta.local'"), "should contain quoted target: {flat}");
     assert!(flat.contains("${SHELL:-/bin/sh} -l -c"), "should contain ${{SHELL:-/bin/sh}} -l -c: {flat}");
     assert!(flat.contains("/home/alice/dev/my-repo"), "should contain checkout dir: {flat}");
-    assert!(flat.contains("cleat attach sess-1"), "should contain inner command: {flat}");
+    // At depth 2 the Quoted("cleat") gets double-escaped, so check for the
+    // unquoted binary name and trailing args which survive flattening.
+    assert!(flat.contains("cleat"), "should contain binary name: {flat}");
+    assert!(flat.contains("attach sess-1"), "should contain trailing args: {flat}");
 
     // Verify the inner command can be traced through the nesting:
-    // depth 2 (innermost): "cd '/home/alice/dev/my-repo' && cleat attach sess-1"
+    // depth 2 (innermost): "cd '/home/alice/dev/my-repo' && 'cleat' attach sess-1"
     // depth 1: "$SHELL -l -c '<quoted depth 2>'"
     // depth 0: "ssh -t 'alice@feta.local' '<quoted depth 1>'"
     //
@@ -534,7 +537,7 @@ fn regression_flatten_matches_old_ssh_wrap_pattern() {
                 Arg::Literal("cd".into()),
                 Arg::Quoted("/home/alice/dev/my-repo".into()),
                 Arg::Literal("&&".into()),
-                Arg::Literal("cleat".into()),
+                Arg::Quoted("cleat".into()),
                 Arg::Literal("attach".into()),
                 Arg::Literal("sess-1".into()),
             ]),
@@ -653,7 +656,7 @@ impl TerminalPool for FakeTerminalPool {
             cwd: cwd.to_path_buf(),
             env_vars: env_vars.clone(),
         });
-        Ok(vec![Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Literal(session_name.to_string())])
+        Ok(vec![Arg::Quoted("cleat".into()), Arg::Literal("attach".into()), Arg::Literal(session_name.to_string())])
     }
 
     async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
@@ -708,7 +711,7 @@ fn terminal_resolve_pushes_command_onto_context() {
     assert_eq!(context.actions.len(), 1);
     match &context.actions[0] {
         ResolvedAction::Command(args) => {
-            assert_eq!(args[0], Arg::Literal("cleat".into()));
+            assert_eq!(args[0], Arg::Quoted("cleat".into()));
             assert_eq!(args[1], Arg::Literal("attach".into()));
             assert_eq!(args[2], Arg::Literal(att_id.to_string()));
         }
@@ -1354,7 +1357,7 @@ fn snapshot_arg_display_multi_level() {
             Arg::Literal("cd".into()),
             Arg::Quoted("/home/alice/dev/my-repo".into()),
             Arg::Literal("&&".into()),
-            Arg::Literal("cleat".into()),
+            Arg::Quoted("cleat".into()),
             Arg::Literal("attach".into()),
             Arg::Literal("sess-1".into()),
         ]),
@@ -1374,7 +1377,7 @@ fn snapshot_arg_display_multi_level() {
 fn snapshot_e2e_workspace_creation_flow() {
     // Step 1: Build cleat-style attach args matching what CleatTerminalPool produces
     let cleat_args = vec![
-        Arg::Literal("cleat".into()),
+        Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("feat__shell__0".into()),
         Arg::Literal("--cwd".into()),
@@ -1429,7 +1432,7 @@ fn snapshot_e2e_workspace_creation_flow() {
 #[test]
 fn snapshot_e2e_local_workspace_creation() {
     let cleat_args = vec![
-        Arg::Literal("cleat".into()),
+        Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("main__shell__0".into()),
         Arg::Literal("--cwd".into()),
@@ -1469,7 +1472,7 @@ fn snapshot_e2e_local_workspace_creation() {
 #[test]
 fn snapshot_e2e_remote_workspace_send_keys() {
     let cleat_args = vec![
-        Arg::Literal("cleat".into()),
+        Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("feat__shell__0".into()),
         Arg::Literal("--cwd".into()),
