@@ -476,8 +476,42 @@ impl TerminalPool for ShpoolTerminalPool {
         }
     }
 
-    async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<(), String> {
-        // No-op: shpool creates sessions on first `attach`.
+    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+        // Build --cmd value. shpool uses shell-words for tokenization (no variable
+        // expansion), so all values must be literal.
+        let mut cmd_parts: Vec<String> = Vec::new();
+        if !env_vars.is_empty() {
+            cmd_parts.push("env".to_string());
+            for (k, v) in env_vars {
+                cmd_parts.push(format!("{k}={v}"));
+            }
+        }
+        cmd_parts.push(shell);
+        if !command.is_empty() {
+            cmd_parts.push("-lic".to_string());
+            cmd_parts.push(command.to_string());
+        }
+        let cmd_str = cmd_parts.join(" ");
+
+        let socket_str = self.socket_path.display().to_string();
+        let config_str = self.config_path.display().to_string();
+        let cwd_str = cwd.display().to_string();
+
+        // Create the session by attaching. Without a TTY, shpool creates the
+        // session and the attach process exits on its own.
+        run!(
+            self.runner,
+            "shpool",
+            &["--socket", &socket_str, "-c", &config_str, "attach", "--cmd", &cmd_str, "--dir", &cwd_str, session_name],
+            Path::new("/")
+        )?;
+
+        // Detach for robustness — ensures session is disconnected even if
+        // the attach process didn't exit cleanly.
+        run!(self.runner, "shpool", &["--socket", &socket_str, "-c", &config_str, "detach", session_name], Path::new("/"))?;
+
         Ok(())
     }
 

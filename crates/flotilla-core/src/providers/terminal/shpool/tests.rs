@@ -244,3 +244,52 @@ fn attach_args_with_env_vars_empty_command() {
         assert!(!inner_flat.contains("-lic"), "inner should not have -lic for empty command: {inner_flat}");
     }
 }
+
+// ── ensure_session tests ───────────────────────────────────────
+
+#[tokio::test]
+async fn ensure_session_creates_via_attach_then_detach() {
+    let runner = Arc::new(MockRunner::new(vec![
+        Ok(String::new()), // attach response
+        Ok(String::new()), // detach response
+    ]));
+    let (pool, _dir) = test_pool(runner.clone());
+    let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
+
+    pool.ensure_session("test-session", "claude", Path::new("/repo"), &env).await.expect("ensure_session");
+
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 2, "should call attach then detach: {calls:?}");
+
+    // First call: shpool attach with --cmd
+    assert_eq!(calls[0].0, "shpool");
+    let attach_args = &calls[0].1;
+    assert!(attach_args.contains(&"attach".to_string()));
+    assert!(attach_args.contains(&"--cmd".to_string()));
+    assert!(attach_args.contains(&"test-session".to_string()));
+
+    // The --cmd value should contain the resolved shell (not ${SHELL:-/bin/sh})
+    let cmd_idx = attach_args.iter().position(|a| a == "--cmd").expect("--cmd present");
+    let cmd_val = &attach_args[cmd_idx + 1];
+    assert!(!cmd_val.contains("${SHELL"), "should not contain unresolved shell variable: {cmd_val}");
+    assert!(cmd_val.contains("FLOTILLA_ATTACHABLE_ID"), "should contain env var: {cmd_val}");
+
+    // Second call: shpool detach
+    assert_eq!(calls[1].0, "shpool");
+    let detach_args = &calls[1].1;
+    assert!(detach_args.contains(&"detach".to_string()));
+    assert!(detach_args.contains(&"test-session".to_string()));
+}
+
+#[tokio::test]
+async fn ensure_session_empty_command_starts_login_shell() {
+    let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new())]));
+    let (pool, _dir) = test_pool(runner.clone());
+
+    pool.ensure_session("test-session", "", Path::new("/repo"), &vec![]).await.expect("ensure_session");
+
+    let calls = runner.calls();
+    let cmd_idx = calls[0].1.iter().position(|a| a == "--cmd").expect("--cmd present");
+    let cmd_val = &calls[0].1[cmd_idx + 1];
+    assert!(!cmd_val.contains("-lic"), "empty command should not have -lic: {cmd_val}");
+}
