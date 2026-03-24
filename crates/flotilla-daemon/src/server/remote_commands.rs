@@ -15,7 +15,7 @@ use flotilla_protocol::{
 };
 use tokio::sync::{oneshot, Mutex, Notify};
 
-use crate::peer::PeerManager;
+use crate::peer::{PeerManager, PeerSender};
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingRemoteCommand {
@@ -86,10 +86,8 @@ impl RemoteCommandRouter {
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 command: Box::new(command),
             };
-            let send_result = {
-                let pm = self.peer_manager.lock().await;
-                pm.send_to(&target_host, PeerWireMessage::Routed(routed)).await
-            };
+            let sender = self.resolve_sender(&target_host).await;
+            let send_result = send_routed(sender, routed).await;
 
             match send_result {
                 Ok(()) => Ok(command_id),
@@ -125,10 +123,8 @@ impl RemoteCommandRouter {
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 command_request_id,
             };
-            let send_result = {
-                let pm = self.peer_manager.lock().await;
-                pm.send_to(&target_host, PeerWireMessage::Routed(routed)).await
-            };
+            let sender = self.resolve_sender(&target_host).await;
+            let send_result = send_routed(sender, routed).await;
             if let Err(err) = send_result {
                 self.pending_remote_cancels.lock().await.remove(&cancel_id);
                 return Err(err);
@@ -273,8 +269,8 @@ impl RemoteCommandRouter {
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                     result: Box::new(CommandValue::Error { message }),
                 };
-                let pm = self.peer_manager.lock().await;
-                let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(response)).await;
+                let sender = self.resolve_sender(&reply_via).await;
+                let _ = send_routed(sender, response).await;
                 return;
             }
         };
@@ -293,8 +289,8 @@ impl RemoteCommandRouter {
                         remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                         event: Box::new(CommandPeerEvent::Started { repo_identity, repo, description }),
                     };
-                    let pm = self.peer_manager.lock().await;
-                    let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(event)).await;
+                    let sender = self.resolve_sender(&reply_via).await;
+                    let _ = send_routed(sender, event).await;
                 }
                 Ok(DaemonEvent::CommandStepUpdate {
                     command_id: id,
@@ -313,8 +309,8 @@ impl RemoteCommandRouter {
                         remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                         event: Box::new(CommandPeerEvent::StepUpdate { repo_identity, repo, step_index, step_count, description, status }),
                     };
-                    let pm = self.peer_manager.lock().await;
-                    let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(event)).await;
+                    let sender = self.resolve_sender(&reply_via).await;
+                    let _ = send_routed(sender, event).await;
                 }
                 Ok(DaemonEvent::CommandFinished { command_id: id, repo_identity, repo, result, .. }) if id == command_id => {
                     let finished = RoutedPeerMessage::CommandEvent {
@@ -331,9 +327,11 @@ impl RemoteCommandRouter {
                         remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                         result: Box::new(result),
                     };
-                    let pm = self.peer_manager.lock().await;
-                    let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(finished)).await;
-                    let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(response)).await;
+                    let sender = self.resolve_sender(&reply_via).await;
+                    if let Ok(sender) = sender {
+                        let _ = sender.send(PeerWireMessage::Routed(finished)).await;
+                        let _ = sender.send(PeerWireMessage::Routed(response)).await;
+                    }
                     self.forwarded_commands.lock().await.remove(&request_id);
                     break;
                 }
@@ -365,8 +363,8 @@ impl RemoteCommandRouter {
             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
             error,
         };
-        let pm = self.peer_manager.lock().await;
-        let _ = pm.send_to(&reply_via, PeerWireMessage::Routed(response)).await;
+        let sender = self.resolve_sender(&reply_via).await;
+        let _ = send_routed(sender, response).await;
     }
 
     #[cfg(test)]
@@ -391,6 +389,18 @@ impl RemoteCommandRouter {
     ) {
         self.cancel_forwarded_command(cancel_id, requester_host, reply_via, command_request_id).await;
     }
+}
+
+impl RemoteCommandRouter {
+    async fn resolve_sender(&self, host: &HostName) -> Result<Arc<dyn PeerSender>, String> {
+        let pm = self.peer_manager.lock().await;
+        pm.resolve_sender(host)
+    }
+}
+
+async fn send_routed(sender: Result<Arc<dyn PeerSender>, String>, msg: RoutedPeerMessage) -> Result<(), String> {
+    let sender = sender?;
+    sender.send(PeerWireMessage::Routed(msg)).await
 }
 
 async fn await_forwarded_command_id(forwarded_commands: &ForwardedCommandMap, command_request_id: u64) -> Result<u64, String> {

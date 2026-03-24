@@ -44,7 +44,7 @@ use super::{
 };
 use crate::peer::{
     test_support::{ensure_test_connection_generation, handle_test_peer_data, wait_for_command_result, BlockingPeerSender, MockPeerSender},
-    PeerManager, PeerSender,
+    InboundPeerEnvelope, PeerManager, PeerSender,
 };
 
 fn ok_response(msg: Message, expected_id: u64) -> Response {
@@ -517,6 +517,55 @@ async fn dispatch_request_execute_remote_routes_command_through_peer_manager() {
 }
 
 #[tokio::test]
+async fn dispatch_request_execute_remote_does_not_hold_peer_manager_lock_across_send() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+    let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+    let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
+    let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
+    let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sent = Arc::new(StdMutex::new(Vec::new()));
+    let sender: Arc<dyn PeerSender> =
+        Arc::new(BlockingPeerSender { started: Arc::clone(&started), release: Arc::clone(&release), sent: Arc::clone(&sent) });
+    peer_manager.lock().await.register_sender(HostName::new("feta"), sender);
+
+    let daemon_for_task = Arc::clone(&daemon);
+    let peer_manager_for_task = Arc::clone(&peer_manager);
+    let pending_remote_commands_for_task = Arc::clone(&pending_remote_commands);
+    let forwarded_commands_for_task = Arc::clone(&forwarded_commands);
+    let pending_remote_cancels_for_task = Arc::clone(&pending_remote_cancels);
+    let next_remote_command_id_for_task = Arc::clone(&next_remote_command_id);
+    let dispatch_task = tokio::spawn(async move {
+        let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+        let remote_command_router = make_remote_command_router(
+            &daemon_for_task,
+            &peer_manager_for_task,
+            &pending_remote_commands_for_task,
+            &forwarded_commands_for_task,
+            &pending_remote_cancels_for_task,
+            &next_remote_command_id_for_task,
+        );
+        let request_dispatcher = RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store);
+        request_dispatcher
+            .dispatch(140, Request::Execute {
+                command: Command { host: Some(HostName::new("feta")), context_repo: None, action: CommandAction::Refresh { repo: None } },
+            })
+            .await
+    });
+
+    started.notified().await;
+    let _guard = tokio::time::timeout(Duration::from_millis(100), peer_manager.lock())
+        .await
+        .expect("peer manager lock should remain available while remote command send is blocked");
+
+    release.notify_waiters();
+    let response = dispatch_task.await.expect("dispatch task");
+    assert!(matches!(ok_response(response, 140), Response::Execute { .. }));
+}
+
+#[tokio::test]
 async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
     let (_tmp, daemon) = empty_daemon().await;
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
@@ -597,6 +646,60 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
     remote_command_router.complete_remote_cancel(cancel_id, None).await;
 
     assert!(matches!(ok_response(response.await.expect("cancel task"), 41), Response::Cancel));
+}
+
+#[tokio::test]
+async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_send() {
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sent = Arc::new(StdMutex::new(Vec::new()));
+    let sender: Arc<dyn PeerSender> =
+        Arc::new(BlockingPeerSender { started: Arc::clone(&started), release: Arc::clone(&release), sent: Arc::clone(&sent) });
+
+    {
+        let mut pm = peer_manager.lock().await;
+        pm.register_sender(HostName::new("relay"), sender);
+    }
+
+    let handle_task = tokio::spawn({
+        let peer_manager = Arc::clone(&peer_manager);
+        async move {
+            let mut pm = peer_manager.lock().await;
+            let connection_peer = HostName::new("desktop");
+            let generation = ensure_test_connection_generation(&mut pm, &connection_peer, MockPeerSender::discard);
+            let _ = pm
+                .handle_inbound(InboundPeerEnvelope {
+                    msg: PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
+                        request_id: 7,
+                        requester_host: HostName::new("desktop"),
+                        target_host: HostName::new("relay"),
+                        remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                        command: Box::new(Command {
+                            host: Some(HostName::new("relay")),
+                            context_repo: None,
+                            action: CommandAction::Refresh { repo: None },
+                        }),
+                    }),
+                    connection_generation: generation,
+                    connection_peer,
+                })
+                .await;
+            let pending_sends = pm.take_pending_sends();
+            drop(pm);
+            for pending in pending_sends {
+                let _ = pending.sender.send(pending.msg).await;
+            }
+        }
+    });
+
+    started.notified().await;
+    let _guard = tokio::time::timeout(Duration::from_millis(100), peer_manager.lock())
+        .await
+        .expect("peer manager lock should remain available while routed send is blocked");
+
+    release.notify_waiters();
+    handle_task.await.expect("handle task should finish");
 }
 
 #[test]

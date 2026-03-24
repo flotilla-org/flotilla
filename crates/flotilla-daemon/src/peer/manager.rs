@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    mem,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -127,6 +128,11 @@ pub struct PendingResyncRequest {
     pub deadline_at: Instant,
 }
 
+pub struct PendingPeerSend {
+    pub sender: Arc<dyn PeerSender>,
+    pub msg: PeerWireMessage,
+}
+
 /// Pre-computed overlay update to apply to InProcessDaemon after releasing the PeerManager lock.
 ///
 /// For `SetProviders`, the caller resolves `identity` → local path at apply time
@@ -184,6 +190,7 @@ pub struct PeerManager {
     /// TODO: sweep overdue requests by deadline_at; today these are removed on
     /// reply, targeted disconnect, or process restart.
     pending_resync_requests: HashMap<ReversePathKey, PendingResyncRequest>,
+    pending_sends: Vec<PendingPeerSend>,
     route_epoch: u64,
     request_id_counter: u64,
     peer_data: HashMap<HostName, HashMap<RepoIdentity, PerRepoPeerState>>,
@@ -219,6 +226,7 @@ impl PeerManager {
             routes: HashMap::new(),
             reverse_paths: HashMap::new(),
             pending_resync_requests: HashMap::new(),
+            pending_sends: Vec::new(),
             route_epoch: 0,
             request_id_counter: 0,
             peer_data: HashMap::new(),
@@ -560,7 +568,7 @@ impl PeerManager {
                 self.store_host_summary(summary);
                 HandleResult::Ignored
             }
-            PeerWireMessage::Routed(msg) => self.handle_routed(env.connection_peer, env.connection_generation, msg).await,
+            PeerWireMessage::Routed(msg) => self.handle_routed(env.connection_peer, env.connection_generation, msg),
             PeerWireMessage::Goodbye { reason } => match reason {
                 GoodbyeReason::Superseded => {
                     self.reconnect_suppressed_until
@@ -572,7 +580,7 @@ impl PeerManager {
         }
     }
 
-    async fn handle_routed(&mut self, connection_peer: HostName, connection_generation: u64, msg: RoutedPeerMessage) -> HandleResult {
+    fn handle_routed(&mut self, connection_peer: HostName, connection_generation: u64, msg: RoutedPeerMessage) -> HandleResult {
         match msg {
             RoutedPeerMessage::RequestResync { request_id, requester_host, target_host, remaining_hops, repo_identity, since_seq } => {
                 if remaining_hops == 0 {
@@ -609,7 +617,7 @@ impl PeerManager {
                     repo_identity,
                     since_seq,
                 };
-                let _ = self.send_to(&target_host, PeerWireMessage::Routed(forwarded)).await;
+                self.queue_send_to(&target_host, PeerWireMessage::Routed(forwarded));
                 HandleResult::Ignored
             }
             RoutedPeerMessage::ResyncSnapshot {
@@ -667,8 +675,8 @@ impl PeerManager {
                     seq,
                     data,
                 };
-                if let Some(sender) = self.senders.get(&reverse_hop.next_hop) {
-                    let _ = sender.send(PeerWireMessage::Routed(forwarded)).await;
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
+                    self.pending_sends.push(PendingPeerSend { sender, msg: PeerWireMessage::Routed(forwarded) });
                 }
                 self.reverse_paths.remove(&key);
                 HandleResult::Ignored
@@ -696,7 +704,7 @@ impl PeerManager {
                     remaining_hops: remaining_hops.saturating_sub(1),
                     command,
                 };
-                let _ = self.send_to(&target_host, PeerWireMessage::Routed(forwarded)).await;
+                self.queue_send_to(&target_host, PeerWireMessage::Routed(forwarded));
                 HandleResult::Ignored
             }
             RoutedPeerMessage::CommandCancelRequest { cancel_id, requester_host, target_host, remaining_hops, command_request_id } => {
@@ -731,7 +739,7 @@ impl PeerManager {
                     remaining_hops: remaining_hops.saturating_sub(1),
                     command_request_id,
                 };
-                let _ = self.send_to(&target_host, PeerWireMessage::Routed(forwarded)).await;
+                self.queue_send_to(&target_host, PeerWireMessage::Routed(forwarded));
                 HandleResult::Ignored
             }
             RoutedPeerMessage::CommandEvent { request_id, requester_host, responder_host, remaining_hops, event } => {
@@ -760,8 +768,8 @@ impl PeerManager {
                     remaining_hops: remaining_hops.saturating_sub(1),
                     event,
                 };
-                if let Some(sender) = self.senders.get(&reverse_hop.next_hop) {
-                    let _ = sender.send(PeerWireMessage::Routed(forwarded)).await;
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
+                    self.pending_sends.push(PendingPeerSend { sender, msg: PeerWireMessage::Routed(forwarded) });
                 }
                 HandleResult::Ignored
             }
@@ -791,8 +799,8 @@ impl PeerManager {
                     remaining_hops: remaining_hops.saturating_sub(1),
                     result,
                 };
-                if let Some(sender) = self.senders.get(&reverse_hop.next_hop) {
-                    let _ = sender.send(PeerWireMessage::Routed(forwarded)).await;
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
+                    self.pending_sends.push(PendingPeerSend { sender, msg: PeerWireMessage::Routed(forwarded) });
                 }
                 self.command_reverse_paths.remove(&key);
                 HandleResult::Ignored
@@ -827,8 +835,8 @@ impl PeerManager {
                     remaining_hops: remaining_hops.saturating_sub(1),
                     error,
                 };
-                if let Some(sender) = self.senders.get(&reverse_hop.next_hop) {
-                    let _ = sender.send(PeerWireMessage::Routed(forwarded)).await;
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
+                    self.pending_sends.push(PendingPeerSend { sender, msg: PeerWireMessage::Routed(forwarded) });
                 }
                 self.command_reverse_paths.remove(&key);
                 HandleResult::Ignored
@@ -1112,6 +1120,16 @@ impl PeerManager {
     pub async fn send_to(&self, name: &HostName, msg: PeerWireMessage) -> Result<(), String> {
         let sender = self.resolve_sender(name)?;
         sender.send(msg).await
+    }
+
+    fn queue_send_to(&mut self, name: &HostName, msg: PeerWireMessage) {
+        if let Ok(sender) = self.resolve_sender(name) {
+            self.pending_sends.push(PendingPeerSend { sender, msg });
+        }
+    }
+
+    pub fn take_pending_sends(&mut self) -> Vec<PendingPeerSend> {
+        mem::take(&mut self.pending_sends)
     }
 
     /// Reconnect a specific peer: disconnect, then connect + subscribe.

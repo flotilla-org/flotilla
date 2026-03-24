@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::{remote_commands::RemoteCommandRouter, shared::sync_peer_query_state, PeerConnectedNotice, SshTransport};
-use crate::peer::{HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
+use crate::peer::{HandleResult, InboundPeerEnvelope, PeerManager, PeerSender, PendingPeerSend};
 
 pub(super) enum ForwardResult {
     Disconnected,
@@ -206,7 +206,8 @@ impl PeerRuntime {
 
                             {
                                 let mut pm = peer_manager_task.lock().await;
-                                match pm.handle_inbound(env).await {
+                                let handle_result = pm.handle_inbound(env).await;
+                                match handle_result {
                                     HandleResult::Updated(ref updated_repo_id) => {
                                         let overlay_version = pm.overlay_version();
                                         let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
@@ -216,7 +217,9 @@ impl PeerRuntime {
                                                 repos.get(updated_repo_id).map(|state| (host.clone(), state.provider_data.clone()))
                                             })
                                             .collect();
+                                        let pending_sends = pm.take_pending_sends();
                                         drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
 
                                         if let Some(local_path) = peer_daemon.preferred_local_path_for_identity(updated_repo_id).await {
                                             peer_daemon.set_peer_providers(&local_path, peers, overlay_version).await;
@@ -235,28 +238,35 @@ impl PeerRuntime {
                                     }
                                     HandleResult::ResyncRequested { request_id, requester_host, reply_via, repo, since_seq: _ } => {
                                         let local_host = pm.local_host().clone();
+                                        let reply_sender = pm.resolve_sender(&reply_via);
+                                        let pending_sends = pm.take_pending_sends();
+                                        drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
+
                                         if let Some(local_path) = peer_daemon.preferred_local_path_for_identity(&repo).await {
                                             if let Some((local_providers, seq)) = peer_daemon.get_local_providers(&local_path).await {
                                                 reply_clock.tick(&local_host);
                                                 let response_clock = reply_clock.clone();
-                                                if let Err(e) = pm
-                                                    .send_to(
-                                                        &reply_via,
-                                                        PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
-                                                            request_id,
-                                                            requester_host: requester_host.clone(),
-                                                            responder_host: local_host.clone(),
-                                                            remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                                                            repo_identity: repo.clone(),
-                                                            repo_path: local_path.clone(),
-                                                            clock: response_clock,
-                                                            seq,
-                                                            data: Box::new(local_providers.clone()),
-                                                        }),
-                                                    )
-                                                    .await
-                                                {
-                                                    warn!(peer = %reply_via, err = %e, "failed to send resync response");
+                                                match reply_sender {
+                                                    Ok(sender) => {
+                                                        if let Err(e) = sender
+                                                            .send(PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
+                                                                request_id,
+                                                                requester_host: requester_host.clone(),
+                                                                responder_host: local_host.clone(),
+                                                                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                                                                repo_identity: repo.clone(),
+                                                                repo_path: local_path.clone(),
+                                                                clock: response_clock,
+                                                                seq,
+                                                                data: Box::new(local_providers.clone()),
+                                                            }))
+                                                            .await
+                                                        {
+                                                            warn!(peer = %reply_via, err = %e, "failed to send resync response");
+                                                        }
+                                                    }
+                                                    Err(e) => warn!(peer = %reply_via, err = %e, "failed to send resync response"),
                                                 }
                                             }
                                         }
@@ -264,50 +274,74 @@ impl PeerRuntime {
                                     HandleResult::NeedsResync { from, repo } => {
                                         let local_host = pm.local_host().clone();
                                         let request_id = pm.note_pending_resync_request(from.clone(), repo.clone());
-                                        if let Err(e) = pm
-                                            .send_to(
-                                                &from,
-                                                PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::RequestResync {
-                                                    request_id,
-                                                    requester_host: local_host,
-                                                    target_host: from.clone(),
-                                                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                                                    repo_identity: repo,
-                                                    since_seq: 0,
-                                                }),
-                                            )
-                                            .await
-                                        {
-                                            warn!(peer = %from, err = %e, "failed to send resync request");
+                                        let sender = pm.resolve_sender(&from);
+                                        let pending_sends = pm.take_pending_sends();
+                                        drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
+
+                                        match sender {
+                                            Ok(sender) => {
+                                                if let Err(e) = sender
+                                                    .send(PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::RequestResync {
+                                                        request_id,
+                                                        requester_host: local_host,
+                                                        target_host: from.clone(),
+                                                        remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                                                        repo_identity: repo,
+                                                        since_seq: 0,
+                                                    }))
+                                                    .await
+                                                {
+                                                    warn!(peer = %from, err = %e, "failed to send resync request");
+                                                }
+                                            }
+                                            Err(e) => warn!(peer = %from, err = %e, "failed to send resync request"),
                                         }
                                     }
                                     HandleResult::ReconnectSuppressed { peer } => {
+                                        let pending_sends = pm.take_pending_sends();
+                                        drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
                                         info!(peer = %peer, "peer requested reconnect suppression");
                                     }
                                     HandleResult::CommandRequested { request_id, requester_host, reply_via, command } => {
+                                        let pending_sends = pm.take_pending_sends();
                                         drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
                                         remote_command_router_task
                                             .spawn_forwarded_command(request_id, requester_host, reply_via, command)
                                             .await;
                                     }
                                     HandleResult::CommandCancelRequested { cancel_id, requester_host, reply_via, command_request_id } => {
+                                        let pending_sends = pm.take_pending_sends();
                                         drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
                                         remote_command_router_task
                                             .spawn_forwarded_cancel(cancel_id, requester_host, reply_via, command_request_id);
                                     }
                                     HandleResult::CommandEventReceived { request_id, responder_host, event } => {
+                                        let pending_sends = pm.take_pending_sends();
                                         drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
                                         remote_command_router_task.emit_remote_command_event(request_id, responder_host, event).await;
                                     }
                                     HandleResult::CommandResponseReceived { request_id, responder_host, result } => {
+                                        let pending_sends = pm.take_pending_sends();
                                         drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
                                         remote_command_router_task.complete_remote_command(request_id, responder_host, result).await;
                                     }
                                     HandleResult::CommandCancelResponseReceived { cancel_id, responder_host: _, error } => {
+                                        let pending_sends = pm.take_pending_sends();
                                         drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
                                         remote_command_router_task.complete_remote_cancel(cancel_id, error).await;
                                     }
-                                    HandleResult::Ignored => {}
+                                    HandleResult::Ignored => {
+                                        let pending_sends = pm.take_pending_sends();
+                                        drop(pm);
+                                        dispatch_pending_sends(pending_sends).await;
+                                    }
                                 }
                             }
                             sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
@@ -522,6 +556,14 @@ pub(super) async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManage
         };
         if let Err(e) = sender.send(PeerWireMessage::Routed(request)).await {
             warn!(peer = %target, err = %e, "failed to dispatch routed resync request");
+        }
+    }
+}
+
+async fn dispatch_pending_sends(pending_sends: Vec<PendingPeerSend>) {
+    for pending in pending_sends {
+        if let Err(e) = pending.sender.send(pending.msg).await {
+            warn!(err = %e, "failed to dispatch queued peer message");
         }
     }
 }
