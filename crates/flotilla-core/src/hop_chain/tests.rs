@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -18,7 +18,7 @@ use crate::{
         InMemoryAttachableStore, SharedAttachableStore, TerminalAttachable, TerminalPurpose,
     },
     config::{HostsConfig, RemoteHostConfig, SshConfig},
-    path_context::ExecutionEnvironmentPath,
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession},
 };
 
@@ -105,12 +105,12 @@ fn test_hosts_config() -> HostsConfig {
 
 fn test_resolver() -> SshRemoteHopResolver {
     // Use a temp dir for config_base so SSH control socket dir creation works
-    let config_base = std::env::temp_dir().join("flotilla-test-ssh-resolver");
+    let config_base = DaemonHostPath::new(std::env::temp_dir().join("flotilla-test-ssh-resolver"));
     SshRemoteHopResolver::new(config_base, test_hosts_config())
 }
 
 fn test_resolver_no_multiplex() -> SshRemoteHopResolver {
-    let config_base = std::env::temp_dir().join("flotilla-test-ssh-resolver-nomux");
+    let config_base = DaemonHostPath::new(std::env::temp_dir().join("flotilla-test-ssh-resolver-nomux"));
     let hosts = HostsConfig { ssh: SshConfig { multiplex: false }, hosts: test_hosts_config().hosts };
     SshRemoteHopResolver::new(config_base, hosts)
 }
@@ -121,7 +121,7 @@ fn test_resolver_no_multiplex() -> SshRemoteHopResolver {
 fn wrap_with_working_directory_and_inner_command() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
         Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
@@ -200,7 +200,7 @@ fn wrap_without_working_directory() {
 fn wrap_empty_command_with_working_directory_produces_login_shell() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![]));
 
     resolver.resolve_wrap(&HostName::new("feta"), &mut context).expect("resolve_wrap should succeed");
@@ -361,7 +361,7 @@ fn wrap_does_not_update_current_host() {
 fn enter_produces_ssh_command_and_sendkeys() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
         Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
@@ -447,7 +447,7 @@ fn enter_empty_command_no_sendkeys() {
 fn enter_with_working_directory_and_empty_command() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/remote/dir"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/remote/dir"));
     context.actions.push(ResolvedAction::Command(vec![]));
 
     resolver.resolve_enter(&HostName::new("feta"), &mut context).expect("resolve_enter should succeed");
@@ -493,7 +493,7 @@ fn regression_flatten_matches_old_ssh_wrap_pattern() {
 
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
         Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
@@ -554,7 +554,7 @@ fn regression_flatten_empty_command_matches_login_shell_pattern() {
     // Old code for empty command: "cd '/dir' && exec $SHELL -l"
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![]));
 
     resolver.resolve_wrap(&HostName::new("feta"), &mut context).expect("resolve_wrap should succeed");
@@ -1407,7 +1407,7 @@ fn snapshot_e2e_workspace_creation_flow() {
     let mut context = ResolutionContext {
         current_host: local_host,
         current_environment: None,
-        working_directory: Some(PathBuf::from("/home/alice/dev/my-repo/wt-feat")),
+        working_directory: Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo/wt-feat")),
         actions: Vec::new(),
         nesting_depth: 0,
     };
@@ -1494,7 +1494,7 @@ fn snapshot_e2e_remote_workspace_send_keys() {
     let mut context = ResolutionContext {
         current_host: local_host,
         current_environment: None,
-        working_directory: Some(PathBuf::from("/home/alice/dev/my-repo/wt-feat")),
+        working_directory: Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo/wt-feat")),
         actions: Vec::new(),
         nesting_depth: 0,
     };
