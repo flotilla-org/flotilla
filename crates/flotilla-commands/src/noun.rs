@@ -11,7 +11,6 @@ use crate::{
 pub enum NounCommand {
     Repo(RepoNoun),
     Checkout(CheckoutNoun),
-    #[command(visible_alias = "pr")]
     Cr(CrNoun),
     Issue(IssueNoun),
     Agent(AgentNoun),

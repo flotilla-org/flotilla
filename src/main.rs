@@ -75,8 +75,7 @@ enum SubCommand {
     Repo(flotilla_commands::commands::repo::RepoNoun),
     /// Manage checkouts
     Checkout(flotilla_commands::commands::checkout::CheckoutNoun),
-    /// Code review
-    #[command(visible_alias = "pr")]
+    /// Code review (alias on CrNoun itself, not duplicated here)
     Cr(flotilla_commands::commands::cr::CrNoun),
     /// Issues
     Issue(flotilla_commands::commands::issue::IssueNoun),

@@ -63,11 +63,19 @@ fn walk_for_completions(tokens: &[&str], cmd: &Command, pos: usize, partial: &st
 /// at this point in the command tree. For commands that accept external subcommands
 /// (like host routing), also include the routable noun names.
 fn valid_next_tokens(cmd: &Command) -> Vec<CompletionItem> {
-    let mut items: Vec<CompletionItem> = cmd
-        .get_subcommands()
-        .filter(|sub| !sub.is_hide_set())
-        .map(|sub| CompletionItem { value: sub.get_name().to_string(), description: sub.get_about().map(|a| a.to_string()) })
-        .collect();
+    let mut items: Vec<CompletionItem> = Vec::new();
+
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        let desc = sub.get_about().map(|a| a.to_string());
+        items.push(CompletionItem { value: sub.get_name().to_string(), description: desc.clone() });
+        // Also emit visible aliases so `pr` completes like `cr`.
+        for alias in sub.get_visible_aliases() {
+            items.push(CompletionItem { value: alias.to_string(), description: desc.clone() });
+        }
+    }
 
     // Add flags and options (--long forms only).
     for arg in cmd.get_arguments() {
@@ -82,14 +90,20 @@ fn valid_next_tokens(cmd: &Command) -> Vec<CompletionItem> {
     }
 
     // If the command allows external subcommands (host routing position),
-    // also offer the routable noun names.
+    // also offer the routable noun names and their aliases.
     if cmd.is_allow_external_subcommands_set() {
         let tmp = NounCommand::augment_subcommands(Command::new("tmp"));
         for sub in tmp.get_subcommands() {
+            let desc = sub.get_about().map(|a| a.to_string());
             let name = sub.get_name().to_string();
-            // Avoid duplicates (a noun might already be a real subcommand).
             if !items.iter().any(|i| i.value == name) {
-                items.push(CompletionItem { value: name, description: sub.get_about().map(|a| a.to_string()) });
+                items.push(CompletionItem { value: name, description: desc.clone() });
+            }
+            for alias in sub.get_visible_aliases() {
+                let alias_str = alias.to_string();
+                if !items.iter().any(|i| i.value == alias_str) {
+                    items.push(CompletionItem { value: alias_str, description: desc.clone() });
+                }
             }
         }
     }
@@ -97,11 +111,11 @@ fn valid_next_tokens(cmd: &Command) -> Vec<CompletionItem> {
     items
 }
 
-/// Look up a noun command by name from `NounCommand`'s clap subcommands.
+/// Look up a noun command by name or alias from `NounCommand`'s clap subcommands.
 /// Returns a cloned `Command` if found, so callers can recurse into it.
 fn find_noun_command(name: &str) -> Option<Command> {
     let tmp = NounCommand::augment_subcommands(Command::new("tmp"));
-    let found = tmp.get_subcommands().find(|sub| sub.get_name() == name).cloned();
+    let found = tmp.get_subcommands().find(|sub| sub.get_name() == name || sub.get_all_aliases().any(|a| a == name)).cloned();
     found
 }
 
@@ -205,5 +219,27 @@ mod tests {
         let completions = complete(&test_root(), "repo myslug checkout --fr", 26);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"--fresh"));
+    }
+
+    #[test]
+    fn pr_alias_completes_at_root() {
+        let completions = complete(&test_root(), "p", 1);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"pr"), "pr alias should appear in completions, got: {values:?}");
+    }
+
+    #[test]
+    fn pr_alias_completes_in_host_routing() {
+        let completions = complete(&test_root(), "host alpha p", 12);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"pr"), "pr alias should appear in host routing completions, got: {values:?}");
+    }
+
+    #[test]
+    fn host_routed_pr_completes_to_verbs() {
+        let completions = complete(&test_root(), "host alpha pr 42 ", 18);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"open"), "pr 42 should complete to verbs, got: {values:?}");
+        assert!(values.contains(&"close"));
     }
 }
