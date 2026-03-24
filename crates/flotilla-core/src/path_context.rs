@@ -82,4 +82,3 @@ impl fmt::Display for ExecutionEnvironmentPath {
         self.0.display().fmt(f)
     }
 }
-
