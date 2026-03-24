@@ -31,7 +31,7 @@ use crate::{
     host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
-    path_context::ExecutionEnvironmentPath,
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag},
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
@@ -1710,7 +1710,7 @@ impl DaemonHandle for InProcessDaemon {
 
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
-        let config_base = self.config.base_path().as_path().to_path_buf();
+        let config_base = DaemonHostPath::new(self.config.base_path().as_path());
 
         // Register the cancellation token before broadcasting CommandStarted
         // so cancel(id) can find it the instant the TUI sees the event.
@@ -1742,16 +1742,18 @@ impl DaemonHandle for InProcessDaemon {
             let resolver_config_base = config_base.clone();
             let resolver_attachable_store = attachable_store.clone();
             let resolver_local_host = local_host.clone();
-            let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: repo_path.clone() };
+            let ee_repo_path = ExecutionEnvironmentPath::new(&repo_path);
+            let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path.clone() };
+            let daemon_socket_dhp = daemon_socket_path.map(DaemonHostPath::new);
 
             let plan = executor::build_plan(
                 command,
-                executor::RepoExecutionContext { identity: repo_identity.clone(), root: repo_path.clone() },
+                executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
                 registry,
                 providers_data,
                 config_base,
                 attachable_store,
-                daemon_socket_path.clone(),
+                daemon_socket_dhp.clone(),
                 local_host,
                 None,
             )
@@ -1780,7 +1782,7 @@ impl DaemonHandle for InProcessDaemon {
                         runner: resolver_runner,
                         config_base: resolver_config_base,
                         attachable_store: resolver_attachable_store,
-                        daemon_socket_path: daemon_socket_path.clone(),
+                        daemon_socket_path: daemon_socket_dhp.clone(),
                         local_host: resolver_local_host,
                     };
                     let result = run_step_plan(
@@ -1788,7 +1790,7 @@ impl DaemonHandle for InProcessDaemon {
                         id,
                         command_host.clone(),
                         repo_identity.clone(),
-                        repo_path.clone(),
+                        ExecutionEnvironmentPath::new(&repo_path),
                         token,
                         event_tx.clone(),
                         &resolver,

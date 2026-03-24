@@ -106,7 +106,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         // The resolved commands handle entering the remote checkout path.
         let working_dir = local_workspace_directory(self.repo_root, self.config_base);
         let remote_name = format!("{branch}@{target_host}");
-        let mut config = workspace_config(self.repo_root, &remote_name, &working_dir, "claude", self.config_base);
+        let mut config = workspace_config(self.repo_root, &remote_name, working_dir.as_path(), "claude", self.config_base);
         config.resolved_commands = Some(resolved_commands);
 
         match ws_mgr.create_workspace(&config).await {

@@ -1,12 +1,10 @@
-use std::path::PathBuf;
-
 use flotilla_protocol::{
     AttachableSetId, CommandValue, DaemonEvent, HostName, HostPath, PreparedTerminalCommand, RepoIdentity, ResolvedPaneCommand, StepStatus,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::checkout::CheckoutIntent;
+use crate::{executor::checkout::CheckoutIntent, path_context::ExecutionEnvironmentPath};
 
 /// Outcome of a single step execution.
 #[derive(Debug, Clone)]
@@ -52,7 +50,7 @@ pub enum StepAction {
     /// Create a workspace for a checkout path produced by a prior step.
     CreateWorkspaceForCheckout {
         label: String,
-        checkout_path: Option<PathBuf>,
+        checkout_path: Option<ExecutionEnvironmentPath>,
     },
 
     // Teleport
@@ -61,8 +59,8 @@ pub enum StepAction {
     },
     EnsureCheckoutForTeleport {
         branch: Option<String>,
-        checkout_key: Option<PathBuf>,
-        initial_path: Option<PathBuf>,
+        checkout_key: Option<ExecutionEnvironmentPath>,
+        initial_path: Option<ExecutionEnvironmentPath>,
     },
     CreateTeleportWorkspace {
         /// Unused by the current resolver, but kept for batch 2: remote step
@@ -83,7 +81,7 @@ pub enum StepAction {
     CreateWorkspaceFromPreparedTerminal {
         target_host: HostName,
         branch: String,
-        checkout_path: PathBuf,
+        checkout_path: ExecutionEnvironmentPath,
         attachable_set_id: Option<AttachableSetId>,
         commands: Vec<ResolvedPaneCommand>,
     },
@@ -91,14 +89,14 @@ pub enum StepAction {
         ws_ref: String,
     },
     PrepareTerminalForCheckout {
-        checkout_path: PathBuf,
+        checkout_path: ExecutionEnvironmentPath,
         commands: Vec<PreparedTerminalCommand>,
     },
 
     // Query
     FetchCheckoutStatus {
         branch: String,
-        checkout_path: Option<PathBuf>,
+        checkout_path: Option<ExecutionEnvironmentPath>,
         change_request_id: Option<String>,
     },
 
@@ -153,7 +151,7 @@ pub async fn run_step_plan(
     command_id: u64,
     host: HostName,
     repo_identity: RepoIdentity,
-    repo: PathBuf,
+    repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
     event_tx: broadcast::Sender<DaemonEvent>,
     resolver: &dyn StepResolver,
@@ -170,7 +168,7 @@ pub async fn run_step_plan(
             command_id,
             host: host.clone(),
             repo_identity: repo_identity.clone(),
-            repo: repo.clone(),
+            repo: repo.as_path().to_path_buf(),
             step_index: i,
             step_count,
             description: step.description.clone(),
@@ -195,7 +193,7 @@ pub async fn run_step_plan(
                     command_id,
                     host: host.clone(),
                     repo_identity: repo_identity.clone(),
-                    repo: repo.clone(),
+                    repo: repo.as_path().to_path_buf(),
                     step_index: i,
                     step_count,
                     description: step.description.clone(),
@@ -208,7 +206,7 @@ pub async fn run_step_plan(
                     command_id,
                     host: host.clone(),
                     repo_identity: repo_identity.clone(),
-                    repo: repo.clone(),
+                    repo: repo.as_path().to_path_buf(),
                     step_index: i,
                     step_count,
                     description: step.description.clone(),

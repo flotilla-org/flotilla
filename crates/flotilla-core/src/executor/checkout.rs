@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
@@ -30,25 +30,28 @@ impl<'a> CheckoutService<'a> {
         validate_checkout_target(repo_root, branch, intent, self.runner).await
     }
 
-    pub(super) async fn create_checkout(&self, repo_root: &Path, branch: &str, create_branch: bool) -> Result<PathBuf, String> {
+    pub(super) async fn create_checkout(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        create_branch: bool,
+    ) -> Result<ExecutionEnvironmentPath, String> {
         let checkout_manager =
             self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        let ee_root = ExecutionEnvironmentPath::new(repo_root);
-        let (path, _checkout) = checkout_manager.create_checkout(&ee_root, branch, create_branch).await?;
-        Ok(path.into_path_buf())
+        let (path, _checkout) = checkout_manager.create_checkout(repo_root, branch, create_branch).await?;
+        Ok(path)
     }
 
     pub(super) async fn remove_checkout(
         &self,
-        repo_root: &Path,
+        repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         deleted_checkout_paths: &[HostPath],
         terminal_manager: Option<&TerminalManager>,
     ) -> Result<(), String> {
         let checkout_manager =
             self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        let ee_root = ExecutionEnvironmentPath::new(repo_root);
-        checkout_manager.remove_checkout(&ee_root, branch).await?;
+        checkout_manager.remove_checkout(repo_root, branch).await?;
 
         // Cascade: remove attachable sets and kill terminal sessions for deleted checkouts
         if let Some(tm) = terminal_manager {
