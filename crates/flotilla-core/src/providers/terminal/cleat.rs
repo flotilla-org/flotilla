@@ -55,6 +55,12 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
+        // If the session already exists, leave it alone.
+        let existing = self.list_sessions().await.unwrap_or_default();
+        if existing.iter().any(|s| s.session_name == session_name) {
+            return Ok(());
+        }
+
         let effective_cmd = if env_vars.is_empty() {
             command.to_string()
         } else {
@@ -121,35 +127,57 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_creates_session() {
-        let json = r#"{"id":"my-session","cwd":"/repo","cmd":"bash","status":"Detached"}"#;
-        let runner = Arc::new(MockRunner::new(vec![Ok(json.into())]));
+        let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"bash","status":"Detached"}"#;
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("[]".into()),        // list_sessions: empty (session doesn't exist)
+            Ok(create_json.into()), // create response
+        ]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         pool.ensure_session("my-session", "bash", Path::new("/repo"), &vec![]).await.expect("ensure session");
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "cleat");
-        assert_eq!(calls[0].1, vec!["create", "--json", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "cleat");
+        assert_eq!(calls[1].1, vec!["create", "--json", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
     }
 
     #[tokio::test]
     async fn ensure_session_includes_env_vars_in_cmd() {
-        let json = r#"{"id":"my-session","cwd":"/repo","cmd":"env FOO=bar claude","status":"Detached"}"#;
-        let runner = Arc::new(MockRunner::new(vec![Ok(json.into())]));
+        let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"env FOO='bar' claude","status":"Detached"}"#;
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("[]".into()),        // list_sessions: empty
+            Ok(create_json.into()), // create response
+        ]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
 
         pool.ensure_session("my-session", "claude", Path::new("/repo"), &env).await.expect("ensure session");
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "cleat");
-        let cmd_idx = calls[0].1.iter().position(|a| a == "--cmd").expect("--cmd present");
-        let cmd_val = &calls[0].1[cmd_idx + 1];
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "cleat");
+        let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
+        let cmd_val = &calls[1].1[cmd_idx + 1];
         assert!(cmd_val.starts_with("env "), "should prefix with env: {cmd_val}");
         assert!(cmd_val.contains("FOO='bar'"), "should contain quoted env var: {cmd_val}");
         assert!(cmd_val.ends_with("claude"), "should end with command: {cmd_val}");
+    }
+
+    #[tokio::test]
+    async fn ensure_session_skips_if_session_exists() {
+        let list_json = r#"[{"id":"my-session","cwd":"/repo","cmd":"claude","status":"Detached"}]"#;
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(list_json.into()), // list_sessions: session exists
+        ]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+
+        pool.ensure_session("my-session", "claude", Path::new("/repo"), &env).await.expect("ensure session");
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "should only call list, not create: {calls:?}");
+        assert!(calls[0].1.contains(&"list".to_string()), "should be a list call: {:?}", calls[0].1);
     }
 
     #[tokio::test]
