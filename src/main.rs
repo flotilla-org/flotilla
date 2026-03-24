@@ -567,14 +567,16 @@ complete -F _flotilla flotilla
             );
         }
         CompletionShell::Zsh => {
+            // Pass the full command line and absolute cursor position.
+            // words[*] is the full line split by words; CURSOR is the absolute byte offset.
             print!(
                 r#"#compdef flotilla
 _flotilla() {{
     local -a completions
-    local line
+    local line="${{words[*]}}"
     while IFS=$'\t' read -r val desc; do
         [ -n "$val" ] && completions+=("$val:$desc")
-    done < <(flotilla complete "${{words[2,-1]}}" "${{CURSOR}}" 2>/dev/null)
+    done < <(flotilla complete "$line" "${{CURSOR}}" 2>/dev/null)
     _describe 'flotilla' completions
 }}
 compdef _flotilla flotilla

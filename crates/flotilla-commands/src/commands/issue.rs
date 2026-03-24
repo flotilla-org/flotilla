@@ -41,6 +41,8 @@ impl IssueNoun {
             (_, Some(IssueVerb::Search { query })) => Ok(Resolved::Command(Command {
                 host: None,
                 context_repo: None,
+                // SENTINEL: repo is empty — `inject_repo_context` in main.rs must fill it
+                // from --repo flag or FLOTILLA_REPO env before dispatch to the daemon.
                 action: CommandAction::SearchIssues { repo: RepoSelector::Query("".into()), query: query.join(" ") },
             })),
             (_, None) => Err("missing issue verb".into()),

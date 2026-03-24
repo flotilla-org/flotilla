@@ -41,6 +41,8 @@ impl CheckoutNoun {
         match (self.subject, self.verb) {
             (_, Some(CheckoutVerb::Create { branch, fresh })) => {
                 let target = if fresh { CheckoutTarget::FreshBranch(branch) } else { CheckoutTarget::Branch(branch) };
+                // SENTINEL: repo is empty — `inject_repo_context` in main.rs must fill it
+                // from --repo flag or FLOTILLA_REPO env before dispatch to the daemon.
                 Ok(Resolved::Command(Command {
                     host: None,
                     context_repo: None,

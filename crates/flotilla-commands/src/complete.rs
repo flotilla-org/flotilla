@@ -56,6 +56,10 @@ fn walk_for_completions(tokens: &[&str], cmd: &Command, pos: usize, partial: &st
 
     // Otherwise treat the token as a positional argument (e.g. a subject slug)
     // and keep walking.
+    // TODO: flags that take a value (e.g. --branch feat) consume two tokens, but
+    // this advances by one. The value token gets treated as a positional on the
+    // next iteration. Works accidentally for static completions but breaks
+    // mid-token value completion for value-accepting flags.
     walk_for_completions(tokens, cmd, pos + 1, partial)
 }
 

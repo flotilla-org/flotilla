@@ -22,8 +22,8 @@ pub enum RepoVerb {
     Add { path: PathBuf },
     /// Stop tracking a repository
     Remove { repo: String },
-    /// Refresh repository data
-    Refresh { repo: Option<String> },
+    /// Refresh repository data (use subject for specific repo, or `repo all refresh` for all)
+    Refresh,
     /// Check out a branch in a repository
     Checkout {
         branch: String,
@@ -49,9 +49,9 @@ impl RepoNoun {
                 context_repo: None,
                 action: CommandAction::UntrackRepo { repo: RepoSelector::Query(repo) },
             })),
-            (subject, Some(RepoVerb::Refresh { repo })) => {
-                // Explicit verb arg takes priority; fall back to subject
-                let resolved_repo = repo.or(subject).map(RepoSelector::Query);
+            (subject, Some(RepoVerb::Refresh)) => {
+                // `repo myslug refresh` → refresh specific, `repo refresh` or `repo all refresh` → refresh all
+                let resolved_repo = subject.filter(|s| s != "all").map(RepoSelector::Query);
                 Ok(Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: resolved_repo } }))
             }
             (Some(subject), Some(RepoVerb::Checkout { branch, fresh })) => {
@@ -89,12 +89,7 @@ impl fmt::Display for RepoNoun {
             match verb {
                 RepoVerb::Add { path } => write!(f, " add {}", path.display())?,
                 RepoVerb::Remove { repo } => write!(f, " remove {repo}")?,
-                RepoVerb::Refresh { repo } => {
-                    write!(f, " refresh")?;
-                    if let Some(r) = repo {
-                        write!(f, " {r}")?;
-                    }
-                }
+                RepoVerb::Refresh => write!(f, " refresh")?,
                 RepoVerb::Checkout { branch, fresh } => {
                     write!(f, " checkout")?;
                     if *fresh {
@@ -170,7 +165,8 @@ mod tests {
 
     #[test]
     fn repo_refresh_specific() {
-        let resolved = parse(&["repo", "refresh", "owner/repo"]).resolve().unwrap();
+        // noun-subject-verb form: `repo owner/repo refresh`
+        let resolved = parse(&["repo", "owner/repo", "refresh"]).resolve().unwrap();
         assert_eq!(
             resolved,
             Resolved::Command(Command {
@@ -179,6 +175,13 @@ mod tests {
                 action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
             })
         );
+    }
+
+    #[test]
+    fn repo_all_refresh() {
+        // `repo all refresh` is the explicit "refresh everything" form
+        let resolved = parse(&["repo", "all", "refresh"]).resolve().unwrap();
+        assert_eq!(resolved, Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
     }
 
     #[test]
@@ -248,9 +251,16 @@ mod tests {
 
     #[test]
     fn repo_subject_form_refresh() {
-        // `repo myslug refresh` — subject used as repo
+        // `repo myslug refresh` — subject used as repo (noun-subject-verb canonical form)
         let resolved = parse(&["repo", "myslug", "refresh"]).resolve().unwrap();
         assert!(matches!(resolved, Resolved::Command(Command { action: CommandAction::Refresh { repo: Some(_) }, .. })));
+    }
+
+    #[test]
+    fn repo_refresh_no_subject_is_all() {
+        // `repo refresh` with no subject means refresh all (shorthand for `repo all refresh`)
+        let resolved = parse(&["repo", "refresh"]).resolve().unwrap();
+        assert_eq!(resolved, Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
     }
 
     #[test]
@@ -290,7 +300,12 @@ mod tests {
 
     #[test]
     fn round_trip_refresh_specific() {
-        assert_round_trip(&["repo", "refresh", "org/repo"]);
+        assert_round_trip(&["repo", "org/repo", "refresh"]);
+    }
+
+    #[test]
+    fn round_trip_all_refresh() {
+        assert_round_trip(&["repo", "all", "refresh"]);
     }
 
     #[test]
