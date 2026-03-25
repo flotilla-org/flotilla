@@ -61,9 +61,13 @@ interactions:
     let session = Session::replaying(&path, masks);
     let runner = Arc::new(ReplayRunner::new(session.clone()));
 
-    use crate::providers::vcs::{git::GitVcs, Vcs};
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::vcs::{git::GitVcs, Vcs},
+    };
     let git = GitVcs::new(runner);
-    let branches = git.list_local_branches(Path::new("/test/repo")).await.unwrap();
+    let repo = ExecutionEnvironmentPath::new("/test/repo");
+    let branches = git.list_local_branches(&repo).await.unwrap();
 
     assert_eq!(branches.len(), 2);
     assert_eq!(branches[0].name, "main");

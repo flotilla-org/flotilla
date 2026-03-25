@@ -1,18 +1,18 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, TerminalStatus};
 
 use super::{TerminalEnvVars, TerminalPool, TerminalSession};
-use crate::providers::{run, run_output, CommandRunner};
+use crate::{
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    providers::{run, run_output, CommandRunner},
+};
 
 pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
-    socket_path: PathBuf,
-    config_path: PathBuf,
+    socket_path: DaemonHostPath,
+    config_path: DaemonHostPath,
 }
 
 /// Shpool config content managed by flotilla.
@@ -43,17 +43,17 @@ enum ShpoolNoPidProbe {
 impl ShpoolTerminalPool {
     /// Create a new ShpoolTerminalPool, cleaning up stale sockets and
     /// spawning the daemon with flotilla's managed config.
-    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
-        let config_path = socket_path.parent().unwrap_or(Path::new(".")).join("config.toml");
-        let config_stale = Self::config_needs_update(&config_path);
-        let mut daemon_state = Self::detect_daemon_state(Arc::clone(&runner), &socket_path, &config_path).await;
+    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: DaemonHostPath) -> Self {
+        let config_path = DaemonHostPath::new(socket_path.as_path().parent().unwrap_or(Path::new(".")).join("config.toml"));
+        let config_stale = Self::config_needs_update(config_path.as_path());
+        let mut daemon_state = Self::detect_daemon_state(Arc::clone(&runner), socket_path.as_path(), config_path.as_path()).await;
 
         if daemon_state == ShpoolDaemonState::Stale {
-            let pid_path = socket_path.with_file_name("daemonized-shpool.pid");
+            let pid_path = socket_path.as_path().with_file_name("daemonized-shpool.pid");
             if pid_path.exists() {
-                let _ = Self::stop_daemon(&socket_path, "shpool").await;
+                let _ = Self::stop_daemon(socket_path.as_path(), "shpool").await;
             } else {
-                Self::clean_stale_socket(&socket_path);
+                Self::clean_stale_socket(socket_path.as_path());
             }
             daemon_state = ShpoolDaemonState::Missing;
         }
@@ -62,11 +62,11 @@ impl ShpoolTerminalPool {
             // Daemon is alive but config changed. Validate we can persist
             // the new config BEFORE killing the daemon, so a write failure
             // doesn't tear down sessions for nothing.
-            let tmp_path = config_path.with_extension("toml.tmp");
+            let tmp_path = config_path.as_path().with_extension("toml.tmp");
             if Self::write_config(&tmp_path) {
                 tracing::info!("shpool config changed, restarting daemon");
-                if Self::stop_daemon(&socket_path, "shpool").await {
-                    if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
+                if Self::stop_daemon(socket_path.as_path(), "shpool").await {
+                    if let Err(e) = std::fs::rename(&tmp_path, config_path.as_path()) {
                         tracing::warn!(err = %e, "failed to rename config, cleaning up temp");
                         let _ = std::fs::remove_file(&tmp_path);
                     }
@@ -77,22 +77,22 @@ impl ShpoolTerminalPool {
             }
         } else if config_stale && daemon_state == ShpoolDaemonState::HealthyWithoutPid {
             tracing::warn!("shpool config changed but daemon has no pid file; writing config for future restart");
-            Self::write_config(&config_path);
+            Self::write_config(config_path.as_path());
         } else if config_stale && daemon_state == ShpoolDaemonState::InconclusiveWithoutPid {
             tracing::warn!("shpool probe was inconclusive without a pid file; leaving socket and config untouched");
         } else if config_stale {
             // No daemon running, safe to write config directly.
-            Self::write_config(&config_path);
+            Self::write_config(config_path.as_path());
         }
-        Self::start_daemon(&socket_path, &config_path).await;
+        Self::start_daemon(socket_path.as_path(), config_path.as_path()).await;
         Self { runner, socket_path, config_path }
     }
 
     /// Sync constructor for tests — skips daemon lifecycle.
     #[cfg(test)]
-    pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: PathBuf) -> Self {
-        let config_path = socket_path.parent().unwrap_or(Path::new(".")).join("config.toml");
-        Self::write_config(&config_path);
+    pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: DaemonHostPath) -> Self {
+        let config_path = DaemonHostPath::new(socket_path.as_path().parent().unwrap_or(Path::new(".")).join("config.toml"));
+        Self::write_config(config_path.as_path());
         Self { runner, socket_path, config_path }
     }
 
@@ -414,8 +414,8 @@ impl ShpoolTerminalPool {
     /// Check whether a session with the given name exists in the shpool daemon.
     /// Unlike `list_sessions()`, this checks ALL sessions (no `flotilla/` prefix filter).
     async fn session_exists(&self, session_name: &str) -> bool {
-        let socket_str = self.socket_path.display().to_string();
-        let config_str = self.config_path.display().to_string();
+        let socket_str = self.socket_path.as_path().display().to_string();
+        let config_str = self.config_path.as_path().display().to_string();
         let result = run!(self.runner, "shpool", &["--socket", &socket_str, "-c", &config_str, "list", "--json"], Path::new("/"));
         match result {
             Ok(json) => {
@@ -481,8 +481,8 @@ impl ShpoolTerminalPool {
 #[async_trait]
 impl TerminalPool for ShpoolTerminalPool {
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
-        let socket_path_str = self.socket_path.display().to_string();
-        let config_path_str = self.config_path.display().to_string();
+        let socket_path_str = self.socket_path.as_path().display().to_string();
+        let config_path_str = self.config_path.as_path().display().to_string();
         let result = run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "list", "--json"], Path::new("/"));
 
         match result {
@@ -494,7 +494,13 @@ impl TerminalPool for ShpoolTerminalPool {
         }
     }
 
-    async fn ensure_session(&self, session_name: &str, command: &str, cwd: &Path, env_vars: &TerminalEnvVars) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+    ) -> Result<(), String> {
         // If the session already exists, leave it alone — don't disrupt a
         // live attach by re-running attach+detach. We can't use list_sessions()
         // here because it filters to flotilla/-prefixed names, but session
@@ -522,9 +528,9 @@ impl TerminalPool for ShpoolTerminalPool {
         }
         let cmd_str = cmd_parts.join(" ");
 
-        let socket_str = self.socket_path.display().to_string();
-        let config_str = self.config_path.display().to_string();
-        let cwd_str = cwd.display().to_string();
+        let socket_str = self.socket_path.as_path().display().to_string();
+        let config_str = self.config_path.as_path().display().to_string();
+        let cwd_str = cwd.as_path().display().to_string();
 
         // Create the session by attaching. Without a TTY, shpool creates the
         // session and the attach process exits on its own with a non-zero
@@ -551,24 +557,30 @@ impl TerminalPool for ShpoolTerminalPool {
         Ok(())
     }
 
-    fn attach_args(&self, session_name: &str, _command: &str, cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
+    fn attach_args(
+        &self,
+        session_name: &str,
+        _command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        _env_vars: &TerminalEnvVars,
+    ) -> Result<Vec<Arg>, String> {
         Ok(vec![
             Arg::Quoted("shpool".into()),
             Arg::Literal("--socket".into()),
-            Arg::Quoted(self.socket_path.display().to_string()),
+            Arg::Quoted(self.socket_path.as_path().display().to_string()),
             Arg::Literal("-c".into()),
-            Arg::Quoted(self.config_path.display().to_string()),
+            Arg::Quoted(self.config_path.as_path().display().to_string()),
             Arg::Literal("attach".into()),
             Arg::Literal("--force".into()),
             Arg::Literal("--dir".into()),
-            Arg::Quoted(cwd.display().to_string()),
+            Arg::Quoted(cwd.as_path().display().to_string()),
             Arg::Quoted(session_name.into()),
         ])
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        let socket_path_str = self.socket_path.display().to_string();
-        let config_path_str = self.config_path.display().to_string();
+        let socket_path_str = self.socket_path.as_path().display().to_string();
+        let config_path_str = self.config_path.as_path().display().to_string();
         run!(self.runner, "shpool", &["--socket", &socket_path_str, "-c", &config_path_str, "kill", session_name], Path::new("/"))
             .map(|_| ())
     }

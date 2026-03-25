@@ -408,7 +408,7 @@ impl App {
     /// Resolve the local workspace template into role→command pairs.
     /// Used to tell the remote host what commands to prepare.
     pub fn local_template_commands(&self) -> Vec<flotilla_protocol::PreparedTerminalCommand> {
-        flotilla_core::template::resolve_template_commands(self.model.active_repo_root(), self.config.base_path())
+        flotilla_core::template::resolve_template_commands(self.model.active_repo_root(), self.config.base_path().as_path())
     }
 
     fn item_execution_host(&self, item: &WorkItem) -> Option<HostName> {
@@ -426,8 +426,14 @@ impl App {
         collect_visible_status_items(&self.model, &self.ui)
     }
 
-    pub fn persisted_tab_order_paths(&self) -> Vec<PathBuf> {
-        self.model.repo_order.iter().filter_map(|repo_identity| self.model.repos.get(repo_identity).map(|repo| repo.path.clone())).collect()
+    pub fn persisted_tab_order_paths(&self) -> Vec<flotilla_core::path_context::ExecutionEnvironmentPath> {
+        self.model
+            .repo_order
+            .iter()
+            .filter_map(|repo_identity| {
+                self.model.repos.get(repo_identity).map(|repo| flotilla_core::path_context::ExecutionEnvironmentPath::new(&repo.path))
+            })
+            .collect()
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {

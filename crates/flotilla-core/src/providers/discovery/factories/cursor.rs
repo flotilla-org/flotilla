@@ -1,11 +1,12 @@
 //! Cloud agent factory for Cursor-based provider.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         coding_agent::{cursor::CursorCodingAgent, CloudAgentService},
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
@@ -31,21 +32,25 @@ impl Factory for CursorCodingAgentFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
         let mut unmet = vec![];
         if env.find_binary("agent").is_none() {
             unmet.push(UnmetRequirement::MissingBinary("agent".into()));
         }
-        if env.find_env_var("CURSOR_API_KEY").is_none() {
-            unmet.push(UnmetRequirement::MissingEnvVar("CURSOR_API_KEY".into()));
-        }
+        let api_key = match env.find_env_var("CURSOR_API_KEY") {
+            Some(key) => key.to_string(),
+            None => {
+                unmet.push(UnmetRequirement::MissingEnvVar("CURSOR_API_KEY".into()));
+                return Err(unmet);
+            }
+        };
         if !unmet.is_empty() {
             return Err(unmet);
         }
         let http = Arc::new(ReqwestHttpClient::new());
-        Ok(Arc::new(CursorCodingAgent::new("cursor".into(), http)))
+        Ok(Arc::new(CursorCodingAgent::new("cursor".into(), api_key, http)))
     }
 }
 
@@ -55,11 +60,12 @@ impl Factory for CursorCodingAgentFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use super::CursorCodingAgentFactory;
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
@@ -75,7 +81,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CursorCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = CursorCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -85,7 +91,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CursorCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = CursorCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without agent binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("agent".into())));
         assert!(
@@ -100,7 +106,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CursorCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = CursorCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without CURSOR_API_KEY");
         assert!(unmet.contains(&UnmetRequirement::MissingEnvVar("CURSOR_API_KEY".into())));
         assert!(!unmet.contains(&UnmetRequirement::MissingBinary("agent".into())), "should not report missing binary when it is present");
@@ -112,7 +118,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = CursorCodingAgentFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = CursorCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail with both missing");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("agent".into())));
         assert!(unmet.contains(&UnmetRequirement::MissingEnvVar("CURSOR_API_KEY".into())));

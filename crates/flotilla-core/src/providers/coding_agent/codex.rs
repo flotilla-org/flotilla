@@ -1,5 +1,4 @@
 use std::{
-    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -11,7 +10,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::providers::{http_execute, types::*, HttpClient};
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{http_execute, types::*, HttpClient},
+};
 
 // --- Auth ---
 
@@ -36,14 +38,6 @@ pub struct CodexAuth {
     pub account_id: Option<String>,
 }
 
-fn codex_home() -> PathBuf {
-    if let Ok(val) = std::env::var("CODEX_HOME") {
-        PathBuf::from(val)
-    } else {
-        dirs::home_dir().expect("could not determine home directory").join(".codex")
-    }
-}
-
 fn parse_auth_file(contents: &str) -> Option<CodexAuth> {
     let file: CodexAuthFile = serde_json::from_str(contents).ok()?;
     match file.auth_mode.as_str() {
@@ -65,14 +59,9 @@ fn parse_auth_file(contents: &str) -> Option<CodexAuth> {
     }
 }
 
-fn read_auth() -> Option<CodexAuth> {
-    let path = codex_home().join("auth.json");
-    let contents = std::fs::read_to_string(path).ok()?;
+fn read_auth(auth_path: &ExecutionEnvironmentPath) -> Option<CodexAuth> {
+    let contents = std::fs::read_to_string(auth_path.as_path()).ok()?;
     parse_auth_file(&contents)
-}
-
-pub fn codex_auth_file_exists() -> bool {
-    codex_home().join("auth.json").exists()
 }
 
 // --- API response types ---
@@ -227,6 +216,7 @@ struct EnvCache {
 
 pub struct CodexCodingAgent {
     provider_name: String,
+    auth_path: ExecutionEnvironmentPath,
     http: Arc<dyn HttpClient>,
     auth_cache: Mutex<AuthCache>,
     env_cache: Mutex<EnvCache>,
@@ -234,9 +224,10 @@ pub struct CodexCodingAgent {
 }
 
 impl CodexCodingAgent {
-    pub fn new(provider_name: String, http: Arc<dyn HttpClient>) -> Self {
+    pub fn new(provider_name: String, auth_path: ExecutionEnvironmentPath, http: Arc<dyn HttpClient>) -> Self {
         Self {
             provider_name,
+            auth_path,
             http,
             auth_cache: Mutex::new(AuthCache { auth: None, loaded_at: None }),
             env_cache: Mutex::new(EnvCache { environment_ids: Vec::new(), loaded_at: None }),
@@ -255,7 +246,7 @@ impl CodexCodingAgent {
     }
 
     fn refresh_auth(&self) -> Option<CodexAuth> {
-        let auth = read_auth();
+        let auth = read_auth(&self.auth_path);
         let mut cache = self.auth_cache.lock().expect("auth_cache lock poisoned");
         cache.auth = auth.clone();
         cache.loaded_at = Some(Instant::now());
@@ -765,7 +756,7 @@ mod tests {
     async fn list_sessions_fetches_envs_and_tasks() {
         let session = replay::test_session(&fixture("codex_tasks.yaml"), replay::Masks::new());
         let http = replay::test_http_client(&session);
-        let agent = CodexCodingAgent::new("codex".into(), http);
+        let agent = CodexCodingAgent::new("codex".into(), ExecutionEnvironmentPath::new("/mock/auth.json"), http);
 
         // Prime auth cache with valid credentials
         {
@@ -815,12 +806,12 @@ mod tests {
         // Write auth.json with fresh token to a temp dir
         let tmp = tempfile::tempdir().expect("tempdir");
         let auth_json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fresh-token","account_id":"acc-1"}}"#;
-        std::fs::write(tmp.path().join("auth.json"), auth_json).expect("write auth.json");
-        std::env::set_var("CODEX_HOME", tmp.path());
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, auth_json).expect("write auth.json");
 
         let session = replay::test_session(&fixture("codex_auth_retry.yaml"), replay::Masks::new());
         let http = replay::test_http_client(&session);
-        let agent = CodexCodingAgent::new("codex".into(), http);
+        let agent = CodexCodingAgent::new("codex".into(), ExecutionEnvironmentPath::new(&auth_path), http);
 
         // Prime auth cache with expired token (no account_id)
         {
@@ -845,9 +836,9 @@ mod tests {
     async fn list_sessions_returns_empty_when_no_auth() {
         let _lock = CODEX_TEST_LOCK.lock().await;
 
-        // Temp dir with NO auth.json
+        // Temp dir with NO auth.json — auth path points to nonexistent file
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("CODEX_HOME", tmp.path());
+        let auth_path = ExecutionEnvironmentPath::new(tmp.path().join("auth.json"));
 
         // Empty fixture — no HTTP calls should be made
         let empty_dir = tempfile::tempdir().expect("tempdir");
@@ -855,13 +846,11 @@ mod tests {
         std::fs::write(&empty_fixture, "interactions: []\n").expect("write empty fixture");
         let session = replay::test_session(empty_fixture.to_str().unwrap(), replay::Masks::new());
         let http = replay::test_http_client(&session);
-        let agent = CodexCodingAgent::new("codex".into(), http);
+        let agent = CodexCodingAgent::new("codex".into(), auth_path, http);
 
         let criteria = RepoCriteria { repo_slug: Some("owner/repo".into()) };
         let sessions = agent.list_sessions(&criteria).await.expect("should succeed");
 
         assert!(sessions.is_empty(), "expected empty sessions when no auth");
-
-        std::env::remove_var("CODEX_HOME");
     }
 }

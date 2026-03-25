@@ -28,7 +28,14 @@ async fn main() {
                 Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
             )),
         ),
-        ("cursor", Arc::new(CursorCodingAgent::new("cursor".to_string(), Arc::new(flotilla_core::providers::ReqwestHttpClient::new())))),
+        (
+            "cursor",
+            Arc::new(CursorCodingAgent::new(
+                "cursor".to_string(),
+                std::env::var("CURSOR_API_KEY").expect("CURSOR_API_KEY must be set"),
+                Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
+            )),
+        ),
     ];
 
     for (name, provider) in &providers {

@@ -1,10 +1,8 @@
-use std::path::{Path, PathBuf};
-
 use flotilla_protocol::{arg::Arg, HostName};
 use tracing::warn;
 
 use super::{ResolutionContext, ResolvedAction, SendKeyStep};
-use crate::config::HostsConfig;
+use crate::{config::HostsConfig, path_context::DaemonHostPath};
 
 /// Resolves a `Hop::RemoteToHost` into SSH-specific actions on the context.
 ///
@@ -21,7 +19,7 @@ pub trait RemoteHopResolver: Send + Sync {
 pub struct SshRemoteHopResolver {
     hosts: HostsConfig,
     /// Pre-resolved multiplex control path, if the directory was created successfully.
-    multiplex_ctrl_path: Option<PathBuf>,
+    multiplex_ctrl_path: Option<DaemonHostPath>,
 }
 
 /// Resolved SSH connection info for a single host.
@@ -33,9 +31,9 @@ struct SshInfo {
 impl SshRemoteHopResolver {
     /// Create from pre-loaded hosts config and a config base path (for SSH control socket dir).
     /// The control socket directory is created eagerly here, not during arg building.
-    pub fn new(config_base: PathBuf, hosts: HostsConfig) -> Self {
+    pub fn new(config_base: DaemonHostPath, hosts: HostsConfig) -> Self {
         let ctrl_dir = config_base.join("ssh");
-        let multiplex_ctrl_path = match std::fs::create_dir_all(&ctrl_dir) {
+        let multiplex_ctrl_path = match std::fs::create_dir_all(ctrl_dir.as_path()) {
             Ok(()) => Some(ctrl_dir.join("ctrl-%r@%h-%p")),
             Err(err) => {
                 warn!(err = %err, "failed to create SSH control socket directory, multiplexing disabled");
@@ -71,7 +69,7 @@ impl SshRemoteHopResolver {
                 args.push(Arg::Literal("-o".into()));
                 args.push(Arg::Literal("ControlMaster=auto".into()));
                 args.push(Arg::Literal("-o".into()));
-                args.push(Arg::Quoted(format!("ControlPath={}", ctrl_path.display())));
+                args.push(Arg::Quoted(format!("ControlPath={ctrl_path}")));
                 args.push(Arg::Literal("-o".into()));
                 args.push(Arg::Literal("ControlPersist=60".into()));
             }
@@ -104,7 +102,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
 
         // Build the innermost args, optionally prefixed with cd
         let shell_inner_args = if let Some(ref dir) = context.working_directory {
-            let mut cd_args = vec![Arg::Literal("cd".into()), Arg::Quoted(dir.display().to_string()), Arg::Literal("&&".into())];
+            let mut cd_args = vec![Arg::Literal("cd".into()), Arg::Quoted(dir.to_string()), Arg::Literal("&&".into())];
             if inner_args.is_empty() {
                 // Empty inner command = open a login shell at the remote directory
                 cd_args.push(Arg::Literal("exec".into()));
@@ -157,7 +155,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
         // Flatten inner command to a string for typing
         let mut type_parts = Vec::new();
         if let Some(ref dir) = context.working_directory {
-            type_parts.push(format!("cd {}", flotilla_protocol::arg::shell_quote(&dir.display().to_string())));
+            type_parts.push(format!("cd {}", flotilla_protocol::arg::shell_quote(&dir.to_string())));
             if !inner_args.is_empty() {
                 type_parts.push("&&".into());
                 type_parts.push(flotilla_protocol::arg::flatten(&inner_args, 0));
@@ -198,8 +196,8 @@ impl RemoteHopResolver for NoopRemoteHopResolver {
 }
 
 /// Create an `SshRemoteHopResolver` by loading hosts config from disk.
-pub fn ssh_resolver_from_config(config_base: &Path) -> Result<SshRemoteHopResolver, String> {
-    let config = crate::config::ConfigStore::with_base(config_base);
+pub fn ssh_resolver_from_config(config_base: &DaemonHostPath) -> Result<SshRemoteHopResolver, String> {
+    let config = crate::config::ConfigStore::with_base(config_base.as_path());
     let hosts = config.load_hosts()?;
-    Ok(SshRemoteHopResolver::new(config_base.to_path_buf(), hosts))
+    Ok(SshRemoteHopResolver::new(config_base.clone(), hosts))
 }

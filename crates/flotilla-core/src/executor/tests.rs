@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     attachable::{AttachableStore, BindingObjectKind, SharedAttachableStore},
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{
         ai_utility::AiUtility,
@@ -81,13 +82,23 @@ impl MockCheckoutManager {
 
 #[async_trait]
 impl CheckoutManager for MockCheckoutManager {
-    async fn list_checkouts(&self, _repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
+    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(vec![])
     }
-    async fn create_checkout(&self, _repo_root: &Path, _branch: &str, _create_branch: bool) -> Result<(PathBuf, Checkout), String> {
-        self.create_result.lock().await.take().expect("create_checkout called more than expected")
+    async fn create_checkout(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        self.create_result
+            .lock()
+            .await
+            .take()
+            .expect("create_checkout called more than expected")
+            .map(|(p, co)| (ExecutionEnvironmentPath::new(p), co))
     }
-    async fn remove_checkout(&self, _repo_root: &Path, _branch: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str) -> Result<(), String> {
         self.remove_result.lock().await.take().expect("remove_checkout called more than expected")
     }
 }
@@ -264,12 +275,12 @@ fn empty_data() -> ProviderData {
     ProviderData::default()
 }
 
-fn repo_root() -> PathBuf {
-    PathBuf::from("/tmp/test-repo")
+fn repo_root() -> ExecutionEnvironmentPath {
+    ExecutionEnvironmentPath::new("/tmp/test-repo")
 }
 
-fn config_base() -> PathBuf {
-    PathBuf::from("/tmp/test-config")
+fn config_base() -> DaemonHostPath {
+    DaemonHostPath::new("/tmp/test-config")
 }
 
 fn runner_ok() -> MockRunner {
@@ -277,7 +288,7 @@ fn runner_ok() -> MockRunner {
 }
 
 fn repo_selector() -> RepoSelector {
-    RepoSelector::Path(repo_root())
+    RepoSelector::Path(repo_root().into_path_buf())
 }
 
 fn local_command(action: CommandAction) -> Command {
@@ -304,7 +315,7 @@ fn remove_checkout_action(branch: &str) -> CommandAction {
     CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(branch.to_string()) }
 }
 
-fn test_attachable_store(base: &Path) -> SharedAttachableStore {
+fn test_attachable_store(base: &DaemonHostPath) -> SharedAttachableStore {
     crate::attachable::shared_file_backed_attachable_store(base)
 }
 
@@ -453,7 +464,7 @@ async fn create_workspace_for_checkout_persists_workspace_binding() {
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
 
     let result = run_build_plan_to_completion_with(
         CommandAction::CreateWorkspaceForCheckout { checkout_path: checkout_path.clone(), label: "feat".into() },
@@ -461,13 +472,13 @@ async fn create_workspace_for_checkout_persists_workspace_binding() {
         data,
         runner,
         repo_root(),
-        temp.path().to_path_buf(),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
 
     assert_ok(result);
-    let store = AttachableStore::with_base(temp.path());
+    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
     let object_id = store
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
@@ -531,7 +542,7 @@ async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present()
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     {
         let mut store = attachable_store.lock().expect("store lock");
         let ensured_set_id = store.ensure_terminal_set(Some(local_host()), Some(HostPath::new(local_host(), path.clone())));
@@ -548,7 +559,7 @@ async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present()
         data,
         runner,
         repo_root(),
-        temp.path().to_path_buf(),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
@@ -556,7 +567,7 @@ async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present()
     match result {
         CommandValue::TerminalPrepared { attachable_set_id, .. } => {
             let set_id = attachable_set_id.expect("attachable set id");
-            let store = AttachableStore::with_base(temp.path());
+            let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
             assert!(store.registry().sets.contains_key(&set_id), "prepare should reuse persisted set");
         }
         other => panic!("expected TerminalPrepared, got {other:?}"),
@@ -571,7 +582,7 @@ async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
 
     let result = run_build_plan_to_completion_with(
         CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] },
@@ -579,7 +590,7 @@ async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
         data,
         runner,
         repo_root(),
-        temp.path().to_path_buf(),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
@@ -589,7 +600,7 @@ async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
         other => panic!("expected TerminalPrepared, got {other:?}"),
     };
 
-    let store = AttachableStore::with_base(temp.path());
+    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
     let set = store.registry().sets.get(&set_id).expect("set should exist");
     assert_eq!(set.checkout, Some(HostPath::new(local_host(), path)));
     assert!(temp.path().join("attachables").join("registry.json").exists(), "registry should be written");
@@ -602,7 +613,7 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     let repo_root = temp.path().join("repo");
     std::fs::create_dir_all(&repo_root).expect("create repo root");
     std::fs::write(
@@ -622,8 +633,8 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
         registry,
         empty_data(),
         runner,
-        repo_root.clone(),
-        temp.path().to_path_buf(),
+        ExecutionEnvironmentPath::new(repo_root.clone()),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
@@ -631,7 +642,7 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
     assert_ok(result);
     let created = workspace_manager.created_configs.lock().await;
     assert_eq!(created.len(), 1);
-    assert_eq!(created[0].working_directory, repo_root);
+    assert_eq!(created[0].working_directory, ExecutionEnvironmentPath::new(&repo_root));
     let resolved = created[0].resolved_commands.as_ref().expect("resolved commands");
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].0, "main");
@@ -649,7 +660,7 @@ async fn create_workspace_from_prepared_terminal_prefixes_name_with_host() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     let repo_root = temp.path().join("repo");
     std::fs::create_dir_all(&repo_root).expect("create repo root");
     std::fs::write(
@@ -669,8 +680,8 @@ async fn create_workspace_from_prepared_terminal_prefixes_name_with_host() {
         registry,
         empty_data(),
         runner,
-        repo_root,
-        temp.path().to_path_buf(),
+        ExecutionEnvironmentPath::new(repo_root),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
@@ -688,7 +699,7 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     let repo_root = temp.path().join("repo");
     std::fs::create_dir_all(&repo_root).expect("create repo root");
     std::fs::write(
@@ -709,14 +720,14 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
         registry,
         empty_data(),
         runner,
-        repo_root,
-        temp.path().to_path_buf(),
+        ExecutionEnvironmentPath::new(repo_root),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
 
     assert_ok(result);
-    let store = AttachableStore::with_base(temp.path());
+    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
     let object_id = store
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
@@ -787,7 +798,7 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn WorkspaceManager>);
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     std::fs::write(
         temp.path().join("hosts.toml"),
         "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
@@ -805,8 +816,8 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
         registry,
         empty_data(),
         runner,
-        PathBuf::from("<remote>/desktop/home/dev/repo"),
-        temp.path().to_path_buf(),
+        ExecutionEnvironmentPath::new("<remote>/desktop/home/dev/repo"),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
@@ -814,8 +825,8 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
     assert_ok(result);
     let created = workspace_manager.created_configs.lock().await;
     assert_eq!(created.len(), 1);
-    assert!(!created[0].working_directory.to_string_lossy().starts_with("<remote>/"));
-    assert!(created[0].working_directory.exists(), "fallback working directory should exist");
+    assert!(!created[0].working_directory.as_path().to_string_lossy().starts_with("<remote>/"));
+    assert!(created[0].working_directory.as_path().exists(), "fallback working directory should exist");
     let resolved = created[0].resolved_commands.as_ref().expect("resolved commands");
     assert!(resolved[0].1.contains("${SHELL:-/bin/sh} -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
 }
@@ -867,7 +878,7 @@ async fn teleport_session_persists_workspace_binding() {
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(temp.path());
+    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
 
     let result = run_build_plan_to_completion_with(
         CommandAction::TeleportSession {
@@ -879,13 +890,13 @@ async fn teleport_session_persists_workspace_binding() {
         data,
         runner,
         repo_root(),
-        temp.path().to_path_buf(),
+        DaemonHostPath::new(temp.path()),
         attachable_store,
     )
     .await;
 
     assert_ok(result);
-    let store = AttachableStore::with_base(temp.path());
+    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
     let object_id = store
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
@@ -1061,7 +1072,7 @@ impl TerminalPool for MockTerminalPool {
         &self,
         _session_name: &str,
         _cmd: &str,
-        _cwd: &Path,
+        _cwd: &ExecutionEnvironmentPath,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
     ) -> Result<(), String> {
         Ok(())
@@ -1070,7 +1081,7 @@ impl TerminalPool for MockTerminalPool {
         &self,
         session_name: &str,
         _cmd: &str,
-        _cwd: &Path,
+        _cwd: &ExecutionEnvironmentPath,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach:{session_name}"))])
@@ -1634,10 +1645,10 @@ async fn daemon_level_commands_return_error() {
 
 #[test]
 fn workspace_config_builds_correct_struct() {
-    let config = workspace_config(Path::new("/nonexistent-repo"), "my-branch", Path::new("/repo/wt"), "claude", &config_base());
+    let config = workspace_config(Path::new("/nonexistent-repo"), "my-branch", Path::new("/repo/wt"), "claude", config_base().as_path());
 
     assert_eq!(config.name, "my-branch");
-    assert_eq!(config.working_directory, PathBuf::from("/repo/wt"));
+    assert_eq!(config.working_directory, ExecutionEnvironmentPath::new("/repo/wt"));
     assert_eq!(config.template_vars.get("main_command"), Some(&"claude".to_string()));
     assert!(config.template_yaml.is_none(), "no template file should exist at test paths");
 }
@@ -1686,8 +1697,8 @@ async fn run_build_plan_to_completion_with(
     registry: ProviderRegistry,
     providers_data: ProviderData,
     runner: MockRunner,
-    root: PathBuf,
-    config_base: PathBuf,
+    root: ExecutionEnvironmentPath,
+    config_base: DaemonHostPath,
     attachable_store: SharedAttachableStore,
 ) -> CommandValue {
     use tokio::sync::broadcast;
@@ -1751,7 +1762,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
             "flotilla/feat-x/shell/0",
             crate::attachable::TerminalPurpose { checkout: "feat-x".into(), role: "shell".into(), index: 0 },
             "bash",
-            PathBuf::from("/repo/wt-feat-x"),
+            crate::path_context::ExecutionEnvironmentPath::new("/repo/wt-feat-x"),
             TerminalStatus::Running,
         );
     }
@@ -2231,7 +2242,7 @@ async fn resolve_workspace_commands_no_template_uses_default() {
     let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
-        working_directory: PathBuf::from("/repo/wt"),
+        working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
         template_vars: [("main_command".to_string(), "claude".to_string())].into_iter().collect(),
         template_yaml: None,
         resolved_commands: None,
@@ -2260,7 +2271,7 @@ content:
 "#;
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
-        working_directory: PathBuf::from("/repo/wt"),
+        working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
         template_vars: std::collections::HashMap::new(),
         template_yaml: Some(yaml.to_string()),
         resolved_commands: None,
@@ -2306,7 +2317,7 @@ async fn resolve_workspace_commands_invalid_template_uses_default() {
     let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
-        working_directory: PathBuf::from("/repo/wt"),
+        working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
         template_vars: [("main_command".to_string(), "claude".to_string())].into_iter().collect(),
         template_yaml: Some("content: [".to_string()),
         resolved_commands: None,
@@ -2329,7 +2340,7 @@ async fn write_branch_issue_links_single_provider_multiple_issues() {
     let runner = MockRunner::new(vec![Ok(String::new())]);
     let issue_ids = vec![("github".to_string(), "10".to_string()), ("github".to_string(), "20".to_string())];
 
-    write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
+    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await;
 
     assert_eq!(runner.remaining(), 0, "single provider should consume exactly 1 response");
 }
@@ -2339,7 +2350,7 @@ async fn write_branch_issue_links_multiple_providers() {
     let runner = MockRunner::new(vec![Ok(String::new()), Ok(String::new())]);
     let issue_ids = vec![("github".to_string(), "10".to_string()), ("jira".to_string(), "PROJ-5".to_string())];
 
-    write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
+    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await;
 
     assert_eq!(runner.remaining(), 0, "two providers should consume exactly 2 responses");
 }
@@ -2349,7 +2360,7 @@ async fn write_branch_issue_links_git_error_tolerated() {
     let runner = MockRunner::new(vec![Err("git config failed".to_string())]);
     let issue_ids = vec![("github".to_string(), "10".to_string())];
 
-    write_branch_issue_links(&repo_root(), "feat-x", &issue_ids, &runner).await;
+    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await;
 
     assert_eq!(runner.remaining(), 0, "should still consume the response even on error");
 }
@@ -2358,7 +2369,7 @@ async fn write_branch_issue_links_git_error_tolerated() {
 async fn write_branch_issue_links_empty_is_noop() {
     let runner = MockRunner::new(vec![]);
 
-    write_branch_issue_links(&repo_root(), "feat-x", &[], &runner).await;
+    write_branch_issue_links(repo_root().as_path(), "feat-x", &[], &runner).await;
 
     assert_eq!(runner.remaining(), 0, "empty issue_ids should make zero calls");
 }
@@ -2372,7 +2383,7 @@ async fn validate_fresh_branch_succeeds_when_neither_exists() {
     // local check -> Err (not found), remote check -> Err (not found)
     let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
 
-    let result = validate_checkout_target(&repo_root(), "new-branch", CheckoutIntent::FreshBranch, &runner).await;
+    let result = validate_checkout_target(repo_root().as_path(), "new-branch", CheckoutIntent::FreshBranch, &runner).await;
 
     assert!(result.is_ok());
 }
@@ -2382,7 +2393,7 @@ async fn validate_fresh_branch_fails_when_local_exists() {
     // local check -> Ok (found), remote check -> Err (not found)
     let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
 
-    let result = validate_checkout_target(&repo_root(), "existing", CheckoutIntent::FreshBranch, &runner).await;
+    let result = validate_checkout_target(repo_root().as_path(), "existing", CheckoutIntent::FreshBranch, &runner).await;
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("already exists"));
@@ -2393,7 +2404,7 @@ async fn validate_fresh_branch_fails_when_remote_exists() {
     // local check -> Err (not found), remote check -> Ok (found)
     let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
 
-    let result = validate_checkout_target(&repo_root(), "remote-only", CheckoutIntent::FreshBranch, &runner).await;
+    let result = validate_checkout_target(repo_root().as_path(), "remote-only", CheckoutIntent::FreshBranch, &runner).await;
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("already exists"));
@@ -2404,7 +2415,7 @@ async fn validate_existing_branch_succeeds_when_local_exists() {
     // local check -> Ok (found), remote check -> Err (not found)
     let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
 
-    let result = validate_checkout_target(&repo_root(), "local-branch", CheckoutIntent::ExistingBranch, &runner).await;
+    let result = validate_checkout_target(repo_root().as_path(), "local-branch", CheckoutIntent::ExistingBranch, &runner).await;
 
     assert!(result.is_ok());
 }
@@ -2414,7 +2425,7 @@ async fn validate_existing_branch_succeeds_when_remote_exists() {
     // local check -> Err (not found), remote check -> Ok (found)
     let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
 
-    let result = validate_checkout_target(&repo_root(), "remote-branch", CheckoutIntent::ExistingBranch, &runner).await;
+    let result = validate_checkout_target(repo_root().as_path(), "remote-branch", CheckoutIntent::ExistingBranch, &runner).await;
 
     assert!(result.is_ok());
 }
@@ -2424,7 +2435,7 @@ async fn validate_existing_branch_fails_when_neither_exists() {
     // local check -> Err (not found), remote check -> Err (not found)
     let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
 
-    let result = validate_checkout_target(&repo_root(), "ghost-branch", CheckoutIntent::ExistingBranch, &runner).await;
+    let result = validate_checkout_target(repo_root().as_path(), "ghost-branch", CheckoutIntent::ExistingBranch, &runner).await;
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("branch not found"));

@@ -1,7 +1,9 @@
-use std::path::PathBuf;
-
 use super::*;
 use crate::attachable::types::{TerminalAttachable, TerminalPurpose};
+
+fn temp_base(dir: &tempfile::TempDir) -> DaemonHostPath {
+    DaemonHostPath::new(dir.path())
+}
 
 fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl AttachableStoreApi) {
     let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
@@ -13,7 +15,7 @@ fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl 
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
     let second = store.ensure_terminal_attachable(
@@ -23,7 +25,7 @@ fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl 
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "codex",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Disconnected,
     );
 
@@ -35,7 +37,7 @@ fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl 
         AttachableContent::Terminal(TerminalAttachable {
             purpose: TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
             command: "codex".into(),
-            working_directory: PathBuf::from("/repo/wt-feat"),
+            working_directory: ExecutionEnvironmentPath::new("/repo/wt-feat"),
             status: TerminalStatus::Disconnected,
         })
     );
@@ -56,7 +58,7 @@ fn contract_ensure_terminal_set_groups_members_by_host_and_checkout(store: &mut 
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
     let agent = store.ensure_terminal_attachable(
@@ -66,7 +68,7 @@ fn contract_ensure_terminal_set_groups_members_by_host_and_checkout(store: &mut 
         "flotilla/feat/agent/0",
         TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
         "codex",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
 
@@ -85,7 +87,7 @@ fn contract_ensure_terminal_attachable_uses_binding_as_primary_identity(store: &
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
     let second = store.ensure_terminal_attachable(
@@ -95,7 +97,7 @@ fn contract_ensure_terminal_attachable_uses_binding_as_primary_identity(store: &
         "flotilla/feat/shell/1",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
 
@@ -143,7 +145,7 @@ fn contract_roundtrip_preserves_stable_ids(
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
     store.save().expect("save registry");
@@ -158,7 +160,7 @@ fn contract_roundtrip_preserves_stable_ids(
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
 
@@ -183,10 +185,10 @@ fn opaque_ids_roundtrip_as_strings() {
 #[test]
 fn empty_registry_roundtrips() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = AttachableStore::with_base(dir.path());
+    let store = AttachableStore::with_base(&temp_base(&dir));
     store.save().expect("save empty registry");
 
-    let reloaded = AttachableStore::with_base(dir.path());
+    let reloaded = AttachableStore::with_base(&temp_base(&dir));
     assert_eq!(reloaded.registry(), store.registry());
     assert!(reloaded.registry().sets.is_empty());
     assert!(reloaded.registry().attachables.is_empty());
@@ -196,7 +198,7 @@ fn empty_registry_roundtrips() {
 #[test]
 fn registry_roundtrip_rebuilds_binding_index() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut store = AttachableStore::with_base(dir.path());
+    let mut store = AttachableStore::with_base(&temp_base(&dir));
 
     let set_id = AttachableSetId::new("set-1");
     let attachable_id = AttachableId::new("att-1");
@@ -214,7 +216,7 @@ fn registry_roundtrip_rebuilds_binding_index() {
         content: AttachableContent::Terminal(TerminalAttachable {
             purpose: TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
             command: "claude".into(),
-            working_directory: PathBuf::from("/repo/wt-feat"),
+            working_directory: ExecutionEnvironmentPath::new("/repo/wt-feat"),
             status: TerminalStatus::Running,
         }),
     });
@@ -235,7 +237,7 @@ fn registry_roundtrip_rebuilds_binding_index() {
 
     store.save().expect("save populated registry");
 
-    let reloaded = AttachableStore::with_base(dir.path());
+    let reloaded = AttachableStore::with_base(&temp_base(&dir));
     assert_eq!(reloaded.registry(), store.registry());
     assert_eq!(reloaded.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0"), Some("att-1"));
     assert_eq!(reloaded.lookup_binding("workspace_manager", "tmux", BindingObjectKind::AttachableSet, "workspace:7"), Some("set-1"));
@@ -243,9 +245,9 @@ fn registry_roundtrip_rebuilds_binding_index() {
 
 #[test]
 fn file_backed_contract_ensure_terminal_attachable_reuses_existing_binding() {
-    contract_ensure_terminal_attachable_reuses_existing_binding(&mut AttachableStore::with_base(
-        tempfile::tempdir().expect("tempdir").path(),
-    ));
+    contract_ensure_terminal_attachable_reuses_existing_binding(&mut AttachableStore::with_base(&temp_base(
+        &tempfile::tempdir().expect("tempdir"),
+    )));
 }
 
 #[test]
@@ -255,9 +257,9 @@ fn in_memory_contract_ensure_terminal_attachable_reuses_existing_binding() {
 
 #[test]
 fn file_backed_contract_ensure_terminal_set_groups_members_by_host_and_checkout() {
-    contract_ensure_terminal_set_groups_members_by_host_and_checkout(&mut AttachableStore::with_base(
-        tempfile::tempdir().expect("tempdir").path(),
-    ));
+    contract_ensure_terminal_set_groups_members_by_host_and_checkout(&mut AttachableStore::with_base(&temp_base(
+        &tempfile::tempdir().expect("tempdir"),
+    )));
 }
 
 #[test]
@@ -267,9 +269,9 @@ fn in_memory_contract_ensure_terminal_set_groups_members_by_host_and_checkout() 
 
 #[test]
 fn file_backed_contract_ensure_terminal_attachable_uses_binding_as_primary_identity() {
-    contract_ensure_terminal_attachable_uses_binding_as_primary_identity(&mut AttachableStore::with_base(
-        tempfile::tempdir().expect("tempdir").path(),
-    ));
+    contract_ensure_terminal_attachable_uses_binding_as_primary_identity(&mut AttachableStore::with_base(&temp_base(
+        &tempfile::tempdir().expect("tempdir"),
+    )));
 }
 
 #[test]
@@ -284,7 +286,7 @@ fn corrupt_registry_file_loads_as_empty() {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(&path, "{ not valid json").expect("write corrupt registry");
 
-    let store = AttachableStore::with_base(dir.path());
+    let store = AttachableStore::with_base(&temp_base(&dir));
     assert!(store.registry().sets.is_empty());
     assert!(store.registry().attachables.is_empty());
     assert!(store.registry().bindings.is_empty());
@@ -292,7 +294,7 @@ fn corrupt_registry_file_loads_as_empty() {
 
 #[test]
 fn file_backed_contract_replacing_binding_is_deterministic() {
-    contract_replacing_binding_is_deterministic(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    contract_replacing_binding_is_deterministic(&mut AttachableStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
 }
 
 #[test]
@@ -303,7 +305,9 @@ fn in_memory_contract_replacing_binding_is_deterministic() {
 #[test]
 fn file_backed_contract_roundtrip_preserves_stable_ids() {
     let dir = tempfile::tempdir().expect("tempdir");
-    contract_roundtrip_preserves_stable_ids(AttachableStore::with_base(dir.path()), |_| Box::new(AttachableStore::with_base(dir.path())));
+    contract_roundtrip_preserves_stable_ids(AttachableStore::with_base(&temp_base(&dir)), |_| {
+        Box::new(AttachableStore::with_base(&temp_base(&dir)))
+    });
 }
 
 #[test]
@@ -317,7 +321,7 @@ fn in_memory_contract_roundtrip_preserves_stable_ids() {
 fn provider_local_state_is_not_identity_source() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("attachables").join("registry.json");
-    let mut store = AttachableStore::with_base(dir.path());
+    let mut store = AttachableStore::with_base(&temp_base(&dir));
     let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
     let attachable_id = store.ensure_terminal_attachable(
         &set_id,
@@ -326,14 +330,14 @@ fn provider_local_state_is_not_identity_source() {
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
     store.save().expect("save registry");
 
     std::fs::remove_file(path).expect("remove persisted registry");
 
-    let store = AttachableStore::with_base(dir.path());
+    let store = AttachableStore::with_base(&temp_base(&dir));
     assert_ne!(
         store.lookup_binding("terminal_pool", "shpool", BindingObjectKind::Attachable, "flotilla/feat/shell/0"),
         Some(attachable_id.as_str())
@@ -353,7 +357,7 @@ fn contract_remove_set_deletes_set_and_members_and_bindings(store: &mut impl Att
         "flotilla/feat/shell/0",
         TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
         "bash",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
     let _agent = store.ensure_terminal_attachable(
@@ -363,7 +367,7 @@ fn contract_remove_set_deletes_set_and_members_and_bindings(store: &mut impl Att
         "flotilla/feat/agent/0",
         TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
         "claude",
-        PathBuf::from("/repo/wt-feat"),
+        ExecutionEnvironmentPath::new("/repo/wt-feat"),
         TerminalStatus::Running,
     );
 
@@ -393,7 +397,9 @@ fn contract_remove_set_returns_none_for_unknown_id(store: &mut impl AttachableSt
 
 #[test]
 fn file_backed_contract_remove_set_deletes_set_and_members_and_bindings() {
-    contract_remove_set_deletes_set_and_members_and_bindings(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    contract_remove_set_deletes_set_and_members_and_bindings(&mut AttachableStore::with_base(&temp_base(
+        &tempfile::tempdir().expect("tempdir"),
+    )));
 }
 
 #[test]
@@ -403,7 +409,7 @@ fn in_memory_contract_remove_set_deletes_set_and_members_and_bindings() {
 
 #[test]
 fn file_backed_contract_remove_set_returns_none_for_unknown_id() {
-    contract_remove_set_returns_none_for_unknown_id(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    contract_remove_set_returns_none_for_unknown_id(&mut AttachableStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
 }
 
 #[test]
@@ -429,7 +435,7 @@ fn contract_sets_for_checkout_returns_empty_for_unknown(store: &mut impl Attacha
 
 #[test]
 fn file_backed_contract_sets_for_checkout_returns_matching_sets() {
-    contract_sets_for_checkout_returns_matching_sets(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    contract_sets_for_checkout_returns_matching_sets(&mut AttachableStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
 }
 
 #[test]
@@ -439,7 +445,9 @@ fn in_memory_contract_sets_for_checkout_returns_matching_sets() {
 
 #[test]
 fn file_backed_contract_sets_for_checkout_returns_empty_for_unknown() {
-    contract_sets_for_checkout_returns_empty_for_unknown(&mut AttachableStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    contract_sets_for_checkout_returns_empty_for_unknown(&mut AttachableStore::with_base(&temp_base(
+        &tempfile::tempdir().expect("tempdir"),
+    )));
 }
 
 #[test]

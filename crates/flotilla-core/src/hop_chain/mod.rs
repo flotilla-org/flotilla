@@ -6,12 +6,10 @@ pub mod terminal;
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
-
 pub use flotilla_protocol::arg::Arg;
 use flotilla_protocol::HostName;
 
-use crate::attachable::AttachableId;
+use crate::{attachable::AttachableId, path_context::ExecutionEnvironmentPath};
 
 /// Declarative — what needs to happen, not how.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +45,7 @@ pub struct ResolvedPlan(pub Vec<ResolvedAction>);
 pub struct ResolutionContext {
     pub current_host: HostName,
     pub current_environment: Option<String>, // placeholder, becomes EnvironmentId in Phase C
-    pub working_directory: Option<PathBuf>,
+    pub working_directory: Option<ExecutionEnvironmentPath>,
     pub actions: Vec<ResolvedAction>,
     pub nesting_depth: usize,
 }

@@ -1,6 +1,6 @@
 //! Claude CLI host detector.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
@@ -14,7 +14,7 @@ pub struct ClaudeDetector;
 
 #[async_trait]
 impl HostDetector for ClaudeDetector {
-    async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
+    async fn detect(&self, runner: &dyn CommandRunner, env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
         // 1. Check PATH — single call proves existence and captures version
         if let Ok(output) = run!(runner, "claude", &["--version"], Path::new(".")) {
             return match parse_first_dotted_version(&output) {
@@ -25,19 +25,17 @@ impl HostDetector for ClaudeDetector {
             };
         }
 
-        // 2. Check known installation locations
-        let known_paths = [dirs::home_dir().map(|h| h.join(".claude/local/claude"))];
-        for path in known_paths.into_iter().flatten() {
-            if path.is_file() {
-                let path_str = path.to_str().unwrap_or("");
-                if let Ok(output) = run!(runner, path_str, &["--version"], Path::new(".")) {
-                    return match parse_first_dotted_version(&output) {
-                        Some(version) => {
-                            vec![EnvironmentAssertion::versioned_binary("claude", path, version)]
-                        }
-                        None => vec![EnvironmentAssertion::binary("claude", path)],
-                    };
-                }
+        // 2. Check known installation location via runner (not local filesystem)
+        if let Some(home) = env.get("HOME") {
+            let path = PathBuf::from(home).join(".claude/local/claude");
+            let path_str = path.to_str().unwrap_or("");
+            if let Ok(output) = run!(runner, path_str, &["--version"], Path::new(".")) {
+                return match parse_first_dotted_version(&output) {
+                    Some(version) => {
+                        vec![EnvironmentAssertion::versioned_binary("claude", &path, version)]
+                    }
+                    None => vec![EnvironmentAssertion::binary("claude", &path)],
+                };
             }
         }
 
@@ -47,10 +45,11 @@ impl HostDetector for ClaudeDetector {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+    };
 
     #[tokio::test]
     async fn claude_detector_found_on_path() {
@@ -60,7 +59,7 @@ mod tests {
         match &assertions[0] {
             EnvironmentAssertion::BinaryAvailable { name, path, version } => {
                 assert_eq!(name, "claude");
-                assert_eq!(path, &PathBuf::from("claude"));
+                assert_eq!(*path, ExecutionEnvironmentPath::new("claude"));
                 assert_eq!(version.as_deref(), Some("1.0.20"));
             }
             other => panic!("expected BinaryAvailable, got {other:?}"),
@@ -68,20 +67,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_detector_fallback_to_home() {
+        // Not on PATH, but found at $HOME/.claude/local/claude
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("/test/home/.claude/local/claude", &["--version"], Ok("1.2.3 (Claude Code)\n".into()))
+            .build();
+        let env = TestEnvVars::new([("HOME", "/test/home")]);
+        let assertions = ClaudeDetector.detect(&runner, &env).await;
+        assert_eq!(assertions.len(), 1);
+        match &assertions[0] {
+            EnvironmentAssertion::BinaryAvailable { name, path, version } => {
+                assert_eq!(name, "claude");
+                assert_eq!(*path, ExecutionEnvironmentPath::new("/test/home/.claude/local/claude"));
+                assert_eq!(version.as_deref(), Some("1.2.3"));
+            }
+            other => panic!("expected BinaryAvailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn claude_detector_not_found() {
-        // No on_run configured → run! returns Err for PATH check
+        // No on_run configured → run! returns Err for PATH and HOME fallback
+        let runner = DiscoveryMockRunner::builder().build();
+        let env = TestEnvVars::new([("HOME", "/nonexistent")]);
+        let assertions = ClaudeDetector.detect(&runner, &env).await;
+        assert!(assertions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_detector_no_home_env() {
+        // No HOME env var set, not on PATH → empty
         let runner = DiscoveryMockRunner::builder().build();
         let assertions = ClaudeDetector.detect(&runner, &TestEnvVars::default()).await;
-        // May be empty or may find at known path — depends on filesystem.
-        // At minimum, verify it doesn't panic and no PATH-based assertion is returned.
-        for a in &assertions {
-            match a {
-                EnvironmentAssertion::BinaryAvailable { path, .. } => {
-                    // If something was found, it shouldn't be the bare "claude" name
-                    assert_ne!(path, &PathBuf::from("claude"));
-                }
-                _ => panic!("unexpected assertion type"),
-            }
-        }
+        assert!(assertions.is_empty());
     }
 }

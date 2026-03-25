@@ -1,4 +1,5 @@
 use super::*;
+use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 fn sample_bag() -> EnvironmentBag {
     EnvironmentBag::new()
@@ -15,8 +16,8 @@ fn sample_bag() -> EnvironmentBag {
 #[test]
 fn find_binary_returns_matching_path() {
     let bag = sample_bag();
-    assert_eq!(bag.find_binary("git"), Some(&PathBuf::from("/usr/bin/git")));
-    assert_eq!(bag.find_binary("gh"), Some(&PathBuf::from("/usr/bin/gh")));
+    assert_eq!(bag.find_binary("git"), Some(&ExecutionEnvironmentPath::new("/usr/bin/git")));
+    assert_eq!(bag.find_binary("gh"), Some(&ExecutionEnvironmentPath::new("/usr/bin/gh")));
     assert_eq!(bag.find_binary("nonexistent"), None);
 }
 
@@ -61,7 +62,7 @@ fn has_auth_checks_provider() {
 fn find_vcs_checkout_returns_root_and_flag() {
     let bag = sample_bag();
     let result = bag.find_vcs_checkout(VcsKind::Git);
-    assert_eq!(result, Some((Path::new("/home/user/project"), true)));
+    assert_eq!(result, Some((&ExecutionEnvironmentPath::new("/home/user/project"), true)));
     assert_eq!(bag.find_vcs_checkout(VcsKind::Jujutsu), None);
 }
 
@@ -99,7 +100,7 @@ fn merge_combines_assertions() {
 #[test]
 fn find_socket_returns_path() {
     let bag = sample_bag();
-    assert_eq!(bag.find_socket("cmux"), Some(&PathBuf::from("/tmp/cmux.sock")));
+    assert_eq!(bag.find_socket("cmux"), Some(&DaemonHostPath::new("/tmp/cmux.sock")));
     assert_eq!(bag.find_socket("nonexistent"), None);
 }
 
@@ -217,10 +218,13 @@ fn environment_bag_assertions_accessor() {
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::BinaryAvailable {
             name: "git".into(),
-            path: PathBuf::from("/usr/bin/git"),
+            path: ExecutionEnvironmentPath::new("/usr/bin/git"),
             version: Some("2.40".into()),
         })
-        .with(EnvironmentAssertion::AuthFileExists { provider: "github".into(), path: PathBuf::from("/home/user/.config/gh/hosts.yml") });
+        .with(EnvironmentAssertion::AuthFileExists {
+            provider: "github".into(),
+            path: ExecutionEnvironmentPath::new("/home/user/.config/gh/hosts.yml"),
+        });
     assert_eq!(bag.assertions().len(), 2);
     assert!(matches!(bag.assertions()[0], EnvironmentAssertion::BinaryAvailable { ref name, .. } if name == "git"));
 }

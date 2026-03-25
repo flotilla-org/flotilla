@@ -1,11 +1,12 @@
 //! GitHub factories for change request and issue tracker providers.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         change_request::{github::GitHubChangeRequest, ChangeRequestTracker},
         discovery::{EnvironmentBag, Factory, HostPlatform, ProviderCategory, ProviderDescriptor, UnmetRequirement},
@@ -56,7 +57,7 @@ impl Factory for GitHubChangeRequestFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         let repo_slug = github_repo_slug(env)?;
@@ -83,7 +84,7 @@ impl Factory for GitHubIssueTrackerFactory {
         &self,
         env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>> {
         let repo_slug = github_repo_slug(env)?;
@@ -98,11 +99,12 @@ impl Factory for GitHubIssueTrackerFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use super::{GitHubChangeRequestFactory, GitHubIssueTrackerFactory};
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{
             test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, HostPlatform, UnmetRequirement,
         },
@@ -133,7 +135,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubChangeRequestFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubChangeRequestFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -143,7 +145,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubChangeRequestFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubChangeRequestFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without gh binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
         assert!(!unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
@@ -155,7 +157,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubChangeRequestFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubChangeRequestFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without remote host");
         assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
         assert!(!unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
@@ -167,7 +169,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubChangeRequestFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubChangeRequestFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail with both missing");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
         assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
@@ -193,7 +195,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubIssueTrackerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubIssueTrackerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -203,7 +205,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubIssueTrackerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubIssueTrackerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without gh binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
         assert!(!unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
@@ -215,7 +217,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubIssueTrackerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubIssueTrackerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without remote host");
         assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
         assert!(!unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
@@ -227,7 +229,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = GitHubIssueTrackerFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = GitHubIssueTrackerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail with both missing");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
         assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));

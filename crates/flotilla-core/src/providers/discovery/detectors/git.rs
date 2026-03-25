@@ -4,9 +4,12 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::providers::{
-    discovery::{EnvVars, EnvironmentAssertion, HostPlatform, RepoDetector, VcsKind},
-    run, CommandRunner,
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{
+        discovery::{EnvVars, EnvironmentAssertion, HostPlatform, RepoDetector, VcsKind},
+        run, CommandRunner,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -18,13 +21,18 @@ pub struct VcsRepoDetector;
 
 #[async_trait]
 impl RepoDetector for VcsRepoDetector {
-    async fn detect(&self, repo_root: &Path, _runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        let git_path = repo_root.join(".git");
+    async fn detect(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        _runner: &dyn CommandRunner,
+        _env: &dyn EnvVars,
+    ) -> Vec<EnvironmentAssertion> {
+        let git_path = repo_root.as_path().join(".git");
         if git_path.is_dir() {
-            vec![EnvironmentAssertion::vcs_checkout(repo_root, VcsKind::Git, true)]
+            vec![EnvironmentAssertion::vcs_checkout(repo_root.as_path(), VcsKind::Git, true)]
         } else if git_path.is_file() {
             // .git file indicates a worktree
-            vec![EnvironmentAssertion::vcs_checkout(repo_root, VcsKind::Git, false)]
+            vec![EnvironmentAssertion::vcs_checkout(repo_root.as_path(), VcsKind::Git, false)]
         } else {
             vec![]
         }
@@ -136,8 +144,13 @@ fn extract_owner_repo(url: &str) -> Option<(String, String)> {
 
 #[async_trait]
 impl RepoDetector for RemoteHostDetector {
-    async fn detect(&self, repo_root: &Path, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        let (remote_name, url) = match preferred_remote(repo_root, runner).await {
+    async fn detect(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        runner: &dyn CommandRunner,
+        _env: &dyn EnvVars,
+    ) -> Vec<EnvironmentAssertion> {
+        let (remote_name, url) = match preferred_remote(repo_root.as_path(), runner).await {
             Some(r) => r,
             None => return vec![],
         };
@@ -160,7 +173,10 @@ impl RepoDetector for RemoteHostDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+    };
 
     // -- VcsRepoDetector --
 
@@ -169,11 +185,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector.detect(dir.path(), &runner, &TestEnvVars::default()).await;
+        let repo_root = ExecutionEnvironmentPath::new(dir.path());
+        let assertions = VcsRepoDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
-                assert_eq!(root, dir.path());
+                assert_eq!(root.as_path(), dir.path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(*is_main_checkout);
             }
@@ -186,11 +203,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(dir.path().join(".git"), "gitdir: /some/path\n").expect("write .git file");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector.detect(dir.path(), &runner, &TestEnvVars::default()).await;
+        let repo_root = ExecutionEnvironmentPath::new(dir.path());
+        let assertions = VcsRepoDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
-                assert_eq!(root, dir.path());
+                assert_eq!(root.as_path(), dir.path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(!*is_main_checkout);
             }
@@ -202,7 +220,8 @@ mod tests {
     async fn vcs_repo_detector_no_git() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let runner = DiscoveryMockRunner::builder().build();
-        let assertions = VcsRepoDetector.detect(dir.path(), &runner, &TestEnvVars::default()).await;
+        let repo_root = ExecutionEnvironmentPath::new(dir.path());
+        let assertions = VcsRepoDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
     }
 
@@ -210,13 +229,13 @@ mod tests {
 
     #[tokio::test]
     async fn remote_host_detector_github_ssh() {
-        let repo_root = Path::new("/tmp/repo");
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("git@github.com:owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
+        let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
@@ -231,13 +250,13 @@ mod tests {
 
     #[tokio::test]
     async fn remote_host_detector_prefers_tracking_remote() {
-        let repo_root = Path::new("/tmp/repo");
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("upstream/main\n".into()))
             .on_run("git", &["remote"], Ok("origin\nupstream\n".into()))
             .on_run("git", &["remote", "get-url", "upstream"], Ok("https://github.com/upstream-owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
+        let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
@@ -252,13 +271,13 @@ mod tests {
 
     #[tokio::test]
     async fn remote_host_detector_https_url() {
-        let repo_root = Path::new("/tmp/repo");
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
+        let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
@@ -273,24 +292,24 @@ mod tests {
 
     #[tokio::test]
     async fn remote_host_detector_no_remotes() {
-        let repo_root = Path::new("/tmp/repo");
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok(String::new()))
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
+        let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
     }
 
     #[tokio::test]
     async fn remote_host_detector_gitlab() {
-        let repo_root = Path::new("/tmp/repo");
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("https://gitlab.example.com/org/project.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
+        let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
@@ -305,13 +324,13 @@ mod tests {
 
     #[tokio::test]
     async fn remote_host_detector_unknown_host_returns_empty() {
-        let repo_root = Path::new("/tmp/repo");
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("https://bitbucket.org/owner/repo.git\n".into()))
             .build();
-        let assertions = RemoteHostDetector.detect(repo_root, &runner, &TestEnvVars::default()).await;
+        let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
     }
 

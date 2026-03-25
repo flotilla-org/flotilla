@@ -1,13 +1,13 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
 use flotilla_protocol::{AgentHarness, AgentStatus, AttachableId};
 use serde::{Deserialize, Serialize};
 
-use crate::config::flotilla_config_dir;
+use crate::path_context::DaemonHostPath;
 
 /// Persisted state for a single agent instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ where
     Arc::new(Mutex::new(Box::new(store)))
 }
 
-pub fn shared_file_backed_agent_state_store(base: impl AsRef<Path>) -> SharedAgentStateStore {
+pub fn shared_file_backed_agent_state_store(base: &DaemonHostPath) -> SharedAgentStateStore {
     shared_agent_state_store(AgentStateStore::with_base(base))
 }
 
@@ -113,25 +113,20 @@ impl AgentStoreState {
 // ---------- file-backed implementation ----------
 
 pub struct AgentStateStore {
-    path: PathBuf,
+    path: DaemonHostPath,
     state: AgentStoreState,
 }
 
 impl AgentStateStore {
-    pub fn new() -> Self {
-        Self::with_path(flotilla_config_dir().join("agents").join("state.json"))
+    pub fn with_base(base: &DaemonHostPath) -> Self {
+        Self::with_path(base.join("agents").join("state.json"))
     }
 
-    pub fn with_base(base: impl AsRef<Path>) -> Self {
-        Self::with_path(base.as_ref().join("agents").join("state.json"))
-    }
-
-    pub fn with_path(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let registry = match Self::load_registry(&path) {
+    pub fn with_path(path: DaemonHostPath) -> Self {
+        let registry = match Self::load_registry(path.as_path()) {
             Ok(registry) => registry,
             Err(err) => {
-                tracing::warn!(path = %path.display(), err = %err, "failed to load agent state, starting empty");
+                tracing::warn!(%path, err = %err, "failed to load agent state, starting empty");
                 AgentRegistry::default()
             }
         };
@@ -145,12 +140,6 @@ impl AgentStateStore {
             Err(e) => return Err(format!("failed to read agent state: {e}")),
         };
         serde_json::from_str(&contents).map_err(|e| format!("failed to parse agent state: {e}"))
-    }
-}
-
-impl Default for AgentStateStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -180,11 +169,11 @@ impl AgentStateStoreApi for AgentStateStore {
     }
 
     fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self.path.as_path().parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create agent state dir: {e}"))?;
         }
         let json = serde_json::to_string_pretty(self.state.registry()).map_err(|e| format!("failed to serialize agent state: {e}"))?;
-        std::fs::write(&self.path, json).map_err(|e| format!("failed to write agent state: {e}"))?;
+        std::fs::write(self.path.as_path(), json).map_err(|e| format!("failed to write agent state: {e}"))?;
         Ok(())
     }
 }
@@ -239,6 +228,10 @@ impl AgentStateStoreApi for InMemoryAgentStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_base(dir: &tempfile::TempDir) -> DaemonHostPath {
+        DaemonHostPath::new(dir.path())
+    }
 
     fn sample_entry() -> AgentEntry {
         AgentEntry {
@@ -407,57 +400,61 @@ mod tests {
 
     #[test]
     fn file_backed_upsert_and_get() {
-        contract_upsert_and_get(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_upsert_and_get(&mut AgentStateStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
     }
 
     #[test]
     fn file_backed_upsert_updates_existing() {
-        contract_upsert_updates_existing(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_upsert_updates_existing(&mut AgentStateStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
     }
 
     #[test]
     fn file_backed_upsert_cleans_stale_session_index() {
-        contract_upsert_cleans_stale_session_index(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_upsert_cleans_stale_session_index(&mut AgentStateStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
     }
 
     #[test]
     fn file_backed_remove_clears_agent_and_session_index() {
-        contract_remove_clears_agent_and_session_index(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_remove_clears_agent_and_session_index(&mut AgentStateStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
     }
 
     #[test]
     fn file_backed_remove_nonexistent_is_noop() {
-        contract_remove_nonexistent_is_noop(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_remove_nonexistent_is_noop(&mut AgentStateStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
     }
 
     #[test]
     fn file_backed_session_id_lookup() {
-        contract_session_id_lookup(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_session_id_lookup(&mut AgentStateStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
     }
 
     #[test]
     fn file_backed_session_id_lookup_absent_when_no_session_id() {
-        contract_session_id_lookup_absent_when_no_session_id(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_session_id_lookup_absent_when_no_session_id(&mut AgentStateStore::with_base(&temp_base(
+            &tempfile::tempdir().expect("tempdir"),
+        )));
     }
 
     #[test]
     fn file_backed_list_agents_returns_all() {
-        contract_list_agents_returns_all(&mut AgentStateStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+        contract_list_agents_returns_all(&mut AgentStateStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
     }
 
     #[test]
     fn file_backed_roundtrip_preserves_state() {
         let dir = tempfile::tempdir().expect("tempdir");
-        contract_roundtrip_preserves_state(AgentStateStore::with_base(dir.path()), |_| Box::new(AgentStateStore::with_base(dir.path())));
+        contract_roundtrip_preserves_state(AgentStateStore::with_base(&temp_base(&dir)), |_| {
+            Box::new(AgentStateStore::with_base(&temp_base(&dir)))
+        });
     }
 
     #[test]
     fn empty_store_roundtrips() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = AgentStateStore::with_base(dir.path());
+        let store = AgentStateStore::with_base(&temp_base(&dir));
         store.save().expect("save empty");
 
-        let reloaded = AgentStateStore::with_base(dir.path());
+        let reloaded = AgentStateStore::with_base(&temp_base(&dir));
         assert!(reloaded.registry().agents.is_empty());
         assert!(reloaded.registry().session_index.is_empty());
     }
@@ -469,7 +466,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, "{ not valid json").expect("write corrupt");
 
-        let store = AgentStateStore::with_base(dir.path());
+        let store = AgentStateStore::with_base(&temp_base(&dir));
         assert!(store.registry().agents.is_empty());
     }
 

@@ -25,6 +25,7 @@ use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, Provider
 use crate::{
     attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         change_request::ChangeRequestTracker,
         discovery::EnvVars,
@@ -516,39 +517,43 @@ impl FakeVcs {
 
 #[async_trait::async_trait]
 impl Vcs for FakeVcs {
-    async fn resolve_repo_root(&self, path: &Path) -> Option<PathBuf> {
+    async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
         let state = self.state.read().expect("FakeVcs state poisoned");
-        if path.starts_with(&state.root) {
-            Some(state.root.clone())
+        if path.as_path().starts_with(&state.root) {
+            Some(ExecutionEnvironmentPath::new(&state.root))
         } else {
             None
         }
     }
 
-    async fn list_local_branches(&self, _repo_root: &Path) -> Result<Vec<BranchInfo>, String> {
+    async fn list_local_branches(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<BranchInfo>, String> {
         Ok(self.state.read().expect("FakeVcs state poisoned").branches.clone())
     }
 
-    async fn list_remote_branches(&self, _repo_root: &Path) -> Result<Vec<String>, String> {
+    async fn list_remote_branches(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<String>, String> {
         Ok(self.state.read().expect("FakeVcs state poisoned").remote_branches.clone())
     }
 
-    async fn commit_log(&self, _repo_root: &Path, _branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    async fn commit_log(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
         Ok(self.state.read().expect("FakeVcs state poisoned").commit_log.iter().take(limit).cloned().collect())
     }
 
-    async fn ahead_behind(&self, _repo_root: &Path, branch: &str, _reference: &str) -> Result<AheadBehind, String> {
+    async fn ahead_behind(&self, _repo_root: &ExecutionEnvironmentPath, branch: &str, _reference: &str) -> Result<AheadBehind, String> {
         let state = self.state.read().expect("FakeVcs state poisoned");
         state.ahead_behind.get(branch).cloned().ok_or_else(|| format!("FakeVcs: ahead_behind not configured for branch {branch:?}"))
     }
 
-    async fn working_tree_status(&self, _repo_root: &Path, checkout_path: &Path) -> Result<WorkingTreeStatus, String> {
+    async fn working_tree_status(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        checkout_path: &ExecutionEnvironmentPath,
+    ) -> Result<WorkingTreeStatus, String> {
         let state = self.state.read().expect("FakeVcs state poisoned");
         state
             .working_tree
-            .get(checkout_path)
+            .get(checkout_path.as_path())
             .cloned()
-            .ok_or_else(|| format!("FakeVcs: working_tree_status not configured for {}", checkout_path.display()))
+            .ok_or_else(|| format!("FakeVcs: working_tree_status not configured for {}", checkout_path))
     }
 }
 
@@ -592,12 +597,24 @@ impl FakeCheckoutManager {
 
 #[async_trait::async_trait]
 impl CheckoutManager for FakeCheckoutManager {
-    async fn list_checkouts(&self, _repo_root: &Path) -> Result<Vec<(PathBuf, Checkout)>, String> {
-        Ok(self.state.read().expect("FakeCheckoutManager state poisoned").checkouts.clone())
+    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        Ok(self
+            .state
+            .read()
+            .expect("FakeCheckoutManager state poisoned")
+            .checkouts
+            .iter()
+            .map(|(p, co)| (ExecutionEnvironmentPath::new(p), co.clone()))
+            .collect())
     }
 
-    async fn create_checkout(&self, repo_root: &Path, branch: &str, _create_branch: bool) -> Result<(PathBuf, Checkout), String> {
-        let path = repo_root.join(branch);
+    async fn create_checkout(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        _create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        let path = repo_root.as_path().join(branch);
         let checkout = Checkout {
             branch: branch.to_string(),
             is_main: false,
@@ -609,10 +626,10 @@ impl CheckoutManager for FakeCheckoutManager {
             association_keys: vec![],
         };
         self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.push((path.clone(), checkout.clone()));
-        Ok((path, checkout))
+        Ok((ExecutionEnvironmentPath::new(path), checkout))
     }
 
-    async fn remove_checkout(&self, _repo_root: &Path, branch: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
         self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.retain(|(_, co)| co.branch != branch);
         Ok(())
     }
@@ -659,7 +676,7 @@ impl WorkspaceManager for FakeWorkspaceManager {
         let ws_ref = format!("workspace:{}", store.len() + 1);
         let workspace = Workspace {
             name: config.name.clone(),
-            directories: vec![config.working_directory.clone()],
+            directories: vec![config.working_directory.clone().into_path_buf()],
             correlation_keys: vec![],
             attachable_set_id: None,
         };
@@ -704,7 +721,7 @@ impl TerminalPool for FakeTerminalPool {
         &self,
         session_name: &str,
         command: &str,
-        cwd: &Path,
+        cwd: &ExecutionEnvironmentPath,
         _env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
@@ -715,7 +732,7 @@ impl TerminalPool for FakeTerminalPool {
             session_name: session_name.to_string(),
             status: TerminalStatus::Running,
             command: Some(command.to_string()),
-            working_directory: Some(cwd.to_path_buf()),
+            working_directory: Some(cwd.clone()),
         });
         Ok(())
     }
@@ -724,7 +741,7 @@ impl TerminalPool for FakeTerminalPool {
         &self,
         session_name: &str,
         _command: &str,
-        _cwd: &Path,
+        _cwd: &ExecutionEnvironmentPath,
         _env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
@@ -803,7 +820,7 @@ impl Factory for FakeIssueTrackerFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
@@ -845,11 +862,11 @@ impl Factory for FakeVcsFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        repo_root: &Path,
+        repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
         let state = self.state.read().expect("FakeVcsFactory state poisoned");
-        if repo_root == state.root {
+        if repo_root.as_path() == state.root {
             Ok(Arc::new(FakeVcs::new(Arc::clone(&self.state))))
         } else {
             Err(vec![UnmetRequirement::NoVcsCheckout])
@@ -889,11 +906,11 @@ impl Factory for FakeCheckoutManagerFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        repo_root: &Path,
+        repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         let state = self.state.read().expect("FakeCheckoutManagerFactory state poisoned");
-        if repo_root == state.root {
+        if repo_root.as_path() == state.root {
             Ok(Arc::new(FakeCheckoutManager::from_state(Arc::clone(&self.state))))
         } else {
             Err(vec![UnmetRequirement::NoVcsCheckout])
@@ -916,7 +933,7 @@ impl Factory for FakeChangeRequestFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
@@ -944,7 +961,7 @@ impl Factory for FakeWorkspaceManagerFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
@@ -972,7 +989,7 @@ impl Factory for FakeTerminalPoolFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
@@ -1039,7 +1056,7 @@ impl Factory for ArcCheckoutManagerFactory {
         &self,
         _env: &EnvironmentBag,
         _config: &ConfigStore,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))

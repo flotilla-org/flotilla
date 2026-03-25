@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-
 use flotilla_protocol::TerminalStatus;
 pub use flotilla_protocol::{AttachableId, AttachableSet, AttachableSetId};
 use serde::{Deserialize, Serialize};
+
+use crate::path_context::ExecutionEnvironmentPath;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttachableContent {
@@ -21,7 +21,7 @@ pub struct TerminalAttachable {
     pub purpose: TerminalPurpose,
     #[serde(default)]
     pub command: String,
-    pub working_directory: PathBuf,
+    pub working_directory: ExecutionEnvironmentPath,
     pub status: TerminalStatus,
 }
 

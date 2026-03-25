@@ -1,11 +1,12 @@
 //! Terminal pool factory for shpool.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
-    config::{flotilla_config_dir, ConfigStore},
+    config::ConfigStore,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         terminal::{shpool::ShpoolTerminalPool, TerminalPool},
@@ -26,12 +27,12 @@ impl Factory for ShpoolTerminalPoolFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
-        _repo_root: &Path,
+        config: &ConfigStore,
+        _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if env.find_binary("shpool").is_some() {
-            let socket_path = flotilla_config_dir().join("shpool/shpool.socket");
+            let socket_path = config.state_dir().join("shpool/shpool.socket");
             let pool = ShpoolTerminalPool::create(runner, socket_path).await;
             Ok(Arc::new(pool))
         } else {
@@ -42,11 +43,12 @@ impl Factory for ShpoolTerminalPoolFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use super::ShpoolTerminalPoolFactory;
     use crate::{
         config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
@@ -56,7 +58,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -66,7 +68,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, Path::new("/repo"), runner).await;
+        let result = ShpoolTerminalPoolFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without shpool binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("shpool".into())));
     }

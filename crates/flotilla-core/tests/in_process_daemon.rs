@@ -11,6 +11,7 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
+    path_context::ExecutionEnvironmentPath,
     providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
@@ -43,7 +44,7 @@ struct FixedRemoteHostDetector {
 impl RepoDetector for FixedRemoteHostDetector {
     async fn detect(
         &self,
-        _repo_root: &Path,
+        _repo_root: &ExecutionEnvironmentPath,
         _runner: &dyn flotilla_core::providers::CommandRunner,
         _env: &dyn flotilla_core::providers::discovery::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
@@ -112,7 +113,7 @@ impl Factory for SlowCloudAgentFactory {
         &self,
         _: &EnvironmentBag,
         _: &ConfigStore,
-        _: &Path,
+        _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.agent) as Arc<dyn CloudAgentService>)
@@ -169,7 +170,7 @@ impl Factory for SlowAiUtilityFactory {
         &self,
         _: &EnvironmentBag,
         _: &ConfigStore,
-        _: &Path,
+        _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
@@ -1720,7 +1721,7 @@ async fn inline_issue_command_returns_zero_and_skips_lifecycle_events() {
 
 #[tokio::test]
 async fn execute_on_untracked_repo_returns_error_without_started_event() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
@@ -1882,7 +1883,7 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
 
 #[tokio::test]
 async fn follower_mode_flag_is_stored() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let leader = InProcessDaemon::new(vec![], config.clone(), fake_discovery(false), HostName::local()).await;
     assert!(!leader.is_follower(), "default daemon should not be follower");
 
@@ -1924,7 +1925,7 @@ async fn follower_mode_skips_external_providers() {
 
 #[tokio::test]
 async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
@@ -1994,7 +1995,7 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
 
 #[tokio::test]
 async fn add_virtual_repo_is_idempotent() {
-    let config = Arc::new(ConfigStore::new());
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
@@ -2226,7 +2227,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
             "flotilla/feat-lifecycle/shell/0",
             TerminalPurpose { checkout: "feat-lifecycle".into(), role: "shell".into(), index: 0 },
             "bash",
-            PathBuf::from("/tmp/repo/wt-feat-lifecycle"),
+            flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp/repo/wt-feat-lifecycle"),
             flotilla_protocol::TerminalStatus::Running,
         );
         set_id

@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::providers::{run, types::*, CommandRunner};
+use crate::{
+    path_context::DaemonHostPath,
+    providers::{run, types::*, CommandRunner},
+};
 
 /// Timeout for individual `zellij action` calls.  Combined with the 1-permit
 /// semaphore this limits the blast radius when Zellij is unresponsive: at most
@@ -34,6 +37,7 @@ struct TabState {
 
 pub struct ZellijWorkspaceManager {
     runner: Arc<dyn CommandRunner>,
+    state_dir: DaemonHostPath,
     /// Optional override for the session name. When `None`, falls back to
     /// the `ZELLIJ_SESSION_NAME` environment variable.
     session_name_override: Option<String>,
@@ -43,14 +47,14 @@ pub struct ZellijWorkspaceManager {
 }
 
 impl ZellijWorkspaceManager {
-    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner, session_name_override: None, action_semaphore: Semaphore::new(1) }
+    pub fn new(runner: Arc<dyn CommandRunner>, state_dir: DaemonHostPath) -> Self {
+        Self { runner, state_dir, session_name_override: None, action_semaphore: Semaphore::new(1) }
     }
 
     /// Create a manager targeting a specific session name, avoiding the need
     /// to read `ZELLIJ_SESSION_NAME` from the process environment.
-    pub fn with_session_name(runner: Arc<dyn CommandRunner>, session_name: String) -> Self {
-        Self { runner, session_name_override: Some(session_name), action_semaphore: Semaphore::new(1) }
+    pub fn with_session_name(runner: Arc<dyn CommandRunner>, state_dir: DaemonHostPath, session_name: String) -> Self {
+        Self { runner, state_dir, session_name_override: Some(session_name), action_semaphore: Semaphore::new(1) }
     }
 
     /// Run `zellij action <args>` and return stdout, or an error on failure.
@@ -99,28 +103,23 @@ impl ZellijWorkspaceManager {
         Ok(())
     }
 
-    /// Return the current Zellij session name, preferring the override if set,
-    /// otherwise falling back to the `ZELLIJ_SESSION_NAME` environment variable.
+    /// Return the current Zellij session name. The session name must have been
+    /// resolved at probe time and passed to `with_session_name()`.
     pub fn session_name(&self) -> Result<String, String> {
-        if let Some(ref name) = self.session_name_override {
-            return Ok(name.clone());
-        }
-        std::env::var("ZELLIJ_SESSION_NAME").map_err(|_| "not running inside a zellij session (ZELLIJ_SESSION_NAME not set)".to_string())
+        self.session_name_override
+            .clone()
+            .ok_or_else(|| "zellij session name not resolved at probe time (ZELLIJ_SESSION_NAME was not set)".to_string())
     }
 
-    /// Return the state file path: `~/.config/flotilla/zellij/{session}/state.toml`.
-    pub fn state_path(session: &str) -> Result<PathBuf, String> {
-        let config_dir = dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
-        Ok(config_dir.join("flotilla").join("zellij").join(session).join("state.toml"))
+    /// Return the state file path for the given zellij session.
+    fn state_path(&self, session: &str) -> DaemonHostPath {
+        self.state_dir.join("zellij").join(session).join("state.toml")
     }
 
     /// Load persisted state for the given session. Returns default on any error.
-    fn load_state(session: &str) -> ZellijState {
-        let path = match Self::state_path(session) {
-            Ok(p) => p,
-            Err(_) => return ZellijState::default(),
-        };
-        let contents = match std::fs::read_to_string(&path) {
+    fn load_state(&self, session: &str) -> ZellijState {
+        let path = self.state_path(session);
+        let contents = match std::fs::read_to_string(path.as_path()) {
             Ok(c) => c,
             Err(_) => return ZellijState::default(),
         };
@@ -134,16 +133,13 @@ impl ZellijWorkspaceManager {
     }
 
     /// Save state for the given session. Silently ignores errors.
-    fn save_state(session: &str, state: &ZellijState) {
-        let path = match Self::state_path(session) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        if let Some(parent) = path.parent() {
+    fn save_state(&self, session: &str, state: &ZellijState) {
+        let path = self.state_path(session);
+        if let Some(parent) = path.as_path().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(contents) = toml::to_string(state) {
-            let _ = std::fs::write(&path, contents);
+            let _ = std::fs::write(path.as_path(), contents);
         }
     }
 
@@ -165,7 +161,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         // Load state for enrichment, pruning stale entries
         let (session, mut state) = match self.session_name() {
             Ok(s) => {
-                let st = Self::load_state(&s);
+                let st = self.load_state(&s);
                 (Some(s), st)
             }
             Err(_) => (None, ZellijState::default()),
@@ -176,7 +172,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         state.tabs.retain(|name, _| live_names.contains(name.as_str()));
         if state.tabs.len() != before_len {
             if let Some(ref session) = session {
-                Self::save_state(session, &state);
+                self.save_state(session, &state);
             }
         }
 
@@ -200,7 +196,7 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         info!(workspace = %config.name, "zellij: creating workspace");
 
         let rendered = super::resolve_template(config);
-        let working_dir = config.working_directory.display().to_string();
+        let working_dir = config.working_directory.as_path().display().to_string();
 
         // Create new tab
         self.zellij_action(&["new-tab", "--name", &config.name, "--cwd", &working_dir]).await?;
@@ -270,13 +266,13 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
 
         // Save state
         if let Ok(session) = self.session_name() {
-            let mut state = Self::load_state(&session);
+            let mut state = self.load_state(&session);
             let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default();
             state.tabs.insert(config.name.clone(), TabState { working_directory: working_dir.clone(), created_at: timestamp });
-            Self::save_state(&session, &state);
+            self.save_state(&session, &state);
         }
 
-        let directories = vec![config.working_directory.clone()];
+        let directories = vec![config.working_directory.clone().into_path_buf()];
         info!(workspace = %config.name, "zellij: workspace ready");
         Ok((config.name.clone(), Workspace { name: config.name.clone(), directories, correlation_keys: vec![], attachable_set_id: None }))
     }
@@ -291,16 +287,29 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_context::ExecutionEnvironmentPath;
+
+    fn test_mgr(state_dir: DaemonHostPath) -> ZellijWorkspaceManager {
+        use crate::providers::testing::MockRunner;
+        let runner = Arc::new(MockRunner::new(vec![]));
+        ZellijWorkspaceManager::new(runner, state_dir)
+    }
 
     #[test]
     fn state_path_contains_session_name() {
-        let path = ZellijWorkspaceManager::state_path("my-session").unwrap();
-        assert!(path.ends_with("flotilla/zellij/my-session/state.toml"));
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = DaemonHostPath::new(dir.path().join("flotilla"));
+        let mgr = test_mgr(state_dir);
+        let path = mgr.state_path("my-session");
+        assert!(path.as_path().ends_with("flotilla/zellij/my-session/state.toml"));
     }
 
     #[test]
     fn load_state_returns_default_for_missing_file() {
-        let state = ZellijWorkspaceManager::load_state("nonexistent-session-xyz");
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = DaemonHostPath::new(dir.path().join("flotilla"));
+        let mgr = test_mgr(state_dir);
+        let state = mgr.load_state("nonexistent-session-xyz");
         assert!(state.tabs.is_empty());
     }
 
@@ -468,12 +477,14 @@ mod tests {
         let session = replay::test_session(&fixture("zellij_workspaces.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = ZellijWorkspaceManager::with_session_name(runner.clone(), "flotilla-test-zj-ws".to_string());
+        let state_tmp = tempfile::tempdir().expect("tempdir for state");
+        let state_dir = DaemonHostPath::new(state_tmp.path());
+        let mgr = ZellijWorkspaceManager::with_session_name(runner.clone(), state_dir, "flotilla-test-zj-ws".to_string());
 
         // Create workspace "feat-123"
         let config1 = WorkspaceConfig {
             name: "feat-123".to_string(),
-            working_directory: PathBuf::from("/tmp"),
+            working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
             resolved_commands: None,
@@ -485,7 +496,7 @@ mod tests {
         // Create workspace "fix-456"
         let config2 = WorkspaceConfig {
             name: "fix-456".to_string(),
-            working_directory: PathBuf::from("/tmp"),
+            working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
             resolved_commands: None,
@@ -566,7 +577,9 @@ mod tests {
         let session = replay::test_session(&fixture("zellij_list.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = ZellijWorkspaceManager::with_session_name(runner, "flotilla-test-zj".to_string());
+        let state_tmp = tempfile::tempdir().expect("tempdir for state");
+        let state_dir = DaemonHostPath::new(state_tmp.path());
+        let mgr = ZellijWorkspaceManager::with_session_name(runner, state_dir, "flotilla-test-zj".to_string());
         let workspaces = mgr.list_workspaces().await.unwrap();
 
         assert_eq!(workspaces.len(), 2);

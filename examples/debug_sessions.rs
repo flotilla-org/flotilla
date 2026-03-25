@@ -9,6 +9,7 @@ use flotilla_core::{
     config::ConfigStore,
     convert::correlation_result_to_work_item,
     data,
+    path_policy::PathPolicy,
     providers::{
         discovery::{self, detectors, FactoryRegistry, ProcessEnvVars},
         types::RepoCriteria,
@@ -25,7 +26,8 @@ async fn main() {
 
     // Step 1: Build registry (same as app startup)
     println!("\n=== Step 1: Build ProviderRegistry ===");
-    let config = ConfigStore::new();
+    let paths = PathPolicy::from_process_env();
+    let config = ConfigStore::new(paths.config_dir, paths.state_dir);
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
 
     let host_dets = detectors::default_host_detectors();
@@ -34,8 +36,10 @@ async fn main() {
     let factories = FactoryRegistry::default_all();
     let attachable_store = shared_file_backed_attachable_store(config.base_path());
 
+    let ee_repo_root = flotilla_core::path_context::ExecutionEnvironmentPath::new(&repo_root);
     let result =
-        discovery::discover_providers(&host_bag, &repo_root, &repo_dets, &factories, &config, Arc::clone(&runner), &ProcessEnvVars).await;
+        discovery::discover_providers(&host_bag, &ee_repo_root, &repo_dets, &factories, &config, Arc::clone(&runner), &ProcessEnvVars)
+            .await;
     let registry = result.registry;
     let repo_slug = result.repo_slug;
     println!("  checkout_managers: {}", registry.checkout_managers.len());

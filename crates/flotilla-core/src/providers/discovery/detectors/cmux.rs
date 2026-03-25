@@ -5,8 +5,6 @@
 //! PATH. The detector checks the `CMUX_SOCKET_PATH` env var, then probes
 //! the binary on PATH, and finally falls back to the hardcoded app-bundle path.
 
-use std::path::Path;
-
 use async_trait::async_trait;
 
 use crate::providers::{
@@ -35,10 +33,10 @@ impl HostDetector for CmuxDetector {
         if runner.exists("cmux", &["list-sessions", "--format=json"]).await {
             assertions.push(EnvironmentAssertion::binary("cmux", "cmux"));
         } else {
-            // 3. Fall back to the hardcoded app-bundle path
-            let app_bundle_path = Path::new(CMUX_APP_BUNDLE_BIN);
-            if app_bundle_path.exists() {
-                assertions.push(EnvironmentAssertion::binary("cmux", app_bundle_path));
+            // 3. Fall back to the macOS app-bundle path — runs the binary to confirm
+            //    it's functional, not just present on disk
+            if runner.exists(CMUX_APP_BUNDLE_BIN, &["list-sessions", "--format=json"]).await {
+                assertions.push(EnvironmentAssertion::binary("cmux", CMUX_APP_BUNDLE_BIN));
             }
         }
 
@@ -48,10 +46,11 @@ impl HostDetector for CmuxDetector {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use crate::{
+        path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+    };
 
     #[tokio::test]
     async fn cmux_detector_with_socket_and_binary() {
@@ -72,12 +71,12 @@ mod tests {
         assert!(matches!(
             &assertions[1],
             EnvironmentAssertion::SocketAvailable { name, path }
-            if name == "cmux" && path == Path::new(socket_path)
+            if name == "cmux" && *path == DaemonHostPath::new(socket_path)
         ));
         assert!(matches!(
             &assertions[2],
             EnvironmentAssertion::BinaryAvailable { name, path, .. }
-            if name == "cmux" && path == &PathBuf::from("cmux")
+            if name == "cmux" && *path == ExecutionEnvironmentPath::new("cmux")
         ));
     }
 
@@ -90,32 +89,30 @@ mod tests {
         assert!(matches!(
             &assertions[0],
             EnvironmentAssertion::BinaryAvailable { name, path, .. }
-            if name == "cmux" && path == &PathBuf::from("cmux")
+            if name == "cmux" && *path == ExecutionEnvironmentPath::new("cmux")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cmux_detector_app_bundle_fallback() {
+        // Not on PATH, but app-bundle check succeeds via runner
+        let runner = DiscoveryMockRunner::builder().tool_exists("cmux", false).tool_exists(CMUX_APP_BUNDLE_BIN, true).build();
+        let assertions = CmuxDetector.detect(&runner, &TestEnvVars::default()).await;
+
+        assert_eq!(assertions.len(), 1);
+        assert!(matches!(
+            &assertions[0],
+            EnvironmentAssertion::BinaryAvailable { name, path, .. }
+            if name == "cmux" && *path == ExecutionEnvironmentPath::new(CMUX_APP_BUNDLE_BIN)
         ));
     }
 
     #[tokio::test]
     async fn cmux_detector_nothing() {
-        // No env var, no binary on PATH, and the app-bundle path likely doesn't
-        // exist in CI — assert empty (or just BinaryAvailable if the app is
-        // installed on this machine).
-        let runner = DiscoveryMockRunner::builder().tool_exists("cmux", false).build();
+        // No env var, no binary on PATH, app-bundle check fails via runner
+        let runner = DiscoveryMockRunner::builder().tool_exists("cmux", false).tool_exists(CMUX_APP_BUNDLE_BIN, false).build();
         let assertions = CmuxDetector.detect(&runner, &TestEnvVars::default()).await;
 
-        // No env var assertions should be present
-        assert!(!assertions.iter().any(|a| matches!(a, EnvironmentAssertion::EnvVarSet { .. })));
-        assert!(!assertions.iter().any(|a| matches!(a, EnvironmentAssertion::SocketAvailable { .. })));
-
-        // If the app-bundle path exists on this machine, we get a BinaryAvailable;
-        // otherwise empty. Both are correct.
-        for a in &assertions {
-            match a {
-                EnvironmentAssertion::BinaryAvailable { name, path, .. } => {
-                    assert_eq!(name, "cmux");
-                    assert_eq!(path, &PathBuf::from(CMUX_APP_BUNDLE_BIN));
-                }
-                other => panic!("unexpected assertion: {other:?}"),
-            }
-        }
+        assert!(assertions.is_empty());
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -18,6 +18,7 @@ use crate::{
         InMemoryAttachableStore, SharedAttachableStore, TerminalAttachable, TerminalPurpose,
     },
     config::{HostsConfig, RemoteHostConfig, SshConfig},
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession},
 };
 
@@ -126,12 +127,12 @@ fn test_hosts_config() -> HostsConfig {
 
 fn test_resolver() -> SshRemoteHopResolver {
     // Use a temp dir for config_base so SSH control socket dir creation works
-    let config_base = std::env::temp_dir().join("flotilla-test-ssh-resolver");
+    let config_base = DaemonHostPath::new(std::env::temp_dir().join("flotilla-test-ssh-resolver"));
     SshRemoteHopResolver::new(config_base, test_hosts_config())
 }
 
 fn test_resolver_no_multiplex() -> SshRemoteHopResolver {
-    let config_base = std::env::temp_dir().join("flotilla-test-ssh-resolver-nomux");
+    let config_base = DaemonHostPath::new(std::env::temp_dir().join("flotilla-test-ssh-resolver-nomux"));
     let hosts = HostsConfig { ssh: SshConfig { multiplex: false }, hosts: test_hosts_config().hosts };
     SshRemoteHopResolver::new(config_base, hosts)
 }
@@ -142,7 +143,7 @@ fn test_resolver_no_multiplex() -> SshRemoteHopResolver {
 fn wrap_with_working_directory_and_inner_command() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
         Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
@@ -229,7 +230,7 @@ fn wrap_without_working_directory() {
 fn wrap_empty_command_with_working_directory_produces_login_shell() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![]));
 
     resolver.resolve_wrap(&HostName::new("feta"), &mut context).expect("resolve_wrap should succeed");
@@ -383,7 +384,7 @@ fn wrap_and_enter_do_not_update_current_host() {
 fn enter_produces_ssh_command_and_sendkeys() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/home/alice/dev/my-repo"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
         Arg::Quoted("cleat".into()),
         Arg::Literal("attach".into()),
@@ -445,7 +446,7 @@ fn enter_empty_command_no_sendkeys() {
 fn enter_with_working_directory_and_empty_command() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.working_directory = Some(PathBuf::from("/remote/dir"));
+    context.working_directory = Some(ExecutionEnvironmentPath::new("/remote/dir"));
     context.actions.push(ResolvedAction::Command(vec![]));
 
     resolver.resolve_enter(&HostName::new("feta"), &mut context).expect("resolve_enter should succeed");
@@ -466,7 +467,7 @@ struct FakeTerminalPool {
 struct FakePoolCall {
     session_name: String,
     command: String,
-    cwd: PathBuf,
+    cwd: ExecutionEnvironmentPath,
     env_vars: TerminalEnvVars,
 }
 
@@ -486,7 +487,13 @@ impl TerminalPool for FakeTerminalPool {
         Ok(Vec::new())
     }
 
-    async fn ensure_session(&self, _session_name: &str, _command: &str, _cwd: &Path, _env_vars: &TerminalEnvVars) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        _session_name: &str,
+        _command: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &TerminalEnvVars,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -494,13 +501,13 @@ impl TerminalPool for FakeTerminalPool {
         &self,
         session_name: &str,
         command: &str,
-        cwd: &Path,
+        cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         self.calls.lock().expect("lock").push(FakePoolCall {
             session_name: session_name.to_string(),
             command: command.to_string(),
-            cwd: cwd.to_path_buf(),
+            cwd: cwd.clone(),
             env_vars: env_vars.clone(),
         });
         Ok(vec![Arg::Quoted("cleat".into()), Arg::Literal("attach".into()), Arg::Literal(session_name.to_string())])
@@ -533,7 +540,7 @@ fn insert_terminal(
         content: AttachableContent::Terminal(TerminalAttachable {
             purpose: TerminalPurpose { checkout: "feat".to_string(), role: "shell".to_string(), index: 0 },
             command: command.to_string(),
-            working_directory: cwd.to_path_buf(),
+            working_directory: ExecutionEnvironmentPath::new(cwd),
             status: TerminalStatus::Disconnected,
         }),
     });
@@ -573,7 +580,7 @@ fn terminal_resolve_pushes_command_onto_context() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].session_name, att_id.to_string());
     assert_eq!(calls[0].command, "bash");
-    assert_eq!(calls[0].cwd, PathBuf::from("/repo/wt-feat"));
+    assert_eq!(calls[0].cwd, ExecutionEnvironmentPath::new("/repo/wt-feat"));
 }
 
 #[test]
@@ -1034,7 +1041,7 @@ fn e2e_resolve(strategy: Arc<dyn CombineStrategy>, target: &str, cleat_args: &[A
     let mut context = ResolutionContext {
         current_host: local_host,
         current_environment: None,
-        working_directory: working_directory.map(PathBuf::from),
+        working_directory: working_directory.map(ExecutionEnvironmentPath::new),
         actions: Vec::new(),
         nesting_depth: 0,
     };

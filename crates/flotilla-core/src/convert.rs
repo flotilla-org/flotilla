@@ -24,7 +24,7 @@ pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> Discove
     let kind = match assertion {
         EnvironmentAssertion::BinaryAvailable { name, path, version } => {
             detail.insert("name".into(), name.clone());
-            detail.insert("path".into(), path.display().to_string());
+            detail.insert("path".into(), path.as_path().display().to_string());
             if let Some(v) = version {
                 detail.insert("version".into(), v.clone());
             }
@@ -36,7 +36,7 @@ pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> Discove
             "env_var_set"
         }
         EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
-            detail.insert("root".into(), root.display().to_string());
+            detail.insert("root".into(), root.as_path().display().to_string());
             detail.insert("kind".into(), format!("{kind:?}"));
             detail.insert("is_main_checkout".into(), is_main_checkout.to_string());
             "vcs_checkout_detected"
@@ -50,12 +50,12 @@ pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> Discove
         }
         EnvironmentAssertion::AuthFileExists { provider, path } => {
             detail.insert("provider".into(), provider.clone());
-            detail.insert("path".into(), path.display().to_string());
+            detail.insert("path".into(), path.as_path().display().to_string());
             "auth_file_exists"
         }
         EnvironmentAssertion::SocketAvailable { name, path } => {
             detail.insert("name".into(), name.clone());
-            detail.insert("path".into(), path.display().to_string());
+            detail.insert("path".into(), path.as_path().display().to_string());
             "socket_available"
         }
     };
@@ -130,18 +130,18 @@ pub fn inventory_from_bag(bag: &EnvironmentBag) -> ToolInventory {
     for assertion in bag.assertions() {
         match assertion {
             EnvironmentAssertion::BinaryAvailable { name, path, version } => {
-                let mut detail = vec![("path".into(), path.display().to_string())];
+                let mut detail = vec![("path".into(), path.as_path().display().to_string())];
                 if let Some(version) = version {
                     detail.push(("version".into(), version.clone()));
                 }
                 inventory.binaries.push(DiscoveryFact { name: name.clone(), detail });
             }
             EnvironmentAssertion::SocketAvailable { name, path } => {
-                let detail = vec![("path".into(), path.display().to_string())];
+                let detail = vec![("path".into(), path.as_path().display().to_string())];
                 inventory.sockets.push(DiscoveryFact { name: name.clone(), detail });
             }
             EnvironmentAssertion::AuthFileExists { provider, path } => {
-                let detail = vec![("path".into(), path.display().to_string())];
+                let detail = vec![("path".into(), path.as_path().display().to_string())];
                 inventory.auth.push(DiscoveryFact { name: provider.clone(), detail });
             }
             EnvironmentAssertion::EnvVarSet { key, .. } => {
@@ -224,13 +224,17 @@ mod tests {
     use super::*;
     use crate::{
         data::{CorrelatedAnchor, CorrelatedWorkItem, StandaloneResult},
+        path_context::{DaemonHostPath, ExecutionEnvironmentPath},
         providers::discovery::EnvironmentAssertion,
     };
 
     #[test]
     fn convert_binary_available() {
-        let assertion =
-            EnvironmentAssertion::BinaryAvailable { name: "git".into(), path: PathBuf::from("/usr/bin/git"), version: Some("2.40".into()) };
+        let assertion = EnvironmentAssertion::BinaryAvailable {
+            name: "git".into(),
+            path: ExecutionEnvironmentPath::new("/usr/bin/git"),
+            version: Some("2.40".into()),
+        };
         let entry = assertion_to_discovery_entry(&assertion);
         assert_eq!(entry.kind, "binary_available");
         assert_eq!(entry.detail["name"], "git");
@@ -240,8 +244,10 @@ mod tests {
 
     #[test]
     fn convert_auth_file_exists() {
-        let assertion =
-            EnvironmentAssertion::AuthFileExists { provider: "github".into(), path: PathBuf::from("/home/.config/gh/hosts.yml") };
+        let assertion = EnvironmentAssertion::AuthFileExists {
+            provider: "github".into(),
+            path: ExecutionEnvironmentPath::new("/home/.config/gh/hosts.yml"),
+        };
         let entry = assertion_to_discovery_entry(&assertion);
         assert_eq!(entry.kind, "auth_file_exists");
         assert_eq!(entry.detail["provider"], "github");
@@ -265,7 +271,7 @@ mod tests {
 
     #[test]
     fn convert_socket_available() {
-        let assertion = EnvironmentAssertion::SocketAvailable { name: "shpool".into(), path: PathBuf::from("/tmp/shpool.sock") };
+        let assertion = EnvironmentAssertion::SocketAvailable { name: "shpool".into(), path: DaemonHostPath::new("/tmp/shpool.sock") };
         let entry = assertion_to_discovery_entry(&assertion);
         assert_eq!(entry.kind, "socket_available");
         assert_eq!(entry.detail["name"], "shpool");

@@ -11,25 +11,18 @@ use crate::providers::{http_execute, types::*, HttpClient};
 
 pub struct CursorCodingAgent {
     provider_name: String,
+    api_key: String,
     http: Arc<dyn HttpClient>,
     auth_warned: AtomicBool,
 }
 
 impl CursorCodingAgent {
-    pub fn new(provider_name: String, http: Arc<dyn HttpClient>) -> Self {
-        Self { provider_name, http, auth_warned: AtomicBool::new(false) }
-    }
-
-    fn api_key() -> Result<String, String> {
-        std::env::var("CURSOR_API_KEY")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "CURSOR_API_KEY is not set".to_string())
+    pub fn new(provider_name: String, api_key: String, http: Arc<dyn HttpClient>) -> Self {
+        Self { provider_name, api_key, http, auth_warned: AtomicBool::new(false) }
     }
 
     async fn fetch_agents(&self) -> Result<Vec<CursorAgent>, String> {
-        let api_key = Self::api_key()?;
+        let api_key = &self.api_key;
         let mut cursor: Option<String> = None;
         let mut all_agents = Vec::new();
 
@@ -43,7 +36,7 @@ impl CursorCodingAgent {
 
             let request = super::REQUEST_FACTORY
                 .get(&url)
-                .basic_auth(&api_key, None::<&str>)
+                .basic_auth(api_key, None::<&str>)
                 .build()
                 .map_err(|e| format!("request build error: {e}"))?;
             let resp = http_execute!(self.http, request)?;
@@ -168,9 +161,9 @@ impl super::CloudAgentService for CursorCodingAgent {
     async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
         let agents = match self.fetch_agents().await {
             Ok(agents) => agents,
-            Err(e) if e.contains("CURSOR_API_KEY is not set") || e.contains("authentication") => {
+            Err(e) if e.contains("authentication") => {
                 if !self.auth_warned.swap(true, Ordering::Relaxed) {
-                    warn!(provider = "cursor", "Cursor sessions unavailable: set CURSOR_API_KEY");
+                    warn!(provider = "cursor", "Cursor sessions unavailable: check CURSOR_API_KEY is valid");
                 }
                 return Ok(vec![]);
             }
@@ -304,7 +297,7 @@ mod tests {
 
     fn cursor_service() -> CursorCodingAgent {
         let http: Arc<dyn crate::providers::HttpClient> = Arc::new(MockHttpClient);
-        CursorCodingAgent::new("cursor".into(), http)
+        CursorCodingAgent::new("cursor".into(), "test-key".into(), http)
     }
 
     #[tokio::test]
