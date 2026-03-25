@@ -1,0 +1,9 @@
+[package]
+name = "flotilla-commands"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
+clap = { version = "4", features = ["derive", "string"] }

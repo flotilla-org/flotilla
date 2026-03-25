@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/flotilla-client",
+    "crates/flotilla-commands",
     "crates/flotilla-core",
     "crates/flotilla-protocol",
     "crates/flotilla-daemon",
@@ -31,6 +32,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-commands = { path = "crates/flotilla-commands" }
 flotilla-core = { path = "crates/flotilla-core" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
