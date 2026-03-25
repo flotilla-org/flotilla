@@ -1,10 +1,12 @@
 pub mod arg;
 pub mod commands;
 pub mod delta;
+pub mod environment;
 pub mod framing;
 mod host;
 mod host_summary;
 pub mod output;
+pub mod path_context;
 pub mod peer;
 pub mod provider_data;
 pub mod query;
@@ -13,8 +15,10 @@ pub mod snapshot;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use environment::{EnvironmentBinding, EnvironmentId, EnvironmentInfo, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, SystemInfo, ToolInventory};
+pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 
 #[cfg(test)]
@@ -153,6 +157,8 @@ pub enum Message {
         host_name: HostName,
         #[serde(default = "uuid::Uuid::nil")]
         session_id: uuid::Uuid,
+        #[serde(default)]
+        environment_id: Option<EnvironmentId>,
     },
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),

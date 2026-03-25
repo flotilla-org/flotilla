@@ -128,6 +128,7 @@ pub(crate) fn snapshot(repo: &Path) -> RepoSnapshot {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
+        environment_binding: None,
     }
 }
 

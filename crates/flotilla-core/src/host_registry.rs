@@ -366,7 +366,13 @@ impl HostRegistry {
 // ---------------------------------------------------------------------------
 
 fn default_host_summary(host_name: &HostName) -> HostSummary {
-    HostSummary { host_name: host_name.clone(), system: SystemInfo::default(), inventory: ToolInventory::default(), providers: vec![] }
+    HostSummary {
+        host_name: host_name.clone(),
+        system: SystemInfo::default(),
+        inventory: ToolInventory::default(),
+        providers: vec![],
+        environments: vec![],
+    }
 }
 
 fn ensure_remote_host_state<'a>(hosts: &'a mut HashMap<HostName, HostState>, host_name: &HostName) -> &'a mut HostState {
@@ -598,7 +604,13 @@ mod tests {
     }
 
     fn minimal_summary(name: &HostName) -> HostSummary {
-        HostSummary { host_name: name.clone(), system: SystemInfo::default(), inventory: ToolInventory::default(), providers: vec![] }
+        HostSummary {
+            host_name: name.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        }
     }
 
     fn make_registry() -> HostRegistry {
@@ -883,6 +895,7 @@ mod tests {
             system: SystemInfo { os: Some("linux".into()), ..Default::default() },
             inventory: ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         };
         registry.publish_peer_summary(&peer_name(), new_summary, &noop_emit).await;
 

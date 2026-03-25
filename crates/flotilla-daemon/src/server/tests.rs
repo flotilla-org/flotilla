@@ -166,6 +166,7 @@ fn checkout(branch: &str) -> Checkout {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        environment_id: None,
     }
 }
 
@@ -451,6 +452,7 @@ async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
             },
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         });
 
         ensure_test_connection_generation(&mut pm, &HostName::new("remote"), MockPeerSender::discard);
@@ -1150,6 +1152,7 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1158,8 +1161,12 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
     let mut reader = BufReader::new(read_half).lines();
     let mut writer = BufWriter::new(write_half);
 
-    let hello =
-        Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("remote-host"), session_id: uuid::Uuid::nil() };
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        host_name: HostName::new("remote-host"),
+        session_id: uuid::Uuid::nil(),
+        environment_id: None,
+    };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
     let line = reader.next_line().await.expect("read hello response").expect("hello line");
@@ -1265,6 +1272,7 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1274,14 +1282,24 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
     let mut writer = BufWriter::new(write_half);
     let remote_host = HostName::new("remote-host");
 
-    let hello = Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: remote_host.clone(), session_id: uuid::Uuid::nil() };
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        host_name: remote_host.clone(),
+        session_id: uuid::Uuid::nil(),
+        environment_id: None,
+    };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
     let line = reader.next_line().await.expect("read hello response").expect("hello line");
     let hello_back: Message = serde_json::from_str(&line).expect("parse hello");
     assert!(matches!(hello_back, Message::Hello { .. }), "expected hello response");
 
-    let summary =
-        HostSummary { host_name: remote_host.clone(), system: Default::default(), inventory: Default::default(), providers: vec![] };
+    let summary = HostSummary {
+        host_name: remote_host.clone(),
+        system: Default::default(),
+        inventory: Default::default(),
+        providers: vec![],
+        environments: vec![],
+    };
 
     flotilla_protocol::framing::write_message_line(&mut writer, &Message::Peer(Box::new(PeerWireMessage::HostSummary(summary.clone()))))
         .await
@@ -1350,6 +1368,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1544,6 +1563,7 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
             },
             inventory: Default::default(),
             providers: vec![],
+            environments: vec![],
         });
     }
 
@@ -1703,6 +1723,7 @@ async fn handle_client_relays_outbound_peer_messages() {
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1711,8 +1732,12 @@ async fn handle_client_relays_outbound_peer_messages() {
     let mut reader = BufReader::new(read_half).lines();
     let mut writer = BufWriter::new(write_half);
 
-    let hello =
-        Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("relay-target"), session_id: uuid::Uuid::nil() };
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        host_name: HostName::new("relay-target"),
+        session_id: uuid::Uuid::nil(),
+        environment_id: None,
+    };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
     let _ = reader.next_line().await.expect("read hello").expect("line");
 
@@ -1789,6 +1814,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             notify_a,
             peer_connected_tx_a,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1805,6 +1831,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             notify_b,
             peer_connected_tx_b,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1817,7 +1844,12 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
         let (read_half, write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half).lines();
         let mut writer = BufWriter::new(write_half);
-        let hello = Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("peer"), session_id: uuid::Uuid::nil() };
+        let hello = Message::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            host_name: HostName::new("peer"),
+            session_id: uuid::Uuid::nil(),
+            environment_id: None,
+        };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
         let line = reader.next_line().await.expect("read hello response").expect("hello response line");

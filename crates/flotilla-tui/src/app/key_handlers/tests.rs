@@ -65,6 +65,7 @@ fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     });
 }

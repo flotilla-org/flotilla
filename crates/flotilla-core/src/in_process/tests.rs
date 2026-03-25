@@ -12,6 +12,7 @@ fn checkout_with_issue(issue_id: &str) -> Checkout {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![AssociationKey::IssueRef("gh".into(), issue_id.into())],
+        environment_id: None,
     }
 }
 
@@ -91,6 +92,7 @@ fn choose_event_uses_delta_for_non_initial_changes() {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
+        environment_binding: None,
     };
 
     let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![], work_items: vec![] };
@@ -119,6 +121,7 @@ fn choose_event_falls_back_to_full_when_delta_is_larger() {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
+        environment_binding: None,
     };
 
     let delta = DeltaEntry {
@@ -192,6 +195,7 @@ fn choose_event_sends_full_when_delta_has_empty_changes() {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
+        environment_binding: None,
     };
 
     // prev_seq > 0 but changes is empty — should still send full
@@ -218,6 +222,7 @@ fn build_repo_snapshot_with_peers_merges_peer_data() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        environment_id: None,
     });
 
     let peers = vec![(host_b, peer_data)];
@@ -263,6 +268,7 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        environment_id: None,
     });
 
     // Create peer data
@@ -276,6 +282,7 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        environment_id: None,
     });
     let peers = vec![(peer_host.clone(), peer_data.clone())];
     let default_snap = RefreshSnapshot::default();
@@ -376,6 +383,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
             CorrelationKey::CheckoutPath(remote_checkout.clone()),
         ],
         association_keys: vec![],
+        environment_id: None,
     });
 
     let peers = vec![(remote_host.clone(), peer_data)];

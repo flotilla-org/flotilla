@@ -80,6 +80,7 @@ mod status_human {
             },
             inventory: ToolInventory::default(),
             providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+            environments: vec![],
         }
     }
 
@@ -213,6 +214,7 @@ mod watch_human {
             issue_total: None,
             issue_has_more: false,
             issue_search_results: None,
+            environment_binding: None,
         }
     }
 

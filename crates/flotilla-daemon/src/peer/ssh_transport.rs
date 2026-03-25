@@ -206,6 +206,7 @@ impl SshTransport {
             protocol_version: PROTOCOL_VERSION,
             host_name: self.local_host.clone(),
             session_id: self.local_session_id,
+            environment_id: None,
         })
         .await?;
 
@@ -338,7 +339,7 @@ impl SshTransport {
 
     fn validate_remote_hello(expected_host_name: &HostName, hello: Message) -> Result<uuid::Uuid, String> {
         match hello {
-            Message::Hello { protocol_version, host_name, session_id } => {
+            Message::Hello { protocol_version, host_name, session_id, .. } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(format!("peer protocol version mismatch: expected {}, got {}", PROTOCOL_VERSION, protocol_version));
                 }
@@ -515,6 +516,7 @@ mod tests {
             protocol_version: flotilla_protocol::PROTOCOL_VERSION,
             host_name: HostName::new("remote"),
             session_id: uuid::Uuid::nil(),
+            environment_id: None,
         };
 
         SshTransport::validate_remote_hello(&HostName::new("remote"), hello).expect("matching hello should be accepted");
@@ -526,6 +528,7 @@ mod tests {
             protocol_version: flotilla_protocol::PROTOCOL_VERSION + 1,
             host_name: HostName::new("remote"),
             session_id: uuid::Uuid::nil(),
+            environment_id: None,
         };
 
         let err = SshTransport::validate_remote_hello(&HostName::new("remote"), hello)
@@ -539,6 +542,7 @@ mod tests {
             protocol_version: flotilla_protocol::PROTOCOL_VERSION,
             host_name: HostName::new("someone-else"),
             session_id: uuid::Uuid::nil(),
+            environment_id: None,
         };
 
         let err =
@@ -622,6 +626,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 host_name: HostName::new("remote"),
                 session_id: uuid::Uuid::nil(),
+                environment_id: None,
             })
             .expect("serialize hello");
             let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {

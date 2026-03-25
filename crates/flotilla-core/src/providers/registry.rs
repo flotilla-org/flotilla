@@ -123,6 +123,7 @@ pub struct ProviderRegistry {
     pub ai_utilities: ProviderSet<dyn AiUtility>,
     pub workspace_managers: ProviderSet<dyn WorkspaceManager>,
     pub terminal_pools: ProviderSet<dyn TerminalPool>,
+    pub environment_providers: ProviderSet<dyn crate::providers::environment::EnvironmentProvider>,
 }
 
 impl ProviderRegistry {
@@ -136,6 +137,7 @@ impl ProviderRegistry {
             ai_utilities: ProviderSet::new(),
             workspace_managers: ProviderSet::new(),
             terminal_pools: ProviderSet::new(),
+            environment_providers: ProviderSet::new(),
         }
     }
 }
@@ -164,6 +166,7 @@ impl ProviderRegistry {
         collect(&mut infos, &self.ai_utilities);
         collect(&mut infos, &self.workspace_managers);
         collect(&mut infos, &self.terminal_pools);
+        collect(&mut infos, &self.environment_providers);
         infos
     }
 }

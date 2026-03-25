@@ -16,6 +16,7 @@ fn insert_local_host(model: &mut TuiModel, name: &str) {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     });
 }
@@ -31,6 +32,7 @@ fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     });
 }
@@ -322,6 +324,7 @@ fn apply_snapshot_sets_unseen_changes_for_inactive_tab() {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            environment_id: None,
         },
     );
     snap2.providers = different_providers;
@@ -421,6 +424,7 @@ fn apply_delta_data_change_on_inactive_tab_sets_unseen() {
             provider_name: String::new(),
             provider_display_name: String::new(),
             item_noun: String::new(),
+            environment_id: None,
         }),
     }]);
     app.apply_delta(change);
@@ -853,6 +857,7 @@ fn host_snapshot_event_populates_hosts_map() {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     })));
     assert_eq!(app.model.my_host(), Some(&HostName::new("desktop")));

@@ -185,6 +185,7 @@ fn provider_category_slug_round_trip() {
         (ProviderCategory::AiUtility, "ai_utility"),
         (ProviderCategory::WorkspaceManager, "workspace_manager"),
         (ProviderCategory::TerminalPool, "terminal_pool"),
+        (ProviderCategory::EnvironmentProvider, "environment_provider"),
     ];
     for (cat, expected_slug) in categories {
         assert_eq!(cat.slug(), expected_slug);

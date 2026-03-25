@@ -23,6 +23,7 @@ fn insert_local_host(model: &mut super::super::TuiModel, name: &str) {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     });
 }
@@ -734,6 +735,7 @@ fn app_with_pr_and_issues(checkout_issue_ids: &[&str]) -> App {
         last_commit: None,
         correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone())],
         association_keys: checkout_issue_ids.iter().map(|id| AssociationKey::IssueRef("gh".into(), (*id).into())).collect(),
+        environment_id: None,
     });
 
     let repo_identity = app.model.active_repo_identity().clone();
@@ -796,6 +798,7 @@ fn remote_only_app_with_providers() -> App {
         last_commit: None,
         correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path)],
         association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into()), AssociationKey::IssueRef("gh".into(), "20".into())],
+        environment_id: None,
     });
 
     let repo_identity = app.model.active_repo_identity().clone();
