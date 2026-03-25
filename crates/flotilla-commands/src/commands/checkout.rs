@@ -39,7 +39,10 @@ pub enum CheckoutVerb {
 impl CheckoutNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match (self.subject, self.verb) {
-            (_, Some(CheckoutVerb::Create { branch, fresh })) => {
+            (Some(_), Some(CheckoutVerb::Create { .. })) => {
+                Err("checkout create does not take a subject (repo comes from --repo or FLOTILLA_REPO)".into())
+            }
+            (None, Some(CheckoutVerb::Create { branch, fresh })) => {
                 let target = if fresh { CheckoutTarget::FreshBranch(branch) } else { CheckoutTarget::Branch(branch) };
                 // SENTINEL: repo is empty — `inject_repo_context` in main.rs must fill it
                 // from --repo flag or FLOTILLA_REPO env before dispatch to the daemon.
@@ -211,5 +214,12 @@ mod tests {
     #[test]
     fn round_trip_status() {
         assert_round_trip::<CheckoutNoun>(&["checkout", "my-feature", "status"]);
+    }
+
+    #[test]
+    fn checkout_create_with_subject_errors() {
+        // `checkout myslug create --branch feat` should error — create doesn't take a subject
+        let noun = parse(&["checkout", "myslug", "create", "--branch", "feat"]);
+        assert!(noun.resolve().is_err());
     }
 }
