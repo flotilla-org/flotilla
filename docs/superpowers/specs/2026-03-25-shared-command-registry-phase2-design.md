@@ -167,7 +167,12 @@ Verb and flag completions come from the clap `Command` tree (same as the Phase 1
 
 ### Context-aware filtering
 
-Commands that require an active repo (`RepoContext::Required`) are excluded from completions when no repo tab is active. For example, `checkout create` does not appear on the overview page. This prevents users from selecting commands that would immediately error.
+The palette's available commands depend on whether the user is on a repo tab or the overview tab:
+
+- **Repo tab**: all nouns and palette-local commands available.
+- **Overview tab / no repos**: only repo-independent commands shown — `host`, `repo` (with explicit subject), palette-local commands (`target`, `layout`, `theme`, `help`, etc.). Repo-scoped nouns (`cr`, `checkout`, `issue`, `agent`, `workspace`) are hidden because both `RepoContext::Required` and `RepoContext::Inferred` commands need a repo to execute.
+
+This filtering applies to both completion suggestions and confirm-time dispatch. If the user types a repo-scoped command on the overview tab, the palette rejects it with "switch to a repo tab first."
 
 ### Tab behavior
 
@@ -346,6 +351,17 @@ After `intent.to_command_tokens()` produces tokens, join them into a display str
 The palette and intent adapter both produce `Resolved` values. The TUI needs a dispatch function analogous to `main.rs::dispatch()`:
 
 ```rust
+/// Repo context comes from the active tab, not from the model's last-selected repo.
+/// Returns None on the overview tab, Some(identity) on repo tabs.
+/// This is the source of truth for palette dispatch — not active_repo_identity_opt(),
+/// which returns the last-selected repo even on the overview tab.
+fn active_tab_repo(app: &App) -> Option<RepoSelector> {
+    if app.ui.is_config {
+        return None; // overview tab — no repo context
+    }
+    Some(RepoSelector::Identity(app.model.active_repo_identity().clone()))
+}
+
 fn tui_dispatch(resolved: Resolved, item: Option<&WorkItem>, app: &mut App) -> Result<(), String> {
     match resolved {
         Resolved::Ready(cmd) => {
@@ -353,17 +369,16 @@ fn tui_dispatch(resolved: Resolved, item: Option<&WorkItem>, app: &mut App) -> R
             Ok(())
         }
         Resolved::NeedsContext { mut command, repo, host } => {
+            let tab_repo = active_tab_repo(app);
             match repo {
                 RepoContext::Required => {
-                    let repo_sel = app.model.active_repo_identity_opt()
-                        .map(|id| RepoSelector::Identity(id.clone()))
+                    let repo_sel = tab_repo
                         .ok_or("no active repo — switch to a repo tab first")?;
                     command.context_repo = Some(repo_sel.clone());
                     fill_repo_sentinels(&mut command.action, repo_sel);
                 }
                 RepoContext::Inferred => {
-                    command.context_repo = app.model.active_repo_identity_opt()
-                        .map(|id| RepoSelector::Identity(id.clone()));
+                    command.context_repo = tab_repo;
                 }
             }
             command.host = resolve_host(host, item, app);
