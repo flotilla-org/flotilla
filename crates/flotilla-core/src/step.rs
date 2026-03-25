@@ -18,6 +18,11 @@ pub struct RemoteStepBatchRequest {
     pub target_host: HostName,
     pub repo_identity: RepoIdentity,
     pub repo: ExecutionEnvironmentPath,
+    /// Global step index of the first step in this batch on the requester.
+    ///
+    /// The executing host emits batch-relative progress indices. The requester
+    /// uses this offset when remapping those updates into the global command
+    /// timeline that the UI already understands.
     pub step_offset: usize,
     pub steps: Vec<Step>,
 }

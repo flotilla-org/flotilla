@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    path_context::ExecutionEnvironmentPath,
     step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
 };
 use flotilla_protocol::{
@@ -221,16 +220,12 @@ impl RemoteCommandRouter {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn spawn_forwarded_remote_step_batch(
         &self,
         request_id: u64,
         requester_host: HostName,
         reply_via: HostName,
-        repo_identity: RepoIdentity,
-        repo_path: PathBuf,
-        step_offset: usize,
-        steps: Vec<Step>,
+        request: RemoteStepBatchRequest,
     ) {
         let ready = Arc::new(Notify::new());
         self.forwarded_remote_step_batches
@@ -239,18 +234,7 @@ impl RemoteCommandRouter {
             .insert(request_id, ForwardedRemoteStepBatch { state: ForwardedRemoteStepBatchState::Launching { ready: Arc::clone(&ready) } });
         let router = self.clone();
         tokio::spawn(async move {
-            router
-                .execute_forwarded_remote_step_batch(
-                    request_id,
-                    requester_host,
-                    reply_via,
-                    repo_identity,
-                    repo_path,
-                    step_offset,
-                    steps,
-                    ready,
-                )
-                .await;
+            router.execute_forwarded_remote_step_batch(request_id, requester_host, reply_via, request, ready).await;
         });
     }
 
@@ -355,33 +339,26 @@ impl RemoteCommandRouter {
     pub(super) async fn emit_remote_step_event(
         &self,
         request_id: u64,
-        responder_host: HostName,
+        _responder_host: HostName,
         batch_step_index: usize,
         batch_step_count: usize,
         description: String,
         status: StepStatus,
     ) {
-        let (progress_sink, failed_message) = {
+        let progress_sink = {
             let mut pending = self.pending_remote_step_batches.lock().await;
             let Some(entry) = pending.get_mut(&request_id) else {
                 return;
             };
-            let failed_message = match &status {
-                StepStatus::Failed { message } => Some(message.clone()),
-                _ => None,
-            };
-            if let Some(message) = &failed_message {
+            if let StepStatus::Failed { message } = &status {
                 entry.failed_message = Some(message.clone());
             }
-            (Arc::clone(&entry.progress_sink), failed_message)
+            Arc::clone(&entry.progress_sink)
         };
-        let _ = responder_host;
-        let _ = failed_message;
         progress_sink.emit(RemoteStepProgressUpdate { batch_step_index, batch_step_count, description, status }).await;
     }
 
-    pub(super) async fn complete_remote_step(&self, request_id: u64, responder_host: HostName, outcomes: Vec<StepOutcome>) {
-        let _ = responder_host;
+    pub(super) async fn complete_remote_step(&self, request_id: u64, _responder_host: HostName, outcomes: Vec<StepOutcome>) {
         let entry = self.pending_remote_step_batches.lock().await.remove(&request_id);
         let Some(entry) = entry else {
             return;
@@ -697,16 +674,12 @@ impl RemoteCommandRouter {
         sender.send(PeerWireMessage::Routed(second)).await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn execute_forwarded_remote_step_batch(
         &self,
         request_id: u64,
         requester_host: HostName,
         reply_via: HostName,
-        repo_identity: RepoIdentity,
-        repo_path: PathBuf,
-        step_offset: usize,
-        steps: Vec<Step>,
+        request: RemoteStepBatchRequest,
         ready: Arc<Notify>,
     ) {
         let responder_host = self.daemon.host_name().clone();
@@ -724,30 +697,19 @@ impl RemoteCommandRouter {
             responder_host.clone(),
         ));
 
-        let invalid_step = steps
+        let invalid_step = request
+            .steps
             .iter()
             .enumerate()
             .find(|(_, step)| step.host != StepHost::Remote(responder_host.clone()))
             .map(|(index, step)| (index, step.description.clone()));
 
+        let steps = request.steps.clone();
         let outcomes = if let Some((index, description)) = invalid_step {
             progress_sink.emit_failed(index, steps.len(), description, "remote step batch targets the wrong host".into()).await;
             Err("remote step batch targets the wrong host".to_string())
         } else {
-            self.daemon
-                .execute_remote_step_batch(
-                    RemoteStepBatchRequest {
-                        command_id: request_id,
-                        target_host: responder_host.clone(),
-                        repo_identity,
-                        repo: ExecutionEnvironmentPath::new(&repo_path),
-                        step_offset,
-                        steps: steps.clone(),
-                    },
-                    progress_sink.clone(),
-                    cancel.clone(),
-                )
-                .await
+            self.daemon.execute_remote_step_batch(request, progress_sink.clone(), cancel.clone()).await
         };
 
         if let Err(message) = &outcomes {

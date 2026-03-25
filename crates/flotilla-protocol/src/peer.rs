@@ -143,6 +143,11 @@ pub enum RoutedPeerMessage {
         remaining_hops: u8,
         repo_identity: RepoIdentity,
         repo_path: PathBuf,
+        /// Global step index of the first step in this batch on the requester.
+        ///
+        /// The responder emits batch-relative progress indices only. The
+        /// requester uses this offset when remapping them back onto the global
+        /// command step sequence.
         step_offset: usize,
         /// Every step in the batch is expected to target `target_host`.
         /// The receiver should reject mismatched steps instead of trying to route them.

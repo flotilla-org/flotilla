@@ -5,7 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_core::{
+    daemon::DaemonHandle, in_process::InProcessDaemon, path_context::ExecutionEnvironmentPath, step::RemoteStepBatchRequest,
+};
 use flotilla_protocol::{DaemonEvent, HostName, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RoutedPeerMessage};
 use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
@@ -492,10 +494,14 @@ impl PeerRuntime {
                                             request_id,
                                             requester_host,
                                             reply_via,
-                                            repo_identity,
-                                            repo_path,
-                                            step_offset,
-                                            steps,
+                                            RemoteStepBatchRequest {
+                                                command_id: request_id,
+                                                target_host: peer_daemon.host_name().clone(),
+                                                repo_identity,
+                                                repo: ExecutionEnvironmentPath::new(&repo_path),
+                                                step_offset,
+                                                steps,
+                                            },
                                         )
                                         .await;
                                 }

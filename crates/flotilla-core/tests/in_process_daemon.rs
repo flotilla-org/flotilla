@@ -1765,6 +1765,32 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
 }
 
 #[tokio::test]
+async fn untrack_missing_repo_returns_error_without_started_event() {
+    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let mut rx = daemon.subscribe();
+    let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
+
+    let err = daemon
+        .execute(Command { host: None, context_repo: None, action: CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) } })
+        .await
+        .expect_err("untracked repo removal should fail");
+    assert!(err.contains("repo not tracked"));
+
+    let started = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::CommandStarted { .. }) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+    assert!(started.is_err() || !started.unwrap(), "should not emit CommandStarted for missing repo removal");
+}
+
+#[tokio::test]
 async fn refresh_all_command_refreshes_every_tracked_repo() {
     let temp = tempfile::tempdir().unwrap();
     let repo_a = temp.path().join("repo-a");
