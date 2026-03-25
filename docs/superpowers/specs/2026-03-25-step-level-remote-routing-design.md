@@ -92,11 +92,13 @@ Add a routed peer message family for remote step execution, distinct from `Comma
 The request carries:
 
 - the presentation host request id,
-- enough repo execution context for the remote daemon to resolve the steps,
+- the repo execution context needed to find the tracked repo on the target host, specifically the repo identity plus the repo root/path the presentation host planned against,
 - a batch of symbolic steps that all target the same remote host,
 - the batch's global step offset so progress can be remapped cleanly on the way back.
 
 The response returns ordered `StepOutcome` values for the batch. Returning only a final success value is insufficient because local follow-on steps may depend on intermediate remote outputs such as checkout paths or prepared terminal results.
+
+The request does not carry provider registry or provider snapshot data. The remote daemon uses the repo identity/context from the request to locate its own tracked repo state, then rebuilds resolver dependencies locally.
 
 ### Event flow
 
@@ -118,7 +120,13 @@ That semantic shift already aligns with the command unification and ambient cont
 - query commands with `Command.host` still use whole-command forwarding,
 - mutation commands with `Command.host` are planned locally and step-routed remotely.
 
-`build_plan()` reads `Command.host` when it needs to stamp steps, and the `_originating_host` parameter becomes unnecessary.
+The dispatch decision point should be explicit:
+
+- `RemoteCommandRouter::dispatch_execute()` may still use `Command.host` to whole-forward query commands,
+- mutation commands must stay on the local daemon so `build_plan()` can run there,
+- after plan stamping, execution follows `Step.host`, not `Command.host`.
+
+`build_plan()` reads `Command.host` when it needs to stamp steps, and the `_originating_host` parameter becomes unnecessary. The planner already runs on the presentation host, so `StepHost::Local` naturally means "run back here." No extra originating-host parameter is needed to express the local workspace step.
 
 ## Phase Plan
 
@@ -134,6 +142,8 @@ Deliver the architectural change with the simplest correct transport:
 - remote progress is flattened into the existing global step timeline.
 
 This phase fixes the known regression where a remote checkout can incorrectly create a workspace on the remote host.
+
+The target host should execute remote steps through its own normal executor-backed resolver shape, built from its local repo context and local daemon dependencies. This should be a standard `ExecutorStepResolver` constructed on the target host, not a stripped-down resolver populated from wire data.
 
 ### Phase 2: coalesced remote batches
 
@@ -157,6 +167,12 @@ In phase 1, cancellation semantics are best-effort and may match current behavio
 - failures from remote steps surface exactly like local step failures, preserving the existing "earlier meaningful result wins if present" behavior.
 
 Batching must not weaken correctness: a failed substep in a remote batch fails the batch, and the presentation host stops the global plan at that point.
+
+## Known Phase-1 Limitation: Cross-Host State Freshness
+
+The presentation host plans against its current snapshot, but a remote host resolves its steps against its own current provider state. Those views can differ.
+
+Phase 1 should treat the remote host's execution-time state as authoritative. That means some plans may be built from slightly stale information and then resolve differently on the target host. This is acceptable as long as step resolution remains the source of truth and steps stay resolve-time and idempotent where practical. The design does not attempt to solve cross-host snapshot synchronization as part of `#464`.
 
 ## Testing
 
