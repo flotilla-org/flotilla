@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use flotilla_protocol::{HostName, RepoDelta, RepoIdentity, RepoSnapshot};
-use tokio::net::{unix::OwnedReadHalf, UnixStream};
+use tokio::net::{unix::OwnedReadHalf, UnixListener, UnixStream};
 
 use super::*;
 
@@ -102,6 +104,31 @@ async fn send_request_writes_message_and_returns_pending_response() {
 
     let response = request_task.await.expect("join").expect("send_request");
     assert!(matches!(response, ResponseResult::Ok { response } if matches!(&*response, Response::ListRepos(repos) if repos.is_empty())));
+}
+
+#[tokio::test]
+async fn dropping_socket_daemon_closes_connection_promptly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind listener");
+
+    let accept_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        stream
+    });
+
+    let daemon = SocketDaemon::connect(&socket_path).await.expect("connect socket daemon");
+    let server_stream = accept_task.await.expect("join accept task");
+
+    drop(daemon);
+
+    let mut server_lines = BufReader::new(server_stream).lines();
+    let eof = tokio::time::timeout(Duration::from_millis(100), server_lines.next_line())
+        .await
+        .expect("client drop should close connection promptly")
+        .expect("read server EOF");
+
+    assert!(eof.is_none(), "server should observe EOF after SocketDaemon drop");
 }
 
 #[tokio::test]

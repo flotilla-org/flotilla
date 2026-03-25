@@ -1,9 +1,12 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{GoodbyeReason, HostName, Message, PeerConnectionState, PeerWireMessage, PROTOCOL_VERSION};
 use tokio::sync::{mpsc, watch, Mutex};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use super::{
     peer_runtime::disconnect_peer_and_rebuild,
@@ -18,6 +21,8 @@ pub(super) struct PeerConnection {
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<tokio::sync::Notify>,
 }
 
 impl PeerConnection {
@@ -27,8 +32,10 @@ impl PeerConnection {
         peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
         peer_manager: Arc<Mutex<PeerManager>>,
         peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
+        client_count: Arc<AtomicUsize>,
+        client_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
-        Self { daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx }
+        Self { daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify }
     }
 
     pub(super) async fn run(
@@ -97,6 +104,10 @@ impl PeerConnection {
                 let _ = displaced.retire(GoodbyeReason::Superseded).await;
             }
         }
+        let count = self.client_count.fetch_add(1, Ordering::SeqCst) + 1;
+        info!(peer = %host_name, %count, "peer connected");
+        self.client_notify.notify_one();
+
         sync_peer_query_state(&self.peer_manager, &self.daemon).await;
         self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Connected).await;
         let _ = self.peer_connected_tx.send(PeerConnectedNotice { peer: host_name.clone(), generation });
@@ -150,5 +161,8 @@ impl PeerConnection {
             self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Disconnected).await;
         }
         relay_task.abort();
+        let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        info!(peer = %host_name, %count, "peer disconnected");
+        self.client_notify.notify_one();
     }
 }

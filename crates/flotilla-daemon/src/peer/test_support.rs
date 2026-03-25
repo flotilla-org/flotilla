@@ -5,6 +5,7 @@ use tokio::sync::Notify;
 
 use crate::peer::{
     channel_transport::channel_transport_pair,
+    dispatch_pending_sends,
     transport::{PeerConnectionStatus, PeerTransport},
     ActivationResult, ConnectionDirection, ConnectionMeta, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender,
 };
@@ -124,6 +125,8 @@ impl TestNetwork {
 
             let env = InboundPeerEnvelope { msg, connection_generation: generation, connection_peer };
             results.push(peer.manager.handle_inbound(env).await);
+            let pending_sends = peer.manager.take_pending_sends();
+            dispatch_pending_sends(pending_sends).await;
         }
 
         results

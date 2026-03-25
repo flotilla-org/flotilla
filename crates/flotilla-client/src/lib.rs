@@ -60,6 +60,7 @@ pub struct SocketDaemon {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     next_id: Arc<AtomicU64>,
+    reader_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Local snapshot seq per repo, for gap detection.
     /// Updated by replay_since (seeding) and the background reader (live events).
     local_seqs: Arc<SeqMap>,
@@ -83,14 +84,6 @@ impl SocketDaemon {
 
         let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
 
-        let daemon = Arc::new(Self {
-            writer: Arc::clone(&writer),
-            pending: Arc::clone(&pending),
-            event_tx: event_tx.clone(),
-            next_id: Arc::clone(&next_id),
-            local_seqs: Arc::clone(&local_seqs),
-        });
-
         // Spawn background reader task
         let reader_pending = Arc::clone(&pending);
         let reader_writer = Arc::clone(&writer);
@@ -98,7 +91,7 @@ impl SocketDaemon {
         let reader_local_seqs = Arc::clone(&local_seqs);
         let reader_recovering = Arc::clone(&recovering);
         let reader_event_tx = event_tx.clone();
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let reader = BufReader::new(read_half);
             let mut lines = reader.lines();
 
@@ -166,12 +159,29 @@ impl SocketDaemon {
             }
         });
 
+        let daemon = Arc::new(Self {
+            writer: Arc::clone(&writer),
+            pending: Arc::clone(&pending),
+            event_tx: event_tx.clone(),
+            next_id: Arc::clone(&next_id),
+            reader_task: std::sync::Mutex::new(Some(reader_task)),
+            local_seqs: Arc::clone(&local_seqs),
+        });
+
         Ok(daemon)
     }
 
     /// Send a request to the daemon and wait for the matching response.
     async fn request(&self, request: Request) -> Result<ResponseResult, String> {
         send_request(&self.writer, &self.pending, &self.next_id, request).await
+    }
+}
+
+impl Drop for SocketDaemon {
+    fn drop(&mut self) {
+        if let Some(reader_task) = self.reader_task.lock().expect("reader task mutex poisoned").take() {
+            reader_task.abort();
+        }
     }
 }
 
