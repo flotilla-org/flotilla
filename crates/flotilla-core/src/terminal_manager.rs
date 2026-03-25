@@ -7,6 +7,7 @@ use crate::{
     attachable::{Attachable, AttachableContent, SharedAttachableStore, TerminalAttachable, TerminalPurpose},
     hop_chain::{
         builder::HopPlanBuilder,
+        environment::NoopEnvironmentHopResolver,
         remote::NoopRemoteHopResolver,
         resolver::{AlwaysWrap, HopResolver},
         terminal::PoolTerminalHopResolver,
@@ -148,8 +149,12 @@ impl TerminalManager {
 
         let terminal_resolver =
             PoolTerminalHopResolver::new(Arc::clone(&self.pool), self.store.clone(), daemon_socket_path.map(|s| s.to_string()));
-        let hop_resolver =
-            HopResolver { remote: Arc::new(NoopRemoteHopResolver), terminal: Arc::new(terminal_resolver), strategy: Arc::new(AlwaysWrap) };
+        let hop_resolver = HopResolver {
+            remote: Arc::new(NoopRemoteHopResolver),
+            environment: Arc::new(NoopEnvironmentHopResolver),
+            terminal: Arc::new(terminal_resolver),
+            strategy: Arc::new(AlwaysWrap),
+        };
 
         let mut context = ResolutionContext {
             current_host: self.local_host.clone(),

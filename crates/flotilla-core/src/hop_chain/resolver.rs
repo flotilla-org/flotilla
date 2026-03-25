@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use super::{remote::RemoteHopResolver, terminal::TerminalHopResolver, Hop, HopPlan, ResolutionContext, ResolvedAction, ResolvedPlan};
+use super::{
+    environment::EnvironmentHopResolver, remote::RemoteHopResolver, terminal::TerminalHopResolver, Hop, HopPlan, ResolutionContext,
+    ResolvedAction, ResolvedPlan,
+};
 
 /// Decides whether to wrap (nest inner command as argument) or sendkeys
 /// (create an execution boundary) at each combination point during resolution.
@@ -32,9 +35,11 @@ impl CombineStrategy for AlwaysSendKeys {
 /// to the appropriate per-hop resolver which mutates the `ResolutionContext`:
 /// - `RunCommand`: pushes a `Command` action directly
 /// - `AttachTerminal`: delegates to `TerminalHopResolver`
+/// - `EnterEnvironment`: delegates to `EnvironmentHopResolver` (wrap or enter based on strategy)
 /// - `RemoteToHost`: delegates to `RemoteHopResolver` (wrap or enter based on strategy)
 pub struct HopResolver {
     pub remote: Arc<dyn RemoteHopResolver>,
+    pub environment: Arc<dyn EnvironmentHopResolver>,
     pub terminal: Arc<dyn TerminalHopResolver>,
     pub strategy: Arc<dyn CombineStrategy>,
 }
@@ -49,6 +54,18 @@ impl HopResolver {
                 }
                 Hop::AttachTerminal { attachable_id } => {
                     self.terminal.resolve(attachable_id, context)?;
+                }
+                Hop::EnterEnvironment { env_id, .. } => {
+                    if context.current_environment.as_ref() == Some(env_id) {
+                        continue; // collapse — already inside this environment
+                    }
+                    if self.strategy.should_wrap(hop, context) {
+                        self.environment.resolve_wrap(env_id, context)?;
+                    } else {
+                        self.environment.resolve_enter(env_id, context)?;
+                    }
+                    context.nesting_depth += 1;
+                    context.current_environment = Some(env_id.clone());
                 }
                 Hop::RemoteToHost { host } => {
                     if *host == context.current_host {
