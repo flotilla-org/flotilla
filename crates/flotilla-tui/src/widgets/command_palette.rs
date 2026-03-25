@@ -60,7 +60,10 @@ impl CommandPaletteWidget {
         // "search <terms>" — apply filter directly, empty clears
         if let Some(query) = text.strip_prefix("search ") {
             let query = query.trim().to_string();
-            let repo_identity = ctx.repo_order[ctx.active_repo].clone();
+            let Some(repo_identity) = ctx.model.active_repo_identity_opt().cloned() else {
+                ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
+                return Outcome::Finished;
+            };
             if query.is_empty() {
                 // Clear the active issue search
                 let cmd = Command {
@@ -96,13 +99,28 @@ impl CommandPaletteWidget {
         match action {
             // Actions that open other widgets — use Swap to replace the palette
             Action::OpenBranchInput => {
+                if ctx.model.active_repo_identity_opt().is_none() {
+                    ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
+                    return Outcome::Finished;
+                }
                 let widget = super::branch_input::BranchInputWidget::new(crate::app::ui_state::BranchInputKind::Manual);
                 Outcome::Swap(Box::new(widget))
             }
-            Action::OpenIssueSearch => Outcome::Swap(Box::new(super::issue_search::IssueSearchWidget::new())),
+            Action::OpenIssueSearch => {
+                if ctx.model.active_repo_identity_opt().is_none() {
+                    ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
+                    Outcome::Finished
+                } else {
+                    Outcome::Swap(Box::new(super::issue_search::IssueSearchWidget::new()))
+                }
+            }
             Action::OpenFilePicker => {
+                let Some(repo_root) = ctx.model.active_repo_root_opt() else {
+                    ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
+                    return Outcome::Finished;
+                };
                 // Build the file picker from the active repo parent
-                let parent_path = ctx.model.active_repo_root().parent().map(|p| format!("{}/", p.display()));
+                let parent_path = repo_root.parent().map(|p| format!("{}/", p.display()));
                 let input = parent_path.map(|s| Input::from(s.as_str())).unwrap_or_default();
                 let dir_entries = refresh_dir_listing_standalone(input.value(), ctx.model);
                 let widget = super::file_picker::FilePickerWidget::new(input.clone(), dir_entries);
@@ -139,12 +157,7 @@ impl CommandPaletteWidget {
                 Outcome::Finished
             }
             Action::Refresh => {
-                let repo = ctx.model.active_repo_root().clone();
-                ctx.commands.push(flotilla_protocol::Command {
-                    host: None,
-                    context_repo: None,
-                    action: flotilla_protocol::CommandAction::Refresh { repo: Some(flotilla_protocol::RepoSelector::Path(repo)) },
-                });
+                ctx.app_actions.push(AppAction::Refresh);
                 Outcome::Finished
             }
 

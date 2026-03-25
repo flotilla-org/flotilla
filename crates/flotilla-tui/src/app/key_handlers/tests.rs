@@ -589,6 +589,35 @@ fn normal_slash_opens_command_palette() {
 }
 
 #[test]
+fn no_active_repo_command_palette_search_shows_status_message() {
+    let mut app = stub_app();
+    app.model.repos.clear();
+    app.model.repo_order.clear();
+    app.screen.repo_pages.clear();
+    app.screen.modal_stack.push(Box::new(crate::widgets::command_palette::CommandPaletteWidget::new()));
+
+    app.handle_key(key(KeyCode::Char('/')));
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
+    assert_eq!(app.model.status_message.as_deref(), Some("No active repo"));
+}
+
+#[test]
+fn no_active_repo_issue_search_dismiss_shows_status_message() {
+    let mut app = stub_app();
+    app.model.repos.clear();
+    app.model.repo_order.clear();
+    app.screen.repo_pages.clear();
+    app.screen.modal_stack.push(Box::new(crate::widgets::issue_search::IssueSearchWidget::new()));
+
+    app.handle_key(key(KeyCode::Esc));
+
+    assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
+    assert_eq!(app.model.status_message.as_deref(), Some("No active repo"));
+}
+
+#[test]
 fn normal_c_toggles_providers() {
     let mut app = stub_app();
     assert!(!active_show_providers(&app));

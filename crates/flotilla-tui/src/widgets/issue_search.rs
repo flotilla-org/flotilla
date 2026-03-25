@@ -38,7 +38,10 @@ impl InteractiveWidget for IssueSearchWidget {
             Action::Confirm => {
                 let query = self.input.value().to_string();
                 if !query.is_empty() {
-                    let repo_identity = ctx.repo_order[ctx.active_repo].clone();
+                    let Some(repo_identity) = ctx.model.active_repo_identity_opt().cloned() else {
+                        ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
+                        return Outcome::Finished;
+                    };
                     let cmd = Command {
                         host: None,
                         context_repo: None,
@@ -51,7 +54,10 @@ impl InteractiveWidget for IssueSearchWidget {
             }
             Action::Dismiss => {
                 // Clear the active issue search
-                let repo_identity = ctx.repo_order[ctx.active_repo].clone();
+                let Some(repo_identity) = ctx.model.active_repo_identity_opt().cloned() else {
+                    ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
+                    return Outcome::Finished;
+                };
                 let cmd = Command {
                     host: None,
                     context_repo: None,

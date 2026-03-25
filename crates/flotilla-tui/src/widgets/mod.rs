@@ -69,6 +69,7 @@ pub enum AppAction {
     MoveTabLeft,
     MoveTabRight,
     Refresh,
+    ShowStatus(String),
     SetSearchQuery { repo: RepoIdentity, query: String },
     ClearSearchQuery { repo: RepoIdentity },
 }

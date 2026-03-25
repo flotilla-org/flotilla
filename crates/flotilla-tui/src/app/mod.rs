@@ -24,6 +24,7 @@ use flotilla_protocol::{
     RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
+use tokio::sync::mpsc;
 use tui_input::Input;
 use ui_state::PendingStatus;
 pub use ui_state::{BranchInputKind, DirEntry, RepoViewLayout, TabId, UiState};
@@ -157,12 +158,24 @@ impl TuiModel {
         &self.repos[&self.repo_order[self.active_repo]]
     }
 
+    pub fn active_opt(&self) -> Option<&TuiRepoModel> {
+        self.repo_order.get(self.active_repo).and_then(|identity| self.repos.get(identity))
+    }
+
     pub fn active_repo_root(&self) -> &PathBuf {
         &self.active().path
     }
 
+    pub fn active_repo_root_opt(&self) -> Option<&PathBuf> {
+        self.active_opt().map(|repo| &repo.path)
+    }
+
     pub fn active_repo_identity(&self) -> &RepoIdentity {
         &self.active().identity
+    }
+
+    pub fn active_repo_identity_opt(&self) -> Option<&RepoIdentity> {
+        self.active_opt().map(|repo| &repo.identity)
     }
 
     pub fn active_labels(&self) -> &RepoLabels {
@@ -193,6 +206,10 @@ pub struct InFlightCommand {
     pub repo_identity: RepoIdentity,
     pub repo: PathBuf,
     pub description: String,
+}
+
+enum BackgroundUpdate {
+    IssueCommandFailed { action: CommandAction, error: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,6 +288,8 @@ pub struct App {
     /// Per-repo shared data handles. Written by `apply_snapshot()`/`apply_delta()`,
     /// read by `RepoPage` widgets during reconciliation and rendering.
     pub repo_data: HashMap<RepoIdentity, Shared<RepoData>>,
+    background_updates_tx: mpsc::UnboundedSender<BackgroundUpdate>,
+    background_updates_rx: mpsc::UnboundedReceiver<BackgroundUpdate>,
 }
 
 impl App {
@@ -306,6 +325,7 @@ impl App {
             repo_data_map.insert(identity.clone(), shared);
             screen.repo_pages.insert(identity.clone(), page);
         }
+        let (background_updates_tx, background_updates_rx) = mpsc::unbounded_channel();
 
         Self {
             daemon,
@@ -320,6 +340,8 @@ impl App {
             should_quit: false,
             screen,
             repo_data: repo_data_map,
+            background_updates_tx,
+            background_updates_rx,
         }
     }
 
@@ -447,6 +469,44 @@ impl App {
         self.model.status_message = status_message;
     }
 
+    pub(crate) fn drain_background_updates(&mut self) {
+        while let Ok(update) = self.background_updates_rx.try_recv() {
+            match update {
+                BackgroundUpdate::IssueCommandFailed { action, error } => {
+                    match action {
+                        CommandAction::FetchMoreIssues { repo, .. } => {
+                            if let Some(repo_identity) = self.repo_identity_for_selector(&repo) {
+                                if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
+                                    repo_model.issue_fetch_pending = false;
+                                }
+                            }
+                        }
+                        CommandAction::SetIssueViewport { repo, .. } => {
+                            if let Some(repo_identity) = self.repo_identity_for_selector(&repo) {
+                                if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
+                                    repo_model.issue_initial_requested = false;
+                                }
+                            }
+                        }
+                        CommandAction::SearchIssues { .. } | CommandAction::ClearIssueSearch { .. } => {}
+                        _ => {}
+                    }
+                    self.set_status_message(Some(error));
+                }
+            }
+        }
+    }
+
+    fn repo_identity_for_selector(&self, repo: &RepoSelector) -> Option<RepoIdentity> {
+        match repo {
+            RepoSelector::Identity(identity) => Some(identity.clone()),
+            RepoSelector::Path(path) => {
+                self.model.repos.values().find(|repo_model| &repo_model.path == path).map(|repo_model| repo_model.identity.clone())
+            }
+            RepoSelector::Query(_) => None,
+        }
+    }
+
     // ── Widget stack helpers ──
 
     /// Pop all modal widgets from the stack.
@@ -513,26 +573,32 @@ impl App {
                     self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
                 }
                 AppAction::ToggleProviders => {
-                    let identity = &self.model.repo_order[self.model.active_repo];
-                    if let Some(page) = self.screen.repo_pages.get_mut(identity) {
-                        page.show_providers = !page.show_providers;
+                    if let Some(identity) = self.model.active_repo_identity_opt() {
+                        if let Some(page) = self.screen.repo_pages.get_mut(identity) {
+                            page.show_providers = !page.show_providers;
+                        }
+                    } else {
+                        self.set_status_message(Some("No active repo".into()));
                     }
                 }
                 AppAction::ToggleMultiSelect => {
-                    let repo_identity = self.model.repo_order[self.model.active_repo].clone();
-                    if let Some(page) = self.screen.repo_pages.get_mut(&repo_identity) {
-                        if let Some(si) = page.table.selected_selectable_idx {
-                            if let Some(&table_idx) = page.table.grouped_items.selectable_indices.get(si) {
-                                if let Some(flotilla_core::data::GroupEntry::Item(item)) =
-                                    page.table.grouped_items.table_entries.get(table_idx)
-                                {
-                                    let item_identity = item.identity.clone();
-                                    if !page.multi_selected.remove(&item_identity) {
-                                        page.multi_selected.insert(item_identity.clone());
+                    if let Some(repo_identity) = self.model.active_repo_identity_opt().cloned() {
+                        if let Some(page) = self.screen.repo_pages.get_mut(&repo_identity) {
+                            if let Some(si) = page.table.selected_selectable_idx {
+                                if let Some(&table_idx) = page.table.grouped_items.selectable_indices.get(si) {
+                                    if let Some(flotilla_core::data::GroupEntry::Item(item)) =
+                                        page.table.grouped_items.table_entries.get(table_idx)
+                                    {
+                                        let item_identity = item.identity.clone();
+                                        if !page.multi_selected.remove(&item_identity) {
+                                            page.multi_selected.insert(item_identity.clone());
+                                        }
                                     }
                                 }
                             }
                         }
+                    } else {
+                        self.set_status_message(Some("No active repo".into()));
                     }
                 }
                 AppAction::OpenActionMenu => {
@@ -559,7 +625,11 @@ impl App {
                     self.config.save_tab_order(&self.persisted_tab_order_paths());
                 }
                 AppAction::OpenFilePicker => {
-                    self.open_file_picker_from_active_repo_parent();
+                    if self.model.active_repo_root_opt().is_some() {
+                        self.open_file_picker_from_active_repo_parent();
+                    } else {
+                        self.set_status_message(Some("No active repo".into()));
+                    }
                 }
                 AppAction::PrevTab => {
                     self.dismiss_modals();
@@ -580,8 +650,14 @@ impl App {
                     }
                 }
                 AppAction::Refresh => {
-                    let repo = self.model.active_repo_root().clone();
-                    self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) }));
+                    if let Some(repo) = self.model.active_repo_root_opt().cloned() {
+                        self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) }));
+                    } else {
+                        self.set_status_message(Some("No active repo".into()));
+                    }
+                }
+                AppAction::ShowStatus(message) => {
+                    self.set_status_message(Some(message));
                 }
                 AppAction::SetSearchQuery { repo, query } => {
                     if let Some(page) = self.screen.repo_pages.get_mut(&repo) {

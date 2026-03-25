@@ -125,6 +125,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         while let Some((cmd, pending_ctx)) = app.proto_commands.take_next() {
             app::executor::dispatch(cmd, &mut app, pending_ctx).await;
         }
+        app.drain_background_updates();
 
         // ── Check quit before rendering ──
         // handle_repo_removed sets should_quit when the last repo is removed,
