@@ -568,6 +568,28 @@ impl RemoteCommandRouter {
     ) {
         self.cancel_forwarded_command(cancel_id, requester_host, reply_via, command_request_id).await;
     }
+
+    #[cfg(test)]
+    pub(super) async fn insert_running_forwarded_remote_step_batch_for_test(
+        &self,
+        request_id: u64,
+        cancel: CancellationToken,
+    ) {
+        self.forwarded_remote_step_batches.lock().await.insert(request_id, ForwardedRemoteStepBatch {
+            state: ForwardedRemoteStepBatchState::Running { cancel },
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cancel_forwarded_remote_step_batch_for_test(
+        &self,
+        cancel_id: u64,
+        requester_host: HostName,
+        reply_via: HostName,
+        remote_step_request_id: u64,
+    ) {
+        self.cancel_forwarded_remote_step_batch(cancel_id, requester_host, reply_via, remote_step_request_id).await;
+    }
 }
 
 #[async_trait]

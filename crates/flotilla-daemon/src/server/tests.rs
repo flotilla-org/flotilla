@@ -27,6 +27,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch, Mutex, Notify},
     time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
     handle_client,
@@ -992,6 +993,47 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
     })
     .await
     .expect("timeout waiting for remote step cancel request");
+
+    let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
+    let remote_peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("feta"))));
+    let remote_pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+    let remote_forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
+    let remote_pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
+    let remote_next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+    let remote_sent = Arc::new(StdMutex::new(Vec::new()));
+    remote_peer_manager
+        .lock()
+        .await
+        .register_sender(HostName::new("local"), Arc::new(MockPeerSender { sent: Arc::clone(&remote_sent) }));
+    let remote_router = make_remote_command_router(
+        &remote_daemon,
+        &remote_peer_manager,
+        &remote_pending_remote_commands,
+        &remote_forwarded_commands,
+        &remote_pending_remote_cancels,
+        &remote_next_remote_command_id,
+    );
+    let remote_cancel = CancellationToken::new();
+    remote_router
+        .insert_running_forwarded_remote_step_batch_for_test(request_id, remote_cancel.clone())
+        .await;
+    remote_router
+        .cancel_forwarded_remote_step_batch_for_test(cancel_id, HostName::new("local"), HostName::new("local"), request_id)
+        .await;
+    assert!(remote_cancel.is_cancelled(), "target-host cancel path should cancel the active remote batch token");
+
+    let remote_cancel_error = {
+        let sent = remote_sent.lock().expect("lock");
+        sent.iter().find_map(|msg| match msg {
+            PeerWireMessage::Routed(RoutedPeerMessage::RemoteStepCancelResponse { cancel_id: response_cancel_id, error, .. })
+                if *response_cancel_id == cancel_id =>
+            {
+                Some(error.clone())
+            }
+            _ => None,
+        })
+    };
+    assert!(matches!(remote_cancel_error, Some(None)), "remote cancel response should report success");
 
     remote_command_router.complete_remote_step_cancel(cancel_id, None).await;
     assert!(matches!(ok_response(cancel_response.await.expect("cancel task"), 403), Response::Cancel));
