@@ -102,19 +102,6 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::CheckoutRemoved { branch } => {
             info!(%branch, "removed checkout");
         }
-        CommandValue::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
-            if app.repo_path_for_identity(&repo_identity).is_some() {
-                app.proto_commands.push(app.repo_command_for_identity(repo_identity, CommandAction::CreateWorkspaceFromPreparedTerminal {
-                    target_host,
-                    branch,
-                    checkout_path,
-                    attachable_set_id,
-                    commands,
-                }));
-            } else {
-                app.model.status_message = Some(format!("repo not found for terminal result: {repo_identity}"));
-            }
-        }
         CommandValue::BranchNameGenerated { name, issue_ids } => {
             let updated = app.screen.modal_stack.last_mut().and_then(|widget| widget.as_any_mut().downcast_mut::<BranchInputWidget>());
             if let Some(biw) = updated {
@@ -139,7 +126,10 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             reset_loading_mode(app);
             app.model.status_message = Some("Command cancelled".into());
         }
-        CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
+        CommandValue::TerminalPrepared { .. }
+        | CommandValue::PreparedWorkspace(_)
+        | CommandValue::AttachCommandResolved { .. }
+        | CommandValue::CheckoutPathResolved { .. } => {
             tracing::warn!("unexpected internal step result reached UI handler");
         }
         CommandValue::RepoDetail(_)
@@ -216,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_prepared_queues_local_workspace_creation() {
+    fn terminal_prepared_does_not_queue_follow_up_workspace_command() {
         let mut app = stub_app();
 
         handle_result(
@@ -231,22 +221,11 @@ mod tests {
             &mut app,
         );
 
-        let (cmd, _) = app.proto_commands.take_next().expect("queued workspace creation");
-        match cmd.action {
-            CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
-                assert_eq!(cmd.host, None);
-                assert_eq!(target_host, HostName::new("remote-a"));
-                assert_eq!(branch, "feat-x");
-                assert_eq!(checkout_path, PathBuf::from("/remote/feat-x"));
-                assert_eq!(attachable_set_id, Some(flotilla_protocol::AttachableSetId::new("set-1")));
-                assert_eq!(commands, vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }]);
-            }
-            other => panic!("expected CreateWorkspaceFromPreparedTerminal, got {other:?}"),
-        }
+        assert!(app.proto_commands.take_next().is_none());
     }
 
     #[test]
-    fn terminal_prepared_uses_originating_repo_not_active_repo() {
+    fn terminal_prepared_ignores_originating_repo_for_follow_up_commands() {
         let mut app = crate::app::test_support::stub_app_with_repos(2);
         app.model.active_repo = 1;
 
@@ -262,11 +241,7 @@ mod tests {
             &mut app,
         );
 
-        let (cmd, _) = app.proto_commands.take_next().expect("queued workspace creation");
-        assert_eq!(
-            cmd.context_repo,
-            Some(flotilla_protocol::RepoSelector::Identity(RepoIdentity { authority: "local".into(), path: "/tmp/repo-0".into() }))
-        );
+        assert!(app.proto_commands.take_next().is_none());
     }
 
     #[test]

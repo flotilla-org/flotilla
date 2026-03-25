@@ -231,7 +231,9 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         }
         CommandValue::Error { message } => format!("error: {message}"),
         CommandValue::Cancelled => "cancelled".to_string(),
-        CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => "internal step result".to_string(),
+        CommandValue::PreparedWorkspace(_) | CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
+            "internal step result".to_string()
+        }
         CommandValue::RepoDetail(detail) => format_repo_detail_human(detail),
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
         CommandValue::RepoWork(work) => format_repo_work_human(work),

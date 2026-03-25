@@ -102,15 +102,7 @@ impl Intent {
             Intent::CreateWorkspace => item.checkout_key().map(|p| {
                 let label =
                     item.branch.clone().unwrap_or_else(|| p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-                let command = app.item_host_repo_command(
-                    CommandAction::PrepareTerminalForCheckout { checkout_path: p.path.clone(), commands: app.local_template_commands() },
-                    item,
-                );
-                if command.host.is_some() {
-                    command
-                } else {
-                    app.repo_command(CommandAction::CreateWorkspaceForCheckout { checkout_path: p.path.clone(), label })
-                }
+                app.item_host_repo_command(CommandAction::CreateWorkspaceForCheckout { checkout_path: p.path.clone(), label }, item)
             }),
             Intent::RemoveCheckout => {
                 if item.kind != WorkItemKind::Checkout || item.is_main_checkout {

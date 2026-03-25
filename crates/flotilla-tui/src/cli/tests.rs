@@ -339,7 +339,10 @@ mod watch_human {
 mod command_result_human {
     use std::path::PathBuf;
 
-    use flotilla_protocol::commands::{CheckoutStatus, CommandValue};
+    use flotilla_protocol::{
+        commands::{CheckoutStatus, CommandValue},
+        HostName, PreparedWorkspace,
+    };
 
     use crate::cli::format_command_result;
 
@@ -455,6 +458,19 @@ mod command_result_human {
     #[test]
     fn cancelled() {
         assert_eq!(format_command_result(&CommandValue::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn prepared_workspace_is_internal_step_result() {
+        let result = CommandValue::PreparedWorkspace(PreparedWorkspace {
+            label: "feat".into(),
+            target_host: HostName::new("feta"),
+            checkout_path: PathBuf::from("/tmp/wt"),
+            attachable_set_id: None,
+            template_yaml: Some("panes: []".into()),
+            prepared_commands: vec![],
+        });
+        assert_eq!(format_command_result(&result), "internal step result");
     }
 }
 

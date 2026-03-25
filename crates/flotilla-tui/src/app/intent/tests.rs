@@ -380,7 +380,7 @@ fn resolve_create_workspace() {
 }
 
 #[test]
-fn resolve_create_workspace_on_remote_checkout_prepares_remote_terminal() {
+fn resolve_create_workspace_on_remote_checkout_routes_single_command_to_remote_host() {
     let mut app = stub_app();
     insert_local_host(&mut app.model, &HostName::local().to_string());
     let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
@@ -391,11 +391,12 @@ fn resolve_create_workspace_on_remote_checkout_prepares_remote_terminal() {
     let cmd = Intent::CreateWorkspace.resolve(&item, &app).unwrap();
 
     match cmd {
-        Command { host, action: CommandAction::PrepareTerminalForCheckout { checkout_path, .. }, .. } => {
+        Command { host, action: CommandAction::CreateWorkspaceForCheckout { checkout_path, label }, .. } => {
             assert_eq!(host, Some(HostName::new("remote-a")));
             assert_eq!(checkout_path, PathBuf::from("/remote/feat-x"));
+            assert_eq!(label, "feat/x");
         }
-        other => panic!("expected PrepareTerminalForCheckout, got {other:?}"),
+        other => panic!("expected CreateWorkspaceForCheckout, got {other:?}"),
     }
 }
 
