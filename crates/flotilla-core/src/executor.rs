@@ -93,7 +93,11 @@ pub async fn build_plan(
     local_host: HostName,
 ) -> Result<StepPlan, CommandValue> {
     let Command { host, action, .. } = cmd;
-    let remote_host = host.as_ref().cloned().map_or(StepHost::Local, StepHost::Remote);
+    let remote_host = host
+        .as_ref()
+        .filter(|target_host| **target_host != local_host)
+        .cloned()
+        .map_or(StepHost::Local, StepHost::Remote);
 
     match action {
         CommandAction::Checkout { target, issue_ids, .. } => {

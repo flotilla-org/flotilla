@@ -1854,6 +1854,32 @@ async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
 }
 
 #[tokio::test]
+async fn build_plan_create_checkout_treats_local_host_as_local() {
+    let mut registry = empty_registry();
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
+    let data = empty_data();
+    let local = local_host();
+
+    let plan = build_plan(
+        command_with_host(local.as_str(), fresh_checkout_action("feat-x")),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        local.clone(),
+    )
+    .await
+    .expect("build plan");
+
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].host, StepHost::Local);
+    assert_eq!(plan.steps[1].host, StepHost::Local);
+}
+
+#[tokio::test]
 async fn build_plan_create_checkout_skips_existing() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
