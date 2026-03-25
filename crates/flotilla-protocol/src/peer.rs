@@ -147,6 +147,8 @@ pub enum RoutedPeerMessage {
         repo_identity: RepoIdentity,
         repo_path: PathBuf,
         step_offset: usize,
+        /// Every step in the batch is expected to target `target_host`.
+        /// The receiver should reject mismatched steps instead of trying to route them.
         steps: Vec<Step>,
     },
     RemoteStepEvent {
@@ -154,8 +156,8 @@ pub enum RoutedPeerMessage {
         requester_host: HostName,
         responder_host: HostName,
         remaining_hops: u8,
-        step_index: usize,
-        step_count: usize,
+        batch_step_index: usize,
+        batch_step_count: usize,
         description: String,
         status: StepStatus,
     },
@@ -562,8 +564,8 @@ mod tests {
             requester_host: HostName::new("workstation"),
             responder_host: HostName::new("feta"),
             remaining_hops: 6,
-            step_index: 0,
-            step_count: 1,
+            batch_step_index: 0,
+            batch_step_count: 1,
             description: "Prepare terminal".into(),
             status: StepStatus::Started,
         };
@@ -575,8 +577,8 @@ mod tests {
                 requester_host,
                 responder_host,
                 remaining_hops,
-                step_index,
-                step_count,
+                batch_step_index,
+                batch_step_count,
                 description,
                 status,
             } => {
@@ -584,8 +586,8 @@ mod tests {
                 assert_eq!(requester_host, HostName::new("workstation"));
                 assert_eq!(responder_host, HostName::new("feta"));
                 assert_eq!(remaining_hops, 6);
-                assert_eq!(step_index, 0);
-                assert_eq!(step_count, 1);
+                assert_eq!(batch_step_index, 0);
+                assert_eq!(batch_step_count, 1);
                 assert_eq!(description, "Prepare terminal");
                 assert_eq!(status, StepStatus::Started);
             }
