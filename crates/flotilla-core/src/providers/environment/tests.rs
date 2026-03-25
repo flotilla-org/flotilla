@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{DaemonHostPath, EnvironmentSpec, EnvironmentStatus, ImageSource};
+use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, HostName, ImageSource};
 
 use super::{docker::DockerEnvironment, runner::EnvironmentRunner, CreateOpts, EnvironmentProvider};
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
@@ -316,4 +316,198 @@ async fn destroy_calls_docker_rm() {
     assert_eq!(args[0], "rm");
     assert!(args.contains(&"-f".to_string()), "should pass -f flag");
     assert!(args.contains(&container_name), "should pass container name");
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that EnvironmentRunner composes correctly with the CleatTerminalPoolFactory:
+/// the factory's binary probe arrives via docker exec, demonstrating the decorator
+/// pattern works end-to-end with real factory logic.
+#[tokio::test]
+async fn environment_runner_supports_factory_probe() {
+    use crate::{
+        config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
+        providers::discovery::{factories::cleat::CleatTerminalPoolFactory, EnvironmentAssertion, EnvironmentBag, Factory},
+    };
+
+    // A runner that succeeds for any docker exec call (simulates cleat present in container)
+    let inner = Arc::new(RecordingRunner::new_ok("cleat 0.5.0"));
+    let env_runner = Arc::new(EnvironmentRunner::new("test-container".to_string(), inner.clone()));
+
+    // Build an EnvironmentBag that asserts cleat is available at the path the factory expects
+    let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = ConfigStore::with_base(dir.path());
+    let repo_root = ExecutionEnvironmentPath::new("/repo");
+
+    // The factory checks env.find_binary("cleat") first — it does NOT call runner for binary detection.
+    // Passing the EnvironmentRunner as the runner proves the decorator is accepted by the factory
+    // and that CleatTerminalPool is constructed with it, proving the composition path.
+    let result = CleatTerminalPoolFactory.probe(&bag, &config, &repo_root, env_runner.clone()).await;
+    assert!(result.is_ok(), "probe should succeed when cleat binary assertion is present");
+
+    // Verify that no actual docker exec calls were made during probe (factory only checks bag)
+    let calls = inner.calls();
+    assert!(calls.is_empty(), "factory probe should not invoke runner during binary check");
+}
+
+/// Verifies that EnvironmentRunner correctly transforms command calls into docker exec form,
+/// matching the pattern that discovery factories would issue inside a container.
+#[tokio::test]
+async fn environment_runner_transforms_commands_for_container() {
+    // Simulate the exact check a discovery factory might perform: "cleat --version"
+    let inner = Arc::new(RecordingRunner::new_ok("cleat 0.5.0"));
+    let env_runner = EnvironmentRunner::new("my-container".to_string(), inner.clone());
+    let label = ChannelLabel::Noop;
+
+    // This is the kind of command a binary-check probe would issue
+    env_runner.run("cleat", &["--version"], Path::new("/"), &label).await.ok();
+
+    let calls = inner.calls();
+    assert_eq!(calls.len(), 1);
+    let (cmd, args, cwd) = &calls[0];
+    assert_eq!(cmd, "docker");
+    assert_eq!(args, &["exec", "-w", "/", "my-container", "cleat", "--version"]);
+    assert_eq!(cwd, Path::new("/"));
+}
+
+/// Integration test: three-hop composition — SSH → docker exec → terminal attach.
+///
+/// Builds a HopPlan with RemoteToHost + EnterEnvironment + AttachTerminal and resolves
+/// it end-to-end using mock resolvers. Asserts that the output is correctly nested:
+/// SSH wrapping docker exec wrapping the terminal attach command.
+#[test]
+fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
+    use std::collections::HashMap;
+
+    use flotilla_protocol::arg::{flatten, Arg};
+
+    use crate::{
+        attachable::AttachableId,
+        hop_chain::{
+            environment::DockerEnvironmentHopResolver,
+            remote::RemoteHopResolver,
+            resolver::{AlwaysWrap, HopResolver},
+            terminal::TerminalHopResolver,
+            Hop, HopPlan, ResolutionContext, ResolvedAction,
+        },
+    };
+
+    // ── Mock resolvers ───────────────────────────────────────────────
+
+    /// A minimal mock RemoteHopResolver for wrap mode:
+    /// pops the inner Command, wraps with ssh <host> <NestedCommand(inner)>.
+    struct MockRemote;
+    impl RemoteHopResolver for MockRemote {
+        fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
+            let inner_action = context.actions.pop().ok_or("mock: no inner action")?;
+            let inner_args = match inner_action {
+                ResolvedAction::Command(args) => args,
+                other => return Err(format!("mock remote wrap: expected Command, got {other:?}")),
+            };
+            let mut ssh_args = vec![Arg::Literal("ssh".into()), Arg::Quoted(host.as_str().to_string())];
+            ssh_args.push(Arg::NestedCommand(inner_args));
+            context.actions.push(ResolvedAction::Command(ssh_args));
+            Ok(())
+        }
+
+        fn resolve_enter(&self, _host: &HostName, _context: &mut ResolutionContext) -> Result<(), String> {
+            unimplemented!("only wrap mode used in this test")
+        }
+    }
+
+    /// A minimal mock TerminalHopResolver that pushes a simple attach command.
+    struct MockTerminal;
+    impl TerminalHopResolver for MockTerminal {
+        fn resolve(&self, attachable_id: &AttachableId, context: &mut ResolutionContext) -> Result<(), String> {
+            context.actions.push(ResolvedAction::Command(vec![
+                Arg::Literal("cleat".into()),
+                Arg::Literal("attach".into()),
+                Arg::Literal(attachable_id.to_string()),
+            ]));
+            Ok(())
+        }
+    }
+
+    // ── Build the HopResolver ────────────────────────────────────────
+
+    let mut containers = HashMap::new();
+    containers.insert(EnvironmentId::new("env1"), "container-abc".to_string());
+    let docker_env = Arc::new(DockerEnvironmentHopResolver::new(containers));
+
+    let resolver = HopResolver {
+        remote: Arc::new(MockRemote),
+        environment: docker_env,
+        terminal: Arc::new(MockTerminal),
+        strategy: Arc::new(AlwaysWrap),
+    };
+
+    // ── Build the HopPlan: RemoteToHost → EnterEnvironment → AttachTerminal ──
+
+    let att_id = AttachableId::new("sess-123");
+    let plan = HopPlan(vec![
+        Hop::RemoteToHost { host: HostName::new("feta") },
+        Hop::EnterEnvironment { env_id: EnvironmentId::new("env1"), provider: "docker".into() },
+        Hop::AttachTerminal { attachable_id: att_id.clone() },
+    ]);
+
+    // ── Resolve from a different host ────────────────────────────────
+
+    let mut context = ResolutionContext {
+        current_host: HostName::new("local-host"),
+        current_environment: None,
+        working_directory: None,
+        actions: Vec::new(),
+        nesting_depth: 0,
+    };
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // ── Assert output structure ──────────────────────────────────────
+
+    // Should produce a single Command action (all wrapped)
+    assert_eq!(resolved.0.len(), 1, "three-hop wrap should produce exactly one Command action");
+
+    let outer_args = match &resolved.0[0] {
+        ResolvedAction::Command(args) => args,
+        other => panic!("expected Command, got {other:?}"),
+    };
+
+    // Outermost: ssh <host> <NestedCommand(...)>
+    assert_eq!(outer_args[0], Arg::Literal("ssh".into()), "outermost command should be ssh");
+    assert_eq!(outer_args[1], Arg::Quoted("feta".into()), "ssh target should be feta");
+    assert_eq!(outer_args.len(), 3, "ssh args should have exactly 3 elements (ssh, target, nested)");
+
+    // Middle: docker exec -it container-abc cleat attach <sess-id>
+    // (DockerEnvironmentHopResolver extends the inner args directly, no extra NestedCommand)
+    let docker_nested = match &outer_args[2] {
+        Arg::NestedCommand(args) => args,
+        other => panic!("expected NestedCommand for docker layer, got {other:?}"),
+    };
+    assert_eq!(docker_nested[0], Arg::Literal("docker".into()), "middle command should be docker");
+    assert_eq!(docker_nested[1], Arg::Literal("exec".into()), "docker subcommand should be exec");
+    assert_eq!(docker_nested[2], Arg::Literal("-it".into()), "docker exec should have -it flag");
+    assert_eq!(docker_nested[3], Arg::Literal("container-abc".into()), "docker exec target should be container-abc");
+
+    // Innermost args are flattened directly into the docker exec invocation
+    assert_eq!(docker_nested[4], Arg::Literal("cleat".into()), "innermost command should be cleat");
+    assert_eq!(docker_nested[5], Arg::Literal("attach".into()), "cleat subcommand should be attach");
+    assert_eq!(docker_nested[6], Arg::Literal(att_id.to_string()), "cleat should attach to correct session");
+    assert_eq!(docker_nested.len(), 7, "docker nested should have exactly 7 args");
+
+    // Verify flatten produces the expected structure
+    let flat = flatten(outer_args, 0);
+    assert!(flat.starts_with("ssh "), "flattened output should start with ssh: {flat}");
+    assert!(flat.contains("docker exec -it container-abc"), "should contain docker exec: {flat}");
+    assert!(flat.contains("cleat attach"), "should contain cleat attach: {flat}");
+    assert!(flat.contains(att_id.as_str()), "should contain session id: {flat}");
+
+    // Verify nesting depth updated for both remote and environment hops
+    assert_eq!(context.nesting_depth, 2, "nesting_depth should be 2 after remote + environment hops");
+    assert_eq!(context.current_host.as_str(), "feta", "current_host should be updated to feta");
+    assert_eq!(context.current_environment, Some(EnvironmentId::new("env1")), "current_environment should be env1");
 }

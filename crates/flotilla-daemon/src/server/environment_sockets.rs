@@ -1,12 +1,17 @@
 use std::collections::HashMap;
 
 use flotilla_protocol::{DaemonHostPath, EnvironmentId};
-use tokio::net::UnixListener;
-use tokio::task::JoinHandle;
+use tokio::{net::UnixListener, task::JoinHandle};
 use tracing::info;
 
 pub struct EnvironmentSocketRegistry {
     sockets: HashMap<EnvironmentId, (JoinHandle<()>, DaemonHostPath)>,
+}
+
+impl Default for EnvironmentSocketRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EnvironmentSocketRegistry {
@@ -27,8 +32,7 @@ impl EnvironmentSocketRegistry {
         // Remove stale socket file if it exists
         let _ = tokio::fs::remove_file(socket_path.as_path()).await;
 
-        let listener = UnixListener::bind(socket_path.as_path())
-            .map_err(|e| format!("failed to bind environment socket: {e}"))?;
+        let listener = UnixListener::bind(socket_path.as_path()).map_err(|e| format!("failed to bind environment socket: {e}"))?;
 
         info!(%id, path = %socket_path, "environment socket listening");
 
