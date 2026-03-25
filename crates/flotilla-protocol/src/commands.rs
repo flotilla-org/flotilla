@@ -539,6 +539,7 @@ mod tests {
                     },
                     inventory: ToolInventory::default(),
                     providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+                    environments: vec![],
                 }),
                 repo_count: 1,
                 work_item_count: 3,
@@ -553,6 +554,7 @@ mod tests {
                     system: SystemInfo::default(),
                     inventory: ToolInventory::default(),
                     providers: vec![],
+                    environments: vec![],
                 },
             })),
         ];
