@@ -1,136 +1,14 @@
-use flotilla_protocol::{
-    AttachableSetId, CommandValue, DaemonEvent, HostName, HostPath, PreparedTerminalCommand, RepoIdentity, ResolvedPaneCommand, StepStatus,
-};
+use flotilla_protocol::{CommandValue, DaemonEvent, HostName, RepoIdentity, StepStatus};
+pub use flotilla_protocol::{Step, StepAction, StepHost, StepOutcome};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::{executor::checkout::CheckoutIntent, path_context::ExecutionEnvironmentPath};
-
-/// Outcome of a single step execution.
-#[derive(Debug, Clone)]
-pub enum StepOutcome {
-    /// Step completed successfully, no specific result to report.
-    Completed,
-    /// Step completed and wants to override the final CommandValue.
-    CompletedWith(CommandValue),
-    /// Inter-step data visible to later steps but excluded from the final result.
-    Produced(CommandValue),
-    /// Step determined its work was already done and skipped.
-    Skipped,
-}
-
-/// Which host a step should execute on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StepHost {
-    /// Run on the same host as the stepper (the daemon executing the plan).
-    Local,
-    /// Run on a specific named remote host.
-    Remote(HostName),
-}
-
-/// A symbolic action that the step runner resolves at execution time.
-pub enum StepAction {
-    // Checkout lifecycle
-    CreateCheckout {
-        branch: String,
-        create_branch: bool,
-        intent: CheckoutIntent,
-        issue_ids: Vec<(String, String)>,
-    },
-    LinkIssuesToBranch {
-        branch: String,
-        issue_ids: Vec<(String, String)>,
-    },
-    RemoveCheckout {
-        branch: String,
-        deleted_checkout_paths: Vec<HostPath>,
-    },
-
-    // Workspace (existing)
-    /// Create a workspace for a checkout path produced by a prior step.
-    CreateWorkspaceForCheckout {
-        label: String,
-        checkout_path: Option<ExecutionEnvironmentPath>,
-    },
-
-    // Teleport
-    ResolveAttachCommand {
-        session_id: String,
-    },
-    EnsureCheckoutForTeleport {
-        branch: Option<String>,
-        checkout_key: Option<ExecutionEnvironmentPath>,
-        initial_path: Option<ExecutionEnvironmentPath>,
-    },
-    CreateTeleportWorkspace {
-        /// Unused by the current resolver, but kept for batch 2: remote step
-        /// routing may need it to re-resolve the attach command on the target host.
-        session_id: String,
-        branch: Option<String>,
-    },
-
-    // Session
-    ArchiveSession {
-        session_id: String,
-    },
-    GenerateBranchName {
-        issue_keys: Vec<String>,
-    },
-
-    // Workspace lifecycle (new)
-    CreateWorkspaceFromPreparedTerminal {
-        target_host: HostName,
-        branch: String,
-        checkout_path: ExecutionEnvironmentPath,
-        attachable_set_id: Option<AttachableSetId>,
-        commands: Vec<ResolvedPaneCommand>,
-    },
-    SelectWorkspace {
-        ws_ref: String,
-    },
-    PrepareTerminalForCheckout {
-        checkout_path: ExecutionEnvironmentPath,
-        commands: Vec<PreparedTerminalCommand>,
-    },
-
-    // Query
-    FetchCheckoutStatus {
-        branch: String,
-        checkout_path: Option<ExecutionEnvironmentPath>,
-        change_request_id: Option<String>,
-    },
-
-    // External interactions
-    OpenChangeRequest {
-        id: String,
-    },
-    CloseChangeRequest {
-        id: String,
-    },
-    OpenIssue {
-        id: String,
-    },
-    LinkIssuesToChangeRequest {
-        change_request_id: String,
-        issue_ids: Vec<String>,
-    },
-
-    /// Test-only no-op action resolved by test harness resolvers.
-    #[cfg(test)]
-    Noop,
-}
+use crate::path_context::ExecutionEnvironmentPath;
 
 /// Resolves symbolic step actions into outcomes.
 #[async_trait::async_trait]
 pub trait StepResolver: Send + Sync {
     async fn resolve(&self, description: &str, action: StepAction, prior: &[StepOutcome]) -> Result<StepOutcome, String>;
-}
-
-/// A single step in a multi-step command.
-pub struct Step {
-    pub description: String,
-    pub host: StepHost,
-    pub action: StepAction,
 }
 
 /// A plan of steps to execute for a command.

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+pub use flotilla_protocol::CheckoutIntent;
 use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
 
@@ -9,12 +10,6 @@ use crate::{
     providers::{registry::ProviderRegistry, run, CommandRunner},
     terminal_manager::TerminalManager,
 };
-
-#[derive(Clone, Copy)]
-pub enum CheckoutIntent {
-    ExistingBranch,
-    FreshBranch,
-}
 
 pub(super) struct CheckoutService<'a> {
     registry: &'a ProviderRegistry,
