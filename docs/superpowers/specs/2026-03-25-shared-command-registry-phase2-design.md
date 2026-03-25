@@ -5,6 +5,7 @@
 **Parent spec:** `docs/superpowers/specs/2026-03-24-shared-command-registry-design.md`
 **Phase 1 spec:** `docs/superpowers/specs/2026-03-24-shared-command-registry-phase1-design.md`
 **Prerequisites:** #502 (unify queries and commands), #506 (ambient context on command definitions)
+**Prerequisite spec:** `docs/superpowers/specs/2026-03-25-commands-unify-and-ambient-context-design.md`
 
 ## Goal
 
@@ -91,8 +92,8 @@ user text ("cr #42 close")
     ↓ if first token is "host": parse_host_command(tokens)
     ↓ otherwise: parse_noun_command(tokens)
     ↓ resolve()
-Resolved::Command(cmd) or Resolved::RequiresRepoContext(cmd)
-    ↓ context injection (repo from active tab)
+Resolved::Ready(cmd) or Resolved::NeedsContext { command, repo, host }
+    ↓ tui_dispatch: fill repo from active tab, resolve host via HostResolution
     ↓ dispatch to daemon
 ```
 
@@ -386,7 +387,9 @@ Verify that typed input resolves to the correct `Resolved` variant:
 #[test]
 fn palette_parses_cr_close() {
     let resolved = parse_palette_input("cr #42 close");
-    assert!(matches!(resolved, Ok(Resolved::Command(cmd)) if matches!(cmd.action, CommandAction::CloseChangeRequest { .. })));
+    // cr close has ProviderHost resolution → NeedsContext
+    assert!(matches!(resolved, Ok(Resolved::NeedsContext { command, host: HostResolution::ProviderHost, .. })
+        if matches!(command.action, CommandAction::CloseChangeRequest { .. })));
 }
 ```
 
@@ -414,7 +417,9 @@ fn intent_round_trips_through_registry() {
     let tokens = Intent::OpenChangeRequest.to_command_tokens(&item, &app).unwrap();
     let noun = parse_noun_command(&tokens).unwrap();
     let resolved = noun.resolve().unwrap();
-    assert!(matches!(resolved, Resolved::Command(cmd) if matches!(cmd.action, CommandAction::OpenChangeRequest { .. })));
+    // cr open has ProviderHost resolution → NeedsContext
+    assert!(matches!(resolved, Resolved::NeedsContext { command, host: HostResolution::ProviderHost, .. }
+        if matches!(command.action, CommandAction::OpenChangeRequest { .. })));
 }
 
 #[test]
