@@ -62,20 +62,8 @@ impl EnvironmentProvider for DockerEnvironment {
         let env_id_env = format!("FLOTILLA_ENVIRONMENT_ID={}", env_id_str);
         let socket_env = format!("FLOTILLA_DAEMON_SOCKET={CONTAINER_SOCKET_PATH}");
 
-        let mut args = vec![
-            "run",
-            "-d",
-            "--name",
-            &container_name,
-            "--label",
-            &label_val,
-            "-v",
-            &socket_mount,
-            "-e",
-            &socket_env,
-            "-e",
-            &env_id_env,
-        ];
+        let mut args =
+            vec!["run", "-d", "--name", &container_name, "--label", &label_val, "-v", &socket_mount, "-e", &socket_env, "-e", &env_id_env];
 
         // Optional reference_repo mount
         let reference_repo_mount;
