@@ -1,124 +1,14 @@
-use flotilla_protocol::{
-    AttachableSetId, CommandValue, DaemonEvent, HostName, HostPath, PreparedTerminalCommand, RepoIdentity, ResolvedPaneCommand, StepStatus,
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
 };
+
+use flotilla_protocol::{CommandValue, DaemonEvent, HostName, RepoIdentity, StepStatus};
+pub use flotilla_protocol::{Step, StepAction, StepHost, StepOutcome};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::{executor::checkout::CheckoutIntent, path_context::ExecutionEnvironmentPath};
-
-/// Outcome of a single step execution.
-#[derive(Debug, Clone)]
-pub enum StepOutcome {
-    /// Step completed successfully, no specific result to report.
-    Completed,
-    /// Step completed and wants to override the final CommandValue.
-    CompletedWith(CommandValue),
-    /// Inter-step data visible to later steps but excluded from the final result.
-    Produced(CommandValue),
-    /// Step determined its work was already done and skipped.
-    Skipped,
-}
-
-/// Which host a step should execute on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StepHost {
-    /// Run on the same host as the stepper (the daemon executing the plan).
-    Local,
-    /// Run on a specific named remote host.
-    Remote(HostName),
-}
-
-/// A symbolic action that the step runner resolves at execution time.
-pub enum StepAction {
-    // Checkout lifecycle
-    CreateCheckout {
-        branch: String,
-        create_branch: bool,
-        intent: CheckoutIntent,
-        issue_ids: Vec<(String, String)>,
-    },
-    LinkIssuesToBranch {
-        branch: String,
-        issue_ids: Vec<(String, String)>,
-    },
-    RemoveCheckout {
-        branch: String,
-        deleted_checkout_paths: Vec<HostPath>,
-    },
-
-    // Workspace (existing)
-    /// Create a workspace for a checkout path produced by a prior step.
-    CreateWorkspaceForCheckout {
-        label: String,
-        checkout_path: Option<ExecutionEnvironmentPath>,
-    },
-
-    // Teleport
-    ResolveAttachCommand {
-        session_id: String,
-    },
-    EnsureCheckoutForTeleport {
-        branch: Option<String>,
-        checkout_key: Option<ExecutionEnvironmentPath>,
-        initial_path: Option<ExecutionEnvironmentPath>,
-    },
-    CreateTeleportWorkspace {
-        /// Unused by the current resolver, but kept for batch 2: remote step
-        /// routing may need it to re-resolve the attach command on the target host.
-        session_id: String,
-        branch: Option<String>,
-    },
-
-    // Session
-    ArchiveSession {
-        session_id: String,
-    },
-    GenerateBranchName {
-        issue_keys: Vec<String>,
-    },
-
-    // Workspace lifecycle (new)
-    CreateWorkspaceFromPreparedTerminal {
-        target_host: HostName,
-        branch: String,
-        checkout_path: ExecutionEnvironmentPath,
-        attachable_set_id: Option<AttachableSetId>,
-        commands: Vec<ResolvedPaneCommand>,
-    },
-    SelectWorkspace {
-        ws_ref: String,
-    },
-    PrepareTerminalForCheckout {
-        checkout_path: ExecutionEnvironmentPath,
-        commands: Vec<PreparedTerminalCommand>,
-    },
-
-    // Query
-    FetchCheckoutStatus {
-        branch: String,
-        checkout_path: Option<ExecutionEnvironmentPath>,
-        change_request_id: Option<String>,
-    },
-
-    // External interactions
-    OpenChangeRequest {
-        id: String,
-    },
-    CloseChangeRequest {
-        id: String,
-    },
-    OpenIssue {
-        id: String,
-    },
-    LinkIssuesToChangeRequest {
-        change_request_id: String,
-        issue_ids: Vec<String>,
-    },
-
-    /// Test-only no-op action resolved by test harness resolvers.
-    #[cfg(test)]
-    Noop,
-}
+use crate::path_context::ExecutionEnvironmentPath;
 
 /// Resolves symbolic step actions into outcomes.
 #[async_trait::async_trait]
@@ -126,11 +16,59 @@ pub trait StepResolver: Send + Sync {
     async fn resolve(&self, description: &str, action: StepAction, prior: &[StepOutcome]) -> Result<StepOutcome, String>;
 }
 
-/// A single step in a multi-step command.
-pub struct Step {
+pub struct RemoteStepBatchRequest {
+    pub command_id: u64,
+    pub target_host: HostName,
+    pub repo_identity: RepoIdentity,
+    pub repo: ExecutionEnvironmentPath,
+    /// Global step index of the first step in this batch on the requester.
+    ///
+    /// The executing host emits batch-relative progress indices. The requester
+    /// uses this offset when remapping those updates into the global command
+    /// timeline that the UI already understands.
+    pub step_offset: usize,
+    pub steps: Vec<Step>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteStepProgressUpdate {
+    pub batch_step_index: usize,
+    pub batch_step_count: usize,
     pub description: String,
-    pub host: StepHost,
-    pub action: StepAction,
+    pub status: StepStatus,
+}
+
+#[async_trait::async_trait]
+pub trait RemoteStepProgressSink: Send + Sync {
+    async fn emit(&self, update: RemoteStepProgressUpdate);
+}
+
+#[async_trait::async_trait]
+pub trait RemoteStepExecutor: Send + Sync {
+    async fn execute_batch(
+        &self,
+        request: RemoteStepBatchRequest,
+        progress_sink: Arc<dyn RemoteStepProgressSink>,
+    ) -> Result<Vec<StepOutcome>, String>;
+
+    async fn cancel_active_batch(&self, command_id: u64) -> Result<(), String>;
+}
+
+pub struct UnsupportedRemoteStepExecutor;
+
+#[async_trait::async_trait]
+impl RemoteStepExecutor for UnsupportedRemoteStepExecutor {
+    async fn execute_batch(
+        &self,
+        request: RemoteStepBatchRequest,
+        _progress_sink: Arc<dyn RemoteStepProgressSink>,
+    ) -> Result<Vec<StepOutcome>, String> {
+        Err(format!("remote step execution is not wired for host {}", request.target_host))
+    }
+
+    async fn cancel_active_batch(&self, _command_id: u64) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A plan of steps to execute for a command.
@@ -149,76 +87,172 @@ impl StepPlan {
 pub async fn run_step_plan(
     plan: StepPlan,
     command_id: u64,
-    host: HostName,
+    local_host: HostName,
     repo_identity: RepoIdentity,
     repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
     event_tx: broadcast::Sender<DaemonEvent>,
     resolver: &dyn StepResolver,
 ) -> CommandValue {
+    let remote_executor = UnsupportedRemoteStepExecutor;
+    run_step_plan_with_remote_executor(plan, command_id, local_host, repo_identity, repo, cancel, event_tx, resolver, &remote_executor)
+        .await
+}
+
+/// Execute a step plan with explicit remote-step handling.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_step_plan_with_remote_executor(
+    plan: StepPlan,
+    command_id: u64,
+    local_host: HostName,
+    repo_identity: RepoIdentity,
+    repo: ExecutionEnvironmentPath,
+    cancel: CancellationToken,
+    event_tx: broadcast::Sender<DaemonEvent>,
+    resolver: &dyn StepResolver,
+    remote_executor: &dyn RemoteStepExecutor,
+) -> CommandValue {
     let step_count = plan.steps.len();
     let mut outcomes: Vec<StepOutcome> = Vec::new();
+    let steps = plan.steps;
+    let mut i = 0usize;
 
-    for (i, step) in plan.steps.into_iter().enumerate() {
+    while i < step_count {
         if cancel.is_cancelled() {
             return CommandValue::Cancelled;
         }
 
-        let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
-            command_id,
-            host: host.clone(),
-            repo_identity: repo_identity.clone(),
-            repo: repo.as_path().to_path_buf(),
-            step_index: i,
-            step_count,
-            description: step.description.clone(),
-            status: StepStatus::Started,
-        });
-
-        let outcome = resolver.resolve(&step.description, step.action, &outcomes).await;
-
-        // Cancellation wins over a successful in-flight step, but provider
-        // errors still surface so we don't hide the underlying failure.
-        if cancel.is_cancelled() && outcome.is_ok() {
-            return CommandValue::Cancelled;
-        }
-
-        match outcome {
-            Ok(step_outcome) => {
-                let status = match &step_outcome {
-                    StepOutcome::Skipped => StepStatus::Skipped,
-                    _ => StepStatus::Succeeded,
-                };
-                let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
+        let step = steps[i].clone();
+        match step.host.clone() {
+            StepHost::Local => {
+                emit_step_update(
+                    &event_tx,
                     command_id,
-                    host: host.clone(),
-                    repo_identity: repo_identity.clone(),
-                    repo: repo.as_path().to_path_buf(),
-                    step_index: i,
+                    local_host.clone(),
+                    repo_identity.clone(),
+                    repo.as_path().to_path_buf(),
+                    i,
                     step_count,
-                    description: step.description.clone(),
-                    status,
-                });
-                outcomes.push(step_outcome);
+                    step.description.clone(),
+                    StepStatus::Started,
+                );
+
+                let outcome = resolver.resolve(&step.description, step.action, &outcomes).await;
+
+                // Cancellation wins over a successful in-flight step, but provider
+                // errors still surface so we don't hide the underlying failure.
+                if cancel.is_cancelled() && outcome.is_ok() {
+                    return CommandValue::Cancelled;
+                }
+
+                match outcome {
+                    Ok(step_outcome) => {
+                        let status = match &step_outcome {
+                            StepOutcome::Skipped => StepStatus::Skipped,
+                            _ => StepStatus::Succeeded,
+                        };
+                        emit_step_update(
+                            &event_tx,
+                            command_id,
+                            local_host.clone(),
+                            repo_identity.clone(),
+                            repo.as_path().to_path_buf(),
+                            i,
+                            step_count,
+                            step.description.clone(),
+                            status,
+                        );
+                        outcomes.push(step_outcome);
+                    }
+                    Err(e) => {
+                        emit_step_update(
+                            &event_tx,
+                            command_id,
+                            local_host.clone(),
+                            repo_identity.clone(),
+                            repo.as_path().to_path_buf(),
+                            i,
+                            step_count,
+                            step.description.clone(),
+                            StepStatus::Failed { message: e.clone() },
+                        );
+                        return prior_result_or_error(&outcomes, e);
+                    }
+                }
+                i += 1;
             }
-            Err(e) => {
-                let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
+            StepHost::Remote(target_host) => {
+                let segment_start = i;
+                let mut segment_steps = vec![step];
+                i += 1;
+                while i < step_count {
+                    match &steps[i].host {
+                        StepHost::Remote(host) if *host == target_host => {
+                            segment_steps.push(steps[i].clone());
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+
+                let progress_sink = Arc::new(EventForwardingProgressSink {
                     command_id,
-                    host: host.clone(),
+                    host: target_host.clone(),
                     repo_identity: repo_identity.clone(),
-                    repo: repo.as_path().to_path_buf(),
-                    step_index: i,
+                    repo: repo.clone(),
+                    step_offset: segment_start,
                     step_count,
-                    description: step.description.clone(),
-                    status: StepStatus::Failed { message: e.clone() },
+                    event_tx: event_tx.clone(),
+                    state: Mutex::new(RemoteProgressState::default()),
                 });
-                // If a prior step produced a meaningful result, preserve it.
-                // The failure is already reported via the StepFailed event.
-                let prior_result = outcomes.iter().rev().find_map(|o| match o {
-                    StepOutcome::CompletedWith(r) => Some(r.clone()),
-                    _ => None,
-                });
-                return prior_result.unwrap_or(CommandValue::Error { message: e });
+                let request = RemoteStepBatchRequest {
+                    command_id,
+                    target_host: target_host.clone(),
+                    repo_identity: repo_identity.clone(),
+                    repo: repo.clone(),
+                    step_offset: segment_start,
+                    steps: segment_steps,
+                };
+
+                let batch = remote_executor.execute_batch(request, progress_sink.clone());
+                tokio::pin!(batch);
+
+                let (cancelled_during_batch, outcome) = tokio::select! {
+                    outcome = &mut batch => (false, outcome),
+                    _ = cancel.cancelled() => {
+                        let outcome = match remote_executor.cancel_active_batch(command_id).await {
+                            Ok(()) => tokio::time::timeout(Duration::from_secs(5), &mut batch)
+                                .await
+                                .unwrap_or_else(|_| Err("timed out waiting for remote batch cancellation".into())),
+                            Err(message) => Err(message),
+                        };
+                        (true, outcome)
+                    }
+                };
+
+                if cancelled_during_batch {
+                    return CommandValue::Cancelled;
+                }
+
+                match outcome {
+                    Ok(step_outcomes) => outcomes.extend(step_outcomes),
+                    Err(e) => {
+                        if let Some(failure) = progress_sink.synthesized_failure(e.clone()) {
+                            emit_step_update(
+                                &event_tx,
+                                command_id,
+                                target_host.clone(),
+                                repo_identity.clone(),
+                                repo.as_path().to_path_buf(),
+                                segment_start + failure.batch_step_index,
+                                step_count,
+                                failure.description,
+                                StepStatus::Failed { message: e.clone() },
+                            );
+                        }
+                        return prior_result_or_error(&outcomes, e);
+                    }
+                }
             }
         }
     }
@@ -232,6 +266,100 @@ pub async fn run_step_plan(
             _ => None,
         })
         .unwrap_or(CommandValue::Ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_step_update(
+    event_tx: &broadcast::Sender<DaemonEvent>,
+    command_id: u64,
+    host: HostName,
+    repo_identity: RepoIdentity,
+    repo: std::path::PathBuf,
+    step_index: usize,
+    step_count: usize,
+    description: String,
+    status: StepStatus,
+) {
+    let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
+        command_id,
+        host,
+        repo_identity,
+        repo,
+        step_index,
+        step_count,
+        description,
+        status,
+    });
+}
+
+fn prior_result_or_error(outcomes: &[StepOutcome], error: String) -> CommandValue {
+    let prior_result = outcomes.iter().rev().find_map(|o| match o {
+        StepOutcome::CompletedWith(r) => Some(r.clone()),
+        _ => None,
+    });
+    prior_result.unwrap_or(CommandValue::Error { message: error })
+}
+
+struct EventForwardingProgressSink {
+    command_id: u64,
+    host: HostName,
+    repo_identity: RepoIdentity,
+    repo: ExecutionEnvironmentPath,
+    step_offset: usize,
+    step_count: usize,
+    event_tx: broadcast::Sender<DaemonEvent>,
+    state: Mutex<RemoteProgressState>,
+}
+
+#[derive(Default)]
+struct RemoteProgressState {
+    latest_batch_step_index: usize,
+    latest_description: Option<String>,
+    failed_emitted: bool,
+}
+
+struct SynthesizedRemoteFailure {
+    batch_step_index: usize,
+    description: String,
+}
+
+impl EventForwardingProgressSink {
+    fn synthesized_failure(&self, message: String) -> Option<SynthesizedRemoteFailure> {
+        let state = self.state.lock().expect("progress state mutex poisoned");
+        if state.failed_emitted {
+            return None;
+        }
+
+        Some(SynthesizedRemoteFailure {
+            batch_step_index: state.latest_batch_step_index,
+            description: state.latest_description.clone().unwrap_or(message),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteStepProgressSink for EventForwardingProgressSink {
+    async fn emit(&self, update: RemoteStepProgressUpdate) {
+        {
+            let mut state = self.state.lock().expect("progress state mutex poisoned");
+            state.latest_batch_step_index = update.batch_step_index;
+            state.latest_description = Some(update.description.clone());
+            if matches!(update.status, StepStatus::Failed { .. }) {
+                state.failed_emitted = true;
+            }
+        }
+        emit_step_update(
+            &self.event_tx,
+            self.command_id,
+            self.host.clone(),
+            self.repo_identity.clone(),
+            self.repo.as_path().to_path_buf(),
+            self.step_offset + update.batch_step_index,
+            self.step_count,
+            update.description,
+            update.status,
+        );
+    }
 }
 
 #[cfg(test)]

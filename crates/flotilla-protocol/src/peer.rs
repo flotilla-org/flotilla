@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{delta::Change, provider_data::ProviderData, CommandValue, HostName, HostSummary, RepoIdentity, StepStatus};
+use crate::{delta::Change, provider_data::ProviderData, CommandValue, HostName, HostSummary, RepoIdentity, Step, StepOutcome, StepStatus};
 
 /// Logical clock for causal ordering and deduplication of peer messages.
 ///
@@ -136,6 +136,54 @@ pub enum RoutedPeerMessage {
         remaining_hops: u8,
         error: Option<String>,
     },
+    RemoteStepRequest {
+        request_id: u64,
+        requester_host: HostName,
+        target_host: HostName,
+        remaining_hops: u8,
+        repo_identity: RepoIdentity,
+        repo_path: PathBuf,
+        /// Global step index of the first step in this batch on the requester.
+        ///
+        /// The responder emits batch-relative progress indices only. The
+        /// requester uses this offset when remapping them back onto the global
+        /// command step sequence.
+        step_offset: usize,
+        /// Every step in the batch is expected to target `target_host`.
+        /// The receiver should reject mismatched steps instead of trying to route them.
+        steps: Vec<Step>,
+    },
+    RemoteStepEvent {
+        request_id: u64,
+        requester_host: HostName,
+        responder_host: HostName,
+        remaining_hops: u8,
+        batch_step_index: usize,
+        batch_step_count: usize,
+        description: String,
+        status: StepStatus,
+    },
+    RemoteStepResponse {
+        request_id: u64,
+        requester_host: HostName,
+        responder_host: HostName,
+        remaining_hops: u8,
+        outcomes: Vec<StepOutcome>,
+    },
+    RemoteStepCancelRequest {
+        cancel_id: u64,
+        requester_host: HostName,
+        target_host: HostName,
+        remaining_hops: u8,
+        remote_step_request_id: u64,
+    },
+    RemoteStepCancelResponse {
+        cancel_id: u64,
+        requester_host: HostName,
+        responder_host: HostName,
+        remaining_hops: u8,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +213,8 @@ pub enum PeerDataKind {
 mod tests {
     use super::*;
     use crate::{
-        Command, CommandAction, CommandValue, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, SystemInfo, ToolInventory,
+        Command, CommandAction, CommandValue, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, StepAction, StepHost,
+        SystemInfo, ToolInventory,
     };
 
     fn sample_host_summary() -> HostSummary {
@@ -463,6 +512,164 @@ mod tests {
                 assert_eq!(error.as_deref(), Some("command not found"));
             }
             other => panic!("expected CommandCancelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn routed_remote_step_request_roundtrip() {
+        let msg = RoutedPeerMessage::RemoteStepRequest {
+            request_id: 43,
+            requester_host: HostName::new("workstation"),
+            target_host: HostName::new("feta"),
+            remaining_hops: 6,
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            repo_path: PathBuf::from("/repo"),
+            step_offset: 2,
+            steps: vec![Step {
+                description: "Prepare terminal".into(),
+                host: StepHost::Remote(HostName::new("feta")),
+                action: StepAction::PrepareTerminalForCheckout {
+                    checkout_path: crate::ExecutionEnvironmentPath::new("/repo"),
+                    commands: vec![],
+                },
+            }],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RoutedPeerMessage::RemoteStepRequest {
+                request_id,
+                requester_host,
+                target_host,
+                remaining_hops,
+                repo_identity,
+                repo_path,
+                step_offset,
+                steps,
+            } => {
+                assert_eq!(request_id, 43);
+                assert_eq!(requester_host, HostName::new("workstation"));
+                assert_eq!(target_host, HostName::new("feta"));
+                assert_eq!(remaining_hops, 6);
+                assert_eq!(repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
+                assert_eq!(repo_path, PathBuf::from("/repo"));
+                assert_eq!(step_offset, 2);
+                assert_eq!(steps.len(), 1);
+            }
+            other => panic!("expected RemoteStepRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn routed_remote_step_event_roundtrip() {
+        let msg = RoutedPeerMessage::RemoteStepEvent {
+            request_id: 43,
+            requester_host: HostName::new("workstation"),
+            responder_host: HostName::new("feta"),
+            remaining_hops: 6,
+            batch_step_index: 0,
+            batch_step_count: 1,
+            description: "Prepare terminal".into(),
+            status: StepStatus::Started,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RoutedPeerMessage::RemoteStepEvent {
+                request_id,
+                requester_host,
+                responder_host,
+                remaining_hops,
+                batch_step_index,
+                batch_step_count,
+                description,
+                status,
+            } => {
+                assert_eq!(request_id, 43);
+                assert_eq!(requester_host, HostName::new("workstation"));
+                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(remaining_hops, 6);
+                assert_eq!(batch_step_index, 0);
+                assert_eq!(batch_step_count, 1);
+                assert_eq!(description, "Prepare terminal");
+                assert_eq!(status, StepStatus::Started);
+            }
+            other => panic!("expected RemoteStepEvent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn routed_remote_step_response_roundtrip() {
+        let msg = RoutedPeerMessage::RemoteStepResponse {
+            request_id: 43,
+            requester_host: HostName::new("workstation"),
+            responder_host: HostName::new("feta"),
+            remaining_hops: 6,
+            outcomes: vec![StepOutcome::Completed, StepOutcome::Produced(CommandValue::Ok)],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RoutedPeerMessage::RemoteStepResponse { request_id, requester_host, responder_host, remaining_hops, outcomes } => {
+                assert_eq!(request_id, 43);
+                assert_eq!(requester_host, HostName::new("workstation"));
+                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(remaining_hops, 6);
+                assert_eq!(outcomes, vec![StepOutcome::Completed, StepOutcome::Produced(CommandValue::Ok)]);
+            }
+            other => panic!("expected RemoteStepResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn routed_remote_step_cancel_request_roundtrip() {
+        let msg = RoutedPeerMessage::RemoteStepCancelRequest {
+            cancel_id: 7,
+            requester_host: HostName::new("workstation"),
+            target_host: HostName::new("feta"),
+            remaining_hops: 6,
+            remote_step_request_id: 43,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RoutedPeerMessage::RemoteStepCancelRequest {
+                cancel_id,
+                requester_host,
+                target_host,
+                remaining_hops,
+                remote_step_request_id,
+            } => {
+                assert_eq!(cancel_id, 7);
+                assert_eq!(requester_host, HostName::new("workstation"));
+                assert_eq!(target_host, HostName::new("feta"));
+                assert_eq!(remaining_hops, 6);
+                assert_eq!(remote_step_request_id, 43);
+            }
+            other => panic!("expected RemoteStepCancelRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn routed_remote_step_cancel_response_roundtrip() {
+        let msg = RoutedPeerMessage::RemoteStepCancelResponse {
+            cancel_id: 7,
+            requester_host: HostName::new("workstation"),
+            responder_host: HostName::new("feta"),
+            remaining_hops: 6,
+            error: Some("remote step not found".into()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RoutedPeerMessage::RemoteStepCancelResponse { cancel_id, requester_host, responder_host, remaining_hops, error } => {
+                assert_eq!(cancel_id, 7);
+                assert_eq!(requester_host, HostName::new("workstation"));
+                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(remaining_hops, 6);
+                assert_eq!(error.as_deref(), Some("remote step not found"));
+            }
+            other => panic!("expected RemoteStepCancelResponse, got {:?}", other),
         }
     }
 }

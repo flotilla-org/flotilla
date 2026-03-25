@@ -27,7 +27,7 @@ use crate::{
         workspace::WorkspaceManager,
         CommandRunner,
     },
-    step::{StepAction, StepOutcome, StepResolver},
+    step::{StepAction, StepHost, StepOutcome, StepResolver},
 };
 
 fn desc(name: &str) -> ProviderDescriptor {
@@ -294,6 +294,10 @@ fn repo_selector() -> RepoSelector {
 
 fn local_command(action: CommandAction) -> Command {
     Command { host: None, context_repo: None, action }
+}
+
+fn command_with_host(host: &str, action: CommandAction) -> Command {
+    Command { host: Some(HostName::new(host)), context_repo: None, action }
 }
 
 fn local_host() -> HostName {
@@ -1677,7 +1681,6 @@ async fn run_build_plan(
         test_attachable_store(&config_base),
         None,
         local_host(),
-        None,
     )
     .await
 }
@@ -1722,7 +1725,6 @@ async fn run_build_plan_to_completion_with(
         attachable_store.clone(),
         None,
         local_host.clone(),
-        None,
     )
     .await;
 
@@ -1827,6 +1829,87 @@ async fn build_plan_create_checkout_returns_steps() {
 }
 
 #[tokio::test]
+async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
+    let mut registry = empty_registry();
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
+    let data = empty_data();
+
+    let plan = build_plan(
+        command_with_host("feta", fresh_checkout_action("feat-x")),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        local_host(),
+    )
+    .await
+    .expect("build plan");
+
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[1].host, StepHost::Local);
+}
+
+#[tokio::test]
+async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
+    let mut registry = empty_registry();
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
+
+    let plan = build_plan(
+        command_with_host("feta", CommandAction::Checkout {
+            repo: repo_selector(),
+            target: CheckoutTarget::FreshBranch("feat-x".to_string()),
+            issue_ids: vec![("github".into(), "123".into())],
+        }),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(empty_data()),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        local_host(),
+    )
+    .await
+    .expect("build plan");
+
+    assert_eq!(plan.steps.len(), 3);
+    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[1].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[2].description, "Create workspace");
+    assert_eq!(plan.steps[2].host, StepHost::Local);
+}
+
+#[tokio::test]
+async fn build_plan_create_checkout_treats_local_host_as_local() {
+    let mut registry = empty_registry();
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
+    let data = empty_data();
+    let local = local_host();
+
+    let plan = build_plan(
+        command_with_host(local.as_str(), fresh_checkout_action("feat-x")),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        local.clone(),
+    )
+    .await
+    .expect("build plan");
+
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].host, StepHost::Local);
+    assert_eq!(plan.steps[1].host, StepHost::Local);
+}
+
+#[tokio::test]
 async fn build_plan_create_checkout_skips_existing() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
@@ -1867,6 +1950,30 @@ async fn checkout_plan_includes_workspace_step() {
 }
 
 #[tokio::test]
+async fn build_plan_prepare_terminal_uses_command_host_for_terminal_step() {
+    let registry = empty_registry();
+    let mut data = empty_data();
+    let path = PathBuf::from("/repo/wt-feat");
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+
+    let plan = build_plan(
+        command_with_host("feta", CommandAction::PrepareTerminalForCheckout { checkout_path: path, commands: vec![] }),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        local_host(),
+    )
+    .await
+    .expect("build plan");
+
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
+}
+
+#[tokio::test]
 async fn checkout_plan_end_to_end_creates_workspace() {
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
@@ -1894,7 +2001,6 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         attachable.clone(),
         None,
         lh.clone(),
-        None,
     )
     .await;
 
@@ -1952,7 +2058,6 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         attachable.clone(),
         None,
         lh.clone(),
-        None,
     )
     .await;
 
@@ -2009,7 +2114,6 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         attachable.clone(),
         None,
         lh.clone(),
-        None,
     )
     .await;
 

@@ -8,7 +8,7 @@ use std::{
 
 use flotilla_protocol::{
     Command, CommandPeerEvent, CommandValue, ConfigLabel, GoodbyeReason, HostName, HostSummary, PeerDataKind, PeerDataMessage,
-    PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage, TopologyRoute, VectorClock,
+    PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage, Step, StepOutcome, StepStatus, TopologyRoute, VectorClock,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -49,6 +49,31 @@ pub enum HandleResult {
     CommandResponseReceived { request_id: u64, responder_host: HostName, result: CommandValue },
     /// A routed command cancel response reached the original requester.
     CommandCancelResponseReceived { cancel_id: u64, responder_host: HostName, error: Option<String> },
+    /// A routed remote-step batch targeted this daemon and should be executed locally.
+    RemoteStepRequested {
+        request_id: u64,
+        requester_host: HostName,
+        reply_via: HostName,
+        repo_identity: RepoIdentity,
+        repo_path: PathBuf,
+        step_offset: usize,
+        steps: Vec<Step>,
+    },
+    /// A routed remote-step progress event reached the original requester.
+    RemoteStepEventReceived {
+        request_id: u64,
+        responder_host: HostName,
+        batch_step_index: usize,
+        batch_step_count: usize,
+        description: String,
+        status: StepStatus,
+    },
+    /// A routed remote-step response reached the original requester.
+    RemoteStepResponseReceived { request_id: u64, responder_host: HostName, outcomes: Vec<StepOutcome> },
+    /// A routed remote-step cancel request targeted this daemon.
+    RemoteStepCancelRequested { cancel_id: u64, requester_host: HostName, reply_via: HostName, remote_step_request_id: u64 },
+    /// A routed remote-step cancel response reached the original requester.
+    RemoteStepCancelResponseReceived { cancel_id: u64, responder_host: HostName, error: Option<String> },
     /// Nothing to do (e.g. message from self).
     Ignored,
 }
@@ -155,6 +180,11 @@ fn peer_wire_message_kind(msg: &PeerWireMessage) -> &'static str {
             RoutedPeerMessage::CommandEvent { .. } => "command_event",
             RoutedPeerMessage::CommandResponse { .. } => "command_response",
             RoutedPeerMessage::CommandCancelResponse { .. } => "command_cancel_response",
+            RoutedPeerMessage::RemoteStepRequest { .. } => "remote_step_request",
+            RoutedPeerMessage::RemoteStepEvent { .. } => "remote_step_event",
+            RoutedPeerMessage::RemoteStepResponse { .. } => "remote_step_response",
+            RoutedPeerMessage::RemoteStepCancelRequest { .. } => "remote_step_cancel_request",
+            RoutedPeerMessage::RemoteStepCancelResponse { .. } => "remote_step_cancel_response",
         },
         PeerWireMessage::Goodbye { .. } => "goodbye",
         PeerWireMessage::Ping { .. } => "ping",
@@ -870,6 +900,223 @@ impl PeerManager {
                 }
 
                 let forwarded = RoutedPeerMessage::CommandCancelResponse {
+                    cancel_id,
+                    requester_host,
+                    responder_host,
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    error,
+                };
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
+                    self.pending_sends.push(PendingPeerSend {
+                        target: reverse_hop.next_hop.clone(),
+                        sender,
+                        msg: PeerWireMessage::Routed(forwarded),
+                    });
+                }
+                self.command_reverse_paths.remove(&key);
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::RemoteStepRequest {
+                request_id,
+                requester_host,
+                target_host,
+                remaining_hops,
+                repo_identity,
+                repo_path,
+                step_offset,
+                steps,
+            } => {
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+                if target_host == self.local_host {
+                    return HandleResult::RemoteStepRequested {
+                        request_id,
+                        requester_host,
+                        reply_via: connection_peer,
+                        repo_identity,
+                        repo_path,
+                        step_offset,
+                        steps,
+                    };
+                }
+
+                let key = CommandReversePathKey { request_id, requester_host: requester_host.clone(), target_host: target_host.clone() };
+                let learned_at = self.next_route_epoch();
+                self.command_reverse_paths.insert(key, ReversePathHop {
+                    next_hop: connection_peer,
+                    next_hop_generation: connection_generation,
+                    learned_at,
+                });
+
+                let forwarded = RoutedPeerMessage::RemoteStepRequest {
+                    request_id,
+                    requester_host,
+                    target_host: target_host.clone(),
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    repo_identity,
+                    repo_path,
+                    step_offset,
+                    steps,
+                };
+                self.queue_send_to(&target_host, PeerWireMessage::Routed(forwarded));
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::RemoteStepEvent {
+                request_id,
+                requester_host,
+                responder_host,
+                remaining_hops,
+                batch_step_index,
+                batch_step_count,
+                description,
+                status,
+            } => {
+                let key = CommandReversePathKey { request_id, requester_host: requester_host.clone(), target_host: responder_host.clone() };
+
+                if requester_host == self.local_host {
+                    return HandleResult::RemoteStepEventReceived {
+                        request_id,
+                        responder_host,
+                        batch_step_index,
+                        batch_step_count,
+                        description,
+                        status,
+                    };
+                }
+
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+
+                let Some(reverse_hop) = self.command_reverse_paths.get(&key).cloned() else {
+                    return HandleResult::Ignored;
+                };
+                if !self.generation_is_current(&reverse_hop.next_hop, reverse_hop.next_hop_generation) {
+                    self.command_reverse_paths.remove(&key);
+                    return HandleResult::Ignored;
+                }
+
+                let forwarded = RoutedPeerMessage::RemoteStepEvent {
+                    request_id,
+                    requester_host,
+                    responder_host,
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    batch_step_index,
+                    batch_step_count,
+                    description,
+                    status,
+                };
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
+                    self.pending_sends.push(PendingPeerSend {
+                        target: reverse_hop.next_hop.clone(),
+                        sender,
+                        msg: PeerWireMessage::Routed(forwarded),
+                    });
+                }
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::RemoteStepResponse { request_id, requester_host, responder_host, remaining_hops, outcomes } => {
+                let key = CommandReversePathKey { request_id, requester_host: requester_host.clone(), target_host: responder_host.clone() };
+
+                if requester_host == self.local_host {
+                    return HandleResult::RemoteStepResponseReceived { request_id, responder_host, outcomes };
+                }
+
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+
+                let Some(reverse_hop) = self.command_reverse_paths.get(&key).cloned() else {
+                    return HandleResult::Ignored;
+                };
+                if !self.generation_is_current(&reverse_hop.next_hop, reverse_hop.next_hop_generation) {
+                    self.command_reverse_paths.remove(&key);
+                    return HandleResult::Ignored;
+                }
+
+                let forwarded = RoutedPeerMessage::RemoteStepResponse {
+                    request_id,
+                    requester_host,
+                    responder_host,
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    outcomes,
+                };
+                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
+                    self.pending_sends.push(PendingPeerSend {
+                        target: reverse_hop.next_hop.clone(),
+                        sender,
+                        msg: PeerWireMessage::Routed(forwarded),
+                    });
+                }
+                self.command_reverse_paths.remove(&key);
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::RemoteStepCancelRequest {
+                cancel_id,
+                requester_host,
+                target_host,
+                remaining_hops,
+                remote_step_request_id,
+            } => {
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+                if target_host == self.local_host {
+                    return HandleResult::RemoteStepCancelRequested {
+                        cancel_id,
+                        requester_host,
+                        reply_via: connection_peer,
+                        remote_step_request_id,
+                    };
+                }
+
+                let key = CommandReversePathKey {
+                    request_id: cancel_id,
+                    requester_host: requester_host.clone(),
+                    target_host: target_host.clone(),
+                };
+                let learned_at = self.next_route_epoch();
+                self.command_reverse_paths.insert(key, ReversePathHop {
+                    next_hop: connection_peer,
+                    next_hop_generation: connection_generation,
+                    learned_at,
+                });
+
+                let forwarded = RoutedPeerMessage::RemoteStepCancelRequest {
+                    cancel_id,
+                    requester_host,
+                    target_host: target_host.clone(),
+                    remaining_hops: remaining_hops.saturating_sub(1),
+                    remote_step_request_id,
+                };
+                self.queue_send_to(&target_host, PeerWireMessage::Routed(forwarded));
+                HandleResult::Ignored
+            }
+            RoutedPeerMessage::RemoteStepCancelResponse { cancel_id, requester_host, responder_host, remaining_hops, error } => {
+                let key = CommandReversePathKey {
+                    request_id: cancel_id,
+                    requester_host: requester_host.clone(),
+                    target_host: responder_host.clone(),
+                };
+
+                if requester_host == self.local_host {
+                    return HandleResult::RemoteStepCancelResponseReceived { cancel_id, responder_host, error };
+                }
+
+                if remaining_hops == 0 {
+                    return HandleResult::Ignored;
+                }
+
+                let Some(reverse_hop) = self.command_reverse_paths.get(&key).cloned() else {
+                    return HandleResult::Ignored;
+                };
+                if !self.generation_is_current(&reverse_hop.next_hop, reverse_hop.next_hop_generation) {
+                    self.command_reverse_paths.remove(&key);
+                    return HandleResult::Ignored;
+                }
+
+                let forwarded = RoutedPeerMessage::RemoteStepCancelResponse {
                     cancel_id,
                     requester_host,
                     responder_host,

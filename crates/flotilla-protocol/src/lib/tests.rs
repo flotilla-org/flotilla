@@ -430,3 +430,22 @@ fn message_peer_goodbye_roundtrip() {
 
     test_helpers::assert_json_roundtrip(&msg);
 }
+
+#[test]
+fn step_roundtrip_covers_command_values() {
+    let step = Step {
+        description: "Create workspace".to_string(),
+        host: StepHost::Remote(HostName::new("feta")),
+        action: StepAction::CreateWorkspaceFromPreparedTerminal {
+            target_host: HostName::new("feta"),
+            branch: "feat/x".to_string(),
+            checkout_path: ExecutionEnvironmentPath::new("/repo/wt-feat-x"),
+            attachable_set_id: Some(AttachableSetId::new("attachable-set")),
+            commands: vec![],
+        },
+    };
+    test_helpers::assert_roundtrip(&step);
+
+    let outcome = StepOutcome::Produced(CommandValue::CheckoutPathResolved { path: PathBuf::from("/repo/wt-feat-x") });
+    test_helpers::assert_roundtrip(&outcome);
+}
