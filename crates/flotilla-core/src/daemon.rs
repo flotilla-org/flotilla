@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use flotilla_protocol::{
-    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoInfo, RepoProvidersResponse,
-    RepoSelector, RepoSnapshot, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
-};
+use flotilla_protocol::{Command, DaemonEvent, RepoInfo, RepoSelector, RepoSnapshot, StatusResponse, StreamKey, TopologyResponse};
 use tokio::sync::broadcast;
 
 /// The boundary between daemon and client.
@@ -43,24 +40,6 @@ pub trait DaemonHandle: Send + Sync {
 
     /// High-level status: repos, health, counts.
     async fn get_status(&self) -> Result<StatusResponse, String>;
-
-    /// Repo detail: work items, provider health, errors.
-    async fn get_repo_detail(&self, repo: &RepoSelector) -> Result<RepoDetailResponse, String>;
-
-    /// Repo discovery: host/repo assertions, providers, unmet requirements.
-    async fn get_repo_providers(&self, repo: &RepoSelector) -> Result<RepoProvidersResponse, String>;
-
-    /// Repo work items.
-    async fn get_repo_work(&self, repo: &RepoSelector) -> Result<RepoWorkResponse, String>;
-
-    /// Host list with connection and summary data.
-    async fn list_hosts(&self) -> Result<HostListResponse, String>;
-
-    /// Detailed host status.
-    async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String>;
-
-    /// Host-level inventory and providers.
-    async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String>;
 
     /// Multi-host routing view.
     async fn get_topology(&self) -> Result<TopologyResponse, String>;

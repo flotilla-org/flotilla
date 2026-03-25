@@ -267,24 +267,18 @@ async fn dispatch_host_query_methods_round_trip() {
         }])
         .await;
 
-    let hosts = dispatch_request_test(&daemon, 40, Request::ListHosts).await;
-    match ok_response(hosts, 40) {
-        Response::ListHosts(parsed) => assert!(parsed.hosts.iter().any(|entry| entry.host == *daemon.host_name())),
-        other => panic!("expected host list response, got {:?}", other),
-    }
+    // Host queries now go through execute() via CommandAction::Query* variants.
+    // Test the internal methods directly to validate the data path.
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
+    assert!(hosts.hosts.iter().any(|entry| entry.host == *daemon.host_name()));
 
-    let status = dispatch_request_test(&daemon, 41, Request::GetHostStatus { host: local_host }).await;
-    match ok_response(status, 41) {
-        Response::GetHostStatus(parsed) => assert!(parsed.is_local),
-        other => panic!("expected host status response, got {:?}", other),
-    }
+    let status = daemon.get_host_status_internal(&local_host).await.expect("host status");
+    assert!(status.is_local);
 
-    let providers = dispatch_request_test(&daemon, 42, Request::GetHostProviders { host: daemon.host_name().to_string() }).await;
-    match ok_response(providers, 42) {
-        Response::GetHostProviders(parsed) => assert_eq!(parsed.summary.host_name, *daemon.host_name()),
-        other => panic!("expected host providers response, got {:?}", other),
-    }
+    let providers = daemon.get_host_providers_internal(&daemon.host_name().to_string()).await.expect("host providers");
+    assert_eq!(providers.summary.host_name, *daemon.host_name());
 
+    // Topology still has a dedicated Request variant.
     let topology = dispatch_request_test(&daemon, 43, Request::GetTopology).await;
     match ok_response(topology, 43) {
         Response::GetTopology(parsed) => {
@@ -306,29 +300,23 @@ async fn dispatch_repo_query_methods_round_trip() {
 
     let repo_name = repo.file_name().expect("repo file name").to_string_lossy().to_string();
 
+    // GetStatus still has a dedicated Request variant.
     let status = dispatch_request_test(&daemon, 1, Request::GetStatus).await;
     match ok_response(status, 1) {
         Response::GetStatus(parsed) => assert!(parsed.repos.iter().any(|entry| entry.path == repo)),
         other => panic!("expected status response, got {:?}", other),
     }
 
-    let detail = dispatch_request_test(&daemon, 2, Request::GetRepoDetail { slug: repo_name.clone() }).await;
-    match ok_response(detail, 2) {
-        Response::GetRepoDetail(parsed) => assert_eq!(parsed.path, repo),
-        other => panic!("expected repo detail response, got {:?}", other),
-    }
+    // Repo queries now go through execute() via CommandAction::Query* variants.
+    // Test the internal methods directly to validate the data path.
+    let detail = daemon.get_repo_detail_internal(&RepoSelector::Query(repo_name.clone())).await.expect("repo detail");
+    assert_eq!(detail.path, repo);
 
-    let providers = dispatch_request_test(&daemon, 3, Request::GetRepoProviders { slug: repo_name.clone() }).await;
-    match ok_response(providers, 3) {
-        Response::GetRepoProviders(parsed) => assert_eq!(parsed.path, repo),
-        other => panic!("expected repo providers response, got {:?}", other),
-    }
+    let providers = daemon.get_repo_providers_internal(&RepoSelector::Query(repo_name.clone())).await.expect("repo providers");
+    assert_eq!(providers.path, repo);
 
-    let work = dispatch_request_test(&daemon, 4, Request::GetRepoWork { slug: repo_name }).await;
-    match ok_response(work, 4) {
-        Response::GetRepoWork(parsed) => assert_eq!(parsed.path, repo),
-        other => panic!("expected repo work response, got {:?}", other),
-    }
+    let work = daemon.get_repo_work_internal(&RepoSelector::Query(repo_name)).await.expect("repo work");
+    assert_eq!(work.path, repo);
 }
 
 #[tokio::test]
@@ -458,7 +446,7 @@ async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
 
     sync_peer_query_state(&peer_manager, &daemon).await;
 
-    let hosts = daemon.list_hosts().await.expect("list hosts after sync");
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts after sync");
     assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::new("remote") && entry.has_summary));
 
     let topology = daemon.get_topology().await.expect("topology after sync");

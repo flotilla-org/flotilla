@@ -86,36 +86,6 @@ impl<'a> RequestDispatcher<'a> {
                 Err(e) => Message::error_response(id, e),
             },
 
-            Request::GetRepoDetail { slug } => match self.daemon.get_repo_detail(&RepoSelector::Query(slug)).await {
-                Ok(detail) => Message::ok_response(id, Response::GetRepoDetail(detail)),
-                Err(e) => Message::error_response(id, e),
-            },
-
-            Request::GetRepoProviders { slug } => match self.daemon.get_repo_providers(&RepoSelector::Query(slug)).await {
-                Ok(providers) => Message::ok_response(id, Response::GetRepoProviders(providers)),
-                Err(e) => Message::error_response(id, e),
-            },
-
-            Request::GetRepoWork { slug } => match self.daemon.get_repo_work(&RepoSelector::Query(slug)).await {
-                Ok(work) => Message::ok_response(id, Response::GetRepoWork(work)),
-                Err(e) => Message::error_response(id, e),
-            },
-
-            Request::ListHosts => match self.daemon.list_hosts().await {
-                Ok(hosts) => Message::ok_response(id, Response::ListHosts(hosts)),
-                Err(e) => Message::error_response(id, e),
-            },
-
-            Request::GetHostStatus { host } => match self.daemon.get_host_status(&host).await {
-                Ok(status) => Message::ok_response(id, Response::GetHostStatus(status)),
-                Err(e) => Message::error_response(id, e),
-            },
-
-            Request::GetHostProviders { host } => match self.daemon.get_host_providers(&host).await {
-                Ok(providers) => Message::ok_response(id, Response::GetHostProviders(providers)),
-                Err(e) => Message::error_response(id, e),
-            },
-
             Request::GetTopology => match self.daemon.get_topology().await {
                 Ok(topology) => Message::ok_response(id, Response::GetTopology(topology)),
                 Err(e) => Message::error_response(id, e),

@@ -1499,6 +1499,115 @@ impl InProcessDaemon {
 
         Ok(())
     }
+
+    // --- Internal query helpers (formerly DaemonHandle trait methods) ---
+
+    pub async fn get_repo_detail_internal(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
+        let repo_path = self.resolve_repo_selector(repo).await?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
+        Ok(RepoDetailResponse {
+            path: state.preferred_path().to_path_buf(),
+            slug: state.slug().map(str::to_string),
+            provider_health: snapshot.provider_health.clone(),
+            work_items: snapshot.work_items.clone(),
+            errors: snapshot.errors.clone(),
+        })
+    }
+
+    pub async fn get_repo_providers_internal(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
+        let repo_path = self.resolve_repo_selector(repo).await?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
+
+        let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+        let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+
+        let provider_infos = state
+            .preferred_root()
+            .model
+            .registry
+            .provider_infos()
+            .into_iter()
+            .map(|(category, name)| {
+                let healthy = snapshot.provider_health.get(&category).and_then(|providers| providers.get(&name)).copied().unwrap_or(true);
+                ProviderInfo { category, name, healthy }
+            })
+            .collect();
+
+        let unmet_requirements =
+            state.unmet().iter().map(|(factory, req)| crate::convert::unmet_requirement_to_proto(factory, req)).collect();
+
+        Ok(RepoProvidersResponse {
+            path: state.preferred_path().to_path_buf(),
+            slug: state.slug().map(str::to_string),
+            host_discovery,
+            repo_discovery,
+            providers: provider_infos,
+            unmet_requirements,
+        })
+    }
+
+    pub async fn get_repo_work_internal(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
+        let repo_path = self.resolve_repo_selector(repo).await?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
+            Some(s) => std::borrow::Cow::Borrowed(s),
+            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name),
+                state.seq(),
+                peer_overlay.as_deref(),
+            )),
+        };
+        Ok(RepoWorkResponse {
+            path: state.preferred_path().to_path_buf(),
+            slug: state.slug().map(str::to_string),
+            work_items: snapshot.work_items.clone(),
+        })
+    }
+
+    pub async fn list_hosts_internal(&self) -> Result<HostListResponse, String> {
+        let local_counts = self.local_host_counts().await;
+        let remote_counts = self.remote_host_counts().await;
+        Ok(self.host_registry.list_hosts(local_counts, &remote_counts).await)
+    }
+
+    pub async fn get_host_status_internal(&self, host: &str) -> Result<HostStatusResponse, String> {
+        let local_counts = self.local_host_counts().await;
+        let remote_counts = self.remote_host_counts().await;
+        self.host_registry.get_host_status(host, local_counts, &remote_counts).await
+    }
+
+    pub async fn get_host_providers_internal(&self, host: &str) -> Result<HostProvidersResponse, String> {
+        let remote_counts = self.remote_host_counts().await;
+        self.host_registry.get_host_providers(host, &remote_counts).await
+    }
 }
 
 #[async_trait]
@@ -1584,6 +1693,137 @@ impl DaemonHandle for InProcessDaemon {
         }
 
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+
+        // Query commands: execute inline, emit lifecycle events with the result.
+        match &command.action {
+            flotilla_protocol::CommandAction::QueryRepoDetail { ref repo } => {
+                let result = match self.get_repo_detail_internal(repo).await {
+                    Ok(detail) => flotilla_protocol::CommandValue::RepoDetail(Box::new(detail)),
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    description: command.description().to_string(),
+                });
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    result,
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::QueryRepoProviders { ref repo } => {
+                let result = match self.get_repo_providers_internal(repo).await {
+                    Ok(providers) => flotilla_protocol::CommandValue::RepoProviders(Box::new(providers)),
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    description: command.description().to_string(),
+                });
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    result,
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::QueryRepoWork { ref repo } => {
+                let result = match self.get_repo_work_internal(repo).await {
+                    Ok(work) => flotilla_protocol::CommandValue::RepoWork(Box::new(work)),
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    description: command.description().to_string(),
+                });
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    result,
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::QueryHostList {} => {
+                let result = match self.list_hosts_internal().await {
+                    Ok(hosts) => flotilla_protocol::CommandValue::HostList(Box::new(hosts)),
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    description: command.description().to_string(),
+                });
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    result,
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::QueryHostStatus { ref target_host } => {
+                let result = match self.get_host_status_internal(target_host).await {
+                    Ok(status) => flotilla_protocol::CommandValue::HostStatus(Box::new(status)),
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    description: command.description().to_string(),
+                });
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    result,
+                });
+                return Ok(id);
+            }
+            flotilla_protocol::CommandAction::QueryHostProviders { ref target_host } => {
+                let result = match self.get_host_providers_internal(target_host).await {
+                    Ok(providers) => flotilla_protocol::CommandValue::HostProviders(Box::new(providers)),
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                };
+                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    description: command.description().to_string(),
+                });
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    host: self.host_name.clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
+                    repo: PathBuf::new(),
+                    result,
+                });
+                return Ok(id);
+            }
+            _ => {}
+        }
 
         match &command.action {
             flotilla_protocol::CommandAction::TrackRepoPath { path } => {
@@ -1896,113 +2136,6 @@ impl DaemonHandle for InProcessDaemon {
             });
         }
         Ok(StatusResponse { repos: summaries })
-    }
-
-    async fn get_repo_detail(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
-        let repo_path = self.resolve_repo_selector(repo).await?;
-        let identity =
-            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
-        let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
-            Some(s) => std::borrow::Cow::Borrowed(s),
-            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name),
-                state.seq(),
-                peer_overlay.as_deref(),
-            )),
-        };
-        Ok(RepoDetailResponse {
-            path: state.preferred_path().to_path_buf(),
-            slug: state.slug().map(str::to_string),
-            provider_health: snapshot.provider_health.clone(),
-            work_items: snapshot.work_items.clone(),
-            errors: snapshot.errors.clone(),
-        })
-    }
-
-    async fn get_repo_providers(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
-        let repo_path = self.resolve_repo_selector(repo).await?;
-        let identity =
-            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
-        let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
-            Some(s) => std::borrow::Cow::Borrowed(s),
-            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name),
-                state.seq(),
-                peer_overlay.as_deref(),
-            )),
-        };
-
-        let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
-        let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
-
-        let provider_infos = state
-            .preferred_root()
-            .model
-            .registry
-            .provider_infos()
-            .into_iter()
-            .map(|(category, name)| {
-                let healthy = snapshot.provider_health.get(&category).and_then(|providers| providers.get(&name)).copied().unwrap_or(true);
-                ProviderInfo { category, name, healthy }
-            })
-            .collect();
-
-        let unmet_requirements =
-            state.unmet().iter().map(|(factory, req)| crate::convert::unmet_requirement_to_proto(factory, req)).collect();
-
-        Ok(RepoProvidersResponse {
-            path: state.preferred_path().to_path_buf(),
-            slug: state.slug().map(str::to_string),
-            host_discovery,
-            repo_discovery,
-            providers: provider_infos,
-            unmet_requirements,
-        })
-    }
-
-    async fn get_repo_work(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
-        let repo_path = self.resolve_repo_selector(repo).await?;
-        let identity =
-            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
-        let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
-            Some(s) => std::borrow::Cow::Borrowed(s),
-            None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name),
-                state.seq(),
-                peer_overlay.as_deref(),
-            )),
-        };
-        Ok(RepoWorkResponse {
-            path: state.preferred_path().to_path_buf(),
-            slug: state.slug().map(str::to_string),
-            work_items: snapshot.work_items.clone(),
-        })
-    }
-
-    async fn list_hosts(&self) -> Result<HostListResponse, String> {
-        let local_counts = self.local_host_counts().await;
-        let remote_counts = self.remote_host_counts().await;
-        Ok(self.host_registry.list_hosts(local_counts, &remote_counts).await)
-    }
-
-    async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String> {
-        let local_counts = self.local_host_counts().await;
-        let remote_counts = self.remote_host_counts().await;
-        self.host_registry.get_host_status(host, local_counts, &remote_counts).await
-    }
-
-    async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String> {
-        let remote_counts = self.remote_host_counts().await;
-        self.host_registry.get_host_providers(host, &remote_counts).await
     }
 
     async fn get_topology(&self) -> Result<TopologyResponse, String> {

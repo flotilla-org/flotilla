@@ -232,12 +232,12 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::Error { message } => format!("error: {message}"),
         CommandValue::Cancelled => "cancelled".to_string(),
         CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => "internal step result".to_string(),
-        CommandValue::RepoDetail(_)
-        | CommandValue::RepoProviders(_)
-        | CommandValue::RepoWork(_)
-        | CommandValue::HostList(_)
-        | CommandValue::HostStatus(_)
-        | CommandValue::HostProviders(_) => "query result".to_string(),
+        CommandValue::RepoDetail(detail) => format_repo_detail_human(detail),
+        CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
+        CommandValue::RepoWork(work) => format_repo_work_human(work),
+        CommandValue::HostList(hosts) => format_host_list_human(hosts),
+        CommandValue::HostStatus(status) => format_host_status_human(status),
+        CommandValue::HostProviders(providers) => format_host_providers_human(providers),
     }
 }
 
@@ -314,66 +314,6 @@ pub async fn run_status(socket_path: &Path, format: OutputFormat) -> Result<(), 
     let output = match format {
         OutputFormat::Human => format_status_response_human(&status),
         OutputFormat::Json => flotilla_protocol::output::json_pretty(&status),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_repo_detail(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let detail = daemon.get_repo_detail(&flotilla_protocol::RepoSelector::Query(slug.to_string())).await?;
-    let output = match format {
-        OutputFormat::Human => format_repo_detail_human(&detail),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&detail),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_repo_providers(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let providers = daemon.get_repo_providers(&flotilla_protocol::RepoSelector::Query(slug.to_string())).await?;
-    let output = match format {
-        OutputFormat::Human => format_repo_providers_human(&providers),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&providers),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_repo_work(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let work = daemon.get_repo_work(&flotilla_protocol::RepoSelector::Query(slug.to_string())).await?;
-    let output = match format {
-        OutputFormat::Human => format_repo_work_human(&work),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&work),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_host_list(daemon: &dyn DaemonHandle, format: OutputFormat) -> Result<(), String> {
-    let hosts = daemon.list_hosts().await?;
-    let output = match format {
-        OutputFormat::Human => format_host_list_human(&hosts),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&hosts),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_host_status(daemon: &dyn DaemonHandle, host: &str, format: OutputFormat) -> Result<(), String> {
-    let status = daemon.get_host_status(host).await?;
-    let output = match format {
-        OutputFormat::Human => format_host_status_human(&status),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&status),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_host_providers(daemon: &dyn DaemonHandle, host: &str, format: OutputFormat) -> Result<(), String> {
-    let providers = daemon.get_host_providers(host).await?;
-    let output = match format {
-        OutputFormat::Human => format_host_providers_human(&providers),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&providers),
     };
     print!("{output}");
     Ok(())

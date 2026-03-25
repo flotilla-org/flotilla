@@ -327,7 +327,7 @@ async fn list_hosts_includes_local_and_configured_disconnected_peers() {
 
     daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
 
-    let hosts = daemon.list_hosts().await.expect("list hosts");
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
 
     assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::local() && entry.is_local));
     assert!(hosts.hosts.iter().any(|entry| {
@@ -345,11 +345,11 @@ async fn get_host_providers_returns_local_summary_and_errors_for_unknown_remote_
     daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
 
     let local_host = daemon.host_name().to_string();
-    let local = daemon.get_host_providers(&local_host).await.expect("local host providers should resolve");
+    let local = daemon.get_host_providers_internal(&local_host).await.expect("local host providers should resolve");
     assert_eq!(local.host, *daemon.host_name());
     assert_eq!(local.summary.host_name, *daemon.host_name());
 
-    let err = daemon.get_host_providers("remote").await.expect_err("remote host without summary should error");
+    let err = daemon.get_host_providers_internal("remote").await.expect_err("remote host without summary should error");
     assert!(err.contains("summary"), "unexpected error: {err}");
 }
 
@@ -383,7 +383,7 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
     daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("remote"), status: PeerConnectionState::Connected });
     daemon.set_peer_providers(&repo, vec![(HostName::new("remote"), peer_data)], 0).await;
 
-    let hosts = daemon.list_hosts().await.expect("list hosts");
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     let remote = hosts.hosts.iter().find(|entry| entry.host == HostName::new("remote")).expect("remote host entry");
     assert_eq!(remote.repo_count, 1);
     assert!(remote.work_item_count >= 1, "remote overlay should contribute work items");
@@ -941,7 +941,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
     daemon.set_peer_providers(&repo, vec![(transient_host.clone(), peer_data)], 0).await;
     let _ = recv_event(&mut rx).await;
 
-    let hosts = daemon.list_hosts().await.expect("list hosts");
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(hosts.hosts.iter().any(|entry| entry.host == transient_host), "transient host should be visible while backed by state");
 
     daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Disconnected).await;
@@ -959,7 +959,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
     .expect("timeout waiting for host removal");
     assert!(removed >= 1, "host removal should carry a stream seq");
 
-    let hosts = daemon.list_hosts().await.expect("list hosts");
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(
         !hosts.hosts.iter().any(|entry| entry.host == transient_host),
         "stale non-configured host should be pruned once summary, connection, and overlay data are gone"
@@ -2029,7 +2029,7 @@ async fn get_repo_work_returns_work_items() {
     trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
-    let work = daemon.get_repo_work(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_work failed");
+    let work = daemon.get_repo_work_internal(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_work failed");
     assert_eq!(work.path, repo);
     // Work items may or may not be present depending on repo state, but the call should succeed
 }
@@ -2051,7 +2051,7 @@ async fn get_repo_detail_returns_provider_health_and_errors() {
     trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
-    let detail = daemon.get_repo_detail(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_detail failed");
+    let detail = daemon.get_repo_detail_internal(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_detail failed");
 
     assert_eq!(detail.path, repo);
     let change_request_health = detail.provider_health.get("change_request").expect("change_request health should be present");
@@ -2067,7 +2067,8 @@ async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery(
     let (_temp, repo, daemon) = daemon_for_plain_dir().await;
 
     let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
-    let providers = daemon.get_repo_providers(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_providers failed");
+    let providers =
+        daemon.get_repo_providers_internal(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_providers failed");
 
     assert_eq!(providers.path, repo);
     assert!(
