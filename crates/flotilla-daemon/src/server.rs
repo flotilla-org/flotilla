@@ -20,7 +20,6 @@ use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
 use flotilla_protocol::{ConfigLabel, EnvironmentId, HostName, Message};
-use self::environment_sockets::EnvironmentSocketRegistry;
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
     net::UnixListener,
@@ -30,6 +29,7 @@ use tracing::{error, info, warn};
 
 use self::{
     client_connection::ClientConnection,
+    environment_sockets::EnvironmentSocketRegistry,
     peer_connection::PeerConnection,
     peer_runtime::PeerRuntime,
     remote_commands::{ForwardedCommandMap, PendingRemoteCancelMap, PendingRemoteCommandMap, RemoteCommandRouter},

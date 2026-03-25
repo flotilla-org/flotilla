@@ -24,7 +24,8 @@ mod tests {
 
     #[tokio::test]
     async fn write_message_line_produces_valid_json_line() {
-        let msg = Message::Hello { protocol_version: 1, host_name: HostName::new("test"), session_id: uuid::Uuid::nil(), environment_id: None };
+        let msg =
+            Message::Hello { protocol_version: 1, host_name: HostName::new("test"), session_id: uuid::Uuid::nil(), environment_id: None };
         let mut buf = Vec::new();
         write_message_line(&mut buf, &msg).await.expect("write should succeed");
 

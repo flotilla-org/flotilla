@@ -1293,14 +1293,13 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
     let hello_back: Message = serde_json::from_str(&line).expect("parse hello");
     assert!(matches!(hello_back, Message::Hello { .. }), "expected hello response");
 
-    let summary =
-        HostSummary {
-            host_name: remote_host.clone(),
-            system: Default::default(),
-            inventory: Default::default(),
-            providers: vec![],
-            environments: vec![],
-        };
+    let summary = HostSummary {
+        host_name: remote_host.clone(),
+        system: Default::default(),
+        inventory: Default::default(),
+        providers: vec![],
+        environments: vec![],
+    };
 
     flotilla_protocol::framing::write_message_line(&mut writer, &Message::Peer(Box::new(PeerWireMessage::HostSummary(summary.clone()))))
         .await
