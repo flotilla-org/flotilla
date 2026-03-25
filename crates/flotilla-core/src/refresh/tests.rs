@@ -444,6 +444,7 @@ fn project_attachable_data_populates_sets_and_ids() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        environment_id: None,
     });
     pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
 
@@ -613,6 +614,7 @@ fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        environment_id: None,
     });
 
     let registry = ProviderRegistry::new();
@@ -644,6 +646,7 @@ fn project_attachable_data_set_appears_without_terminal_scan() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        environment_id: None,
     });
 
     let registry = ProviderRegistry::new();

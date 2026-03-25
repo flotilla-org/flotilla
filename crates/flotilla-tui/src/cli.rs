@@ -232,6 +232,12 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::Error { message } => format!("error: {message}"),
         CommandValue::Cancelled => "cancelled".to_string(),
         CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => "internal step result".to_string(),
+        CommandValue::RepoDetail(detail) => format_repo_detail_human(detail),
+        CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
+        CommandValue::RepoWork(work) => format_repo_work_human(work),
+        CommandValue::HostList(hosts) => format_host_list_human(hosts),
+        CommandValue::HostStatus(status) => format_host_status_human(status),
+        CommandValue::HostProviders(providers) => format_host_providers_human(providers),
     }
 }
 
@@ -257,10 +263,20 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             format!("[repo]     {}: untracked", repo_name(path))
         }
         DaemonEvent::CommandStarted { repo, description, .. } => {
-            format!("[command]  {}: started \"{}\"", repo_name(repo), description)
+            if repo.as_os_str().is_empty() {
+                // Query commands have no repo context — show description only
+                format!("[query]    {description}")
+            } else {
+                format!("[command]  {}: started \"{}\"", repo_name(repo), description)
+            }
         }
         DaemonEvent::CommandFinished { repo, result, .. } => {
-            format!("[command]  {}: finished \u{2192} {}", repo_name(repo), format_command_result(result))
+            if repo.as_os_str().is_empty() {
+                // Query commands have no repo context — show result directly
+                format_command_result(result)
+            } else {
+                format!("[command]  {}: finished \u{2192} {}", repo_name(repo), format_command_result(result))
+            }
         }
         DaemonEvent::CommandStepUpdate { repo, description, step_index, step_count, .. } => {
             format!("[step]     {}: {} ({}/{})", repo_name(repo), description, step_index + 1, step_count)
@@ -308,66 +324,6 @@ pub async fn run_status(socket_path: &Path, format: OutputFormat) -> Result<(), 
     let output = match format {
         OutputFormat::Human => format_status_response_human(&status),
         OutputFormat::Json => flotilla_protocol::output::json_pretty(&status),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_repo_detail(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let detail = daemon.get_repo_detail(&flotilla_protocol::RepoSelector::Query(slug.to_string())).await?;
-    let output = match format {
-        OutputFormat::Human => format_repo_detail_human(&detail),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&detail),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_repo_providers(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let providers = daemon.get_repo_providers(&flotilla_protocol::RepoSelector::Query(slug.to_string())).await?;
-    let output = match format {
-        OutputFormat::Human => format_repo_providers_human(&providers),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&providers),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_repo_work(daemon: &dyn DaemonHandle, slug: &str, format: OutputFormat) -> Result<(), String> {
-    let work = daemon.get_repo_work(&flotilla_protocol::RepoSelector::Query(slug.to_string())).await?;
-    let output = match format {
-        OutputFormat::Human => format_repo_work_human(&work),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&work),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_host_list(daemon: &dyn DaemonHandle, format: OutputFormat) -> Result<(), String> {
-    let hosts = daemon.list_hosts().await?;
-    let output = match format {
-        OutputFormat::Human => format_host_list_human(&hosts),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&hosts),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_host_status(daemon: &dyn DaemonHandle, host: &str, format: OutputFormat) -> Result<(), String> {
-    let status = daemon.get_host_status(host).await?;
-    let output = match format {
-        OutputFormat::Human => format_host_status_human(&status),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&status),
-    };
-    print!("{output}");
-    Ok(())
-}
-
-pub async fn run_host_providers(daemon: &dyn DaemonHandle, host: &str, format: OutputFormat) -> Result<(), String> {
-    let providers = daemon.get_host_providers(host).await?;
-    let output = match format {
-        OutputFormat::Human => format_host_providers_human(&providers),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&providers),
     };
     print!("{output}");
     Ok(())
@@ -537,14 +493,15 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
 }
 
 pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {
+    let is_query = command.action.is_query();
     let mut rx = daemon.subscribe();
     let command_id = daemon.execute(command).await?;
 
     loop {
         match rx.recv().await {
-            Ok(event @ DaemonEvent::CommandStarted { command_id: id, .. }) if id == command_id => {
-                if matches!(format, OutputFormat::Human) {
-                    println!("{}", format_event_human(&event));
+            Ok(ref event @ DaemonEvent::CommandStarted { command_id: id, .. }) if id == command_id => {
+                if matches!(format, OutputFormat::Human) && !is_query {
+                    println!("{}", format_event_human(event));
                 }
             }
             Ok(event @ DaemonEvent::CommandStepUpdate { command_id: id, .. }) if id == command_id => {
@@ -555,7 +512,11 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
             Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
                 match format {
                     OutputFormat::Human => {
-                        println!("{}", format_event_human(event));
+                        if is_query {
+                            print!("{}", format_command_result(result));
+                        } else {
+                            println!("{}", format_event_human(event));
+                        }
                     }
                     OutputFormat::Json => {
                         println!("{}", flotilla_protocol::output::json_pretty(&result));

@@ -67,6 +67,7 @@ impl MockCheckoutManager {
                 last_commit: None,
                 correlation_keys: vec![],
                 association_keys: vec![],
+                environment_id: None,
             })))),
             remove_result: tokio::sync::Mutex::new(Some(Ok(()))),
         }

@@ -3,6 +3,7 @@ pub mod cleat;
 pub mod cmux;
 pub mod codex;
 pub mod cursor;
+pub mod docker;
 pub mod git;
 pub mod github;
 pub mod passthrough;
@@ -49,6 +50,7 @@ impl FactoryRegistry {
             // Priority: inside-cmux > inside-zellij > inside-tmux > cmux-binary-fallback
             workspace_managers: workspace_factories(),
             terminal_pools: terminal_pool_factories(),
+            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
         }
     }
 
@@ -62,6 +64,7 @@ impl FactoryRegistry {
             ai_utilities: vec![],
             workspace_managers: workspace_factories(),
             terminal_pools: terminal_pool_factories(),
+            environment_providers: vec![],
         }
     }
 }

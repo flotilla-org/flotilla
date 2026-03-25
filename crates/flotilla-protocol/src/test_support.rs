@@ -58,6 +58,7 @@ impl TestCheckout {
             last_commit: None,
             correlation_keys: self.correlation_keys,
             association_keys: vec![],
+            environment_id: None,
         }
     }
 }
@@ -139,6 +140,7 @@ impl TestSession {
             provider_name: String::new(),
             provider_display_name: String::new(),
             item_noun: String::new(),
+            environment_id: None,
         }
     }
 }

@@ -130,6 +130,7 @@ mod tests {
                 last_commit: None,
                 correlation_keys: vec![],
                 association_keys: vec![],
+                environment_id: None,
             }),
         };
         assert_json_roundtrip(&change);

@@ -195,6 +195,7 @@ impl super::CloudAgentService for CursorCodingAgent {
                     provider_name: provider_name.clone(),
                     provider_display_name: "Cursor".into(),
                     item_noun: "Agent".into(),
+                    environment_id: None,
                 })
             })
             .collect())

@@ -969,6 +969,7 @@ fn group_work_items_sessions_sorted_by_updated_at_descending() {
         provider_name: String::new(),
         provider_display_name: String::new(),
         item_noun: String::new(),
+        environment_id: None,
     });
     providers.sessions.insert("s-new".to_string(), CloudAgentSession {
         title: "New".to_string(),
@@ -979,6 +980,7 @@ fn group_work_items_sessions_sorted_by_updated_at_descending() {
         provider_name: String::new(),
         provider_display_name: String::new(),
         item_noun: String::new(),
+        environment_id: None,
     });
     providers.sessions.insert("s-mid".to_string(), CloudAgentSession {
         title: "Mid".to_string(),
@@ -989,6 +991,7 @@ fn group_work_items_sessions_sorted_by_updated_at_descending() {
         provider_name: String::new(),
         provider_display_name: String::new(),
         item_noun: String::new(),
+        environment_id: None,
     });
 
     let labels = default_labels();
@@ -1015,6 +1018,7 @@ fn group_work_items_sessions_grouped_by_provider_then_time() {
         provider_name: "claude".to_string(),
         provider_display_name: "Claude".to_string(),
         item_noun: "Agent".to_string(),
+        environment_id: None,
     });
     providers.sessions.insert("s-codex-new".to_string(), CloudAgentSession {
         title: "Codex New".to_string(),
@@ -1025,6 +1029,7 @@ fn group_work_items_sessions_grouped_by_provider_then_time() {
         provider_name: "codex".to_string(),
         provider_display_name: "Codex".to_string(),
         item_noun: "Task".to_string(),
+        environment_id: None,
     });
     providers.sessions.insert("s-claude-new".to_string(), CloudAgentSession {
         title: "Claude New".to_string(),
@@ -1035,6 +1040,7 @@ fn group_work_items_sessions_grouped_by_provider_then_time() {
         provider_name: "claude".to_string(),
         provider_display_name: "Claude".to_string(),
         item_noun: "Agent".to_string(),
+        environment_id: None,
     });
 
     let labels = default_labels();
@@ -1110,6 +1116,7 @@ fn test_cloud_agent_session(status: flotilla_protocol::SessionStatus) -> flotill
         provider_name: String::new(),
         provider_display_name: String::new(),
         item_noun: String::new(),
+        environment_id: None,
     }
 }
 

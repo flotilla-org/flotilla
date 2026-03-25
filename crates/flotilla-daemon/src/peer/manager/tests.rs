@@ -37,6 +37,7 @@ fn sample_host_summary_for(name: &str) -> flotilla_protocol::HostSummary {
         },
         inventory: flotilla_protocol::ToolInventory::default(),
         providers: vec![],
+        environments: vec![],
     }
 }
 

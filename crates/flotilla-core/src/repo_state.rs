@@ -340,6 +340,7 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            environment_id: None,
         });
 
         let entry = state.record_delta(&new_providers, &HashMap::new(), &[], vec![]);
@@ -452,6 +453,7 @@ mod tests {
                     last_commit: None,
                     correlation_keys: vec![],
                     association_keys: vec![],
+                    environment_id: None,
                 },
             );
             state.record_delta(&providers, &HashMap::new(), &[], vec![]);
@@ -494,6 +496,7 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            environment_id: None,
         });
 
         state.record_delta(&new_providers, &new_health, &new_errors, vec![]);

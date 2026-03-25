@@ -4,9 +4,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use flotilla_protocol::{arg::flatten, HostName, TerminalStatus};
+use flotilla_protocol::{arg::flatten, EnvironmentId, HostName, TerminalStatus};
 
 use super::{
+    environment::{DockerEnvironmentHopResolver, EnvironmentHopResolver, NoopEnvironmentHopResolver},
     remote::{RemoteHopResolver, SshRemoteHopResolver},
     resolver::{AlwaysSendKeys, AlwaysWrap, CombineStrategy, HopResolver},
     terminal::TerminalHopResolver,
@@ -78,9 +79,10 @@ fn flatten_actions(actions: &[ResolvedAction]) -> Vec<String> {
 
 // ── CombineStrategy tests ───────────────────────────────────────────
 
-fn all_hop_variants() -> [Hop; 3] {
+fn all_hop_variants() -> [Hop; 4] {
     [
         Hop::RemoteToHost { host: HostName::new("gouda") },
+        Hop::EnterEnvironment { env_id: EnvironmentId::new("env-1"), provider: "docker".into() },
         Hop::AttachTerminal { attachable_id: crate::attachable::AttachableId::new("sess-1") },
         Hop::RunCommand { command: vec![super::Arg::Literal("echo".into())] },
     ]
@@ -739,7 +741,8 @@ impl TerminalHopResolver for MockTerminalHopResolver {
 fn mock_hop_resolver(strategy: Arc<dyn CombineStrategy>) -> (HopResolver, Arc<MockRemoteHopResolver>, Arc<MockTerminalHopResolver>) {
     let remote = Arc::new(MockRemoteHopResolver::new());
     let terminal = Arc::new(MockTerminalHopResolver::new());
-    let resolver = HopResolver { remote: remote.clone(), terminal: terminal.clone(), strategy };
+    let environment: Arc<dyn EnvironmentHopResolver> = Arc::new(NoopEnvironmentHopResolver);
+    let resolver = HopResolver { remote: remote.clone(), environment, terminal: terminal.clone(), strategy };
     (resolver, remote, terminal)
 }
 
@@ -1037,7 +1040,8 @@ fn e2e_resolve(strategy: Arc<dyn CombineStrategy>, target: &str, cleat_args: &[A
     } else {
         (Arc::new(test_resolver_no_multiplex()), Arc::new(super::terminal::NoopTerminalHopResolver))
     };
-    let hop_resolver = HopResolver { remote, terminal, strategy };
+    let environment: Arc<dyn EnvironmentHopResolver> = Arc::new(NoopEnvironmentHopResolver);
+    let hop_resolver = HopResolver { remote, terminal, environment, strategy };
     let mut context = ResolutionContext {
         current_host: local_host,
         current_environment: None,
@@ -1089,4 +1093,177 @@ fn snapshot_e2e_remote_workspace_send_keys() {
 
     let flattened = flatten_actions(&resolved.0);
     insta::assert_debug_snapshot!("e2e_remote_send_keys_flattened", &flattened);
+}
+
+// ── DockerEnvironmentHopResolver tests ────────────────────────────────
+
+fn docker_env_resolver(containers: &[(&str, &str)]) -> DockerEnvironmentHopResolver {
+    let map = containers.iter().map(|(id, name)| (EnvironmentId::new(*id), name.to_string())).collect();
+    DockerEnvironmentHopResolver::new(map)
+}
+
+/// Helper: build a HopResolver with mock remote, mock terminal, and a real DockerEnvironmentHopResolver.
+fn mock_hop_resolver_with_env(
+    strategy: Arc<dyn CombineStrategy>,
+    containers: &[(&str, &str)],
+) -> (HopResolver, Arc<MockRemoteHopResolver>, Arc<MockTerminalHopResolver>) {
+    let remote = Arc::new(MockRemoteHopResolver::new());
+    let terminal = Arc::new(MockTerminalHopResolver::new());
+    let environment: Arc<dyn EnvironmentHopResolver> = Arc::new(docker_env_resolver(containers));
+    let resolver = HopResolver { remote: remote.clone(), environment, terminal: terminal.clone(), strategy };
+    (resolver, remote, terminal)
+}
+
+#[test]
+fn enter_environment_wrap_produces_docker_exec() {
+    let env_id = EnvironmentId::new("my-env");
+    let att_id = AttachableId::new("sess-1");
+
+    let (resolver, _remote, _terminal) = mock_hop_resolver_with_env(Arc::new(AlwaysWrap), &[("my-env", "my-container")]);
+
+    let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".into() }, Hop::AttachTerminal {
+        attachable_id: att_id.clone(),
+    }]);
+    let mut context = minimal_context();
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Terminal pushes Command(mock-attach, sess-1)
+    // Environment wrap pops it, prepends docker exec -it <container>, pushes back
+    assert_eq!(resolved.0.len(), 1);
+    let args = expect_command(&resolved.0[0]);
+    assert_eq!(args[0], Arg::Literal("docker".into()));
+    assert_eq!(args[1], Arg::Literal("exec".into()));
+    assert_eq!(args[2], Arg::Literal("-it".into()));
+    assert_eq!(args[3], Arg::Literal("my-container".into()));
+    assert_eq!(args[4], Arg::Literal("mock-attach".into()));
+    assert_eq!(args[5], Arg::Quoted("sess-1".into()));
+
+    assert_eq!(context.nesting_depth, 1);
+    assert_eq!(context.current_environment, Some(env_id));
+}
+
+#[test]
+fn enter_environment_collapses_when_already_inside() {
+    let env_id = EnvironmentId::new("my-env");
+
+    let (resolver, _remote, _terminal) = mock_hop_resolver_with_env(Arc::new(AlwaysWrap), &[("my-env", "my-container")]);
+
+    let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".into() }, Hop::RunCommand {
+        command: vec![Arg::Literal("echo".into()), Arg::Literal("hello".into())],
+    }]);
+    let mut context = minimal_context();
+    // Already inside this environment
+    context.current_environment = Some(env_id.clone());
+
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // EnterEnvironment should be collapsed; only the RunCommand should appear
+    assert_eq!(resolved.0.len(), 1);
+    assert_eq!(expect_command(&resolved.0[0]), [Arg::Literal("echo".into()), Arg::Literal("hello".into())]);
+    assert_eq!(context.nesting_depth, 0, "nesting_depth should not change when hop is collapsed");
+}
+
+#[test]
+fn remote_then_environment_then_terminal() {
+    let env_id = EnvironmentId::new("abc");
+    let att_id = AttachableId::new("sess-1");
+
+    let (resolver, remote, terminal) = mock_hop_resolver_with_env(Arc::new(AlwaysWrap), &[("abc", "container-abc")]);
+
+    let plan = HopPlan(vec![
+        Hop::RemoteToHost { host: HostName::new("feta") },
+        Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".into() },
+        Hop::AttachTerminal { attachable_id: att_id.clone() },
+    ]);
+    let mut context = minimal_context();
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Resolution walks inside-out:
+    // 1. AttachTerminal → pushes Command(mock-attach, sess-1)
+    // 2. EnterEnvironment (wrap) → pops it, wraps with docker exec, pushes Command(docker exec -it container-abc mock-attach sess-1)
+    // 3. RemoteToHost (wrap) → pops it, wraps with ssh, pushes Command(ssh feta <NestedCommand(docker exec ...)>)
+    assert_eq!(resolved.0.len(), 1);
+    let args = expect_command(&resolved.0[0]);
+    assert_eq!(args[0], Arg::Literal("ssh".into()));
+    assert_eq!(args[1], Arg::Quoted("feta".into()));
+
+    let nested = expect_nested(&args[2]);
+    assert_eq!(nested[0], Arg::Literal("docker".into()));
+    assert_eq!(nested[1], Arg::Literal("exec".into()));
+    assert_eq!(nested[2], Arg::Literal("-it".into()));
+    assert_eq!(nested[3], Arg::Literal("container-abc".into()));
+    assert_eq!(nested[4], Arg::Literal("mock-attach".into()));
+    assert_eq!(nested[5], Arg::Quoted("sess-1".into()));
+
+    // Verify nesting depth: 2 (remote + environment)
+    assert_eq!(context.nesting_depth, 2);
+    assert_eq!(context.current_host.as_str(), "feta");
+    assert_eq!(context.current_environment, Some(env_id));
+
+    // Verify mock resolvers were called
+    assert_eq!(remote.recorded_calls().len(), 1);
+    assert!(matches!(&remote.recorded_calls()[0], MockRemoteCall::Wrap(h) if h.as_str() == "feta"));
+    assert_eq!(terminal.recorded_calls().len(), 1);
+    assert_eq!(terminal.recorded_calls()[0], att_id);
+}
+
+#[test]
+fn enter_environment_enter_produces_docker_exec_shell_and_sendkeys() {
+    let env_id = EnvironmentId::new("my-env");
+    let att_id = AttachableId::new("sess-1");
+
+    let (resolver, _remote, _terminal) = mock_hop_resolver_with_env(Arc::new(AlwaysSendKeys), &[("my-env", "my-container")]);
+
+    let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".into() }, Hop::AttachTerminal {
+        attachable_id: att_id.clone(),
+    }]);
+    let mut context = minimal_context();
+    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
+
+    // Terminal pushes Command(mock-attach, sess-1)
+    // Environment enter pops it, converts to SendKeys, pushes docker exec -it container /bin/sh
+    assert_eq!(resolved.0.len(), 2);
+
+    // First action: SendKeys with the terminal attach command
+    let steps = expect_send_keys(&resolved.0[0]);
+    assert_eq!(steps.len(), 2);
+    let text = expect_type_step(&steps[0]);
+    assert!(text.contains("mock-attach"), "SendKeys should contain terminal command: {text}");
+    assert_eq!(steps[1], SendKeyStep::WaitForPrompt);
+
+    // Second action: docker exec enter command
+    let args = expect_command(&resolved.0[1]);
+    assert_eq!(args[0], Arg::Literal("docker".into()));
+    assert_eq!(args[1], Arg::Literal("exec".into()));
+    assert_eq!(args[2], Arg::Literal("-it".into()));
+    assert_eq!(args[3], Arg::Literal("my-container".into()));
+    assert_eq!(args[4], Arg::Literal("/bin/sh".into()));
+}
+
+#[test]
+fn enter_environment_unknown_env_returns_error() {
+    let env_id = EnvironmentId::new("unknown-env");
+
+    let (resolver, _remote, _terminal) = mock_hop_resolver_with_env(Arc::new(AlwaysWrap), &[("other-env", "other-container")]);
+
+    let plan = HopPlan(vec![Hop::EnterEnvironment { env_id, provider: "docker".into() }, Hop::RunCommand {
+        command: vec![Arg::Literal("ls".into())],
+    }]);
+    let mut context = minimal_context();
+    let err = resolver.resolve(&plan, &mut context).expect_err("should fail for unknown environment");
+    assert!(err.contains("unknown environment"), "error should mention unknown environment: {err}");
+}
+
+#[test]
+fn noop_environment_resolver_rejects_all_hops() {
+    let env_id = EnvironmentId::new("any-env");
+
+    let (resolver, _remote, _terminal) = mock_hop_resolver(Arc::new(AlwaysWrap));
+
+    let plan = HopPlan(vec![Hop::EnterEnvironment { env_id, provider: "docker".into() }, Hop::RunCommand {
+        command: vec![Arg::Literal("ls".into())],
+    }]);
+    let mut context = minimal_context();
+    let err = resolver.resolve(&plan, &mut context).expect_err("should fail with noop resolver");
+    assert!(err.contains("no environment transport"), "error should mention no transport: {err}");
 }

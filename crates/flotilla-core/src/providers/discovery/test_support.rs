@@ -494,6 +494,7 @@ impl CheckoutBuilder {
             last_commit: None,
             correlation_keys: self.correlation_keys,
             association_keys: self.association_keys,
+            environment_id: None,
         };
         self.parent.checkouts.push((path, checkout));
         self.parent
@@ -624,6 +625,7 @@ impl CheckoutManager for FakeCheckoutManager {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
             association_keys: vec![],
+            environment_id: None,
         };
         self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.push((path.clone(), checkout.clone()));
         Ok((ExecutionEnvironmentPath::new(path), checkout))
@@ -1111,6 +1113,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             ai_utilities: vec![],
             workspace_managers: workspace_manager_factories,
             terminal_pools: terminal_pool_factories,
+            environment_providers: vec![],
         },
         attachable_store,
     }

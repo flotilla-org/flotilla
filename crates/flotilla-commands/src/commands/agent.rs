@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
 
-use crate::Resolved;
+use crate::{
+    resolved::{HostResolution, RepoContext},
+    Resolved,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Cloud agents")]
@@ -31,16 +34,20 @@ pub enum AgentVerb {
 impl AgentNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
-            AgentVerb::Teleport { branch, checkout } => Ok(Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::TeleportSession { session_id: self.subject, branch, checkout_key: checkout },
-            })),
-            AgentVerb::Archive => Ok(Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::ArchiveSession { session_id: self.subject },
-            })),
+            AgentVerb::Teleport { branch, checkout } => Ok(Resolved::NeedsContext {
+                command: Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::TeleportSession { session_id: self.subject, branch, checkout_key: checkout },
+                },
+                repo: RepoContext::Inferred,
+                host: HostResolution::Local,
+            }),
+            AgentVerb::Archive => Ok(Resolved::NeedsContext {
+                command: Command { host: None, context_repo: None, action: CommandAction::ArchiveSession { session_id: self.subject } },
+                repo: RepoContext::Inferred,
+                host: HostResolution::ProviderHost,
+            }),
         }
     }
 }
@@ -72,7 +79,11 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction};
 
     use super::AgentNoun;
-    use crate::{test_utils::assert_round_trip, Resolved};
+    use crate::{
+        resolved::{HostResolution, RepoContext},
+        test_utils::assert_round_trip,
+        Resolved,
+    };
 
     fn parse(args: &[&str]) -> AgentNoun {
         AgentNoun::try_parse_from(args).expect("should parse")
@@ -81,35 +92,36 @@ mod tests {
     #[test]
     fn agent_teleport_no_flags() {
         let resolved = parse(&["agent", "claude-1", "teleport"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::TeleportSession { session_id: "claude-1".into(), branch: None, checkout_key: None },
-            })
-        );
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::Local,
+        });
     }
 
     #[test]
     fn agent_teleport_with_branch() {
         let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::TeleportSession { session_id: "claude-1".into(), branch: Some("feat".into()), checkout_key: None },
-            })
-        );
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::Local,
+        });
     }
 
     #[test]
     fn agent_teleport_with_branch_and_checkout() {
         let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat", "--checkout", "/tmp/wt"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::TeleportSession {
@@ -117,21 +129,20 @@ mod tests {
                     branch: Some("feat".into()),
                     checkout_key: Some(PathBuf::from("/tmp/wt")),
                 },
-            })
-        );
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::Local,
+        });
     }
 
     #[test]
     fn agent_archive() {
         let resolved = parse(&["agent", "claude-1", "archive"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::ArchiveSession { session_id: "claude-1".into() },
-            })
-        );
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command { host: None, context_repo: None, action: CommandAction::ArchiveSession { session_id: "claude-1".into() } },
+            repo: RepoContext::Inferred,
+            host: HostResolution::ProviderHost,
+        });
     }
 
     #[test]

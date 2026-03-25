@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod environment;
 pub mod flatten;
 pub mod remote;
 pub mod resolver;
@@ -7,7 +8,7 @@ pub mod terminal;
 mod tests;
 
 pub use flotilla_protocol::arg::Arg;
-use flotilla_protocol::HostName;
+use flotilla_protocol::{EnvironmentId, HostName};
 
 use crate::{attachable::AttachableId, path_context::ExecutionEnvironmentPath};
 
@@ -15,6 +16,7 @@ use crate::{attachable::AttachableId, path_context::ExecutionEnvironmentPath};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hop {
     RemoteToHost { host: HostName },
+    EnterEnvironment { env_id: EnvironmentId, provider: String },
     AttachTerminal { attachable_id: AttachableId },
     RunCommand { command: Vec<Arg> },
 }
@@ -44,7 +46,7 @@ pub struct ResolvedPlan(pub Vec<ResolvedAction>);
 /// Mutable state accumulated during inside-out resolution.
 pub struct ResolutionContext {
     pub current_host: HostName,
-    pub current_environment: Option<String>, // placeholder, becomes EnvironmentId in Phase C
+    pub current_environment: Option<EnvironmentId>,
     pub working_directory: Option<ExecutionEnvironmentPath>,
     pub actions: Vec<ResolvedAction>,
     pub nesting_depth: usize,

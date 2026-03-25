@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::HostName;
+use crate::{EnvironmentInfo, HostName};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSummary {
@@ -12,6 +12,8 @@ pub struct HostSummary {
     pub inventory: ToolInventory,
     #[serde(default)]
     pub providers: Vec<HostProviderStatus>,
+    #[serde(default)]
+    pub environments: Vec<EnvironmentInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -96,6 +98,7 @@ mod tests {
             },
             inventory: ToolInventory::default(),
             providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+            environments: vec![],
         };
 
         assert_roundtrip(&summary);
@@ -120,6 +123,7 @@ mod tests {
                 },
                 inventory: ToolInventory::default(),
                 providers: vec![],
+                environments: vec![],
             },
         };
         assert_roundtrip(&snapshot);

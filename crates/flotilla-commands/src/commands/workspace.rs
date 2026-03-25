@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
 
-use crate::Resolved;
+use crate::{
+    resolved::{HostResolution, RepoContext},
+    Resolved,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Workspaces")]
@@ -22,11 +25,11 @@ pub enum WorkspaceVerb {
 impl WorkspaceNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
-            WorkspaceVerb::Select => Ok(Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::SelectWorkspace { ws_ref: self.subject },
-            })),
+            WorkspaceVerb::Select => Ok(Resolved::NeedsContext {
+                command: Command { host: None, context_repo: None, action: CommandAction::SelectWorkspace { ws_ref: self.subject } },
+                repo: RepoContext::Inferred,
+                host: HostResolution::Local,
+            }),
         }
     }
 }
@@ -47,7 +50,11 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction};
 
     use super::WorkspaceNoun;
-    use crate::{test_utils::assert_round_trip, Resolved};
+    use crate::{
+        resolved::{HostResolution, RepoContext},
+        test_utils::assert_round_trip,
+        Resolved,
+    };
 
     fn parse(args: &[&str]) -> WorkspaceNoun {
         WorkspaceNoun::try_parse_from(args).expect("should parse")
@@ -56,14 +63,11 @@ mod tests {
     #[test]
     fn workspace_select() {
         let resolved = parse(&["workspace", "feat-ws", "select"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::SelectWorkspace { ws_ref: "feat-ws".into() },
-            })
-        );
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command { host: None, context_repo: None, action: CommandAction::SelectWorkspace { ws_ref: "feat-ws".into() } },
+            repo: RepoContext::Inferred,
+            host: HostResolution::Local,
+        });
     }
 
     #[test]

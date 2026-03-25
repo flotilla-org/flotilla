@@ -3,7 +3,10 @@ use std::{fmt, path::PathBuf};
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, RepoSelector};
 
-use crate::Resolved;
+use crate::{
+    resolved::{HostResolution, RepoContext},
+    Resolved,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Manage checkouts")]
@@ -44,25 +47,36 @@ impl CheckoutNoun {
             }
             (None, Some(CheckoutVerb::Create { branch, fresh })) => {
                 let target = if fresh { CheckoutTarget::FreshBranch(branch) } else { CheckoutTarget::Branch(branch) };
-                // SENTINEL: repo is empty — `inject_repo_context` in main.rs must fill it
-                // from --repo flag or FLOTILLA_REPO env before dispatch to the daemon.
-                Ok(Resolved::Command(Command {
+                // SENTINEL: repo is empty — dispatch must fill it from --repo or FLOTILLA_REPO.
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        host: None,
+                        context_repo: None,
+                        action: CommandAction::Checkout { repo: RepoSelector::Query("".into()), target, issue_ids: vec![] },
+                    },
+                    repo: RepoContext::Required,
+                    host: HostResolution::ProvisioningTarget,
+                })
+            }
+            (Some(subject), Some(CheckoutVerb::Remove)) => Ok(Resolved::NeedsContext {
+                command: Command {
                     host: None,
                     context_repo: None,
-                    action: CommandAction::Checkout { repo: RepoSelector::Query("".into()), target, issue_ids: vec![] },
-                }))
-            }
-            (Some(subject), Some(CheckoutVerb::Remove)) => Ok(Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(subject) },
-            })),
+                    action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(subject) },
+                },
+                repo: RepoContext::Inferred,
+                host: HostResolution::SubjectHost,
+            }),
             (None, Some(CheckoutVerb::Remove)) => Err("remove requires a checkout subject".into()),
-            (Some(subject), Some(CheckoutVerb::Status { checkout_path, cr_id })) => Ok(Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::FetchCheckoutStatus { branch: subject, checkout_path, change_request_id: cr_id },
-            })),
+            (Some(subject), Some(CheckoutVerb::Status { checkout_path, cr_id })) => Ok(Resolved::NeedsContext {
+                command: Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::FetchCheckoutStatus { branch: subject, checkout_path, change_request_id: cr_id },
+                },
+                repo: RepoContext::Inferred,
+                host: HostResolution::SubjectHost,
+            }),
             (None, Some(CheckoutVerb::Status { .. })) => Err("status requires a checkout subject".into()),
             (_, None) => Err("missing checkout verb".into()),
         }
@@ -107,7 +121,11 @@ mod tests {
     use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction, RepoSelector};
 
     use super::CheckoutNoun;
-    use crate::{test_utils::assert_round_trip, Resolved};
+    use crate::{
+        resolved::{HostResolution, RepoContext},
+        test_utils::assert_round_trip,
+        Resolved,
+    };
 
     fn parse(args: &[&str]) -> CheckoutNoun {
         CheckoutNoun::try_parse_from(args).expect("should parse")
@@ -116,9 +134,8 @@ mod tests {
     #[test]
     fn checkout_create_branch() {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
@@ -126,16 +143,17 @@ mod tests {
                     target: CheckoutTarget::Branch("feat-x".into()),
                     issue_ids: vec![],
                 },
-            })
-        );
+            },
+            repo: RepoContext::Required,
+            host: HostResolution::ProvisioningTarget,
+        });
     }
 
     #[test]
     fn checkout_create_fresh_branch() {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x", "--fresh"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
@@ -143,42 +161,45 @@ mod tests {
                     target: CheckoutTarget::FreshBranch("feat-x".into()),
                     issue_ids: vec![],
                 },
-            })
-        );
+            },
+            repo: RepoContext::Required,
+            host: HostResolution::ProvisioningTarget,
+        });
     }
 
     #[test]
     fn checkout_remove() {
         let resolved = parse(&["checkout", "my-feature", "remove"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("my-feature".into()) },
-            })
-        );
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::SubjectHost,
+        });
     }
 
     #[test]
     fn checkout_status_subject_only() {
         let resolved = parse(&["checkout", "my-feature", "status"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::FetchCheckoutStatus { branch: "my-feature".into(), checkout_path: None, change_request_id: None },
-            })
-        );
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::SubjectHost,
+        });
     }
 
     #[test]
     fn checkout_status_with_all_flags() {
         let resolved = parse(&["checkout", "my-feature", "status", "--checkout-path", "/tmp/wt", "--cr-id", "42"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::FetchCheckoutStatus {
@@ -186,8 +207,10 @@ mod tests {
                     checkout_path: Some(PathBuf::from("/tmp/wt")),
                     change_request_id: Some("42".into()),
                 },
-            })
-        );
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::SubjectHost,
+        });
     }
 
     #[test]

@@ -257,6 +257,7 @@ pub enum ProviderCategory {
     AiUtility,
     WorkspaceManager,
     TerminalPool,
+    EnvironmentProvider,
 }
 
 impl ProviderCategory {
@@ -270,6 +271,7 @@ impl ProviderCategory {
             Self::AiUtility => "ai_utility",
             Self::WorkspaceManager => "workspace_manager",
             Self::TerminalPool => "terminal_pool",
+            Self::EnvironmentProvider => "environment_provider",
         }
     }
 
@@ -283,6 +285,7 @@ impl ProviderCategory {
             Self::AiUtility => "AI Utility",
             Self::WorkspaceManager => "Workspace Manager",
             Self::TerminalPool => "Terminal Pool",
+            Self::EnvironmentProvider => "Environment Provider",
         }
     }
 }
@@ -401,6 +404,7 @@ pub type CloudAgentFactory = dyn Factory<Output = dyn CloudAgentService>;
 pub type AiUtilityFactory = dyn Factory<Output = dyn AiUtility>;
 pub type WorkspaceManagerFactory = dyn Factory<Output = dyn WorkspaceManager>;
 pub type TerminalPoolFactory = dyn Factory<Output = dyn TerminalPool>;
+pub type EnvironmentProviderFactory = dyn Factory<Output = dyn crate::providers::environment::EnvironmentProvider>;
 
 // ---------------------------------------------------------------------------
 // Factory registry
@@ -415,6 +419,7 @@ pub struct FactoryRegistry {
     pub ai_utilities: Vec<Box<AiUtilityFactory>>,
     pub workspace_managers: Vec<Box<WorkspaceManagerFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
+    pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
 }
 
 pub struct DiscoveryRuntime {
@@ -542,6 +547,10 @@ pub async fn discover_providers(
     .await;
     probe_all(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.terminal_pools.insert(desc.implementation.clone(), desc, provider);
+    })
+    .await;
+    probe_all(&factories.environment_providers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+        registry.environment_providers.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
 
@@ -762,6 +771,7 @@ mod orchestrator_tests {
             ai_utilities: vec![],
             workspace_managers: vec![],
             terminal_pools: vec![],
+            environment_providers: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
@@ -790,6 +800,7 @@ mod orchestrator_tests {
             ai_utilities: vec![],
             workspace_managers: vec![],
             terminal_pools: vec![],
+            environment_providers: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;

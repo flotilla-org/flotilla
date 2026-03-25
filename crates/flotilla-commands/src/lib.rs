@@ -6,4 +6,4 @@ pub mod resolved;
 pub(crate) mod test_utils;
 
 pub use noun::NounCommand;
-pub use resolved::{Refinable, Resolved};
+pub use resolved::{HostResolution, Refinable, RepoContext, Resolved};

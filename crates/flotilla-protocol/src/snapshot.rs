@@ -3,6 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    environment::EnvironmentBinding,
     host::{HostName, HostPath, RepoIdentity},
     provider_data::{AttachableSetId, Issue, ProviderData},
 };
@@ -72,6 +73,8 @@ pub struct RepoSnapshot {
     pub issue_has_more: bool,
     #[serde(default)]
     pub issue_search_results: Option<Vec<(String, Issue)>>,
+    #[serde(default)]
+    pub environment_binding: Option<EnvironmentBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +219,7 @@ mod tests {
             issue_total: None,
             issue_has_more: false,
             issue_search_results: None,
+            environment_binding: None,
         };
         let json = serde_json::to_string(&empty).expect("serialize");
         let decoded_empty: RepoSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -272,6 +276,7 @@ mod tests {
             issue_total: None,
             issue_has_more: false,
             issue_search_results: None,
+            environment_binding: None,
         };
         let json = serde_json::to_string(&populated).expect("serialize");
         let decoded_populated: RepoSnapshot = serde_json::from_str(&json).expect("deserialize");

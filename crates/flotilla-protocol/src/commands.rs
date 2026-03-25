@@ -2,7 +2,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{arg::Arg, AttachableSetId, RepoIdentity};
+use crate::{
+    arg::Arg,
+    query::{HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse},
+    AttachableSetId, RepoIdentity,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoSelector {
@@ -137,6 +141,38 @@ pub enum CommandAction {
     ClearIssueSearch {
         repo: RepoSelector,
     },
+    // Query commands — read-only operations dispatched through execute()
+    QueryRepoDetail {
+        repo: RepoSelector,
+    },
+    QueryRepoProviders {
+        repo: RepoSelector,
+    },
+    QueryRepoWork {
+        repo: RepoSelector,
+    },
+    QueryHostList {},
+    QueryHostStatus {
+        target_host: String,
+    },
+    QueryHostProviders {
+        target_host: String,
+    },
+}
+
+impl CommandAction {
+    /// Whether this action is a read-only query command.
+    pub fn is_query(&self) -> bool {
+        matches!(
+            self,
+            CommandAction::QueryRepoDetail { .. }
+                | CommandAction::QueryRepoProviders { .. }
+                | CommandAction::QueryRepoWork { .. }
+                | CommandAction::QueryHostList {}
+                | CommandAction::QueryHostStatus { .. }
+                | CommandAction::QueryHostProviders { .. }
+        )
+    }
 }
 
 impl Command {
@@ -166,13 +202,19 @@ impl Command {
             CommandAction::FetchMoreIssues { .. } => "Fetching issues...",
             CommandAction::SearchIssues { .. } => "Searching issues...",
             CommandAction::ClearIssueSearch { .. } => "Clearing search...",
+            CommandAction::QueryRepoDetail { .. } => "query repo detail",
+            CommandAction::QueryRepoProviders { .. } => "query repo providers",
+            CommandAction::QueryRepoWork { .. } => "query repo work",
+            CommandAction::QueryHostList {} => "query host list",
+            CommandAction::QueryHostStatus { .. } => "query host status",
+            CommandAction::QueryHostProviders { .. } => "query host providers",
         }
     }
 }
 
 /// Result returned from command execution, or inter-step data passed between steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
     Ok,
     RepoTracked {
@@ -217,6 +259,12 @@ pub enum CommandValue {
     CheckoutPathResolved {
         path: PathBuf,
     },
+    RepoDetail(Box<RepoDetailResponse>),
+    RepoProviders(Box<RepoProvidersResponse>),
+    RepoWork(Box<RepoWorkResponse>),
+    HostList(Box<HostListResponse>),
+    HostStatus(Box<HostStatusResponse>),
+    HostProviders(Box<HostProvidersResponse>),
 }
 
 /// Status of an individual step within a multi-step command.
@@ -244,7 +292,16 @@ pub struct CheckoutStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{arg::Arg, test_helpers::assert_json_roundtrip, AttachableSetId, HostName, RepoIdentity};
+    use crate::{
+        arg::Arg,
+        query::{
+            HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse,
+            RepoWorkResponse,
+        },
+        test_helpers::assert_json_roundtrip,
+        AttachableSetId, HostEnvironment, HostName, HostProviderStatus, HostSummary, PeerConnectionState, RepoIdentity, SystemInfo,
+        ToolInventory,
+    };
 
     fn repo_identity() -> RepoIdentity {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
@@ -371,6 +428,24 @@ mod tests {
                 context_repo: None,
                 action: CommandAction::ClearIssueSearch { repo: RepoSelector::Path(PathBuf::from("/repo")) },
             },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Path(PathBuf::from("/repo")) },
+            },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/repo")) },
+            },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/repo")) },
+            },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostStatus { target_host: "desktop".into() } },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostProviders { target_host: "desktop".into() } },
         ];
 
         for cmd in cases {
@@ -416,6 +491,72 @@ mod tests {
             CommandValue::Cancelled,
             CommandValue::AttachCommandResolved { command: "bash --login".into() },
             CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
+            CommandValue::RepoDetail(Box::new(RepoDetailResponse {
+                path: PathBuf::from("/repo"),
+                slug: Some("owner/repo".into()),
+                provider_health: Default::default(),
+                work_items: vec![],
+                errors: vec![],
+            })),
+            CommandValue::RepoProviders(Box::new(RepoProvidersResponse {
+                path: PathBuf::from("/repo"),
+                slug: Some("owner/repo".into()),
+                host_discovery: vec![],
+                repo_discovery: vec![],
+                providers: vec![],
+                unmet_requirements: vec![],
+            })),
+            CommandValue::RepoWork(Box::new(RepoWorkResponse {
+                path: PathBuf::from("/repo"),
+                slug: Some("owner/repo".into()),
+                work_items: vec![],
+            })),
+            CommandValue::HostList(Box::new(HostListResponse {
+                hosts: vec![HostListEntry {
+                    host: HostName::new("desktop"),
+                    is_local: true,
+                    configured: true,
+                    connection_status: PeerConnectionState::Connected,
+                    has_summary: true,
+                    repo_count: 1,
+                    work_item_count: 3,
+                }],
+            })),
+            CommandValue::HostStatus(Box::new(HostStatusResponse {
+                host: HostName::new("desktop"),
+                is_local: true,
+                configured: true,
+                connection_status: PeerConnectionState::Connected,
+                summary: Some(HostSummary {
+                    host_name: HostName::new("desktop"),
+                    system: SystemInfo {
+                        home_dir: Some("/home/dev".into()),
+                        os: Some("linux".into()),
+                        arch: Some("aarch64".into()),
+                        cpu_count: Some(8),
+                        memory_total_mb: Some(16384),
+                        environment: HostEnvironment::Unknown,
+                    },
+                    inventory: ToolInventory::default(),
+                    providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+                    environments: vec![],
+                }),
+                repo_count: 1,
+                work_item_count: 3,
+            })),
+            CommandValue::HostProviders(Box::new(HostProvidersResponse {
+                host: HostName::new("desktop"),
+                is_local: true,
+                configured: true,
+                connection_status: PeerConnectionState::Connected,
+                summary: HostSummary {
+                    host_name: HostName::new("desktop"),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                    environments: vec![],
+                },
+            })),
         ];
 
         for result in cases {
@@ -427,7 +568,7 @@ mod tests {
     fn command_result_uses_snake_case_tag() {
         let result = CommandValue::CheckoutCreated { branch: "x".into(), path: PathBuf::from("/tmp/x") };
         let json = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("checkout_created"));
+        assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("checkout_created"));
     }
 
     #[test]
@@ -579,6 +720,24 @@ mod tests {
                 context_repo: None,
                 action: CommandAction::ClearIssueSearch { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
             },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
+            },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
+            },
+            Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
+            },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostStatus { target_host: "desktop".into() } },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostProviders { target_host: "desktop".into() } },
         ];
         for cmd in cases {
             let desc = cmd.description();

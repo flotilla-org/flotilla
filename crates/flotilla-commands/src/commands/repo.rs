@@ -42,9 +42,9 @@ impl RepoNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match (self.subject, self.verb) {
             (_, Some(RepoVerb::Add { path })) => {
-                Ok(Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path } }))
+                Ok(Resolved::Ready(Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path } }))
             }
-            (_, Some(RepoVerb::Remove { repo })) => Ok(Resolved::Command(Command {
+            (_, Some(RepoVerb::Remove { repo })) => Ok(Resolved::Ready(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::UntrackRepo { repo: RepoSelector::Query(repo) },
@@ -52,28 +52,40 @@ impl RepoNoun {
             (subject, Some(RepoVerb::Refresh)) => {
                 // `repo myslug refresh` → refresh specific, `repo refresh` or `repo all refresh` → refresh all
                 let resolved_repo = subject.filter(|s| s != "all").map(RepoSelector::Query);
-                Ok(Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: resolved_repo } }))
+                Ok(Resolved::Ready(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: resolved_repo } }))
             }
             (Some(subject), Some(RepoVerb::Checkout { branch, fresh })) => {
                 let target = if fresh { CheckoutTarget::FreshBranch(branch) } else { CheckoutTarget::Branch(branch) };
-                Ok(Resolved::Command(Command {
+                Ok(Resolved::Ready(Command {
                     host: None,
                     context_repo: None,
                     action: CommandAction::Checkout { repo: RepoSelector::Query(subject), target, issue_ids: vec![] },
                 }))
             }
             (None, Some(RepoVerb::Checkout { .. })) => Err("checkout requires a repository subject".into()),
-            (Some(subject), Some(RepoVerb::PrepareTerminal { path })) => Ok(Resolved::Command(Command {
+            (Some(subject), Some(RepoVerb::PrepareTerminal { path })) => Ok(Resolved::Ready(Command {
                 host: None,
                 context_repo: Some(RepoSelector::Query(subject)),
                 action: CommandAction::PrepareTerminalForCheckout { checkout_path: path, commands: vec![] },
             })),
             (None, Some(RepoVerb::PrepareTerminal { .. })) => Err("prepare-terminal requires a repository subject".into()),
-            (Some(subject), Some(RepoVerb::Providers)) => Ok(Resolved::RepoProviders { slug: subject }),
+            (Some(subject), Some(RepoVerb::Providers)) => Ok(Resolved::Ready(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query(subject) },
+            })),
             (None, Some(RepoVerb::Providers)) => Err("providers requires a repository subject".into()),
-            (Some(subject), Some(RepoVerb::Work)) => Ok(Resolved::RepoWork { slug: subject }),
+            (Some(subject), Some(RepoVerb::Work)) => Ok(Resolved::Ready(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query(subject) },
+            })),
             (None, Some(RepoVerb::Work)) => Err("work requires a repository subject".into()),
-            (Some(slug), None) => Ok(Resolved::RepoDetail { slug }),
+            (Some(subject), None) => Ok(Resolved::Ready(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Query(subject) },
+            })),
             (None, None) => Err("missing repo arguments".into()),
         }
     }
@@ -125,7 +137,7 @@ mod tests {
         let resolved = parse(&["repo", "add", "/tmp/test"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::Ready(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/test") },
@@ -138,7 +150,7 @@ mod tests {
         let resolved = parse(&["repo", "remove", "owner/repo"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::Ready(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::UntrackRepo { repo: RepoSelector::Query("owner/repo".into()) },
@@ -149,7 +161,7 @@ mod tests {
     #[test]
     fn repo_refresh_all() {
         let resolved = parse(&["repo", "refresh"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
+        assert_eq!(resolved, Resolved::Ready(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
     }
 
     #[test]
@@ -158,7 +170,7 @@ mod tests {
         let resolved = parse(&["repo", "owner/repo", "refresh"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::Ready(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
@@ -170,25 +182,46 @@ mod tests {
     fn repo_all_refresh() {
         // `repo all refresh` is the explicit "refresh everything" form
         let resolved = parse(&["repo", "all", "refresh"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
+        assert_eq!(resolved, Resolved::Ready(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
     }
 
     #[test]
     fn repo_query_detail() {
         let resolved = parse(&["repo", "myslug"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::RepoDetail { slug: "myslug".into() });
+        assert_eq!(
+            resolved,
+            Resolved::Ready(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Query("myslug".into()) },
+            })
+        );
     }
 
     #[test]
     fn repo_query_providers() {
         let resolved = parse(&["repo", "myslug", "providers"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::RepoProviders { slug: "myslug".into() });
+        assert_eq!(
+            resolved,
+            Resolved::Ready(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("myslug".into()) },
+            })
+        );
     }
 
     #[test]
     fn repo_query_work() {
         let resolved = parse(&["repo", "myslug", "work"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::RepoWork { slug: "myslug".into() });
+        assert_eq!(
+            resolved,
+            Resolved::Ready(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query("myslug".into()) },
+            })
+        );
     }
 
     #[test]
@@ -196,7 +229,7 @@ mod tests {
         let resolved = parse(&["repo", "myslug", "checkout", "feat-x"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::Ready(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
@@ -213,7 +246,7 @@ mod tests {
         let resolved = parse(&["repo", "myslug", "checkout", "--fresh", "feat-x"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::Ready(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
@@ -230,7 +263,7 @@ mod tests {
         let resolved = parse(&["repo", "myslug", "prepare-terminal", "/tmp/path"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::Ready(Command {
                 host: None,
                 context_repo: Some(RepoSelector::Query("myslug".into())),
                 action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/path"), commands: vec![] },
@@ -242,14 +275,14 @@ mod tests {
     fn repo_subject_form_refresh() {
         // `repo myslug refresh` — subject used as repo (noun-subject-verb canonical form)
         let resolved = parse(&["repo", "myslug", "refresh"]).resolve().unwrap();
-        assert!(matches!(resolved, Resolved::Command(Command { action: CommandAction::Refresh { repo: Some(_) }, .. })));
+        assert!(matches!(resolved, Resolved::Ready(Command { action: CommandAction::Refresh { repo: Some(_) }, .. })));
     }
 
     #[test]
     fn repo_refresh_no_subject_is_all() {
         // `repo refresh` with no subject means refresh all (shorthand for `repo all refresh`)
         let resolved = parse(&["repo", "refresh"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
+        assert_eq!(resolved, Resolved::Ready(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }));
     }
 
     #[test]

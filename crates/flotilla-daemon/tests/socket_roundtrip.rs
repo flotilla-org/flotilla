@@ -5,6 +5,19 @@ use flotilla_daemon::server::DaemonServer;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector, StreamKey};
 use tokio::time::Instant;
 
+/// Execute a query command and wait for the CommandFinished result.
+async fn execute_query(daemon: &dyn DaemonHandle, action: CommandAction) -> CommandValue {
+    let mut rx = daemon.subscribe();
+    let command = Command { host: None, context_repo: None, action };
+    let command_id = daemon.execute(command).await.expect("execute query");
+    loop {
+        match rx.recv().await.expect("recv event") {
+            DaemonEvent::CommandFinished { command_id: id, result, .. } if id == command_id => return result,
+            _ => continue,
+        }
+    }
+}
+
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn socket_roundtrip() {
@@ -196,37 +209,59 @@ async fn query_commands_roundtrip() {
     assert!(!status.repos.is_empty(), "status should list at least one repo");
     assert_eq!(status.repos[0].path, repo);
 
-    // Test get_repo_detail by repo directory name
+    // Test repo query commands via execute() + CommandFinished events
     let repo_name = repo.file_name().expect("repo file_name").to_str().expect("repo name utf8");
-    let detail = client.get_repo_detail(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_detail");
-    assert_eq!(detail.path, repo);
 
-    // Test get_repo_providers
-    let providers = client.get_repo_providers(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_providers");
-    assert_eq!(providers.path, repo);
-    assert!(!providers.providers.is_empty(), "should have at least VCS provider");
+    let detail_result = execute_query(&*client, CommandAction::QueryRepoDetail { repo: RepoSelector::Query(repo_name.to_string()) }).await;
+    match detail_result {
+        CommandValue::RepoDetail(detail) => assert_eq!(detail.path, repo),
+        other => panic!("expected RepoDetail, got {other:?}"),
+    }
 
-    // Test get_repo_work
-    let work = client.get_repo_work(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_work");
-    assert_eq!(work.path, repo);
+    let providers_result =
+        execute_query(&*client, CommandAction::QueryRepoProviders { repo: RepoSelector::Query(repo_name.to_string()) }).await;
+    match providers_result {
+        CommandValue::RepoProviders(providers) => {
+            assert_eq!(providers.path, repo);
+            assert!(!providers.providers.is_empty(), "should have at least VCS provider");
+        }
+        other => panic!("expected RepoProviders, got {other:?}"),
+    }
 
-    // Test host query commands against the local daemon state
-    let hosts = client.list_hosts().await.expect("list_hosts");
-    assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::local() && entry.is_local));
+    let work_result = execute_query(&*client, CommandAction::QueryRepoWork { repo: RepoSelector::Query(repo_name.to_string()) }).await;
+    match work_result {
+        CommandValue::RepoWork(work) => assert_eq!(work.path, repo),
+        other => panic!("expected RepoWork, got {other:?}"),
+    }
+
+    // Test host query commands via execute()
+    let hosts_result = execute_query(&*client, CommandAction::QueryHostList {}).await;
+    match hosts_result {
+        CommandValue::HostList(hosts) => {
+            assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::local() && entry.is_local));
+        }
+        other => panic!("expected HostList, got {other:?}"),
+    }
 
     let local_host = HostName::local().to_string();
-    let host_status = client.get_host_status(&local_host).await.expect("get_host_status");
-    assert!(host_status.is_local, "local host query should resolve to local host");
+    let host_status_result = execute_query(&*client, CommandAction::QueryHostStatus { target_host: local_host.clone() }).await;
+    match host_status_result {
+        CommandValue::HostStatus(status) => assert!(status.is_local, "local host query should resolve to local host"),
+        other => panic!("expected HostStatus, got {other:?}"),
+    }
 
-    let host_providers = client.get_host_providers(&local_host).await.expect("get_host_providers");
-    assert_eq!(host_providers.summary.host_name, HostName::local());
+    let host_providers_result = execute_query(&*client, CommandAction::QueryHostProviders { target_host: local_host }).await;
+    match host_providers_result {
+        CommandValue::HostProviders(providers) => assert_eq!(providers.summary.host_name, HostName::local()),
+        other => panic!("expected HostProviders, got {other:?}"),
+    }
 
     let topology = client.get_topology().await.expect("get_topology");
     assert_eq!(topology.local_host, HostName::local());
 
     // Test slug resolution error for nonexistent repo
-    let err = client.get_repo_detail(&RepoSelector::Query("nonexistent".to_string())).await;
-    assert!(err.is_err(), "nonexistent slug should return error");
+    let err_result = execute_query(&*client, CommandAction::QueryRepoDetail { repo: RepoSelector::Query("nonexistent".to_string()) }).await;
+    assert!(matches!(err_result, CommandValue::Error { .. }), "nonexistent slug should return error");
 
     // Clean up
     server_handle.abort();

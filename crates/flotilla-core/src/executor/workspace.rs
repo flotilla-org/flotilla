@@ -8,6 +8,7 @@ use crate::{
     attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
     hop_chain::{
         builder::HopPlanBuilder,
+        environment::NoopEnvironmentHopResolver,
         remote::ssh_resolver_from_config,
         resolver::{AlwaysWrap, HopResolver},
         terminal::NoopTerminalHopResolver,
@@ -254,8 +255,12 @@ fn resolve_prepared_commands_via_hop_chain(
     local_host: &HostName,
 ) -> Result<Vec<(String, String)>, String> {
     let ssh_resolver = ssh_resolver_from_config(&DaemonHostPath::new(config_base))?;
-    let hop_resolver =
-        HopResolver { remote: Arc::new(ssh_resolver), terminal: Arc::new(NoopTerminalHopResolver), strategy: Arc::new(AlwaysWrap) };
+    let hop_resolver = HopResolver {
+        remote: Arc::new(ssh_resolver),
+        environment: Arc::new(NoopEnvironmentHopResolver),
+        terminal: Arc::new(NoopTerminalHopResolver),
+        strategy: Arc::new(AlwaysWrap),
+    };
     let plan_builder = HopPlanBuilder::new(local_host);
 
     let mut result = Vec::with_capacity(commands.len());

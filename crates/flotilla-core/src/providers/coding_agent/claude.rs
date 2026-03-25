@@ -332,6 +332,7 @@ impl super::CloudAgentService for ClaudeCodingAgent {
                     provider_name: provider_name.clone(),
                     provider_display_name: "Claude".into(),
                     item_noun: "Agent".into(),
+                    environment_id: None,
                 })
             })
             .collect())

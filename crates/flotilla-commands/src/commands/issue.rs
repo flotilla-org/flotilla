@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction, RepoSelector};
 
-use crate::Resolved;
+use crate::{
+    resolved::{HostResolution, RepoContext},
+    Resolved,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Issues")]
@@ -27,22 +30,31 @@ pub enum IssueVerb {
 impl IssueNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match (self.subject, self.verb) {
-            (Some(subject), Some(IssueVerb::Open)) => {
-                Ok(Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::OpenIssue { id: subject } }))
-            }
+            (Some(subject), Some(IssueVerb::Open)) => Ok(Resolved::NeedsContext {
+                command: Command { host: None, context_repo: None, action: CommandAction::OpenIssue { id: subject } },
+                repo: RepoContext::Inferred,
+                host: HostResolution::ProviderHost,
+            }),
             (None, Some(IssueVerb::Open)) => Err("open requires an issue subject".into()),
             (Some(subject), Some(IssueVerb::SuggestBranch)) => {
                 let issue_keys = subject.split(',').map(|s| s.trim().to_string()).collect();
-                Ok(Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::GenerateBranchName { issue_keys } }))
+                Ok(Resolved::NeedsContext {
+                    command: Command { host: None, context_repo: None, action: CommandAction::GenerateBranchName { issue_keys } },
+                    repo: RepoContext::Inferred,
+                    host: HostResolution::ProvisioningTarget,
+                })
             }
             (None, Some(IssueVerb::SuggestBranch)) => Err("suggest-branch requires an issue subject".into()),
-            (_, Some(IssueVerb::Search { query })) => Ok(Resolved::Command(Command {
-                host: None,
-                context_repo: None,
-                // SENTINEL: repo is empty — `inject_repo_context` in main.rs must fill it
-                // from --repo flag or FLOTILLA_REPO env before dispatch to the daemon.
-                action: CommandAction::SearchIssues { repo: RepoSelector::Query("".into()), query: query.join(" ") },
-            })),
+            (_, Some(IssueVerb::Search { query })) => Ok(Resolved::NeedsContext {
+                command: Command {
+                    host: None,
+                    context_repo: None,
+                    // SENTINEL: repo is empty — dispatch must fill it from --repo or FLOTILLA_REPO.
+                    action: CommandAction::SearchIssues { repo: RepoSelector::Query("".into()), query: query.join(" ") },
+                },
+                repo: RepoContext::Required,
+                host: HostResolution::Local,
+            }),
             (_, None) => Err("missing issue verb".into()),
         }
     }
@@ -76,7 +88,11 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction, RepoSelector};
 
     use super::IssueNoun;
-    use crate::{test_utils::assert_round_trip, Resolved};
+    use crate::{
+        resolved::{HostResolution, RepoContext},
+        test_utils::assert_round_trip,
+        Resolved,
+    };
 
     fn parse(args: &[&str]) -> IssueNoun {
         IssueNoun::try_parse_from(args).expect("should parse")
@@ -85,36 +101,39 @@ mod tests {
     #[test]
     fn issue_open() {
         let resolved = parse(&["issue", "1", "open"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::OpenIssue { id: "1".into() } })
-        );
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command { host: None, context_repo: None, action: CommandAction::OpenIssue { id: "1".into() } },
+            repo: RepoContext::Inferred,
+            host: HostResolution::ProviderHost,
+        });
     }
 
     #[test]
     fn issue_suggest_branch_multiple() {
         let resolved = parse(&["issue", "1,5,7", "suggest-branch"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::GenerateBranchName { issue_keys: vec!["1".into(), "5".into(), "7".into()] },
-            })
-        );
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::ProvisioningTarget,
+        });
     }
 
     #[test]
     fn issue_search() {
         let resolved = parse(&["issue", "search", "my", "query"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Command(Command {
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::SearchIssues { repo: RepoSelector::Query("".into()), query: "my query".into() },
-            })
-        );
+            },
+            repo: RepoContext::Required,
+            host: HostResolution::Local,
+        });
     }
 
     #[test]

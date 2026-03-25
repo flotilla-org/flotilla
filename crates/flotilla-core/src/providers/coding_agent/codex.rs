@@ -195,6 +195,7 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
         provider_name: provider_name.to_string(),
         provider_display_name: "Codex".into(),
         item_noun: "Task".into(),
+        environment_id: None,
     })
 }
 

@@ -425,6 +425,7 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            environment_id: None,
         };
         assert_eq!(git_status_display(&co), "");
     }
@@ -440,6 +441,7 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            environment_id: None,
         };
         assert_eq!(git_status_display(&co), "MS?↑");
     }
@@ -455,6 +457,7 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            environment_id: None,
         };
         assert_eq!(git_status_display(&co), "M");
     }
