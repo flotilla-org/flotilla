@@ -121,10 +121,10 @@ Resolved::Ready(cmd) or Resolved::NeedsContext { command, repo, host }
 
 ```rust
 /// Parse a token sequence starting with "host".
+/// The first element ("host") is consumed by clap as argv[0].
 pub fn parse_host_command(tokens: &[&str]) -> Result<Resolved, String> {
-    let partial = HostNounPartial::try_parse_from(
-        std::iter::once("flotilla").chain(tokens.iter().copied())
-    ).map_err(|e| e.to_string())?;
+    let partial = HostNounPartial::try_parse_from(tokens)
+        .map_err(|e| e.to_string())?;
     partial.refine()?.resolve()
 }
 ```
