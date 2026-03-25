@@ -192,8 +192,8 @@ impl Intent {
                 Some(vec!["cr".into(), cr_id.clone(), "open".into()])
             }
             Intent::ArchiveSession => {
-                let session_id = item.session_id.as_ref()?;
-                Some(vec!["agent".into(), session_id.clone(), "archive".into()])
+                let session_key = item.session_key.as_ref()?;
+                Some(vec!["agent".into(), session_key.clone(), "archive".into()])
             }
             // Non-convertible intents return None
             Intent::RemoveCheckout       // two-step flow with path-based selector
@@ -342,11 +342,18 @@ Verify that intent → tokens → parse → resolve produces the same `Command` 
 ```rust
 #[test]
 fn intent_round_trips_through_registry() {
-    let item = work_item_with_checkout("my-feature");
-    let tokens = Intent::RemoveCheckout.to_command_tokens(&item, &app).unwrap();
+    let item = work_item_with_cr("#42");
+    let tokens = Intent::OpenChangeRequest.to_command_tokens(&item, &app).unwrap();
     let noun = parse_noun_command(&tokens).unwrap();
     let resolved = noun.resolve().unwrap();
-    // Should produce RemoveCheckout command for "my-feature"
+    // Should produce CloseChangeRequest is not what we want — OpenChangeRequest → cr #42 open
+    assert!(matches!(resolved, Resolved::Command(cmd) if matches!(cmd.action, CommandAction::OpenChangeRequest { .. })));
+}
+
+#[test]
+fn non_convertible_intent_returns_none() {
+    let item = work_item_with_checkout("my-feature");
+    assert!(Intent::RemoveCheckout.to_command_tokens(&item, &app).is_none());
 }
 ```
 
