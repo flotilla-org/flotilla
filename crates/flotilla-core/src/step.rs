@@ -216,13 +216,12 @@ pub async fn run_step_plan_with_remote_executor(
                     }
                 };
 
+                if cancelled_during_batch {
+                    return CommandValue::Cancelled;
+                }
+
                 match outcome {
-                    Ok(step_outcomes) => {
-                        if cancelled_during_batch {
-                            return CommandValue::Cancelled;
-                        }
-                        outcomes.extend(step_outcomes);
-                    }
+                    Ok(step_outcomes) => outcomes.extend(step_outcomes),
                     Err(e) => {
                         if let Some(failure) = progress_sink.synthesized_failure(e.clone()) {
                             emit_step_update(

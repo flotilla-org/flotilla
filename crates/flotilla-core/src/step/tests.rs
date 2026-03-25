@@ -731,3 +731,61 @@ async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
     assert_eq!(result, CommandValue::Cancelled);
     assert_eq!(remote.cancelled_commands().await, vec![11]);
 }
+
+#[tokio::test]
+async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remote_batch_errors() {
+    struct PanicResolver;
+
+    #[async_trait::async_trait]
+    impl StepResolver for PanicResolver {
+        async fn resolve(&self, _desc: &str, _action: StepAction, _prior: &[StepOutcome]) -> Result<StepOutcome, String> {
+            panic!("local resolver should not run");
+        }
+    }
+
+    let wait_for_cancel = Arc::new(Notify::new());
+    let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
+        assert_host: HostName::new("feta"),
+        progress: vec![RemoteStepProgressUpdate {
+            batch_step_index: 0,
+            batch_step_count: 1,
+            description: "remote".into(),
+            status: StepStatus::Started,
+        }],
+        wait_for_cancel: Some(Arc::clone(&wait_for_cancel)),
+        result: Err("cancelled".into()),
+    }]);
+    let (cancel, tx) = setup();
+    let mut rx = tx.subscribe();
+    let plan =
+        StepPlan::new(vec![Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop }]);
+
+    let cancel_clone = cancel.clone();
+    let remote_clone = remote.clone();
+    let task = tokio::spawn(async move {
+        run_step_plan_with_remote_executor(
+            plan,
+            12,
+            HostName::local(),
+            RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            ExecutionEnvironmentPath::new("/repo"),
+            cancel_clone,
+            tx,
+            &PanicResolver,
+            &remote_clone,
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    cancel.cancel();
+
+    let result = task.await.expect("join");
+    assert_eq!(result, CommandValue::Cancelled);
+    assert_eq!(remote.cancelled_commands().await, vec![12]);
+
+    let failure_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|event| matches!(event, DaemonEvent::CommandStepUpdate { status: StepStatus::Failed { .. }, .. }))
+        .collect();
+    assert!(failure_events.is_empty());
+}
