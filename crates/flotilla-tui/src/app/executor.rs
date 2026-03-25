@@ -138,6 +138,14 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
             tracing::warn!("unexpected internal step result reached UI handler");
         }
+        CommandValue::RepoDetail(_)
+        | CommandValue::RepoProviders(_)
+        | CommandValue::RepoWork(_)
+        | CommandValue::HostList(_)
+        | CommandValue::HostStatus(_)
+        | CommandValue::HostProviders(_) => {
+            tracing::warn!("query result reached TUI handler — should be handled by CLI");
+        }
     }
 }
 

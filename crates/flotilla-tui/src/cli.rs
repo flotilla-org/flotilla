@@ -232,6 +232,12 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::Error { message } => format!("error: {message}"),
         CommandValue::Cancelled => "cancelled".to_string(),
         CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => "internal step result".to_string(),
+        CommandValue::RepoDetail(_)
+        | CommandValue::RepoProviders(_)
+        | CommandValue::RepoWork(_)
+        | CommandValue::HostList(_)
+        | CommandValue::HostStatus(_)
+        | CommandValue::HostProviders(_) => "query result".to_string(),
     }
 }
 
