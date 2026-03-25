@@ -43,29 +43,46 @@ pub fn filter_entries<'a>(entries: &'a [PaletteEntry], prefix: &str) -> Vec<&'a 
 }
 
 /// Result of parsing a palette-local command (built-in noun-free commands).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum PaletteLocalResult<'a> {
-    /// A layout subcommand was matched (e.g. "layout zoom").
-    SetLayout(&'a str),
-    /// A target subcommand was matched (e.g. "target feta").
-    SetTarget(&'a str),
-    /// A search subcommand was matched with a query (e.g. "search bug fix").
-    Search(&'a str),
-    /// A bare palette entry action was matched.
     Action(Action),
+    SetLayout(&'a str),
+    SetTheme(&'a str),
+    SetTarget(&'a str),
+    Search(&'a str),
 }
 
-/// Parse a palette-local (built-in) command from the input string.
-///
-/// Returns `None` if the input is not a recognised palette-local command
-/// (e.g. it looks like a noun-verb command).
-pub fn parse_palette_local(_input: &str) -> Option<PaletteLocalResult<'_>> {
-    todo!("implement in Task 5")
+/// Try to parse input as a palette-local command. Returns None if not a local command.
+pub fn parse_palette_local(input: &str) -> Option<PaletteLocalResult<'_>> {
+    let (cmd, rest) = input.split_once(' ').unwrap_or((input, ""));
+    let arg = rest.trim();
+    match cmd {
+        "layout" if !arg.is_empty() => Some(PaletteLocalResult::SetLayout(arg)),
+        "theme" if !arg.is_empty() => Some(PaletteLocalResult::SetTheme(arg)),
+        "target" if !arg.is_empty() => Some(PaletteLocalResult::SetTarget(arg)),
+        // "search" with trailing content → search command; bare "search" falls through to no-arg lookup
+        "search" if input.starts_with("search ") => Some(PaletteLocalResult::Search(arg)),
+        _ => {
+            // Check no-arg palette entries
+            let entries = all_entries();
+            entries.iter().find(|e| e.name == cmd && arg.is_empty()).map(|e| PaletteLocalResult::Action(e.action))
+        }
+    }
 }
 
-/// Return completions for the current palette-local input.
-pub fn palette_local_completions(_input: &str) -> Vec<String> {
-    todo!("implement in Task 5")
+pub const LAYOUT_VALUES: &[&str] = &["auto", "zoom", "right", "below"];
+
+/// Get completions for palette-local argument commands at the current input position.
+pub fn palette_local_completions(input: &str) -> Vec<&'static str> {
+    let (cmd, rest) = input.split_once(' ').unwrap_or((input, ""));
+    if rest.is_empty() && !input.ends_with(' ') {
+        // Still completing the command name — handled by filter_entries
+        return vec![];
+    }
+    match cmd {
+        "layout" => LAYOUT_VALUES.iter().filter(|v| v.starts_with(rest.trim())).copied().collect(),
+        _ => vec![],
+    }
 }
 
 #[cfg(test)]
