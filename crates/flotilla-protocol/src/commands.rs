@@ -214,7 +214,7 @@ impl Command {
 
 /// Result returned from command execution, or inter-step data passed between steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
     Ok,
     RepoTracked {
@@ -568,7 +568,7 @@ mod tests {
     fn command_result_uses_snake_case_tag() {
         let result = CommandValue::CheckoutCreated { branch: "x".into(), path: PathBuf::from("/tmp/x") };
         let json = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("checkout_created"));
+        assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("checkout_created"));
     }
 
     #[test]
