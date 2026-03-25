@@ -32,7 +32,7 @@ This gives the palette a single dispatch path. The current 9 query variants and 
 | `/` | Global | Opens palette empty. All nouns and global commands available. |
 | `?` | Contextual | Opens palette pre-filled with noun + subject from the selected work item (e.g., `cr #42 `). Cursor positioned after the subject, verb completions shown. |
 
-`?` currently triggers `ToggleHelp`. Help moves to `F1`.
+`?` currently triggers `ToggleHelp`. Help moves to `h` (freeing `h` from `CycleHost`, which becomes the palette-local `host <name>` command). `h` is a natural mnemonic for help, and `CycleHost` is being replaced by argument-bearing palette commands anyway. The `h` key is also being freed in anticipation of the host noun becoming "provisioning target" when sandbox/VM/container provisioning lands.
 
 ### Pre-fill mapping
 
@@ -76,7 +76,8 @@ The palette parse flow:
 user text ("cr #42 close")
     ↓ split into tokens
     ↓ try palette-local commands first (layout, theme, search, etc.)
-    ↓ if no match: parse_noun_command(tokens)
+    ↓ if first token is "host": parse_host_command(tokens)
+    ↓ otherwise: parse_noun_command(tokens)
     ↓ resolve()
 Resolved::Command(cmd) or Resolved::RequiresRepoContext(cmd)
     ↓ context injection (repo from active tab)
@@ -84,6 +85,20 @@ Resolved::Command(cmd) or Resolved::RequiresRepoContext(cmd)
 ```
 
 **Precedence rule:** Palette-local commands are tried first because they are short, unambiguous names that don't conflict with noun names (except `host` — see below). If no palette-local command matches the first token, the input is parsed as a noun-verb command.
+
+**Host parsing:** `NounCommand` excludes `Host` because host uses two-stage parsing (`HostNounPartial` → `refine()` → `HostNoun`). The palette needs a separate entry point for host commands:
+
+```rust
+/// Parse a token sequence starting with "host".
+pub fn parse_host_command(tokens: &[&str]) -> Result<Resolved, String> {
+    let partial = HostNounPartial::try_parse_from(
+        std::iter::once("flotilla").chain(tokens.iter().copied())
+    ).map_err(|e| e.to_string())?;
+    partial.refine()?.resolve()
+}
+```
+
+The palette checks the first token: if `"host"`, it calls `parse_host_command`; otherwise `parse_noun_command`. This mirrors the CLI's existing two-path dispatch (`SubCommand::Host(partial) => partial.refine()?.resolve()`).
 
 **`host` ambiguity:** `host` exists as both a palette-local command (set active host) and a registry noun (with verbs like `status`, `providers`, and routing). Resolution: `host <name>` with a single argument and no verb is treated as the palette-local "set host" command. `host <name> <verb>` or `host <name> <noun> ...` is parsed as the registry noun. The palette checks whether the second token matches a known `HostVerb` or noun name to disambiguate.
 
@@ -136,7 +151,7 @@ Existing no-arg palette entries become argument-bearing commands. They are palet
 | `host <name>` | `local`, known peer hostnames | From model |
 | `search <query>` | Free text | None |
 | `refresh` | None | — |
-| `help` | None | — (opens F1 help) |
+| `help` | None | — (toggles help overlay) |
 | `quit` | None | — |
 | `providers` | None | — |
 | `debug` | None | — |
@@ -160,7 +175,7 @@ key binding → Action::Dispatch(Intent) → intent.resolve(item, app) → Comma
 
 ```
 key binding → Action::Dispatch(Intent) → intent.to_command_tokens(item, app) → Vec<String>
-    → parse_noun_command(tokens) → noun.resolve() → Resolved → dispatch
+    → parse (noun or host path) → resolve() → Resolved → dispatch
 ```
 
 ### Which intents convert
@@ -181,31 +196,38 @@ key binding → Action::Dispatch(Intent) → intent.to_command_tokens(item, app)
 
 Intents that cannot convert keep their current `intent.resolve(item, app)` path. They still produce a `Command` directly. This is a pragmatic split — as more nouns gain verbs (e.g., `workspace create` in phase 3), more intents can migrate.
 
-Each convertible intent builds a token vector from the work item's data:
+Each convertible intent builds a token vector from the work item's data. **Host routing is preserved:** when the work item is on a remote host (determined by `item.host` vs `app.my_host`), the tokens are prefixed with `["host", hostname]`. This produces e.g. `["host", "feta", "cr", "#42", "open"]`, which parses through the host routing path and sets `Command.host` correctly.
 
 ```rust
 impl Intent {
     fn to_command_tokens(&self, item: &WorkItem, app: &App) -> Option<Vec<String>> {
-        match self {
+        let mut tokens = match self {
             Intent::OpenChangeRequest => {
                 let cr_id = item.change_request_key.as_ref()?;
-                Some(vec!["cr".into(), cr_id.clone(), "open".into()])
+                vec!["cr".into(), cr_id.clone(), "open".into()]
             }
             Intent::ArchiveSession => {
                 let session_key = item.session_key.as_ref()?;
-                Some(vec!["agent".into(), session_key.clone(), "archive".into()])
+                vec!["agent".into(), session_key.clone(), "archive".into()]
             }
             // Non-convertible intents return None
             Intent::RemoveCheckout       // two-step flow with path-based selector
             | Intent::CreateWorkspace    // local/remote branching, no registry noun
-            | Intent::LinkIssuesToChangeRequest => None,  // model diffing
+            | Intent::LinkIssuesToChangeRequest => return None,  // model diffing
             // ...
+        };
+
+        // Prepend host routing for remote work items
+        if let Some(target_host) = item.remote_host(app) {
+            tokens.splice(0..0, vec!["host".into(), target_host.to_string()]);
         }
+
+        Some(tokens)
     }
 }
 ```
 
-When `to_command_tokens` returns `None`, the dispatch falls back to the existing `intent.resolve(item, app)` path.
+When `to_command_tokens` returns `None`, the dispatch falls back to the existing `intent.resolve(item, app)` path. The existing host-routing helpers (`targeted_command`, `targeted_repo_command`, `provider_repo_command`) continue to serve non-convertible intents.
 
 `Intent::is_available` and `Intent::is_allowed_for_host` stay unchanged — they still gate whether the intent is offered.
 
@@ -227,31 +249,51 @@ When a TUI action fires via key binding (not the palette), the status bar briefl
 
 For non-convertible intents (`RemoveCheckout`, `CreateWorkspace`, `LinkIssuesToChangeRequest`), no echo is shown — they don't have a clean command string representation yet.
 
+### Status bar layout
+
+The status bar is reorganized into four sections:
+
+```
+| command echo / pre-fill | key hints | errors/status/actions | layout/host prefs |
+```
+
+1. **Command echo / pre-fill** (left) — transient command text from key-binding actions, or the pre-fill preview showing what `?` would open. This is a new `command_echo` field on `UiState`, separate from `status_message`. Cleared on next key press.
+
+2. **Key hints** — existing key binding hints (unchanged).
+
+3. **Errors / status / actions** — the existing `status_message` field, used for errors, step progress, and provider failures. No change to its semantics.
+
+4. **Layout / host prefs** (right) — existing layout and host display (unchanged).
+
+This separation means command echo never collides with error messages. They are different fields rendered in different sections.
+
+### Pre-fill preview
+
+When a work item is selected, the command echo section shows the pre-fill preview with `?` highlighted:
+
+```
+| /cr #42 ? | d Del  p PR  / Cmd | | zoom  local |
+```
+
+The `?` is visually highlighted (e.g., bold or contrasting color) to hint "press `?` to act on this." When no selection exists:
+
+```
+| | d Del  p PR  / Cmd  h Help | | zoom  local |
+```
+
 ### Implementation
 
-After `intent.to_command_tokens()` produces tokens, join them into a display string and set it on the status bar, cleared on next key press. The status bar already supports `status_message` — this is a similar transient message.
-
-### Status bar pre-fill preview
-
-When a work item is selected, the status bar shows the command context with `?` highlighted as a continuation hint:
-
-```
-/cr #42 ?     /     F1 Help
-```
-
-The `?` is visually highlighted (e.g., bold or contrasting color) to indicate "press `?` to act on this." This teaches the user that `?` opens the palette pre-filled with the shown context. When no selection exists, it shows just:
-
-```
-/     F1 Help
-```
+After `intent.to_command_tokens()` produces tokens, join them into a display string and set `app.ui_state.command_echo`. Cleared on next key press.
 
 ## Key Binding Changes
 
 | Key | Old action | New action |
 |-----|-----------|------------|
 | `?` | `ToggleHelp` | Contextual palette (pre-filled) |
-| `F1` | (unbound) | `ToggleHelp` |
+| `h` | `CycleHost` | `ToggleHelp` |
 | `Esc` (Normal mode) | (quit or no-op) | Clear table selection |
+
+`CycleHost` has no direct replacement key — host selection moves to the palette (`host <name>`).
 
 All other bindings unchanged.
 
@@ -301,7 +343,7 @@ This replaces the current `resolve_and_push` for intent-driven actions (for conv
 | Completion source trait + model-backed sources | `flotilla-tui` (sources query `AppModel`) |
 | Intent adapter (`to_command_tokens`) | `flotilla-tui` |
 | Command echo in status bar | `flotilla-tui` |
-| Key binding changes (?, F1, Esc) | `flotilla-tui` |
+| Key binding changes (?, h, Esc) | `flotilla-tui` |
 | Palette-local command definitions | `flotilla-tui` |
 | `Resolved::RequiresRepoContext` | `flotilla-commands` (delivered by #502) |
 | `Esc` clears selection | `flotilla-tui` |
@@ -346,7 +388,6 @@ fn intent_round_trips_through_registry() {
     let tokens = Intent::OpenChangeRequest.to_command_tokens(&item, &app).unwrap();
     let noun = parse_noun_command(&tokens).unwrap();
     let resolved = noun.resolve().unwrap();
-    // Should produce CloseChangeRequest is not what we want — OpenChangeRequest → cr #42 open
     assert!(matches!(resolved, Resolved::Command(cmd) if matches!(cmd.action, CommandAction::OpenChangeRequest { .. })));
 }
 
@@ -400,7 +441,7 @@ fn no_echo_for_non_convertible_intent() {
 - `?` opens contextual palette (pre-filled from selection)
 - `/` opens global palette (empty)
 - `Esc` clears table selection in Normal mode
-- Help moves to `F1`
+- Help moves to `h`
 - Palette-local commands gain argument support (`layout <name>`, `theme <name>`, `host <name>`)
 - Intents construct command token strings, resolve through registry
 - Command echo in status bar on key-binding actions
