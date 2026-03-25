@@ -116,6 +116,7 @@ pub enum StepAction {
     },
 
     /// Test-only no-op action resolved by test harness resolvers.
+    #[cfg(any(test, feature = "test-support"))]
     Noop,
 }
 
