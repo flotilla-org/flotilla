@@ -313,7 +313,11 @@ pub fn path_to_slug(path: &Path) -> String {
 }
 
 fn repo_file_key(path: &Path) -> String {
-    urlencoding::encode(&path.to_string_lossy()).into_owned()
+    let key = urlencoding::encode(&path.to_string_lossy()).into_owned();
+    if key.len() > 200 {
+        tracing::warn!(key_len = key.len(), path = %path.display(), "repo config filename key is close to filesystem limit");
+    }
+    key
 }
 
 /// Owns daemon-side paths and caches the global `FlotillaConfig`.

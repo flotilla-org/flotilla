@@ -488,8 +488,12 @@ impl App {
                                 }
                             }
                         }
+                        // These commands do not set per-repo pending flags, so
+                        // there is nothing to unwind beyond surfacing the error.
                         CommandAction::SearchIssues { .. } | CommandAction::ClearIssueSearch { .. } => {}
-                        _ => {}
+                        other => {
+                            tracing::warn!(action = ?other, "unexpected background issue command failure");
+                        }
                     }
                     self.set_status_message(Some(error));
                 }
