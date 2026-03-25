@@ -564,37 +564,6 @@ impl StepResolver for ExecutorStepResolver {
                 workspace_orchestrator.attach_prepared_workspace(&prepared).await?;
                 Ok(StepOutcome::Completed)
             }
-            StepAction::CreateWorkspaceForCheckout { label, checkout_path: explicit_path } => {
-                let path: Option<ExecutionEnvironmentPath> = if let Some(p) = explicit_path {
-                    let host_key = HostPath::new(self.local_host.clone(), p.as_path().to_path_buf());
-                    if !self.providers_data.checkouts.contains_key(&host_key) {
-                        return Err(format!("checkout not found: {}", p));
-                    }
-                    info!(%label, "entering workspace");
-                    Some(p)
-                } else {
-                    prior.iter().find_map(|o| match o {
-                        StepOutcome::CompletedWith(CommandValue::CheckoutCreated { path, .. }) => Some(ExecutionEnvironmentPath::new(path)),
-                        _ => None,
-                    })
-                };
-                match path {
-                    Some(p) => {
-                        let tm = self.terminal_manager();
-                        let workspace_orchestrator = WorkspaceOrchestrator::new(
-                            self.repo.root.as_path(),
-                            self.registry.as_ref(),
-                            self.config_base.as_path(),
-                            &self.attachable_store,
-                            self.daemon_socket_path.as_ref().map(|p| p.as_path()),
-                            &self.local_host,
-                            tm.as_ref(),
-                        );
-                        workspace_orchestrator.create_workspace_for_checkout(p.as_path(), &label).await
-                    }
-                    None => Ok(StepOutcome::Skipped),
-                }
-            }
             StepAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
                 let tm = self.terminal_manager();
                 let workspace_orchestrator = WorkspaceOrchestrator::new(
@@ -764,7 +733,6 @@ impl StepResolver for ExecutorStepResolver {
                     }
                 }
             }
-            _ => Ok(StepOutcome::Completed),
         }
     }
 }

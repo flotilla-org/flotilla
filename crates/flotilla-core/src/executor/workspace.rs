@@ -16,7 +16,6 @@ use crate::{
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{registry::ProviderRegistry, types::WorkspaceAttachRequest, workspace::WorkspaceManager},
-    step::StepOutcome,
     terminal_manager::TerminalManager,
 };
 
@@ -41,31 +40,6 @@ impl<'a> WorkspaceOrchestrator<'a> {
         terminal_manager: Option<&'a TerminalManager>,
     ) -> Self {
         Self { repo_root, registry, config_base, attachable_store, daemon_socket_path, local_host, terminal_manager }
-    }
-
-    pub(super) async fn create_workspace_for_checkout(&self, checkout_path: &Path, label: &str) -> Result<StepOutcome, String> {
-        let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
-            return Ok(StepOutcome::Skipped);
-        };
-
-        if self.select_existing_workspace(ws_mgr.as_ref(), checkout_path).await {
-            return Ok(StepOutcome::Completed);
-        }
-
-        let mut config = workspace_config(self.repo_root, label, checkout_path, "claude", self.config_base);
-        if let Some(tm) = self.terminal_manager {
-            let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
-            terminal_preparation.resolve_workspace_commands(&mut config).await;
-        }
-        let attach_request = workspace_attach_request_from_config(config);
-
-        match ws_mgr.create_workspace(&attach_request).await {
-            Ok((ws_ref, _workspace)) => {
-                self.persist_workspace_binding(provider_name, &ws_ref, self.local_host, checkout_path);
-                Ok(StepOutcome::Completed)
-            }
-            Err(err) => Err(err),
-        }
     }
 
     pub(super) async fn create_workspace_for_teleport(&self, checkout_path: &Path, label: &str, teleport_cmd: &str) -> Result<(), String> {

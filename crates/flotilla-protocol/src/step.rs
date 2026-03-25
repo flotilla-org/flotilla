@@ -49,12 +49,6 @@ pub enum StepAction {
         deleted_checkout_paths: Vec<HostPath>,
     },
 
-    // Workspace (existing)
-    CreateWorkspaceForCheckout {
-        label: String,
-        checkout_path: Option<ExecutionEnvironmentPath>,
-    },
-
     // Teleport
     ResolveAttachCommand {
         session_id: String,
@@ -119,10 +113,6 @@ pub enum StepAction {
         change_request_id: String,
         issue_ids: Vec<String>,
     },
-
-    /// Test-only no-op action resolved by test harness resolvers.
-    #[cfg(any(test, feature = "test-support"))]
-    Noop,
 }
 
 /// A single step in a multi-step command.

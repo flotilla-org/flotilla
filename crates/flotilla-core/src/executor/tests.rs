@@ -2620,15 +2620,11 @@ async fn validate_existing_branch_fails_when_neither_exists() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn executor_step_resolver_creates_workspace() {
-    let ws_mgr = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = empty_registry();
-    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
-
+async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() {
     let config_base = config_base();
     let resolver = ExecutorStepResolver {
         repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        registry: Arc::new(registry),
+        registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         config_base: config_base.clone(),
@@ -2639,24 +2635,25 @@ async fn executor_step_resolver_creates_workspace() {
 
     let prior =
         vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
-    let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into(), checkout_path: None };
+    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None };
     let outcome = resolver.resolve("create workspace", action, &prior).await;
-    assert!(outcome.is_ok(), "resolve should succeed: {outcome:?}");
-
-    let calls = ws_mgr.calls.lock().await;
-    assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "should call create_workspace, got: {calls:?}");
+    match outcome {
+        Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared))) => {
+            assert_eq!(prepared.label, "feat");
+            assert_eq!(prepared.target_host, local_host());
+            assert_eq!(prepared.checkout_path, PathBuf::from("/repo/wt-feat"));
+            assert!(!prepared.prepared_commands.is_empty(), "default workspace template should produce commands");
+        }
+        other => panic!("expected PreparedWorkspace outcome, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn executor_step_resolver_skips_when_no_checkout_path() {
-    let ws_mgr = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = empty_registry();
-    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn WorkspaceManager>);
-
+async fn executor_step_resolver_prepare_workspace_skips_when_no_checkout_path() {
     let config_base = config_base();
     let resolver = ExecutorStepResolver {
         repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        registry: Arc::new(registry),
+        registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         config_base: config_base.clone(),
@@ -2665,10 +2662,7 @@ async fn executor_step_resolver_skips_when_no_checkout_path() {
         local_host: local_host(),
     };
 
-    let action = StepAction::CreateWorkspaceForCheckout { label: "feat".into(), checkout_path: None };
+    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None };
     let outcome = resolver.resolve("create workspace", action, &[]).await;
     assert!(matches!(outcome, Ok(StepOutcome::Skipped)), "should skip when no prior CheckoutCreated outcome: {outcome:?}");
-
-    let calls = ws_mgr.calls.lock().await;
-    assert!(calls.is_empty(), "should not call workspace manager when no checkout path in prior outcomes, got: {calls:?}");
 }

@@ -22,7 +22,7 @@ impl StepResolver for TestResolver {
 }
 
 fn make_step(desc: &str) -> Step {
-    Step { description: desc.to_string(), host: StepHost::Local, action: StepAction::Noop }
+    Step { description: desc.to_string(), host: StepHost::Local, action: StepAction::AttachWorkspace }
 }
 
 fn setup() -> (CancellationToken, broadcast::Sender<DaemonEvent>) {
@@ -347,7 +347,7 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
 
     let (cancel, tx) = setup();
     let plan = StepPlan::new(vec![
-        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::AttachWorkspace },
         make_step("local"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
@@ -387,7 +387,7 @@ async fn remote_failure_stops_execution() {
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
     let plan = StepPlan::new(vec![
-        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::AttachWorkspace },
         make_step("local"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
@@ -446,7 +446,7 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
     let plan = StepPlan::new(vec![
-        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::AttachWorkspace },
         make_step("local"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
@@ -498,8 +498,8 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
     let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed)]);
     let plan = StepPlan::new(vec![
         make_step("local"),
-        Step { description: "remote-a".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
-        Step { description: "remote-b".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote-a".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::AttachWorkspace },
+        Step { description: "remote-b".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::AttachWorkspace },
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
         assert_host: HostName::new("feta"),
@@ -567,8 +567,11 @@ async fn remote_error_does_not_duplicate_failed_progress() {
 
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
-    let plan =
-        StepPlan::new(vec![Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop }]);
+    let plan = StepPlan::new(vec![Step {
+        description: "remote".into(),
+        host: StepHost::Remote(HostName::new("feta")),
+        action: StepAction::AttachWorkspace,
+    }]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
         assert_host: HostName::new("feta"),
         progress: vec![
@@ -617,8 +620,8 @@ async fn remote_progress_maps_to_global_step_indices() {
     let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed), Ok(StepOutcome::Completed)]);
     let plan = StepPlan::new(vec![
         make_step("local-a"),
-        Step { description: "remote-a".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
-        Step { description: "remote-b".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote-a".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::AttachWorkspace },
+        Step { description: "remote-b".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::AttachWorkspace },
         make_step("local-b"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
@@ -701,8 +704,11 @@ async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
         result: Ok(vec![StepOutcome::Completed]),
     }]);
     let (cancel, tx) = setup();
-    let plan =
-        StepPlan::new(vec![Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop }]);
+    let plan = StepPlan::new(vec![Step {
+        description: "remote".into(),
+        host: StepHost::Remote(HostName::new("feta")),
+        action: StepAction::AttachWorkspace,
+    }]);
 
     let cancel_clone = cancel.clone();
     let remote_clone = remote.clone();
@@ -754,8 +760,11 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
     }]);
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
-    let plan =
-        StepPlan::new(vec![Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop }]);
+    let plan = StepPlan::new(vec![Step {
+        description: "remote".into(),
+        host: StepHost::Remote(HostName::new("feta")),
+        action: StepAction::AttachWorkspace,
+    }]);
 
     let cancel_clone = cancel.clone();
     let remote_clone = remote.clone();
@@ -812,8 +821,11 @@ async fn cancellation_after_remote_cancel_timeout_returns_cancelled_without_wait
     let (cancel, tx) = setup();
     let started = Arc::new(Notify::new());
     let remote = StalledRemoteExecutor { started: Arc::clone(&started) };
-    let plan =
-        StepPlan::new(vec![Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop }]);
+    let plan = StepPlan::new(vec![Step {
+        description: "remote".into(),
+        host: StepHost::Remote(HostName::new("feta")),
+        action: StepAction::AttachWorkspace,
+    }]);
 
     let cancel_clone = cancel.clone();
     let task = tokio::spawn(async move {
