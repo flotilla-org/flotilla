@@ -74,7 +74,12 @@ enum ForwardedRemoteStepBatchState {
 
 type PendingRemoteStepBatchMap = Arc<Mutex<HashMap<u64, PendingRemoteStepBatch>>>;
 type ActiveRemoteStepBatchMap = Arc<Mutex<HashMap<u64, ActiveRemoteStepBatch>>>;
-type PendingRemoteStepCancelMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>;
+struct PendingRemoteStepCancel {
+    target_host: HostName,
+    completion: oneshot::Sender<Result<(), String>>,
+}
+
+type PendingRemoteStepCancelMap = Arc<Mutex<HashMap<u64, PendingRemoteStepCancel>>>;
 type ForwardedRemoteStepBatchMap = Arc<Mutex<HashMap<u64, ForwardedRemoteStepBatch>>>;
 
 #[derive(Clone)]
@@ -189,11 +194,9 @@ impl RemoteCommandRouter {
                 Ok(Err(_)) => Err("remote cancel response channel closed".to_string()),
                 Err(_) => {
                     self.pending_remote_cancels.lock().await.remove(&cancel_id);
-                Err("timed out waiting for remote cancel response".to_string())
+                    Err("timed out waiting for remote cancel response".to_string())
                 }
             }
-        } else if self.active_remote_step_batches.lock().await.contains_key(&command_id) {
-            <Self as RemoteStepExecutor>::cancel_active_batch(self, command_id).await
         } else {
             self.daemon.cancel(command_id).await
         }
@@ -391,12 +394,43 @@ impl RemoteCommandRouter {
     }
 
     pub(super) async fn complete_remote_step_cancel(&self, cancel_id: u64, error: Option<String>) {
-        let tx = self.pending_remote_step_cancels.lock().await.remove(&cancel_id);
-        if let Some(tx) = tx {
-            let _ = tx.send(match error {
+        let pending = self.pending_remote_step_cancels.lock().await.remove(&cancel_id);
+        if let Some(pending) = pending {
+            let _ = pending.completion.send(match error {
                 Some(message) => Err(message),
                 None => Ok(()),
             });
+        }
+    }
+
+    pub(super) async fn fail_pending_remote_steps_for_host(&self, host: &HostName) {
+        let message = format!("remote step peer disconnected: {host}");
+
+        let request_ids: Vec<u64> = {
+            let mut active = self.active_remote_step_batches.lock().await;
+            active.extract_if(|_, entry| entry.target_host == *host).map(|(_, entry)| entry.request_id).collect()
+        };
+
+        if !request_ids.is_empty() {
+            let mut pending_batches = self.pending_remote_step_batches.lock().await;
+            for request_id in request_ids {
+                if let Some(entry) = pending_batches.remove(&request_id) {
+                    let _ = entry.completion.send(Err(message.clone()));
+                }
+            }
+        }
+
+        let cancel_ids: Vec<u64> = {
+            let pending_cancels = self.pending_remote_step_cancels.lock().await;
+            pending_cancels.iter().filter_map(|(cancel_id, pending)| (pending.target_host == *host).then_some(*cancel_id)).collect()
+        };
+        if !cancel_ids.is_empty() {
+            let mut pending_cancels = self.pending_remote_step_cancels.lock().await;
+            for cancel_id in cancel_ids {
+                if let Some(pending) = pending_cancels.remove(&cancel_id) {
+                    let _ = pending.completion.send(Err(message.clone()));
+                }
+            }
         }
     }
 
@@ -543,16 +577,10 @@ impl RemoteStepExecutor for RemoteCommandRouter {
         request: RemoteStepBatchRequest,
         progress_sink: Arc<dyn RemoteStepProgressSink>,
     ) -> Result<Vec<StepOutcome>, String> {
-        if let Some((index, step)) = request
-            .steps
-            .iter()
-            .enumerate()
-            .find(|(_, step)| step.host != StepHost::Remote(request.target_host.clone()))
+        if let Some((index, step)) =
+            request.steps.iter().enumerate().find(|(_, step)| step.host != StepHost::Remote(request.target_host.clone()))
         {
-            return Err(format!(
-                "remote step {} targets {:?}, expected remote host {}",
-                index, step.host, request.target_host
-            ));
+            return Err(format!("remote step {} targets {:?}, expected remote host {}", index, step.host, request.target_host));
         }
 
         let request_id = {
@@ -566,10 +594,10 @@ impl RemoteStepExecutor for RemoteCommandRouter {
             failed_message: None,
             completion: tx,
         });
-        self.active_remote_step_batches.lock().await.insert(
-            request.command_id,
-            ActiveRemoteStepBatch { request_id, target_host: request.target_host.clone() },
-        );
+        self.active_remote_step_batches
+            .lock()
+            .await
+            .insert(request.command_id, ActiveRemoteStepBatch { request_id, target_host: request.target_host.clone() });
 
         let routed = RoutedPeerMessage::RemoteStepRequest {
             request_id,
@@ -604,7 +632,10 @@ impl RemoteStepExecutor for RemoteCommandRouter {
             pm.next_request_id()
         };
         let (tx, rx) = oneshot::channel();
-        self.pending_remote_step_cancels.lock().await.insert(cancel_id, tx);
+        self.pending_remote_step_cancels
+            .lock()
+            .await
+            .insert(cancel_id, PendingRemoteStepCancel { target_host: active.target_host.clone(), completion: tx });
         let routed = RoutedPeerMessage::RemoteStepCancelRequest {
             cancel_id,
             requester_host: self.daemon.host_name().clone(),
@@ -797,13 +828,7 @@ struct RoutedRemoteStepProgressSink {
 }
 
 impl RoutedRemoteStepProgressSink {
-    fn new(
-        router: RemoteCommandRouter,
-        request_id: u64,
-        requester_host: HostName,
-        reply_via: HostName,
-        responder_host: HostName,
-    ) -> Self {
+    fn new(router: RemoteCommandRouter, request_id: u64, requester_host: HostName, reply_via: HostName, responder_host: HostName) -> Self {
         Self { router, request_id, requester_host, reply_via, responder_host, state: Mutex::new(RoutedRemoteStepProgressState::default()) }
     }
 
@@ -818,19 +843,16 @@ impl RoutedRemoteStepProgressSink {
         }
         let _ = self
             .router
-            .send_routed_to(
-                &self.reply_via,
-                RoutedPeerMessage::RemoteStepEvent {
-                    request_id: self.request_id,
-                    requester_host: self.requester_host.clone(),
-                    responder_host: self.responder_host.clone(),
-                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                    batch_step_index,
-                    batch_step_count,
-                    description,
-                    status,
-                },
-            )
+            .send_routed_to(&self.reply_via, RoutedPeerMessage::RemoteStepEvent {
+                request_id: self.request_id,
+                requester_host: self.requester_host.clone(),
+                responder_host: self.responder_host.clone(),
+                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                batch_step_index,
+                batch_step_count,
+                description,
+                status,
+            })
             .await;
     }
 
@@ -844,9 +866,7 @@ impl RoutedRemoteStepProgressSink {
             if state.saw_failed {
                 None
             } else {
-                state.last_started.clone().or_else(|| {
-                    steps.first().map(|step| (0usize, batch_step_count, step.description.clone()))
-                })
+                state.last_started.clone().or_else(|| steps.first().map(|step| (0usize, batch_step_count, step.description.clone())))
             }
         };
 

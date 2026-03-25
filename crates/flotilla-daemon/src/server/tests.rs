@@ -627,7 +627,15 @@ async fn remote_command_mutations_route_remote_step_requests() {
     .expect("timeout waiting for routed message");
 
     match routed {
-        RoutedPeerMessage::RemoteStepRequest { requester_host, target_host, repo_identity: identity, repo_path, step_offset, steps, .. } => {
+        RoutedPeerMessage::RemoteStepRequest {
+            requester_host,
+            target_host,
+            repo_identity: identity,
+            repo_path,
+            step_offset,
+            steps,
+            ..
+        } => {
             assert_eq!(requester_host, HostName::new("local"));
             assert_eq!(target_host, HostName::new("feta"));
             assert_eq!(identity, repo_identity);
@@ -723,24 +731,10 @@ async fn remote_command_remote_step_events_remap_to_presentation_command_id_and_
         )
         .await;
     remote_command_router
-        .emit_remote_step_event(
-            request_id,
-            HostName::new("feta"),
-            1,
-            2,
-            "Link issues to branch".into(),
-            StepStatus::Started,
-        )
+        .emit_remote_step_event(request_id, HostName::new("feta"), 1, 2, "Link issues to branch".into(), StepStatus::Started)
         .await;
     remote_command_router
-        .emit_remote_step_event(
-            request_id,
-            HostName::new("feta"),
-            1,
-            2,
-            "Link issues to branch".into(),
-            StepStatus::Succeeded,
-        )
+        .emit_remote_step_event(request_id, HostName::new("feta"), 1, 2, "Link issues to branch".into(), StepStatus::Succeeded)
         .await;
     remote_command_router.complete_remote_step(request_id, HostName::new("feta"), vec![]).await;
 
@@ -761,15 +755,12 @@ async fn remote_command_remote_step_events_remap_to_presentation_command_id_and_
     .await
     .expect("timeout waiting for remapped step updates");
 
-    assert_eq!(
-        observed,
-        vec![
-            (0, 3, "Create checkout for branch feat-remap".into(), StepStatus::Started),
-            (0, 3, "Create checkout for branch feat-remap".into(), StepStatus::Succeeded),
-            (1, 3, "Link issues to branch".into(), StepStatus::Started),
-            (1, 3, "Link issues to branch".into(), StepStatus::Succeeded),
-        ]
-    );
+    assert_eq!(observed, vec![
+        (0, 3, "Create checkout for branch feat-remap".into(), StepStatus::Started),
+        (0, 3, "Create checkout for branch feat-remap".into(), StepStatus::Succeeded),
+        (1, 3, "Link issues to branch".into(), StepStatus::Started),
+        (1, 3, "Link issues to branch".into(), StepStatus::Succeeded),
+    ]);
 }
 
 #[tokio::test]
@@ -906,6 +897,197 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
     remote_command_router.complete_remote_cancel(cancel_id, None).await;
 
     assert!(matches!(ok_response(response.await.expect("cancel task"), 41), Response::Cancel));
+}
+
+#[tokio::test]
+async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_command_cancelled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
+    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+    let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+    let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
+    let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
+    let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+    let sent = Arc::new(StdMutex::new(Vec::new()));
+    peer_manager.lock().await.register_sender(HostName::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
+    let remote_command_router = make_remote_command_router(
+        &daemon,
+        &peer_manager,
+        &pending_remote_commands,
+        &forwarded_commands,
+        &pending_remote_cancels,
+        &next_remote_command_id,
+    );
+
+    let mut rx = daemon.subscribe();
+    let command_id = remote_command_router
+        .dispatch_execute(Command {
+            host: Some(HostName::new("feta")),
+            context_repo: None,
+            action: CommandAction::Checkout {
+                repo: RepoSelector::Identity(repo_identity.clone()),
+                target: CheckoutTarget::FreshBranch("feat-cancel-active-remote".into()),
+                issue_ids: vec![("github".into(), "123".into())],
+            },
+        })
+        .await
+        .expect("dispatch execute");
+
+    let request_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(request_id) = sent.lock().expect("lock").iter().find_map(|msg| match msg {
+                PeerWireMessage::Routed(RoutedPeerMessage::RemoteStepRequest { request_id, .. }) => Some(*request_id),
+                _ => None,
+            }) {
+                return request_id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timeout waiting for remote step request");
+
+    let daemon_for_task = Arc::clone(&daemon);
+    let peer_manager_for_task = Arc::clone(&peer_manager);
+    let pending_remote_commands_for_task = Arc::clone(&pending_remote_commands);
+    let forwarded_commands_for_task = Arc::clone(&forwarded_commands);
+    let pending_remote_cancels_for_task = Arc::clone(&pending_remote_cancels);
+    let next_remote_command_id_for_task = Arc::clone(&next_remote_command_id);
+    let agent_state_store_for_task = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let cancel_response = tokio::spawn(async move {
+        let remote_command_router = make_remote_command_router(
+            &daemon_for_task,
+            &peer_manager_for_task,
+            &pending_remote_commands_for_task,
+            &forwarded_commands_for_task,
+            &pending_remote_cancels_for_task,
+            &next_remote_command_id_for_task,
+        );
+        let request_dispatcher = RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store_for_task);
+        request_dispatcher.dispatch(403, Request::Cancel { command_id }).await
+    });
+
+    let cancel_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(cancel_id) = sent.lock().expect("lock").iter().find_map(|msg| match msg {
+                PeerWireMessage::Routed(RoutedPeerMessage::RemoteStepCancelRequest { cancel_id, remote_step_request_id, .. })
+                    if *remote_step_request_id == request_id =>
+                {
+                    Some(*cancel_id)
+                }
+                PeerWireMessage::Routed(RoutedPeerMessage::CommandCancelRequest { .. }) => {
+                    panic!("whole-command cancel should not be routed for an active remote step batch");
+                }
+                _ => None,
+            }) {
+                return cancel_id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timeout waiting for remote step cancel request");
+
+    remote_command_router.complete_remote_step_cancel(cancel_id, None).await;
+    assert!(matches!(ok_response(cancel_response.await.expect("cancel task"), 403), Response::Cancel));
+
+    remote_command_router.complete_remote_step(request_id, HostName::new("feta"), vec![]).await;
+
+    let finished = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await.expect("broadcast channel should stay open") {
+                DaemonEvent::CommandFinished { command_id: id, result, .. } if id == command_id => return result,
+                DaemonEvent::CommandStepUpdate { command_id: id, description, status, .. }
+                    if id == command_id && description == "Create workspace" =>
+                {
+                    panic!("local workspace step should not run after cancellation, saw {status:?}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for cancelled command to finish");
+
+    assert_eq!(finished, CommandValue::Cancelled);
+}
+
+#[tokio::test]
+async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
+    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+    let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+    let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
+    let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
+    let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+    let sent = Arc::new(StdMutex::new(Vec::new()));
+    peer_manager.lock().await.register_sender(HostName::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
+    let remote_command_router = make_remote_command_router(
+        &daemon,
+        &peer_manager,
+        &pending_remote_commands,
+        &forwarded_commands,
+        &pending_remote_cancels,
+        &next_remote_command_id,
+    );
+
+    let mut rx = daemon.subscribe();
+    let command_id = remote_command_router
+        .dispatch_execute(Command {
+            host: Some(HostName::new("feta")),
+            context_repo: None,
+            action: CommandAction::Checkout {
+                repo: RepoSelector::Identity(repo_identity.clone()),
+                target: CheckoutTarget::FreshBranch("feat-cancel-disconnect".into()),
+                issue_ids: vec![],
+            },
+        })
+        .await
+        .expect("dispatch execute");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if sent.lock().expect("lock").iter().any(|msg| {
+                matches!(msg, PeerWireMessage::Routed(RoutedPeerMessage::RemoteStepRequest { target_host, .. }) if *target_host == HostName::new("feta"))
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timeout waiting for remote step request");
+
+    remote_command_router.fail_pending_remote_steps_for_host(&HostName::new("feta")).await;
+
+    let finished = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await.expect("broadcast channel should stay open") {
+                DaemonEvent::CommandFinished { command_id: id, result, .. } if id == command_id => return result,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for disconnected command to finish");
+
+    match finished {
+        CommandValue::Error { message } => {
+            assert!(message.contains("disconnected"), "unexpected disconnect error: {message}");
+        }
+        other => panic!("expected disconnect error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

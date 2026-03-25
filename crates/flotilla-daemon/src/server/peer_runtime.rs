@@ -164,6 +164,7 @@ impl PeerRuntime {
                     let tx = peer_data_tx_for_ssh.clone();
                     let pm = Arc::clone(&peer_manager_task);
                     let daemon_for_cleanup = Arc::clone(&peer_daemon);
+                    let remote_command_router_for_cleanup = remote_command_router_task.clone();
                     let initial_rx = initial_rx_map.remove(&peer_name);
                     let peer_connected_tx_clone = peer_connected_tx_for_ssh.clone();
 
@@ -195,6 +196,7 @@ impl PeerRuntime {
                                 }
                             }
                             let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
+                            remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                             if plan.was_active {
                                 daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected).await;
                             }
@@ -249,6 +251,7 @@ impl PeerRuntime {
                                         }
                                     }
                                     let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
+                                    remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                                     if plan.was_active {
                                         daemon_for_cleanup
                                             .publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected)
