@@ -271,7 +271,8 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             }
         }
         DaemonEvent::CommandFinished { repo, result, .. } => {
-            if is_query_result(result) {
+            if repo.as_os_str().is_empty() {
+                // Query commands have no repo context — show result directly
                 format_command_result(result)
             } else {
                 format!("[command]  {}: finished \u{2192} {}", repo_name(repo), format_command_result(result))
@@ -491,26 +492,15 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
     Ok(())
 }
 
-fn is_query_result(result: &CommandValue) -> bool {
-    matches!(
-        result,
-        CommandValue::RepoDetail(_)
-            | CommandValue::RepoProviders(_)
-            | CommandValue::RepoWork(_)
-            | CommandValue::HostList(_)
-            | CommandValue::HostStatus(_)
-            | CommandValue::HostProviders(_)
-    )
-}
-
 pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {
+    let is_query = command.description().starts_with("query");
     let mut rx = daemon.subscribe();
     let command_id = daemon.execute(command).await?;
 
     loop {
         match rx.recv().await {
-            Ok(ref event @ DaemonEvent::CommandStarted { command_id: id, ref description, .. }) if id == command_id => {
-                if matches!(format, OutputFormat::Human) && !description.starts_with("query") {
+            Ok(ref event @ DaemonEvent::CommandStarted { command_id: id, .. }) if id == command_id => {
+                if matches!(format, OutputFormat::Human) && !is_query {
                     println!("{}", format_event_human(event));
                 }
             }
@@ -522,7 +512,7 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
             Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
                 match format {
                     OutputFormat::Human => {
-                        if is_query_result(result) {
+                        if is_query {
                             print!("{}", format_command_result(result));
                         } else {
                             println!("{}", format_event_human(event));
