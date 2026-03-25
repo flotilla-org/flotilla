@@ -35,7 +35,7 @@ use crate::{
     providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag},
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
-    step::run_step_plan,
+    step::run_step_plan_with_remote_executor,
 };
 
 fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
@@ -1946,7 +1946,8 @@ impl DaemonHandle for InProcessDaemon {
                         daemon_socket_path: daemon_socket_dhp.clone(),
                         local_host: resolver_local_host,
                     };
-                    let result = run_step_plan(
+                    let remote_executor = crate::step::UnsupportedRemoteStepExecutor;
+                    let result = run_step_plan_with_remote_executor(
                         step_plan,
                         id,
                         command_host.clone(),
@@ -1955,6 +1956,7 @@ impl DaemonHandle for InProcessDaemon {
                         token,
                         event_tx.clone(),
                         &resolver,
+                        &remote_executor,
                     )
                     .await;
                     refresh_trigger.notify_one();

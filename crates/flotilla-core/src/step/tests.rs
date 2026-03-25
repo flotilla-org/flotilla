@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
 use super::*;
 
@@ -28,6 +28,66 @@ fn make_step(desc: &str) -> Step {
 fn setup() -> (CancellationToken, broadcast::Sender<DaemonEvent>) {
     let (tx, _rx) = broadcast::channel(64);
     (CancellationToken::new(), tx)
+}
+
+#[derive(Clone)]
+struct TestRemoteExecutor {
+    batches: Arc<Mutex<Vec<TestRemoteBatch>>>,
+    cancelled: Arc<Mutex<Vec<u64>>>,
+    active_wait_for_cancel: Arc<Mutex<Option<Arc<Notify>>>>,
+}
+
+struct TestRemoteBatch {
+    assert_host: HostName,
+    progress: Vec<RemoteStepProgressUpdate>,
+    wait_for_cancel: Option<Arc<Notify>>,
+    result: Result<Vec<StepOutcome>, String>,
+}
+
+impl TestRemoteExecutor {
+    fn new(batches: Vec<TestRemoteBatch>) -> Self {
+        Self {
+            batches: Arc::new(Mutex::new(batches)),
+            cancelled: Arc::new(Mutex::new(Vec::new())),
+            active_wait_for_cancel: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn cancelled_commands(&self) -> Vec<u64> {
+        self.cancelled.lock().await.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteStepExecutor for TestRemoteExecutor {
+    async fn execute_batch(
+        &self,
+        request: RemoteStepBatchRequest,
+        progress_sink: Arc<dyn RemoteStepProgressSink>,
+    ) -> Result<Vec<StepOutcome>, String> {
+        let batch = self.batches.lock().await.remove(0);
+        assert_eq!(request.target_host, batch.assert_host);
+
+        for update in batch.progress {
+            progress_sink.emit(update).await;
+        }
+
+        if let Some(wait_for_cancel) = batch.wait_for_cancel {
+            *self.active_wait_for_cancel.lock().await = Some(Arc::clone(&wait_for_cancel));
+            wait_for_cancel.notified().await;
+            *self.active_wait_for_cancel.lock().await = None;
+        }
+
+        batch.result
+    }
+
+    async fn cancel_active_batch(&self, command_id: u64) -> Result<(), String> {
+        self.cancelled.lock().await.push(command_id);
+        if let Some(wait_for_cancel) = self.active_wait_for_cancel.lock().await.clone() {
+            wait_for_cancel.notify_waiters();
+        }
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -271,4 +331,222 @@ async fn later_failure_preserves_earlier_completed_with() {
     )
     .await;
     assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
+}
+
+#[tokio::test]
+async fn local_step_consumes_produced_outcome_from_remote_step() {
+    struct PriorAssertingResolver;
+
+    #[async_trait::async_trait]
+    impl StepResolver for PriorAssertingResolver {
+        async fn resolve(&self, _desc: &str, _action: StepAction, prior: &[StepOutcome]) -> Result<StepOutcome, String> {
+            assert_eq!(prior, &[StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach remote".into() })]);
+            Ok(StepOutcome::Completed)
+        }
+    }
+
+    let (cancel, tx) = setup();
+    let plan = StepPlan::new(vec![
+        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        make_step("local"),
+    ]);
+    let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
+        assert_host: HostName::new("feta"),
+        progress: vec![],
+        wait_for_cancel: None,
+        result: Ok(vec![StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach remote".into() })]),
+    }]);
+
+    let result = run_step_plan_with_remote_executor(
+        plan,
+        1,
+        HostName::local(),
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        ExecutionEnvironmentPath::new("/repo"),
+        cancel,
+        tx,
+        &PriorAssertingResolver,
+        &remote,
+    )
+    .await;
+
+    assert_eq!(result, CommandValue::Ok);
+}
+
+#[tokio::test]
+async fn remote_failure_stops_execution() {
+    struct PanicResolver;
+
+    #[async_trait::async_trait]
+    impl StepResolver for PanicResolver {
+        async fn resolve(&self, _desc: &str, _action: StepAction, _prior: &[StepOutcome]) -> Result<StepOutcome, String> {
+            panic!("local resolver should not be called after remote failure");
+        }
+    }
+
+    let (cancel, tx) = setup();
+    let mut rx = tx.subscribe();
+    let plan = StepPlan::new(vec![
+        Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        make_step("local"),
+    ]);
+    let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
+        assert_host: HostName::new("feta"),
+        progress: vec![
+            RemoteStepProgressUpdate {
+                batch_step_index: 0,
+                batch_step_count: 1,
+                description: "remote".into(),
+                status: StepStatus::Started,
+            },
+            RemoteStepProgressUpdate {
+                batch_step_index: 0,
+                batch_step_count: 1,
+                description: "remote".into(),
+                status: StepStatus::Failed { message: "boom".into() },
+            },
+        ],
+        wait_for_cancel: None,
+        result: Err("boom".into()),
+    }]);
+
+    let result = run_step_plan_with_remote_executor(
+        plan,
+        1,
+        HostName::local(),
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        ExecutionEnvironmentPath::new("/repo"),
+        cancel,
+        tx,
+        &PanicResolver,
+        &remote,
+    )
+    .await;
+
+    assert_eq!(result, CommandValue::Error { message: "boom".into() });
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(events.iter().all(|event| match event {
+        DaemonEvent::CommandStepUpdate { step_index, .. } => *step_index == 0,
+        _ => true,
+    }));
+}
+
+#[tokio::test]
+async fn remote_progress_maps_to_global_step_indices() {
+    let (cancel, tx) = setup();
+    let mut rx = tx.subscribe();
+    let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed), Ok(StepOutcome::Completed)]);
+    let plan = StepPlan::new(vec![
+        make_step("local-a"),
+        Step { description: "remote-a".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote-b".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        make_step("local-b"),
+    ]);
+    let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
+        assert_host: HostName::new("feta"),
+        progress: vec![
+            RemoteStepProgressUpdate {
+                batch_step_index: 0,
+                batch_step_count: 2,
+                description: "remote-a".into(),
+                status: StepStatus::Started,
+            },
+            RemoteStepProgressUpdate {
+                batch_step_index: 0,
+                batch_step_count: 2,
+                description: "remote-a".into(),
+                status: StepStatus::Succeeded,
+            },
+            RemoteStepProgressUpdate {
+                batch_step_index: 1,
+                batch_step_count: 2,
+                description: "remote-b".into(),
+                status: StepStatus::Started,
+            },
+            RemoteStepProgressUpdate {
+                batch_step_index: 1,
+                batch_step_count: 2,
+                description: "remote-b".into(),
+                status: StepStatus::Succeeded,
+            },
+        ],
+        wait_for_cancel: None,
+        result: Ok(vec![StepOutcome::Completed, StepOutcome::Completed]),
+    }]);
+
+    let result = run_step_plan_with_remote_executor(
+        plan,
+        7,
+        HostName::local(),
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        ExecutionEnvironmentPath::new("/repo"),
+        cancel,
+        tx,
+        &resolver,
+        &remote,
+    )
+    .await;
+
+    assert_eq!(result, CommandValue::Ok);
+
+    let remote_indices: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            DaemonEvent::CommandStepUpdate { host, step_index, .. } if host == HostName::new("feta") => Some(step_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(remote_indices, vec![1, 1, 2, 2]);
+}
+
+#[tokio::test]
+async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
+    struct PanicResolver;
+
+    #[async_trait::async_trait]
+    impl StepResolver for PanicResolver {
+        async fn resolve(&self, _desc: &str, _action: StepAction, _prior: &[StepOutcome]) -> Result<StepOutcome, String> {
+            panic!("local resolver should not run");
+        }
+    }
+
+    let wait_for_cancel = Arc::new(Notify::new());
+    let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
+        assert_host: HostName::new("feta"),
+        progress: vec![RemoteStepProgressUpdate {
+            batch_step_index: 0,
+            batch_step_count: 1,
+            description: "remote".into(),
+            status: StepStatus::Started,
+        }],
+        wait_for_cancel: Some(Arc::clone(&wait_for_cancel)),
+        result: Ok(vec![StepOutcome::Completed]),
+    }]);
+    let (cancel, tx) = setup();
+    let plan =
+        StepPlan::new(vec![Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop }]);
+
+    let cancel_clone = cancel.clone();
+    let remote_clone = remote.clone();
+    let task = tokio::spawn(async move {
+        run_step_plan_with_remote_executor(
+            plan,
+            11,
+            HostName::local(),
+            RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            ExecutionEnvironmentPath::new("/repo"),
+            cancel_clone,
+            tx,
+            &PanicResolver,
+            &remote_clone,
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    cancel.cancel();
+
+    let result = task.await.expect("join");
+    assert_eq!(result, CommandValue::Cancelled);
+    assert_eq!(remote.cancelled_commands().await, vec![11]);
 }
