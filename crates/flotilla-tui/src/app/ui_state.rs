@@ -112,6 +112,9 @@ pub struct UiState {
     pub layout: LayoutAreas,
     pub show_debug: bool,
     pub help_scroll: u16,
+    /// Transient echo of the last dispatched command, shown dim at the left of the status bar.
+    /// Examples: `"cr #42 open"`, `"/cr #42 ?"`.
+    pub command_echo: Option<String>,
 }
 
 impl UiState {
@@ -124,6 +127,7 @@ impl UiState {
             layout: LayoutAreas::default(),
             show_debug: false,
             help_scroll: 0,
+            command_echo: None,
         }
     }
 
