@@ -258,6 +258,7 @@ pub enum CommandValue {
         attachable_set_id: Option<AttachableSetId>,
         commands: Vec<ResolvedPaneCommand>,
     },
+    PreparedWorkspace(PreparedWorkspace),
     BranchNameGenerated {
         name: String,
         issue_ids: Vec<(String, String)>,
@@ -491,6 +492,14 @@ mod tests {
                 attachable_set_id: Some(AttachableSetId::new("set-1")),
                 commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
             },
+            CommandValue::PreparedWorkspace(PreparedWorkspace {
+                label: "feat-x".into(),
+                target_host: HostName::new("desktop"),
+                checkout_path: PathBuf::from("/remote/repo/feat-x"),
+                attachable_set_id: Some(AttachableSetId::new("set-1")),
+                template_yaml: Some("layout: []\ncontent: []\n".into()),
+                prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+            }),
             CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
             CommandValue::CheckoutStatus(CheckoutStatus {
                 branch: "old".into(),

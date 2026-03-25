@@ -464,14 +464,16 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
     let prepare = Step {
         description: "Prepare workspace".to_string(),
         host: StepHost::Remote(HostName::new("feta")),
-        action: StepAction::PrepareWorkspace { checkout_path: ExecutionEnvironmentPath::new("/repo/wt-feat-x"), label: "feat/x".into() },
+        action: StepAction::PrepareWorkspace {
+            checkout_path: Some(ExecutionEnvironmentPath::new("/repo/wt-feat-x")),
+            label: "feat/x".into(),
+        },
     };
     test_helpers::assert_roundtrip(&prepare);
 
-    let attach = Step {
-        description: "Attach workspace".to_string(),
-        host: StepHost::Local,
-        action: StepAction::AttachWorkspace { prepared_workspace: prepared },
-    };
+    let produced = StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared.clone()));
+    test_helpers::assert_roundtrip(&produced);
+
+    let attach = Step { description: "Attach workspace".to_string(), host: StepHost::Local, action: StepAction::AttachWorkspace };
     test_helpers::assert_roundtrip(&attach);
 }

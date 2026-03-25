@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    path_context::ExecutionEnvironmentPath, AttachableSetId, CommandValue, HostName, HostPath, PreparedTerminalCommand, PreparedWorkspace,
-    ResolvedPaneCommand,
+    path_context::ExecutionEnvironmentPath, AttachableSetId, CommandValue, HostName, HostPath, PreparedTerminalCommand, ResolvedPaneCommand,
 };
 
 /// Whether a checkout command targets an existing branch or creates a fresh one.
@@ -87,12 +86,10 @@ pub enum StepAction {
         commands: Vec<ResolvedPaneCommand>,
     },
     PrepareWorkspace {
-        checkout_path: ExecutionEnvironmentPath,
+        checkout_path: Option<ExecutionEnvironmentPath>,
         label: String,
     },
-    AttachWorkspace {
-        prepared_workspace: PreparedWorkspace,
-    },
+    AttachWorkspace,
     SelectWorkspace {
         ws_ref: String,
     },

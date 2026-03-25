@@ -7,23 +7,23 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::{
-    providers::types::{Workspace, WorkspaceConfig},
+    providers::types::{Workspace, WorkspaceAttachRequest},
     template::{self, PaneLayout, PaneTemplate, SurfaceTemplate, WorkspaceTemplate},
 };
 
 #[async_trait]
 pub trait WorkspaceManager: Send + Sync {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String>;
-    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<(String, Workspace), String>;
+    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String>;
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String>;
 }
 
-/// Resolve a `WorkspaceConfig` into a `PaneLayout` for workspace managers.
+/// Resolve a `WorkspaceAttachRequest` into a `PaneLayout` for workspace managers.
 ///
 /// Parses the template YAML as a `WorkspaceTemplate` (content + layout format),
-/// then builds panes from resolved commands. Falls back to the default template
+/// then builds panes from attach commands. Falls back to the default template
 /// when no YAML is provided or parsing fails.
-pub(crate) fn resolve_template(config: &WorkspaceConfig) -> PaneLayout {
+pub(crate) fn resolve_template(config: &WorkspaceAttachRequest) -> PaneLayout {
     let tmpl = if let Some(ref yaml) = config.template_yaml {
         serde_yml::from_str::<WorkspaceTemplate>(yaml).unwrap_or_else(|e| {
             tracing::warn!(err = %e, "failed to parse workspace template, using default");
@@ -33,11 +33,9 @@ pub(crate) fn resolve_template(config: &WorkspaceConfig) -> PaneLayout {
         template::default_template()
     };
 
-    if let Some(resolved) = config.resolved_commands.as_deref() {
-        // Terminal pool resolved commands — build panes from those
-        build_pane_layout(&tmpl, resolved)
+    if !config.attach_commands.is_empty() {
+        build_pane_layout(&tmpl, &config.attach_commands)
     } else {
-        // No terminal pool — render template vars into content commands directly
         let rendered = tmpl.render(&config.template_vars);
         let fallback: Vec<(String, String)> = rendered.content.iter().map(|e| (e.role.clone(), e.command.clone())).collect();
         build_pane_layout(&rendered, &fallback)

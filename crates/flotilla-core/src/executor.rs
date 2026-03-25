@@ -13,7 +13,9 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{arg::Arg, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, ResolvedPaneCommand};
+use flotilla_protocol::{
+    arg::Arg, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand,
+};
 use tracing::{debug, error, info};
 
 use self::{
@@ -137,11 +139,11 @@ pub async fn build_plan(
 
         CommandAction::GenerateBranchName { issue_keys } => Ok(build_generate_branch_name_plan(issue_keys)),
 
-        CommandAction::CreateWorkspaceForCheckout { checkout_path, label } => Ok(StepPlan::new(vec![Step {
-            description: format!("Create workspace for {label}"),
-            host: StepHost::Local,
-            action: StepAction::CreateWorkspaceForCheckout { label, checkout_path: Some(ExecutionEnvironmentPath::new(checkout_path)) },
-        }])),
+        CommandAction::CreateWorkspaceForCheckout { checkout_path, label } => Ok(build_create_workspace_plan(
+            workspace_label_for_host(&label, &remote_host),
+            Some(ExecutionEnvironmentPath::new(checkout_path)),
+            remote_host,
+        )),
 
         CommandAction::CreateWorkspaceFromPreparedTerminal { target_host, branch, checkout_path, attachable_set_id, commands } => {
             Ok(StepPlan::new(vec![Step {
@@ -239,6 +241,7 @@ fn build_create_checkout_plan(
     checkout_host: StepHost,
 ) -> StepPlan {
     let mut steps = Vec::new();
+    let workspace_host = checkout_host.clone();
 
     steps.push(Step {
         description: format!("Create checkout for branch {branch}"),
@@ -254,13 +257,28 @@ fn build_create_checkout_plan(
         });
     }
 
-    steps.push(Step {
-        description: "Create workspace".to_string(),
-        host: StepHost::Local,
-        action: StepAction::CreateWorkspaceForCheckout { label: branch, checkout_path: None },
-    });
+    let workspace_label = workspace_label_for_host(&branch, &workspace_host);
+    steps.extend(build_create_workspace_plan(workspace_label, None, workspace_host).steps);
 
     StepPlan::new(steps)
+}
+
+fn build_create_workspace_plan(label: String, checkout_path: Option<ExecutionEnvironmentPath>, checkout_host: StepHost) -> StepPlan {
+    StepPlan::new(vec![
+        Step {
+            description: format!("Prepare workspace for {label}"),
+            host: checkout_host,
+            action: StepAction::PrepareWorkspace { checkout_path, label },
+        },
+        Step { description: "Attach workspace".to_string(), host: StepHost::Local, action: StepAction::AttachWorkspace },
+    ])
+}
+
+fn workspace_label_for_host(label: &str, host: &StepHost) -> String {
+    match host {
+        StepHost::Local => label.to_string(),
+        StepHost::Remote(target_host) => format!("{label}@{target_host}"),
+    }
 }
 
 /// Build a step plan for `TeleportSession`.
@@ -454,6 +472,98 @@ impl StepResolver for ExecutorStepResolver {
                 let session_actions = ReadOnlySessionActionService::new(self.registry.as_ref(), self.providers_data.as_ref());
                 Ok(StepOutcome::CompletedWith(session_actions.generate_branch_name_result(&issue_keys).await))
             }
+            StepAction::PrepareWorkspace { checkout_path: explicit_path, label } => {
+                let prepared_checkout: Option<(ExecutionEnvironmentPath, String)> = if let Some(p) = explicit_path {
+                    let host_key = HostPath::new(self.local_host.clone(), p.as_path().to_path_buf());
+                    let branch = self
+                        .providers_data
+                        .checkouts
+                        .get(&host_key)
+                        .map(|checkout| checkout.branch.clone())
+                        .ok_or_else(|| format!("checkout not found: {}", p))?;
+                    Some((p, branch))
+                } else {
+                    prior.iter().find_map(|o| match o {
+                        StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch, path }) => {
+                            Some((ExecutionEnvironmentPath::new(path), branch.clone()))
+                        }
+                        _ => None,
+                    })
+                };
+
+                let Some((checkout_path, branch)) = prepared_checkout else {
+                    return Ok(StepOutcome::Skipped);
+                };
+
+                let tm = self.terminal_manager();
+                let workspace_orchestrator = WorkspaceOrchestrator::new(
+                    self.repo.root.as_path(),
+                    self.registry.as_ref(),
+                    self.config_base.as_path(),
+                    &self.attachable_store,
+                    self.daemon_socket_path.as_ref().map(|p| p.as_path()),
+                    &self.local_host,
+                    tm.as_ref(),
+                );
+                let attachable_set_id =
+                    workspace_orchestrator.ensure_attachable_set_for_checkout(&self.local_host, checkout_path.as_path());
+                let template_yaml =
+                    workspace_config(self.repo.root.as_path(), &label, checkout_path.as_path(), "claude", self.config_base.as_path())
+                        .template_yaml;
+                let prepared_commands = if let Some(ref tm) = tm {
+                    let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
+                    terminal_preparation
+                        .prepare_terminal_commands(&branch, checkout_path.as_path(), &[], || {
+                            workspace_config(
+                                self.repo.root.as_path(),
+                                &label,
+                                checkout_path.as_path(),
+                                "claude",
+                                self.config_base.as_path(),
+                            )
+                        })
+                        .await?
+                } else {
+                    terminals::render_fallback_commands(|| {
+                        workspace_config(self.repo.root.as_path(), &label, checkout_path.as_path(), "claude", self.config_base.as_path())
+                    })
+                    .into_iter()
+                    .map(|cmd| ResolvedPaneCommand { role: cmd.role, args: vec![Arg::Literal(cmd.command)] })
+                    .collect()
+                };
+
+                Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
+                    label,
+                    target_host: self.local_host.clone(),
+                    checkout_path: checkout_path.into_path_buf(),
+                    attachable_set_id,
+                    template_yaml,
+                    prepared_commands,
+                })))
+            }
+            StepAction::AttachWorkspace => {
+                let prepared = prior
+                    .iter()
+                    .rev()
+                    .find_map(|o| match o {
+                        StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared)) => Some(prepared.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| "prepared workspace not produced by prior step".to_string())?;
+
+                let tm = self.terminal_manager();
+                let workspace_orchestrator = WorkspaceOrchestrator::new(
+                    self.repo.root.as_path(),
+                    self.registry.as_ref(),
+                    self.config_base.as_path(),
+                    &self.attachable_store,
+                    self.daemon_socket_path.as_ref().map(|p| p.as_path()),
+                    &self.local_host,
+                    tm.as_ref(),
+                );
+                workspace_orchestrator.attach_prepared_workspace(&prepared).await?;
+                Ok(StepOutcome::Completed)
+            }
             StepAction::CreateWorkspaceForCheckout { label, checkout_path: explicit_path } => {
                 let path: Option<ExecutionEnvironmentPath> = if let Some(p) = explicit_path {
                     let host_key = HostPath::new(self.local_host.clone(), p.as_path().to_path_buf());
@@ -497,13 +607,14 @@ impl StepResolver for ExecutorStepResolver {
                     tm.as_ref(),
                 );
                 workspace_orchestrator
-                    .create_workspace_from_prepared_terminal(
-                        &target_host,
-                        &branch,
-                        checkout_path.as_path(),
-                        attachable_set_id.as_ref(),
-                        &commands,
-                    )
+                    .attach_prepared_workspace(&PreparedWorkspace {
+                        label: format!("{branch}@{target_host}"),
+                        target_host,
+                        checkout_path: checkout_path.into_path_buf(),
+                        attachable_set_id,
+                        template_yaml: None,
+                        prepared_commands: commands,
+                    })
                     .await?;
                 Ok(StepOutcome::Completed)
             }
@@ -653,8 +764,7 @@ impl StepResolver for ExecutorStepResolver {
                     }
                 }
             }
-            #[cfg(any(test, feature = "test-support"))]
-            StepAction::Noop => Ok(StepOutcome::Completed),
+            _ => Ok(StepOutcome::Completed),
         }
     }
 }

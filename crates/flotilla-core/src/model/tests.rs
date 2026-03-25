@@ -11,7 +11,7 @@ use crate::{
         issue_tracker::IssueTracker,
         types::{
             AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
-            WorkspaceConfig,
+            WorkspaceAttachRequest,
         },
         vcs::{CheckoutManager, Vcs},
         workspace::WorkspaceManager,
@@ -136,7 +136,7 @@ impl WorkspaceManager for StubWorkspaceManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         Ok(vec![])
     }
-    async fn create_workspace(&self, _: &WorkspaceConfig) -> Result<(String, Workspace), String> {
+    async fn create_workspace(&self, _: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         Err("stub".into())
     }
     async fn select_workspace(&self, _: &str) -> Result<(), String> {

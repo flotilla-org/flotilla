@@ -109,7 +109,7 @@ struct MockWorkspaceManager {
     existing: Vec<(String, Workspace)>,
     create_result: tokio::sync::Mutex<Result<(), String>>,
     select_result: tokio::sync::Mutex<Result<(), String>>,
-    created_configs: tokio::sync::Mutex<Vec<WorkspaceConfig>>,
+    created_configs: tokio::sync::Mutex<Vec<WorkspaceAttachRequest>>,
     calls: tokio::sync::Mutex<Vec<String>>,
 }
 
@@ -151,7 +151,7 @@ impl WorkspaceManager for MockWorkspaceManager {
         self.calls.lock().await.push("list_workspaces".to_string());
         Ok(self.existing.clone())
     }
-    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<(String, Workspace), String> {
+    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         self.created_configs.lock().await.push(config.clone());
         self.calls.lock().await.push(format!("create_workspace:{}", config.name));
         let result = self.create_result.lock().await;
@@ -648,7 +648,7 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
     let created = workspace_manager.created_configs.lock().await;
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].working_directory, ExecutionEnvironmentPath::new(&repo_root));
-    let resolved = created[0].resolved_commands.as_ref().expect("resolved commands");
+    let resolved = &created[0].attach_commands;
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].0, "main");
     assert!(resolved[0].1.contains("ssh -t"));
@@ -832,7 +832,7 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
     assert_eq!(created.len(), 1);
     assert!(!created[0].working_directory.as_path().to_string_lossy().starts_with("<remote>/"));
     assert!(created[0].working_directory.as_path().exists(), "fallback working directory should exist");
-    let resolved = created[0].resolved_commands.as_ref().expect("resolved commands");
+    let resolved = &created[0].attach_commands;
     assert!(resolved[0].1.contains("${SHELL:-/bin/sh} -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
 }
 
@@ -1820,9 +1820,10 @@ async fn build_plan_create_checkout_returns_steps() {
 
     match plan {
         Ok(step_plan) => {
-            assert_eq!(step_plan.steps.len(), 2, "checkout + workspace steps");
+            assert_eq!(step_plan.steps.len(), 3, "checkout + prepare + attach steps");
             assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-            assert_eq!(step_plan.steps[1].description, "Create workspace");
+            assert_eq!(step_plan.steps[1].description, "Prepare workspace for feat-x");
+            assert_eq!(step_plan.steps[2].description, "Attach workspace");
         }
         Err(_) => panic!("expected Ok, got Err"),
     }
@@ -1848,9 +1849,10 @@ async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
     .await
     .expect("build plan");
 
-    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps.len(), 3);
     assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
-    assert_eq!(plan.steps[1].host, StepHost::Local);
+    assert_eq!(plan.steps[1].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[2].host, StepHost::Local);
 }
 
 #[tokio::test]
@@ -1876,11 +1878,13 @@ async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
     .await
     .expect("build plan");
 
-    assert_eq!(plan.steps.len(), 3);
+    assert_eq!(plan.steps.len(), 4);
     assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
     assert_eq!(plan.steps[1].host, StepHost::Remote(HostName::new("feta")));
-    assert_eq!(plan.steps[2].description, "Create workspace");
-    assert_eq!(plan.steps[2].host, StepHost::Local);
+    assert_eq!(plan.steps[2].description, "Prepare workspace for feat-x@feta");
+    assert_eq!(plan.steps[2].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[3].description, "Attach workspace");
+    assert_eq!(plan.steps[3].host, StepHost::Local);
 }
 
 #[tokio::test]
@@ -1904,9 +1908,10 @@ async fn build_plan_create_checkout_treats_local_host_as_local() {
     .await
     .expect("build plan");
 
-    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps.len(), 3);
     assert_eq!(plan.steps[0].host, StepHost::Local);
     assert_eq!(plan.steps[1].host, StepHost::Local);
+    assert_eq!(plan.steps[2].host, StepHost::Local);
 }
 
 #[tokio::test]
@@ -1923,9 +1928,10 @@ async fn build_plan_create_checkout_skips_existing() {
 
     match plan {
         Ok(step_plan) => {
-            assert_eq!(step_plan.steps.len(), 2, "checkout + workspace steps");
+            assert_eq!(step_plan.steps.len(), 3, "checkout + prepare + attach steps");
             assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-            assert_eq!(step_plan.steps[1].description, "Create workspace");
+            assert_eq!(step_plan.steps[1].description, "Prepare workspace for feat-x");
+            assert_eq!(step_plan.steps[2].description, "Attach workspace");
         }
         Err(_) => panic!("expected Ok, got Err"),
     }
@@ -1941,9 +1947,10 @@ async fn checkout_plan_includes_workspace_step() {
 
     match plan {
         Ok(step_plan) => {
-            assert_eq!(step_plan.steps.len(), 2, "expected checkout + workspace steps");
+            assert_eq!(step_plan.steps.len(), 3, "expected checkout + prepare + attach steps");
             assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-            assert_eq!(step_plan.steps[1].description, "Create workspace");
+            assert_eq!(step_plan.steps[1].description, "Prepare workspace for feat-x");
+            assert_eq!(step_plan.steps[2].description, "Attach workspace");
         }
         Err(_) => panic!("expected Ok"),
     }
@@ -1971,6 +1978,68 @@ async fn build_plan_prepare_terminal_uses_command_host_for_terminal_step() {
 
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
+}
+
+#[tokio::test]
+async fn build_plan_create_workspace_for_checkout_uses_prepare_and_attach_steps_locally() {
+    let registry = empty_registry();
+    let mut data = empty_data();
+    let path = PathBuf::from("/repo/wt-feat");
+    data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
+
+    let plan = build_plan(
+        local_command(CommandAction::CreateWorkspaceForCheckout { checkout_path: path.clone(), label: "feat".into() }),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        local_host(),
+    )
+    .await
+    .expect("build plan");
+
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].host, StepHost::Local);
+    assert!(matches!(
+        plan.steps[0].action,
+        StepAction::PrepareWorkspace { ref checkout_path, ref label }
+            if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat"
+    ));
+    assert_eq!(plan.steps[1].host, StepHost::Local);
+    assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
+}
+
+#[tokio::test]
+async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_attach() {
+    let registry = empty_registry();
+    let mut data = empty_data();
+    let path = PathBuf::from("/repo/wt-feat");
+    data.checkouts.insert(HostPath::new(HostName::new("feta"), path.clone()), TestCheckout::new("feat").build());
+
+    let plan = build_plan(
+        command_with_host("feta", CommandAction::CreateWorkspaceForCheckout { checkout_path: path.clone(), label: "feat".into() }),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        local_host(),
+    )
+    .await
+    .expect("build plan");
+
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
+    assert!(matches!(
+        plan.steps[0].action,
+        StepAction::PrepareWorkspace { ref checkout_path, ref label }
+            if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat@feta"
+    ));
+    assert_eq!(plan.steps[1].host, StepHost::Local);
+    assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
 }
 
 #[tokio::test]

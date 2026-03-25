@@ -132,7 +132,7 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         Ok(workspaces)
     }
 
-    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<(String, Workspace), String> {
+    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         info!(workspace = %config.name, "tmux: creating workspace");
 
         let rendered = super::resolve_template(config);
@@ -429,24 +429,24 @@ mod tests {
         let mgr = TmuxWorkspaceManager::new(runner.clone(), state_dir);
 
         // Create workspace "feat-123"
-        let config1 = WorkspaceConfig {
+        let config1 = WorkspaceAttachRequest {
             name: "feat-123".to_string(),
             working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
-            resolved_commands: None,
+            attach_commands: vec![],
         };
         let (name1, ws1) = mgr.create_workspace(&config1).await.unwrap();
         assert_eq!(name1, "feat-123");
         assert_eq!(ws1.name, "feat-123");
 
         // Create workspace "fix-456"
-        let config2 = WorkspaceConfig {
+        let config2 = WorkspaceAttachRequest {
             name: "fix-456".to_string(),
             working_directory: ExecutionEnvironmentPath::new("/tmp"),
             template_yaml: None,
             template_vars: HashMap::new(),
-            resolved_commands: None,
+            attach_commands: vec![],
         };
         let (name2, ws2) = mgr.create_workspace(&config2).await.unwrap();
         assert_eq!(name2, "fix-456");

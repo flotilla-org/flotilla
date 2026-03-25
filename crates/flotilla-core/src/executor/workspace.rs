@@ -1,6 +1,6 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
-use flotilla_protocol::{arg, AttachableSetId, HostName, HostPath, ResolvedPaneCommand};
+use flotilla_protocol::{arg, AttachableSetId, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand};
 use tracing::{info, warn};
 
 use super::{terminals::TerminalPreparationService, workspace_config};
@@ -15,7 +15,7 @@ use crate::{
         ResolutionContext, ResolvedAction,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::{registry::ProviderRegistry, workspace::WorkspaceManager},
+    providers::{registry::ProviderRegistry, types::WorkspaceAttachRequest, workspace::WorkspaceManager},
     step::StepOutcome,
     terminal_manager::TerminalManager,
 };
@@ -57,8 +57,9 @@ impl<'a> WorkspaceOrchestrator<'a> {
             let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
             terminal_preparation.resolve_workspace_commands(&mut config).await;
         }
+        let attach_request = workspace_attach_request_from_config(config);
 
-        match ws_mgr.create_workspace(&config).await {
+        match ws_mgr.create_workspace(&attach_request).await {
             Ok((ws_ref, _workspace)) => {
                 self.persist_workspace_binding(provider_name, &ws_ref, self.local_host, checkout_path);
                 Ok(StepOutcome::Completed)
@@ -77,8 +78,9 @@ impl<'a> WorkspaceOrchestrator<'a> {
             let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
             terminal_preparation.resolve_workspace_commands(&mut config).await;
         }
+        let attach_request = workspace_attach_request_from_config(config);
 
-        match ws_mgr.create_workspace(&config).await {
+        match ws_mgr.create_workspace(&attach_request).await {
             Ok((ws_ref, _workspace)) => {
                 self.persist_workspace_binding(provider_name, &ws_ref, self.local_host, checkout_path);
                 Ok(())
@@ -87,20 +89,22 @@ impl<'a> WorkspaceOrchestrator<'a> {
         }
     }
 
-    pub(super) async fn create_workspace_from_prepared_terminal(
-        &self,
-        target_host: &HostName,
-        branch: &str,
-        checkout_path: &Path,
-        attachable_set_id: Option<&AttachableSetId>,
-        commands: &[ResolvedPaneCommand],
-    ) -> Result<(), String> {
+    pub(super) async fn attach_prepared_workspace(&self, prepared: &PreparedWorkspace) -> Result<(), String> {
         let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
             return Ok(());
         };
 
-        let resolved_commands =
-            resolve_prepared_commands_via_hop_chain(target_host, checkout_path, commands, self.config_base, self.local_host)?;
+        if prepared.target_host == *self.local_host && self.select_existing_workspace(ws_mgr.as_ref(), &prepared.checkout_path).await {
+            return Ok(());
+        }
+
+        let attach_commands = resolve_prepared_commands_via_hop_chain(
+            &prepared.target_host,
+            &prepared.checkout_path,
+            &prepared.prepared_commands,
+            self.config_base,
+            self.local_host,
+        )?;
 
         // The workspace itself is local to the presentation host, so its
         // working directory only needs to be a valid local directory.
@@ -116,14 +120,20 @@ impl<'a> WorkspaceOrchestrator<'a> {
         } else {
             ExecutionEnvironmentPath::new(self.config_base)
         };
-        let remote_name = format!("{branch}@{target_host}");
-        let mut config = workspace_config(self.repo_root, &remote_name, working_dir.as_path(), "claude", self.config_base);
-        config.resolved_commands = Some(resolved_commands);
+        let attach_request = WorkspaceAttachRequest {
+            name: prepared.label.clone(),
+            working_directory: working_dir,
+            template_vars: HashMap::from([("main_command".to_string(), "claude".to_string())]),
+            template_yaml: prepared.template_yaml.clone(),
+            attach_commands,
+        };
 
-        match ws_mgr.create_workspace(&config).await {
+        match ws_mgr.create_workspace(&attach_request).await {
             Ok((ws_ref, _workspace)) => {
-                if let Some(set_id) = attachable_set_id {
-                    self.persist_workspace_binding_for_set(provider_name, &ws_ref, set_id, target_host, checkout_path);
+                if let Some(set_id) = prepared.attachable_set_id.as_ref() {
+                    self.persist_workspace_binding_for_set(provider_name, &ws_ref, set_id, &prepared.target_host, &prepared.checkout_path);
+                } else {
+                    self.persist_workspace_binding(provider_name, &ws_ref, &prepared.target_host, &prepared.checkout_path);
                 }
                 Ok(())
             }
@@ -239,6 +249,16 @@ impl<'a> WorkspaceOrchestrator<'a> {
                 warn!(err = %err, "failed to persist attachable registry after workspace binding update");
             }
         }
+    }
+}
+
+fn workspace_attach_request_from_config(config: crate::providers::types::WorkspaceConfig) -> WorkspaceAttachRequest {
+    WorkspaceAttachRequest {
+        name: config.name,
+        working_directory: config.working_directory,
+        template_vars: config.template_vars,
+        template_yaml: config.template_yaml,
+        attach_commands: config.resolved_commands.unwrap_or_default(),
     }
 }
 

@@ -103,7 +103,7 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         Ok(workspaces)
     }
 
-    async fn create_workspace(&self, config: &WorkspaceConfig) -> Result<(String, Workspace), String> {
+    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         info!(workspace = %config.name, "cmux: creating workspace");
 
         let rendered = super::resolve_template(config);
@@ -306,12 +306,12 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_returns_error_when_ref_missing() {
         let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
-        let config = WorkspaceConfig {
+        let config = WorkspaceAttachRequest {
             name: "demo".into(),
             working_directory: ExecutionEnvironmentPath::new("/tmp/repo"),
             template_vars: std::collections::HashMap::new(),
             template_yaml: None,
-            resolved_commands: None,
+            attach_commands: vec![],
         };
 
         let err = manager.create_workspace(&config).await.expect_err("should fail when ref is missing");

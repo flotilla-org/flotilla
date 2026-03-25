@@ -198,7 +198,7 @@ impl WorkspaceManager for MockWorkspaceManager {
         self.result.clone()
     }
 
-    async fn create_workspace(&self, _config: &WorkspaceConfig) -> Result<(String, Workspace), String> {
+    async fn create_workspace(&self, _config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         Err("not implemented".to_string())
     }
 
