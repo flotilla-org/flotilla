@@ -742,3 +742,83 @@ mod repo_name_fn {
         assert_eq!(repo_name(Path::new("/home/user/projects/flotilla")), "flotilla");
     }
 }
+
+mod query_event_formatting {
+    use std::path::PathBuf;
+
+    use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostListResponse, HostName, RepoIdentity};
+
+    use crate::cli::format_event_human;
+
+    fn test_identity() -> RepoIdentity {
+        RepoIdentity { authority: String::new(), path: String::new() }
+    }
+
+    fn query_started(description: &str) -> DaemonEvent {
+        DaemonEvent::CommandStarted {
+            command_id: 1,
+            host: HostName::local(),
+            repo_identity: test_identity(),
+            repo: PathBuf::default(),
+            description: description.to_string(),
+        }
+    }
+
+    fn query_finished(result: CommandValue) -> DaemonEvent {
+        DaemonEvent::CommandFinished {
+            command_id: 1,
+            host: HostName::local(),
+            repo_identity: test_identity(),
+            repo: PathBuf::default(),
+            result,
+        }
+    }
+
+    #[test]
+    fn started_event_with_empty_repo_shows_query_prefix() {
+        let output = format_event_human(&query_started("query repo detail"));
+        assert!(output.starts_with("[query]"), "expected [query] prefix, got: {output}");
+        assert!(output.contains("query repo detail"));
+    }
+
+    #[test]
+    fn started_event_with_repo_shows_command_prefix() {
+        let event = DaemonEvent::CommandStarted {
+            command_id: 1,
+            host: HostName::local(),
+            repo_identity: test_identity(),
+            repo: PathBuf::from("/tmp/myrepo"),
+            description: "checkout".to_string(),
+        };
+        let output = format_event_human(&event);
+        assert!(output.starts_with("[command]"), "expected [command] prefix, got: {output}");
+    }
+
+    #[test]
+    fn finished_query_success_shows_result_directly() {
+        let result = CommandValue::HostList(Box::new(HostListResponse { hosts: vec![] }));
+        let output = format_event_human(&query_finished(result));
+        assert!(!output.contains("[command]"), "query result should not have [command] prefix, got: {output}");
+    }
+
+    #[test]
+    fn finished_query_error_shows_error_directly() {
+        let result = CommandValue::Error { message: "repo not found".into() };
+        let output = format_event_human(&query_finished(result));
+        assert!(!output.contains("[command]"), "query error should not have [command] prefix, got: {output}");
+        assert!(output.contains("error: repo not found"));
+    }
+
+    #[test]
+    fn finished_non_query_shows_command_prefix() {
+        let event = DaemonEvent::CommandFinished {
+            command_id: 1,
+            host: HostName::local(),
+            repo_identity: test_identity(),
+            repo: PathBuf::from("/tmp/myrepo"),
+            result: CommandValue::Ok,
+        };
+        let output = format_event_human(&event);
+        assert!(output.starts_with("[command]"), "non-query result should have [command] prefix, got: {output}");
+    }
+}

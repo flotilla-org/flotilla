@@ -358,12 +358,23 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
-    let repo_selector = match (&cli.repo, std::env::var("FLOTILLA_REPO").ok()) {
+fn resolve_repo_from_env(cli: &Cli) -> Option<RepoSelector> {
+    match (&cli.repo, std::env::var("FLOTILLA_REPO").ok()) {
         (Some(repo), _) => Some(RepoSelector::Query(repo.clone())),
         (None, Some(repo)) if !repo.is_empty() => Some(RepoSelector::Query(repo)),
         _ => None,
-    };
+    }
+}
+
+fn set_context_repo(cmd: &mut Command, cli: &Cli) {
+    if cmd.context_repo.is_some() {
+        return;
+    }
+    cmd.context_repo = resolve_repo_from_env(cli);
+}
+
+fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
+    let repo_selector = resolve_repo_from_env(cli);
 
     match &mut cmd.action {
         CommandAction::Checkout { repo, .. } if *repo == RepoSelector::Query(String::new()) => {
@@ -382,46 +393,21 @@ fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch(mut resolved: flotilla_commands::Resolved, cli: &Cli, format: OutputFormat) -> Result<()> {
-    use flotilla_commands::Resolved;
+async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: OutputFormat) -> Result<()> {
+    use flotilla_commands::{RepoContext, Resolved};
     reset_sigpipe();
-    if let Resolved::Command(ref mut cmd) = resolved {
-        inject_repo_context(cmd, cli)?;
-    }
     match resolved {
-        Resolved::Command(cmd) => run_control_command(cli, cmd, format).await,
-        Resolved::RepoDetail { slug } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_repo_detail(&*daemon, &slug, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::RepoProviders { slug } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_repo_providers(&*daemon, &slug, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::RepoWork { slug } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_repo_work(&*daemon, &slug, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostList => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_host_list(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostStatus { host } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_host_status(&*daemon, &host, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostProviders { host } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_host_providers(&*daemon, &host, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostRepoDetail { host, slug } => {
-            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug}"))
-        }
-        Resolved::HostRepoProviders { host, slug } => {
-            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug} providers"))
-        }
-        Resolved::HostRepoWork { host, slug } => {
-            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug} work"))
+        Resolved::Ready(cmd) => run_control_command(cli, cmd, format).await,
+        // HostResolution is not interpreted at the CLI edge — SubjectHost and ProviderHost
+        // require item context (TUI-only), and ProvisioningTarget is handled by wrapping the
+        // command in `host <name> ...` syntax which sets Command.host during noun resolution.
+        // Phase 2 palette and TUI dispatch will use HostResolution via resolve_host().
+        Resolved::NeedsContext { mut command, repo, .. } => {
+            match repo {
+                RepoContext::Required => inject_repo_context(&mut command, cli)?,
+                RepoContext::Inferred => set_context_repo(&mut command, cli),
+            }
+            run_control_command(cli, command, format).await
         }
     }
 }

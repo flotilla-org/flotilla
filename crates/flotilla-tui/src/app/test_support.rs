@@ -14,9 +14,8 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, ProviderData, ProviderError,
-    RepoDelta, RepoDetailResponse, RepoInfo, RepoLabels, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, StatusResponse, StreamKey,
-    TopologyResponse, WorkItem,
+    Change, Command, DaemonEvent, HostName, ProviderData, ProviderError, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot, StatusResponse,
+    StreamKey, TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
@@ -67,30 +66,6 @@ impl DaemonHandle for StubDaemon {
 
     async fn get_status(&self) -> Result<StatusResponse, String> {
         Ok(StatusResponse { repos: vec![] })
-    }
-
-    async fn get_repo_detail(&self, _repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
-        Err("stub".into())
-    }
-
-    async fn get_repo_providers(&self, _repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
-        Err("stub".into())
-    }
-
-    async fn get_repo_work(&self, _repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
-        Err("stub".into())
-    }
-
-    async fn list_hosts(&self) -> Result<HostListResponse, String> {
-        Err("stub".into())
-    }
-
-    async fn get_host_status(&self, _host: &str) -> Result<HostStatusResponse, String> {
-        Err("stub".into())
-    }
-
-    async fn get_host_providers(&self, _host: &str) -> Result<HostProvidersResponse, String> {
-        Err("stub".into())
     }
 
     async fn get_topology(&self) -> Result<TopologyResponse, String> {

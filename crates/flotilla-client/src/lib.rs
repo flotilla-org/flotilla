@@ -11,8 +11,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, DaemonEvent, HostListResponse, HostProvidersResponse, HostStatusResponse, Message, ReplayCursor, RepoDetailResponse,
-    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoWorkResponse, Request, Response, ResponseResult, StatusResponse,
+    Command, DaemonEvent, Message, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot, Request, Response, ResponseResult, StatusResponse,
     StreamKey, TopologyResponse,
 };
 use tokio::{
@@ -395,20 +394,6 @@ fn encode_replay_cursors(last_seen: &HashMap<StreamKey, u64>) -> Vec<ReplayCurso
     last_seen.iter().map(|(stream, &seq)| ReplayCursor { stream: stream.clone(), seq }).collect()
 }
 
-/// Convert a `RepoSelector` to a query string for use in RPC requests that
-/// still use `slug: String` on the wire.
-///
-/// `Identity` selectors are converted via `to_string()` and sent as a slug
-/// query. This works when the identity string matches a known slug but may
-/// produce confusing errors if it doesn't.
-fn repo_selector_to_query_string(selector: &flotilla_protocol::RepoSelector) -> String {
-    match selector {
-        flotilla_protocol::RepoSelector::Path(p) => p.display().to_string(),
-        flotilla_protocol::RepoSelector::Query(q) => q.clone(),
-        flotilla_protocol::RepoSelector::Identity(id) => id.to_string(),
-    }
-}
-
 fn into_success_response(result: ResponseResult) -> Result<Response, String> {
     match result {
         ResponseResult::Ok { response } => Ok(*response),
@@ -679,51 +664,6 @@ impl DaemonHandle for SocketDaemon {
         match into_success_response(self.request(Request::GetStatus).await?)? {
             Response::GetStatus(status) => Ok(status),
             other => Err(format!("unexpected response for get_status: {other:?}")),
-        }
-    }
-
-    async fn get_repo_detail(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
-        let slug = repo_selector_to_query_string(repo);
-        match into_success_response(self.request(Request::GetRepoDetail { slug }).await?)? {
-            Response::GetRepoDetail(detail) => Ok(detail),
-            other => Err(format!("unexpected response for get_repo_detail: {other:?}")),
-        }
-    }
-
-    async fn get_repo_providers(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
-        let slug = repo_selector_to_query_string(repo);
-        match into_success_response(self.request(Request::GetRepoProviders { slug }).await?)? {
-            Response::GetRepoProviders(providers) => Ok(providers),
-            other => Err(format!("unexpected response for get_repo_providers: {other:?}")),
-        }
-    }
-
-    async fn get_repo_work(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoWorkResponse, String> {
-        let slug = repo_selector_to_query_string(repo);
-        match into_success_response(self.request(Request::GetRepoWork { slug }).await?)? {
-            Response::GetRepoWork(work) => Ok(work),
-            other => Err(format!("unexpected response for get_repo_work: {other:?}")),
-        }
-    }
-
-    async fn list_hosts(&self) -> Result<HostListResponse, String> {
-        match into_success_response(self.request(Request::ListHosts).await?)? {
-            Response::ListHosts(hosts) => Ok(hosts),
-            other => Err(format!("unexpected response for list_hosts: {other:?}")),
-        }
-    }
-
-    async fn get_host_status(&self, host: &str) -> Result<HostStatusResponse, String> {
-        match into_success_response(self.request(Request::GetHostStatus { host: host.to_string() }).await?)? {
-            Response::GetHostStatus(status) => Ok(status),
-            other => Err(format!("unexpected response for get_host_status: {other:?}")),
-        }
-    }
-
-    async fn get_host_providers(&self, host: &str) -> Result<HostProvidersResponse, String> {
-        match into_success_response(self.request(Request::GetHostProviders { host: host.to_string() }).await?)? {
-            Response::GetHostProviders(providers) => Ok(providers),
-            other => Err(format!("unexpected response for get_host_providers: {other:?}")),
         }
     }
 

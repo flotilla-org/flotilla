@@ -185,11 +185,11 @@ async fn send_request_cleans_pending_on_timeout() {
     let request_writer = Arc::clone(&harness.writer);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::ListHosts).await });
+    let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetStatus).await });
 
     let (id, request) = read_request(&mut harness.lines).await;
     assert_eq!(id, 1);
-    assert_eq!(request, Request::ListHosts);
+    assert_eq!(request, Request::GetStatus);
 
     tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
@@ -577,7 +577,8 @@ async fn recover_from_gap_handles_parse_error_gracefully() {
 
     // Respond with the wrong success variant.
     let tx = harness.pending.lock().await.remove(&id).expect("pending sender");
-    tx.send(ResponseResult::Ok { response: Box::new(Response::ListHosts(HostListResponse { hosts: vec![] })) }).expect("send bad response");
+    tx.send(ResponseResult::Ok { response: Box::new(Response::GetStatus(flotilla_protocol::StatusResponse { repos: vec![] })) })
+        .expect("send bad response");
 
     // Should complete without panic.
     recover_task.await.expect("recover_from_gap should not panic on unexpected response variant");

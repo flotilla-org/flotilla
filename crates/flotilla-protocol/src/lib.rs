@@ -65,7 +65,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
@@ -99,12 +99,6 @@ pub enum Request {
     RemoveRepo { path: std::path::PathBuf },
     ReplaySince { last_seen: Vec<ReplayCursor> },
     GetStatus,
-    GetRepoDetail { slug: String },
-    GetRepoProviders { slug: String },
-    GetRepoWork { slug: String },
-    ListHosts,
-    GetHostStatus { host: String },
-    GetHostProviders { host: String },
     GetTopology,
     AgentHook { event: AgentHookEvent },
 }
@@ -124,12 +118,6 @@ pub enum Response {
     RemoveRepo,
     ReplaySince(Vec<DaemonEvent>),
     GetStatus(StatusResponse),
-    GetRepoDetail(RepoDetailResponse),
-    GetRepoProviders(RepoProvidersResponse),
-    GetRepoWork(RepoWorkResponse),
-    ListHosts(HostListResponse),
-    GetHostStatus(HostStatusResponse),
-    GetHostProviders(HostProvidersResponse),
     GetTopology(TopologyResponse),
     AgentHook,
 }

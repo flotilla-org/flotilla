@@ -13,12 +13,12 @@ pub type ProviderHealthMap = HashMap<String, HashMap<String, bool>>;
 
 // --- status ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub repos: Vec<RepoSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSummary {
     pub path: PathBuf,
     pub slug: Option<String>,
@@ -29,7 +29,7 @@ pub struct RepoSummary {
 
 // --- repo detail ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoDetailResponse {
     pub path: PathBuf,
     pub slug: Option<String>,
@@ -40,7 +40,7 @@ pub struct RepoDetailResponse {
 
 // --- repo providers ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoProvidersResponse {
     pub path: PathBuf,
     pub slug: Option<String>,
@@ -50,20 +50,20 @@ pub struct RepoProvidersResponse {
     pub unmet_requirements: Vec<UnmetRequirementInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryEntry {
     pub kind: String,
     pub detail: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderInfo {
     pub category: String,
     pub name: String,
     pub healthy: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnmetRequirementInfo {
     pub factory: String,
     pub kind: String,
@@ -73,7 +73,7 @@ pub struct UnmetRequirementInfo {
 
 // --- repo work ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoWorkResponse {
     pub path: PathBuf,
     pub slug: Option<String>,
