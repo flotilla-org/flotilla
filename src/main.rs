@@ -398,6 +398,10 @@ async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: Outp
     reset_sigpipe();
     match resolved {
         Resolved::Ready(cmd) => run_control_command(cli, cmd, format).await,
+        // HostResolution is not interpreted at the CLI edge — SubjectHost and ProviderHost
+        // require item context (TUI-only), and ProvisioningTarget is handled by wrapping the
+        // command in `host <name> ...` syntax which sets Command.host during noun resolution.
+        // Phase 2 palette and TUI dispatch will use HostResolution via resolve_host().
         Resolved::NeedsContext { mut command, repo, .. } => {
             match repo {
                 RepoContext::Required => inject_repo_context(&mut command, cli)?,
