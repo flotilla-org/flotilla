@@ -1,4 +1,5 @@
 mod client_connection;
+pub mod environment_sockets;
 mod peer_connection;
 mod peer_runtime;
 mod remote_commands;
@@ -18,7 +19,8 @@ use std::{
 use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
-use flotilla_protocol::{ConfigLabel, HostName, Message};
+use flotilla_protocol::{ConfigLabel, EnvironmentId, HostName, Message};
+use self::environment_sockets::EnvironmentSocketRegistry;
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
     net::UnixListener,
@@ -154,6 +156,9 @@ pub struct DaemonServer {
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
     agent_state_store: SharedAgentStateStore,
+    /// Registry of per-environment Unix sockets. Initialized on startup and
+    /// populated when environments are created (wired in Phase D).
+    pub environment_sockets: Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
 }
 
 impl DaemonServer {
@@ -196,6 +201,7 @@ impl DaemonServer {
             peer_manager,
             remote_command_router,
             agent_state_store,
+            environment_sockets: Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
         })
     }
 
@@ -320,6 +326,7 @@ impl DaemonServer {
                                     client_notify,
                                     peer_connected_tx,
                                     agent_state_store,
+                                    None,
                                 )
                                 .await;
                             });
@@ -367,6 +374,11 @@ fn spawn_peer_networking_runtime(
 }
 
 /// Handle a single client connection.
+///
+/// `environment_context` — when `Some(id)`, this connection was accepted on a
+/// per-environment socket; if the Hello message carries a mismatched
+/// `environment_id` the connection is dropped.  `None` means the main socket
+/// (forward-compatible with HTTP transport).
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: tokio::net::UnixStream,
@@ -379,6 +391,7 @@ async fn handle_client(
     client_notify: Arc<Notify>,
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
     agent_state_store: SharedAgentStateStore,
+    environment_context: Option<EnvironmentId>,
 ) {
     let (read_half, write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
@@ -414,7 +427,22 @@ async fn handle_client(
                 .run(lines, writer, id, request)
                 .await;
         }
-        Message::Hello { protocol_version, host_name, session_id, .. } => {
+        Message::Hello { protocol_version, host_name, session_id, environment_id } => {
+            // Verify environment identity when connected on a per-environment socket.
+            if let Some(expected) = &environment_context {
+                if let Some(claimed) = &environment_id {
+                    if expected != claimed {
+                        warn!(
+                            %expected,
+                            %claimed,
+                            "environment_id mismatch on per-environment socket — dropping connection"
+                        );
+                        return;
+                    }
+                }
+                // No environment_id in Hello is fine — old client connecting to a scoped socket.
+            }
+            // environment_context is None: main socket, accept whatever the client sends.
             PeerConnection::new(daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify)
                 .run(lines, writer, protocol_version, host_name, session_id)
                 .await;

@@ -1152,6 +1152,7 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1271,6 +1272,7 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1367,6 +1369,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1721,6 +1724,7 @@ async fn handle_client_relays_outbound_peer_messages() {
             notify_ref,
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1811,6 +1815,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             notify_a,
             peer_connected_tx_a,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
@@ -1827,6 +1832,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             notify_b,
             peer_connected_tx_b,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
         )
         .await;
     });
