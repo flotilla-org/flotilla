@@ -2,10 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    delta::Change, provider_data::ProviderData, CommandValue, HostName, HostSummary, RepoIdentity, Step, StepAction, StepHost, StepOutcome,
-    StepStatus,
-};
+use crate::{delta::Change, provider_data::ProviderData, CommandValue, HostName, HostSummary, RepoIdentity, Step, StepOutcome, StepStatus};
 
 /// Logical clock for causal ordering and deduplication of peer messages.
 ///
@@ -211,7 +208,8 @@ pub enum PeerDataKind {
 mod tests {
     use super::*;
     use crate::{
-        Command, CommandAction, CommandValue, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, SystemInfo, ToolInventory,
+        Command, CommandAction, CommandValue, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, StepAction, StepHost,
+        SystemInfo, ToolInventory,
     };
 
     fn sample_host_summary() -> HostSummary {

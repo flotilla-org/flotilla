@@ -91,13 +91,9 @@ pub async fn build_plan(
     attachable_store: SharedAttachableStore,
     daemon_socket_path: Option<DaemonHostPath>,
     local_host: HostName,
-    // TODO(multi-host): When a command is forwarded from another host, this carries
-    // the requester's hostname so plan builders can stamp `StepHost::Remote(originator)`
-    // on steps that need to run back on the presentation host (e.g. workspace creation
-    // after a remote checkout). Passed by `execute_forwarded_command` in server.rs.
-    _originating_host: Option<HostName>,
 ) -> Result<StepPlan, CommandValue> {
-    let Command { action, .. } = cmd;
+    let Command { host, action, .. } = cmd;
+    let remote_host = host.as_ref().cloned().map_or(StepHost::Local, StepHost::Remote);
 
     match action {
         CommandAction::Checkout { target, issue_ids, .. } => {
@@ -105,7 +101,7 @@ pub async fn build_plan(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            Ok(build_create_checkout_plan(branch, create_branch, intent, issue_ids))
+            Ok(build_create_checkout_plan(branch, create_branch, intent, issue_ids, remote_host))
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
@@ -169,7 +165,7 @@ pub async fn build_plan(
 
         CommandAction::PrepareTerminalForCheckout { checkout_path, commands } => Ok(StepPlan::new(vec![Step {
             description: "Prepare terminal for checkout".to_string(),
-            host: StepHost::Local,
+            host: remote_host,
             action: StepAction::PrepareTerminalForCheckout { checkout_path: ExecutionEnvironmentPath::new(checkout_path), commands },
         }])),
 
@@ -235,19 +231,25 @@ pub async fn build_plan(
 ///
 /// All steps are symbolic — the `ExecutorStepResolver` provides infrastructure
 /// (registry, providers_data, runner, local_host) at execution time.
-fn build_create_checkout_plan(branch: String, create_branch: bool, intent: CheckoutIntent, issue_ids: Vec<(String, String)>) -> StepPlan {
+fn build_create_checkout_plan(
+    branch: String,
+    create_branch: bool,
+    intent: CheckoutIntent,
+    issue_ids: Vec<(String, String)>,
+    checkout_host: StepHost,
+) -> StepPlan {
     let mut steps = Vec::new();
 
     steps.push(Step {
         description: format!("Create checkout for branch {branch}"),
-        host: StepHost::Local,
+        host: checkout_host.clone(),
         action: StepAction::CreateCheckout { branch: branch.clone(), create_branch, intent, issue_ids: issue_ids.clone() },
     });
 
     if !issue_ids.is_empty() {
         steps.push(Step {
             description: "Link issues to branch".to_string(),
-            host: StepHost::Local,
+            host: checkout_host,
             action: StepAction::LinkIssuesToBranch { branch: branch.clone(), issue_ids },
         });
     }

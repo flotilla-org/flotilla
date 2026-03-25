@@ -1917,7 +1917,6 @@ impl DaemonHandle for InProcessDaemon {
                 attachable_store,
                 daemon_socket_dhp.clone(),
                 local_host,
-                None,
             )
             .await;
 
