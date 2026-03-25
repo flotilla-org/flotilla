@@ -46,7 +46,7 @@ impl CheckoutNoun {
                 let target = if fresh { CheckoutTarget::FreshBranch(branch) } else { CheckoutTarget::Branch(branch) };
                 // SENTINEL: repo is empty — `inject_repo_context` in main.rs must fill it
                 // from --repo flag or FLOTILLA_REPO env before dispatch to the daemon.
-                Ok(Resolved::Command(Command {
+                Ok(Resolved::RequiresRepoContext(Command {
                     host: None,
                     context_repo: None,
                     action: CommandAction::Checkout { repo: RepoSelector::Query("".into()), target, issue_ids: vec![] },
@@ -118,7 +118,7 @@ mod tests {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::RequiresRepoContext(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
@@ -135,7 +135,7 @@ mod tests {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x", "--fresh"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::RequiresRepoContext(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::Checkout {

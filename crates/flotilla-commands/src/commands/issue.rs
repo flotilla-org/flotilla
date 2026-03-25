@@ -36,7 +36,7 @@ impl IssueNoun {
                 Ok(Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::GenerateBranchName { issue_keys } }))
             }
             (None, Some(IssueVerb::SuggestBranch)) => Err("suggest-branch requires an issue subject".into()),
-            (_, Some(IssueVerb::Search { query })) => Ok(Resolved::Command(Command {
+            (_, Some(IssueVerb::Search { query })) => Ok(Resolved::RequiresRepoContext(Command {
                 host: None,
                 context_repo: None,
                 // SENTINEL: repo is empty — `inject_repo_context` in main.rs must fill it
@@ -109,7 +109,7 @@ mod tests {
         let resolved = parse(&["issue", "search", "my", "query"]).resolve().unwrap();
         assert_eq!(
             resolved,
-            Resolved::Command(Command {
+            Resolved::RequiresRepoContext(Command {
                 host: None,
                 context_repo: None,
                 action: CommandAction::SearchIssues { repo: RepoSelector::Query("".into()), query: "my query".into() },

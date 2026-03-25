@@ -382,48 +382,20 @@ fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch(mut resolved: flotilla_commands::Resolved, cli: &Cli, format: OutputFormat) -> Result<()> {
+async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: OutputFormat) -> Result<()> {
     use flotilla_commands::Resolved;
     reset_sigpipe();
-    if let Resolved::Command(ref mut cmd) = resolved {
-        inject_repo_context(cmd, cli)?;
-    }
-    match resolved {
-        Resolved::Command(cmd) => run_control_command(cli, cmd, format).await,
-        Resolved::RepoDetail { slug } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_repo_detail(&*daemon, &slug, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    let cmd = match resolved {
+        Resolved::Command(mut cmd) => {
+            inject_repo_context(&mut cmd, cli)?;
+            cmd
         }
-        Resolved::RepoProviders { slug } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_repo_providers(&*daemon, &slug, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+        Resolved::RequiresRepoContext(mut cmd) => {
+            inject_repo_context(&mut cmd, cli)?;
+            cmd
         }
-        Resolved::RepoWork { slug } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_repo_work(&*daemon, &slug, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostList => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_host_list(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostStatus { host } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_host_status(&*daemon, &host, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostProviders { host } => {
-            let daemon = connect_daemon(cli).await?;
-            flotilla_tui::cli::run_host_providers(&*daemon, &host, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
-        }
-        Resolved::HostRepoDetail { host, slug } => {
-            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug}"))
-        }
-        Resolved::HostRepoProviders { host, slug } => {
-            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug} providers"))
-        }
-        Resolved::HostRepoWork { host, slug } => {
-            Err(color_eyre::eyre::eyre!("host-routed repo queries not yet supported: host {host} repo {slug} work"))
-        }
-    }
+    };
+    run_control_command(cli, cmd, format).await
 }
 
 async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {

@@ -429,16 +429,8 @@ mod tests {
                 action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/repo")) },
             },
             Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} },
-            Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus { target_host: "desktop".into() },
-            },
-            Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::QueryHostProviders { target_host: "desktop".into() },
-            },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostStatus { target_host: "desktop".into() } },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostProviders { target_host: "desktop".into() } },
         ];
 
         for cmd in cases {
@@ -727,16 +719,8 @@ mod tests {
                 action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
             },
             Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} },
-            Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus { target_host: "desktop".into() },
-            },
-            Command {
-                host: None,
-                context_repo: None,
-                action: CommandAction::QueryHostProviders { target_host: "desktop".into() },
-            },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostStatus { target_host: "desktop".into() } },
+            Command { host: None, context_repo: None, action: CommandAction::QueryHostProviders { target_host: "desktop".into() } },
         ];
         for cmd in cases {
             let desc = cmd.description();

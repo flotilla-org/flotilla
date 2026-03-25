@@ -69,11 +69,23 @@ impl RepoNoun {
                 action: CommandAction::PrepareTerminalForCheckout { checkout_path: path, commands: vec![] },
             })),
             (None, Some(RepoVerb::PrepareTerminal { .. })) => Err("prepare-terminal requires a repository subject".into()),
-            (Some(subject), Some(RepoVerb::Providers)) => Ok(Resolved::RepoProviders { slug: subject }),
+            (Some(subject), Some(RepoVerb::Providers)) => Ok(Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query(subject) },
+            })),
             (None, Some(RepoVerb::Providers)) => Err("providers requires a repository subject".into()),
-            (Some(subject), Some(RepoVerb::Work)) => Ok(Resolved::RepoWork { slug: subject }),
+            (Some(subject), Some(RepoVerb::Work)) => Ok(Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query(subject) },
+            })),
             (None, Some(RepoVerb::Work)) => Err("work requires a repository subject".into()),
-            (Some(slug), None) => Ok(Resolved::RepoDetail { slug }),
+            (Some(subject), None) => Ok(Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Query(subject) },
+            })),
             (None, None) => Err("missing repo arguments".into()),
         }
     }
@@ -176,19 +188,40 @@ mod tests {
     #[test]
     fn repo_query_detail() {
         let resolved = parse(&["repo", "myslug"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::RepoDetail { slug: "myslug".into() });
+        assert_eq!(
+            resolved,
+            Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Query("myslug".into()) },
+            })
+        );
     }
 
     #[test]
     fn repo_query_providers() {
         let resolved = parse(&["repo", "myslug", "providers"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::RepoProviders { slug: "myslug".into() });
+        assert_eq!(
+            resolved,
+            Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("myslug".into()) },
+            })
+        );
     }
 
     #[test]
     fn repo_query_work() {
         let resolved = parse(&["repo", "myslug", "work"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::RepoWork { slug: "myslug".into() });
+        assert_eq!(
+            resolved,
+            Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query("myslug".into()) },
+            })
+        );
     }
 
     #[test]

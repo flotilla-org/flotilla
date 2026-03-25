@@ -90,14 +90,22 @@ impl Refinable for HostNounPartial {
 impl HostNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
-            HostVerb::List => Ok(Resolved::HostList),
+            HostVerb::List => Ok(Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} })),
             HostVerb::Status => {
                 let host = self.subject.ok_or("status requires a host name")?;
-                Ok(Resolved::HostStatus { host })
+                Ok(Resolved::Command(Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::QueryHostStatus { target_host: host },
+                }))
             }
             HostVerb::Providers => {
                 let host = self.subject.ok_or("providers requires a host name")?;
-                Ok(Resolved::HostProviders { host })
+                Ok(Resolved::Command(Command {
+                    host: None,
+                    context_repo: None,
+                    action: CommandAction::QueryHostProviders { target_host: host },
+                }))
             }
             HostVerb::Refresh { repo } => {
                 let host = self.subject.ok_or("refresh requires a host name")?;
@@ -155,7 +163,7 @@ impl fmt::Display for HostNounPartial {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction, RepoSelector};
+    use flotilla_protocol::{Command, CommandAction, HostName, RepoSelector};
 
     use super::HostNounPartial;
     use crate::{Refinable, Resolved};
@@ -167,17 +175,34 @@ mod tests {
 
     #[test]
     fn host_list() {
-        assert_eq!(parse_and_resolve(&["host", "list"]), Resolved::HostList);
+        assert_eq!(
+            parse_and_resolve(&["host", "list"]),
+            Resolved::Command(Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} })
+        );
     }
 
     #[test]
     fn host_status() {
-        assert_eq!(parse_and_resolve(&["host", "alpha", "status"]), Resolved::HostStatus { host: "alpha".into() });
+        assert_eq!(
+            parse_and_resolve(&["host", "alpha", "status"]),
+            Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryHostStatus { target_host: "alpha".into() },
+            })
+        );
     }
 
     #[test]
     fn host_providers() {
-        assert_eq!(parse_and_resolve(&["host", "alpha", "providers"]), Resolved::HostProviders { host: "alpha".into() });
+        assert_eq!(
+            parse_and_resolve(&["host", "alpha", "providers"]),
+            Resolved::Command(Command {
+                host: None,
+                context_repo: None,
+                action: CommandAction::QueryHostProviders { target_host: "alpha".into() },
+            })
+        );
     }
 
     #[test]
@@ -253,19 +278,31 @@ mod tests {
     fn host_routed_repo_query_becomes_host_targeted() {
         // `host feta repo myslug providers` should NOT silently drop the host
         let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "providers"]);
-        assert_eq!(resolved, Resolved::HostRepoProviders { host: "feta".into(), slug: "myslug".into() });
+        assert!(matches!(
+            resolved,
+            Resolved::Command(ref cmd) if cmd.host == Some(HostName::new("feta"))
+                && matches!(cmd.action, CommandAction::QueryRepoProviders { ref repo } if *repo == RepoSelector::Query("myslug".into()))
+        ));
     }
 
     #[test]
     fn host_routed_repo_detail_becomes_host_targeted() {
         let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug"]);
-        assert_eq!(resolved, Resolved::HostRepoDetail { host: "feta".into(), slug: "myslug".into() });
+        assert!(matches!(
+            resolved,
+            Resolved::Command(ref cmd) if cmd.host == Some(HostName::new("feta"))
+                && matches!(cmd.action, CommandAction::QueryRepoDetail { ref repo } if *repo == RepoSelector::Query("myslug".into()))
+        ));
     }
 
     #[test]
     fn host_routed_repo_work_becomes_host_targeted() {
         let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "work"]);
-        assert_eq!(resolved, Resolved::HostRepoWork { host: "feta".into(), slug: "myslug".into() });
+        assert!(matches!(
+            resolved,
+            Resolved::Command(ref cmd) if cmd.host == Some(HostName::new("feta"))
+                && matches!(cmd.action, CommandAction::QueryRepoWork { ref repo } if *repo == RepoSelector::Query("myslug".into()))
+        ));
     }
 
     #[test]
