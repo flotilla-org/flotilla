@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use flotilla_protocol::{CommandValue, DaemonEvent, HostName, RepoIdentity, StepStatus};
 pub use flotilla_protocol::{Step, StepAction, StepHost, StepOutcome};
@@ -217,8 +220,13 @@ pub async fn run_step_plan_with_remote_executor(
                 let (cancelled_during_batch, outcome) = tokio::select! {
                     outcome = &mut batch => (false, outcome),
                     _ = cancel.cancelled() => {
-                        let _ = remote_executor.cancel_active_batch(command_id).await;
-                        (true, batch.await)
+                        let outcome = match remote_executor.cancel_active_batch(command_id).await {
+                            Ok(()) => tokio::time::timeout(Duration::from_secs(5), &mut batch)
+                                .await
+                                .unwrap_or_else(|_| Err("timed out waiting for remote batch cancellation".into())),
+                            Err(message) => Err(message),
+                        };
+                        (true, outcome)
                     }
                 };
 

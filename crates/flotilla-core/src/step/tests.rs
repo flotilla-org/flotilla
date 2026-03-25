@@ -786,3 +786,57 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
         .collect();
     assert!(failure_events.is_empty());
 }
+
+#[tokio::test]
+async fn cancellation_after_remote_cancel_timeout_returns_cancelled_without_waiting_forever() {
+    struct StalledRemoteExecutor {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteStepExecutor for StalledRemoteExecutor {
+        async fn execute_batch(
+            &self,
+            _request: RemoteStepBatchRequest,
+            _progress_sink: Arc<dyn RemoteStepProgressSink>,
+        ) -> Result<Vec<StepOutcome>, String> {
+            self.started.notify_waiters();
+            std::future::pending().await
+        }
+
+        async fn cancel_active_batch(&self, _command_id: u64) -> Result<(), String> {
+            Err("timed out waiting for remote cancel response".into())
+        }
+    }
+
+    let (cancel, tx) = setup();
+    let started = Arc::new(Notify::new());
+    let remote = StalledRemoteExecutor { started: Arc::clone(&started) };
+    let plan =
+        StepPlan::new(vec![Step { description: "remote".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop }]);
+
+    let cancel_clone = cancel.clone();
+    let task = tokio::spawn(async move {
+        run_step_plan_with_remote_executor(
+            plan,
+            13,
+            HostName::local(),
+            RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            ExecutionEnvironmentPath::new("/repo"),
+            cancel_clone,
+            tx,
+            &TestResolver::new(vec![]),
+            &remote,
+        )
+        .await
+    });
+
+    started.notified().await;
+    cancel.cancel();
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(200), task)
+        .await
+        .expect("cancellation should not wait forever")
+        .expect("task should join");
+    assert_eq!(result, CommandValue::Cancelled);
+}
