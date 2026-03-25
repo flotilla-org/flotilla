@@ -101,7 +101,7 @@ impl EnvironmentProvider for DockerEnvironment {
         let format = r#"{{.Names}}\t{{.Label "flotilla.environment"}}\t{{.Image}}"#;
         let output = self
             .runner
-            .run("docker", &["ps", "--filter", "label=flotilla.environment", "--format", format], Path::new("/"), &ChannelLabel::Noop)
+            .run("docker", &["ps", "-a", "--filter", "label=flotilla.environment", "--format", format], Path::new("/"), &ChannelLabel::Noop)
             .await?;
 
         let handles = output
