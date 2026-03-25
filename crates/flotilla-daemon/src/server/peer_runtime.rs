@@ -70,6 +70,38 @@ enum PostHandleAction {
         cancel_id: u64,
         error: Option<String>,
     },
+    RemoteStepRequested {
+        request_id: u64,
+        requester_host: HostName,
+        reply_via: HostName,
+        repo_identity: RepoIdentity,
+        repo_path: PathBuf,
+        step_offset: usize,
+        steps: Vec<flotilla_protocol::Step>,
+    },
+    RemoteStepEventReceived {
+        request_id: u64,
+        responder_host: HostName,
+        batch_step_index: usize,
+        batch_step_count: usize,
+        description: String,
+        status: flotilla_protocol::StepStatus,
+    },
+    RemoteStepResponseReceived {
+        request_id: u64,
+        responder_host: HostName,
+        outcomes: Vec<flotilla_protocol::StepOutcome>,
+    },
+    RemoteStepCancelRequested {
+        cancel_id: u64,
+        requester_host: HostName,
+        reply_via: HostName,
+        remote_step_request_id: u64,
+    },
+    RemoteStepCancelResponseReceived {
+        cancel_id: u64,
+        error: Option<String>,
+    },
     Ignored,
 }
 
@@ -305,6 +337,55 @@ impl PeerRuntime {
                                     HandleResult::CommandCancelResponseReceived { cancel_id, responder_host: _, error } => {
                                         PostHandleAction::CommandCancelResponseReceived { cancel_id, error }
                                     }
+                                    HandleResult::RemoteStepRequested {
+                                        request_id,
+                                        requester_host,
+                                        reply_via,
+                                        repo_identity,
+                                        repo_path,
+                                        step_offset,
+                                        steps,
+                                    } => PostHandleAction::RemoteStepRequested {
+                                        request_id,
+                                        requester_host,
+                                        reply_via,
+                                        repo_identity,
+                                        repo_path,
+                                        step_offset,
+                                        steps,
+                                    },
+                                    HandleResult::RemoteStepEventReceived {
+                                        request_id,
+                                        responder_host,
+                                        batch_step_index,
+                                        batch_step_count,
+                                        description,
+                                        status,
+                                    } => PostHandleAction::RemoteStepEventReceived {
+                                        request_id,
+                                        responder_host,
+                                        batch_step_index,
+                                        batch_step_count,
+                                        description,
+                                        status,
+                                    },
+                                    HandleResult::RemoteStepResponseReceived { request_id, responder_host, outcomes } => {
+                                        PostHandleAction::RemoteStepResponseReceived { request_id, responder_host, outcomes }
+                                    }
+                                    HandleResult::RemoteStepCancelRequested {
+                                        cancel_id,
+                                        requester_host,
+                                        reply_via,
+                                        remote_step_request_id,
+                                    } => PostHandleAction::RemoteStepCancelRequested {
+                                        cancel_id,
+                                        requester_host,
+                                        reply_via,
+                                        remote_step_request_id,
+                                    },
+                                    HandleResult::RemoteStepCancelResponseReceived { cancel_id, responder_host: _, error } => {
+                                        PostHandleAction::RemoteStepCancelResponseReceived { cancel_id, error }
+                                    }
                                     HandleResult::Ignored => PostHandleAction::Ignored,
                                 };
                                 let pending_sends = pm.take_pending_sends();
@@ -393,6 +474,65 @@ impl PeerRuntime {
                                 }
                                 PostHandleAction::CommandCancelResponseReceived { cancel_id, error } => {
                                     remote_command_router_task.complete_remote_cancel(cancel_id, error).await;
+                                }
+                                PostHandleAction::RemoteStepRequested {
+                                    request_id,
+                                    requester_host,
+                                    reply_via,
+                                    repo_identity,
+                                    repo_path,
+                                    step_offset,
+                                    steps,
+                                } => {
+                                    remote_command_router_task
+                                        .spawn_forwarded_remote_step_batch(
+                                            request_id,
+                                            requester_host,
+                                            reply_via,
+                                            repo_identity,
+                                            repo_path,
+                                            step_offset,
+                                            steps,
+                                        )
+                                        .await;
+                                }
+                                PostHandleAction::RemoteStepEventReceived {
+                                    request_id,
+                                    responder_host,
+                                    batch_step_index,
+                                    batch_step_count,
+                                    description,
+                                    status,
+                                } => {
+                                    remote_command_router_task
+                                        .emit_remote_step_event(
+                                            request_id,
+                                            responder_host,
+                                            batch_step_index,
+                                            batch_step_count,
+                                            description,
+                                            status,
+                                        )
+                                        .await;
+                                }
+                                PostHandleAction::RemoteStepResponseReceived { request_id, responder_host, outcomes } => {
+                                    remote_command_router_task.complete_remote_step(request_id, responder_host, outcomes).await;
+                                }
+                                PostHandleAction::RemoteStepCancelRequested {
+                                    cancel_id,
+                                    requester_host,
+                                    reply_via,
+                                    remote_step_request_id,
+                                } => {
+                                    remote_command_router_task.spawn_forwarded_remote_step_cancel(
+                                        cancel_id,
+                                        requester_host,
+                                        reply_via,
+                                        remote_step_request_id,
+                                    );
+                                }
+                                PostHandleAction::RemoteStepCancelResponseReceived { cancel_id, error } => {
+                                    remote_command_router_task.complete_remote_step_cancel(cancel_id, error).await;
                                 }
                                 PostHandleAction::Ignored => {}
                             }
@@ -594,6 +734,11 @@ pub(super) async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManage
             RoutedPeerMessage::CommandEvent { requester_host, .. } => requester_host.clone(),
             RoutedPeerMessage::CommandResponse { requester_host, .. } => requester_host.clone(),
             RoutedPeerMessage::CommandCancelResponse { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::RemoteStepRequest { target_host, .. } => target_host.clone(),
+            RoutedPeerMessage::RemoteStepEvent { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::RemoteStepResponse { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::RemoteStepCancelRequest { target_host, .. } => target_host.clone(),
+            RoutedPeerMessage::RemoteStepCancelResponse { requester_host, .. } => requester_host.clone(),
         };
         let sender = {
             let pm = peer_manager.lock().await;

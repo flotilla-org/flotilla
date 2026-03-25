@@ -657,7 +657,7 @@ impl StepResolver for ExecutorStepResolver {
                     }
                 }
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             StepAction::Noop => Ok(StepOutcome::Completed),
         }
     }

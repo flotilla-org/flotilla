@@ -13,6 +13,7 @@ test-support = ["flotilla-protocol/test-support"]
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 tokio = { workspace = true }
+tokio-util = "0.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

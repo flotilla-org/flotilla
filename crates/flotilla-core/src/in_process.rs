@@ -35,7 +35,10 @@ use crate::{
     providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag},
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
-    step::run_step_plan_with_remote_executor,
+    step::{
+        run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome,
+        StepResolver,
+    },
 };
 
 fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
@@ -1608,50 +1611,59 @@ impl InProcessDaemon {
         let remote_counts = self.remote_host_counts().await;
         self.host_registry.get_host_providers(host, &remote_counts).await
     }
-}
 
-#[async_trait]
-impl DaemonHandle for InProcessDaemon {
-    fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-        self.event_tx.subscribe()
+    pub async fn execute_with_remote_executor(
+        &self,
+        command: Command,
+        remote_executor: Arc<dyn RemoteStepExecutor>,
+    ) -> Result<u64, String> {
+        self.execute_impl(command, remote_executor, true).await
     }
 
-    async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
-        let repo_path = self.resolve_repo_selector(repo).await?;
-        let identity =
-            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
-        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
-        let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
-        Ok(match state.cached_snapshot() {
-            Some(s) => (**s).clone(),
-            None => build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq(), peer_overlay.as_deref()),
-        })
+    pub async fn execute_remote_step_batch(
+        &self,
+        request: RemoteStepBatchRequest,
+        progress_sink: Arc<dyn RemoteStepProgressSink>,
+        cancel: CancellationToken,
+    ) -> Result<Vec<StepOutcome>, String> {
+        let local_repo_path = self
+            .preferred_local_path_for_identity(&request.repo_identity)
+            .await
+            .ok_or_else(|| format!("repo not tracked locally: {}", request.repo_identity))?;
+        let (registry, providers_data) = {
+            let repos = self.repos.read().await;
+            let state = repos.get(&request.repo_identity).ok_or_else(|| format!("repo not tracked locally: {}", request.repo_identity))?;
+            (state.registry(), state.providers())
+        };
+
+        let config_base = DaemonHostPath::new(self.config.base_path().as_path());
+        let attachable_store = self.discovery.shared_attachable_store(&self.config);
+        let daemon_socket_path = self.daemon_socket_path.read().await.clone().map(DaemonHostPath::new);
+        let resolver = executor::ExecutorStepResolver {
+            repo: executor::RepoExecutionContext {
+                identity: request.repo_identity.clone(),
+                root: ExecutionEnvironmentPath::new(&local_repo_path),
+            },
+            registry,
+            providers_data,
+            runner: Arc::clone(&self.discovery.runner),
+            config_base,
+            attachable_store,
+            daemon_socket_path,
+            local_host: self.host_name.clone(),
+        };
+
+        execute_local_remote_step_batch(self.host_name.clone(), request, progress_sink, cancel, &resolver).await
     }
 
-    async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-        let repos = self.repos.read().await;
-        let order = self.repo_order.read().await;
-        let mut result = Vec::new();
-        for identity in order.iter() {
-            if let Some(state) = repos.get(identity) {
-                result.push(RepoInfo {
-                    identity: state.identity().clone(),
-                    path: state.preferred_path().to_path_buf(),
-                    name: repo_name(state.preferred_path()),
-                    labels: state.labels().clone(),
-                    provider_names: state.provider_names(),
-                    provider_health: crate::convert::health_to_proto(state.provider_health()),
-                    loading: state.loading(),
-                });
-            }
-        }
-        Ok(result)
-    }
-
-    async fn execute(&self, command: Command) -> Result<u64, String> {
+    async fn execute_impl(
+        &self,
+        command: Command,
+        remote_executor: Arc<dyn RemoteStepExecutor>,
+        allow_remote_host: bool,
+    ) -> Result<u64, String> {
         let command_host = command.host.clone().unwrap_or_else(|| self.host_name.clone());
-        if command_host != self.host_name {
+        if !allow_remote_host && command_host != self.host_name {
             return Err(format!("remote command routing not implemented yet for host {command_host}"));
         }
 
@@ -1694,7 +1706,6 @@ impl DaemonHandle for InProcessDaemon {
 
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
 
-        // Query commands: execute inline with lifecycle events.
         if command.action.is_query() {
             let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -1722,12 +1733,10 @@ impl DaemonHandle for InProcessDaemon {
                     Ok(v) => flotilla_protocol::CommandValue::HostList(Box::new(v)),
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
                 },
-                flotilla_protocol::CommandAction::QueryHostStatus { target_host } => {
-                    match self.get_host_status_internal(target_host).await {
-                        Ok(v) => flotilla_protocol::CommandValue::HostStatus(Box::new(v)),
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
-                    }
-                }
+                flotilla_protocol::CommandAction::QueryHostStatus { target_host } => match self.get_host_status_internal(target_host).await {
+                    Ok(v) => flotilla_protocol::CommandValue::HostStatus(Box::new(v)),
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 flotilla_protocol::CommandAction::QueryHostProviders { target_host } => {
                     match self.get_host_providers_internal(target_host).await {
                         Ok(v) => flotilla_protocol::CommandValue::HostProviders(Box::new(v)),
@@ -1747,115 +1756,123 @@ impl DaemonHandle for InProcessDaemon {
             return Ok(id);
         }
 
-        match &command.action {
-            flotilla_protocol::CommandAction::TrackRepoPath { path } => {
-                let repo_identity = self.detect_repo_identity(path).await;
-                let description = command.description().to_string();
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: repo_identity.clone(),
-                    repo: path.clone(),
-                    description,
-                });
-                let result = match self.add_repo(path).await {
-                    Ok((tracked_path, resolved_from)) => flotilla_protocol::CommandValue::RepoTracked { path: tracked_path, resolved_from },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: self.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
-                    repo: path.clone(),
-                    result,
-                });
-                return Ok(id);
-            }
-            flotilla_protocol::CommandAction::UntrackRepo { repo } => {
-                let repo_path = self.resolve_repo_selector(repo).await?;
-                let repo_identity =
-                    self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
-                let description = command.description().to_string();
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: repo_identity.clone(),
-                    repo: repo_path.clone(),
-                    description,
-                });
-                let result = match self.remove_repo(&repo_path).await {
-                    Ok(()) => flotilla_protocol::CommandValue::RepoUntracked { path: repo_path.clone() },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity,
-                    repo: repo_path,
-                    result,
-                });
-                return Ok(id);
-            }
-            flotilla_protocol::CommandAction::Refresh { repo: None } => {
-                let repo_paths = {
-                    let repos = self.repos.read().await;
-                    let order = self.repo_order.read().await;
-                    order
-                        .iter()
-                        .filter_map(|identity| repos.get(identity).map(|state| state.preferred_path().to_path_buf()))
-                        .collect::<Vec<_>>()
-                };
-                let display_repo = repo_paths.first().cloned().unwrap_or_default();
-                let display_repo_identity =
-                    self.tracked_repo_identity_for_path(&display_repo).await.unwrap_or_else(|| fallback_repo_identity(&display_repo));
-                let description = command.description().to_string();
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: display_repo_identity.clone(),
-                    repo: display_repo.clone(),
-                    description,
-                });
-                let mut refreshed = Vec::new();
+        if matches!(command.action, flotilla_protocol::CommandAction::Refresh { repo: None }) {
+            let repo_paths = {
+                let repos = self.repos.read().await;
+                let order = self.repo_order.read().await;
+                order
+                    .iter()
+                    .filter_map(|identity| repos.get(identity).map(|state| state.preferred_path().to_path_buf()))
+                    .collect::<Vec<_>>()
+            };
+            let repo_path = repo_paths.first().cloned().unwrap_or_default();
+            let repo_identity = self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
+            let description = command.description().to_string();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity: repo_identity.clone(),
+                repo: repo_path.clone(),
+                description,
+            });
+            let mut refreshed = Vec::new();
+            let result = match async {
                 for repo in &repo_paths {
                     self.refresh(&flotilla_protocol::RepoSelector::Path(repo.clone())).await?;
                     refreshed.push(repo.clone());
                 }
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: display_repo_identity,
-                    repo: display_repo,
-                    result: flotilla_protocol::CommandValue::Refreshed { repos: refreshed },
-                });
-                return Ok(id);
+                Ok::<(), String>(())
             }
-            flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } => {
-                let repo_path = self.resolve_repo_selector(selector).await?;
-                let repo_identity =
-                    self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
-                let description = command.description().to_string();
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: repo_identity.clone(),
-                    repo: repo_path.clone(),
-                    description,
-                });
-                let result = match self.refresh(&flotilla_protocol::RepoSelector::Path(repo_path.clone())).await {
-                    Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: vec![repo_path.clone()] },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity,
-                    repo: repo_path,
-                    result,
-                });
-                return Ok(id);
-            }
-            _ => {}
+            .await
+            {
+                Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: refreshed },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity,
+                repo: repo_path,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::TrackRepoPath { path } = &command.action {
+            let description = command.description().to_string();
+            let repo_path = path.clone();
+            let repo_identity = self.detect_repo_identity(path).await;
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity: repo_identity.clone(),
+                repo: repo_path.clone(),
+                description,
+            });
+            let result = match self.add_repo(path).await {
+                Ok((tracked_path, resolved_from)) => flotilla_protocol::CommandValue::RepoTracked { path: tracked_path, resolved_from },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity: self.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
+                repo: repo_path,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::UntrackRepo { repo } = &command.action {
+            let repo_path = self.resolve_repo_selector(repo).await?;
+            let description = command.description().to_string();
+            let repo_identity =
+                self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity: repo_identity.clone(),
+                repo: repo_path.clone(),
+                description,
+            });
+            let result = match self.remove_repo(&repo_path).await {
+                Ok(()) => flotilla_protocol::CommandValue::RepoUntracked { path: repo_path.clone() },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity,
+                repo: repo_path,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } = &command.action {
+            let repo_path = self.resolve_repo_selector(selector).await?;
+            let description = command.description().to_string();
+            let repo_identity =
+                self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity: repo_identity.clone(),
+                repo: repo_path.clone(),
+                description,
+            });
+            let result = match self.refresh(&flotilla_protocol::RepoSelector::Path(repo_path.clone())).await {
+                Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: vec![repo_path.clone()] },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity,
+                repo: repo_path,
+                result,
+            });
+            return Ok(id);
         }
 
         // Gather what the spawned task needs — validate repo before broadcasting
@@ -1874,8 +1891,6 @@ impl DaemonHandle for InProcessDaemon {
         let repo_path = repo.to_path_buf();
         let config_base = DaemonHostPath::new(self.config.base_path().as_path());
 
-        // Register the cancellation token before broadcasting CommandStarted
-        // so cancel(id) can find it the instant the TUI sees the event.
         let active_ref = Arc::clone(&self.active_commands);
         let token = CancellationToken::new();
         {
@@ -1885,19 +1900,16 @@ impl DaemonHandle for InProcessDaemon {
 
         let _ = self.event_tx.send(DaemonEvent::CommandStarted {
             command_id: id,
-            host: self.host_name.clone(),
+            host: command_host.clone(),
             repo_identity: repo_identity.clone(),
             repo: repo_path.clone(),
             description,
         });
 
-        // Spawn the entire build_plan + execution so execute() returns the
-        // command_id immediately. This keeps the TUI event loop responsive.
         let local_host = self.host_name.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
         tokio::spawn(async move {
-            // Clone values the resolver needs before build_plan consumes them.
             let resolver_registry = Arc::clone(&registry);
             let resolver_providers_data = Arc::clone(&providers_data);
             let resolver_runner = Arc::clone(&runner);
@@ -1946,7 +1958,6 @@ impl DaemonHandle for InProcessDaemon {
                         daemon_socket_path: daemon_socket_dhp.clone(),
                         local_host: resolver_local_host,
                     };
-                    let remote_executor = crate::step::UnsupportedRemoteStepExecutor;
                     let result = run_step_plan_with_remote_executor(
                         step_plan,
                         id,
@@ -1956,7 +1967,7 @@ impl DaemonHandle for InProcessDaemon {
                         token,
                         event_tx.clone(),
                         &resolver,
-                        &remote_executor,
+                        remote_executor.as_ref(),
                     )
                     .await;
                     refresh_trigger.notify_one();
@@ -1974,6 +1985,115 @@ impl DaemonHandle for InProcessDaemon {
         });
 
         Ok(id)
+    }
+}
+
+async fn execute_local_remote_step_batch(
+    local_host: HostName,
+    request: RemoteStepBatchRequest,
+    progress_sink: Arc<dyn RemoteStepProgressSink>,
+    cancel: CancellationToken,
+    resolver: &dyn StepResolver,
+) -> Result<Vec<StepOutcome>, String> {
+    let mut outcomes = Vec::new();
+    let step_count = request.steps.len();
+
+    for (index, step) in request.steps.into_iter().enumerate() {
+        if step.host != flotilla_protocol::StepHost::Remote(local_host.clone()) {
+            return Err(format!("remote step {} targets {:?}, expected remote host {}", index, step.host, local_host));
+        }
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+
+        progress_sink
+            .emit(crate::step::RemoteStepProgressUpdate {
+                batch_step_index: index,
+                batch_step_count: step_count,
+                description: step.description.clone(),
+                status: flotilla_protocol::StepStatus::Started,
+            })
+            .await;
+
+        let outcome = resolver.resolve(&step.description, step.action, &outcomes).await;
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+
+        match outcome {
+            Ok(step_outcome) => {
+                let status = match &step_outcome {
+                    StepOutcome::Skipped => flotilla_protocol::StepStatus::Skipped,
+                    _ => flotilla_protocol::StepStatus::Succeeded,
+                };
+                progress_sink
+                    .emit(crate::step::RemoteStepProgressUpdate {
+                        batch_step_index: index,
+                        batch_step_count: step_count,
+                        description: step.description,
+                        status,
+                    })
+                    .await;
+                outcomes.push(step_outcome);
+            }
+            Err(message) => {
+                progress_sink
+                    .emit(crate::step::RemoteStepProgressUpdate {
+                        batch_step_index: index,
+                        batch_step_count: step_count,
+                        description: step.description,
+                        status: flotilla_protocol::StepStatus::Failed { message: message.clone() },
+                    })
+                    .await;
+                return Err(message);
+            }
+        }
+    }
+
+    Ok(outcomes)
+}
+
+#[async_trait]
+impl DaemonHandle for InProcessDaemon {
+    fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.event_tx.subscribe()
+    }
+
+    async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
+        let repo_path = self.resolve_repo_selector(repo).await?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
+        Ok(match state.cached_snapshot() {
+            Some(s) => (**s).clone(),
+            None => build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq(), peer_overlay.as_deref()),
+        })
+    }
+
+    async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
+        let repos = self.repos.read().await;
+        let order = self.repo_order.read().await;
+        let mut result = Vec::new();
+        for identity in order.iter() {
+            if let Some(state) = repos.get(identity) {
+                result.push(RepoInfo {
+                    identity: state.identity().clone(),
+                    path: state.preferred_path().to_path_buf(),
+                    name: repo_name(state.preferred_path()),
+                    labels: state.labels().clone(),
+                    provider_names: state.provider_names(),
+                    provider_health: crate::convert::health_to_proto(state.provider_health()),
+                    loading: state.loading(),
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    async fn execute(&self, command: Command) -> Result<u64, String> {
+        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false).await
     }
 
     async fn cancel(&self, command_id: u64) -> Result<(), String> {
