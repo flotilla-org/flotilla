@@ -108,27 +108,16 @@ impl fmt::Display for RepoNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt, path::PathBuf};
+    use std::path::PathBuf;
 
     use clap::Parser;
     use flotilla_protocol::{CheckoutTarget, Command, CommandAction, RepoSelector};
 
     use super::RepoNoun;
-    use crate::Resolved;
+    use crate::{test_utils::assert_round_trip, Resolved};
 
     fn parse(args: &[&str]) -> RepoNoun {
         RepoNoun::try_parse_from(args).expect("should parse")
-    }
-
-    fn assert_round_trip(args: &[&str])
-    where
-        RepoNoun: fmt::Display + PartialEq + fmt::Debug,
-    {
-        let parsed = RepoNoun::try_parse_from(args).expect("initial parse");
-        let displayed = parsed.to_string();
-        let tokens: Vec<&str> = displayed.split_whitespace().collect();
-        let reparsed = RepoNoun::try_parse_from(&tokens).expect("re-parse from display");
-        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -265,51 +254,51 @@ mod tests {
 
     #[test]
     fn round_trip_checkout_main() {
-        assert_round_trip(&["repo", "myslug", "checkout", "main"]);
+        assert_round_trip::<RepoNoun>(&["repo", "myslug", "checkout", "main"]);
     }
 
     #[test]
     fn round_trip_checkout_fresh() {
-        assert_round_trip(&["repo", "myslug", "checkout", "--fresh", "main"]);
+        assert_round_trip::<RepoNoun>(&["repo", "myslug", "checkout", "--fresh", "main"]);
     }
 
     #[test]
     fn round_trip_add() {
-        assert_round_trip(&["repo", "add", "/tmp/test"]);
+        assert_round_trip::<RepoNoun>(&["repo", "add", "/tmp/test"]);
     }
 
     #[test]
     fn round_trip_providers() {
-        assert_round_trip(&["repo", "myslug", "providers"]);
+        assert_round_trip::<RepoNoun>(&["repo", "myslug", "providers"]);
     }
 
     #[test]
     fn round_trip_work() {
-        assert_round_trip(&["repo", "myslug", "work"]);
+        assert_round_trip::<RepoNoun>(&["repo", "myslug", "work"]);
     }
 
     #[test]
     fn round_trip_remove() {
-        assert_round_trip(&["repo", "remove", "org/repo"]);
+        assert_round_trip::<RepoNoun>(&["repo", "remove", "org/repo"]);
     }
 
     #[test]
     fn round_trip_refresh_all() {
-        assert_round_trip(&["repo", "refresh"]);
+        assert_round_trip::<RepoNoun>(&["repo", "refresh"]);
     }
 
     #[test]
     fn round_trip_refresh_specific() {
-        assert_round_trip(&["repo", "org/repo", "refresh"]);
+        assert_round_trip::<RepoNoun>(&["repo", "org/repo", "refresh"]);
     }
 
     #[test]
     fn round_trip_all_refresh() {
-        assert_round_trip(&["repo", "all", "refresh"]);
+        assert_round_trip::<RepoNoun>(&["repo", "all", "refresh"]);
     }
 
     #[test]
     fn round_trip_prepare_terminal() {
-        assert_round_trip(&["repo", "myslug", "prepare-terminal", "/tmp/path"]);
+        assert_round_trip::<RepoNoun>(&["repo", "myslug", "prepare-terminal", "/tmp/path"]);
     }
 }

@@ -1,5 +1,3 @@
-use std::fmt;
-
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
 
@@ -47,8 +45,8 @@ impl CrNoun {
     }
 }
 
-impl fmt::Display for CrNoun {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for CrNoun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "cr {}", self.subject)?;
         match &self.verb {
             CrVerb::Open => write!(f, " open")?,
@@ -66,27 +64,14 @@ impl fmt::Display for CrNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt;
-
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction};
 
     use super::CrNoun;
-    use crate::Resolved;
+    use crate::{test_utils::assert_round_trip, Resolved};
 
     fn parse(args: &[&str]) -> CrNoun {
         CrNoun::try_parse_from(args).expect("should parse")
-    }
-
-    fn assert_round_trip(args: &[&str])
-    where
-        CrNoun: fmt::Display + PartialEq + fmt::Debug,
-    {
-        let parsed = CrNoun::try_parse_from(args).expect("initial parse");
-        let displayed = parsed.to_string();
-        let tokens: Vec<&str> = displayed.split_whitespace().collect();
-        let reparsed = CrNoun::try_parse_from(&tokens).expect("re-parse from display");
-        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -136,16 +121,16 @@ mod tests {
 
     #[test]
     fn round_trip_open() {
-        assert_round_trip(&["cr", "42", "open"]);
+        assert_round_trip::<CrNoun>(&["cr", "42", "open"]);
     }
 
     #[test]
     fn round_trip_close() {
-        assert_round_trip(&["cr", "42", "close"]);
+        assert_round_trip::<CrNoun>(&["cr", "42", "close"]);
     }
 
     #[test]
     fn round_trip_link_issues() {
-        assert_round_trip(&["cr", "42", "link-issues", "1", "5", "7"]);
+        assert_round_trip::<CrNoun>(&["cr", "42", "link-issues", "1", "5", "7"]);
     }
 }

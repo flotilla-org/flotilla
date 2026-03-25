@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
@@ -45,8 +45,8 @@ impl AgentNoun {
     }
 }
 
-impl fmt::Display for AgentNoun {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for AgentNoun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "agent {}", self.subject)?;
         match &self.verb {
             AgentVerb::Teleport { branch, checkout } => {
@@ -66,27 +66,16 @@ impl fmt::Display for AgentNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt, path::PathBuf};
+    use std::path::PathBuf;
 
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction};
 
     use super::AgentNoun;
-    use crate::Resolved;
+    use crate::{test_utils::assert_round_trip, Resolved};
 
     fn parse(args: &[&str]) -> AgentNoun {
         AgentNoun::try_parse_from(args).expect("should parse")
-    }
-
-    fn assert_round_trip(args: &[&str])
-    where
-        AgentNoun: fmt::Display + PartialEq + fmt::Debug,
-    {
-        let parsed = AgentNoun::try_parse_from(args).expect("initial parse");
-        let displayed = parsed.to_string();
-        let tokens: Vec<&str> = displayed.split_whitespace().collect();
-        let reparsed = AgentNoun::try_parse_from(&tokens).expect("re-parse from display");
-        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -147,16 +136,16 @@ mod tests {
 
     #[test]
     fn round_trip_teleport() {
-        assert_round_trip(&["agent", "claude-1", "teleport"]);
+        assert_round_trip::<AgentNoun>(&["agent", "claude-1", "teleport"]);
     }
 
     #[test]
     fn round_trip_teleport_with_branch() {
-        assert_round_trip(&["agent", "claude-1", "teleport", "--branch", "feat"]);
+        assert_round_trip::<AgentNoun>(&["agent", "claude-1", "teleport", "--branch", "feat"]);
     }
 
     #[test]
     fn round_trip_archive() {
-        assert_round_trip(&["agent", "claude-1", "archive"]);
+        assert_round_trip::<AgentNoun>(&["agent", "claude-1", "archive"]);
     }
 }

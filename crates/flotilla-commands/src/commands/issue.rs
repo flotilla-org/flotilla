@@ -1,5 +1,3 @@
-use std::fmt;
-
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction, RepoSelector};
 
@@ -50,8 +48,8 @@ impl IssueNoun {
     }
 }
 
-impl fmt::Display for IssueNoun {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for IssueNoun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "issue")?;
         if let Some(subject) = &self.subject {
             write!(f, " {subject}")?;
@@ -74,27 +72,14 @@ impl fmt::Display for IssueNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt;
-
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction, RepoSelector};
 
     use super::IssueNoun;
-    use crate::Resolved;
+    use crate::{test_utils::assert_round_trip, Resolved};
 
     fn parse(args: &[&str]) -> IssueNoun {
         IssueNoun::try_parse_from(args).expect("should parse")
-    }
-
-    fn assert_round_trip(args: &[&str])
-    where
-        IssueNoun: fmt::Display + PartialEq + fmt::Debug,
-    {
-        let parsed = IssueNoun::try_parse_from(args).expect("initial parse");
-        let displayed = parsed.to_string();
-        let tokens: Vec<&str> = displayed.split_whitespace().collect();
-        let reparsed = IssueNoun::try_parse_from(&tokens).expect("re-parse from display");
-        assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
     }
 
     #[test]
@@ -140,11 +125,11 @@ mod tests {
 
     #[test]
     fn round_trip_open() {
-        assert_round_trip(&["issue", "1", "open"]);
+        assert_round_trip::<IssueNoun>(&["issue", "1", "open"]);
     }
 
     #[test]
     fn round_trip_suggest_branch() {
-        assert_round_trip(&["issue", "1,5,7", "suggest-branch"]);
+        assert_round_trip::<IssueNoun>(&["issue", "1,5,7", "suggest-branch"]);
     }
 }
