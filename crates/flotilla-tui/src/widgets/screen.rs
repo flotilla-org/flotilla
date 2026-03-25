@@ -242,6 +242,7 @@ impl InteractiveWidget for Screen {
                         StatusBarAction::ClearError(id) => {
                             ctx.app_actions.push(AppAction::ClearError(id));
                         }
+                        StatusBarAction::None => {}
                     }
                     return Outcome::Consumed;
                 }

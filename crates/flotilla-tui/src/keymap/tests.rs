@@ -37,6 +37,7 @@ fn round_trip_non_dispatch_actions() {
         Action::OpenIssueSearch,
         Action::OpenFilePicker,
         Action::OpenCommandPalette,
+        Action::OpenContextualPalette,
         Action::FillSelected,
     ];
     for action in actions {
@@ -106,6 +107,7 @@ fn all_actions_have_descriptions() {
         Action::OpenIssueSearch,
         Action::OpenFilePicker,
         Action::OpenCommandPalette,
+        Action::OpenContextualPalette,
         Action::FillSelected,
         Action::Dispatch(Intent::SwitchToWorkspace),
         Action::Dispatch(Intent::CreateWorkspace),
@@ -168,7 +170,7 @@ fn normal_mode_specific_bindings() {
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(q)), Some(Action::Quit));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(r)), Some(Action::Refresh));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(space)), Some(Action::ToggleMultiSelect));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(h)), Some(Action::CycleHost));
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(h)), Some(Action::ToggleHelp));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(l)), Some(Action::CycleLayout));
     assert_eq!(
         km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('T'), KeyModifiers::SHIFT)),
@@ -237,12 +239,21 @@ fn close_confirm_has_y_n_bindings() {
 }
 
 #[test]
-fn help_mode_toggle_with_question_mark() {
+fn help_mode_toggle_with_h() {
+    let km = Keymap::defaults();
+    // h maps to ToggleHelp in Normal and Help modes
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(h)), Some(Action::ToggleHelp));
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), crokey::key!(h)), Some(Action::ToggleHelp));
+}
+
+#[test]
+fn question_mark_maps_to_contextual_palette_in_normal() {
     let km = Keymap::defaults();
     let question_mark = kc(KeyCode::Char('?'), KeyModifiers::NONE);
-    // ? is a shared binding for ToggleHelp
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), question_mark), Some(Action::ToggleHelp));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), question_mark), Some(Action::ToggleHelp));
+    // ? now maps to OpenContextualPalette in Normal mode
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), question_mark), Some(Action::OpenContextualPalette));
+    // ? is not bound in Help mode (no longer a shared binding)
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), question_mark), None);
 }
 
 #[test]

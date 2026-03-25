@@ -10,8 +10,13 @@ const SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatusBarAction {
-    KeyPress { code: KeyCode, modifiers: KeyModifiers },
+    KeyPress {
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    },
     ClearError(usize),
+    /// Indicator is display-only; clicks are ignored.
+    None,
 }
 
 impl StatusBarAction {

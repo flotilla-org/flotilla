@@ -1,6 +1,6 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 72
+assertion_line: 76
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
@@ -25,11 +25,11 @@ expression: output
 │                       │Actions                                                               │                       │
 │                       │Enter             Confirm / execute                                   │                       │
 │                       │/                 Open command palette                                │                       │
+│                       │?                 Open contextual palette (pre-filled)                │                       │
 │                       │.                 Open action menu                                    │                       │
 │                       │n                 New branch input                                    │                       │
 │                       │d                 Remove checkout                                     │                       │
 │                       │p                 Open change request in browser                      │                       │
-│                       │a                 Open file picker                                    │                       │
 │                       └──────────────────────────────────────────────────────────────────────┘                       │
 └──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
-HELP                         <j> DOWN  <k> UP  <ESC> CLOSE  <?> CLOSE 
+HELP                         <j> DOWN  <k> UP  <ESC> CLOSE  <h> CLOSE 

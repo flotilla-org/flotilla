@@ -1,6 +1,6 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 663
+assertion_line: 662
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
@@ -25,4 +25,4 @@ expression: output
 │                                                                      ││                                              │
 │                                                                      ││                                              │
 /he                          <ENT> RUN  <ESC> CLOSE  <TAB> FILL                                   ◫ auto   @local
-  help  show key bindings                                                                                         ?
+  help  show key bindings                                                                                         h

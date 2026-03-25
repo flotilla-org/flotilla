@@ -28,8 +28,8 @@ expression: output
   search     filter items in view                                                                                 /
   refresh    refresh active repo                                                                                  r
   branch     create a new branch                                                                                  n
-  help       show key bindings                                                                                    ?
+  help       show key bindings                                                                                    h
   quit       exit flotilla                                                                                        q
-  layout     cycle view layout                                                                                    l
-  host       cycle target host                                                                                    h
+  layout     set view layout                                                                                      l
+  target     set provisioning target
   theme      cycle color theme

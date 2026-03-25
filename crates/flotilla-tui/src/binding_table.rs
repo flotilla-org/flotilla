@@ -105,14 +105,13 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Shared, "up", Action::SelectPrev),
     b(BindingModeId::Shared, "enter", Action::Confirm),
     b(BindingModeId::Shared, "esc", Action::Dismiss),
-    b(BindingModeId::Shared, "?", Action::ToggleHelp),
     b(BindingModeId::Shared, "S-K", Action::ToggleStatusBarKeys),
     // ── Normal ──
     // Hint order matters: ENT, ., n, ?, q matches the old status bar layout.
     hk(BindingModeId::Normal, "enter", "ENT", Action::Confirm, "Open"),
     h(BindingModeId::Normal, ".", Action::OpenActionMenu, "Menu"),
     h(BindingModeId::Normal, "n", Action::OpenBranchInput, "New"),
-    h(BindingModeId::Normal, "?", Action::ToggleHelp, "Help"),
+    h(BindingModeId::Normal, "?", Action::OpenContextualPalette, "Ctx"),
     h(BindingModeId::Normal, "q", Action::Quit, "Quit"),
     b(BindingModeId::Normal, "r", Action::Refresh),
     b(BindingModeId::Normal, "[", Action::PrevTab),
@@ -120,7 +119,7 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Normal, "{", Action::MoveTabLeft),
     b(BindingModeId::Normal, "}", Action::MoveTabRight),
     b(BindingModeId::Normal, "space", Action::ToggleMultiSelect),
-    b(BindingModeId::Normal, "h", Action::CycleHost),
+    h(BindingModeId::Normal, "h", Action::ToggleHelp, "Help"),
     b(BindingModeId::Normal, "l", Action::CycleLayout),
     b(BindingModeId::Normal, "S-T", Action::CycleTheme),
     b(BindingModeId::Normal, "/", Action::OpenCommandPalette),
@@ -140,7 +139,7 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::Help, "j", Action::SelectNext, "Down"),
     h(BindingModeId::Help, "k", Action::SelectPrev, "Up"),
     hk(BindingModeId::Help, "esc", "ESC", Action::Dismiss, "Close"),
-    h(BindingModeId::Help, "?", Action::ToggleHelp, "Close"),
+    h(BindingModeId::Help, "h", Action::ToggleHelp, "Close"),
     b(BindingModeId::Help, "q", Action::Dismiss),
     // ── ActionMenu ──
     h(BindingModeId::ActionMenu, "j", Action::SelectNext, "Down"),
@@ -522,7 +521,7 @@ mod tests {
     fn hints_for_single_mode_includes_shared() {
         // Create a table with a shared hint and a mode hint.
         let table =
-            &[Binding { mode: BindingModeId::Shared, key: "?", action: Action::ToggleHelp, hint: Some("Help"), hint_key: None }, Binding {
+            &[Binding { mode: BindingModeId::Shared, key: "esc", action: Action::Dismiss, hint: Some("Back"), hint_key: None }, Binding {
                 mode: BindingModeId::Normal,
                 key: "q",
                 action: Action::Quit,
@@ -533,7 +532,7 @@ mod tests {
         let mode = KeyBindingMode::Single(BindingModeId::Normal);
         let hints = compiled.hints_for(&mode);
         let keys: Vec<&str> = hints.iter().map(|h| h.key.as_str()).collect();
-        assert!(keys.contains(&"?"), "should include shared hint '?'");
+        assert!(keys.contains(&"ESC"), "should include shared hint 'ESC'");
         assert!(keys.contains(&"q"), "should include mode hint 'q'");
     }
 
@@ -621,7 +620,7 @@ mod tests {
     #[test]
     fn hints_for_no_shared_fallback_excludes_shared_hints() {
         let table =
-            &[Binding { mode: BindingModeId::Shared, key: "?", action: Action::ToggleHelp, hint: Some("Help"), hint_key: None }, Binding {
+            &[Binding { mode: BindingModeId::Shared, key: "esc", action: Action::Dismiss, hint: Some("Back"), hint_key: None }, Binding {
                 mode: BindingModeId::CommandPalette,
                 key: "esc",
                 action: Action::Dismiss,
@@ -631,7 +630,8 @@ mod tests {
         let compiled = CompiledBindings::from_table_with_no_shared_fallback(table, &[BindingModeId::CommandPalette]);
         let hints = compiled.hints_for(&KeyBindingMode::Single(BindingModeId::CommandPalette));
         let keys: Vec<&str> = hints.iter().map(|h| h.key.as_str()).collect();
-        assert!(!keys.contains(&"?"), "should NOT include shared hint '?' for no-fallback mode");
+        // Shared hints are suppressed for no-fallback modes
+        assert_eq!(keys.len(), 1, "should only include mode-specific hint, not shared hint");
         assert!(keys.contains(&"ESC"), "should include mode-specific hint");
     }
 }

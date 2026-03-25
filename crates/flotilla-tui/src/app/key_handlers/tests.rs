@@ -199,7 +199,7 @@ fn resolve_action_maps_shared_navigation_keys() {
     assert_eq!(app.resolve_action(key(KeyCode::Up)), Some(Action::SelectPrev));
     assert_eq!(app.resolve_action(key(KeyCode::Enter)), Some(Action::Confirm));
     assert_eq!(app.resolve_action(key(KeyCode::Esc)), Some(Action::Dismiss));
-    assert_eq!(app.resolve_action(key(KeyCode::Char('?'))), Some(Action::ToggleHelp));
+    assert_eq!(app.resolve_action(key(KeyCode::Char('?'))), Some(Action::OpenContextualPalette));
 }
 
 #[test]
@@ -229,18 +229,18 @@ fn resolve_action_maps_q_by_mode() {
 // entirely. The widget-stack mode is no longer reflected in ui.mode.
 
 #[test]
-fn question_mark_toggles_help_from_normal() {
+fn h_toggles_help_from_normal() {
     let mut app = stub_app();
     assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
-    app.handle_key(key(KeyCode::Char('?')));
+    app.handle_key(key(KeyCode::Char('h')));
     assert!(!app.screen.modal_stack.is_empty(), "expected modal widget pushed on stack");
 }
 
 #[test]
-fn question_mark_toggles_help_back_to_normal() {
+fn h_toggles_help_back_to_normal() {
     let mut app = stub_app();
     app.screen.modal_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
-    app.handle_key(key(KeyCode::Char('?')));
+    app.handle_key(key(KeyCode::Char('h')));
     assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
 }
 
@@ -629,28 +629,15 @@ fn normal_c_toggles_providers() {
 }
 
 #[test]
-fn normal_h_cycles_target_host_through_known_peers() {
+fn normal_h_toggles_help() {
+    // h is now bound to ToggleHelp, not CycleHost
     let mut app = stub_app();
     insert_peer_host(&mut app.model, "alpha");
-    insert_peer_host(&mut app.model, "beta");
 
     app.handle_key(key(KeyCode::Char('h')));
-    assert_eq!(app.ui.target_host, Some(HostName::new("alpha")));
-
-    app.handle_key(key(KeyCode::Char('h')));
-    assert_eq!(app.ui.target_host, Some(HostName::new("beta")));
-
-    app.handle_key(key(KeyCode::Char('h')));
+    // h toggles help, not host — target_host stays None
     assert_eq!(app.ui.target_host, None);
-}
-
-#[test]
-fn normal_h_ignores_empty_peer_list() {
-    let mut app = stub_app();
-
-    app.handle_key(key(KeyCode::Char('h')));
-
-    assert_eq!(app.ui.target_host, None);
+    assert!(!app.screen.modal_stack.is_empty(), "expected help widget pushed on stack");
 }
 
 #[test]
@@ -698,14 +685,16 @@ fn clicking_layout_status_cycles_layout() {
 }
 
 #[test]
-fn clicking_host_status_target_cycles_target_host() {
+fn clicking_host_status_indicator_is_display_only() {
+    // The host indicator now uses StatusBarAction::None — clicking it does nothing.
     let mut app = stub_app();
     insert_peer_host(&mut app.model, "alpha");
-    app.screen.status_bar.key_targets = vec![StatusBarTarget::new(Rect::new(0, 29, 16, 1), StatusBarAction::key(KeyCode::Char('h')))];
+    app.screen.status_bar.key_targets = vec![StatusBarTarget::new(Rect::new(0, 29, 16, 1), StatusBarAction::None)];
 
     app.handle_mouse(left_click(4, 29));
 
-    assert_eq!(app.ui.target_host, Some(HostName::new("alpha")));
+    // target_host remains None — the click was ignored
+    assert_eq!(app.ui.target_host, None);
 }
 
 #[test]

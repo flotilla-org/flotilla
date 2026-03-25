@@ -209,7 +209,7 @@ impl InteractiveWidget for StatusBarWidget {
                 ctx.app_actions.push(AppAction::ClearError(id));
                 Outcome::Consumed
             }
-            None => Outcome::Ignored,
+            Some(StatusBarAction::None) | None => Outcome::Ignored,
         }
     }
 
@@ -272,7 +272,7 @@ pub(crate) fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
 
     vec![
         ModeIndicator::new(layout_icon, layout_label, StatusBarAction::key(KeyCode::Char('l'))),
-        ModeIndicator::new("", &host_label, StatusBarAction::key(KeyCode::Char('h'))),
+        ModeIndicator::new("", &host_label, StatusBarAction::None),
     ]
 }
 
