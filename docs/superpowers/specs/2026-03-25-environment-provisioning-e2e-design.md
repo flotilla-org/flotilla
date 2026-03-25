@@ -23,6 +23,14 @@ pub struct Command {
 
 `host` + `environment` together are the proto-`ProvisioningTarget`. `host` alone means bare host (today's behavior). `host` + `environment` means provision a container on that host. `#[serde(default, skip_serializing_if = "Option::is_none")]` for consistency with existing optional fields on `Command`.
 
+## Data Model Corrections (from Phase C)
+
+Phase C added `environment_id: Option<EnvironmentId>` to both `Checkout` and `CloudAgentSession`, and `environment_binding: Option<EnvironmentBinding>` to `RepoSnapshot`. Phase D corrects these:
+
+- **Remove `environment_id` from `CloudAgentSession`** — cloud agent sessions (Claude, Codex, Cursor) run in their own sandboxes, not flotilla-managed environments. The field is meaningless on them.
+- **Remove `environment_binding` from `RepoSnapshot`** — the repo-to-environment relationship is many-to-many (multiple environments per repo, multiple repos per environment). The correct model is `environment_id` on individual items (checkouts, terminals) plus host-level `EnvironmentInfo` in `HostSummary`. The `EnvironmentBinding` type can be removed from `flotilla-protocol`.
+- **Keep `environment_id` on `Checkout`** — each checkout knows which environment it lives in.
+
 ## Step System
 
 ### New StepAction Variants
@@ -30,6 +38,7 @@ pub struct Command {
 ```rust
 EnsureEnvironmentImage { spec: EnvironmentSpec },
 CreateEnvironment { image: ImageId, opts: CreateOpts },
+EnsureRepoInEnvironment { env_id: EnvironmentId, repo_slug: String },
 DiscoverEnvironmentProviders { env_id: EnvironmentId },
 DestroyEnvironment { env_id: EnvironmentId },
 ```
@@ -55,7 +64,9 @@ The `ExecutorStepResolver` gains:
 
 `EnsureEnvironmentImage { spec }` — looks up `EnvironmentProvider` from the host's registry, calls `ensure_image(spec)`. Returns `Produced(ImageId)`.
 
-`CreateEnvironment { image, opts }` — creates sandbox socket via `EnvironmentSocketRegistry::add()`, passes socket path in `CreateOpts`. Calls `provider.create(image, opts)`. Stores the `EnvironmentHandle`. Returns `Produced(EnvironmentId)`.
+`CreateEnvironment { image, opts }` — creates sandbox socket via `EnvironmentSocketRegistry::add()`, passes socket path in `CreateOpts`. Creates a per-environment staging directory at `$FLOTILLA_STATE_DIR/env-{id}/refs/` on the host and mounts it into the container at `/ref/`. Calls `provider.create(image, opts)`. Stores the `EnvironmentHandle`. Returns `Produced(EnvironmentId)`.
+
+`EnsureRepoInEnvironment { env_id, repo_slug }` — makes a repo's source available inside the environment. The step resolver resolves the repo's location on the host from the execution context (e.g., `git rev-parse --git-common-dir` for git repos). It then creates a symlink at `$FLOTILLA_STATE_DIR/env-{id}/refs/{repo_slug}/` pointing to the resolved path. Since the staging directory is already mounted inside the container, the symlink appears immediately at `/ref/{repo_slug}/`. No container restart needed. The protocol-level step action carries only the repo slug — the git-specific resolution is an implementation detail of the step resolver. Returns `Completed`.
 
 `DiscoverEnvironmentProviders { env_id }` — retrieves handle, calls `handle.env_vars()` to get raw `HashMap<String, String>`. Runs the host-level and repo-level detectors through the environment runner to build an `EnvironmentBag` from the container's environment (same detection pipeline as host discovery, routed through the runner). Then runs `FactoryRegistry::probe()` with the environment's `EnvironmentBag` and runner. Stores the resulting per-environment `ProviderRegistry`. Returns `Completed`.
 
@@ -70,34 +81,35 @@ The `ExecutorStepResolver` gains:
 ```
 1. EnsureEnvironmentImage { spec }             on Remote(host)
 2. CreateEnvironment { image, opts }           on Remote(host)
-3. DiscoverEnvironmentProviders { env_id }     on Remote(host)
-4. CreateCheckout { branch, ... }              on Environment(env_id)
-5. PrepareTerminalForCheckout { ... }          on Environment(env_id)
-6. CreateWorkspaceFromPreparedTerminal { ... } on Environment(env_id)
-7. ResolveAttachCommand { ... }                → HopPlan with EnterEnvironment
+3. EnsureRepoInEnvironment { env_id, repo }    on Remote(host)
+4. DiscoverEnvironmentProviders { env_id }     on Remote(host)
+5. CreateCheckout { branch, ... }              on Environment(env_id)
+6. PrepareTerminalForCheckout { ... }          on Environment(env_id)
+7. CreateWorkspaceFromPreparedTerminal { ... } on Environment(env_id)
+8. ResolveAttachCommand { ... }                → HopPlan with EnterEnvironment
 ```
 
-Steps 1-3 run on the host (the host daemon orchestrates the environment). Steps 4-6 run inside the environment (routed through the environment's providers). Step 7 produces a hop plan that includes the `EnterEnvironment` hop for correct attach resolution.
+Steps 1-4 run on the host (the host daemon orchestrates the environment and mounts the repo). Steps 5-7 run inside the environment (routed through the environment's providers). Step 8 produces a hop plan that includes the `EnterEnvironment` hop for correct attach resolution.
 
 `CreateOpts` is populated by the plan builder:
 - `daemon_socket_path` — from the sandbox socket registry (step 2 creates it)
-- `reference_repo` — resolved from the host repo's git common dir (`git rev-parse --git-common-dir`)
+- `staging_dir` — `$FLOTILLA_STATE_DIR/env-{id}/refs/`, mounted into the container at `/ref/`
 - `tokens` — passed through from `Command` context (Phase D: programmatic, Phase E: from config)
+
+Note: `CreateOpts` no longer carries `reference_repo` directly. The staging directory is mounted as a whole, and `EnsureRepoInEnvironment` symlinks individual repos into it. This supports multiple repos in one environment without restarting the container.
 
 ## CloneCheckoutManager
 
-New `CheckoutManager` implementation for environments. Discovered inside the container by its factory when the `EnvironmentBag` indicates a container context (presence of `FLOTILLA_ENVIRONMENT_ID` env var and `/ref/repo` reference mount).
+New `CheckoutManager` implementation for environments. Discovered inside the container by its factory when the `EnvironmentBag` indicates a container context (presence of `FLOTILLA_ENVIRONMENT_ID` env var and `/ref/` directory with repo references).
 
 ```rust
 struct CloneCheckoutManager {
     runner: Arc<dyn CommandRunner>,
-    reference_repo: ExecutionEnvironmentPath,  // /ref/repo
+    reference_dir: ExecutionEnvironmentPath,  // /ref/{repo-slug}
 }
 ```
 
-`create_checkout(branch)` → `git clone --reference /ref/repo <remote_url> /workspace/<branch>`. The remote URL is read from the reference repo: `git --git-dir /ref/repo remote get-url origin`. For fresh branches, clones default branch then `git checkout -b <branch>`.
-
-For fresh branches, clones with `--no-checkout` then `git checkout -b <branch>` from the default branch.
+`create_checkout(branch)` → `git clone --reference /ref/{repo-slug} <remote_url> /workspace/<branch>`. The remote URL is read from the reference: `git --git-dir /ref/{repo-slug} remote get-url origin`. For fresh branches, clones with `--no-checkout` then `git checkout -b <branch>` from the default branch.
 
 Uses the same `CheckoutManager` trait as the worktree implementation. The plan builder and step resolver don't know about the difference — they call `create_checkout()` and the discovered provider handles the rest.
 
@@ -107,9 +119,9 @@ Uses the same `CheckoutManager` trait as the worktree implementation. The plan b
 
 `CloneCheckoutManagerFactory` probes for:
 - `FLOTILLA_ENVIRONMENT_ID` in `EnvironmentBag` (we're inside a container)
-- `/ref/repo` exists and is a valid git directory (reference mount is available)
+- `/ref/` directory exists with at least one repo reference subdirectory
 
-If both conditions are met, it returns a `CloneCheckoutManager`. Priority should be higher than the worktree factory inside environments (worktree creation doesn't make sense inside a disposable container).
+If both conditions are met, it returns a `CloneCheckoutManager` pointed at the appropriate `/ref/{repo-slug}` for the current repo context. Priority should be higher than the worktree factory inside environments (worktree creation doesn't make sense inside a disposable container).
 
 ## Hop Chain Wiring
 
