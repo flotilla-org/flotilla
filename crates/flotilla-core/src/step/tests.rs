@@ -481,13 +481,136 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
         matches!(
             event,
             DaemonEvent::CommandStepUpdate {
+                host,
                 step_index: 0,
                 description,
                 status: StepStatus::Failed { message },
                 ..
-            } if description == "remote" && message == "boom"
+            } if host == &HostName::new("feta") && description == "remote" && message == "boom"
         )
     }));
+}
+
+#[tokio::test]
+async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
+    let (cancel, tx) = setup();
+    let mut rx = tx.subscribe();
+    let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed)]);
+    let plan = StepPlan::new(vec![
+        make_step("local"),
+        Step { description: "remote-a".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote-b".into(), host: StepHost::Remote(HostName::new("feta")), action: StepAction::Noop },
+    ]);
+    let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
+        assert_host: HostName::new("feta"),
+        progress: vec![
+            RemoteStepProgressUpdate {
+                batch_step_index: 0,
+                batch_step_count: 2,
+                description: "remote-a".into(),
+                status: StepStatus::Started,
+            },
+            RemoteStepProgressUpdate {
+                batch_step_index: 1,
+                batch_step_count: 2,
+                description: "remote-b".into(),
+                status: StepStatus::Started,
+            },
+        ],
+        wait_for_cancel: None,
+        result: Err("boom".into()),
+    }]);
+
+    let result = run_step_plan_with_remote_executor(
+        plan,
+        1,
+        HostName::local(),
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        ExecutionEnvironmentPath::new("/repo"),
+        cancel,
+        tx,
+        &resolver,
+        &remote,
+    )
+    .await;
+
+    assert_eq!(result, CommandValue::Error { message: "boom".into() });
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let failure_events: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            DaemonEvent::CommandStepUpdate { host, step_index, description, status, .. } => Some((host, step_index, description, status)),
+            _ => None,
+        })
+        .filter(|(_, _, _, status)| matches!(status, StepStatus::Failed { .. }))
+        .collect();
+
+    assert_eq!(failure_events.len(), 1);
+    assert!(matches!(
+        &failure_events[0],
+        (host, 2, description, StepStatus::Failed { message })
+            if host == &HostName::new("feta") && description == "remote-b" && message == "boom"
+    ));
+}
+
+#[tokio::test]
+async fn remote_error_does_not_duplicate_failed_progress() {
+    struct PanicResolver;
+
+    #[async_trait::async_trait]
+    impl StepResolver for PanicResolver {
+        async fn resolve(&self, _desc: &str, _action: StepAction, _prior: &[StepOutcome]) -> Result<StepOutcome, String> {
+            panic!("local resolver should not be called after remote failure");
+        }
+    }
+
+    let (cancel, tx) = setup();
+    let mut rx = tx.subscribe();
+    let plan = StepPlan::new(vec![Step {
+        description: "remote".into(),
+        host: StepHost::Remote(HostName::new("feta")),
+        action: StepAction::Noop,
+    }]);
+    let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
+        assert_host: HostName::new("feta"),
+        progress: vec![
+            RemoteStepProgressUpdate {
+                batch_step_index: 0,
+                batch_step_count: 1,
+                description: "remote".into(),
+                status: StepStatus::Started,
+            },
+            RemoteStepProgressUpdate {
+                batch_step_index: 0,
+                batch_step_count: 1,
+                description: "remote".into(),
+                status: StepStatus::Failed { message: "boom".into() },
+            },
+        ],
+        wait_for_cancel: None,
+        result: Err("boom".into()),
+    }]);
+
+    let result = run_step_plan_with_remote_executor(
+        plan,
+        1,
+        HostName::local(),
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        ExecutionEnvironmentPath::new("/repo"),
+        cancel,
+        tx,
+        &PanicResolver,
+        &remote,
+    )
+    .await;
+
+    assert_eq!(result, CommandValue::Error { message: "boom".into() });
+
+    let failure_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|event| matches!(event, DaemonEvent::CommandStepUpdate { status: StepStatus::Failed { .. }, .. }))
+        .collect();
+    assert_eq!(failure_events.len(), 1);
 }
 
 #[tokio::test]

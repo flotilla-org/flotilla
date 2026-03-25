@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flotilla_protocol::{CommandValue, DaemonEvent, HostName, RepoIdentity, StepStatus};
 pub use flotilla_protocol::{Step, StepAction, StepHost, StepOutcome};
@@ -194,17 +194,18 @@ pub async fn run_step_plan_with_remote_executor(
                     step_offset: segment_start,
                     step_count,
                     event_tx: event_tx.clone(),
+                    state: Mutex::new(RemoteProgressState::default()),
                 });
                 let request = RemoteStepBatchRequest {
                     command_id,
-                    target_host,
+                    target_host: target_host.clone(),
                     repo_identity: repo_identity.clone(),
                     repo: repo.clone(),
                     step_offset: segment_start,
                     steps: segment_steps,
                 };
 
-                let batch = remote_executor.execute_batch(request, progress_sink);
+                let batch = remote_executor.execute_batch(request, progress_sink.clone());
                 tokio::pin!(batch);
 
                 let (cancelled_during_batch, outcome) = tokio::select! {
@@ -223,17 +224,19 @@ pub async fn run_step_plan_with_remote_executor(
                         outcomes.extend(step_outcomes);
                     }
                     Err(e) => {
-                        emit_step_update(
-                            &event_tx,
-                            command_id,
-                            host.clone(),
-                            repo_identity.clone(),
-                            repo.as_path().to_path_buf(),
-                            segment_start,
-                            step_count,
-                            steps[segment_start].description.clone(),
-                            StepStatus::Failed { message: e.clone() },
-                        );
+                        if let Some(failure) = progress_sink.synthesized_failure(e.clone()) {
+                            emit_step_update(
+                                &event_tx,
+                                command_id,
+                                target_host.clone(),
+                                repo_identity.clone(),
+                                repo.as_path().to_path_buf(),
+                                segment_start + failure.batch_step_index,
+                                step_count,
+                                failure.description,
+                                StepStatus::Failed { message: e.clone() },
+                            );
+                        }
                         return prior_result_or_error(&outcomes, e);
                     }
                 }
@@ -291,11 +294,46 @@ struct EventForwardingProgressSink {
     step_offset: usize,
     step_count: usize,
     event_tx: broadcast::Sender<DaemonEvent>,
+    state: Mutex<RemoteProgressState>,
+}
+
+#[derive(Default)]
+struct RemoteProgressState {
+    latest_batch_step_index: usize,
+    latest_description: Option<String>,
+    failed_emitted: bool,
+}
+
+struct SynthesizedRemoteFailure {
+    batch_step_index: usize,
+    description: String,
+}
+
+impl EventForwardingProgressSink {
+    fn synthesized_failure(&self, message: String) -> Option<SynthesizedRemoteFailure> {
+        let state = self.state.lock().expect("progress state mutex poisoned");
+        if state.failed_emitted {
+            return None;
+        }
+
+        Some(SynthesizedRemoteFailure {
+            batch_step_index: state.latest_batch_step_index,
+            description: state.latest_description.clone().unwrap_or_else(|| message),
+        })
+    }
 }
 
 #[async_trait::async_trait]
 impl RemoteStepProgressSink for EventForwardingProgressSink {
     async fn emit(&self, update: RemoteStepProgressUpdate) {
+        {
+            let mut state = self.state.lock().expect("progress state mutex poisoned");
+            state.latest_batch_step_index = update.batch_step_index;
+            state.latest_description = Some(update.description.clone());
+            if matches!(update.status, StepStatus::Failed { .. }) {
+                state.failed_emitted = true;
+            }
+        }
         emit_step_update(
             &self.event_tx,
             self.command_id,
