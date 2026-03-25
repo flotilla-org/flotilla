@@ -196,6 +196,7 @@ fn sample_remote_host_summary(name: &str) -> HostSummary {
         },
         inventory: ToolInventory::default(),
         providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+        environments: vec![],
     }
 }
 
@@ -836,6 +837,7 @@ async fn publish_peer_summary_normalizes_host_name() {
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         })
         .await;
 

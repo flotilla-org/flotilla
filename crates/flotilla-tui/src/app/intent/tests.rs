@@ -23,6 +23,7 @@ fn insert_local_host(model: &mut super::super::TuiModel, name: &str) {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     });
 }

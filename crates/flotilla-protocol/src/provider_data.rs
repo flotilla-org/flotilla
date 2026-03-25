@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{HostName, HostPath};
+use crate::{EnvironmentId, HostName, HostPath};
 
 /// Identity keys — safe for union-find grouping. Items sharing a
 /// CorrelationKey are the same work unit.
@@ -14,6 +14,7 @@ pub enum CorrelationKey {
     AttachableSet(AttachableSetId),
     ChangeRequestRef(String, String), // (provider_name, CR id)
     SessionRef(String, String),       // (provider_name, session_id)
+    EnvironmentRef(EnvironmentId),
 }
 
 /// Association keys — "related to" links that do NOT merge work units.
@@ -351,6 +352,7 @@ mod tests {
             CorrelationKey::AttachableSet(AttachableSetId::new("set-1")),
             CorrelationKey::ChangeRequestRef("gh".into(), "1".into()),
             CorrelationKey::SessionRef("cl".into(), "s".into()),
+            CorrelationKey::EnvironmentRef(crate::EnvironmentId::new("env-1")),
         ];
         for case in &correlation_cases {
             assert_roundtrip(case);

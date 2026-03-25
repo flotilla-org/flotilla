@@ -347,6 +347,7 @@ fn daemon_event_host_snapshot_roundtrip() {
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     }));
     let json = serde_json::to_string(&event).expect("serialize");
@@ -368,7 +369,12 @@ fn replay_cursor_with_stream_key_host_roundtrip() {
 
 #[test]
 fn message_hello_roundtrip() {
-    let msg = Message::Hello { protocol_version: PROTOCOL_VERSION, host_name: HostName::new("desktop"), session_id: uuid::Uuid::nil() };
+    let msg = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        host_name: HostName::new("desktop"),
+        session_id: uuid::Uuid::nil(),
+        environment_id: None,
+    };
 
     test_helpers::assert_json_roundtrip(&msg);
 }

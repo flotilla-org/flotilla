@@ -414,7 +414,7 @@ async fn handle_client(
                 .run(lines, writer, id, request)
                 .await;
         }
-        Message::Hello { protocol_version, host_name, session_id } => {
+        Message::Hello { protocol_version, host_name, session_id, .. } => {
             PeerConnection::new(daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify)
                 .run(lines, writer, protocol_version, host_name, session_id)
                 .await;

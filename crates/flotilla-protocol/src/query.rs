@@ -187,6 +187,7 @@ mod tests {
             },
             inventory: ToolInventory::default(),
             providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+            environments: vec![],
         }
     }
 

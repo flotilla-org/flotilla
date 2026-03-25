@@ -80,6 +80,7 @@ mod status_human {
             },
             inventory: ToolInventory::default(),
             providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), healthy: true }],
+            environments: vec![],
         }
     }
 

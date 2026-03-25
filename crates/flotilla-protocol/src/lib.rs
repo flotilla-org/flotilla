@@ -157,6 +157,8 @@ pub enum Message {
         host_name: HostName,
         #[serde(default = "uuid::Uuid::nil")]
         session_id: uuid::Uuid,
+        #[serde(default)]
+        environment_id: Option<EnvironmentId>,
     },
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),

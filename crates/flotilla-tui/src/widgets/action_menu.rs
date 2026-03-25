@@ -507,6 +507,7 @@ mod tests {
                 system: flotilla_protocol::SystemInfo::default(),
                 inventory: flotilla_protocol::ToolInventory::default(),
                 providers: vec![],
+                environments: vec![],
             },
         });
 

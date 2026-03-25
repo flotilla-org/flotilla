@@ -16,6 +16,7 @@ fn insert_local_host(model: &mut TuiModel, name: &str) {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     });
 }
@@ -31,6 +32,7 @@ fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     });
 }
@@ -853,6 +855,7 @@ fn host_snapshot_event_populates_hosts_map() {
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
+            environments: vec![],
         },
     })));
     assert_eq!(app.model.my_host(), Some(&HostName::new("desktop")));
