@@ -263,10 +263,19 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             format!("[repo]     {}: untracked", repo_name(path))
         }
         DaemonEvent::CommandStarted { repo, description, .. } => {
-            format!("[command]  {}: started \"{}\"", repo_name(repo), description)
+            if repo.as_os_str().is_empty() {
+                // Query commands have no repo context — show description only
+                format!("[query]    {description}")
+            } else {
+                format!("[command]  {}: started \"{}\"", repo_name(repo), description)
+            }
         }
         DaemonEvent::CommandFinished { repo, result, .. } => {
-            format!("[command]  {}: finished \u{2192} {}", repo_name(repo), format_command_result(result))
+            if is_query_result(result) {
+                format_command_result(result)
+            } else {
+                format!("[command]  {}: finished \u{2192} {}", repo_name(repo), format_command_result(result))
+            }
         }
         DaemonEvent::CommandStepUpdate { repo, description, step_index, step_count, .. } => {
             format!("[step]     {}: {} ({}/{})", repo_name(repo), description, step_index + 1, step_count)
