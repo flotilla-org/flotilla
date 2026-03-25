@@ -10,7 +10,9 @@ Introduce the `EnvironmentProvider` trait, `ProvisionedEnvironment` handle trait
 
 ## Core Types
 
-All types use `DaemonHostPath` and `ExecutionEnvironmentPath` newtypes where appropriate. These newtypes move from `flotilla-core` to `flotilla-protocol` as a prep step, since they are pure `PathBuf` wrappers with transparent serde and carry no core logic.
+All types use `DaemonHostPath` and `ExecutionEnvironmentPath` newtypes where appropriate.
+
+**Prerequisite:** move `DaemonHostPath` and `ExecutionEnvironmentPath` from `flotilla-core::path_context` to `flotilla-protocol`. They are pure `PathBuf` wrappers with transparent serde and carry no core logic. This is a small mechanical refactor (move definitions, update imports) that should be a separate prep PR. Until the migration, types like `CreateOpts` that use these newtypes live in `flotilla-core` — the protocol-layer types (`HostEnvironmentInfo`, `EnvironmentBinding`) use plain `PathBuf` with conversion in `convert.rs`.
 
 ```rust
 struct EnvironmentId(String);  // filesystem-safe: UUID or slug
@@ -55,7 +57,7 @@ pub type EnvironmentProviderFactory = dyn Factory<Output = dyn EnvironmentProvid
 pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
 ```
 
-The factory `probe()` checks `docker --version` via the injected runner. If Docker is available, returns a `DockerEnvironment` provider. The host summary reports the capability so remote daemons know which hosts can provision environments.
+The factory `probe()` checks `docker --version` via the injected runner. If Docker is available, returns a `DockerEnvironment` provider.
 
 ```rust
 #[async_trait]
@@ -154,11 +156,15 @@ struct EnvironmentRunner {
 }
 ```
 
-Transforms `run("git", &["status"], cwd, label)` into `inner.run("docker", &["exec", "-w", cwd_str, &container_name, "git", "status"], "/", label)`.
+All three `CommandRunner` methods are wrapped:
+
+**`run(cmd, args, cwd, label)`** → `inner.run("docker", &["exec", "-w", cwd_str, &container_name, cmd, ...args], "/", label)`.
+
+**`run_output(cmd, args, cwd, label)`** → same transformation, delegates to `inner.run_output()`.
+
+**`exists(cmd, args)`** → cannot delegate to `inner.exists()` (different signature — no `cwd` or `label`). Instead calls `inner.run("docker", &["exec", &container_name, "which", cmd], "/", label)` and converts the result to `bool`.
 
 The caller's `cwd` (an `ExecutionEnvironmentPath` inside the container) becomes a `-w` flag on `docker exec`. The host-side `cwd` is irrelevant (uses `/`).
-
-`exists(cmd, args)` wraps similarly: `inner.run("docker", &["exec", &container_name, "which", cmd], "/", label)`.
 
 This runner feeds into `FactoryRegistry::probe()` for interior provider discovery — the same factories discover cleat, git, etc. inside the container using the decorated runner.
 
@@ -175,7 +181,7 @@ EnterEnvironment { env_id: EnvironmentId, provider: String }
 
 ### EnvironmentHopResolver
 
-New per-hop resolver trait, following the pattern of `RemoteHopResolver` and `TerminalHopResolver`:
+New per-hop resolver trait, following the `resolve_wrap`/`resolve_enter` pattern of `RemoteHopResolver`:
 
 ```rust
 trait EnvironmentHopResolver: Send + Sync {
@@ -192,7 +198,7 @@ trait EnvironmentHopResolver: Send + Sync {
 
 **Collapse logic:** if `ResolutionContext.current_environment == env_id`, skip the hop.
 
-The `HopResolver` dispatches `EnterEnvironment` hops to this resolver. No structural changes to the resolution algorithm — just a new hop type and per-hop resolver.
+**Dispatch:** `HopResolver::resolve()` gains an `EnterEnvironment` arm in its `match` on `Hop`. The existing `CombineStrategy::should_wrap()` already receives `&Hop` — it pattern-matches the new variant to decide between `resolve_wrap` and `resolve_enter`. The `ResolutionContext::current_environment` field changes from `Option<String>` (placeholder) to `Option<EnvironmentId>`.
 
 ## Sandbox-Scoped Sockets
 
@@ -222,7 +228,7 @@ impl EnvironmentSocketRegistry {
 
 ### Protocol handshake
 
-The `Hello` message gains `environment_id: Option<EnvironmentId>`. The server verifies:
+The `Hello` message gains `environment_id: Option<EnvironmentId>` (with `#[serde(default)]` for wire compatibility). No protocol version bump needed — the project is in a no-backwards-compatibility phase. The server verifies:
 - Environment socket connection: claimed `environment_id` must match the socket's environment — reject mismatches.
 - Main socket connection: `environment_id` accepted as-is (forward-proofs for HTTP/TCP transport).
 
@@ -230,7 +236,7 @@ The `Hello` message gains `environment_id: Option<EnvironmentId>`. The server ve
 
 ### Host level
 
-Environment info is reported in the host summary exchanged between peers. This tells the mesh which environments exist and where.
+Environment info is reported in the host summary exchanged between peers. This tells the mesh which environments exist and where. The successful factory probe also indicates the host can provision Docker environments — remote daemons use this when routing provisioning requests. `HostSummary` in `flotilla-protocol` gains a new field: `environments: Vec<HostEnvironmentInfo>`.
 
 ```rust
 struct HostEnvironmentInfo {
@@ -244,14 +250,19 @@ The semantics of "host level" are "owning daemon node," not physical containment
 
 ### Repo level
 
-Provider data items (checkouts, terminals, agents) gain `environment_id: Option<EnvironmentId>` as a first-class field. A repo-level binding connects the work to its environment:
+Provider data items (checkouts, terminals, agents) gain `environment_id: Option<EnvironmentId>` as a first-class field. `RepoModel` gains an optional environment binding that connects the repo's work to its environment:
 
 ```rust
+// On RepoModel (core) and in repo snapshot data (protocol):
+environment_binding: Option<EnvironmentBinding>,
+
 struct EnvironmentBinding {
     environment_id: EnvironmentId,
     host: HostName,
 }
 ```
+
+The binding is set when a step plan wires an environment to a checkout workflow (Phase D). For Phase C, the types exist and are serializable; the binding is populated in tests but not yet by production step execution.
 
 ### Correlation
 
