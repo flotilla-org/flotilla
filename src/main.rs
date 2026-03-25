@@ -358,24 +358,23 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
+fn resolve_repo_from_env(cli: &Cli) -> Option<RepoSelector> {
+    match (&cli.repo, std::env::var("FLOTILLA_REPO").ok()) {
+        (Some(repo), _) => Some(RepoSelector::Query(repo.clone())),
+        (None, Some(repo)) if !repo.is_empty() => Some(RepoSelector::Query(repo)),
+        _ => None,
+    }
+}
+
 fn set_context_repo(cmd: &mut Command, cli: &Cli) {
     if cmd.context_repo.is_some() {
         return;
     }
-    let repo_selector = match (&cli.repo, std::env::var("FLOTILLA_REPO").ok()) {
-        (Some(repo), _) => Some(RepoSelector::Query(repo.clone())),
-        (None, Some(repo)) if !repo.is_empty() => Some(RepoSelector::Query(repo)),
-        _ => None,
-    };
-    cmd.context_repo = repo_selector;
+    cmd.context_repo = resolve_repo_from_env(cli);
 }
 
 fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
-    let repo_selector = match (&cli.repo, std::env::var("FLOTILLA_REPO").ok()) {
-        (Some(repo), _) => Some(RepoSelector::Query(repo.clone())),
-        (None, Some(repo)) if !repo.is_empty() => Some(RepoSelector::Query(repo)),
-        _ => None,
-    };
+    let repo_selector = resolve_repo_from_env(cli);
 
     match &mut cmd.action {
         CommandAction::Checkout { repo, .. } if *repo == RepoSelector::Query(String::new()) => {

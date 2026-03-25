@@ -493,7 +493,7 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
 }
 
 pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {
-    let is_query = command.description().starts_with("query");
+    let is_query = command.action.is_query();
     let mut rx = daemon.subscribe();
     let command_id = daemon.execute(command).await?;
 

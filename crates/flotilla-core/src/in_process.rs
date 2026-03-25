@@ -1694,135 +1694,57 @@ impl DaemonHandle for InProcessDaemon {
 
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
 
-        // Query commands: execute inline, emit lifecycle events with the result.
-        match &command.action {
-            flotilla_protocol::CommandAction::QueryRepoDetail { ref repo } => {
-                let result = match self.get_repo_detail_internal(repo).await {
-                    Ok(detail) => flotilla_protocol::CommandValue::RepoDetail(Box::new(detail)),
+        // Query commands: execute inline with lifecycle events.
+        if command.action.is_query() {
+            let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: PathBuf::new(),
+                description: command.description().to_string(),
+            });
+
+            let result = match &command.action {
+                flotilla_protocol::CommandAction::QueryRepoDetail { repo } => match self.get_repo_detail_internal(repo).await {
+                    Ok(v) => flotilla_protocol::CommandValue::RepoDetail(Box::new(v)),
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    description: command.description().to_string(),
-                });
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    result,
-                });
-                return Ok(id);
-            }
-            flotilla_protocol::CommandAction::QueryRepoProviders { ref repo } => {
-                let result = match self.get_repo_providers_internal(repo).await {
-                    Ok(providers) => flotilla_protocol::CommandValue::RepoProviders(Box::new(providers)),
+                },
+                flotilla_protocol::CommandAction::QueryRepoProviders { repo } => match self.get_repo_providers_internal(repo).await {
+                    Ok(v) => flotilla_protocol::CommandValue::RepoProviders(Box::new(v)),
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    description: command.description().to_string(),
-                });
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    result,
-                });
-                return Ok(id);
-            }
-            flotilla_protocol::CommandAction::QueryRepoWork { ref repo } => {
-                let result = match self.get_repo_work_internal(repo).await {
-                    Ok(work) => flotilla_protocol::CommandValue::RepoWork(Box::new(work)),
+                },
+                flotilla_protocol::CommandAction::QueryRepoWork { repo } => match self.get_repo_work_internal(repo).await {
+                    Ok(v) => flotilla_protocol::CommandValue::RepoWork(Box::new(v)),
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    description: command.description().to_string(),
-                });
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    result,
-                });
-                return Ok(id);
-            }
-            flotilla_protocol::CommandAction::QueryHostList {} => {
-                let result = match self.list_hosts_internal().await {
-                    Ok(hosts) => flotilla_protocol::CommandValue::HostList(Box::new(hosts)),
+                },
+                flotilla_protocol::CommandAction::QueryHostList {} => match self.list_hosts_internal().await {
+                    Ok(v) => flotilla_protocol::CommandValue::HostList(Box::new(v)),
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    description: command.description().to_string(),
-                });
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    result,
-                });
-                return Ok(id);
-            }
-            flotilla_protocol::CommandAction::QueryHostStatus { ref target_host } => {
-                let result = match self.get_host_status_internal(target_host).await {
-                    Ok(status) => flotilla_protocol::CommandValue::HostStatus(Box::new(status)),
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    description: command.description().to_string(),
-                });
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    result,
-                });
-                return Ok(id);
-            }
-            flotilla_protocol::CommandAction::QueryHostProviders { ref target_host } => {
-                let result = match self.get_host_providers_internal(target_host).await {
-                    Ok(providers) => flotilla_protocol::CommandValue::HostProviders(Box::new(providers)),
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                };
-                let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    description: command.description().to_string(),
-                });
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    host: self.host_name.clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() },
-                    repo: PathBuf::new(),
-                    result,
-                });
-                return Ok(id);
-            }
-            _ => {}
+                },
+                flotilla_protocol::CommandAction::QueryHostStatus { target_host } => {
+                    match self.get_host_status_internal(target_host).await {
+                        Ok(v) => flotilla_protocol::CommandValue::HostStatus(Box::new(v)),
+                        Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    }
+                }
+                flotilla_protocol::CommandAction::QueryHostProviders { target_host } => {
+                    match self.get_host_providers_internal(target_host).await {
+                        Ok(v) => flotilla_protocol::CommandValue::HostProviders(Box::new(v)),
+                        Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    }
+                }
+                _ => unreachable!("is_query() returned true for non-query action"),
+            };
+
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                host: self.host_name.clone(),
+                repo_identity: empty_identity,
+                repo: PathBuf::new(),
+                result,
+            });
+            return Ok(id);
         }
 
         match &command.action {

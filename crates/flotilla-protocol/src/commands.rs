@@ -160,6 +160,21 @@ pub enum CommandAction {
     },
 }
 
+impl CommandAction {
+    /// Whether this action is a read-only query command.
+    pub fn is_query(&self) -> bool {
+        matches!(
+            self,
+            CommandAction::QueryRepoDetail { .. }
+                | CommandAction::QueryRepoProviders { .. }
+                | CommandAction::QueryRepoWork { .. }
+                | CommandAction::QueryHostList {}
+                | CommandAction::QueryHostStatus { .. }
+                | CommandAction::QueryHostProviders { .. }
+        )
+    }
+}
+
 impl Command {
     pub fn description(&self) -> &'static str {
         match &self.action {

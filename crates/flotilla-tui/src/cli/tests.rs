@@ -742,8 +742,9 @@ mod repo_name_fn {
 }
 
 mod query_event_formatting {
-    use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostListResponse, HostName, RepoIdentity};
     use std::path::PathBuf;
+
+    use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostListResponse, HostName, RepoIdentity};
 
     use crate::cli::format_event_human;
 
