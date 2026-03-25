@@ -41,6 +41,7 @@ pub enum Action {
     OpenIssueSearch,
     OpenFilePicker,
     OpenCommandPalette,
+    OpenContextualPalette,
     FillSelected,
     Dispatch(Intent),
 }
@@ -106,6 +107,7 @@ impl Action {
             "open_issue_search" => Action::OpenIssueSearch,
             "open_file_picker" => Action::OpenFilePicker,
             "open_command_palette" => Action::OpenCommandPalette,
+            "open_contextual_palette" => Action::OpenContextualPalette,
             "fill_selected" => Action::FillSelected,
             // Intent-wrapping actions
             "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
@@ -153,6 +155,7 @@ impl Action {
             Action::OpenIssueSearch => "open_issue_search",
             Action::OpenFilePicker => "open_file_picker",
             Action::OpenCommandPalette => "open_command_palette",
+            Action::OpenContextualPalette => "open_contextual_palette",
             Action::FillSelected => "fill_selected",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "switch_to_workspace",
@@ -197,6 +200,7 @@ impl Action {
             Action::OpenIssueSearch => "Search issues",
             Action::OpenFilePicker => "Open file picker",
             Action::OpenCommandPalette => "Open command palette",
+            Action::OpenContextualPalette => "Open contextual palette (pre-filled)",
             Action::FillSelected => "Fill selected item",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",
@@ -349,6 +353,7 @@ impl Keymap {
             ("Actions", &[
                 Action::Confirm,
                 Action::OpenCommandPalette,
+                Action::OpenContextualPalette,
                 Action::OpenActionMenu,
                 Action::OpenBranchInput,
                 Action::Dispatch(Intent::RemoveCheckout),
@@ -366,7 +371,6 @@ impl Keymap {
                 Action::ToggleArchived,
                 Action::ToggleDebug,
                 Action::CycleTheme,
-                Action::CycleHost,
                 Action::ToggleHelp,
                 Action::Dismiss,
                 Action::Quit,

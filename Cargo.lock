@@ -1203,6 +1203,7 @@ dependencies = [
  "ratatui-image",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "time",
  "tokio",
