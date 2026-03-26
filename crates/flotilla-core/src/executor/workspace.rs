@@ -117,14 +117,19 @@ impl<'a> WorkspaceOrchestrator<'a> {
         }
     }
 
-    pub(super) fn ensure_attachable_set_for_checkout(&self, target_host: &HostName, checkout_path: &Path) -> Option<AttachableSetId> {
+    pub(super) fn ensure_attachable_set_for_checkout(
+        &self,
+        target_host: &HostName,
+        checkout_path: &Path,
+        environment_id: Option<&EnvironmentId>,
+    ) -> Option<AttachableSetId> {
         let Ok(mut store) = self.attachable_store.lock() else {
             warn!("attachable store lock poisoned while ensuring attachable set for checkout");
             return None;
         };
 
         let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
-        let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout));
+        let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout), environment_id.cloned());
         if changed {
             if let Err(err) = store.save() {
                 warn!(err = %err, "failed to persist attachable registry after ensuring attachable set");
@@ -176,6 +181,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         let (set_id, changed_set) = store.ensure_terminal_set_with_change(
             Some(target_host.clone()),
             Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+            None,
         );
         let changed_binding = store.replace_binding(ProviderBinding {
             provider_category: "workspace_manager".into(),

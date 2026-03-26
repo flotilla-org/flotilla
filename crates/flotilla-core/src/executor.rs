@@ -651,8 +651,11 @@ impl StepResolver for ExecutorStepResolver {
                     &self.local_host,
                     tm.as_ref(),
                 );
-                let attachable_set_id =
-                    workspace_orchestrator.ensure_attachable_set_for_checkout(&self.local_host, checkout_path.as_path());
+                let attachable_set_id = workspace_orchestrator.ensure_attachable_set_for_checkout(
+                    &self.local_host,
+                    checkout_path.as_path(),
+                    context_environment_id.as_ref(),
+                );
                 let workspace_config =
                     workspace_config(self.repo.root.as_path(), &label, checkout_path.as_path(), "claude", self.config_base.as_path());
                 let template_yaml = workspace_config.template_yaml.clone();
@@ -770,7 +773,7 @@ impl StepResolver for ExecutorStepResolver {
                         tm.as_ref(),
                     );
                     let attachable_set_id =
-                        workspace_orchestrator.ensure_attachable_set_for_checkout(&self.local_host, checkout_path.as_path());
+                        workspace_orchestrator.ensure_attachable_set_for_checkout(&self.local_host, checkout_path.as_path(), None);
                     let commands = if let Some(ref tm) = tm {
                         let terminal_preparation =
                             TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
