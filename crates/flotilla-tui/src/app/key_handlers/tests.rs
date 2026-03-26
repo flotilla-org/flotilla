@@ -1386,7 +1386,7 @@ fn delete_confirm_y_with_no_info_does_not_push_command() {
 fn open_action_menu_includes_open_change_request() {
     let mut app = stub_app();
     let mut item = make_work_item("a");
-    item.change_request_key = Some("PR#10".into());
+    item.change_request_key = Some("10".into());
     setup_table(&mut app, vec![item]);
     app.open_action_menu();
     assert_eq!(app.screen.modal_stack.len(), 1);
@@ -1437,13 +1437,13 @@ fn l_cycles_layout_in_normal_mode() {
 fn normal_p_opens_change_request() {
     let mut app = stub_app();
     let mut item = make_work_item("a");
-    item.change_request_key = Some("PR#42".into());
+    item.change_request_key = Some("42".into());
     setup_table(&mut app, vec![item]);
     app.handle_key(key(KeyCode::Char('p')));
     let (cmd, _) = app.proto_commands.take_next().unwrap();
     match cmd {
         Command { action: CommandAction::OpenChangeRequest { id }, .. } => {
-            assert_eq!(id, "PR#42");
+            assert_eq!(id, "42");
         }
         other => panic!("expected OpenChangeRequest, got {:?}", other),
     }

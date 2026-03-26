@@ -10,7 +10,7 @@ use crate::{
 #[command(about = "Issues")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct IssueNoun {
-    /// Issue ID or comma-separated IDs (e.g. "#1,#5,#7")
+    /// Issue ID or comma-separated IDs (e.g. "1,5,7")
     pub subject: Option<String>,
 
     #[command(subcommand)]

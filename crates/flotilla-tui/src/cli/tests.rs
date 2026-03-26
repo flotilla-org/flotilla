@@ -510,7 +510,7 @@ mod work_items_table {
     #[test]
     fn item_with_all_fields_populated() {
         let mut item = make_work_item(WorkItemKind::ChangeRequest, Some("feat-x"), "Feature X");
-        item.change_request_key = Some("PR#10".to_string());
+        item.change_request_key = Some("10".to_string());
         item.session_key = Some("sess-1".to_string());
         item.issue_keys = vec!["I-1".to_string(), "I-2".to_string()];
         let table = format_work_items_table(&[item]);
@@ -518,7 +518,7 @@ mod work_items_table {
         assert!(output.contains("ChangeRequest"), "should show kind");
         assert!(output.contains("feat-x"), "should show branch");
         assert!(output.contains("Feature X"), "should show description");
-        assert!(output.contains("PR#10"), "should show PR key");
+        assert!(output.contains("10"), "should show PR key");
         assert!(output.contains("sess-1"), "should show session key");
         assert!(output.contains("I-1, I-2"), "should join issue keys with comma");
     }

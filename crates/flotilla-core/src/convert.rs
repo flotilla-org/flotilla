@@ -314,7 +314,7 @@ mod tests {
             attachable_set_id: None,
             branch: Some("feature-login".to_string()),
             description: "Implement login flow".to_string(),
-            linked_change_request: Some("PR#55".to_string()),
+            linked_change_request: Some("55".to_string()),
             linked_session: Some("sess-abc".to_string()),
             linked_issues: vec!["GH-10".to_string(), "LIN-20".to_string()],
             workspace_refs: vec!["cmux-1".to_string()],
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(checkout.key, hp("/repos/my-project/wt-1"));
         assert!(!checkout.is_main_checkout);
 
-        assert_eq!(proto.change_request_key.as_deref(), Some("PR#55"));
+        assert_eq!(proto.change_request_key.as_deref(), Some("55"));
         assert_eq!(proto.session_key.as_deref(), Some("sess-abc"));
         assert_eq!(proto.issue_keys, vec!["GH-10", "LIN-20"]);
         assert_eq!(proto.workspace_refs, vec!["cmux-1"]);

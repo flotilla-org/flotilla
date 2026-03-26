@@ -310,7 +310,7 @@ mod tests {
                 branch: Some("main".into()),
                 description: "Main".into(),
                 checkout: Some(CheckoutRef { key: hp("/repos/main"), is_main_checkout: true }),
-                change_request_key: Some("PR#1".into()),
+                change_request_key: Some("1".into()),
                 session_key: Some("sess-1".into()),
                 issue_keys: vec!["I-1".into(), "I-2".into()],
                 workspace_refs: vec!["ws-1".into()],
@@ -411,7 +411,7 @@ mod tests {
         let identities = vec![
             WorkItemIdentity::Checkout(hp("/path/to/wt")),
             WorkItemIdentity::AttachableSet(AttachableSetId::new("set-1")),
-            WorkItemIdentity::ChangeRequest("PR#99".into()),
+            WorkItemIdentity::ChangeRequest("99".into()),
             WorkItemIdentity::Session("sess-abc".into()),
             WorkItemIdentity::Issue("GH-42".into()),
             WorkItemIdentity::RemoteBranch("origin/main".into()),

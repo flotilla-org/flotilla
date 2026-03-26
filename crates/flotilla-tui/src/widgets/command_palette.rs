@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn confirm_noun_verb_pushes_command() {
         let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("cr #42 close");
+        widget.input = Input::from("cr 42 close");
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
@@ -805,7 +805,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::Finished));
 
         let (cmd, _) = harness.commands.take_next().expect("expected command");
-        assert!(matches!(cmd.action, CommandAction::CloseChangeRequest { ref id } if id == "#42"));
+        assert!(matches!(cmd.action, CommandAction::CloseChangeRequest { ref id } if id == "42"));
     }
 
     #[test]
@@ -825,9 +825,9 @@ mod tests {
 
     #[test]
     fn confirm_noun_verb_inferred_repo_on_overview_tab_rejects() {
-        // `cr #42 close` uses RepoContext::Inferred — should be rejected on overview tab
+        // `cr 42 close` uses RepoContext::Inferred — should be rejected on overview tab
         let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("cr #42 close");
+        widget.input = Input::from("cr 42 close");
         let mut harness = TestWidgetHarness::new();
         harness.is_config = true;
         let mut ctx = harness.ctx();
@@ -879,15 +879,15 @@ mod tests {
     #[test]
     fn prefill_from_cr() {
         let mut item = bare_item();
-        item.change_request_key = Some("#42".into());
-        assert_eq!(palette_prefill(&item), Some("cr #42 ".into()));
+        item.change_request_key = Some("42".into());
+        assert_eq!(palette_prefill(&item), Some("cr 42 ".into()));
     }
 
     #[test]
     fn prefill_prefers_cr_over_checkout() {
         let mut item = checkout_item("feat", "/tmp/repo", false);
-        item.change_request_key = Some("#42".into());
-        assert_eq!(palette_prefill(&item), Some("cr #42 ".into()));
+        item.change_request_key = Some("42".into());
+        assert_eq!(palette_prefill(&item), Some("cr 42 ".into()));
     }
 
     #[test]
@@ -975,12 +975,12 @@ mod tests {
     #[test]
     fn explicit_host_routing_preserved_for_needs_context() {
         let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
-        // Simulate `host feta cr #42 open` — HostNoun::resolve() sets command.host = Some("feta")
+        // Simulate `host feta cr 42 open` — HostNoun::resolve() sets command.host = Some("feta")
         let cmd = Command {
             host: Some(HostName::new("feta")),
             environment: None,
             context_repo: None,
-            action: CommandAction::OpenChangeRequest { id: "#42".into() },
+            action: CommandAction::OpenChangeRequest { id: "42".into() },
         };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
         let result = tui_dispatch(resolved, None, false, Some(&repo_id), &None, &None, false).expect("should succeed");
@@ -998,7 +998,7 @@ mod tests {
             branch: None,
             description: String::new(),
             checkout: None,
-            change_request_key: Some("#42".into()),
+            change_request_key: Some("42".into()),
             session_key: None,
             issue_keys: Vec::new(),
             workspace_refs: Vec::new(),
@@ -1010,7 +1010,7 @@ mod tests {
             agent_keys: Vec::new(),
         };
         let cmd =
-            Command { host: None, environment: None, context_repo: None, action: CommandAction::OpenChangeRequest { id: "#42".into() } };
+            Command { host: None, environment: None, context_repo: None, action: CommandAction::OpenChangeRequest { id: "42".into() } };
         let my_host = Some(HostName::new("local-host"));
         // ProviderHost on a remote-only repo should derive host from the item
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };

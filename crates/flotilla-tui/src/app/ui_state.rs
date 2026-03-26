@@ -113,7 +113,7 @@ pub struct UiState {
     pub show_debug: bool,
     pub help_scroll: u16,
     /// Transient echo of the last dispatched command, shown dim at the left of the status bar.
-    /// Examples: `"cr #42 open"`, `"/cr #42 ?"`.
+    /// Examples: `"cr 42 open"`, `"/cr 42 ?"`.
     pub command_echo: Option<String>,
 }
 

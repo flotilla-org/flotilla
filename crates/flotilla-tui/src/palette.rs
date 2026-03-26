@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn parse_noun_returns_none() {
-        let result = parse_palette_local("cr #42 open");
+        let result = parse_palette_local("cr 42 open");
         assert!(result.is_none());
     }
 
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn parse_palette_input_cr_close() {
-        let result = parse_palette_input("cr #42 close").expect("should parse");
+        let result = parse_palette_input("cr 42 close").expect("should parse");
         assert!(matches!(result, PaletteParseResult::Resolved(Resolved::NeedsContext { ref command, .. })
                 if matches!(command.action, CommandAction::CloseChangeRequest { .. })));
     }
@@ -662,7 +662,7 @@ mod tests {
         let identity = model.repo_order[0].clone();
         let repo = model.repos.get_mut(&identity).expect("repo exists");
         let mut pd = ProviderData::default();
-        pd.change_requests.insert("#42".into(), ChangeRequest {
+        pd.change_requests.insert("42".into(), ChangeRequest {
             title: "Fix bug".into(),
             branch: "fix-bug".into(),
             status: ChangeRequestStatus::Open,
@@ -672,7 +672,7 @@ mod tests {
             provider_name: String::new(),
             provider_display_name: String::new(),
         });
-        pd.change_requests.insert("#99".into(), ChangeRequest {
+        pd.change_requests.insert("99".into(), ChangeRequest {
             title: "Add feature".into(),
             branch: "add-feature".into(),
             status: ChangeRequestStatus::Draft,
@@ -753,14 +753,14 @@ mod tests {
         let model = model_with_crs();
         let completions = palette_completions("cr ", &model, true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert!(values.contains(&"#42"), "expected '#42' in {values:?}");
-        assert!(values.contains(&"#99"), "expected '#99' in {values:?}");
+        assert!(values.contains(&"42"), "expected '42' in {values:?}");
+        assert!(values.contains(&"99"), "expected '99' in {values:?}");
     }
 
     #[test]
     fn noun_subject_shows_verbs() {
         let model = empty_model();
-        let completions = palette_completions("cr #42 ", &model, true);
+        let completions = palette_completions("cr 42 ", &model, true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"open"), "expected 'open' in {values:?}");
         assert!(values.contains(&"close"), "expected 'close' in {values:?}");
