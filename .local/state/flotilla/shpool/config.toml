@@ -1,7 +1,0 @@
-# Managed by flotilla — edits will be overwritten.
-# Disable shpool's prompt prefix; flotilla has its own UI.
-prompt_prefix = ""
-
-# Forward terminal-critical env vars from the attaching client
-# so terminfo, truecolor, and locale survive the daemon boundary.
-forward_env = ["TERM", "TERMINFO", "TERMINFO_DIRS", "COLORTERM"]
