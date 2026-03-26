@@ -272,17 +272,10 @@ impl App {
         }
 
         // Try registry path for convertible intents.
-        if let Some(tokens) = intent.to_command_tokens(item) {
-            self.ui.command_echo = Some(tokens.join(" "));
+        if let Some(noun) = intent.to_noun_command(item) {
+            self.ui.command_echo = Some(noun.to_string());
 
-            let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-            let parse_result = if token_refs.first() == Some(&"host") {
-                flotilla_commands::parse_host_command(&token_refs)
-            } else {
-                flotilla_commands::parse_noun_command(&token_refs).and_then(|noun| noun.resolve())
-            };
-
-            match parse_result {
+            match noun.resolve() {
                 Ok(resolved) => {
                     let is_config = self.ui.is_config;
                     let active_repo = if is_config { None } else { Some(self.model.active_repo_identity()) };

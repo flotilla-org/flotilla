@@ -927,34 +927,39 @@ fn bare_item_has_no_intents_available() {
     assert!(available.is_empty(), "bare item should have no intents, got {available:?}");
 }
 
-// ── to_command_tokens tests ──
+// ── to_noun_command tests ──
 
 #[test]
-fn open_cr_produces_tokens() {
+fn open_cr_produces_noun() {
     let mut item = bare_item();
     item.change_request_key = Some("#42".into());
-    assert_eq!(Intent::OpenChangeRequest.to_command_tokens(&item), Some(vec!["cr".into(), "#42".into(), "open".into()]));
+    let noun = Intent::OpenChangeRequest.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "cr #42 open");
+    assert!(noun.resolve().is_ok());
 }
 
 #[test]
-fn close_cr_produces_tokens() {
+fn close_cr_produces_noun() {
     let mut item = bare_item();
     item.change_request_key = Some("#42".into());
-    assert_eq!(Intent::CloseChangeRequest.to_command_tokens(&item), Some(vec!["cr".into(), "#42".into(), "close".into()]));
+    let noun = Intent::CloseChangeRequest.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "cr #42 close");
 }
 
 #[test]
-fn open_issue_produces_tokens() {
+fn open_issue_produces_noun() {
     let mut item = bare_item();
     item.issue_keys = vec!["#7".into()];
-    assert_eq!(Intent::OpenIssue.to_command_tokens(&item), Some(vec!["issue".into(), "#7".into(), "open".into()]));
+    let noun = Intent::OpenIssue.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "issue #7 open");
 }
 
 #[test]
-fn archive_session_produces_tokens() {
+fn archive_session_produces_noun() {
     let mut item = bare_item();
     item.session_key = Some("claude-1".into());
-    assert_eq!(Intent::ArchiveSession.to_command_tokens(&item), Some(vec!["agent".into(), "claude-1".into(), "archive".into()]));
+    let noun = Intent::ArchiveSession.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "agent claude-1 archive");
 }
 
 #[test]
@@ -962,10 +967,8 @@ fn teleport_session_with_branch() {
     let mut item = bare_item();
     item.session_key = Some("claude-1".into());
     item.branch = Some("feat".into());
-    assert_eq!(
-        Intent::TeleportSession.to_command_tokens(&item),
-        Some(vec!["agent".into(), "claude-1".into(), "teleport".into(), "--branch".into(), "feat".into()])
-    );
+    let noun = Intent::TeleportSession.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "agent claude-1 teleport --branch feat");
 }
 
 #[test]
@@ -974,45 +977,37 @@ fn teleport_session_with_branch_and_checkout() {
     item.session_key = Some("claude-1".into());
     item.branch = Some("feat".into());
     item.checkout = Some(CheckoutRef { key: HostPath::new(HostName::local(), "/work/repo"), is_main_checkout: false });
-    assert_eq!(
-        Intent::TeleportSession.to_command_tokens(&item),
-        Some(vec![
-            "agent".into(),
-            "claude-1".into(),
-            "teleport".into(),
-            "--branch".into(),
-            "feat".into(),
-            "--checkout".into(),
-            "/work/repo".into(),
-        ])
-    );
+    let noun = Intent::TeleportSession.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "agent claude-1 teleport --branch feat --checkout /work/repo");
 }
 
 #[test]
-fn switch_workspace_produces_tokens() {
+fn switch_workspace_produces_noun() {
     let mut item = bare_item();
     item.workspace_refs = vec!["ws-1".into()];
-    assert_eq!(Intent::SwitchToWorkspace.to_command_tokens(&item), Some(vec!["workspace".into(), "ws-1".into(), "select".into()]));
+    let noun = Intent::SwitchToWorkspace.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "workspace ws-1 select");
 }
 
 #[test]
-fn generate_branch_name_produces_tokens() {
+fn generate_branch_name_produces_noun() {
     let mut item = bare_item();
     item.issue_keys = vec!["#1".into(), "#5".into()];
-    assert_eq!(Intent::GenerateBranchName.to_command_tokens(&item), Some(vec!["issue".into(), "#1,#5".into(), "suggest-branch".into()]));
+    let noun = Intent::GenerateBranchName.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "issue #1,#5 suggest-branch");
 }
 
 #[test]
 fn remove_checkout_returns_none() {
     let mut item = bare_item();
     item.branch = Some("feat".into());
-    assert!(Intent::RemoveCheckout.to_command_tokens(&item).is_none());
+    assert!(Intent::RemoveCheckout.to_noun_command(&item).is_none());
 }
 
 #[test]
 fn create_workspace_returns_none() {
     let item = bare_item();
-    assert!(Intent::CreateWorkspace.to_command_tokens(&item).is_none());
+    assert!(Intent::CreateWorkspace.to_noun_command(&item).is_none());
 }
 
 #[test]
@@ -1020,21 +1015,21 @@ fn link_issues_returns_none() {
     let mut item = bare_item();
     item.change_request_key = Some("#42".into());
     item.issue_keys = vec!["#1".into()];
-    assert!(Intent::LinkIssuesToChangeRequest.to_command_tokens(&item).is_none());
+    assert!(Intent::LinkIssuesToChangeRequest.to_noun_command(&item).is_none());
 }
 
 #[test]
 fn create_checkout_remote_branch_no_fresh_flag() {
     let item = remote_branch_item("feat/upstream");
-    let tokens = Intent::CreateCheckout.to_command_tokens(&item);
-    assert_eq!(tokens, Some(vec!["checkout".into(), "create".into(), "--branch".into(), "feat/upstream".into()]));
+    let noun = Intent::CreateCheckout.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "checkout create --branch feat/upstream");
 }
 
 #[test]
 fn create_checkout_change_request_no_fresh_flag() {
     let item = pr_item("99");
-    let tokens = Intent::CreateCheckout.to_command_tokens(&item);
-    assert_eq!(tokens, Some(vec!["checkout".into(), "create".into(), "--branch".into(), "feat/pr-branch".into()]));
+    let noun = Intent::CreateCheckout.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "checkout create --branch feat/pr-branch");
 }
 
 #[test]
@@ -1042,8 +1037,8 @@ fn create_checkout_issue_adds_fresh_flag() {
     let mut item = bare_item();
     item.branch = Some("feat/new".into());
     // kind is WorkItemKind::Issue (bare_item default), not RemoteBranch/ChangeRequest
-    let tokens = Intent::CreateCheckout.to_command_tokens(&item);
-    assert_eq!(tokens, Some(vec!["checkout".into(), "create".into(), "--branch".into(), "feat/new".into(), "--fresh".into()]));
+    let noun = Intent::CreateCheckout.to_noun_command(&item).expect("should produce noun");
+    assert_eq!(noun.to_string(), "checkout create --branch feat/new --fresh");
 }
 
 // ── requires_local_host tests ──
