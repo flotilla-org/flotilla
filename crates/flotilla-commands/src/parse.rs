@@ -25,7 +25,7 @@ mod tests {
 
     #[test]
     fn parse_cr_open() {
-        let noun = parse_noun_command(&["cr", "#42", "open"]).unwrap();
+        let noun = parse_noun_command(&["cr", "42", "open"]).unwrap();
         let resolved = noun.resolve().unwrap();
         assert!(matches!(resolved, Resolved::NeedsContext { ref command, .. }
             if matches!(command.action, CommandAction::OpenChangeRequest { .. })));
@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn parse_host_routed_command() {
-        let resolved = parse_host_command(&["host", "feta", "cr", "#42", "open"]).unwrap();
+        let resolved = parse_host_command(&["host", "feta", "cr", "42", "open"]).unwrap();
         match &resolved {
             Resolved::NeedsContext { command, .. } => {
                 assert!(command.host.is_some());

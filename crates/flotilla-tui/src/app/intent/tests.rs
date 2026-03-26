@@ -933,26 +933,26 @@ fn bare_item_has_no_intents_available() {
 #[test]
 fn open_cr_produces_noun() {
     let mut item = bare_item();
-    item.change_request_key = Some("#42".into());
+    item.change_request_key = Some("42".into());
     let noun = Intent::OpenChangeRequest.to_noun_command(&item).expect("should produce noun");
-    assert_eq!(noun.to_string(), "cr #42 open");
+    assert_eq!(noun.to_string(), "cr 42 open");
     assert!(noun.resolve().is_ok());
 }
 
 #[test]
 fn close_cr_produces_noun() {
     let mut item = bare_item();
-    item.change_request_key = Some("#42".into());
+    item.change_request_key = Some("42".into());
     let noun = Intent::CloseChangeRequest.to_noun_command(&item).expect("should produce noun");
-    assert_eq!(noun.to_string(), "cr #42 close");
+    assert_eq!(noun.to_string(), "cr 42 close");
 }
 
 #[test]
 fn open_issue_produces_noun() {
     let mut item = bare_item();
-    item.issue_keys = vec!["#7".into()];
+    item.issue_keys = vec!["7".into()];
     let noun = Intent::OpenIssue.to_noun_command(&item).expect("should produce noun");
-    assert_eq!(noun.to_string(), "issue #7 open");
+    assert_eq!(noun.to_string(), "issue 7 open");
 }
 
 #[test]
@@ -993,9 +993,9 @@ fn switch_workspace_produces_noun() {
 #[test]
 fn generate_branch_name_produces_noun() {
     let mut item = bare_item();
-    item.issue_keys = vec!["#1".into(), "#5".into()];
+    item.issue_keys = vec!["1".into(), "5".into()];
     let noun = Intent::GenerateBranchName.to_noun_command(&item).expect("should produce noun");
-    assert_eq!(noun.to_string(), "issue #1,#5 suggest-branch");
+    assert_eq!(noun.to_string(), "issue 1,5 suggest-branch");
     // Comma-separated subjects resolve correctly — IssueNoun splits on commas
     assert!(noun.resolve().is_ok());
 }
@@ -1016,8 +1016,8 @@ fn create_workspace_returns_none() {
 #[test]
 fn link_issues_returns_none() {
     let mut item = bare_item();
-    item.change_request_key = Some("#42".into());
-    item.issue_keys = vec!["#1".into()];
+    item.change_request_key = Some("42".into());
+    item.issue_keys = vec!["1".into()];
     assert!(Intent::LinkIssuesToChangeRequest.to_noun_command(&item).is_none());
 }
 

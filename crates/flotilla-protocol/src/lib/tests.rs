@@ -112,7 +112,7 @@ fn message_event_snapshot_roundtrip() {
             branch: Some("feature-x".to_string()),
             description: "Feature X".to_string(),
             checkout: Some(CheckoutRef { key: hp("/tmp/my-repo/wt"), is_main_checkout: false }),
-            change_request_key: Some("PR#10".to_string()),
+            change_request_key: Some("10".to_string()),
             session_key: None,
             issue_keys: vec!["ISSUE-1".to_string()],
             workspace_refs: vec![],
