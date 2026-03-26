@@ -434,6 +434,86 @@ fn contract_sets_for_checkout_returns_empty_for_unknown(store: &mut impl Attacha
     assert!(store.sets_for_checkout(&unknown).is_empty());
 }
 
+fn contract_lookup_workspace_ref_for_set(store: &mut impl AttachableStoreApi) {
+    let set_id = AttachableSetId::new("set-1");
+    store.insert_set(AttachableSet {
+        id: set_id.clone(),
+        host_affinity: None,
+        checkout: None,
+        template_identity: None,
+        members: Vec::new(),
+    });
+
+    // No bindings yet => None
+    assert_eq!(store.lookup_workspace_ref_for_set("workspace_manager", "cmux", &set_id), None);
+
+    // Add a workspace binding for this set
+    store.replace_binding(ProviderBinding {
+        provider_category: "workspace_manager".into(),
+        provider_name: "cmux".into(),
+        object_kind: BindingObjectKind::AttachableSet,
+        object_id: set_id.to_string(),
+        external_ref: "workspace:1".into(),
+    });
+    assert_eq!(store.lookup_workspace_ref_for_set("workspace_manager", "cmux", &set_id), Some("workspace:1".to_string()));
+
+    // Different provider_name => None
+    assert_eq!(store.lookup_workspace_ref_for_set("workspace_manager", "tmux", &set_id), None);
+
+    // Attachable binding for same object_id doesn't match (wrong object_kind)
+    let att_id = AttachableId::new("att-1");
+    store.insert_attachable(Attachable {
+        id: att_id.clone(),
+        set_id: set_id.clone(),
+        content: AttachableContent::Terminal(TerminalAttachable {
+            purpose: TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            command: "bash".into(),
+            working_directory: ExecutionEnvironmentPath::new("/repo"),
+            status: TerminalStatus::Running,
+        }),
+    });
+    store.replace_binding(ProviderBinding {
+        provider_category: "workspace_manager".into(),
+        provider_name: "cmux".into(),
+        object_kind: BindingObjectKind::Attachable,
+        object_id: att_id.to_string(),
+        external_ref: "session:99".into(),
+    });
+    // Still returns the set binding, not the attachable binding
+    assert_eq!(store.lookup_workspace_ref_for_set("workspace_manager", "cmux", &set_id), Some("workspace:1".to_string()));
+}
+
+fn contract_lookup_workspace_ref_for_set_newest_wins(store: &mut impl AttachableStoreApi) {
+    let set_id = AttachableSetId::new("set-1");
+    store.insert_set(AttachableSet {
+        id: set_id.clone(),
+        host_affinity: None,
+        checkout: None,
+        template_identity: None,
+        members: Vec::new(),
+    });
+
+    // Push OLD binding
+    store.replace_binding(ProviderBinding {
+        provider_category: "workspace_manager".into(),
+        provider_name: "cmux".into(),
+        object_kind: BindingObjectKind::AttachableSet,
+        object_id: "OLD-UUID".into(),
+        external_ref: "workspace:old".into(),
+    });
+    // Push NEW binding for the same set
+    store.replace_binding(ProviderBinding {
+        provider_category: "workspace_manager".into(),
+        provider_name: "cmux".into(),
+        object_kind: BindingObjectKind::AttachableSet,
+        object_id: set_id.to_string(),
+        external_ref: "workspace:new".into(),
+    });
+
+    // Newest (last-appended) wins
+    assert_eq!(store.lookup_workspace_ref_for_set("workspace_manager", "cmux", &set_id), Some("workspace:new".to_string()));
+}
+
 #[test]
 fn file_backed_contract_sets_for_checkout_returns_matching_sets() {
     contract_sets_for_checkout_returns_matching_sets(&mut AttachableStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
@@ -454,4 +534,24 @@ fn file_backed_contract_sets_for_checkout_returns_empty_for_unknown() {
 #[test]
 fn in_memory_contract_sets_for_checkout_returns_empty_for_unknown() {
     contract_sets_for_checkout_returns_empty_for_unknown(&mut InMemoryAttachableStore::new());
+}
+
+#[test]
+fn file_backed_contract_lookup_workspace_ref_for_set() {
+    contract_lookup_workspace_ref_for_set(&mut AttachableStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
+}
+
+#[test]
+fn in_memory_contract_lookup_workspace_ref_for_set() {
+    contract_lookup_workspace_ref_for_set(&mut InMemoryAttachableStore::new());
+}
+
+#[test]
+fn file_backed_contract_lookup_workspace_ref_for_set_newest_wins() {
+    contract_lookup_workspace_ref_for_set_newest_wins(&mut AttachableStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
+}
+
+#[test]
+fn in_memory_contract_lookup_workspace_ref_for_set_newest_wins() {
+    contract_lookup_workspace_ref_for_set_newest_wins(&mut InMemoryAttachableStore::new());
 }

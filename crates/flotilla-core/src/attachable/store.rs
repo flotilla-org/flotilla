@@ -78,6 +78,7 @@ pub trait AttachableStoreApi: Send + Sync {
         object_kind: BindingObjectKind,
         external_ref: &str,
     ) -> Option<&str>;
+    fn lookup_workspace_ref_for_set(&self, provider_category: &str, provider_name: &str, set_id: &AttachableSetId) -> Option<String>;
     fn remove_binding_object(
         &mut self,
         provider_category: &str,
@@ -278,6 +279,19 @@ impl AttachableStoreState {
     ) -> Option<&str> {
         let key = Self::binding_key(provider_category, provider_name, &object_kind, external_ref);
         self.binding_index.get(&key).map(String::as_str)
+    }
+
+    fn lookup_workspace_ref_for_set(&self, provider_category: &str, provider_name: &str, set_id: &AttachableSetId) -> Option<String> {
+        self.registry
+            .bindings
+            .iter()
+            .rfind(|b| {
+                b.provider_category == provider_category
+                    && b.provider_name == provider_name
+                    && b.object_kind == BindingObjectKind::AttachableSet
+                    && b.object_id == set_id.to_string()
+            })
+            .map(|b| b.external_ref.clone())
     }
 
     fn remove_binding_object(
@@ -523,6 +537,10 @@ impl AttachableStore {
         self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
     }
 
+    pub fn lookup_workspace_ref_for_set(&self, provider_category: &str, provider_name: &str, set_id: &AttachableSetId) -> Option<String> {
+        self.state.lookup_workspace_ref_for_set(provider_category, provider_name, set_id)
+    }
+
     pub fn remove_binding_object(
         &mut self,
         provider_category: &str,
@@ -663,6 +681,10 @@ impl AttachableStoreApi for AttachableStore {
         self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
     }
 
+    fn lookup_workspace_ref_for_set(&self, provider_category: &str, provider_name: &str, set_id: &AttachableSetId) -> Option<String> {
+        self.state.lookup_workspace_ref_for_set(provider_category, provider_name, set_id)
+    }
+
     fn remove_binding_object(
         &mut self,
         provider_category: &str,
@@ -801,6 +823,10 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         external_ref: &str,
     ) -> Option<&str> {
         self.state.lookup_binding(provider_category, provider_name, object_kind, external_ref)
+    }
+
+    fn lookup_workspace_ref_for_set(&self, provider_category: &str, provider_name: &str, set_id: &AttachableSetId) -> Option<String> {
+        self.state.lookup_workspace_ref_for_set(provider_category, provider_name, set_id)
     }
 
     fn remove_binding_object(
