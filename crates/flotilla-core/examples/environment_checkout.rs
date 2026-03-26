@@ -59,12 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a dummy socket file so the mount doesn't fail
     std::fs::write(socket_path.as_path(), "")?;
 
-    let opts = CreateOpts {
-        tokens: vec![],
-        reference_repo: Some(reference_repo),
-        daemon_socket_path: socket_path,
-        working_directory: None,
-    };
+    let opts =
+        CreateOpts { tokens: vec![], reference_repo: Some(reference_repo), daemon_socket_path: socket_path, working_directory: None };
     let handle = provider.create(env_id, &image, opts).await?;
     let container = handle.container_name().unwrap_or("unknown");
     println!("Container: {container}");
@@ -86,10 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bag = bag.with(EnvironmentAssertion::env_var(key, value));
     }
     println!("Env vars: {} entries", raw_vars.len());
-    println!(
-        "FLOTILLA_ENVIRONMENT_ID = {:?}",
-        raw_vars.get("FLOTILLA_ENVIRONMENT_ID")
-    );
+    println!("FLOTILLA_ENVIRONMENT_ID = {:?}", raw_vars.get("FLOTILLA_ENVIRONMENT_ID"));
 
     let config_dir = tempfile::tempdir()?;
     let config = ConfigStore::with_base(config_dir.path());
@@ -98,10 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_registry = factory_registry.probe_all(&bag, &config, &env_repo_root, env_runner.clone()).await;
 
     let checkout_mgr = provider_registry.checkout_managers.preferred();
-    println!(
-        "Checkout manager: {}",
-        checkout_mgr.map(|_| "found").unwrap_or("NONE")
-    );
+    println!("Checkout manager: {}", checkout_mgr.map(|_| "found").unwrap_or("NONE"));
 
     if let Some((desc, _)) = provider_registry.checkout_managers.preferred_with_desc() {
         println!("  backend: {}, impl: {}", desc.backend, desc.implementation);
