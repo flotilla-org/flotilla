@@ -90,6 +90,7 @@ pub fn palette_local_completions(input: &str) -> Vec<&'static str> {
 
 /// Result of parsing palette input text.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum PaletteParseResult<'a> {
     /// A palette-local command (layout, theme, target, search, etc.)
     Local(PaletteLocalResult<'a>),
