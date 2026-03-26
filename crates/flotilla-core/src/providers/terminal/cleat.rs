@@ -75,10 +75,23 @@ impl TerminalPool for CleatTerminalPool {
             return Ok(());
         }
 
-        let effective_cmd = if env_vars.is_empty() {
+        // Inject TERM/COLORTERM defaults when the daemon process doesn't have
+        // them (common for remote daemons started via non-interactive SSH).
+        // cleat captures env at session creation, so sessions created without
+        // TERM get no color support. xterm-256color is the safe universal default.
+        let needs_env_prefix = !env_vars.is_empty()
+            || std::env::var("TERM").unwrap_or_default().is_empty()
+            || std::env::var("COLORTERM").unwrap_or_default().is_empty();
+        let effective_cmd = if !needs_env_prefix {
             command.to_string()
         } else {
             let mut parts = vec!["env".to_string()];
+            if std::env::var("TERM").unwrap_or_default().is_empty() {
+                parts.push("TERM=xterm-256color".to_string());
+            }
+            if std::env::var("COLORTERM").unwrap_or_default().is_empty() {
+                parts.push("COLORTERM=truecolor".to_string());
+            }
             for (k, v) in env_vars {
                 parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
             }
