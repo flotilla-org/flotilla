@@ -424,7 +424,6 @@ fn apply_delta_data_change_on_inactive_tab_sets_unseen() {
             provider_name: String::new(),
             provider_display_name: String::new(),
             item_noun: String::new(),
-            environment_id: None,
         }),
     }]);
     app.apply_delta(change);

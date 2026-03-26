@@ -132,7 +132,6 @@ fn message_event_snapshot_roundtrip() {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
-        environment_binding: None,
     };
     let msg = Message::Event { event: Box::new(DaemonEvent::RepoSnapshot(Box::new(snapshot))) };
     let json = serde_json::to_string(&msg).expect("serialize");
