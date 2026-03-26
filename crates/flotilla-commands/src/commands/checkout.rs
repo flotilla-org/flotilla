@@ -51,6 +51,7 @@ impl CheckoutNoun {
                 Ok(Resolved::NeedsContext {
                     command: Command {
                         host: None,
+                        environment: None,
                         context_repo: None,
                         action: CommandAction::Checkout { repo: RepoSelector::Query("".into()), target, issue_ids: vec![] },
                     },
@@ -61,6 +62,7 @@ impl CheckoutNoun {
             (Some(subject), Some(CheckoutVerb::Remove)) => Ok(Resolved::NeedsContext {
                 command: Command {
                     host: None,
+                    environment: None,
                     context_repo: None,
                     action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(subject) },
                 },
@@ -71,6 +73,7 @@ impl CheckoutNoun {
             (Some(subject), Some(CheckoutVerb::Status { checkout_path, cr_id })) => Ok(Resolved::NeedsContext {
                 command: Command {
                     host: None,
+                    environment: None,
                     context_repo: None,
                     action: CommandAction::FetchCheckoutStatus { branch: subject, checkout_path, change_request_id: cr_id },
                 },
@@ -137,6 +140,7 @@ mod tests {
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
                     repo: RepoSelector::Query("".into()),
@@ -155,6 +159,7 @@ mod tests {
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
                     repo: RepoSelector::Query("".into()),
@@ -173,6 +178,7 @@ mod tests {
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("my-feature".into()) },
             },
@@ -187,6 +193,7 @@ mod tests {
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: CommandAction::FetchCheckoutStatus { branch: "my-feature".into(), checkout_path: None, change_request_id: None },
             },
@@ -201,6 +208,7 @@ mod tests {
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: CommandAction::FetchCheckoutStatus {
                     branch: "my-feature".into(),

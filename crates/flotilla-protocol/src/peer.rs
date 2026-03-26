@@ -392,6 +392,7 @@ mod tests {
             remaining_hops: 7,
             command: Box::new(Command {
                 host: Some(HostName::new("feta")),
+                environment: None,
                 context_repo: None,
                 action: CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) },
             }),

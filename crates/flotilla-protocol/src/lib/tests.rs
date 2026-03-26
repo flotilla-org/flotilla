@@ -4,7 +4,7 @@ use super::*;
 use crate::test_support::hp;
 
 fn sample_command() -> Command {
-    Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/my-repo") } }
+    Command { host: None, environment: None, context_repo: None, action: CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/my-repo") } }
 }
 
 #[test]

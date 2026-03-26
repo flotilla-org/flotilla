@@ -42,9 +42,10 @@ fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
 #[test]
 fn command_queue_push_and_take_fifo() {
     let mut q = CommandQueue::default();
-    q.push(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
+    q.push(Command { host: None, environment: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
     q.push(Command {
         host: None,
+        environment: None,
         context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
         action: CommandAction::OpenChangeRequest { id: "1".into() },
     });
@@ -618,7 +619,7 @@ fn push_close_confirm_widget(app: &mut App, id: &str) {
         id.into(),
         "Test PR".into(),
         WorkItemIdentity::Session("test".into()),
-        Command { host: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: id.into() } },
+        Command { host: None, environment: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: id.into() } },
     );
     app.screen.modal_stack.push(Box::new(widget));
 }
@@ -673,7 +674,7 @@ fn command_queue_push_with_context() {
         description: "Archive session".into(),
         repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
     };
-    q.push_with_context(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } }, Some(ctx));
+    q.push_with_context(Command { host: None, environment: None, context_repo: None, action: CommandAction::Refresh { repo: None } }, Some(ctx));
     let (cmd, ctx) = q.take_next().expect("should have one entry");
     assert!(matches!(cmd.action, CommandAction::Refresh { .. }));
     assert!(ctx.is_some());
@@ -683,7 +684,7 @@ fn command_queue_push_with_context() {
 #[test]
 fn command_queue_push_without_context() {
     let mut q = CommandQueue::default();
-    q.push(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
+    q.push(Command { host: None, environment: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
     let (_, ctx) = q.take_next().expect("should have one entry");
     assert!(ctx.is_none());
 }

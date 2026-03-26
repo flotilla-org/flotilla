@@ -259,6 +259,7 @@ impl RepoPage {
             let repo_identity = ctx.repo_order[ctx.active_repo].clone();
             ctx.commands.push(flotilla_protocol::Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: flotilla_protocol::CommandAction::ClearIssueSearch { repo: flotilla_protocol::RepoSelector::Path(repo_path) },
             });

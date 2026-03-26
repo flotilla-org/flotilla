@@ -573,7 +573,7 @@ fn resolve_open_pr_on_remote_only_repo_routes_to_remote_host_by_identity() {
     item.host = HostName::new("desktop");
     let cmd = Intent::OpenChangeRequest.resolve(&item, &app).expect("command");
     match cmd {
-        Command { host, context_repo, action: CommandAction::OpenChangeRequest { id } } => {
+        Command { host, context_repo, action: CommandAction::OpenChangeRequest { id }, .. } => {
             assert_eq!(host, Some(HostName::new("desktop")));
             assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
             assert_eq!(id, "123");
@@ -613,7 +613,7 @@ fn resolve_open_issue_on_remote_only_repo_routes_to_remote_host_by_identity() {
     item.issue_keys = vec!["7".into(), "8".into()];
     let cmd = Intent::OpenIssue.resolve(&item, &app).expect("command");
     match cmd {
-        Command { host, context_repo, action: CommandAction::OpenIssue { id } } => {
+        Command { host, context_repo, action: CommandAction::OpenIssue { id }, .. } => {
             assert_eq!(host, Some(HostName::new("desktop")));
             assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
             assert_eq!(id, "7");
@@ -688,7 +688,7 @@ fn resolve_archive_session_on_remote_only_repo_routes_to_remote_host_by_identity
     item.host = HostName::new("desktop");
     let cmd = Intent::ArchiveSession.resolve(&item, &app).expect("command");
     match cmd {
-        Command { host, context_repo, action: CommandAction::ArchiveSession { session_id } } => {
+        Command { host, context_repo, action: CommandAction::ArchiveSession { session_id }, .. } => {
             assert_eq!(host, Some(HostName::new("desktop")));
             assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
             assert_eq!(session_id, "sess-99");
@@ -853,7 +853,7 @@ fn resolve_link_issues_to_pr_on_remote_only_repo_routes_to_remote_host_by_identi
 
     let cmd = Intent::LinkIssuesToChangeRequest.resolve(&item, &app).expect("command");
     match cmd {
-        Command { host, context_repo, action: CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } } => {
+        Command { host, context_repo, action: CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids }, .. } => {
             assert_eq!(host, Some(HostName::new("desktop")));
             assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
             assert_eq!(change_request_id, "42");
@@ -885,7 +885,7 @@ fn resolve_close_change_request_on_remote_only_repo_routes_to_remote_host_by_ide
 
     let cmd = Intent::CloseChangeRequest.resolve(&item, &app).expect("command");
     match cmd {
-        Command { host, context_repo, action: CommandAction::CloseChangeRequest { id } } => {
+        Command { host, context_repo, action: CommandAction::CloseChangeRequest { id }, .. } => {
             assert_eq!(host, Some(HostName::new("desktop")));
             assert_eq!(context_repo, Some(RepoSelector::Identity(app.model.active_repo_identity().clone())));
             assert_eq!(id, "42");

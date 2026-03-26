@@ -293,11 +293,11 @@ fn repo_selector() -> RepoSelector {
 }
 
 fn local_command(action: CommandAction) -> Command {
-    Command { host: None, context_repo: None, action }
+    Command { host: None, environment: None, context_repo: None, action }
 }
 
 fn command_with_host(host: &str, action: CommandAction) -> Command {
-    Command { host: Some(HostName::new(host)), context_repo: None, action }
+    Command { host: Some(HostName::new(host)), environment: None, context_repo: None, action }
 }
 
 fn local_host() -> HostName {

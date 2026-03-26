@@ -245,6 +245,7 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
     let command_id = follower
         .execute(Command {
             host: None,
+            environment: None,
             context_repo: None,
             action: CommandAction::Checkout {
                 repo: RepoSelector::Path(follower_repo.clone()),

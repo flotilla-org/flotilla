@@ -380,36 +380,38 @@ impl App {
     }
 
     pub fn command(&self, action: CommandAction) -> Command {
-        Command { host: None, context_repo: None, action }
+        Command { host: None, environment: None, context_repo: None, action }
     }
 
     pub fn repo_command(&self, action: CommandAction) -> Command {
-        Command { host: None, context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())), action }
+        Command { host: None, environment: None, context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())), action }
     }
 
     pub fn repo_command_for_identity(&self, repo_identity: RepoIdentity, action: CommandAction) -> Command {
-        Command { host: None, context_repo: Some(RepoSelector::Identity(repo_identity)), action }
+        Command { host: None, environment: None, context_repo: Some(RepoSelector::Identity(repo_identity)), action }
     }
 
     pub fn targeted_command(&self, action: CommandAction) -> Command {
-        Command { host: self.ui.target_host.clone(), context_repo: None, action }
+        Command { host: self.ui.target_host.clone(), environment: None, context_repo: None, action }
     }
 
     pub fn targeted_repo_command(&self, action: CommandAction) -> Command {
         Command {
             host: self.ui.target_host.clone(),
+            environment: None,
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,
         }
     }
 
     pub fn item_host_command(&self, action: CommandAction, item: &WorkItem) -> Command {
-        Command { host: self.item_execution_host(item), context_repo: None, action }
+        Command { host: self.item_execution_host(item), environment: None, context_repo: None, action }
     }
 
     pub fn item_host_repo_command(&self, action: CommandAction, item: &WorkItem) -> Command {
         Command {
             host: self.item_execution_host(item),
+            environment: None,
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,
         }

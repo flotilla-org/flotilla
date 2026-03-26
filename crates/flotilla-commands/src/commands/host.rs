@@ -90,11 +90,12 @@ impl Refinable for HostNounPartial {
 impl HostNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
-            HostVerb::List => Ok(Resolved::Ready(Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} })),
+            HostVerb::List => Ok(Resolved::Ready(Command { host: None, environment: None, context_repo: None, action: CommandAction::QueryHostList {} })),
             HostVerb::Status => {
                 let host = self.subject.ok_or("status requires a host name")?;
                 Ok(Resolved::Ready(Command {
                     host: None,
+                    environment: None,
                     context_repo: None,
                     action: CommandAction::QueryHostStatus { target_host: host },
                 }))
@@ -103,6 +104,7 @@ impl HostNoun {
                 let host = self.subject.ok_or("providers requires a host name")?;
                 Ok(Resolved::Ready(Command {
                     host: None,
+                    environment: None,
                     context_repo: None,
                     action: CommandAction::QueryHostProviders { target_host: host },
                 }))
@@ -110,7 +112,7 @@ impl HostNoun {
             HostVerb::Refresh { repo } => {
                 let host = self.subject.ok_or("refresh requires a host name")?;
                 let resolved_repo = repo.map(RepoSelector::Query);
-                let mut cmd = Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: resolved_repo } };
+                let mut cmd = Command { host: None, environment: None, context_repo: None, action: CommandAction::Refresh { repo: resolved_repo } };
                 cmd.host = Some(HostName::new(&host));
                 Ok(Resolved::Ready(cmd))
             }
@@ -177,7 +179,7 @@ mod tests {
     fn host_list() {
         assert_eq!(
             parse_and_resolve(&["host", "list"]),
-            Resolved::Ready(Command { host: None, context_repo: None, action: CommandAction::QueryHostList {} })
+            Resolved::Ready(Command { host: None, environment: None, context_repo: None, action: CommandAction::QueryHostList {} })
         );
     }
 
@@ -187,6 +189,7 @@ mod tests {
             parse_and_resolve(&["host", "alpha", "status"]),
             Resolved::Ready(Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: CommandAction::QueryHostStatus { target_host: "alpha".into() },
             })
@@ -199,6 +202,7 @@ mod tests {
             parse_and_resolve(&["host", "alpha", "providers"]),
             Resolved::Ready(Command {
                 host: None,
+                environment: None,
                 context_repo: None,
                 action: CommandAction::QueryHostProviders { target_host: "alpha".into() },
             })

@@ -49,7 +49,7 @@ impl<'a> RequestDispatcher<'a> {
 
             Request::Refresh { repo } => {
                 let command =
-                    Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) } };
+                    Command { host: None, environment: None, context_repo: None, action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) } };
                 match self.daemon.execute(command).await {
                     Ok(_) => Message::ok_response(id, Response::Refresh),
                     Err(e) => Message::error_response(id, e),
@@ -57,7 +57,7 @@ impl<'a> RequestDispatcher<'a> {
             }
 
             Request::AddRepo { path } => {
-                let command = Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
+                let command = Command { host: None, environment: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
                 match self.daemon.execute(command).await {
                     Ok(_) => Message::ok_response(id, Response::AddRepo),
                     Err(e) => Message::error_response(id, e),
@@ -66,7 +66,7 @@ impl<'a> RequestDispatcher<'a> {
 
             Request::RemoveRepo { path } => {
                 let command =
-                    Command { host: None, context_repo: None, action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) } };
+                    Command { host: None, environment: None, context_repo: None, action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) } };
                 match self.daemon.execute(command).await {
                     Ok(_) => Message::ok_response(id, Response::RemoveRepo),
                     Err(e) => Message::error_response(id, e),

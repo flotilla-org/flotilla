@@ -8,7 +8,7 @@ use tokio::time::Instant;
 /// Execute a query command and wait for the CommandFinished result.
 async fn execute_query(daemon: &dyn DaemonHandle, action: CommandAction) -> CommandValue {
     let mut rx = daemon.subscribe();
-    let command = Command { host: None, context_repo: None, action };
+    let command = Command { host: None, environment: None, context_repo: None, action };
     let command_id = daemon.execute(command).await.expect("execute query");
     loop {
         match rx.recv().await.expect("recv event") {
@@ -87,6 +87,7 @@ async fn socket_roundtrip() {
     client
         .execute(Command {
             host: None,
+            environment: None,
             context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
         })
@@ -328,7 +329,7 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
 
     let mut rx = client.subscribe();
     let command_id = client
-        .execute(Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
+        .execute(Command { host: None, environment: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
         .await
         .expect("execute refresh all");
 
