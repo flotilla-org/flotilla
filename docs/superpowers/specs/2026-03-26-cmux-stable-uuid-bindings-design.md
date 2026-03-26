@@ -12,21 +12,49 @@ Workspace manager bindings use workspace refs as keys in the attachable registry
 
 ## Solution
 
-Switch all three providers to use stable identifiers as their canonical workspace identity (ws_ref).
+Switch all three providers to use stable identifiers as their canonical workspace identity (ws_ref), and simplify the workspace data model by removing `directories` and the local TOML state files.
+
+### Stable identifiers
 
 - **cmux:** Use cmux's stable UUIDs, exposed via `--id-format uuids`. UUIDs are globally unique and never reused.
 - **zellij:** Use `{session_name}:{tab_id}` where `tab_id` comes from the new `list-tabs --json` output. The `tab_id` is stable within a zellij session. Prefixing with the session name prevents cross-session collisions.
 - **tmux:** Use `{start_time}:{session_name}:@{window_id}` where `start_time` is the tmux server's `#{start_time}` (Unix epoch), `session_name` is `#{session_name}`, and `window_id` is `#{window_id}` (format `@N`). Window IDs are monotonically increasing and never reused within a server instance. Including `start_time` first ensures all bindings from a dead server share a common prefix, enabling future prefix-based invalidation when the server restarts.
 
+### Remove `directories` from `Workspace`
+
+The `Workspace.directories` field is only consumed in one place: `select_existing_workspace()`, which lists all workspaces and matches by directory path to avoid creating duplicates. This approach is broken for remote workspaces (directories are local paths that don't exist on the presentation host), and requires tmux/zellij to maintain local TOML state files just to track which directory each workspace was created for.
+
+The correct model is: "does an attachable set exist for this checkout, and does a workspace binding already point to that set?" This is entirely answerable from the binding system.
+
+### Rewrite `select_existing_workspace` via bindings
+
+Replace the current directory-matching approach with a binding-based lookup:
+
+1. `sets_for_checkout(checkout_path)` — find the attachable set(s) for this checkout
+2. Reverse-scan bindings for `(workspace_manager, provider_name, AttachableSet, *)` where `object_id == set_id` — find the ws_ref
+3. If found, `select_workspace(ws_ref)` and return
+
+This requires a small addition to the store API: a reverse binding lookup (set_id → external_ref) for a given provider category/name. Alternatively, scan the bindings list inline — it's small.
+
+This works for both local and remote workspaces.
+
+### Drop TOML state files
+
+The tmux and zellij providers maintain local state files (`{state_dir}/tmux/{session}/state.toml` and `{state_dir}/zellij/{session}/state.toml`) keyed by window/tab name. These exist solely to provide `directories` for `select_existing_workspace`. With both removed, the state files are unnecessary. All three providers become stateless — identity and state come from the multiplexer and the attachable binding system.
+
 ## Scope
 
-Narrow fix to the cmux, zellij, and tmux workspace providers. The broader attachable set lifecycle (stale binding cleanup, orphaned sets, validation during refresh) is out of scope.
+Changes to workspace providers, the `Workspace` struct, and `select_existing_workspace`. The broader attachable set lifecycle (stale binding cleanup, orphaned sets) is out of scope.
 
 ## Changes
 
+### `Workspace` struct (protocol)
+
+Remove the `directories` field. The struct retains `name`, `correlation_keys`, and `attachable_set_id`.
+
 ### `CmuxWorkspaceManager` (cmux.rs)
 
-**`list_workspaces()`:** Pass `--id-format uuids` to `list-workspaces`. Update `parse_workspaces()` to read the `id` field (UUID) instead of `ref` as the ws_ref.
+**`list_workspaces()`:** Pass `--id-format uuids` to `list-workspaces`. Update `parse_workspaces()` to read the `id` field (UUID) instead of `ref` as the ws_ref. Stop populating `directories`.
 
 **`create_workspace()`:** The `new-workspace` command returns `OK workspace:N` regardless of id-format flags. After creation, issue a follow-up `list-workspaces --id-format both` call, match by the returned positional ref to find the UUID, and return the UUID as the ws_ref.
 
@@ -34,11 +62,13 @@ Narrow fix to the cmux, zellij, and tmux workspace providers. The broader attach
 
 ### `ZellijWorkspaceManager` (zellij.rs)
 
-**`list_workspaces()`:** Replace `query-tab-names` with `list-tabs --json`. Parse each tab's `tab_id` and `name`. Return ws_ref as `{session_name}:{tab_id}`. Use the `name` field for the `Workspace.name`.
+**`list_workspaces()`:** Replace `query-tab-names` with `list-tabs --json`. Parse each tab's `tab_id` and `name`. Return ws_ref as `{session_name}:{tab_id}`. Use the `name` field for `Workspace.name`.
 
 **`create_workspace()`:** `new-tab` now returns the tab_id to stdout. Construct ws_ref as `{session_name}:{tab_id}`.
 
 **`select_workspace()`:** Parse the tab_id from the ws_ref (after the `:`), call `go-to-tab-by-id {tab_id}` instead of `go-to-tab-name`.
+
+**Remove:** `ZellijState`, `TabState`, `load_state()`, `save_state()`, `state_path()`, `state_dir` field, and associated tests.
 
 ### `TmuxWorkspaceManager` (tmux.rs)
 
@@ -48,14 +78,40 @@ Narrow fix to the cmux, zellij, and tmux workspace providers. The broader attach
 
 **`select_workspace()`:** Parse the `@N` window ID from the ws_ref (after the last `:`), call `select-window -t @N`.
 
-### Downstream (no changes)
+**Remove:** `TmuxState`, `WindowState`, `load_state()`, `save_state()`, `state_path()`, `state_dir` field, and associated tests.
 
-The orchestrator, binding system, refresh, and correlation all treat ws_ref as an opaque string. Swapping identifiers requires no changes outside the workspace providers.
+### `WorkspaceOrchestrator` (executor/workspace.rs)
+
+**`select_existing_workspace()`:** Replace directory-matching with binding-based lookup:
+1. Lock the attachable store
+2. `sets_for_checkout()` to find the set for this checkout
+3. Scan bindings for `(workspace_manager, provider, AttachableSet)` where `object_id` matches the set — extract the ws_ref
+4. Call `select_workspace(ws_ref)`
+
+This removes the need to call `ws_mgr.list_workspaces()` and removes the `checkout_path` parameter in favor of the checkout's `HostPath`.
+
+### `AttachableStoreApi` (store.rs)
+
+Add a reverse binding lookup method:
+```rust
+fn lookup_workspace_ref_for_set(
+    &self,
+    provider_category: &str,
+    provider_name: &str,
+    set_id: &AttachableSetId,
+) -> Option<String>;
+```
+
+Scans bindings where `object_kind == AttachableSet` and `object_id == set_id`, returns the `external_ref`. Linear scan over a small list.
+
+### Downstream
+
+The orchestrator, binding system, refresh, and correlation all treat ws_ref as an opaque string. Correlation already uses only `AttachableSet` keys for workspaces (not directories). No changes needed.
 
 ### Migration
 
-None. We are in a no-backwards-compat phase. Existing bindings keyed on old-format refs become dead entries. New bindings use stable identifiers. Orphaned old bindings are harmless and can be cleaned up as part of future lifecycle work.
+None. We are in a no-backwards-compat phase. Existing bindings keyed on old-format refs become dead entries. New bindings use stable identifiers. Orphaned old bindings are harmless and can be cleaned up as part of future lifecycle work. Existing TOML state files become unused — they can be left in place or cleaned up manually.
 
 ### Tests
 
-Re-record replay fixtures against the real systems (`REPLAY=record`) rather than editing fixture files directly. This may require human intervention to set up the workspace managers (cmux running, zellij session active, tmux session active). Add assertions that parsed ws_ref values use the new stable formats.
+Re-record replay fixtures against the real systems (`REPLAY=record`) rather than editing fixture files directly. This may require human intervention to set up the workspace managers (cmux running, zellij session active, tmux session active). Add assertions that parsed ws_ref values use the new stable formats. Remove tests for the deleted TOML state management.
