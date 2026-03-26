@@ -296,6 +296,8 @@ pub struct AttachableSet {
     #[serde(default)]
     pub template_identity: Option<String>,
     #[serde(default)]
+    pub environment_id: Option<EnvironmentId>,
+    #[serde(default)]
     pub members: Vec<AttachableId>,
 }
 

@@ -364,6 +364,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
         host_affinity: Some(remote_host.clone()),
         checkout: Some(remote_checkout.clone()),
         template_identity: None,
+        environment_id: None,
         members: vec![],
     });
 

@@ -76,6 +76,7 @@ fn make_attachable_set(id: &str, path: &str) -> flotilla_protocol::AttachableSet
         host_affinity: Some(flotilla_protocol::HostName::new("test-host")),
         checkout: Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path))),
         template_identity: None,
+        environment_id: None,
         members: vec![],
     }
 }
@@ -1304,6 +1305,7 @@ fn workspace_only_joins_checkout_through_attachable_set() {
         host_affinity: Some(flotilla_protocol::HostName::new("feta")),
         checkout: Some(remote_checkout.clone()),
         template_identity: None,
+        environment_id: None,
         members: vec![],
     });
     providers.workspaces.insert("ws-1".to_string(), Workspace {

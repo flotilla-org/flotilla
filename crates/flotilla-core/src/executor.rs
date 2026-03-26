@@ -549,6 +549,7 @@ impl StepResolver for ExecutorStepResolver {
                     target_host: self.local_host.clone(),
                     checkout_path: checkout_path.into_path_buf(),
                     attachable_set_id,
+                    environment_id: None,
                     template_yaml,
                     prepared_commands,
                 })))
@@ -593,6 +594,7 @@ impl StepResolver for ExecutorStepResolver {
                         target_host,
                         checkout_path: checkout_path.into_path_buf(),
                         attachable_set_id,
+                        environment_id: None,
                         template_yaml: None,
                         prepared_commands: commands,
                     })

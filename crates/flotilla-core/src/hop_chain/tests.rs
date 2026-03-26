@@ -534,6 +534,7 @@ fn insert_terminal(
         host_affinity,
         checkout: None,
         template_identity: None,
+        environment_id: None,
         members: vec![attachable_id.clone()],
     });
     store.insert_attachable(Attachable {

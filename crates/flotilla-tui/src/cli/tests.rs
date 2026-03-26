@@ -466,6 +466,7 @@ mod command_result_human {
             target_host: HostName::new("feta"),
             checkout_path: PathBuf::from("/tmp/wt"),
             attachable_set_id: None,
+            environment_id: None,
             template_yaml: Some("panes: []".into()),
             prepared_commands: vec![],
         });

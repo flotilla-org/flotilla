@@ -461,6 +461,7 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
         target_host: HostName::new("feta"),
         checkout_path: PathBuf::from("/repo/wt-feat-x"),
         attachable_set_id: Some(AttachableSetId::new("attachable-set")),
+        environment_id: None,
         template_yaml: Some("layout: []\ncontent: []\n".into()),
         prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![arg::Arg::Literal("bash".into())] }],
     };

@@ -208,6 +208,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
                 host_affinity: Some(target_host.clone()),
                 checkout: Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
                 template_identity: None,
+                environment_id: None,
                 members: Vec::new(),
             });
         }

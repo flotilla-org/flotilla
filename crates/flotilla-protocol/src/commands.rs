@@ -51,6 +51,8 @@ pub struct PreparedWorkspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachable_set_id: Option<AttachableSetId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<crate::EnvironmentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_yaml: Option<String>,
     pub prepared_commands: Vec<ResolvedPaneCommand>,
 }
@@ -548,6 +550,7 @@ mod tests {
                 target_host: HostName::new("desktop"),
                 checkout_path: PathBuf::from("/remote/repo/feat-x"),
                 attachable_set_id: Some(AttachableSetId::new("set-1")),
+                environment_id: None,
                 template_yaml: Some("layout: []\ncontent: []\n".into()),
                 prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
             }),
@@ -645,6 +648,7 @@ mod tests {
             target_host: HostName::new("desktop"),
             checkout_path: PathBuf::from("/remote/repo/feat-x"),
             attachable_set_id: Some(AttachableSetId::new("set-1")),
+            environment_id: None,
             template_yaml: Some("layout: []\ncontent: []\n".into()),
             prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
         };

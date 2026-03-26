@@ -1546,6 +1546,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
             host_affinity: Some(remote_host.clone()),
             checkout: Some(remote_checkout.clone()),
             template_identity: None,
+            environment_id: None,
             members: vec![],
         });
         store.replace_binding(ProviderBinding {
@@ -1588,6 +1589,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
         host_affinity: Some(remote_host.clone()),
         checkout: Some(remote_checkout.clone()),
         template_identity: None,
+        environment_id: None,
         members: vec![],
     });
     daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
@@ -1641,6 +1643,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
             host_affinity: Some(remote_host.clone()),
             checkout: Some(remote_checkout.clone()),
             template_identity: None,
+            environment_id: None,
             members: vec![],
         });
         store.replace_binding(ProviderBinding {
@@ -1683,6 +1686,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
         host_affinity: Some(remote_host.clone()),
         checkout: Some(remote_checkout.clone()),
         template_identity: None,
+        environment_id: None,
         members: vec![],
     });
     daemon.set_peer_providers(&repo, vec![(remote_host.clone(), peer_data)], 0).await;
@@ -1778,7 +1782,12 @@ async fn untrack_missing_repo_returns_error_without_started_event() {
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
     let err = daemon
-        .execute(Command { host: None, environment: None, context_repo: None, action: CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) } })
+        .execute(Command {
+            host: None,
+            environment: None,
+            context_repo: None,
+            action: CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) },
+        })
         .await
         .expect_err("untracked repo removal should fail");
     assert!(err.contains("repo not tracked"));
