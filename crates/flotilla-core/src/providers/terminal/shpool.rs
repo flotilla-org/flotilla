@@ -523,9 +523,24 @@ impl TerminalPool for ShpoolTerminalPool {
         // Build --cmd value. shpool uses shell-words for tokenization (no
         // variable expansion), so all values must be literal. Quote values
         // so paths with spaces are handled correctly.
+        //
+        // Inject TERM/COLORTERM defaults when the daemon process doesn't have
+        // them (common for remote daemons started via non-interactive SSH).
+        // shpool captures env at session creation, not at attach time, so
+        // sessions created without TERM get no color support. xterm-256color
+        // is the safe universal default (same as tmux/zellij).
         let mut cmd_parts: Vec<String> = Vec::new();
-        if !env_vars.is_empty() {
+        let needs_env_prefix = !env_vars.is_empty()
+            || std::env::var("TERM").unwrap_or_default().is_empty()
+            || std::env::var("COLORTERM").unwrap_or_default().is_empty();
+        if needs_env_prefix {
             cmd_parts.push("env".to_string());
+            if std::env::var("TERM").unwrap_or_default().is_empty() {
+                cmd_parts.push("TERM=xterm-256color".to_string());
+            }
+            if std::env::var("COLORTERM").unwrap_or_default().is_empty() {
+                cmd_parts.push("COLORTERM=truecolor".to_string());
+            }
             for (k, v) in env_vars {
                 cmd_parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
             }
