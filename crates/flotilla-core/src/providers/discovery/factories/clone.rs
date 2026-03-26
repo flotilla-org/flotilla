@@ -47,9 +47,12 @@ impl Factory for CloneCheckoutManagerFactory {
         }
 
         // Require /ref/repo to exist as a valid git dir
-        let ref_dir_valid = runner.exists("git", &["--git-dir", "/ref/repo", "rev-parse"]).await;
-        if !ref_dir_valid {
-            return Err(vec![UnmetRequirement::MissingBinary("git (ref repo at /ref/repo)".into())]);
+        if runner
+            .run("git", &["--git-dir", "/ref/repo", "rev-parse", "--git-dir"], std::path::Path::new("/"), &crate::providers::ChannelLabel::Noop)
+            .await
+            .is_err()
+        {
+            return Err(vec![UnmetRequirement::MissingBinary("git (reference repo at /ref/repo)".into())]);
         }
 
         Ok(Arc::new(CloneCheckoutManager::new(runner, ExecutionEnvironmentPath::new("/ref/repo"))))
@@ -76,7 +79,11 @@ mod tests {
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "env-abc-123"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
-        let runner = Arc::new(DiscoveryMockRunner::builder().tool_exists("git", true).build());
+        let runner = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("git", &["--git-dir", "/ref/repo", "rev-parse", "--git-dir"], Ok("/ref/repo".into()))
+                .build(),
+        );
 
         let result = CloneCheckoutManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok(), "factory should succeed when env var is set and git ref exists");
@@ -99,12 +106,12 @@ mod tests {
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "env-abc-123"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
-        // git exists check returns false (no /ref/repo)
-        let runner = Arc::new(DiscoveryMockRunner::builder().tool_exists("git", false).build());
+        // No response queued for git --git-dir /ref/repo — runner returns Err by default
+        let runner = Arc::new(DiscoveryMockRunner::builder().build());
 
         let result = CloneCheckoutManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without ref repo");
-        assert!(!unmet.is_empty());
+        assert!(unmet.iter().any(|u| matches!(u, UnmetRequirement::MissingBinary(_))));
     }
 
     #[tokio::test]
