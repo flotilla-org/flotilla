@@ -9,6 +9,7 @@ mod terminals;
 mod workspace;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -447,6 +448,9 @@ pub(crate) struct ExecutorStepResolver {
     pub attachable_store: SharedAttachableStore,
     pub daemon_socket_path: Option<DaemonHostPath>,
     pub local_host: HostName,
+    // Environment lifecycle state
+    pub environment_handles: std::sync::Mutex<HashMap<flotilla_protocol::EnvironmentId, crate::providers::environment::EnvironmentHandle>>,
+    pub environment_registries: std::sync::Mutex<HashMap<flotilla_protocol::EnvironmentId, Arc<ProviderRegistry>>>,
 }
 
 impl ExecutorStepResolver {
@@ -464,10 +468,28 @@ impl StepResolver for ExecutorStepResolver {
     async fn resolve(
         &self,
         _description: &str,
-        _context: &StepExecutionContext,
+        context: &StepExecutionContext,
         action: StepAction,
         prior: &[StepOutcome],
     ) -> Result<StepOutcome, String> {
+        // Part F: Environment-polymorphic dispatch — determine the effective
+        // registry and runner based on whether we're inside an environment.
+        let (effective_registry, effective_runner) = match context {
+            StepExecutionContext::Host(_) => (self.registry.clone(), self.runner.clone()),
+            StepExecutionContext::Environment(_, env_id) => {
+                let registry = {
+                    let registries = self.environment_registries.lock().expect("environment_registries lock");
+                    registries.get(env_id).cloned().ok_or_else(|| format!("environment registry not found: {env_id}"))?
+                };
+                let runner = {
+                    let handles = self.environment_handles.lock().expect("environment_handles lock");
+                    let handle = handles.get(env_id).ok_or_else(|| format!("environment handle not found: {env_id}"))?;
+                    handle.runner(self.runner.clone())
+                };
+                (registry, runner)
+            }
+        };
+
         match action {
             StepAction::CreateCheckout { branch, create_branch, intent, .. } => {
                 let checkout_flow = CheckoutFlow {
@@ -475,9 +497,9 @@ impl StepResolver for ExecutorStepResolver {
                     create_branch,
                     intent,
                     repo_root: &self.repo.root,
-                    registry: self.registry.as_ref(),
+                    registry: effective_registry.as_ref(),
                     providers_data: self.providers_data.as_ref(),
-                    runner: self.runner.as_ref(),
+                    runner: effective_runner.as_ref(),
                     local_host: &self.local_host,
                 };
                 let result = checkout_flow.checkout_created_result().await?;
@@ -487,11 +509,11 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::CompletedWith(result))
             }
             StepAction::LinkIssuesToBranch { branch, issue_ids } => {
-                write_branch_issue_links(self.repo.root.as_path(), &branch, &issue_ids, &*self.runner).await;
+                write_branch_issue_links(self.repo.root.as_path(), &branch, &issue_ids, &*effective_runner).await;
                 Ok(StepOutcome::Completed)
             }
             StepAction::RemoveCheckout { branch, deleted_checkout_paths } => {
-                let checkout_service = CheckoutService::new(self.registry.as_ref(), self.runner.as_ref());
+                let checkout_service = CheckoutService::new(effective_registry.as_ref(), effective_runner.as_ref());
                 let tm = self.terminal_manager();
                 checkout_service.remove_checkout(&self.repo.root, &branch, &deleted_checkout_paths, tm.as_ref()).await?;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))
@@ -589,7 +611,7 @@ impl StepResolver for ExecutorStepResolver {
                 let tm = self.terminal_manager();
                 let workspace_orchestrator = WorkspaceOrchestrator::new(
                     self.repo.root.as_path(),
-                    self.registry.as_ref(),
+                    effective_registry.as_ref(),
                     self.config_base.as_path(),
                     &self.attachable_store,
                     self.daemon_socket_path.as_ref().map(|p| p.as_path()),
@@ -753,7 +775,7 @@ impl StepResolver for ExecutorStepResolver {
                     checkout_path.as_ref().map(|p| p.as_path()),
                     change_request_id.as_deref(),
                     self.repo.root.as_path(),
-                    self.runner.as_ref(),
+                    effective_runner.as_ref(),
                 )
                 .await;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutStatus(info)))
@@ -818,11 +840,95 @@ impl StepResolver for ExecutorStepResolver {
                     }
                 }
             }
-            StepAction::EnsureEnvironmentImage { .. }
-            | StepAction::CreateEnvironment { .. }
-            | StepAction::DiscoverEnvironmentProviders { .. }
-            | StepAction::DestroyEnvironment { .. } => Err("environment lifecycle steps not yet wired".to_string()),
+
+            // -----------------------------------------------------------------
+            // Environment lifecycle actions — always use host-side providers
+            // -----------------------------------------------------------------
+            StepAction::EnsureEnvironmentImage { spec } => {
+                let env_provider =
+                    self.registry.environment_providers.preferred().ok_or_else(|| "no environment provider available".to_string())?;
+                let image = env_provider.ensure_image(&spec).await?;
+                Ok(StepOutcome::Produced(CommandValue::ImageEnsured { image }))
+            }
+            StepAction::CreateEnvironment { env_id, image: _ } => {
+                // Extract actual ImageId from prior EnsureEnvironmentImage outcome
+                let image = prior
+                    .iter()
+                    .find_map(|o| match o {
+                        StepOutcome::Produced(CommandValue::ImageEnsured { image }) => Some(image.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| "image not produced by prior EnsureEnvironmentImage step".to_string())?;
+
+                let env_provider =
+                    self.registry.environment_providers.preferred().ok_or_else(|| "no environment provider available".to_string())?;
+
+                // Resolve reference repo path
+                let reference_repo = self.resolve_reference_repo().await;
+
+                let daemon_socket =
+                    self.daemon_socket_path.clone().ok_or_else(|| "daemon socket path required for environment creation".to_string())?;
+
+                let opts = crate::providers::environment::CreateOpts {
+                    tokens: vec![],
+                    reference_repo,
+                    daemon_socket_path: daemon_socket,
+                    working_directory: None,
+                };
+
+                let handle = env_provider.create(env_id.clone(), &image, opts).await?;
+                self.environment_handles.lock().expect("environment_handles lock").insert(env_id.clone(), handle);
+                Ok(StepOutcome::Produced(CommandValue::EnvironmentCreated { env_id }))
+            }
+            StepAction::DiscoverEnvironmentProviders { env_id } => {
+                let handle = {
+                    let handles = self.environment_handles.lock().expect("environment_handles lock");
+                    handles.get(&env_id).cloned().ok_or_else(|| format!("environment handle not found: {env_id}"))?
+                };
+
+                let env_runner = handle.runner(self.runner.clone());
+
+                // Build a minimal EnvironmentBag from raw env vars
+                let raw_env_vars = handle.env_vars().await?;
+                let mut bag = crate::providers::discovery::EnvironmentBag::new();
+                for (key, value) in &raw_env_vars {
+                    bag = bag.with(crate::providers::discovery::EnvironmentAssertion::env_var(key, value));
+                }
+
+                // Probe factories with the environment runner
+                let config = crate::config::ConfigStore::with_base("/tmp/flotilla-env-discovery");
+                let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
+                let factory_registry = crate::providers::discovery::FactoryRegistry::default_all();
+                let provider_registry = factory_registry.probe_all(&bag, &config, &env_repo_root, env_runner).await;
+
+                self.environment_registries.lock().expect("environment_registries lock").insert(env_id, Arc::new(provider_registry));
+
+                Ok(StepOutcome::Completed)
+            }
+            StepAction::DestroyEnvironment { env_id } => {
+                let handle = {
+                    let mut handles = self.environment_handles.lock().expect("environment_handles lock");
+                    handles.remove(&env_id).ok_or_else(|| format!("environment handle not found: {env_id}"))?
+                };
+                handle.destroy().await?;
+                self.environment_registries.lock().expect("environment_registries lock").remove(&env_id);
+                Ok(StepOutcome::Completed)
+            }
+
             StepAction::Noop => Ok(StepOutcome::Completed),
+        }
+    }
+}
+
+impl ExecutorStepResolver {
+    async fn resolve_reference_repo(&self) -> Option<DaemonHostPath> {
+        let result = self
+            .runner
+            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Noop)
+            .await;
+        match result {
+            Ok(path) => Some(DaemonHostPath::new(path.trim())),
+            Err(_) => None,
         }
     }
 }
