@@ -85,14 +85,15 @@ Remove the `directories` field. The struct retains `name`, `correlation_keys`, a
 **`select_existing_workspace()`:** Replace directory-matching with binding-based lookup:
 1. Lock the attachable store
 2. `sets_for_checkout()` to find the set for this checkout
-3. Scan bindings for `(workspace_manager, provider, AttachableSet)` where `object_id` matches the set — extract the ws_ref
+3. `lookup_workspace_ref_for_set()` to find the ws_ref bound to that set
 4. Call `select_workspace(ws_ref)`
+5. **On failure, fall through to create.** If the bound workspace no longer exists (dead tmux server, closed cmux workspace), `select_workspace` will fail. Log the error and proceed to create a new workspace, which writes a fresh binding replacing the stale one. This preserves the current fallback behavior.
 
 This removes the need to call `ws_mgr.list_workspaces()` and removes the `checkout_path` parameter in favor of the checkout's `HostPath`.
 
 ### `AttachableStoreApi` (store.rs)
 
-Add a reverse binding lookup method:
+**Reverse binding lookup:**
 ```rust
 fn lookup_workspace_ref_for_set(
     &self,
@@ -104,9 +105,15 @@ fn lookup_workspace_ref_for_set(
 
 Scans bindings where `object_kind == AttachableSet` and `object_id == set_id`, returns the `external_ref`. Linear scan over a small list.
 
+**1:1 binding invariant for workspace→set:** When `persist_workspace_binding` writes a new binding (ws_ref → set_id), it must also remove any existing workspace binding for the same set_id (same provider category/name). The current `replace_binding` is keyed by `external_ref`, so after a workspace is recreated with a new stable ID, the old binding persists alongside the new one. Without cleanup, the reverse lookup could return the stale ref. Enforcing 1:1 (one workspace per attachable set per provider) ensures the reverse lookup is unambiguous.
+
 ### Downstream
 
 The orchestrator, binding system, refresh, and correlation all treat ws_ref as an opaque string. Correlation already uses only `AttachableSet` keys for workspaces (not directories). No changes needed.
+
+### Known regression: loss of live directory-matching fallback
+
+The current `select_existing_workspace` consults `list_workspaces()` and matches by directory, which serves as a live recovery path when the attachable registry is missing or desynced — particularly for cmux, which reports directories from the multiplexer itself. Under this design, a wiped or desynced registry will always create a duplicate workspace even when an exact live workspace already exists. This is acceptable: the directory-matching path is already broken for remote workspaces, and a reconciliation mechanism (matching live workspaces to sets as a fallback) can be added as part of the broader lifecycle work.
 
 ### Migration
 
