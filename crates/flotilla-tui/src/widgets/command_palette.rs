@@ -546,7 +546,7 @@ impl InteractiveWidget for CommandPaletteWidget {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use flotilla_protocol::{Command, CommandAction};
+    use flotilla_protocol::{Command, CommandAction, WorkItemIdentity, WorkItemKind};
 
     use super::*;
     use crate::app::test_support::{bare_item, checkout_item, session_item, TestWidgetHarness};
@@ -964,5 +964,49 @@ mod tests {
             CommandAction::Checkout { repo, .. } => assert_ne!(*repo, RepoSelector::Query("".into())),
             _ => panic!("wrong action"),
         }
+    }
+
+    #[test]
+    fn explicit_host_routing_preserved_for_needs_context() {
+        let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
+        // Simulate `host feta cr #42 open` — HostNoun::resolve() sets command.host = Some("feta")
+        let cmd = Command {
+            host: Some(HostName::new("feta")),
+            context_repo: None,
+            action: CommandAction::OpenChangeRequest { id: "#42".into() },
+        };
+        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
+        let result = tui_dispatch(resolved, None, false, Some(&repo_id), &None, &None, false).expect("should succeed");
+        // Explicit host must be preserved, not clobbered by ProviderHost resolution
+        assert_eq!(result.host, Some(HostName::new("feta")));
+    }
+
+    #[test]
+    fn contextual_palette_derives_host_from_source_item() {
+        let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
+        let mut item = WorkItem {
+            kind: WorkItemKind::ChangeRequest,
+            identity: WorkItemIdentity::ChangeRequest("42".into()),
+            host: HostName::new("remote-peer"),
+            branch: None,
+            description: String::new(),
+            checkout: None,
+            change_request_key: Some("#42".into()),
+            session_key: None,
+            issue_keys: Vec::new(),
+            workspace_refs: Vec::new(),
+            is_main_checkout: false,
+            debug_group: Vec::new(),
+            source: None,
+            terminal_keys: Vec::new(),
+            attachable_set_id: None,
+            agent_keys: Vec::new(),
+        };
+        let cmd = Command { host: None, context_repo: None, action: CommandAction::OpenChangeRequest { id: "#42".into() } };
+        let my_host = Some(HostName::new("local-host"));
+        // ProviderHost on a remote-only repo should derive host from the item
+        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
+        let result = tui_dispatch(resolved, Some(&item), false, Some(&repo_id), &None, &my_host, true).expect("should succeed");
+        assert_eq!(result.host, Some(HostName::new("remote-peer")));
     }
 }
