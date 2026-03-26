@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod cleat;
+pub mod clone;
 pub mod cmux;
 pub mod codex;
 pub mod cursor;
@@ -31,7 +32,7 @@ fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
 }
 
 fn checkout_manager_factories() -> Vec<Box<super::CheckoutManagerFactory>> {
-    vec![Box::new(git::WtCheckoutManagerFactory), Box::new(git::GitCheckoutManagerFactory)]
+    vec![Box::new(clone::CloneCheckoutManagerFactory), Box::new(git::WtCheckoutManagerFactory), Box::new(git::GitCheckoutManagerFactory)]
 }
 
 impl FactoryRegistry {
