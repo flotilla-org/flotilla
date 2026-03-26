@@ -1,19 +1,18 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
-assertion_line: 1458
 expression: "&resolved"
 ---
 ResolvedPlan(
     [
         Command(
             [
-                Quoted(
+                Literal(
                     "cleat",
                 ),
                 Literal(
                     "attach",
                 ),
-                Quoted(
+                Literal(
                     "main__shell__0",
                 ),
                 Literal(

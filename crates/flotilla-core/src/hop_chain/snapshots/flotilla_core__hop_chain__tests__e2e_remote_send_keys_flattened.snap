@@ -1,9 +1,8 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
-assertion_line: 1514
 expression: "&flattened"
 ---
 [
-    "SendKeys: [Type(\"cd '/home/alice/dev/my-repo/wt-feat' && 'cleat' attach 'feat__shell__0' --cwd '/home/alice/dev/my-repo/wt-feat'\"), WaitForPrompt]",
+    "SendKeys: [Type(\"cd '/home/alice/dev/my-repo/wt-feat' && cleat attach feat__shell__0 --cwd '/home/alice/dev/my-repo/wt-feat'\"), WaitForPrompt]",
     "Command: ssh -t 'alice@feta.local'",
 ]

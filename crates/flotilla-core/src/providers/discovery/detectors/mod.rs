@@ -25,6 +25,8 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(CommandDetector::new("cleat", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("shpool", &["version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("gemini", &["--version"], parse_first_dotted_version)),
+        Box::new(EnvVarDetector::new("TERM")),
+        Box::new(EnvVarDetector::new("COLORTERM")),
     ]
 }
 

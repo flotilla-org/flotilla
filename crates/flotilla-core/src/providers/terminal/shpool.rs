@@ -13,6 +13,10 @@ pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
     socket_path: DaemonHostPath,
     config_path: DaemonHostPath,
+    /// Terminal env defaults (TERM, COLORTERM) from discovery, injected into
+    /// sessions at creation time. Empty when the daemon environment already
+    /// has them (local case); populated for remote daemons started without a TTY.
+    terminal_env_defaults: TerminalEnvVars,
 }
 
 /// Shpool config content managed by flotilla.
@@ -43,7 +47,7 @@ enum ShpoolNoPidProbe {
 impl ShpoolTerminalPool {
     /// Create a new ShpoolTerminalPool, cleaning up stale sockets and
     /// spawning the daemon with flotilla's managed config.
-    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: DaemonHostPath) -> Self {
+    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: DaemonHostPath, terminal_env_defaults: TerminalEnvVars) -> Self {
         let config_path = DaemonHostPath::new(socket_path.as_path().parent().unwrap_or(Path::new(".")).join("config.toml"));
         let config_stale = Self::config_needs_update(config_path.as_path());
         let mut daemon_state = Self::detect_daemon_state(Arc::clone(&runner), socket_path.as_path(), config_path.as_path()).await;
@@ -85,7 +89,7 @@ impl ShpoolTerminalPool {
             Self::write_config(config_path.as_path());
         }
         Self::start_daemon(socket_path.as_path(), config_path.as_path()).await;
-        Self { runner, socket_path, config_path }
+        Self { runner, socket_path, config_path, terminal_env_defaults }
     }
 
     /// Sync constructor for tests — skips daemon lifecycle.
@@ -93,7 +97,7 @@ impl ShpoolTerminalPool {
     pub(crate) fn new(runner: Arc<dyn CommandRunner>, socket_path: DaemonHostPath) -> Self {
         let config_path = DaemonHostPath::new(socket_path.as_path().parent().unwrap_or(Path::new(".")).join("config.toml"));
         Self::write_config(config_path.as_path());
-        Self { runner, socket_path, config_path }
+        Self { runner, socket_path, config_path, terminal_env_defaults: vec![] }
     }
 
     /// Check if a process is alive. Returns true for both "alive and ours"
@@ -523,9 +527,16 @@ impl TerminalPool for ShpoolTerminalPool {
         // Build --cmd value. shpool uses shell-words for tokenization (no
         // variable expansion), so all values must be literal. Quote values
         // so paths with spaces are handled correctly.
+        //
+        // terminal_env_defaults (from discovery) provide TERM/COLORTERM
+        // fallbacks for daemons started without a TTY (e.g. remote SSH).
         let mut cmd_parts: Vec<String> = Vec::new();
-        if !env_vars.is_empty() {
+        let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
+        if has_env {
             cmd_parts.push("env".to_string());
+            for (k, v) in &self.terminal_env_defaults {
+                cmd_parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
+            }
             for (k, v) in env_vars {
                 cmd_parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
             }
@@ -574,7 +585,7 @@ impl TerminalPool for ShpoolTerminalPool {
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
         Ok(vec![
-            Arg::Quoted("shpool".into()),
+            Arg::Literal("shpool".into()),
             Arg::Literal("--socket".into()),
             Arg::Quoted(self.socket_path.as_path().display().to_string()),
             Arg::Literal("-c".into()),
@@ -583,7 +594,8 @@ impl TerminalPool for ShpoolTerminalPool {
             Arg::Literal("--force".into()),
             Arg::Literal("--dir".into()),
             Arg::Quoted(cwd.as_path().display().to_string()),
-            Arg::Quoted(session_name.into()),
+            // Session names are UUIDs (attachable IDs) — always shell-safe, no quoting needed.
+            Arg::Literal(session_name.into()),
         ])
     }
 

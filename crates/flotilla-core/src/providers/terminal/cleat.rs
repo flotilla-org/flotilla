@@ -28,11 +28,17 @@ enum SessionStatus {
 pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
+    terminal_env_defaults: TerminalEnvVars,
 }
 
 impl CleatTerminalPool {
     pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>) -> Self {
-        Self { runner, binary: binary.into() }
+        Self { runner, binary: binary.into(), terminal_env_defaults: vec![] }
+    }
+
+    pub fn with_terminal_env_defaults(mut self, defaults: TerminalEnvVars) -> Self {
+        self.terminal_env_defaults = defaults;
+        self
     }
 
     fn parse_list_output(json: &str) -> Result<Vec<SessionInfo>, String> {
@@ -75,10 +81,16 @@ impl TerminalPool for CleatTerminalPool {
             return Ok(());
         }
 
-        let effective_cmd = if env_vars.is_empty() {
+        // terminal_env_defaults (from discovery) provide TERM/COLORTERM
+        // fallbacks for daemons started without a TTY (e.g. remote SSH).
+        let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
+        let effective_cmd = if !has_env {
             command.to_string()
         } else {
             let mut parts = vec!["env".to_string()];
+            for (k, v) in &self.terminal_env_defaults {
+                parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
+            }
             for (k, v) in env_vars {
                 parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
             }
@@ -103,9 +115,10 @@ impl TerminalPool for CleatTerminalPool {
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
         Ok(vec![
-            Arg::Quoted(self.binary.clone()),
+            Arg::Literal(self.binary.clone()),
             Arg::Literal("attach".into()),
-            Arg::Quoted(session_name.into()),
+            // Session names are UUIDs (attachable IDs) — always shell-safe, no quoting needed.
+            Arg::Literal(session_name.into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted(cwd.as_path().display().to_string()),
         ])
@@ -210,7 +223,7 @@ mod tests {
         let cmd =
             pool.attach_command("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert!(cmd.contains("'cleat' attach 'my-session'"));
+        assert!(cmd.contains("cleat attach my-session"));
         assert!(cmd.contains("--cwd '/repo'"));
         assert!(!cmd.contains("--cmd"), "should NOT have --cmd");
     }
@@ -236,9 +249,9 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("my-session".into()),
+            Arg::Literal("my-session".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/repo".into()),
         ]);
@@ -250,7 +263,7 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-        assert_eq!(flat, "'cleat' attach 'my-session' --cwd '/repo'");
+        assert_eq!(flat, "cleat attach my-session --cwd '/repo'");
     }
 
     #[test]
@@ -260,9 +273,9 @@ mod tests {
 
         // Same structure regardless of command
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("sess-1".into()),
+            Arg::Literal("sess-1".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/home/dev".into()),
         ]);
@@ -276,9 +289,9 @@ mod tests {
 
         // Env vars are baked in at ensure_session/create time — not in attach_args
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("sess".into()),
+            Arg::Literal("sess".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/wd".into()),
         ]);
@@ -291,9 +304,9 @@ mod tests {
         let args = pool.attach_args("sess", "", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("sess".into()),
+            Arg::Literal("sess".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/wd".into()),
         ]);
@@ -307,6 +320,24 @@ mod tests {
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         // No --cmd, no NestedCommand
-        assert_eq!(flat, "'cleat' attach 'sess' --cwd '/wd'");
+        assert_eq!(flat, "cleat attach sess --cwd '/wd'");
+    }
+
+    #[tokio::test]
+    async fn ensure_session_terminal_env_defaults_appear_before_caller_env() {
+        let create_json = r#"{"id":"sess","cwd":"/repo","cmd":"env TERM='xterm-256color' FOO='bar' claude","status":"Detached"}"#;
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok(create_json.into())]));
+        let env_defaults = vec![("TERM".to_string(), "xterm-256color".to_string())];
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat").with_terminal_env_defaults(env_defaults);
+        let caller_env = vec![("FOO".to_string(), "bar".to_string())];
+
+        pool.ensure_session("sess", "claude", &ExecutionEnvironmentPath::new("/repo"), &caller_env).await.expect("ensure session");
+
+        let calls = runner.calls();
+        let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
+        let cmd_val = &calls[1].1[cmd_idx + 1];
+        let term_pos = cmd_val.find("TERM=").expect("should contain TERM");
+        let foo_pos = cmd_val.find("FOO=").expect("should contain FOO");
+        assert!(term_pos < foo_pos, "terminal defaults should appear before caller env vars: {cmd_val}");
     }
 }

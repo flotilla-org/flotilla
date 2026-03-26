@@ -33,7 +33,8 @@ impl Factory for ShpoolTerminalPoolFactory {
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if env.find_binary("shpool").is_some() {
             let socket_path = config.state_dir().join("shpool/shpool.socket");
-            let pool = ShpoolTerminalPool::create(runner, socket_path).await;
+            let terminal_env_defaults = super::terminal_env_defaults_from_bag(env);
+            let pool = ShpoolTerminalPool::create(runner, socket_path, terminal_env_defaults).await;
             Ok(Arc::new(pool))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("shpool".into())])

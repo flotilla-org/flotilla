@@ -12,7 +12,21 @@ pub mod shpool;
 pub mod tmux;
 pub mod zellij;
 
-use super::FactoryRegistry;
+use super::{EnvironmentBag, FactoryRegistry};
+use crate::providers::terminal::TerminalEnvVars;
+
+/// Extract TERM/COLORTERM defaults from discovery for terminal pool session creation.
+/// When the daemon runs without a TTY (e.g. remote SSH), these provide fallback values
+/// so sessions get color support. Uses xterm-256color as the safe universal default.
+pub(super) fn terminal_env_defaults_from_bag(env: &EnvironmentBag) -> TerminalEnvVars {
+    let mut defaults = Vec::new();
+    let term = env.find_env_var("TERM").unwrap_or("xterm-256color");
+    defaults.push(("TERM".to_string(), term.to_string()));
+    if let Some(colorterm) = env.find_env_var("COLORTERM") {
+        defaults.push(("COLORTERM".to_string(), colorterm.to_string()));
+    }
+    defaults
+}
 
 fn workspace_factories() -> Vec<Box<super::WorkspaceManagerFactory>> {
     vec![

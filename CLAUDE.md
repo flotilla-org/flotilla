@@ -124,6 +124,17 @@ Each trait lives in `crates/flotilla-core/src/providers/<category>/mod.rs` with 
 
 Every provider trait has label methods: `section_label()`, `item_noun()`, `abbreviation()`, `display_name()`. Override defaults in implementations for custom terminology.
 
+### Discovery and Provider Construction
+
+Providers are constructed via **factories** (`discovery/factories/`) that receive an `EnvironmentBag` — a typed collection of `EnvironmentAssertion` values populated by **detectors** (`discovery/detectors/`).
+
+- **Host detectors** (`HostDetector`) probe the daemon's environment: available binaries, env vars, sockets. They receive an injected `CommandRunner` and `EnvVars` trait — **never use `std::env` directly** in providers or factories.
+- **Repo detectors** (`RepoDetector`) probe per-repo state (VCS roots, remotes).
+- The `EnvironmentBag` provides typed queries: `find_binary()`, `find_env_var()`, `find_socket()`, `find_vcs_checkout()`, `find_remote_host()`.
+- Factories call `env.find_binary("tool")` to check availability, `env.find_env_var("KEY")` for env values, and receive a `ConfigStore` for user preferences.
+
+**Why injected collaborators?** The daemon may run discovery for remote hosts or container environments where the host process's own env vars and binaries are wrong. The `EnvVars` trait and `CommandRunner` trait abstract this so tests can inject values and environments can provide their own. Never use `std::env` or `std::process::Command` directly in providers — always go through the injected `EnvVars` and `CommandRunner`.
+
 ### Correlation
 
 Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `AttachableSet`, `ChangeRequestRef`, `SessionRef`). Items sharing any key merge into a single `WorkItem`. Issues link post-correlation via `AssociationKey` (don't cause merges). Tests in `crates/flotilla-core/src/providers/correlation.rs`.

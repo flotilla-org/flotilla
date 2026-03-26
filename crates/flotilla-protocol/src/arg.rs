@@ -258,14 +258,14 @@ mod tests {
 
     #[test]
     fn flatten_regression_remote_attach_with_multiplex() {
-        // With SSH multiplexing args (all Literal since they're raw shell flags)
+        // With SSH multiplexing args — ControlPath uses inner double-quotes for SSH config parser
         let args = [
             Arg::Literal("ssh".into()),
             Arg::Literal("-t".into()),
             Arg::Literal("-o".into()),
             Arg::Literal("ControlMaster=auto".into()),
             Arg::Literal("-o".into()),
-            Arg::Quoted("/home/user/.config/flotilla/ssh/ctrl-%r@%h-%p".into()),
+            Arg::Quoted("ControlPath=\"/home/user/.config/flotilla/ssh/ctrl-%r@%h-%p\"".into()),
             Arg::Literal("-o".into()),
             Arg::Literal("ControlPersist=60".into()),
             Arg::Quoted("user@feta".into()),
@@ -276,6 +276,23 @@ mod tests {
         assert!(full.starts_with("ssh -t -o ControlMaster=auto -o "));
         assert!(full.contains("'user@feta'"));
         assert!(full.ends_with("'tmux attach'"));
+    }
+
+    #[test]
+    fn flatten_control_path_with_spaces() {
+        // ControlPath with spaces in path (macOS Application Support) — inner double-quotes
+        // protect against SSH config parser splitting on whitespace
+        let args = [
+            Arg::Literal("ssh".into()),
+            Arg::Literal("-t".into()),
+            Arg::Literal("-o".into()),
+            Arg::Quoted("ControlPath=\"/Users/alice/Library/Application Support/flotilla/ssh/ctrl-%r@%h-%p\"".into()),
+            Arg::Quoted("user@feta".into()),
+        ];
+
+        let full = flatten(&args, 0);
+        // The double-quotes survive inside the single-quoted arg, so SSH's config parser sees them
+        assert_eq!(full, "ssh -t -o 'ControlPath=\"/Users/alice/Library/Application Support/flotilla/ssh/ctrl-%r@%h-%p\"' 'user@feta'");
     }
 
     // ── Display tests ────────────────────────────────────────────────

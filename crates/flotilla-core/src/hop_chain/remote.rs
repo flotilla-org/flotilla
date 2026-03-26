@@ -69,7 +69,10 @@ impl SshRemoteHopResolver {
                 args.push(Arg::Literal("-o".into()));
                 args.push(Arg::Literal("ControlMaster=auto".into()));
                 args.push(Arg::Literal("-o".into()));
-                args.push(Arg::Quoted(format!("ControlPath={ctrl_path}")));
+                // Inner double-quotes protect against SSH's config parser splitting on
+                // whitespace (e.g. macOS "Application Support"). Assumes the path itself
+                // contains no double-quotes, which is safe for filesystem paths.
+                args.push(Arg::Quoted(format!("ControlPath=\"{ctrl_path}\"")));
                 args.push(Arg::Literal("-o".into()));
                 args.push(Arg::Literal("ControlPersist=60".into()));
             }
