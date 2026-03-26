@@ -355,6 +355,7 @@ impl InProcessDaemon {
                 repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
             ),
             &*discovery.env,
+            vec![],
         );
 
         let daemon = Arc::new(Self {
