@@ -286,6 +286,8 @@ REPLAY=record cargo test -p flotilla-core test_my_provider
 
 This runs your test against real systems (git, GitHub, Claude API, HTTP endpoints). The test must succeed. On exit, the fixture file is written with all interactions masked.
 
+**Never edit replay fixture YAML files directly.** Always re-record them against the real system with `REPLAY=record`. Fixtures capture real interaction sequences including exact command arguments, response formats, and ordering — hand-editing risks subtle mismatches that pass in replay but fail against the real system. If recording requires setup that can't be automated (e.g. a running cmux instance, an active zellij session), flag it for human intervention.
+
 ### Passthrough
 
 Validate tests against live execution without writing fixtures:

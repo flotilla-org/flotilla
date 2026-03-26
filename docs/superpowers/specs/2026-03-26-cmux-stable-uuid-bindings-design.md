@@ -58,4 +58,4 @@ None. We are in a no-backwards-compat phase. Existing bindings keyed on old-form
 
 ### Tests
 
-Update existing cmux, zellij, and tmux replay fixtures to reflect the new commands and response formats. Verify parsed ws_ref values use the new formats.
+Re-record replay fixtures against the real systems (`REPLAY=record`) rather than editing fixture files directly. This may require human intervention to set up the workspace managers (cmux running, zellij session active, tmux session active). Add assertions that parsed ws_ref values use the new stable formats.
