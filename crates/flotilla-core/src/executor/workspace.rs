@@ -63,11 +63,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         }
     }
 
-    pub(super) async fn attach_prepared_workspace(
-        &self,
-        prepared: &PreparedWorkspace,
-        container_name: Option<&str>,
-    ) -> Result<(), String> {
+    pub(super) async fn attach_prepared_workspace(&self, prepared: &PreparedWorkspace, container_name: Option<&str>) -> Result<(), String> {
         let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
             return Ok(());
         };
