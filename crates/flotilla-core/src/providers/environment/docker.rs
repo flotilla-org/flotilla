@@ -53,8 +53,7 @@ impl EnvironmentProvider for DockerEnvironment {
         }
     }
 
-    async fn create(&self, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
-        let id = EnvironmentId::new(Uuid::new_v4().to_string());
+    async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
         let container_name = format!("flotilla-env-{}", id);
 
         let socket_str = opts.daemon_socket_path.to_string();
@@ -145,6 +144,10 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
 
     fn image(&self) -> &ImageId {
         &self.image
+    }
+
+    fn container_name(&self) -> Option<&str> {
+        Some(&self.container_name)
     }
 
     async fn status(&self) -> Result<EnvironmentStatus, String> {
