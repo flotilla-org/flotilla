@@ -1,3 +1,4 @@
+pub mod clone;
 pub mod git;
 pub mod git_worktree;
 pub mod wt;

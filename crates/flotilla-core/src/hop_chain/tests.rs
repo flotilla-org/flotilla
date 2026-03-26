@@ -534,6 +534,7 @@ fn insert_terminal(
         host_affinity,
         checkout: None,
         template_identity: None,
+        environment_id: None,
         members: vec![attachable_id.clone()],
     });
     store.insert_attachable(Attachable {
@@ -977,6 +978,78 @@ fn build_for_attachable_unknown_id_returns_error() {
 
     let err = builder.build_for_attachable(&AttachableId::new("nonexistent"), &store).expect_err("should fail for unknown attachable");
     assert!(err.contains("attachable not found"), "error should mention not found: {err}");
+}
+
+#[test]
+fn build_for_attachable_with_environment_id() {
+    let local_host = HostName::new("my-host");
+    let att_id = AttachableId::new("term-env");
+    let env_id = EnvironmentId::new("env-sandbox-1");
+
+    let mut store = InMemoryAttachableStore::new();
+    let set_id = store.allocate_set_id();
+    store.insert_set(AttachableSet {
+        id: set_id.clone(),
+        host_affinity: Some(HostName::new("feta")),
+        checkout: None,
+        template_identity: None,
+        environment_id: Some(env_id.clone()),
+        members: vec![att_id.clone()],
+    });
+    store.insert_attachable(Attachable {
+        id: att_id.clone(),
+        set_id,
+        content: AttachableContent::Terminal(TerminalAttachable {
+            purpose: TerminalPurpose { checkout: "feat".to_string(), role: "shell".to_string(), index: 0 },
+            command: "bash".to_string(),
+            working_directory: ExecutionEnvironmentPath::new("/repo/wt-feat"),
+            status: TerminalStatus::Disconnected,
+        }),
+    });
+
+    let builder = HopPlanBuilder::new(&local_host);
+    let plan = builder.build_for_attachable(&att_id, &store).expect("should succeed");
+
+    assert_eq!(plan.0.len(), 3, "should have RemoteToHost + EnterEnvironment + AttachTerminal");
+    assert_eq!(plan.0[0], Hop::RemoteToHost { host: HostName::new("feta") });
+    assert_eq!(plan.0[1], Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".to_string() });
+    assert_eq!(plan.0[2], Hop::AttachTerminal { attachable_id: att_id.clone() });
+}
+
+#[test]
+fn build_for_attachable_with_environment_id_local_host() {
+    let local_host = HostName::new("my-host");
+    let att_id = AttachableId::new("term-env-local");
+    let env_id = EnvironmentId::new("env-local-1");
+
+    let mut store = InMemoryAttachableStore::new();
+    let set_id = store.allocate_set_id();
+    store.insert_set(AttachableSet {
+        id: set_id.clone(),
+        host_affinity: Some(HostName::new("my-host")),
+        checkout: None,
+        template_identity: None,
+        environment_id: Some(env_id.clone()),
+        members: vec![att_id.clone()],
+    });
+    store.insert_attachable(Attachable {
+        id: att_id.clone(),
+        set_id,
+        content: AttachableContent::Terminal(TerminalAttachable {
+            purpose: TerminalPurpose { checkout: "feat".to_string(), role: "shell".to_string(), index: 0 },
+            command: "bash".to_string(),
+            working_directory: ExecutionEnvironmentPath::new("/repo/wt-feat"),
+            status: TerminalStatus::Disconnected,
+        }),
+    });
+
+    let builder = HopPlanBuilder::new(&local_host);
+    let plan = builder.build_for_attachable(&att_id, &store).expect("should succeed");
+
+    // Local host: no RemoteToHost, but still has EnterEnvironment
+    assert_eq!(plan.0.len(), 2, "should have EnterEnvironment + AttachTerminal");
+    assert_eq!(plan.0[0], Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".to_string() });
+    assert_eq!(plan.0[1], Hop::AttachTerminal { attachable_id: att_id.clone() });
 }
 
 #[test]

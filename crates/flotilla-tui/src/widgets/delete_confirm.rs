@@ -58,6 +58,7 @@ impl InteractiveWidget for DeleteConfirmWidget {
                     let action = CommandAction::RemoveCheckout { checkout };
                     let command = Command {
                         host: self.remote_host.clone(),
+                        environment: None,
                         context_repo: Some(RepoSelector::Identity(ctx.model.active_repo_identity().clone())),
                         action,
                     };

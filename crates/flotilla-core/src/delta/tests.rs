@@ -56,7 +56,6 @@ fn session(title: &str) -> CloudAgentSession {
         provider_name: String::new(),
         provider_display_name: String::new(),
         item_noun: String::new(),
-        environment_id: None,
     }
 }
 

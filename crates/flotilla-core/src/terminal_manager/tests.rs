@@ -300,6 +300,7 @@ async fn attach_command_rejects_remote_attachable() {
             host_affinity: Some(remote_host),
             checkout: None,
             template_identity: None,
+            environment_id: None,
             members: vec![att_id.clone()],
         });
         s.insert_attachable(Attachable {

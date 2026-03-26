@@ -41,7 +41,6 @@ fn repo_data_with_archived_session() -> Shared<RepoData> {
         provider_name: String::new(),
         provider_display_name: String::new(),
         item_noun: String::new(),
-        environment_id: None,
     });
     Shared::new(RepoData {
         path: PathBuf::from("/tmp/test-repo"),

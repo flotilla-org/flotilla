@@ -2,8 +2,6 @@ use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::HostName;
-
 /// Filesystem-safe identifier for a sandbox environment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -76,11 +74,4 @@ pub struct EnvironmentInfo {
     pub id: EnvironmentId,
     pub image: ImageId,
     pub status: EnvironmentStatus,
-}
-
-/// Associates a sandbox environment with the host it runs on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvironmentBinding {
-    pub environment_id: EnvironmentId,
-    pub host: HostName,
 }

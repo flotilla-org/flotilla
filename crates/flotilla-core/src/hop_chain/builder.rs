@@ -29,6 +29,10 @@ impl<'a> HopPlanBuilder<'a> {
             }
         }
 
+        if let Some(ref env_id) = set.environment_id {
+            hops.push(Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".to_string() });
+        }
+
         hops.push(Hop::AttachTerminal { attachable_id: attachable_id.clone() });
 
         Ok(HopPlan(hops))

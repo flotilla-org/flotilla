@@ -27,7 +27,7 @@ use crate::{
         workspace::WorkspaceManager,
         CommandRunner,
     },
-    step::{StepAction, StepHost, StepOutcome, StepResolver},
+    step::{StepAction, StepExecutionContext, StepOutcome, StepResolver},
 };
 
 fn desc(name: &str) -> ProviderDescriptor {
@@ -293,11 +293,11 @@ fn repo_selector() -> RepoSelector {
 }
 
 fn local_command(action: CommandAction) -> Command {
-    Command { host: None, context_repo: None, action }
+    Command { host: None, environment: None, context_repo: None, action }
 }
 
 fn command_with_host(host: &str, action: CommandAction) -> Command {
-    Command { host: Some(HostName::new(host)), context_repo: None, action }
+    Command { host: Some(HostName::new(host)), environment: None, context_repo: None, action }
 }
 
 fn local_host() -> HostName {
@@ -1741,6 +1741,8 @@ async fn run_build_plan_to_completion_with(
                 attachable_store,
                 daemon_socket_path: None,
                 local_host: local_host.clone(),
+                environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+                environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
             };
             run_step_plan(step_plan, 1, local_host, repo_identity(), repo_root(), cancel, tx, &resolver).await
         }
@@ -1850,9 +1852,9 @@ async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 3);
-    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
-    assert_eq!(plan.steps[1].host, StepHost::Remote(HostName::new("feta")));
-    assert_eq!(plan.steps[2].host, StepHost::Local);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::new("feta")));
+    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::local()));
 }
 
 #[tokio::test]
@@ -1879,12 +1881,12 @@ async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 4);
-    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
-    assert_eq!(plan.steps[1].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::new("feta")));
     assert_eq!(plan.steps[2].description, "Prepare workspace for feat-x@feta");
-    assert_eq!(plan.steps[2].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::new("feta")));
     assert_eq!(plan.steps[3].description, "Attach workspace");
-    assert_eq!(plan.steps[3].host, StepHost::Local);
+    assert_eq!(plan.steps[3].host, StepExecutionContext::Host(HostName::local()));
 }
 
 #[tokio::test]
@@ -1909,9 +1911,9 @@ async fn build_plan_create_checkout_treats_local_host_as_local() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 3);
-    assert_eq!(plan.steps[0].host, StepHost::Local);
-    assert_eq!(plan.steps[1].host, StepHost::Local);
-    assert_eq!(plan.steps[2].host, StepHost::Local);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::local()));
 }
 
 #[tokio::test]
@@ -1977,7 +1979,7 @@ async fn build_plan_prepare_terminal_uses_command_host_for_terminal_step() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
 }
 
 #[tokio::test]
@@ -2001,13 +2003,13 @@ async fn build_plan_create_workspace_for_checkout_uses_prepare_and_attach_steps_
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[0].host, StepHost::Local);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::local()));
     assert!(matches!(
         plan.steps[0].action,
         StepAction::PrepareWorkspace { ref checkout_path, ref label }
             if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat"
     ));
-    assert_eq!(plan.steps[1].host, StepHost::Local);
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
     assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
 }
 
@@ -2032,13 +2034,13 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[0].host, StepHost::Remote(HostName::new("feta")));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
     assert!(matches!(
         plan.steps[0].action,
         StepAction::PrepareWorkspace { ref checkout_path, ref label }
             if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat@feta"
     ));
-    assert_eq!(plan.steps[1].host, StepHost::Local);
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
     assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
 }
 
@@ -2083,6 +2085,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         attachable_store: attachable,
         daemon_socket_path: None,
         local_host: lh.clone(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let result = match plan {
@@ -2140,6 +2144,8 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         attachable_store: attachable,
         daemon_socket_path: None,
         local_host: lh.clone(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let result = match plan {
@@ -2196,6 +2202,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         attachable_store: attachable,
         daemon_socket_path: None,
         local_host: lh.clone(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let result = match plan {
@@ -2330,6 +2338,126 @@ async fn build_plan_simple_command_returns_ok() {
         run_build_plan_to_completion(CommandAction::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
 
     assert_ok(result);
+}
+
+// -----------------------------------------------------------------------
+// Tests: environment checkout plan
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn build_plan_with_environment_prepends_lifecycle_steps() {
+    let registry = empty_registry();
+    let data = empty_data();
+
+    let spec = flotilla_protocol::EnvironmentSpec {
+        image: flotilla_protocol::ImageSource::Registry("flotilla-dev-env:latest".to_string()),
+        token_requirements: vec!["github".to_string()],
+    };
+    let cmd = Command {
+        host: Some(HostName::new("feta")),
+        environment: Some(spec),
+        context_repo: Some(repo_selector()),
+        action: CommandAction::Checkout {
+            repo: repo_selector(),
+            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
+            issue_ids: vec![],
+        },
+    };
+
+    let plan = build_plan(
+        cmd,
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        HostName::new("laptop"),
+    )
+    .await
+    .expect("build_plan should succeed");
+
+    // Verify 6 steps
+    assert_eq!(plan.steps.len(), 6);
+
+    // Verify step actions in order
+    assert!(matches!(plan.steps[0].action, StepAction::EnsureEnvironmentImage { .. }));
+    assert!(matches!(plan.steps[1].action, StepAction::CreateEnvironment { .. }));
+    assert!(matches!(plan.steps[2].action, StepAction::DiscoverEnvironmentProviders { .. }));
+    assert!(matches!(plan.steps[3].action, StepAction::CreateCheckout { .. }));
+    assert!(matches!(plan.steps[4].action, StepAction::PrepareWorkspace { .. }));
+    assert!(matches!(plan.steps[5].action, StepAction::AttachWorkspace));
+
+    // Verify host assignments — steps 0-2: Host(feta)
+    assert_eq!(*plan.steps[0].host.host_name(), HostName::new("feta"));
+    assert_eq!(*plan.steps[1].host.host_name(), HostName::new("feta"));
+    assert_eq!(*plan.steps[2].host.host_name(), HostName::new("feta"));
+    assert!(matches!(&plan.steps[0].host, StepExecutionContext::Host(_)));
+    assert!(matches!(&plan.steps[1].host, StepExecutionContext::Host(_)));
+    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Host(_)));
+
+    // Steps 3-4: Environment(feta, env_id)
+    assert!(matches!(&plan.steps[3].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
+    assert!(matches!(&plan.steps[4].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
+
+    // Step 5: Host(laptop) — attach on local
+    assert_eq!(*plan.steps[5].host.host_name(), HostName::new("laptop"));
+    assert!(matches!(&plan.steps[5].host, StepExecutionContext::Host(_)));
+
+    // Verify workspace label includes remote host suffix
+    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[4].action {
+        assert_eq!(label, "feature-x@feta");
+    } else {
+        panic!("step 4 should be PrepareWorkspace");
+    }
+}
+
+#[tokio::test]
+async fn build_plan_with_environment_local_host_omits_suffix() {
+    let registry = empty_registry();
+    let data = empty_data();
+
+    let spec = flotilla_protocol::EnvironmentSpec {
+        image: flotilla_protocol::ImageSource::Registry("dev:latest".to_string()),
+        token_requirements: vec![],
+    };
+    let cmd = Command {
+        host: Some(HostName::new("laptop")),
+        environment: Some(spec),
+        context_repo: Some(repo_selector()),
+        action: CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::Branch("main".to_string()), issue_ids: vec![] },
+    };
+
+    let plan = build_plan(
+        cmd,
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        HostName::new("laptop"),
+    )
+    .await
+    .expect("build_plan should succeed");
+
+    assert_eq!(plan.steps.len(), 6);
+
+    // When target_host == local_host, workspace label should be just the branch
+    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[4].action {
+        assert_eq!(label, "main");
+    } else {
+        panic!("step 4 should be PrepareWorkspace");
+    }
+
+    // Checkout step should use ExistingBranch intent
+    if let StepAction::CreateCheckout { ref branch, create_branch, intent, .. } = plan.steps[3].action {
+        assert_eq!(branch, "main");
+        assert!(!create_branch);
+        assert_eq!(intent, CheckoutIntent::ExistingBranch);
+    } else {
+        panic!("step 3 should be CreateCheckout");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -2631,12 +2759,15 @@ async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() 
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
         local_host: local_host(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let prior =
         vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
     let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None };
-    let outcome = resolver.resolve("create workspace", action, &prior).await;
+    let context = StepExecutionContext::Host(local_host());
+    let outcome = resolver.resolve("create workspace", &context, action, &prior).await;
     match outcome {
         Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared))) => {
             assert_eq!(prepared.label, "feat");
@@ -2660,9 +2791,237 @@ async fn executor_step_resolver_prepare_workspace_skips_when_no_checkout_path() 
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
         local_host: local_host(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None };
-    let outcome = resolver.resolve("create workspace", action, &[]).await;
+    let context = StepExecutionContext::Host(local_host());
+    let outcome = resolver.resolve("create workspace", &context, action, &[]).await;
     assert!(matches!(outcome, Ok(StepOutcome::Skipped)), "should skip when no prior CheckoutCreated outcome: {outcome:?}");
+}
+
+// -----------------------------------------------------------------------
+// Tests: Environment lifecycle actions
+// -----------------------------------------------------------------------
+
+use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId};
+
+use crate::providers::environment::{CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment};
+
+struct MockEnvironmentProvider {
+    ensure_image_results: tokio::sync::Mutex<Vec<Result<ImageId, String>>>,
+    create_results: tokio::sync::Mutex<Vec<Result<EnvironmentHandle, String>>>,
+}
+
+#[async_trait]
+impl EnvironmentProvider for MockEnvironmentProvider {
+    async fn ensure_image(&self, _spec: &EnvironmentSpec) -> Result<ImageId, String> {
+        self.ensure_image_results.lock().await.remove(0)
+    }
+    async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+        self.create_results.lock().await.remove(0)
+    }
+    async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+        Ok(vec![])
+    }
+}
+
+struct MockProvisionedEnvironment {
+    id: EnvironmentId,
+    image: ImageId,
+}
+
+#[async_trait]
+impl ProvisionedEnvironment for MockProvisionedEnvironment {
+    fn id(&self) -> &EnvironmentId {
+        &self.id
+    }
+    fn image(&self) -> &ImageId {
+        &self.image
+    }
+    fn container_name(&self) -> Option<&str> {
+        Some("mock-container")
+    }
+    async fn status(&self) -> Result<EnvironmentStatus, String> {
+        Ok(EnvironmentStatus::Running)
+    }
+    async fn env_vars(&self) -> Result<std::collections::HashMap<String, String>, String> {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("PATH".to_string(), "/usr/bin".to_string());
+        Ok(vars)
+    }
+    fn runner(&self, host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
+        host_runner
+    }
+    async fn destroy(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn registry_with_env_provider(provider: Arc<dyn EnvironmentProvider>) -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    let desc = ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "mock-docker");
+    registry.environment_providers.insert("mock-docker", desc, provider);
+    registry
+}
+
+#[tokio::test]
+async fn executor_step_resolver_ensure_environment_image() {
+    let config_base = config_base();
+    let provider = Arc::new(MockEnvironmentProvider {
+        ensure_image_results: tokio::sync::Mutex::new(vec![Ok(ImageId::new("flotilla:test-abc123"))]),
+        create_results: tokio::sync::Mutex::new(vec![]),
+    });
+    let registry = registry_with_env_provider(provider);
+    let resolver = ExecutorStepResolver {
+        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        registry: Arc::new(registry),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
+        config_base: config_base.clone(),
+        attachable_store: test_attachable_store(&config_base),
+        daemon_socket_path: None,
+        local_host: local_host(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
+
+    let spec = EnvironmentSpec { image: flotilla_protocol::ImageSource::Registry("test:latest".into()), token_requirements: vec![] };
+    let action = StepAction::EnsureEnvironmentImage { spec };
+    let context = StepExecutionContext::Host(local_host());
+    let outcome = resolver.resolve("ensure image", &context, action, &[]).await;
+    match outcome {
+        Ok(StepOutcome::Produced(CommandValue::ImageEnsured { image })) => {
+            assert_eq!(image, ImageId::new("flotilla:test-abc123"));
+        }
+        other => panic!("expected ImageEnsured outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn executor_step_resolver_ensure_environment_image_error_when_no_provider() {
+    let config_base = config_base();
+    let resolver = ExecutorStepResolver {
+        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        registry: Arc::new(empty_registry()),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
+        config_base: config_base.clone(),
+        attachable_store: test_attachable_store(&config_base),
+        daemon_socket_path: None,
+        local_host: local_host(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
+
+    let spec = EnvironmentSpec { image: flotilla_protocol::ImageSource::Registry("test:latest".into()), token_requirements: vec![] };
+    let action = StepAction::EnsureEnvironmentImage { spec };
+    let context = StepExecutionContext::Host(local_host());
+    let outcome = resolver.resolve("ensure image", &context, action, &[]).await;
+    assert!(outcome.is_err(), "should fail when no environment provider available");
+    assert!(outcome.unwrap_err().contains("no environment provider available"));
+}
+
+#[tokio::test]
+async fn executor_step_resolver_create_environment() {
+    let config_base = config_base();
+    let env_id = EnvironmentId::new("env-test-1");
+    let image_id = ImageId::new("flotilla:test-abc123");
+
+    let mock_env: EnvironmentHandle = Arc::new(MockProvisionedEnvironment { id: env_id.clone(), image: image_id.clone() });
+
+    let provider = Arc::new(MockEnvironmentProvider {
+        ensure_image_results: tokio::sync::Mutex::new(vec![]),
+        create_results: tokio::sync::Mutex::new(vec![Ok(mock_env)]),
+    });
+    let registry = registry_with_env_provider(provider);
+    // resolve_reference_repo calls `git rev-parse --git-common-dir`
+    let runner = Arc::new(MockRunner::new(vec![Ok("/tmp/test-repo/.git".into())]));
+    let resolver = ExecutorStepResolver {
+        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        registry: Arc::new(registry),
+        providers_data: Arc::new(empty_data()),
+        runner,
+        config_base: config_base.clone(),
+        attachable_store: test_attachable_store(&config_base),
+        daemon_socket_path: Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+        local_host: local_host(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
+
+    // Prior step must have produced the image
+    let prior = vec![StepOutcome::Produced(CommandValue::ImageEnsured { image: image_id.clone() })];
+    let action = StepAction::CreateEnvironment { env_id: env_id.clone(), image: None };
+    let context = StepExecutionContext::Host(local_host());
+    let outcome = resolver.resolve("create env", &context, action, &prior).await;
+    match outcome {
+        Ok(StepOutcome::Produced(CommandValue::EnvironmentCreated { env_id: created_id })) => {
+            assert_eq!(created_id, env_id);
+        }
+        other => panic!("expected EnvironmentCreated outcome, got {other:?}"),
+    }
+
+    // Verify handle was stored
+    let handles = resolver.environment_handles.lock().expect("lock");
+    assert!(handles.contains_key(&env_id), "environment handle should be stored");
+}
+
+#[tokio::test]
+async fn executor_step_resolver_destroy_environment() {
+    let config_base = config_base();
+    let env_id = EnvironmentId::new("env-destroy-1");
+    let image_id = ImageId::new("flotilla:test");
+
+    let mock_env: EnvironmentHandle = Arc::new(MockProvisionedEnvironment { id: env_id.clone(), image: image_id });
+
+    // Pre-populate the handle
+    let mut handles_map = std::collections::HashMap::new();
+    handles_map.insert(env_id.clone(), mock_env);
+
+    let resolver = ExecutorStepResolver {
+        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        registry: Arc::new(empty_registry()),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
+        config_base: config_base.clone(),
+        attachable_store: test_attachable_store(&config_base),
+        daemon_socket_path: None,
+        local_host: local_host(),
+        environment_handles: std::sync::Mutex::new(handles_map),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
+
+    let action = StepAction::DestroyEnvironment { env_id: env_id.clone() };
+    let context = StepExecutionContext::Host(local_host());
+    let outcome = resolver.resolve("destroy env", &context, action, &[]).await;
+    assert!(matches!(outcome, Ok(StepOutcome::Completed)), "destroy should complete: {outcome:?}");
+
+    // Verify handle was removed
+    let handles = resolver.environment_handles.lock().expect("lock");
+    assert!(!handles.contains_key(&env_id), "environment handle should be removed after destroy");
+}
+
+#[tokio::test]
+async fn executor_step_resolver_destroy_environment_not_found() {
+    let config_base = config_base();
+    let resolver = ExecutorStepResolver {
+        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        registry: Arc::new(empty_registry()),
+        providers_data: Arc::new(empty_data()),
+        runner: Arc::new(runner_ok()),
+        config_base: config_base.clone(),
+        attachable_store: test_attachable_store(&config_base),
+        daemon_socket_path: None,
+        local_host: local_host(),
+        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
+
+    let action = StepAction::DestroyEnvironment { env_id: EnvironmentId::new("nonexistent") };
+    let context = StepExecutionContext::Host(local_host());
+    let outcome = resolver.resolve("destroy env", &context, action, &[]).await;
+    assert!(outcome.is_err(), "should fail when handle not found");
+    assert!(outcome.unwrap_err().contains("environment handle not found"));
 }

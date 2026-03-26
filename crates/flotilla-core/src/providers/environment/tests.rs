@@ -203,7 +203,8 @@ async fn create_returns_handle() {
         working_directory: None,
     };
 
-    let result = provider.create(&image, opts).await;
+    let id = EnvironmentId::new("test-env-1");
+    let result = provider.create(id, &image, opts).await;
 
     assert!(result.is_ok(), "create should succeed");
     let handle = result.unwrap();
@@ -248,7 +249,8 @@ async fn status_returns_running() {
         working_directory: None,
     };
 
-    let handle = provider.create(&image, opts).await.expect("create");
+    let id = EnvironmentId::new("test-env-status");
+    let handle = provider.create(id, &image, opts).await.expect("create");
     let status = handle.status().await.expect("status");
 
     assert_eq!(status, EnvironmentStatus::Running);
@@ -276,7 +278,8 @@ async fn env_vars_parses_output() {
         working_directory: None,
     };
 
-    let handle = provider.create(&image, opts).await.expect("create");
+    let id = EnvironmentId::new("test-env-vars");
+    let handle = provider.create(id, &image, opts).await.expect("create");
     let vars = handle.env_vars().await.expect("env_vars");
 
     assert_eq!(vars.get("FOO"), Some(&"bar".to_string()));
@@ -306,7 +309,8 @@ async fn destroy_calls_docker_rm() {
         working_directory: None,
     };
 
-    let handle = provider.create(&image, opts).await.expect("create");
+    let id = EnvironmentId::new("test-env-destroy");
+    let handle = provider.create(id, &image, opts).await.expect("create");
     let container_name = format!("flotilla-env-{}", handle.id());
     handle.destroy().await.expect("destroy");
 

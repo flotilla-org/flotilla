@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use flotilla_protocol::{arg, AttachableSetId, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand};
+use flotilla_protocol::{arg, AttachableSetId, EnvironmentId, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand};
 use tracing::{info, warn};
 
 use super::{terminals::TerminalPreparationService, workspace_config};
@@ -8,11 +8,11 @@ use crate::{
     attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
     hop_chain::{
         builder::HopPlanBuilder,
-        environment::NoopEnvironmentHopResolver,
+        environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
         remote::ssh_resolver_from_config,
         resolver::{AlwaysWrap, HopResolver},
         terminal::NoopTerminalHopResolver,
-        ResolutionContext, ResolvedAction,
+        Hop, ResolutionContext, ResolvedAction,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{registry::ProviderRegistry, types::WorkspaceAttachRequest, workspace::WorkspaceManager},
@@ -63,7 +63,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         }
     }
 
-    pub(super) async fn attach_prepared_workspace(&self, prepared: &PreparedWorkspace) -> Result<(), String> {
+    pub(super) async fn attach_prepared_workspace(&self, prepared: &PreparedWorkspace, container_name: Option<&str>) -> Result<(), String> {
         let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
             return Ok(());
         };
@@ -78,6 +78,8 @@ impl<'a> WorkspaceOrchestrator<'a> {
             &prepared.prepared_commands,
             self.config_base,
             self.local_host,
+            prepared.environment_id.as_ref(),
+            container_name,
         )?;
 
         // The workspace itself is local to the presentation host, so its
@@ -115,14 +117,19 @@ impl<'a> WorkspaceOrchestrator<'a> {
         }
     }
 
-    pub(super) fn ensure_attachable_set_for_checkout(&self, target_host: &HostName, checkout_path: &Path) -> Option<AttachableSetId> {
+    pub(super) fn ensure_attachable_set_for_checkout(
+        &self,
+        target_host: &HostName,
+        checkout_path: &Path,
+        environment_id: Option<&EnvironmentId>,
+    ) -> Option<AttachableSetId> {
         let Ok(mut store) = self.attachable_store.lock() else {
             warn!("attachable store lock poisoned while ensuring attachable set for checkout");
             return None;
         };
 
         let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
-        let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout));
+        let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout), environment_id.cloned());
         if changed {
             if let Err(err) = store.save() {
                 warn!(err = %err, "failed to persist attachable registry after ensuring attachable set");
@@ -174,6 +181,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         let (set_id, changed_set) = store.ensure_terminal_set_with_change(
             Some(target_host.clone()),
             Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+            None,
         );
         let changed_binding = store.replace_binding(ProviderBinding {
             provider_category: "workspace_manager".into(),
@@ -208,6 +216,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
                 host_affinity: Some(target_host.clone()),
                 checkout: Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
                 template_identity: None,
+                environment_id: None,
                 members: Vec::new(),
             });
         }
@@ -247,11 +256,21 @@ fn resolve_prepared_commands_via_hop_chain(
     commands: &[ResolvedPaneCommand],
     config_base: &Path,
     local_host: &HostName,
+    environment_id: Option<&EnvironmentId>,
+    container_name: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let ssh_resolver = ssh_resolver_from_config(&DaemonHostPath::new(config_base))?;
+    let env_resolver: Arc<dyn crate::hop_chain::environment::EnvironmentHopResolver> = match (environment_id, container_name) {
+        (Some(env_id), Some(name)) => {
+            let mut containers = HashMap::new();
+            containers.insert(env_id.clone(), name.to_string());
+            Arc::new(DockerEnvironmentHopResolver::new(containers))
+        }
+        _ => Arc::new(NoopEnvironmentHopResolver),
+    };
     let hop_resolver = HopResolver {
         remote: Arc::new(ssh_resolver),
-        environment: Arc::new(NoopEnvironmentHopResolver),
+        environment: env_resolver,
         terminal: Arc::new(NoopTerminalHopResolver),
         strategy: Arc::new(AlwaysWrap),
     };
@@ -259,7 +278,11 @@ fn resolve_prepared_commands_via_hop_chain(
 
     let mut result = Vec::with_capacity(commands.len());
     for cmd in commands {
-        let plan = plan_builder.build_for_prepared_command(target_host, &cmd.args);
+        let mut plan = plan_builder.build_for_prepared_command(target_host, &cmd.args);
+        if let Some(env_id) = environment_id {
+            let run_cmd_index = plan.0.iter().position(|h| matches!(h, Hop::RunCommand { .. })).unwrap_or(plan.0.len());
+            plan.0.insert(run_cmd_index, Hop::EnterEnvironment { env_id: env_id.clone(), provider: "docker".to_string() });
+        }
         let mut context = ResolutionContext {
             current_host: local_host.clone(),
             current_environment: None,

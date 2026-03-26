@@ -208,6 +208,7 @@ fn registry_roundtrip_rebuilds_binding_index() {
         host_affinity: Some(HostName::new("desktop")),
         checkout: Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")),
         template_identity: Some("default".into()),
+        environment_id: None,
         members: vec![attachable_id.clone()],
     });
     store.insert_attachable(Attachable {

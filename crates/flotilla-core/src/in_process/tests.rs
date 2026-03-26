@@ -92,7 +92,6 @@ fn choose_event_uses_delta_for_non_initial_changes() {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
-        environment_binding: None,
     };
 
     let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![], work_items: vec![] };
@@ -121,7 +120,6 @@ fn choose_event_falls_back_to_full_when_delta_is_larger() {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
-        environment_binding: None,
     };
 
     let delta = DeltaEntry {
@@ -195,7 +193,6 @@ fn choose_event_sends_full_when_delta_has_empty_changes() {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
-        environment_binding: None,
     };
 
     // prev_seq > 0 but changes is empty — should still send full
@@ -367,6 +364,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
         host_affinity: Some(remote_host.clone()),
         checkout: Some(remote_checkout.clone()),
         template_identity: None,
+        environment_id: None,
         members: vec![],
     });
 

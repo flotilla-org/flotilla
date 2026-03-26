@@ -212,7 +212,6 @@ pub fn snapshot_to_proto(
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
-        environment_binding: None,
     }
 }
 

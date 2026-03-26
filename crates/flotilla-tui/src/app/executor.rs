@@ -140,6 +140,9 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::HostProviders(_) => {
             tracing::warn!("query result reached TUI handler — should be handled by CLI");
         }
+        CommandValue::ImageEnsured { .. } | CommandValue::EnvironmentCreated { .. } => {
+            tracing::warn!("unexpected environment lifecycle result reached UI handler");
+        }
     }
 }
 

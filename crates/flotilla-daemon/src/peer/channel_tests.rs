@@ -207,6 +207,7 @@ async fn routed_command_request_reaches_target_through_relay() {
         remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
         command: Box::new(Command {
             host: Some(HostName::new("host-c")),
+            environment: None,
             context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
         }),
@@ -226,6 +227,7 @@ async fn routed_command_request_reaches_target_through_relay() {
                 && *command
                     == Command {
                         host: Some(HostName::new("host-c")),
+                        environment: None,
                         context_repo: None,
                         action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
                     }
@@ -256,6 +258,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 command: Box::new(Command {
                     host: Some(HostName::new("host-c")),
+                    environment: None,
                     context_repo: None,
                     action: CommandAction::Refresh { repo: None },
                 }),
@@ -345,6 +348,7 @@ async fn routed_command_returns_clear_error_for_unknown_target() {
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 command: Box::new(Command {
                     host: Some(HostName::new("host-z")),
+                    environment: None,
                     context_repo: None,
                     action: CommandAction::Refresh { repo: None },
                 }),

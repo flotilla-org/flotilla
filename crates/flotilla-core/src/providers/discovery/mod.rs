@@ -422,6 +422,67 @@ pub struct FactoryRegistry {
     pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
 }
 
+impl FactoryRegistry {
+    /// Probe all factory categories against an environment bag and return a
+    /// populated `ProviderRegistry`. Used for environment-internal discovery
+    /// where detectors have already run and the bag is pre-built.
+    pub async fn probe_all(
+        &self,
+        env: &EnvironmentBag,
+        config: &ConfigStore,
+        repo_root: &ExecutionEnvironmentPath,
+        runner: Arc<dyn CommandRunner>,
+    ) -> ProviderRegistry {
+        async fn probe_category<T: ?Sized + Send + Sync + 'static>(
+            factories: &[Box<dyn Factory<Output = T>>],
+            env: &EnvironmentBag,
+            config: &ConfigStore,
+            repo_root: &ExecutionEnvironmentPath,
+            runner: &Arc<dyn CommandRunner>,
+        ) -> Vec<(ProviderDescriptor, Arc<T>)> {
+            let mut results = Vec::new();
+            for factory in factories {
+                if let Ok(provider) = factory.probe(env, config, repo_root, runner.clone()).await {
+                    results.push((factory.descriptor(), provider));
+                }
+            }
+            results
+        }
+
+        let mut registry = ProviderRegistry::new();
+
+        for (desc, p) in probe_category(&self.vcs, env, config, repo_root, &runner).await {
+            registry.vcs.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.checkout_managers, env, config, repo_root, &runner).await {
+            registry.checkout_managers.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.change_requests, env, config, repo_root, &runner).await {
+            registry.change_requests.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.issue_trackers, env, config, repo_root, &runner).await {
+            registry.issue_trackers.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.cloud_agents, env, config, repo_root, &runner).await {
+            registry.cloud_agents.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.ai_utilities, env, config, repo_root, &runner).await {
+            registry.ai_utilities.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.workspace_managers, env, config, repo_root, &runner).await {
+            registry.workspace_managers.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.terminal_pools, env, config, repo_root, &runner).await {
+            registry.terminal_pools.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.environment_providers, env, config, repo_root, &runner).await {
+            registry.environment_providers.insert(desc.implementation.clone(), desc, p);
+        }
+
+        registry
+    }
+}
+
 pub struct DiscoveryRuntime {
     pub runner: Arc<dyn CommandRunner>,
     pub env: Arc<dyn EnvVars>,

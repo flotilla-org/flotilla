@@ -94,7 +94,8 @@ impl FilePickerWidget {
         if entry.is_git_repo && !entry.is_added {
             let path = PathBuf::from(format!("{}{}", base, entry.name));
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            let cmd = Command { host: None, context_repo: None, action: CommandAction::TrackRepoPath { path: canonical } };
+            let cmd =
+                Command { host: None, environment: None, context_repo: None, action: CommandAction::TrackRepoPath { path: canonical } };
             ctx.commands.push(cmd);
             return Outcome::Finished;
         } else if entry.is_dir {

@@ -4,7 +4,7 @@ use std::{
 };
 
 use flotilla_protocol::{CommandValue, DaemonEvent, HostName, RepoIdentity, StepStatus};
-pub use flotilla_protocol::{Step, StepAction, StepHost, StepOutcome};
+pub use flotilla_protocol::{Step, StepAction, StepExecutionContext, StepOutcome};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -13,7 +13,13 @@ use crate::path_context::ExecutionEnvironmentPath;
 /// Resolves symbolic step actions into outcomes.
 #[async_trait::async_trait]
 pub trait StepResolver: Send + Sync {
-    async fn resolve(&self, description: &str, action: StepAction, prior: &[StepOutcome]) -> Result<StepOutcome, String>;
+    async fn resolve(
+        &self,
+        description: &str,
+        context: &StepExecutionContext,
+        action: StepAction,
+        prior: &[StepOutcome],
+    ) -> Result<StepOutcome, String>;
 }
 
 pub struct RemoteStepBatchRequest {
@@ -123,75 +129,76 @@ pub async fn run_step_plan_with_remote_executor(
         }
 
         let step = steps[i].clone();
-        match step.host.clone() {
-            StepHost::Local => {
-                emit_step_update(
-                    &event_tx,
-                    command_id,
-                    local_host.clone(),
-                    repo_identity.clone(),
-                    repo.as_path().to_path_buf(),
-                    i,
-                    step_count,
-                    step.description.clone(),
-                    StepStatus::Started,
-                );
+        let step_target = step.host.host_name().clone();
 
-                let outcome = resolver.resolve(&step.description, step.action, &outcomes).await;
+        if step_target == local_host {
+            emit_step_update(
+                &event_tx,
+                command_id,
+                local_host.clone(),
+                repo_identity.clone(),
+                repo.as_path().to_path_buf(),
+                i,
+                step_count,
+                step.description.clone(),
+                StepStatus::Started,
+            );
 
-                // Cancellation wins over a successful in-flight step, but provider
-                // errors still surface so we don't hide the underlying failure.
-                if cancel.is_cancelled() && outcome.is_ok() {
-                    return CommandValue::Cancelled;
-                }
+            let outcome = resolver.resolve(&step.description, &step.host, step.action, &outcomes).await;
 
-                match outcome {
-                    Ok(step_outcome) => {
-                        let status = match &step_outcome {
-                            StepOutcome::Skipped => StepStatus::Skipped,
-                            _ => StepStatus::Succeeded,
-                        };
-                        emit_step_update(
-                            &event_tx,
-                            command_id,
-                            local_host.clone(),
-                            repo_identity.clone(),
-                            repo.as_path().to_path_buf(),
-                            i,
-                            step_count,
-                            step.description.clone(),
-                            status,
-                        );
-                        outcomes.push(step_outcome);
-                    }
-                    Err(e) => {
-                        emit_step_update(
-                            &event_tx,
-                            command_id,
-                            local_host.clone(),
-                            repo_identity.clone(),
-                            repo.as_path().to_path_buf(),
-                            i,
-                            step_count,
-                            step.description.clone(),
-                            StepStatus::Failed { message: e.clone() },
-                        );
-                        return prior_result_or_error(&outcomes, e);
-                    }
-                }
-                i += 1;
+            // Cancellation wins over a successful in-flight step, but provider
+            // errors still surface so we don't hide the underlying failure.
+            if cancel.is_cancelled() && outcome.is_ok() {
+                return CommandValue::Cancelled;
             }
-            StepHost::Remote(target_host) => {
+
+            match outcome {
+                Ok(step_outcome) => {
+                    let status = match &step_outcome {
+                        StepOutcome::Skipped => StepStatus::Skipped,
+                        _ => StepStatus::Succeeded,
+                    };
+                    emit_step_update(
+                        &event_tx,
+                        command_id,
+                        local_host.clone(),
+                        repo_identity.clone(),
+                        repo.as_path().to_path_buf(),
+                        i,
+                        step_count,
+                        step.description.clone(),
+                        status,
+                    );
+                    outcomes.push(step_outcome);
+                }
+                Err(e) => {
+                    emit_step_update(
+                        &event_tx,
+                        command_id,
+                        local_host.clone(),
+                        repo_identity.clone(),
+                        repo.as_path().to_path_buf(),
+                        i,
+                        step_count,
+                        step.description.clone(),
+                        StepStatus::Failed { message: e.clone() },
+                    );
+                    return prior_result_or_error(&outcomes, e);
+                }
+            }
+            i += 1;
+        } else {
+            let target_host = step_target;
+            {
                 let segment_start = i;
                 let mut segment_steps = vec![step];
                 i += 1;
                 while i < step_count {
-                    match &steps[i].host {
-                        StepHost::Remote(host) if *host == target_host => {
-                            segment_steps.push(steps[i].clone());
-                            i += 1;
-                        }
-                        _ => break,
+                    if *steps[i].host.host_name() == target_host {
+                        segment_steps.push(steps[i].clone());
+                        i += 1;
+                    } else {
+                        break;
                     }
                 }
 

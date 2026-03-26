@@ -355,6 +355,7 @@ impl InProcessDaemon {
                 repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
             ),
             &*discovery.env,
+            vec![],
         );
 
         let daemon = Arc::new(Self {
@@ -1650,6 +1651,8 @@ impl InProcessDaemon {
             attachable_store,
             daemon_socket_path,
             local_host: self.host_name.clone(),
+            environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+            environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         execute_local_remote_step_batch(self.host_name.clone(), request, progress_sink, cancel, &resolver).await
@@ -1957,6 +1960,8 @@ impl InProcessDaemon {
                         attachable_store: resolver_attachable_store,
                         daemon_socket_path: daemon_socket_dhp.clone(),
                         local_host: resolver_local_host.clone(),
+                        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+                        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
                     };
                     let result = run_step_plan_with_remote_executor(
                         step_plan,
@@ -1999,7 +2004,7 @@ async fn execute_local_remote_step_batch(
     let step_count = request.steps.len();
 
     for (index, step) in request.steps.into_iter().enumerate() {
-        if step.host != flotilla_protocol::StepHost::Remote(local_host.clone()) {
+        if *step.host.host_name() != local_host {
             return Err(format!("remote step {} targets {:?}, expected remote host {}", index, step.host, local_host));
         }
         if cancel.is_cancelled() {
@@ -2015,7 +2020,7 @@ async fn execute_local_remote_step_batch(
             })
             .await;
 
-        let outcome = resolver.resolve(&step.description, step.action, &outcomes).await;
+        let outcome = resolver.resolve(&step.description, &step.host, step.action, &outcomes).await;
         if cancel.is_cancelled() {
             return Err("cancelled".into());
         }

@@ -60,6 +60,7 @@ impl TerminalManager {
             host_affinity: Some(host),
             checkout: Some(checkout_path),
             template_identity: None,
+            environment_id: None,
             members: Vec::new(),
         });
         Ok(id)

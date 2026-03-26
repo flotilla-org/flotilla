@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use flotilla_protocol::{HostName, HostPath, TerminalStatus};
+use flotilla_protocol::{EnvironmentId, HostName, HostPath, TerminalStatus};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -52,7 +52,12 @@ pub trait AttachableStoreApi: Send + Sync {
         working_directory: ExecutionEnvironmentPath,
         status: TerminalStatus,
     ) -> AttachableId;
-    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool);
+    fn ensure_terminal_set_with_change(
+        &mut self,
+        host_affinity: Option<HostName>,
+        checkout: Option<HostPath>,
+        environment_id: Option<EnvironmentId>,
+    ) -> (AttachableSetId, bool);
     #[allow(clippy::too_many_arguments)]
     fn ensure_terminal_attachable_with_change(
         &mut self,
@@ -140,7 +145,7 @@ impl AttachableStoreState {
     }
 
     fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
-        self.ensure_terminal_set_with_change(host_affinity, checkout).0
+        self.ensure_terminal_set_with_change(host_affinity, checkout, None).0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -168,13 +173,30 @@ impl AttachableStoreState {
         .0
     }
 
-    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
-        if let Some(existing) = self.registry.sets.values().find(|set| set.host_affinity == host_affinity && set.checkout == checkout) {
+    fn ensure_terminal_set_with_change(
+        &mut self,
+        host_affinity: Option<HostName>,
+        checkout: Option<HostPath>,
+        environment_id: Option<EnvironmentId>,
+    ) -> (AttachableSetId, bool) {
+        if let Some(existing) = self
+            .registry
+            .sets
+            .values()
+            .find(|set| set.host_affinity == host_affinity && set.checkout == checkout && set.environment_id == environment_id)
+        {
             return (existing.id.clone(), false);
         }
 
         let id = self.allocate_set_id();
-        self.insert_set(AttachableSet { id: id.clone(), host_affinity, checkout, template_identity: None, members: Vec::new() });
+        self.insert_set(AttachableSet {
+            id: id.clone(),
+            host_affinity,
+            checkout,
+            template_identity: None,
+            environment_id,
+            members: Vec::new(),
+        });
         (id, true)
     }
 
@@ -434,8 +456,9 @@ impl AttachableStore {
         &mut self,
         host_affinity: Option<HostName>,
         checkout: Option<HostPath>,
+        environment_id: Option<EnvironmentId>,
     ) -> (AttachableSetId, bool) {
-        self.state.ensure_terminal_set_with_change(host_affinity, checkout)
+        self.state.ensure_terminal_set_with_change(host_affinity, checkout, environment_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -571,8 +594,13 @@ impl AttachableStoreApi for AttachableStore {
         self.state.ensure_terminal_set(host_affinity, checkout)
     }
 
-    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
-        self.state.ensure_terminal_set_with_change(host_affinity, checkout)
+    fn ensure_terminal_set_with_change(
+        &mut self,
+        host_affinity: Option<HostName>,
+        checkout: Option<HostPath>,
+        environment_id: Option<EnvironmentId>,
+    ) -> (AttachableSetId, bool) {
+        self.state.ensure_terminal_set_with_change(host_affinity, checkout, environment_id)
     }
 
     fn ensure_terminal_attachable(
@@ -706,8 +734,13 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         self.state.ensure_terminal_set(host_affinity, checkout)
     }
 
-    fn ensure_terminal_set_with_change(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> (AttachableSetId, bool) {
-        self.state.ensure_terminal_set_with_change(host_affinity, checkout)
+    fn ensure_terminal_set_with_change(
+        &mut self,
+        host_affinity: Option<HostName>,
+        checkout: Option<HostPath>,
+        environment_id: Option<EnvironmentId>,
+    ) -> (AttachableSetId, bool) {
+        self.state.ensure_terminal_set_with_change(host_affinity, checkout, environment_id)
     }
 
     fn ensure_terminal_attachable(

@@ -236,8 +236,6 @@ pub struct CloudAgentSession {
     /// receive snapshots from a remote daemon and needs display context.
     #[serde(default)]
     pub item_noun: String,
-    #[serde(default)]
-    pub environment_id: Option<EnvironmentId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +295,8 @@ pub struct AttachableSet {
     pub checkout: Option<HostPath>,
     #[serde(default)]
     pub template_identity: Option<String>,
+    #[serde(default)]
+    pub environment_id: Option<EnvironmentId>,
     #[serde(default)]
     pub members: Vec<AttachableId>,
 }
@@ -475,7 +475,6 @@ mod tests {
                 provider_name: String::new(),
                 provider_display_name: String::new(),
                 item_noun: String::new(),
-                environment_id: None,
             },
             CloudAgentSession {
                 title: "T".into(),
@@ -486,7 +485,6 @@ mod tests {
                 provider_name: String::new(),
                 provider_display_name: String::new(),
                 item_noun: String::new(),
-                environment_id: None,
             },
         ];
         for case in &session_cases {

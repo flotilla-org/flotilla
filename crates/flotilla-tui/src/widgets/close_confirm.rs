@@ -91,6 +91,7 @@ mod tests {
     fn make_widget() -> CloseConfirmWidget {
         CloseConfirmWidget::new("PR-1".into(), "Fix all the things".into(), WorkItemIdentity::ChangeRequest("PR-1".into()), Command {
             host: None,
+            environment: None,
             context_repo: None,
             action: CommandAction::CloseChangeRequest { id: "PR-1".into() },
         })
@@ -131,6 +132,7 @@ mod tests {
         let identity = WorkItemIdentity::ChangeRequest("PR-42".into());
         let mut widget = CloseConfirmWidget::new("PR-42".into(), "test".into(), identity.clone(), Command {
             host: None,
+            environment: None,
             context_repo: None,
             action: CommandAction::CloseChangeRequest { id: "PR-42".into() },
         });
@@ -149,6 +151,7 @@ mod tests {
         let mut harness = TestWidgetHarness::new();
         let expected = Command {
             host: Some(HostName::new("remote-host")),
+            environment: None,
             context_repo: Some(RepoSelector::Identity(harness.model.active_repo_identity().clone())),
             action: CommandAction::CloseChangeRequest { id: "PR-1".into() },
         };

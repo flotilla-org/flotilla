@@ -17,13 +17,14 @@ pub fn build_local_host_summary(
     host_bag: &EnvironmentBag,
     providers: Vec<HostProviderStatus>,
     env: &dyn EnvVars,
+    environments: Vec<flotilla_protocol::EnvironmentInfo>,
 ) -> HostSummary {
     HostSummary {
         host_name: host_name.clone(),
         system: collect_system_info(env),
         inventory: inventory_from_bag(host_bag),
         providers,
-        environments: vec![],
+        environments,
     }
 }
 
@@ -96,5 +97,27 @@ mod tests {
     fn classify_host_environment_unknown_without_markers() {
         let env = classify_host_environment_from_markers(false, None);
         assert_eq!(env, HostEnvironment::Unknown);
+    }
+
+    #[test]
+    fn build_local_host_summary_populates_environments() {
+        use flotilla_protocol::{EnvironmentId, EnvironmentInfo, EnvironmentStatus, ImageId};
+
+        use crate::providers::discovery::ProcessEnvVars;
+
+        let host_name = HostName::new("test-host");
+        let bag = EnvironmentBag::new();
+        let env = ProcessEnvVars;
+
+        let environments = vec![EnvironmentInfo {
+            id: EnvironmentId::new("env-1"),
+            image: ImageId::new("test-image:latest"),
+            status: EnvironmentStatus::Running,
+        }];
+
+        let summary = build_local_host_summary(&host_name, &bag, vec![], &env, environments);
+
+        assert_eq!(summary.environments.len(), 1);
+        assert_eq!(summary.environments[0].id, EnvironmentId::new("env-1"));
     }
 }

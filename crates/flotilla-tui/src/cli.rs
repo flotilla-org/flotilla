@@ -240,6 +240,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
+        CommandValue::ImageEnsured { image } => format!("image ensured: {image}"),
+        CommandValue::EnvironmentCreated { env_id } => format!("environment created: {env_id}"),
     }
 }
 

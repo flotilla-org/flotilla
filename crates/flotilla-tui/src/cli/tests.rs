@@ -214,7 +214,6 @@ mod watch_human {
             issue_total: None,
             issue_has_more: false,
             issue_search_results: None,
-            environment_binding: None,
         }
     }
 
@@ -467,6 +466,8 @@ mod command_result_human {
             target_host: HostName::new("feta"),
             checkout_path: PathBuf::from("/tmp/wt"),
             attachable_set_id: None,
+            environment_id: None,
+            container_name: None,
             template_yaml: Some("panes: []".into()),
             prepared_commands: vec![],
         });

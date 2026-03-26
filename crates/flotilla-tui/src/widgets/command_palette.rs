@@ -162,6 +162,7 @@ impl CommandPaletteWidget {
                 if query.is_empty() {
                     let cmd = Command {
                         host: None,
+                        environment: None,
                         context_repo: None,
                         action: CommandAction::ClearIssueSearch { repo: RepoSelector::Identity(repo_identity.clone()) },
                     };
@@ -170,6 +171,7 @@ impl CommandPaletteWidget {
                 } else {
                     let cmd = Command {
                         host: None,
+                        environment: None,
                         context_repo: None,
                         action: CommandAction::SearchIssues { repo: RepoSelector::Identity(repo_identity.clone()), query: query.clone() },
                     };
@@ -924,7 +926,7 @@ mod tests {
 
     #[test]
     fn dispatch_ready_passes_through() {
-        let cmd = Command { host: None, context_repo: None, action: CommandAction::Refresh { repo: None } };
+        let cmd = Command { host: None, environment: None, context_repo: None, action: CommandAction::Refresh { repo: None } };
         let result = tui_dispatch(Resolved::Ready(cmd), None, false, None, &None, &None, false);
         assert!(result.is_ok());
     }
@@ -934,6 +936,7 @@ mod tests {
         use flotilla_protocol::CheckoutTarget;
         let cmd = Command {
             host: None,
+            environment: None,
             context_repo: None,
             action: CommandAction::Checkout {
                 repo: RepoSelector::Query("".into()),
@@ -951,6 +954,7 @@ mod tests {
         use flotilla_protocol::CheckoutTarget;
         let cmd = Command {
             host: None,
+            environment: None,
             context_repo: None,
             action: CommandAction::Checkout {
                 repo: RepoSelector::Query("".into()),
@@ -972,8 +976,12 @@ mod tests {
     fn explicit_host_routing_preserved_for_needs_context() {
         let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
         // Simulate `host feta cr 42 open` — HostNoun::resolve() sets command.host = Some("feta")
-        let cmd =
-            Command { host: Some(HostName::new("feta")), context_repo: None, action: CommandAction::OpenChangeRequest { id: "42".into() } };
+        let cmd = Command {
+            host: Some(HostName::new("feta")),
+            environment: None,
+            context_repo: None,
+            action: CommandAction::OpenChangeRequest { id: "42".into() },
+        };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
         let result = tui_dispatch(resolved, None, false, Some(&repo_id), &None, &None, false).expect("should succeed");
         // Explicit host must be preserved, not clobbered by ProviderHost resolution
@@ -1001,7 +1009,8 @@ mod tests {
             attachable_set_id: None,
             agent_keys: Vec::new(),
         };
-        let cmd = Command { host: None, context_repo: None, action: CommandAction::OpenChangeRequest { id: "42".into() } };
+        let cmd =
+            Command { host: None, environment: None, context_repo: None, action: CommandAction::OpenChangeRequest { id: "42".into() } };
         let my_host = Some(HostName::new("local-host"));
         // ProviderHost on a remote-only repo should derive host from the item
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };

@@ -16,7 +16,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandPeerEvent, CommandValue, DaemonEvent, HostName, PeerWireMessage, RepoIdentity, RepoSelector,
-    RoutedPeerMessage, Step, StepHost, StepStatus,
+    RoutedPeerMessage, Step, StepStatus,
 };
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -577,9 +577,7 @@ impl RemoteStepExecutor for RemoteCommandRouter {
         request: RemoteStepBatchRequest,
         progress_sink: Arc<dyn RemoteStepProgressSink>,
     ) -> Result<Vec<StepOutcome>, String> {
-        if let Some((index, step)) =
-            request.steps.iter().enumerate().find(|(_, step)| step.host != StepHost::Remote(request.target_host.clone()))
-        {
+        if let Some((index, step)) = request.steps.iter().enumerate().find(|(_, step)| *step.host.host_name() != request.target_host) {
             return Err(format!("remote step {} targets {:?}, expected remote host {}", index, step.host, request.target_host));
         }
 
@@ -704,7 +702,7 @@ impl RemoteCommandRouter {
             .steps
             .iter()
             .enumerate()
-            .find(|(_, step)| step.host != StepHost::Remote(responder_host.clone()))
+            .find(|(_, step)| *step.host.host_name() != responder_host)
             .map(|(index, step)| (index, step.description.clone()));
 
         let steps = request.steps.clone();

@@ -33,7 +33,6 @@ fn make_snapshot(repo: &Path, seq: u64) -> RepoSnapshot {
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,
-        environment_binding: None,
     }
 }
 

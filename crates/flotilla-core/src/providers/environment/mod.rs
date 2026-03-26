@@ -29,7 +29,7 @@ pub type EnvironmentHandle = Arc<dyn ProvisionedEnvironment>;
 #[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
     async fn ensure_image(&self, spec: &EnvironmentSpec) -> Result<ImageId, String>;
-    async fn create(&self, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String>;
+    async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String>;
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String>;
 }
 
@@ -38,6 +38,9 @@ pub trait EnvironmentProvider: Send + Sync {
 pub trait ProvisionedEnvironment: Send + Sync {
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
+    /// Provider-specific transport identifier (e.g. Docker container name).
+    /// Used by hop chain to construct exec/enter commands.
+    fn container_name(&self) -> Option<&str>;
     async fn status(&self) -> Result<EnvironmentStatus, String>;
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
     fn runner(&self, host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner>;
