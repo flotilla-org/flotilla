@@ -969,6 +969,26 @@ fn teleport_session_with_branch() {
 }
 
 #[test]
+fn teleport_session_with_branch_and_checkout() {
+    let mut item = bare_item();
+    item.session_key = Some("claude-1".into());
+    item.branch = Some("feat".into());
+    item.checkout = Some(CheckoutRef { key: HostPath::new(HostName::local(), "/work/repo"), is_main_checkout: false });
+    assert_eq!(
+        Intent::TeleportSession.to_command_tokens(&item),
+        Some(vec![
+            "agent".into(),
+            "claude-1".into(),
+            "teleport".into(),
+            "--branch".into(),
+            "feat".into(),
+            "--checkout".into(),
+            "/work/repo".into(),
+        ])
+    );
+}
+
+#[test]
 fn switch_workspace_produces_tokens() {
     let mut item = bare_item();
     item.workspace_refs = vec!["ws-1".into()];

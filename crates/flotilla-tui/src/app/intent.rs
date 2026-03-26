@@ -252,6 +252,9 @@ impl Intent {
                 if let Some(branch) = &item.branch {
                     tokens.extend(["--branch".into(), branch.clone()]);
                 }
+                if let Some(co) = item.checkout_key() {
+                    tokens.extend(["--checkout".into(), co.path.display().to_string()]);
+                }
                 Some(tokens)
             }
             Intent::SwitchToWorkspace => {

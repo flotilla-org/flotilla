@@ -354,14 +354,26 @@ fn subject_completions(noun: &str, partial: &str, model: &TuiModel) -> Vec<Palet
                 vec![]
             }
         }
-        "repo" => model
-            .repos
-            .values()
-            .map(|repo| {
-                let name = TuiModel::repo_name(&repo.path);
-                (repo.identity.path.clone(), name)
-            })
-            .collect(),
+        "repo" => {
+            // Check for duplicate paths across authorities
+            let mut path_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for repo in model.repos.values() {
+                *path_counts.entry(repo.identity.path.as_str()).or_default() += 1;
+            }
+            model
+                .repos
+                .values()
+                .map(|repo| {
+                    let name = TuiModel::repo_name(&repo.path);
+                    let value = if path_counts.get(repo.identity.path.as_str()).copied().unwrap_or(0) > 1 {
+                        format!("{}:{}", repo.identity.authority, repo.identity.path)
+                    } else {
+                        repo.identity.path.clone()
+                    };
+                    (value, name)
+                })
+                .collect()
+        }
         "host" => model.hosts.keys().map(|h| (h.to_string(), String::new())).collect(),
         _ => vec![],
     };
