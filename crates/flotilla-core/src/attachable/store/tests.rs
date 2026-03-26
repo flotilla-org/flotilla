@@ -441,6 +441,7 @@ fn contract_lookup_workspace_ref_for_set(store: &mut impl AttachableStoreApi) {
         host_affinity: None,
         checkout: None,
         template_identity: None,
+        environment_id: None,
         members: Vec::new(),
     });
 
@@ -483,17 +484,18 @@ fn contract_lookup_workspace_ref_for_set(store: &mut impl AttachableStoreApi) {
     assert_eq!(store.lookup_workspace_ref_for_set("workspace_manager", "cmux", &set_id), Some("workspace:1".to_string()));
 }
 
-fn contract_lookup_workspace_ref_for_set_newest_wins(store: &mut impl AttachableStoreApi) {
+fn contract_lookup_workspace_ref_for_set_ignores_other_set_ids(store: &mut impl AttachableStoreApi) {
     let set_id = AttachableSetId::new("set-1");
     store.insert_set(AttachableSet {
         id: set_id.clone(),
         host_affinity: None,
         checkout: None,
         template_identity: None,
+        environment_id: None,
         members: Vec::new(),
     });
 
-    // Push OLD binding
+    // Binding for a different object_id (not set-1)
     store.replace_binding(ProviderBinding {
         provider_category: "workspace_manager".into(),
         provider_name: "cmux".into(),
@@ -501,7 +503,7 @@ fn contract_lookup_workspace_ref_for_set_newest_wins(store: &mut impl Attachable
         object_id: "OLD-UUID".into(),
         external_ref: "workspace:old".into(),
     });
-    // Push NEW binding for the same set
+    // Binding for the actual set
     store.replace_binding(ProviderBinding {
         provider_category: "workspace_manager".into(),
         provider_name: "cmux".into(),
@@ -510,7 +512,7 @@ fn contract_lookup_workspace_ref_for_set_newest_wins(store: &mut impl Attachable
         external_ref: "workspace:new".into(),
     });
 
-    // Newest (last-appended) wins
+    // Lookup returns the binding matching set-1, ignoring the OLD-UUID binding
     assert_eq!(store.lookup_workspace_ref_for_set("workspace_manager", "cmux", &set_id), Some("workspace:new".to_string()));
 }
 
@@ -547,11 +549,13 @@ fn in_memory_contract_lookup_workspace_ref_for_set() {
 }
 
 #[test]
-fn file_backed_contract_lookup_workspace_ref_for_set_newest_wins() {
-    contract_lookup_workspace_ref_for_set_newest_wins(&mut AttachableStore::with_base(&temp_base(&tempfile::tempdir().expect("tempdir"))));
+fn file_backed_contract_lookup_workspace_ref_for_set_ignores_other_set_ids() {
+    contract_lookup_workspace_ref_for_set_ignores_other_set_ids(&mut AttachableStore::with_base(&temp_base(
+        &tempfile::tempdir().expect("tempdir"),
+    )));
 }
 
 #[test]
-fn in_memory_contract_lookup_workspace_ref_for_set_newest_wins() {
-    contract_lookup_workspace_ref_for_set_newest_wins(&mut InMemoryAttachableStore::new());
+fn in_memory_contract_lookup_workspace_ref_for_set_ignores_other_set_ids() {
+    contract_lookup_workspace_ref_for_set_ignores_other_set_ids(&mut InMemoryAttachableStore::new());
 }

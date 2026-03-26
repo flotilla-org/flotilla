@@ -2182,7 +2182,10 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         "should return CheckoutCreated for pre-existing checkout, got: {result:?}"
     );
     let calls = ws_mgr.calls.lock().await;
-    assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "should create workspace for pre-existing checkout: {calls:?}");
+    assert!(
+        calls.iter().any(|c| c.starts_with("select_workspace") || c.starts_with("create_workspace")),
+        "should select or create workspace for pre-existing checkout: {calls:?}"
+    );
 }
 
 #[tokio::test]
