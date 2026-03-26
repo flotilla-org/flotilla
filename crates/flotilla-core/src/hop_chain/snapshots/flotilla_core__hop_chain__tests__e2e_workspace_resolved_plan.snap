@@ -1,6 +1,5 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
-assertion_line: 1413
 expression: "&resolved"
 ---
 ResolvedPlan(
@@ -38,13 +37,13 @@ ResolvedPlan(
                                 Literal(
                                     "&&",
                                 ),
-                                Quoted(
+                                Literal(
                                     "cleat",
                                 ),
                                 Literal(
                                     "attach",
                                 ),
-                                Quoted(
+                                Literal(
                                     "feat__shell__0",
                                 ),
                                 Literal(

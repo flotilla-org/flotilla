@@ -1,6 +1,5 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
-assertion_line: 1468
 expression: flat
 ---
-'cleat' attach 'main__shell__0' --cwd '/home/alice/dev/my-repo'
+cleat attach main__shell__0 --cwd '/home/alice/dev/my-repo'

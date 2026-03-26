@@ -1,6 +1,5 @@
 ---
 source: crates/flotilla-core/src/hop_chain/tests.rs
-assertion_line: 1500
 expression: "&resolved"
 ---
 ResolvedPlan(
@@ -8,7 +7,7 @@ ResolvedPlan(
         SendKeys {
             steps: [
                 Type(
-                    "cd '/home/alice/dev/my-repo/wt-feat' && 'cleat' attach 'feat__shell__0' --cwd '/home/alice/dev/my-repo/wt-feat'",
+                    "cd '/home/alice/dev/my-repo/wt-feat' && cleat attach feat__shell__0 --cwd '/home/alice/dev/my-repo/wt-feat'",
                 ),
                 WaitForPrompt,
             ],

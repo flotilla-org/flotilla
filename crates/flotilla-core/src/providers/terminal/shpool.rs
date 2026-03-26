@@ -574,7 +574,7 @@ impl TerminalPool for ShpoolTerminalPool {
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
         Ok(vec![
-            Arg::Quoted("shpool".into()),
+            Arg::Literal("shpool".into()),
             Arg::Literal("--socket".into()),
             Arg::Quoted(self.socket_path.as_path().display().to_string()),
             Arg::Literal("-c".into()),
@@ -583,7 +583,7 @@ impl TerminalPool for ShpoolTerminalPool {
             Arg::Literal("--force".into()),
             Arg::Literal("--dir".into()),
             Arg::Quoted(cwd.as_path().display().to_string()),
-            Arg::Quoted(session_name.into()),
+            Arg::Literal(session_name.into()),
         ])
     }
 

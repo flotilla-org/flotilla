@@ -147,7 +147,7 @@ fn wrap_with_working_directory_and_inner_command() {
     let mut context = minimal_context();
     context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
-        Arg::Quoted("cleat".into()),
+        Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Literal("sess-1".into()),
     ]));
@@ -174,7 +174,7 @@ fn wrap_with_working_directory_and_inner_command() {
     assert_eq!(inner_args[0], Arg::Literal("cd".into()));
     assert_eq!(inner_args[1], Arg::Quoted("/home/alice/dev/my-repo".into()));
     assert_eq!(inner_args[2], Arg::Literal("&&".into()));
-    assert_eq!(inner_args[3], Arg::Quoted("cleat".into()));
+    assert_eq!(inner_args[3], Arg::Literal("cleat".into()));
     assert_eq!(inner_args[4], Arg::Literal("attach".into()));
     assert_eq!(inner_args[5], Arg::Literal("sess-1".into()));
 
@@ -191,7 +191,7 @@ fn wrap_with_working_directory_and_inner_command() {
                 Arg::Literal("cd".into()),
                 Arg::Quoted("/home/alice/dev/my-repo".into()),
                 Arg::Literal("&&".into()),
-                Arg::Quoted("cleat".into()),
+                Arg::Literal("cleat".into()),
                 Arg::Literal("attach".into()),
                 Arg::Literal("sess-1".into()),
             ]),
@@ -283,7 +283,7 @@ fn wrap_with_multiplex_includes_control_args() {
     assert_eq!(args[4], Arg::Literal("-o".into()));
     // args[5] is ControlPath=<path> — just check it starts correctly
     match &args[5] {
-        Arg::Quoted(s) => assert!(s.starts_with("ControlPath="), "expected ControlPath, got {s}"),
+        Arg::Quoted(s) => assert!(s.starts_with("ControlPath=\""), "expected ControlPath with inner quotes, got {s}"),
         other => panic!("expected Quoted ControlPath, got {other:?}"),
     }
     assert_eq!(args[6], Arg::Literal("-o".into()));
@@ -388,7 +388,7 @@ fn enter_produces_ssh_command_and_sendkeys() {
     let mut context = minimal_context();
     context.working_directory = Some(ExecutionEnvironmentPath::new("/home/alice/dev/my-repo"));
     context.actions.push(ResolvedAction::Command(vec![
-        Arg::Quoted("cleat".into()),
+        Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Literal("sess-1".into()),
     ]));
@@ -404,7 +404,7 @@ fn enter_produces_ssh_command_and_sendkeys() {
     let text = expect_type_step(&steps[0]);
     assert!(text.contains("cd"), "should include cd: {text}");
     assert!(text.contains("/home/alice/dev/my-repo"), "should include dir: {text}");
-    assert!(text.contains("'cleat' attach sess-1"), "should include inner cmd: {text}");
+    assert!(text.contains("cleat attach sess-1"), "should include inner cmd: {text}");
     assert_eq!(steps[1], SendKeyStep::WaitForPrompt);
 
     // Top: SSH enter command (no inner command arg)
@@ -512,7 +512,7 @@ impl TerminalPool for FakeTerminalPool {
             cwd: cwd.clone(),
             env_vars: env_vars.clone(),
         });
-        Ok(vec![Arg::Quoted("cleat".into()), Arg::Literal("attach".into()), Arg::Literal(session_name.to_string())])
+        Ok(vec![Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Literal(session_name.to_string())])
     }
 
     async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
@@ -574,7 +574,7 @@ fn terminal_resolve_pushes_command_onto_context() {
     // Verify a Command was pushed onto the context
     assert_eq!(context.actions.len(), 1);
     let args = expect_command(&context.actions[0]);
-    assert_eq!(args[0], Arg::Quoted("cleat".into()));
+    assert_eq!(args[0], Arg::Literal("cleat".into()));
     assert_eq!(args[1], Arg::Literal("attach".into()));
     assert_eq!(args[2], Arg::Literal(att_id.to_string()));
 
@@ -1078,9 +1078,9 @@ fn build_for_prepared_command_host_routing() {
 /// Simple cleat-style attach args: `cleat attach <session> --cwd <cwd>`.
 fn e2e_cleat_args(session: &str, cwd: &str) -> Vec<Arg> {
     vec![
-        Arg::Quoted("cleat".into()),
+        Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
-        Arg::Quoted(session.into()),
+        Arg::Literal(session.into()),
         Arg::Literal("--cwd".into()),
         Arg::Quoted(cwd.into()),
     ]

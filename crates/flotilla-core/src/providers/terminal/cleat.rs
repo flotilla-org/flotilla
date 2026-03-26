@@ -103,9 +103,9 @@ impl TerminalPool for CleatTerminalPool {
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
         Ok(vec![
-            Arg::Quoted(self.binary.clone()),
+            Arg::Literal(self.binary.clone()),
             Arg::Literal("attach".into()),
-            Arg::Quoted(session_name.into()),
+            Arg::Literal(session_name.into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted(cwd.as_path().display().to_string()),
         ])
@@ -210,7 +210,7 @@ mod tests {
         let cmd =
             pool.attach_command("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert!(cmd.contains("'cleat' attach 'my-session'"));
+        assert!(cmd.contains("cleat attach my-session"));
         assert!(cmd.contains("--cwd '/repo'"));
         assert!(!cmd.contains("--cmd"), "should NOT have --cmd");
     }
@@ -236,9 +236,9 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("my-session".into()),
+            Arg::Literal("my-session".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/repo".into()),
         ]);
@@ -250,7 +250,7 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-        assert_eq!(flat, "'cleat' attach 'my-session' --cwd '/repo'");
+        assert_eq!(flat, "cleat attach my-session --cwd '/repo'");
     }
 
     #[test]
@@ -260,9 +260,9 @@ mod tests {
 
         // Same structure regardless of command
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("sess-1".into()),
+            Arg::Literal("sess-1".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/home/dev".into()),
         ]);
@@ -276,9 +276,9 @@ mod tests {
 
         // Env vars are baked in at ensure_session/create time — not in attach_args
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("sess".into()),
+            Arg::Literal("sess".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/wd".into()),
         ]);
@@ -291,9 +291,9 @@ mod tests {
         let args = pool.attach_args("sess", "", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
         assert_eq!(args, vec![
-            Arg::Quoted("cleat".into()),
+            Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
-            Arg::Quoted("sess".into()),
+            Arg::Literal("sess".into()),
             Arg::Literal("--cwd".into()),
             Arg::Quoted("/wd".into()),
         ]);
@@ -307,6 +307,6 @@ mod tests {
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         // No --cmd, no NestedCommand
-        assert_eq!(flat, "'cleat' attach 'sess' --cwd '/wd'");
+        assert_eq!(flat, "cleat attach sess --cwd '/wd'");
     }
 }

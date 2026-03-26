@@ -147,7 +147,7 @@ async fn attach_builds_command() {
     assert!(!cmd.contains("--cmd"), "should NOT have --cmd: {cmd}");
     assert!(cmd.contains("--dir"), "should include --dir: {cmd}");
     assert!(cmd.contains("/home/dev"), "should include cwd: {cmd}");
-    assert!(cmd.contains("'flotilla/feat/shell/0'"), "session name should be last: {cmd}");
+    assert!(cmd.ends_with("flotilla/feat/shell/0"), "session name should be last: {cmd}");
 }
 
 #[tokio::test]
@@ -171,7 +171,7 @@ fn attach_args_with_command_no_env() {
         pool.attach_args("flotilla/feat/shell/0", "bash", &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
 
     assert_eq!(args, vec![
-        Arg::Quoted("shpool".into()),
+        Arg::Literal("shpool".into()),
         Arg::Literal("--socket".into()),
         Arg::Quoted(socket),
         Arg::Literal("-c".into()),
@@ -180,7 +180,7 @@ fn attach_args_with_command_no_env() {
         Arg::Literal("--force".into()),
         Arg::Literal("--dir".into()),
         Arg::Quoted("/home/dev".into()),
-        Arg::Quoted("flotilla/feat/shell/0".into()),
+        Arg::Literal("flotilla/feat/shell/0".into()),
     ]);
 }
 
@@ -191,13 +191,13 @@ fn attach_args_flatten_with_command_no_env() {
         pool.attach_args("flotilla/feat/shell/0", "bash", &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
     let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-    assert!(flat.starts_with("'shpool' --socket "), "should start with shpool: {flat}");
+    assert!(flat.starts_with("shpool --socket "), "should start with shpool: {flat}");
     assert!(flat.contains("attach"), "should include attach: {flat}");
     assert!(flat.contains("--force"), "should include --force: {flat}");
     assert!(!flat.contains("--cmd"), "should NOT have --cmd: {flat}");
     assert!(flat.contains("--dir"), "should include --dir: {flat}");
     assert!(flat.contains("'/home/dev'"), "should include cwd: {flat}");
-    assert!(flat.ends_with("'flotilla/feat/shell/0'"), "session name should be last: {flat}");
+    assert!(flat.ends_with("flotilla/feat/shell/0"), "session name should be last: {flat}");
 }
 
 #[test]
