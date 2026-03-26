@@ -88,16 +88,16 @@ impl CommandPaletteWidget {
     fn fill_completion(&mut self, completion: &PaletteCompletion) {
         let input = self.input.value();
         let trailing_space = input.ends_with(' ');
-        let tokens: Vec<&str> = input.split_whitespace().collect();
+        let tokens = palette::tokenize_palette_input(input).unwrap_or_default();
 
         // Determine prefix: everything before the token being completed.
         let prefix = if trailing_space || tokens.is_empty() {
             // Cursor is after a space — completion replaces nothing, just append.
             input.to_string()
         } else {
-            // The last token is a partial — replace it with the completion value.
-            let last = tokens.last().copied().unwrap_or("");
-            input[..input.len() - last.len()].to_string()
+            // The last token is a partial — slice input at its start offset.
+            let last = tokens.last().expect("tokens is non-empty");
+            input[..last.offset].to_string()
         };
 
         let filled = format!("{}{} ", prefix, completion.value);

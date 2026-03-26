@@ -97,39 +97,73 @@ pub enum PaletteParseResult<'a> {
     Resolved(Resolved),
 }
 
+/// A token with its byte offset in the original input.
+pub struct Token {
+    pub value: String,
+    /// Byte offset of the token's start in the original input (including any leading quote).
+    pub offset: usize,
+}
+
 /// Tokenize palette input. Like shell splitting with quote support, but without
 /// treating `#` as a comment character (users type `cr #42 open`, not shell scripts).
-fn tokenize_palette_input(input: &str) -> Result<Vec<String>, String> {
+///
+/// Returns tokens with their byte offsets in the original input, enabling
+/// prefix slicing for Tab completion.
+pub fn tokenize_palette_input(input: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut token_start: Option<usize> = None;
+    let mut byte_offset = 0;
     let mut chars = input.chars().peekable();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
 
     while let Some(ch) = chars.next() {
         match ch {
-            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            '\'' if !in_double_quote => {
+                if token_start.is_none() {
+                    token_start = Some(byte_offset);
+                }
+                in_single_quote = !in_single_quote;
+            }
+            '"' if !in_single_quote => {
+                if token_start.is_none() {
+                    token_start = Some(byte_offset);
+                }
+                in_double_quote = !in_double_quote;
+            }
             '\\' if !in_single_quote => {
-                // Backslash escaping: take next char literally
+                if token_start.is_none() {
+                    token_start = Some(byte_offset);
+                }
+                byte_offset += ch.len_utf8();
                 if let Some(next) = chars.next() {
                     current.push(next);
+                    byte_offset += next.len_utf8();
                 }
+                continue;
             }
             ' ' | '\t' if !in_single_quote && !in_double_quote => {
                 if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
+                    tokens.push(Token { value: std::mem::take(&mut current), offset: token_start.unwrap_or(byte_offset) });
+                    token_start = None;
                 }
             }
-            _ => current.push(ch),
+            _ => {
+                if token_start.is_none() {
+                    token_start = Some(byte_offset);
+                }
+                current.push(ch);
+            }
         }
+        byte_offset += ch.len_utf8();
     }
 
     if in_single_quote || in_double_quote {
         return Err("unclosed quote".to_string());
     }
     if !current.is_empty() {
-        tokens.push(current);
+        tokens.push(Token { value: current, offset: token_start.unwrap_or(byte_offset) });
     }
     Ok(tokens)
 }
@@ -142,7 +176,7 @@ pub fn parse_palette_input(input: &str) -> Result<PaletteParseResult<'_>, String
     }
     // 2. Tokenize (quote-aware split without shell comment handling)
     let tokens = tokenize_palette_input(input)?;
-    let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+    let token_refs: Vec<&str> = tokens.iter().map(|t| t.value.as_str()).collect();
     if token_refs.is_empty() {
         return Err("empty command".into());
     }
@@ -340,7 +374,13 @@ fn subject_completions(noun: &str, partial: &str, model: &TuiModel) -> Vec<Palet
                     items.push((key.clone(), session.title.clone()));
                 }
                 for (key, agent) in &repo.providers.agents {
-                    items.push((key.clone(), format!("{:?}", agent.harness)));
+                    let harness_label = match &agent.harness {
+                        flotilla_protocol::AgentHarness::ClaudeCode => "Claude Code",
+                        flotilla_protocol::AgentHarness::Codex => "Codex",
+                        flotilla_protocol::AgentHarness::Gemini => "Gemini",
+                        flotilla_protocol::AgentHarness::OpenCode => "OpenCode",
+                    };
+                    items.push((key.clone(), harness_label.to_string()));
                 }
                 items
             } else {
