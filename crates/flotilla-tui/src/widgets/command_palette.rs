@@ -386,19 +386,23 @@ pub(crate) fn tui_dispatch(
                 }
             }
 
-            // Host resolution
-            command.host = match host {
-                HostResolution::Local => None,
-                HostResolution::ProvisioningTarget => target_host.clone(),
-                HostResolution::SubjectHost => item.and_then(|i| item_execution_host(i, my_host)),
-                HostResolution::ProviderHost => {
-                    if active_repo_is_remote_only {
-                        item.and_then(|i| item_execution_host(i, my_host))
-                    } else {
-                        None
+            // Host resolution — only fill if not already set by explicit `host <name>` routing.
+            // When the user types `host feta cr #42 open`, HostNoun::resolve() calls set_host("feta")
+            // during noun resolution, so command.host is already Some. We must not clobber it.
+            if command.host.is_none() {
+                command.host = match host {
+                    HostResolution::Local => None,
+                    HostResolution::ProvisioningTarget => target_host.clone(),
+                    HostResolution::SubjectHost => item.and_then(|i| item_execution_host(i, my_host)),
+                    HostResolution::ProviderHost => {
+                        if active_repo_is_remote_only {
+                            item.and_then(|i| item_execution_host(i, my_host))
+                        } else {
+                            None
+                        }
                     }
-                }
-            };
+                };
+            }
 
             Ok(command)
         }
