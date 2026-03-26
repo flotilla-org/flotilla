@@ -107,9 +107,39 @@ Scans bindings where `object_kind == AttachableSet` and `object_id == set_id`, r
 
 **1:1 binding invariant for workspace→set:** When `persist_workspace_binding` writes a new binding (ws_ref → set_id), it must also remove any existing workspace binding for the same set_id (same provider category/name). The current `replace_binding` is keyed by `external_ref`, so after a workspace is recreated with a new stable ID, the old binding persists alongside the new one. Without cleanup, the reverse lookup could return the stale ref. Enforcing 1:1 (one workspace per attachable set per provider) ensures the reverse lookup is unambiguous.
 
+### `WorkspaceManager` trait (workspace/mod.rs)
+
+Add a method to declare the scope of `list_workspaces()`:
+
+```rust
+/// Returns a prefix that all ws_refs from this provider instance will
+/// start with. Only bindings matching this prefix should be considered
+/// authoritative for pruning. Returns empty string if list_workspaces()
+/// is exhaustive.
+fn binding_scope_prefix(&self) -> String;
+```
+
+| Provider | Return value | Meaning |
+|----------|-------------|---------|
+| cmux | `""` | `list_workspaces()` is exhaustive — all cmux bindings are in scope |
+| zellij | `"{session_name}:"` | Only this session's bindings are in scope |
+| tmux | `"{start_time}:{session_name}:"` | Only this server instance + session's bindings are in scope |
+
+### Stale binding pruning (refresh.rs)
+
+During `project_attachable_data`, after iterating over live workspaces:
+
+1. Collect the set of live ws_refs from `list_workspaces()`
+2. Get the provider's `binding_scope_prefix()`
+3. For each workspace_manager binding in the store: if the binding's `external_ref` starts with the scope prefix but is NOT in the live set, remove it
+
+This is safe because the scope prefix restricts pruning to bindings the current provider instance is authoritative about. Bindings from other sessions, server instances, or providers are untouched.
+
+Note: the exact shape of this scoping mechanism may evolve (e.g., into something richer when we model multi-session properly), but the semantics are correct: "prune only what I'm the authority on."
+
 ### Downstream
 
-The orchestrator, binding system, refresh, and correlation all treat ws_ref as an opaque string. Correlation already uses only `AttachableSet` keys for workspaces (not directories). No changes needed.
+The orchestrator, binding system, and correlation all treat ws_ref as an opaque string. Correlation already uses only `AttachableSet` keys for workspaces (not directories). No changes needed beyond the pruning addition in refresh.
 
 ### Known regression: loss of live directory-matching fallback
 
@@ -117,7 +147,7 @@ The current `select_existing_workspace` consults `list_workspaces()` and matches
 
 ### Migration
 
-None. We are in a no-backwards-compat phase. Existing bindings keyed on old-format refs become dead entries. New bindings use stable identifiers. Orphaned old bindings are harmless and can be cleaned up as part of future lifecycle work. Existing TOML state files become unused — they can be left in place or cleaned up manually.
+None. We are in a no-backwards-compat phase. Existing bindings keyed on old-format refs become dead entries — and will be cleaned up by the new pruning logic on the next refresh cycle. New bindings use stable identifiers. Existing TOML state files become unused — they can be left in place or cleaned up manually.
 
 ### Tests
 
