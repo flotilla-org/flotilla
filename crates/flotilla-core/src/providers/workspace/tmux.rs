@@ -1,39 +1,17 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{
-    path_context::DaemonHostPath,
-    providers::{run, types::*, CommandRunner},
-};
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct TmuxState {
-    #[serde(default)]
-    windows: HashMap<String, WindowState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WindowState {
-    working_directory: String,
-    created_at: String,
-}
+use crate::providers::{run, types::*, CommandRunner};
 
 pub struct TmuxWorkspaceManager {
     runner: Arc<dyn CommandRunner>,
-    state_dir: DaemonHostPath,
 }
 
 impl TmuxWorkspaceManager {
-    pub fn new(runner: Arc<dyn CommandRunner>, state_dir: DaemonHostPath) -> Self {
-        Self { runner, state_dir }
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner }
     }
 
     /// Run a tmux command and return stdout, or an error on failure.
@@ -44,38 +22,6 @@ impl TmuxWorkspaceManager {
     /// Return the current tmux session name.
     async fn session_name(&self) -> Result<String, String> {
         self.tmux_cmd(&["display-message", "-p", "#{session_name}"]).await
-    }
-
-    /// Return the state file path for the given tmux session.
-    fn state_path(&self, session: &str) -> DaemonHostPath {
-        self.state_dir.join("tmux").join(session).join("state.toml")
-    }
-
-    /// Load persisted state for the given session. Returns default on any error.
-    fn load_state(&self, session: &str) -> TmuxState {
-        let path = self.state_path(session);
-        let contents = match std::fs::read_to_string(path.as_path()) {
-            Ok(c) => c,
-            Err(_) => return TmuxState::default(),
-        };
-        match toml::from_str(&contents) {
-            Ok(state) => state,
-            Err(e) => {
-                warn!(err = %e, "corrupt tmux state file, treating as empty");
-                TmuxState::default()
-            }
-        }
-    }
-
-    /// Save state for the given session. Silently ignores errors.
-    fn save_state(&self, session: &str, state: &TmuxState) {
-        let path = self.state_path(session);
-        if let Some(parent) = path.as_path().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(contents) = toml::to_string(state) {
-            let _ = std::fs::write(path.as_path(), contents);
-        }
     }
 
     /// Map split direction names to tmux flags.
@@ -95,30 +41,18 @@ impl TmuxWorkspaceManager {
 #[async_trait]
 impl super::WorkspaceManager for TmuxWorkspaceManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
-        let output = self.tmux_cmd(&["list-windows", "-F", "#{window_name}"]).await?;
-        let window_names: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+        let session = self.session_name().await?;
+        let start_time = self.tmux_cmd(&["display-message", "-p", "#{start_time}"]).await?;
+        let output = self.tmux_cmd(&["list-windows", "-F", "#{window_id}\t#{window_name}"]).await?;
 
-        // Load state for enrichment, pruning stale entries
-        let (session, mut state) = match self.session_name().await {
-            Ok(s) => {
-                let st = self.load_state(&s);
-                (Some(s), st)
-            }
-            Err(_) => (None, TmuxState::default()),
-        };
-
-        let live_names: HashSet<&str> = window_names.iter().copied().collect();
-        let before_len = state.windows.len();
-        state.windows.retain(|name, _| live_names.contains(name.as_str()));
-        if state.windows.len() != before_len {
-            if let Some(ref session) = session {
-                self.save_state(session, &state);
-            }
-        }
-
-        let workspaces = window_names
-            .into_iter()
-            .map(|name| (name.to_string(), Workspace { name: name.to_string(), correlation_keys: vec![], attachable_set_id: None }))
+        let workspaces = output
+            .lines()
+            .filter(|l| !l.is_empty())
+            .filter_map(|line| {
+                let (window_id, name) = line.split_once('\t')?;
+                let ws_ref = format!("{start_time}:{session}:{window_id}");
+                Some((ws_ref, Workspace { name: name.to_string(), correlation_keys: vec![], attachable_set_id: None }))
+            })
             .collect();
 
         Ok(workspaces)
@@ -130,11 +64,11 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
         let rendered = super::resolve_template(config);
         let working_dir = config.working_directory.as_path().display().to_string();
 
-        // Create new window
-        self.tmux_cmd(&["new-window", "-n", &config.name, "-c", &working_dir]).await?;
-
-        // Small delay to let tmux process window creation
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Create new window, capturing its window ID
+        let window_id = self.tmux_cmd(&["new-window", "-n", &config.name, "-c", &working_dir, "-P", "-F", "#{window_id}"]).await?;
+        let session = self.session_name().await?;
+        let start_time = self.tmux_cmd(&["display-message", "-p", "#{start_time}"]).await?;
+        let ws_ref = format!("{start_time}:{session}:{window_id}");
 
         // Track pane count for focus. focus_pane_index captures the tmux pane index
         // of the first surface in the template pane marked with focus=true.
@@ -209,21 +143,14 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
             self.tmux_cmd(&["select-pane", "-t", &target]).await.ok();
         }
 
-        // Save state
-        if let Ok(session) = self.session_name().await {
-            let mut state = self.load_state(&session);
-            let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default();
-            state.windows.insert(config.name.clone(), WindowState { working_directory: working_dir.clone(), created_at: timestamp });
-            self.save_state(&session, &state);
-        }
-
         info!(workspace = %config.name, "tmux: workspace ready");
-        Ok((config.name.clone(), Workspace { name: config.name.clone(), correlation_keys: vec![], attachable_set_id: None }))
+        Ok((ws_ref, Workspace { name: config.name.clone(), correlation_keys: vec![], attachable_set_id: None }))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        info!(%ws_ref, "tmux: switching to window");
-        self.tmux_cmd(&["select-window", "-t", ws_ref]).await?;
+        let window_id = ws_ref.rsplit_once(':').map(|(_, id)| id).ok_or_else(|| format!("invalid tmux ws_ref: {ws_ref}"))?;
+        info!(%ws_ref, %window_id, "tmux: switching to window by id");
+        self.tmux_cmd(&["select-window", "-t", window_id]).await?;
         Ok(())
     }
 
@@ -234,8 +161,13 @@ impl super::WorkspaceManager for TmuxWorkspaceManager {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use crate::path_context::ExecutionEnvironmentPath;
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::{replay, workspace::WorkspaceManager},
+    };
 
     #[test]
     fn split_flag_maps_directions() {
@@ -246,120 +178,6 @@ mod tests {
         assert_eq!(TmuxWorkspaceManager::split_flag("unknown"), "-h");
         assert_eq!(TmuxWorkspaceManager::split_flag(""), "-h");
     }
-
-    fn test_mgr(state_dir: DaemonHostPath) -> TmuxWorkspaceManager {
-        use crate::providers::testing::MockRunner;
-        let runner = Arc::new(MockRunner::new(vec![]));
-        TmuxWorkspaceManager::new(runner, state_dir)
-    }
-
-    #[test]
-    fn state_path_contains_session_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let state_dir = DaemonHostPath::new(dir.path().join("flotilla"));
-        let mgr = test_mgr(state_dir);
-        let path = mgr.state_path("my-session");
-        assert!(path.as_path().ends_with("flotilla/tmux/my-session/state.toml"));
-    }
-
-    #[test]
-    fn load_state_returns_default_for_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let state_dir = DaemonHostPath::new(dir.path().join("flotilla"));
-        let mgr = test_mgr(state_dir);
-        let state = mgr.load_state("nonexistent-session-xyz");
-        assert!(state.windows.is_empty());
-    }
-
-    #[test]
-    fn toml_serialization_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = "test-session";
-        let state_path = dir.path().join("flotilla").join("tmux").join(session).join("state.toml");
-
-        // Create state with a window entry
-        let mut state = TmuxState::default();
-        state.windows.insert("my-window".to_string(), WindowState {
-            working_directory: "/tmp/work".to_string(),
-            created_at: "1234567890".to_string(),
-        });
-
-        // Save manually (since state_path uses dirs::config_dir)
-        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
-        let contents = toml::to_string(&state).unwrap();
-        std::fs::write(&state_path, &contents).unwrap();
-
-        // Load back and verify
-        let loaded: TmuxState = toml::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
-        assert_eq!(loaded.windows.len(), 1);
-        assert_eq!(loaded.windows["my-window"].working_directory, "/tmp/work");
-        assert_eq!(loaded.windows["my-window"].created_at, "1234567890");
-    }
-
-    #[test]
-    fn corrupt_toml_fails_deserialization() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.toml");
-        std::fs::write(&path, "this is not valid toml {{{{").unwrap();
-
-        // Direct deserialization should fail
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(toml::from_str::<TmuxState>(&contents).is_err());
-    }
-
-    #[test]
-    fn state_serialization_format() {
-        let mut state = TmuxState::default();
-        state.windows.insert("feat-branch".to_string(), WindowState {
-            working_directory: "/home/user/project".to_string(),
-            created_at: "1000".to_string(),
-        });
-        let serialized = toml::to_string(&state).unwrap();
-        assert!(serialized.contains("[windows.feat-branch]"));
-        assert!(serialized.contains("working_directory"));
-        assert!(serialized.contains("created_at"));
-    }
-
-    #[test]
-    fn prune_retains_only_live_windows() {
-        let mut state = TmuxState::default();
-        state
-            .windows
-            .insert("live-window".to_string(), WindowState { working_directory: "/tmp/live".to_string(), created_at: "1".to_string() });
-        state
-            .windows
-            .insert("stale-window".to_string(), WindowState { working_directory: "/tmp/stale".to_string(), created_at: "2".to_string() });
-        state
-            .windows
-            .insert("another-stale".to_string(), WindowState { working_directory: "/tmp/stale2".to_string(), created_at: "3".to_string() });
-
-        let live_names: HashSet<&str> = ["live-window"].into_iter().collect();
-        state.windows.retain(|name, _| live_names.contains(name.as_str()));
-
-        assert_eq!(state.windows.len(), 1);
-        assert!(state.windows.contains_key("live-window"));
-    }
-
-    #[test]
-    fn prune_empty_state_is_noop() {
-        let mut state = TmuxState::default();
-        let live_names: HashSet<&str> = ["win1", "win2"].into_iter().collect();
-        state.windows.retain(|name, _| live_names.contains(name.as_str()));
-        assert!(state.windows.is_empty());
-    }
-
-    #[test]
-    fn prune_all_live_removes_nothing() {
-        let mut state = TmuxState::default();
-        state.windows.insert("win1".to_string(), WindowState { working_directory: "/tmp/1".to_string(), created_at: "1".to_string() });
-        state.windows.insert("win2".to_string(), WindowState { working_directory: "/tmp/2".to_string(), created_at: "2".to_string() });
-
-        let live_names: HashSet<&str> = ["win1", "win2"].into_iter().collect();
-        state.windows.retain(|name, _| live_names.contains(name.as_str()));
-        assert_eq!(state.windows.len(), 2);
-    }
-
-    use crate::providers::{replay, workspace::WorkspaceManager};
 
     fn fixture(name: &str) -> String {
         crate::providers::testing::fixture_path("workspace", name)
@@ -400,12 +218,6 @@ mod tests {
 
     fn teardown_tmux_ws_session() {
         let _ = std::process::Command::new("tmux").args(["kill-session", "-t", "flotilla-test-tmux-ws"]).status();
-
-        // Clean up state files created by create_workspace
-        if let Some(config_dir) = dirs::config_dir() {
-            let state_dir = config_dir.join("flotilla").join("tmux").join("flotilla-test-tmux-ws");
-            let _ = std::fs::remove_dir_all(&state_dir);
-        }
     }
 
     #[tokio::test]
@@ -419,9 +231,7 @@ mod tests {
         let session = replay::test_session(&fixture("tmux_workspaces.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let state_tmp = tempfile::tempdir().expect("tempdir for state");
-        let state_dir = DaemonHostPath::new(state_tmp.path());
-        let mgr = TmuxWorkspaceManager::new(runner.clone(), state_dir);
+        let mgr = TmuxWorkspaceManager::new(runner.clone());
 
         // Create workspace "feat-123"
         let config1 = WorkspaceAttachRequest {
@@ -432,8 +242,9 @@ mod tests {
             attach_commands: vec![],
         };
         let (name1, ws1) = mgr.create_workspace(&config1).await.unwrap();
-        assert_eq!(name1, "feat-123");
         assert_eq!(ws1.name, "feat-123");
+        // ws_ref is now start_time:session:@window_id, not the name
+        assert!(name1.contains(':'), "ws_ref should contain colons: {name1}");
 
         // Create workspace "fix-456"
         let config2 = WorkspaceAttachRequest {
@@ -444,16 +255,16 @@ mod tests {
             attach_commands: vec![],
         };
         let (name2, ws2) = mgr.create_workspace(&config2).await.unwrap();
-        assert_eq!(name2, "fix-456");
         assert_eq!(ws2.name, "fix-456");
+        assert!(name2.contains(':'), "ws_ref should contain colons: {name2}");
 
         // Verify with external command: list windows through the runner
         let list_output = run!(runner, "tmux", &["list-windows", "-F", "#{window_name}"], Path::new(".")).unwrap();
         assert!(list_output.contains("feat-123"), "expected 'feat-123' in list output: {list_output}");
         assert!(list_output.contains("fix-456"), "expected 'fix-456' in list output: {list_output}");
 
-        // Switch to "feat-123"
-        mgr.select_workspace("feat-123").await.unwrap();
+        // Switch to first workspace by ws_ref
+        mgr.select_workspace(&name1).await.unwrap();
 
         // Verify current window through the runner
         let current = run!(runner, "tmux", &["display-message", "-p", "#{window_name}"], Path::new(".")).unwrap();
@@ -485,9 +296,7 @@ mod tests {
         let session = replay::test_session(&fixture("tmux_list.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let state_tmp = tempfile::tempdir().expect("tempdir for state");
-        let state_dir = DaemonHostPath::new(state_tmp.path());
-        let mgr = TmuxWorkspaceManager::new(runner, state_dir);
+        let mgr = TmuxWorkspaceManager::new(runner);
         let workspaces = mgr.list_workspaces().await.unwrap();
 
         assert_eq!(workspaces.len(), 2);
@@ -495,7 +304,7 @@ mod tests {
         assert!(names.contains(&"main-work"), "expected 'main-work' in {names:?}");
         assert!(names.contains(&"feature-branch"), "expected 'feature-branch' in {names:?}");
 
-        // No state file exists, so correlation_keys should be empty
+        // correlation_keys should be empty
         for (_key, ws) in &workspaces {
             assert!(ws.correlation_keys.is_empty());
         }
