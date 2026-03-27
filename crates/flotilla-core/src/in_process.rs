@@ -571,9 +571,6 @@ impl InProcessDaemon {
             // checkout set after the first broadcast cycle. Before that first
             // broadcast, only the preferred root's own checkouts are present.
             for (host_path, checkout) in &state.preferred_root().model.data.providers.checkouts {
-                if host_path.host != self.host_name {
-                    continue;
-                }
                 let matched = match selector {
                     flotilla_protocol::CheckoutSelector::Path(path) => host_path.path == *path,
                     flotilla_protocol::CheckoutSelector::Query(query) => {
