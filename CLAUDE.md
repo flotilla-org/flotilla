@@ -172,7 +172,7 @@ Workspace templates: `.flotilla/workspace.yaml` in repo root.
 
 ## Issue Types and Labels
 
-Issues have a **type** (lifecycle stage) and **labels** (topic tags). Set the type via the GitHub API: `gh api -X PATCH repos/flotilla-org/flotilla/issues/N -f type="TypeName"`.
+Issues have a **type** (lifecycle stage) and **labels** (topic tags). `gh issue create` does not support `--type`, so set it after creation via the API: `gh api -X PATCH repos/flotilla-org/flotilla/issues/N -f type="TypeName"`.
 
 | Type | Use for |
 |------|---------|
