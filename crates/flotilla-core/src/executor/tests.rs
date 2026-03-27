@@ -1084,6 +1084,35 @@ async fn remove_checkout_failure() {
     assert_error_eq(result, "cannot remove trunk");
 }
 
+#[tokio::test]
+async fn remove_checkout_resolves_for_remote_host() {
+    let remote = HostName::new("remote-box");
+    let remote_hp = HostPath::new(remote.clone(), PathBuf::from("/repo/wt-feat"));
+    let mut data = empty_data();
+    data.checkouts.insert(remote_hp, TestCheckout::new("feat").build());
+
+    let config_base = config_base();
+    let plan = build_plan(
+        command_with_host("remote-box", remove_checkout_action("feat")),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(empty_registry()),
+        Arc::new(data),
+        config_base.clone(),
+        test_attachable_store(&config_base),
+        None,
+        local_host(),
+    )
+    .await;
+
+    let plan = plan.expect("build_plan should succeed for remote checkout");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("remote-box")));
+    assert!(
+        matches!(&plan.steps[0].action, StepAction::RemoveCheckout { branch, .. } if branch == "feat"),
+        "step should be RemoveCheckout for branch feat"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Tests: RemoveCheckout — terminal cleanup
 // -----------------------------------------------------------------------

@@ -143,15 +143,15 @@ pub async fn build_plan(
             .await
         }
 
-        CommandAction::RemoveCheckout { checkout } => match resolve_checkout_branch(&checkout, &providers_data, &local_host) {
+        CommandAction::RemoveCheckout { checkout } => match resolve_checkout_branch(&checkout, &providers_data, &target_host) {
             Ok(branch) => {
                 let deleted_paths: Vec<HostPath> = providers_data
                     .checkouts
                     .iter()
-                    .filter(|(hp, co)| co.branch == branch && hp.host == local_host)
+                    .filter(|(hp, co)| co.branch == branch && hp.host == target_host)
                     .map(|(hp, _)| hp.clone())
                     .collect();
-                Ok(build_remove_checkout_plan(branch, deleted_paths, local_host))
+                Ok(build_remove_checkout_plan(branch, deleted_paths, target_host))
             }
             Err(message) => Err(CommandValue::Error { message }),
         },
