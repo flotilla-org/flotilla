@@ -295,6 +295,9 @@ pub enum CommandValue {
     EnvironmentCreated {
         env_id: crate::EnvironmentId,
     },
+    EnvironmentSpecRead {
+        spec: crate::EnvironmentSpec,
+    },
 }
 
 /// Status of an individual step within a multi-step command.
@@ -640,6 +643,14 @@ mod tests {
                     environments: vec![],
                 },
             })),
+            CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },
+            CommandValue::EnvironmentCreated { env_id: crate::EnvironmentId::new("env-1") },
+            CommandValue::EnvironmentSpecRead {
+                spec: crate::EnvironmentSpec {
+                    image: crate::ImageSource::Registry("ubuntu:24.04".into()),
+                    token_env_vars: vec!["GITHUB_TOKEN".into()],
+                },
+            },
         ];
 
         for result in cases {

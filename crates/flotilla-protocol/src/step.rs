@@ -144,6 +144,8 @@ pub enum StepAction {
     DestroyEnvironment {
         env_id: crate::EnvironmentId,
     },
+    /// Read `.flotilla/environment.yaml` from the repo root known to the step resolver at runtime.
+    ReadEnvironmentSpec,
 }
 
 /// A single step in a multi-step command.

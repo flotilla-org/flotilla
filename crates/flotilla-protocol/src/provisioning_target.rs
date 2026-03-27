@@ -48,21 +48,23 @@ impl FromStr for ProvisioningTarget {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         fn non_blank(component: &str) -> Option<&str> {
             let trimmed = component.trim();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
         }
 
         if let Some(rest) = s.strip_prefix('@') {
             // `@host`
-            let host = non_blank(rest)
-                .ok_or_else(|| format!("invalid ProvisioningTarget: host name cannot be empty in '{s}'"))?;
+            let host = non_blank(rest).ok_or_else(|| format!("invalid ProvisioningTarget: host name cannot be empty in '{s}'"))?;
             Ok(Self::Host { host: HostName::new(host) })
         } else if let Some(rest) = s.strip_prefix('+') {
             // `+provider@host`
             if let Some((provider, host)) = rest.split_once('@') {
-                let provider = non_blank(provider)
-                    .ok_or_else(|| format!("invalid ProvisioningTarget: provider cannot be empty in '{s}'"))?;
-                let host = non_blank(host)
-                    .ok_or_else(|| format!("invalid ProvisioningTarget: host cannot be empty in '{s}'"))?;
+                let provider =
+                    non_blank(provider).ok_or_else(|| format!("invalid ProvisioningTarget: provider cannot be empty in '{s}'"))?;
+                let host = non_blank(host).ok_or_else(|| format!("invalid ProvisioningTarget: host cannot be empty in '{s}'"))?;
                 Ok(Self::NewEnvironment { host: HostName::new(host), provider: provider.to_string() })
             } else {
                 Err(format!("invalid ProvisioningTarget: expected '+provider@host', got '{s}'"))
@@ -70,10 +72,8 @@ impl FromStr for ProvisioningTarget {
         } else if let Some(rest) = s.strip_prefix('=') {
             // `=env_id@host`
             if let Some((env_id, host)) = rest.split_once('@') {
-                let env_id = non_blank(env_id)
-                    .ok_or_else(|| format!("invalid ProvisioningTarget: env_id cannot be empty in '{s}'"))?;
-                let host = non_blank(host)
-                    .ok_or_else(|| format!("invalid ProvisioningTarget: host cannot be empty in '{s}'"))?;
+                let env_id = non_blank(env_id).ok_or_else(|| format!("invalid ProvisioningTarget: env_id cannot be empty in '{s}'"))?;
+                let host = non_blank(host).ok_or_else(|| format!("invalid ProvisioningTarget: host cannot be empty in '{s}'"))?;
                 Ok(Self::ExistingEnvironment { host: HostName::new(host), env_id: EnvironmentId::new(env_id) })
             } else {
                 Err(format!("invalid ProvisioningTarget: expected '=env_id@host', got '{s}'"))
