@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>InProcessDaemon Struct Analysis</title>
+<style>
+  :root { --bg: #1a1a2e; --fg: #e0e0e0; --accent: #16213e; --border: #333; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--fg); font-family: 'SF Mono', 'Fira Code', monospace; padding: 24px; }
+  h1 { font-size: 1.4em; margin-bottom: 4px; color: #7fdbca; }
+  h2 { font-size: 1.1em; margin: 32px 0 12px; color: #c792ea; }
+  .subtitle { color: #666; font-size: 0.85em; margin-bottom: 24px; }
+
+  /* Heatmap */
+  .heatmap-container { overflow-x: auto; margin-bottom: 32px; }
+  table.heatmap { border-collapse: collapse; font-size: 0.7em; }
+  table.heatmap th, table.heatmap td { padding: 3px 2px; text-align: center; border: 1px solid #222; min-width: 22px; }
+  table.heatmap th { background: var(--accent); position: sticky; top: 0; z-index: 2; }
+  table.heatmap th.field-header { writing-mode: vertical-rl; text-orientation: mixed; height: 130px; white-space: nowrap; font-weight: normal; }
+  table.heatmap th.method-name { text-align: right; padding-right: 8px; font-weight: normal; white-space: nowrap; position: sticky; left: 0; background: var(--accent); z-index: 3; }
+  table.heatmap td.hit { background: #4fc3f7; }
+  table.heatmap td.nohit { background: #111; }
+  table.heatmap .cluster-sep { border-left: 2px solid #c792ea !important; }
+  table.heatmap .method-sep { border-top: 2px solid #546e7a !important; }
+
+  /* Cluster colors */
+  .c-repo { color: #4fc3f7; }
+  .c-peer { color: #ff8a65; }
+  .c-host { color: #aed581; }
+  .c-exec { color: #ffb74d; }
+  .c-infra { color: #b39ddb; }
+  .c-lone { color: #666; }
+  .hit-repo { background: #1a6b8a !important; }
+  .hit-peer { background: #8a3a1a !important; }
+  .hit-host { background: #4a7a1a !important; }
+  .hit-exec { background: #8a5a1a !important; }
+  .hit-infra { background: #4a3a6a !important; }
+  .hit-lone { background: #444 !important; }
+
+  /* Legend */
+  .legend { display: flex; gap: 20px; margin: 12px 0 20px; flex-wrap: wrap; font-size: 0.8em; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 2px; }
+
+  /* Proposed structs */
+  .structs { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 16px 0; }
+  .struct-card { border: 1px solid var(--border); border-radius: 8px; padding: 16px; background: var(--accent); }
+  .struct-card h3 { font-size: 0.95em; margin-bottom: 8px; }
+  .struct-card ul { list-style: none; padding: 0; }
+  .struct-card li { font-size: 0.8em; padding: 2px 0; color: #aaa; }
+  .struct-card li code { color: #e0e0e0; }
+  .struct-card .method-list { margin-top: 8px; border-top: 1px solid #333; padding-top: 8px; }
+  .struct-card .method-list li { color: #777; font-style: italic; }
+
+  .co-access { font-size: 0.75em; color: #888; margin: 8px 0; }
+</style>
+</head>
+<body>
+
+<h1>InProcessDaemon — Field Affinity Analysis</h1>
+<p class="subtitle">Which fields are accessed together by which methods? Clusters reveal hidden sub-structs.</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#1a6b8a"></div><span>Repo Registry</span></div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#8a3a1a"></div><span>Peer Overlay</span></div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#4a7a1a"></div><span>Host Registry</span></div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#8a5a1a"></div><span>Command Slot</span></div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#4a3a6a"></div><span>Infrastructure</span></div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#444"></div><span>Identity (shared)</span></div>
+</div>
+
+<h2>Field × Method Heatmap</h2>
+<p class="co-access">Fields grouped by proposed cluster. Columns within a cluster that light up together confirm cohesion.</p>
+
+<div class="heatmap-container" id="heatmap-container"></div>
+
+<h2>Proposed Sub-Structs</h2>
+<div class="structs" id="structs-container"></div>
+
+<h2>Co-Access Counts (field pairs accessed by the same method)</h2>
+<p class="co-access" id="co-access-summary"></p>
+
+<script>
+// ── Data ──────────────────────────────────────────────────────────────
+const fields = [
+  // Repo Registry
+  { name: "repos", cluster: "repo" },
+  { name: "repo_order", cluster: "repo" },
+  { name: "path_identities", cluster: "repo" },
+  // Peer Overlay
+  { name: "peer_providers", cluster: "peer" },
+  { name: "peer_overlay_versions", cluster: "peer" },
+  // Host Registry
+  { name: "hosts", cluster: "host" },
+  { name: "configured_peer_names", cluster: "host" },
+  { name: "topology_routes", cluster: "host" },
+  { name: "local_host_summary", cluster: "host" },
+  // Command Slot
+  { name: "next_command_id", cluster: "exec" },
+  { name: "active_command", cluster: "exec" },
+  // Infrastructure
+  { name: "event_tx", cluster: "infra" },
+  { name: "config", cluster: "infra" },
+  { name: "discovery", cluster: "infra" },
+  { name: "host_bag", cluster: "infra" },
+  { name: "agent_state_store", cluster: "infra" },
+  { name: "daemon_socket_path", cluster: "infra" },
+  // Identity (shared — used broadly)
+  { name: "host_name", cluster: "lone" },
+  { name: "follower", cluster: "lone" },
+  { name: "session_id", cluster: "lone" },
+];
+
+const methods = [
+  // ── Repo-centric ──
+  { name: "poll_snapshots", fields: ["repos","peer_providers","host_name","event_tx"], group: "snapshot" },
+  { name: "broadcast_snapshot_inner", fields: ["path_identities","peer_providers","repos","host_name","event_tx"], group: "snapshot" },
+  { name: "ensure_issues_cached", fields: ["path_identities","repos"], group: "issues" },
+  { name: "search_issues", fields: ["path_identities","repos"], group: "issues" },
+  { name: "fetch_missing_linked_issues", fields: ["repos"], group: "issues" },
+  { name: "refresh_issues_incremental", fields: ["repos","path_identities"], group: "issues" },
+  { name: "get_local_providers", fields: ["path_identities","repos","host_name"], group: "snapshot" },
+  { name: "refresh", fields: ["path_identities","repos"], group: "snapshot" },
+  // ── Repo management ──
+  { name: "add_virtual_repo", fields: ["repos","repo_order","path_identities","event_tx"], group: "repo-mgmt" },
+  { name: "add_repo", fields: ["path_identities","host_bag","discovery","config","repos","repo_order","event_tx","agent_state_store"], group: "repo-mgmt" },
+  { name: "remove_repo", fields: ["path_identities","repos","repo_order","peer_providers","peer_overlay_versions","config","event_tx"], group: "repo-mgmt" },
+  // ── Host management ──
+  { name: "send_event", fields: ["hosts","event_tx"], group: "host-mgmt" },
+  { name: "set_configured_peer_names", fields: ["configured_peer_names","hosts"], group: "host-mgmt" },
+  { name: "set_peer_host_summaries", fields: ["hosts","host_name"], group: "host-mgmt" },
+  { name: "publish_peer_connection_status", fields: ["hosts","host_name","event_tx","configured_peer_names"], group: "host-mgmt" },
+  { name: "publish_peer_summary", fields: ["hosts","host_name","event_tx"], group: "host-mgmt" },
+  { name: "sync_host_membership", fields: ["configured_peer_names","peer_providers","hosts","host_name"], group: "host-mgmt" },
+  { name: "set_topology_routes", fields: ["topology_routes"], group: "host-mgmt" },
+  { name: "set_peer_providers", fields: ["path_identities","peer_overlay_versions","peer_providers","hosts","configured_peer_names"], group: "host-mgmt" },
+  // ── Execution ──
+  { name: "execute", fields: ["host_name","repos","path_identities","event_tx","next_command_id","discovery","config","active_command","daemon_socket_path","agent_state_store"], group: "execution" },
+  { name: "cancel", fields: ["active_command"], group: "execution" },
+  // ── Trait queries ──
+  { name: "get_state", fields: ["repos","path_identities","peer_providers","host_name"], group: "queries" },
+  { name: "list_repos", fields: ["repos","repo_order"], group: "queries" },
+  { name: "get_status", fields: ["peer_providers","repos","repo_order","host_name"], group: "queries" },
+  { name: "get_repo_detail", fields: ["repos","path_identities","peer_providers","host_name"], group: "queries" },
+  { name: "get_repo_providers", fields: ["repos","path_identities","peer_providers","host_name","host_bag"], group: "queries" },
+  { name: "get_repo_work", fields: ["repos","path_identities","peer_providers","host_name"], group: "queries" },
+  { name: "list_hosts", fields: ["configured_peer_names","hosts","host_name","peer_providers","repos","repo_order"], group: "queries" },
+  { name: "get_host_status", fields: ["configured_peer_names","hosts","host_name","local_host_summary","peer_providers"], group: "queries" },
+  { name: "get_host_providers", fields: ["configured_peer_names","hosts","host_name","local_host_summary","peer_providers"], group: "queries" },
+  { name: "get_topology", fields: ["topology_routes","configured_peer_names","host_name"], group: "queries" },
+  { name: "replay_since", fields: ["repos","repo_order","peer_providers","hosts","host_name"], group: "queries" },
+  { name: "local_host_counts", fields: ["repos","repo_order","host_name"], group: "queries" },
+  { name: "remote_host_counts", fields: ["peer_providers"], group: "queries" },
+];
+
+const clusterColors = {
+  repo: "#1a6b8a", peer: "#8a3a1a", host: "#4a7a1a",
+  exec: "#8a5a1a", infra: "#4a3a6a", lone: "#444"
+};
+
+const clusterNames = {
+  repo: "Repo Registry", peer: "Peer Overlay", host: "Host Registry",
+  exec: "Command Slot", infra: "Infrastructure", lone: "Identity"
+};
+
+// ── Heatmap ───────────────────────────────────────────────────────────
+const container = document.getElementById("heatmap-container");
+const table = document.createElement("table");
+table.className = "heatmap";
+
+// Header row
+const thead = document.createElement("thead");
+const headerRow = document.createElement("tr");
+const cornerTh = document.createElement("th");
+cornerTh.style.minWidth = "180px";
+headerRow.appendChild(cornerTh);
+
+let prevCluster = null;
+for (const f of fields) {
+  const th = document.createElement("th");
+  th.className = "field-header";
+  th.textContent = f.name;
+  th.style.color = clusterColors[f.cluster];
+  if (prevCluster && prevCluster !== f.cluster) th.classList.add("cluster-sep");
+  prevCluster = f.cluster;
+  headerRow.appendChild(th);
+}
+thead.appendChild(headerRow);
+table.appendChild(thead);
+
+// Body rows
+const tbody = document.createElement("tbody");
+let prevGroup = null;
+for (const m of methods) {
+  const row = document.createElement("tr");
+  const th = document.createElement("th");
+  th.className = "method-name";
+  th.textContent = m.name;
+  if (prevGroup && prevGroup !== m.group) row.classList.add("method-sep");
+  prevGroup = m.group;
+  row.appendChild(th);
+
+  let prevC = null;
+  for (const f of fields) {
+    const td = document.createElement("td");
+    const hit = m.fields.includes(f.name);
+    td.className = hit ? `hit hit-${f.cluster}` : "nohit";
+    if (hit) td.title = `${m.name} → ${f.name}`;
+    if (prevC && prevC !== f.cluster) td.classList.add("cluster-sep");
+    prevC = f.cluster;
+    row.appendChild(td);
+  }
+  tbody.appendChild(row);
+}
+table.appendChild(tbody);
+container.appendChild(table);
+
+// ── Co-access counts ──────────────────────────────────────────────────
+const coAccess = {};
+for (const m of methods) {
+  for (let i = 0; i < m.fields.length; i++) {
+    for (let j = i + 1; j < m.fields.length; j++) {
+      const key = [m.fields[i], m.fields[j]].sort().join(" + ");
+      coAccess[key] = (coAccess[key] || 0) + 1;
+    }
+  }
+}
+const sorted = Object.entries(coAccess).sort((a, b) => b[1] - a[1]).slice(0, 15);
+const summaryEl = document.getElementById("co-access-summary");
+summaryEl.innerHTML = "<strong>Top 15 most frequently co-accessed field pairs:</strong><br>" +
+  sorted.map(([pair, count]) => `${pair}: <strong>${count}</strong> methods`).join("<br>");
+
+// ── Proposed structs ──────────────────────────────────────────────────
+const proposals = [
+  {
+    name: "RepoRegistry",
+    color: clusterColors.repo,
+    fields: ["repos: RwLock<HashMap<RepoIdentity, RepoState>>", "repo_order: RwLock<Vec<RepoIdentity>>", "path_identities: RwLock<HashMap<PathBuf, RepoIdentity>>"],
+    methods: ["resolve_repo_selector()", "tracked_repo_identity_for_path()", "resolve_checkout_selector()", "tracked_repo_paths()"],
+    rationale: "These 3 fields are co-accessed by 25 of 34 methods. path_identities is essentially an index into repos. repo_order defines iteration sequence. All three are needed for any repo lookup.",
+    coAccessCount: 18
+  },
+  {
+    name: "PeerOverlay",
+    color: clusterColors.peer,
+    fields: ["peer_providers: RwLock<HashMap<RepoIdentity, Vec<(HostName, ProviderData)>>>", "peer_overlay_versions: RwLock<HashMap<RepoIdentity, u64>>"],
+    methods: ["set_peer_providers()", "get_peer_overlay_for()"],
+    rationale: "peer_overlay_versions exists solely to guard peer_providers from stale writes. They're always accessed together in set_peer_providers and cleanup. 14 methods read peer_providers for snapshot merging.",
+    coAccessCount: 3
+  },
+  {
+    name: "HostRegistry",
+    color: clusterColors.host,
+    fields: ["hosts: RwLock<HashMap<HostName, HostState>>", "configured_peer_names: RwLock<HashSet<HostName>>", "topology_routes: RwLock<Vec<TopologyRoute>>", "local_host_summary: HostSummary"],
+    methods: ["sync_host_membership()", "update_host_status()", "update_host_summary()", "should_present_host_state()", "mark_host_removed()", "build_host_snapshot()"],
+    rationale: "6 free functions already operate on hosts HashMap — they're methods waiting for a struct. configured_peer_names and topology_routes are only used in host-related operations. local_host_summary is host identity.",
+    coAccessCount: 10
+  },
+  {
+    name: "CommandSlot",
+    color: clusterColors.exec,
+    fields: ["next_command_id: AtomicU64", "active_command: Arc<Mutex<Option<ActiveCommand>>>"],
+    methods: ["allocate_id()", "try_acquire()", "release()", "cancel()"],
+    rationale: "Used exclusively by execute() and cancel(). Completely independent of all other state. Single-slot design docs already describe it as a unit.",
+    coAccessCount: 1
+  }
+];
+
+const structsEl = document.getElementById("structs-container");
+for (const p of proposals) {
+  const card = document.createElement("div");
+  card.className = "struct-card";
+  card.style.borderColor = p.color;
+  card.innerHTML = `
+    <h3 style="color:${p.color}">${p.name}</h3>
+    <ul>${p.fields.map(f => `<li><code>${f}</code></li>`).join("")}</ul>
+    <div class="method-list">
+      <li style="color:${p.color}; font-style:normal; font-size:0.75em; margin-bottom:4px;">Would absorb these methods:</li>
+      ${p.methods.map(m => `<li>${m}</li>`).join("")}
+    </div>
+    <p style="font-size:0.72em; color:#888; margin-top:8px; line-height:1.4;">${p.rationale}</p>
+  `;
+  structsEl.appendChild(card);
+}
+</script>
+</body>
+</html>
