@@ -621,7 +621,10 @@ impl App {
                     });
                     match result {
                         Ok(target) => self.ui.provisioning_target = target,
-                        Err(e) => tracing::warn!(%name, %e, "invalid provisioning target"),
+                        Err(e) => {
+                            tracing::warn!(%name, %e, "invalid provisioning target");
+                            self.set_status_message(Some(format!("invalid target: {name}")));
+                        }
                     }
                 }
                 AppAction::ToggleDebug => {
