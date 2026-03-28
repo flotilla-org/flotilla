@@ -16,7 +16,6 @@ pub mod section_table;
 pub mod split_table;
 pub mod status_bar_widget;
 pub mod tabs;
-pub mod work_item_table;
 
 use std::{any::Any, collections::HashMap};
 

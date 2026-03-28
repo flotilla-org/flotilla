@@ -94,68 +94,6 @@ fn default_labels() -> SectionLabels {
     SectionLabels::default()
 }
 
-fn header_titles(entries: &[GroupEntry]) -> Vec<String> {
-    entries
-        .iter()
-        .filter_map(|e| match e {
-            GroupEntry::Header(h) => Some(h.0.clone()),
-            GroupEntry::Item(_) => None,
-        })
-        .collect()
-}
-
-fn item_branches(entries: &[GroupEntry]) -> Vec<Option<String>> {
-    entries
-        .iter()
-        .filter_map(|e| match e {
-            GroupEntry::Header(_) => None,
-            GroupEntry::Item(item) => Some(item.branch.clone()),
-        })
-        .collect()
-}
-
-fn item_change_request_keys(entries: &[GroupEntry]) -> Vec<String> {
-    entries
-        .iter()
-        .filter_map(|e| match e {
-            GroupEntry::Header(_) => None,
-            GroupEntry::Item(item) => item.change_request_key.clone(),
-        })
-        .collect()
-}
-
-fn issue_key_groups(entries: &[GroupEntry]) -> Vec<Vec<String>> {
-    entries
-        .iter()
-        .filter_map(|e| match e {
-            GroupEntry::Header(_) => None,
-            GroupEntry::Item(item) => {
-                if item.kind == WorkItemKind::Issue {
-                    Some(item.issue_keys.clone())
-                } else {
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
-fn session_descriptions(entries: &[GroupEntry]) -> Vec<&str> {
-    entries
-        .iter()
-        .filter_map(|e| match e {
-            GroupEntry::Header(_) => None,
-            GroupEntry::Item(item) => {
-                if item.kind == WorkItemKind::Session {
-                    Some(item.description.as_str())
-                } else {
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
 // -----------------------------------------------------------------------
 // Display / formatting tests
 // -----------------------------------------------------------------------
@@ -164,12 +102,6 @@ fn session_descriptions(entries: &[GroupEntry]) -> Vec<&str> {
 fn refresh_error_display() {
     let err = RefreshError { category: "github", provider: "GitHub".to_string(), message: "rate limited".to_string() };
     assert_eq!(format!("{err}"), "github/GitHub: rate limited");
-}
-
-#[test]
-fn section_header_display() {
-    let hdr = SectionHeader("Checkouts".to_string());
-    assert_eq!(format!("{hdr}"), "Checkouts");
 }
 
 // -----------------------------------------------------------------------
@@ -773,283 +705,6 @@ fn correlate_issue_not_in_provider_data_ignored_by_association() {
 }
 
 // -----------------------------------------------------------------------
-// group_work_items() tests
-// -----------------------------------------------------------------------
-
-#[test]
-fn group_work_items_empty_input() {
-    let providers = new_providers();
-    let labels = default_labels();
-    let result = group_work_items(&[], &providers, &labels, Path::new("/tmp"));
-    assert!(result.table_entries.is_empty());
-    assert!(result.selectable_indices.is_empty());
-}
-
-#[test]
-fn group_work_items_single_checkout() {
-    let providers = new_providers();
-    let labels = default_labels();
-    let items = vec![to_proto(&checkout_item("/tmp/wt", Some("feat"), false))];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    // Should have 1 header + 1 item
-    assert_eq!(result.table_entries.len(), 2);
-    assert!(matches!(result.table_entries[0], GroupEntry::Header(_)));
-    assert!(matches!(result.table_entries[1], GroupEntry::Item(_)));
-    assert_eq!(result.selectable_indices, vec![1]);
-}
-
-#[test]
-fn group_work_items_sections_appear_in_order() {
-    // checkouts, sessions, PRs, remote branches, issues
-    let providers = new_providers();
-    let labels = default_labels();
-    let items = vec![
-        to_proto(&checkout_item("/tmp/wt", Some("feat"), false)),
-        to_proto(&session_item("s1", "Session")),
-        to_proto(&cr_item("10", "PR")),
-        to_proto(&remote_branch_item("origin/dev")),
-        to_proto(&issue_item("1", "Bug")),
-    ];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    // Expect 5 headers + 5 items = 10 entries
-    assert_eq!(result.table_entries.len(), 10);
-
-    let headers = header_titles(&result.table_entries);
-    assert_eq!(headers, vec!["Checkouts", "Sessions", "Change Requests", "Remote Branches", "Issues",]);
-}
-
-#[test]
-fn group_work_items_checkouts_sorted_by_path_main_first() {
-    let providers = new_providers();
-    let labels = default_labels();
-    let items = vec![
-        to_proto(&checkout_item("/tmp/z", Some("z-branch"), false)),
-        to_proto(&checkout_item("/tmp/a", Some("a-branch"), false)),
-        to_proto(&checkout_item("/tmp/main", Some("main"), true)),
-        to_proto(&checkout_item("/tmp/m", Some("m-branch"), false)),
-    ];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    let branches = item_branches(&result.table_entries);
-    assert_eq!(branches, vec![
-        Some("main".to_string()),     // main always first
-        Some("a-branch".to_string()), // then by path ascending
-        Some("m-branch".to_string()),
-        Some("z-branch".to_string()),
-    ]);
-}
-
-#[test]
-fn group_work_items_codex_worktree_sorts_after_siblings() {
-    // Real scenario: main at ~/dev/flotilla, sibling worktrees at
-    // ~/dev/flotilla.checkout-order etc., and a Codex auto-worktree at
-    // ~/.codex/worktrees/0cf6/flotilla.  The Codex path currently sorts
-    // between main and siblings because raw "/Users/x/.codex" < "/Users/x/dev".
-    let providers = new_providers();
-    let labels = default_labels();
-    let items = vec![
-        to_proto(&checkout_item("/Users/robert/dev/flotilla", Some("main"), true)),
-        to_proto(&checkout_item("/Users/robert/.codex/worktrees/0cf6/flotilla", Some("codex-detached"), false)),
-        to_proto(&checkout_item("/Users/robert/dev/flotilla.checkout-order", Some("checkout-order"), false)),
-        to_proto(&checkout_item("/Users/robert/dev/flotilla.low-hang-13", Some("low-hang-13"), false)),
-    ];
-    let repo_root = Path::new("/Users/robert/dev/flotilla");
-    let result = group_work_items(&items, &providers, &labels, repo_root);
-
-    let branches = item_branches(&result.table_entries);
-    assert_eq!(branches, vec![
-        Some("main".to_string()),           // main always first
-        Some("checkout-order".to_string()), // siblings next
-        Some("low-hang-13".to_string()),
-        Some("codex-detached".to_string()), // external worktrees last
-    ]);
-}
-
-#[test]
-fn group_work_items_prs_sorted_by_id_descending() {
-    let providers = new_providers();
-    let labels = default_labels();
-    let pr1 = to_proto(&cr_item("1", "PR one"));
-    let pr5 = to_proto(&cr_item("5", "PR five"));
-    let pr3 = to_proto(&cr_item("3", "PR three"));
-
-    let items = vec![pr1, pr5, pr3];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    let cr_keys = item_change_request_keys(&result.table_entries);
-    assert_eq!(cr_keys, vec!["5", "3", "1"]);
-}
-
-#[test]
-fn group_work_items_issues_sorted_by_id_descending() {
-    let providers = new_providers();
-    let labels = default_labels();
-    let items =
-        vec![to_proto(&issue_item("3", "Issue three")), to_proto(&issue_item("10", "Issue ten")), to_proto(&issue_item("1", "Issue one"))];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    let issue_keys = issue_key_groups(&result.table_entries);
-    assert_eq!(issue_keys, vec![vec!["10".to_string()], vec!["3".to_string()], vec!["1".to_string()]]);
-}
-
-#[test]
-fn group_work_items_remote_branches_sorted_by_name() {
-    let providers = new_providers();
-    let labels = default_labels();
-    let items = vec![to_proto(&remote_branch_item("z-remote")), to_proto(&remote_branch_item("a-remote"))];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    let branches = item_branches(&result.table_entries);
-    assert_eq!(branches, vec![Some("a-remote".to_string()), Some("z-remote".to_string()),]);
-}
-
-#[test]
-fn group_work_items_selectable_indices_skip_headers() {
-    let providers = new_providers();
-    let labels = default_labels();
-    let items = vec![
-        to_proto(&checkout_item("/tmp/a", Some("a"), false)),
-        to_proto(&checkout_item("/tmp/b", Some("b"), false)),
-        to_proto(&issue_item("1", "Bug")),
-    ];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    // Layout: Header(0), Item(1), Item(2), Header(3), Item(4)
-    assert_eq!(result.selectable_indices, vec![1, 2, 4]);
-}
-
-#[test]
-fn group_work_items_empty_sections_omitted() {
-    let providers = new_providers();
-    let labels = default_labels();
-    // Only issues, no checkouts/sessions/PRs/remote
-    let items = vec![to_proto(&issue_item("1", "Bug"))];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    assert_eq!(result.table_entries.len(), 2); // 1 header + 1 item
-    let headers = header_titles(&result.table_entries);
-    assert_eq!(headers, vec!["Issues"]);
-}
-
-#[test]
-fn group_work_items_uses_custom_labels() {
-    let providers = new_providers();
-    let labels = SectionLabels {
-        checkouts: "Checkouts".into(),
-        change_requests: "Pull Requests".into(),
-        issues: "Tickets".into(),
-        sessions: "Agents".into(),
-    };
-    let items = vec![
-        to_proto(&checkout_item("/tmp/wt", Some("feat"), false)),
-        to_proto(&session_item("s1", "Agent")),
-        to_proto(&cr_item("1", "PR")),
-        to_proto(&issue_item("1", "Ticket")),
-    ];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    let headers = header_titles(&result.table_entries);
-    assert_eq!(headers, vec!["Checkouts", "Agents", "Pull Requests", "Tickets"]);
-}
-
-#[test]
-fn group_work_items_sessions_sorted_by_updated_at_descending() {
-    let mut providers = new_providers();
-    // Populate providers with sessions that have updated_at
-    providers.sessions.insert("s-old".to_string(), CloudAgentSession {
-        title: "Old".to_string(),
-        status: SessionStatus::Idle,
-        model: None,
-        updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-        correlation_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-        item_noun: String::new(),
-    });
-    providers.sessions.insert("s-new".to_string(), CloudAgentSession {
-        title: "New".to_string(),
-        status: SessionStatus::Running,
-        model: None,
-        updated_at: Some("2026-03-01T00:00:00Z".to_string()),
-        correlation_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-        item_noun: String::new(),
-    });
-    providers.sessions.insert("s-mid".to_string(), CloudAgentSession {
-        title: "Mid".to_string(),
-        status: SessionStatus::Running,
-        model: None,
-        updated_at: Some("2026-02-01T00:00:00Z".to_string()),
-        correlation_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-        item_noun: String::new(),
-    });
-
-    let labels = default_labels();
-    let si1 = to_proto(&session_item("s-old", "Old"));
-    let si2 = to_proto(&session_item("s-new", "New"));
-    let si3 = to_proto(&session_item("s-mid", "Mid"));
-
-    let items = vec![si1, si2, si3];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    let session_descs = session_descriptions(&result.table_entries);
-    assert_eq!(session_descs, vec!["New", "Mid", "Old"]);
-}
-
-#[test]
-fn group_work_items_sessions_grouped_by_provider_then_time() {
-    let mut providers = new_providers();
-    providers.sessions.insert("s-claude-old".to_string(), CloudAgentSession {
-        title: "Claude Old".to_string(),
-        status: SessionStatus::Idle,
-        model: None,
-        updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-        correlation_keys: vec![],
-        provider_name: "claude".to_string(),
-        provider_display_name: "Claude".to_string(),
-        item_noun: "Agent".to_string(),
-    });
-    providers.sessions.insert("s-codex-new".to_string(), CloudAgentSession {
-        title: "Codex New".to_string(),
-        status: SessionStatus::Running,
-        model: None,
-        updated_at: Some("2026-03-01T00:00:00Z".to_string()),
-        correlation_keys: vec![],
-        provider_name: "codex".to_string(),
-        provider_display_name: "Codex".to_string(),
-        item_noun: "Task".to_string(),
-    });
-    providers.sessions.insert("s-claude-new".to_string(), CloudAgentSession {
-        title: "Claude New".to_string(),
-        status: SessionStatus::Running,
-        model: None,
-        updated_at: Some("2026-02-01T00:00:00Z".to_string()),
-        correlation_keys: vec![],
-        provider_name: "claude".to_string(),
-        provider_display_name: "Claude".to_string(),
-        item_noun: "Agent".to_string(),
-    });
-
-    let labels = default_labels();
-    let items = vec![
-        to_proto(&session_item("s-claude-old", "Claude Old")),
-        to_proto(&session_item("s-codex-new", "Codex New")),
-        to_proto(&session_item("s-claude-new", "Claude New")),
-    ];
-    let result = group_work_items(&items, &providers, &labels, Path::new("/tmp"));
-
-    let session_descs = session_descriptions(&result.table_entries);
-    // claude sessions grouped first (alphabetically), newest first within group
-    // then codex sessions
-    assert_eq!(session_descs, vec!["Claude New", "Claude Old", "Codex New"]);
-}
-
-// -----------------------------------------------------------------------
 // SectionLabels default test
 // -----------------------------------------------------------------------
 
@@ -1061,21 +716,6 @@ fn section_labels_default_values() {
     assert_eq!(labels.issues, "Issues");
     assert_eq!(labels.sessions, "Sessions");
 }
-
-// -----------------------------------------------------------------------
-// GroupedWorkItems default test
-// -----------------------------------------------------------------------
-
-#[test]
-fn grouped_work_items_default_is_empty() {
-    let g = GroupedWorkItems::default();
-    assert!(g.table_entries.is_empty());
-    assert!(g.selectable_indices.is_empty());
-}
-
-// -----------------------------------------------------------------------
-// GroupedWorkItems::filter_archived_sessions tests
-// -----------------------------------------------------------------------
 
 fn test_session_work_item(id: &str) -> flotilla_protocol::WorkItem {
     flotilla_protocol::WorkItem {
@@ -1109,108 +749,6 @@ fn test_cloud_agent_session(status: flotilla_protocol::SessionStatus) -> flotill
         provider_display_name: String::new(),
         item_noun: String::new(),
     }
-}
-
-#[test]
-fn filter_archived_sessions_removes_archived_and_expired() {
-    use flotilla_protocol::SessionStatus;
-
-    let active = test_session_work_item("s1");
-    let archived = test_session_work_item("s2");
-
-    let checkout = flotilla_protocol::WorkItem {
-        kind: WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(flotilla_protocol::HostPath::new(
-            flotilla_protocol::HostName::local(),
-            std::path::PathBuf::from("/tmp/co"),
-        )),
-        host: flotilla_protocol::HostName::local(),
-        branch: Some("main".into()),
-        description: "checkout".into(),
-        checkout: None,
-        change_request_key: None,
-        session_key: None,
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: false,
-        debug_group: Vec::new(),
-        source: None,
-        terminal_keys: Vec::new(),
-        attachable_set_id: None,
-        agent_keys: Vec::new(),
-    };
-
-    let mut grouped = GroupedWorkItems::default();
-    grouped.table_entries.push(GroupEntry::Header(SectionHeader("Sessions".into())));
-    grouped.selectable_indices.push(1);
-    grouped.table_entries.push(GroupEntry::Item(Box::new(active)));
-    grouped.selectable_indices.push(2);
-    grouped.table_entries.push(GroupEntry::Item(Box::new(archived)));
-    grouped.table_entries.push(GroupEntry::Header(SectionHeader("Checkouts".into())));
-    grouped.selectable_indices.push(4);
-    grouped.table_entries.push(GroupEntry::Item(Box::new(checkout)));
-
-    let mut providers = ProviderData::default();
-    providers.sessions.insert("s1".into(), test_cloud_agent_session(SessionStatus::Running));
-    providers.sessions.insert("s2".into(), test_cloud_agent_session(SessionStatus::Archived));
-
-    let filtered = grouped.filter_archived_sessions(&providers);
-
-    assert_eq!(filtered.selectable_indices.len(), 2);
-    let header_count = filtered.table_entries.iter().filter(|e| matches!(e, GroupEntry::Header(_))).count();
-    assert_eq!(header_count, 2);
-}
-
-#[test]
-fn filter_archived_sessions_removes_orphaned_headers() {
-    use flotilla_protocol::SessionStatus;
-
-    let archived = test_session_work_item("s1");
-
-    let mut grouped = GroupedWorkItems::default();
-    grouped.table_entries.push(GroupEntry::Header(SectionHeader("Sessions".into())));
-    grouped.selectable_indices.push(1);
-    grouped.table_entries.push(GroupEntry::Item(Box::new(archived)));
-
-    let mut providers = ProviderData::default();
-    providers.sessions.insert("s1".into(), test_cloud_agent_session(SessionStatus::Archived));
-
-    let filtered = grouped.filter_archived_sessions(&providers);
-    assert!(filtered.table_entries.is_empty());
-    assert!(filtered.selectable_indices.is_empty());
-}
-
-#[test]
-fn filter_archived_sessions_keeps_agent_items() {
-    let agent = flotilla_protocol::WorkItem {
-        kind: WorkItemKind::Agent,
-        identity: WorkItemIdentity::Agent("a1".into()),
-        host: flotilla_protocol::HostName::local(),
-        branch: None,
-        description: "agent".into(),
-        checkout: None,
-        change_request_key: None,
-        session_key: None,
-        issue_keys: Vec::new(),
-        workspace_refs: Vec::new(),
-        is_main_checkout: false,
-        debug_group: Vec::new(),
-        source: None,
-        terminal_keys: Vec::new(),
-        attachable_set_id: None,
-        agent_keys: vec!["a1".into()],
-    };
-
-    let mut grouped = GroupedWorkItems::default();
-    grouped.table_entries.push(GroupEntry::Header(SectionHeader("Agents".into())));
-    grouped.selectable_indices.push(1);
-    grouped.table_entries.push(GroupEntry::Item(Box::new(agent)));
-
-    let providers = ProviderData::default();
-    let filtered = grouped.filter_archived_sessions(&providers);
-
-    assert_eq!(filtered.selectable_indices.len(), 1);
-    assert_eq!(filtered.table_entries.len(), 2);
 }
 
 // -----------------------------------------------------------------------
@@ -1267,17 +805,17 @@ fn end_to_end_mixed_providers() {
     let main_item = work_items.iter().find(|wi| wi.branch() == Some("main")).expect("should have main");
     assert!(main_item.is_main_checkout());
 
-    // Now group them
+    // Now group them into sections
     let labels = default_labels();
     let proto_items: Vec<_> = work_items.iter().map(to_proto).collect();
-    let grouped = group_work_items(&proto_items, &providers, &labels, Path::new("/tmp"));
+    let sections = group_work_items_split(&proto_items, &providers, &labels, Path::new("/tmp"));
 
     // Should have sections for checkouts, sessions, remote, issues
-    let header_count = grouped.table_entries.iter().filter(|e| matches!(e, GroupEntry::Header(_))).count();
-    assert_eq!(header_count, 4, "should have exactly 4 section headers");
+    assert_eq!(sections.len(), 4, "should have exactly 4 sections");
 
-    // All items should be selectable
-    assert_eq!(grouped.selectable_indices.len(), 5);
+    // All items should be present
+    let total: usize = sections.iter().map(|s| s.items.len()).sum();
+    assert_eq!(total, 5);
 }
 
 #[test]

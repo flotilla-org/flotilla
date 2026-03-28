@@ -164,7 +164,7 @@ impl App {
 
     /// Check if the current selection is near the bottom and fetch more issues.
     ///
-    /// The WorkItemTable widget handles selection changes but can't mutate
+    /// The SplitTable widget handles selection changes but can't mutate
     /// `model.repos` (to set `issue_fetch_pending`). This post-dispatch check
     /// runs after every key event to trigger infinite scroll when needed.
     fn check_infinite_scroll(&mut self) {

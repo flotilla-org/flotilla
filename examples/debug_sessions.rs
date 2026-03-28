@@ -94,32 +94,28 @@ async fn main() {
         println!("    [{i}] name={:?} keys={:?}", ws.name, ws.correlation_keys);
     }
 
-    // Step 3: Show resulting table entries
-    println!("\n=== Step 3: Table entries after correlate() ===");
+    // Step 3: Show resulting table sections
+    println!("\n=== Step 3: Table sections after correlate() ===");
     let section_labels = data::SectionLabels::default();
     let work_items: Vec<_> = snapshot
         .work_items
         .iter()
         .map(|item| correlation_result_to_work_item(item, &snapshot.correlation_groups, &flotilla_core::HostName::local()))
         .collect();
-    let table_view = data::group_work_items(&work_items, &snapshot.providers, &section_labels, &repo_root);
-    for (i, entry) in table_view.table_entries.iter().enumerate() {
-        match entry {
-            data::GroupEntry::Header(h) => {
-                println!("  [{i}] HEADER: {h}");
-            }
-            data::GroupEntry::Item(item) => {
-                println!(
-                    "  [{i}] {:?} desc={:?} branch={:?} co={:?} pr={:?} ses={:?} ws={:?}",
-                    item.kind,
-                    item.description,
-                    item.branch,
-                    item.checkout_key(),
-                    item.change_request_key,
-                    item.session_key,
-                    item.workspace_refs
-                );
-            }
+    let sections = data::group_work_items_split(&work_items, &snapshot.providers, &section_labels, &repo_root);
+    for section in &sections {
+        println!("  SECTION [{}]: {} items", section.label, section.items.len());
+        for (i, item) in section.items.iter().enumerate() {
+            println!(
+                "    [{i}] {:?} desc={:?} branch={:?} co={:?} pr={:?} ses={:?} ws={:?}",
+                item.kind,
+                item.description,
+                item.branch,
+                item.checkout_key(),
+                item.change_request_key,
+                item.session_key,
+                item.workspace_refs
+            );
         }
     }
 }

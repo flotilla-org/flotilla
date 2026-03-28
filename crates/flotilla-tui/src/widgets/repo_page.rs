@@ -167,11 +167,7 @@ impl RepoPage {
             sessions: data.labels.cloud_agents.section.clone(),
         };
         let sections = flotilla_core::data::group_work_items_split(&data.work_items, &data.providers, &section_labels, &data.path);
-        let sections = if self.show_archived {
-            sections
-        } else {
-            flotilla_core::data::filter_archived_sections(sections, &data.providers)
-        };
+        let sections = if self.show_archived { sections } else { flotilla_core::data::filter_archived_sections(sections, &data.providers) };
         self.table.update_sections(sections);
 
         let current_identities: HashSet<WorkItemIdentity> = self.table.all_items().map(|item| item.identity.clone()).collect();

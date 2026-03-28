@@ -35,21 +35,6 @@ impl fmt::Display for RefreshError {
 }
 
 #[derive(Debug, Clone)]
-pub struct SectionHeader(pub String);
-
-impl fmt::Display for SectionHeader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum GroupEntry {
-    Header(SectionHeader),
-    Item(Box<flotilla_protocol::WorkItem>),
-}
-
-#[derive(Debug, Clone)]
 pub enum CorrelatedAnchor {
     Checkout(CheckoutRef),
     AttachableSet(flotilla_protocol::AttachableSetId),
@@ -251,63 +236,6 @@ impl CorrelationResult {
             CorrelationResult::Correlated(c) => Some(c),
             _ => None,
         }
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct GroupedWorkItems {
-    pub table_entries: Vec<GroupEntry>,
-    pub selectable_indices: Vec<usize>,
-}
-
-impl GroupedWorkItems {
-    /// Return a new `GroupedWorkItems` with archived/expired session-only items removed.
-    /// Agent items are never filtered. Items with non-Session kinds are kept.
-    pub fn filter_archived_sessions(&self, providers: &ProviderData) -> GroupedWorkItems {
-        use flotilla_protocol::SessionStatus;
-
-        let mut entries = Vec::new();
-        let mut selectable = Vec::new();
-
-        for entry in &self.table_entries {
-            match entry {
-                GroupEntry::Item(item) => {
-                    if item.kind == WorkItemKind::Session {
-                        let is_archived = item
-                            .session_key
-                            .as_deref()
-                            .and_then(|k| providers.sessions.get(k))
-                            .is_some_and(|s| matches!(s.status, SessionStatus::Archived | SessionStatus::Expired));
-                        if is_archived {
-                            continue;
-                        }
-                    }
-                    selectable.push(entries.len());
-                    entries.push(entry.clone());
-                }
-                GroupEntry::Header(_) => {
-                    entries.push(entry.clone());
-                }
-            }
-        }
-
-        // Remove orphaned headers (header followed by another header or end-of-list)
-        let mut cleaned = Vec::new();
-        let mut cleaned_selectable = Vec::new();
-        for (i, entry) in entries.iter().enumerate() {
-            if let GroupEntry::Header(_) = entry {
-                let next_is_item = entries.get(i + 1).is_some_and(|e| matches!(e, GroupEntry::Item(_)));
-                if !next_is_item {
-                    continue;
-                }
-            }
-            if selectable.contains(&i) {
-                cleaned_selectable.push(cleaned.len());
-            }
-            cleaned.push(entry.clone());
-        }
-
-        GroupedWorkItems { table_entries: cleaned, selectable_indices: cleaned_selectable }
     }
 }
 
@@ -696,125 +624,6 @@ fn checkout_sort_tier(path: &Path, repo_root: &Path) -> u8 {
     1
 }
 
-/// Sort work items into sections and build table entries.
-///
-/// Accepts protocol `WorkItem` (flat, serializable) so this function can be
-/// used both in-process (core side) and in the TUI after receiving a repo snapshot.
-pub fn group_work_items(
-    work_items: &[flotilla_protocol::WorkItem],
-    providers: &ProviderData,
-    labels: &SectionLabels,
-    repo_root: &Path,
-) -> GroupedWorkItems {
-    let mut checkout_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
-    let mut attachable_set_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
-    let mut session_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
-    let mut pr_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
-    let mut remote_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
-    let mut issue_items: Vec<&flotilla_protocol::WorkItem> = Vec::new();
-
-    for item in work_items {
-        match item.kind {
-            WorkItemKind::Checkout => checkout_items.push(item),
-            WorkItemKind::AttachableSet => attachable_set_items.push(item),
-            WorkItemKind::Session => session_items.push(item),
-            WorkItemKind::ChangeRequest => pr_items.push(item),
-            WorkItemKind::RemoteBranch => remote_items.push(item),
-            WorkItemKind::Issue => issue_items.push(item),
-            WorkItemKind::Agent => session_items.push(item),
-        }
-    }
-
-    let mut entries: Vec<GroupEntry> = Vec::new();
-    let mut selectable: Vec<usize> = Vec::new();
-
-    // Checkouts -- group by host, then main first within host, then proximity, then path
-    checkout_items.sort_by_cached_key(|item| {
-        let host_name = item.host.to_string();
-        let main_tier = u8::from(!item.is_main_checkout);
-        let key = item.checkout_key();
-        let proximity_tier = key.map(|p| checkout_sort_tier(&p.path, repo_root)).unwrap_or(1);
-        let path_key = key.map(|p| p.path.to_path_buf());
-        (host_name, main_tier, proximity_tier, path_key)
-    });
-    if !checkout_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader(labels.checkouts.clone())));
-        for item in checkout_items {
-            selectable.push(entries.len());
-            entries.push(GroupEntry::Item(Box::new(item.clone())));
-        }
-    }
-
-    attachable_set_items.sort_by(|a, b| a.description.cmp(&b.description));
-    if !attachable_set_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader("Attachable Sets".into())));
-        for item in attachable_set_items {
-            selectable.push(entries.len());
-            entries.push(GroupEntry::Item(Box::new(item.clone())));
-        }
-    }
-
-    // Sessions -- grouped by provider, then sorted by updated_at descending
-    session_items.sort_by(|a, b| {
-        let a_ses = a.session_key.as_deref().and_then(|k| providers.sessions.get(k));
-        let b_ses = b.session_key.as_deref().and_then(|k| providers.sessions.get(k));
-        let a_provider = a_ses.map(|s| s.provider_name.as_str()).unwrap_or("");
-        let b_provider = b_ses.map(|s| s.provider_name.as_str()).unwrap_or("");
-        a_provider.cmp(b_provider).then_with(|| {
-            let a_time = a_ses.and_then(|s| s.updated_at.as_deref());
-            let b_time = b_ses.and_then(|s| s.updated_at.as_deref());
-            b_time.cmp(&a_time)
-        })
-    });
-    if !session_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader(labels.sessions.clone())));
-        for item in session_items {
-            selectable.push(entries.len());
-            entries.push(GroupEntry::Item(Box::new(item.clone())));
-        }
-    }
-
-    // PRs -- sorted by id descending
-    pr_items.sort_by(|a, b| {
-        let a_num = a.change_request_key.as_deref().and_then(|k| k.parse::<i64>().ok());
-        let b_num = b.change_request_key.as_deref().and_then(|k| k.parse::<i64>().ok());
-        b_num.cmp(&a_num)
-    });
-    if !pr_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader(labels.change_requests.clone())));
-        for item in pr_items {
-            selectable.push(entries.len());
-            entries.push(GroupEntry::Item(Box::new(item.clone())));
-        }
-    }
-
-    // Remote branches -- sorted by branch name
-    remote_items.sort_by(|a, b| a.branch.cmp(&b.branch));
-    if !remote_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader("Remote Branches".into())));
-        for item in remote_items {
-            selectable.push(entries.len());
-            entries.push(GroupEntry::Item(Box::new(item.clone())));
-        }
-    }
-
-    // Issues -- sorted by id descending
-    issue_items.sort_by(|a, b| {
-        let a_num = a.issue_keys.first().and_then(|k| k.parse::<i64>().ok());
-        let b_num = b.issue_keys.first().and_then(|k| k.parse::<i64>().ok());
-        b_num.cmp(&a_num)
-    });
-    if !issue_items.is_empty() {
-        entries.push(GroupEntry::Header(SectionHeader(labels.issues.clone())));
-        for item in issue_items {
-            selectable.push(entries.len());
-            entries.push(GroupEntry::Item(Box::new(item.clone())));
-        }
-    }
-
-    GroupedWorkItems { table_entries: entries, selectable_indices: selectable }
-}
-
 /// Sort work items into typed sections, each with its own sorted item list.
 ///
 /// Unlike `group_work_items()`, which returns a flat interleaved list of headers and items,
@@ -960,7 +769,11 @@ pub fn filter_archived_sections(sections: Vec<SectionData>, providers: &Provider
                     }
                 });
             }
-            if section.items.is_empty() { None } else { Some(section) }
+            if section.items.is_empty() {
+                None
+            } else {
+                Some(section)
+            }
         })
         .collect()
 }
