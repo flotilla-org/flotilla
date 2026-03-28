@@ -990,7 +990,7 @@ impl StepResolver for ExecutorStepResolver {
                     .await
                     .map_err(|e| format!("failed to read .flotilla/environment.yaml from HEAD: {e}"))?;
                 let spec: flotilla_protocol::EnvironmentSpec =
-                    serde_yaml::from_str(&yaml).map_err(|e| format!("invalid .flotilla/environment.yaml: {e}"))?;
+                    serde_yml::from_str(&yaml).map_err(|e| format!("invalid .flotilla/environment.yaml: {e}"))?;
                 Ok(StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec }))
             }
             StepAction::EnsureEnvironmentImage { provider } => {

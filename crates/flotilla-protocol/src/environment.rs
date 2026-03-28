@@ -42,15 +42,28 @@ pub struct EnvironmentSpec {
 /// image:
 ///   registry: ubuntu:24.04
 /// ```
+/// Source from which to obtain a container image.
+///
+/// In YAML config, written as a map with one key:
+/// ```yaml
+/// image:
+///   dockerfile: .flotilla/Dockerfile.dev-env
+/// ```
+/// or:
+/// ```yaml
+/// image:
+///   registry: ubuntu:24.04
+/// ```
+///
+/// Custom serde impls because serde_yml uses YAML tags (`!dockerfile path`) for
+/// externally-tagged enums, which is unfriendly for hand-written config files.
+/// These impls produce plain map keys (`dockerfile: path`) instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSource {
     Dockerfile(PathBuf),
     Registry(String),
 }
 
-/// Serde helper: serialize ImageSource as `{"dockerfile": "path"}` or `{"registry": "image"}`.
-/// serde_yaml 0.9 uses YAML tags for externally-tagged enums, which is unfriendly for
-/// user-written config files. This manual impl uses a plain map instead.
 impl Serialize for ImageSource {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
@@ -128,7 +141,7 @@ image:
 token_env_vars:
   - GITHUB_TOKEN
 "#;
-        let spec: EnvironmentSpec = serde_yaml::from_str(yaml).expect("should parse dockerfile variant");
+        let spec: EnvironmentSpec = serde_yml::from_str(yaml).expect("should parse dockerfile variant");
         assert_eq!(spec.image, ImageSource::Dockerfile(PathBuf::from(".flotilla/Dockerfile.dev-env")));
         assert_eq!(spec.token_env_vars, vec!["GITHUB_TOKEN"]);
     }
@@ -140,7 +153,7 @@ image:
   registry: ubuntu:24.04
 token_env_vars: []
 "#;
-        let spec: EnvironmentSpec = serde_yaml::from_str(yaml).expect("should parse registry variant");
+        let spec: EnvironmentSpec = serde_yml::from_str(yaml).expect("should parse registry variant");
         assert_eq!(spec.image, ImageSource::Registry("ubuntu:24.04".into()));
         assert!(spec.token_env_vars.is_empty());
     }
@@ -152,7 +165,7 @@ image:
   dockerfile: Dockerfile
 token_env_vars: []
 "#;
-        let spec: EnvironmentSpec = serde_yaml::from_str(yaml).expect("should parse with empty tokens");
+        let spec: EnvironmentSpec = serde_yml::from_str(yaml).expect("should parse with empty tokens");
         assert_eq!(spec.image, ImageSource::Dockerfile(PathBuf::from("Dockerfile")));
     }
 }

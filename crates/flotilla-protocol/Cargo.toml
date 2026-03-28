@@ -19,5 +19,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
-serde_yaml = "0.9"
+serde_yml = "0.0.12"
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -552,7 +552,7 @@ fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion>
 
         // +<provider>@<hostname> — new environment via provider
         for provider in &summary.providers {
-            if provider.category == "environment_provider" {
+            if provider.category == "environment_provider" && !provider.implementation.is_empty() {
                 let value = format!("+{}@{hostname}", provider.implementation);
                 if partial.is_empty() || value.starts_with(partial) {
                     let description = format!("new {} environment", provider.name);
