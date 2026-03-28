@@ -626,10 +626,10 @@ fn checkout_sort_tier(path: &Path, repo_root: &Path) -> u8 {
 
 /// Sort work items into typed sections, each with its own sorted item list.
 ///
-/// Unlike `group_work_items()`, which returns a flat interleaved list of headers and items,
-/// this function returns a `Vec<SectionData>` where each section is self-contained.
-/// Empty sections are omitted. Display order: Checkouts, AttachableSets, CloudAgents,
-/// ChangeRequests, RemoteBranches, Issues.
+/// Returns a `Vec<SectionData>` where each section is self-contained with its
+/// kind, display label, and sorted items. Empty sections are omitted.
+/// Display order: Checkouts, AttachableSets, CloudAgents, ChangeRequests,
+/// RemoteBranches, Issues.
 pub fn group_work_items_split(
     work_items: &[flotilla_protocol::WorkItem],
     providers: &ProviderData,

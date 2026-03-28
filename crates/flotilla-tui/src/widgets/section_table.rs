@@ -192,13 +192,37 @@ impl<T: Identifiable> SectionTable<T> {
     /// Builds a header row from the column definitions, then one data row per
     /// item using each column's extractor. No block/border is added — the
     /// composing widget owns the outer container.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderCtx, highlight_style: Style) {
+    ///
+    /// If `row_style_override` is provided, it is called for each item. When it
+    /// returns `Some(style)`, that style is applied to the row (e.g. for
+    /// multi-select or pending-action indicators).
+    #[allow(clippy::type_complexity)]
+    pub fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ctx: &RenderCtx,
+        highlight_style: Style,
+        row_style_override: Option<&dyn Fn(&T) -> Option<Style>>,
+    ) {
         let header = Row::new(
             self.columns.iter().map(|c| Cell::from(Span::raw(c.header.clone())).style(Style::default().fg(ctx.theme.muted).bold())),
         )
         .height(1);
 
-        let rows: Vec<Row> = self.items.iter().map(|item| Row::new(self.columns.iter().map(|c| (c.extract)(item, ctx)))).collect();
+        let rows: Vec<Row> = self
+            .items
+            .iter()
+            .map(|item| {
+                let mut row = Row::new(self.columns.iter().map(|c| (c.extract)(item, ctx)));
+                if let Some(ref style_fn) = row_style_override {
+                    if let Some(style) = style_fn(item) {
+                        row = row.style(style);
+                    }
+                }
+                row
+            })
+            .collect();
 
         let widths: Vec<Constraint> = self.columns.iter().map(|c| c.width).collect();
 

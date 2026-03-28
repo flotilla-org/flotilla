@@ -4,7 +4,7 @@ use flotilla_core::data::{SectionData, SectionKind};
 use flotilla_protocol::{WorkItem, WorkItemIdentity};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Row, Table},
     Frame,
@@ -16,7 +16,10 @@ use super::{
     PROVIDER_CATEGORIES,
 };
 use crate::{
-    app::{ui_state::PendingAction, ProviderStatus, TuiModel, UiState},
+    app::{
+        ui_state::{PendingAction, PendingStatus},
+        ProviderStatus, TuiModel, UiState,
+    },
     theme::Theme,
 };
 
@@ -82,6 +85,7 @@ impl SplitTable {
                 continue;
             }
             if let Some(mut existing) = old_sections.remove(&sd.kind) {
+                existing.header_label = sd.label.clone();
                 existing.update_items(sd.items);
                 self.sections.push((sd.kind, existing));
             } else {
@@ -231,8 +235,8 @@ impl SplitTable {
         frame: &mut Frame,
         area: Rect,
         show_providers: bool,
-        _multi_selected: &HashSet<WorkItemIdentity>,
-        _pending_actions: &HashMap<WorkItemIdentity, PendingAction>,
+        multi_selected: &HashSet<WorkItemIdentity>,
+        pending_actions: &HashMap<WorkItemIdentity, PendingAction>,
     ) {
         self.table_area = area;
         ui.layout.table_area = area;
@@ -291,6 +295,20 @@ impl SplitTable {
 
         self.section_areas.clear();
 
+        // Build row-style override closure for multi-select and pending-action indicators.
+        let row_style = |item: &WorkItem| -> Option<Style> {
+            if let Some(pending) = pending_actions.get(&item.identity) {
+                match &pending.status {
+                    PendingStatus::Failed(_) => Some(Style::default().fg(theme.error).add_modifier(Modifier::DIM)),
+                    PendingStatus::InFlight => None,
+                }
+            } else if multi_selected.contains(&item.identity) {
+                Some(Style::default().bg(theme.multi_select_bg))
+            } else {
+                None
+            }
+        };
+
         for (i, (_kind, table)) in self.sections.iter_mut().enumerate() {
             let divider_area = chunks[i * 2];
             let table_area = chunks[i * 2 + 1];
@@ -323,7 +341,7 @@ impl SplitTable {
 
             let highlight_style = if i == self.active_section { Style::default().bg(theme.row_highlight) } else { Style::default() };
 
-            table.render(frame, table_area, &render_ctx, highlight_style);
+            table.render(frame, table_area, &render_ctx, highlight_style, Some(&row_style));
             self.section_areas.push(table_area);
         }
     }
