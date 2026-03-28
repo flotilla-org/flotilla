@@ -2520,6 +2520,139 @@ async fn build_plan_with_environment_local_host_omits_suffix() {
     }
 }
 
+#[tokio::test]
+async fn build_plan_with_existing_environment_returns_4_steps() {
+    let registry = empty_registry();
+    let data = empty_data();
+
+    let cmd = Command {
+        host: Some(HostName::new("feta")),
+        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::ExistingEnvironment {
+            host: HostName::new("feta"),
+            env_id: flotilla_protocol::EnvironmentId::new("env-abc"),
+        }),
+        context_repo: Some(repo_selector()),
+        action: CommandAction::Checkout {
+            repo: repo_selector(),
+            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
+            issue_ids: vec![],
+        },
+    };
+
+    let plan = build_plan(
+        cmd,
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        HostName::new("laptop"),
+    )
+    .await
+    .expect("build_plan should succeed");
+
+    assert_eq!(plan.steps.len(), 4, "existing-environment checkout should have 4 steps");
+
+    assert!(matches!(plan.steps[0].action, StepAction::DiscoverEnvironmentProviders { .. }));
+    assert!(matches!(plan.steps[1].action, StepAction::CreateCheckout { .. }));
+    assert!(matches!(plan.steps[2].action, StepAction::PrepareWorkspace { .. }));
+    assert!(matches!(plan.steps[3].action, StepAction::AttachWorkspace));
+
+    // Steps 0 executes on Host(feta)
+    assert_eq!(*plan.steps[0].host.host_name(), HostName::new("feta"));
+    assert!(matches!(&plan.steps[0].host, StepExecutionContext::Host(_)));
+
+    // Steps 1-2 execute in Environment(feta, env_id)
+    assert!(matches!(&plan.steps[1].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
+    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
+
+    // Step 3 attaches on the local host
+    assert_eq!(*plan.steps[3].host.host_name(), HostName::new("laptop"));
+    assert!(matches!(&plan.steps[3].host, StepExecutionContext::Host(_)));
+}
+
+#[tokio::test]
+async fn build_plan_with_host_target_returns_standard_checkout_plan() {
+    let registry = empty_registry();
+    let data = empty_data();
+
+    // ProvisioningTarget::Host should fall through to the standard checkout plan
+    let cmd = Command {
+        host: Some(HostName::new("feta")),
+        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("feta") }),
+        context_repo: Some(repo_selector()),
+        action: CommandAction::Checkout {
+            repo: repo_selector(),
+            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
+            issue_ids: vec![],
+        },
+    };
+
+    let plan = build_plan(
+        cmd,
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        HostName::new("laptop"),
+    )
+    .await
+    .expect("build_plan should succeed");
+
+    // Standard checkout plan: CreateCheckout + PrepareWorkspace + AttachWorkspace
+    assert_eq!(plan.steps.len(), 3, "host-target checkout should have 3 steps");
+
+    assert!(matches!(plan.steps[0].action, StepAction::CreateCheckout { .. }));
+    assert!(matches!(plan.steps[1].action, StepAction::PrepareWorkspace { .. }));
+    assert!(matches!(plan.steps[2].action, StepAction::AttachWorkspace));
+
+    // CreateCheckout and PrepareWorkspace run on the target host
+    assert_eq!(*plan.steps[0].host.host_name(), HostName::new("feta"));
+    assert_eq!(*plan.steps[1].host.host_name(), HostName::new("feta"));
+    // AttachWorkspace runs on the local host
+    assert_eq!(*plan.steps[2].host.host_name(), HostName::new("laptop"));
+}
+
+#[tokio::test]
+async fn build_plan_with_no_provisioning_target_returns_standard_checkout_plan() {
+    let registry = empty_registry();
+    let data = empty_data();
+
+    // No provisioning_target should also produce the standard checkout plan
+    let cmd = Command {
+        host: Some(HostName::new("feta")),
+        provisioning_target: None,
+        context_repo: Some(repo_selector()),
+        action: CommandAction::Checkout {
+            repo: repo_selector(),
+            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
+            issue_ids: vec![],
+        },
+    };
+
+    let plan = build_plan(
+        cmd,
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(data),
+        config_base(),
+        test_attachable_store(&config_base()),
+        None,
+        HostName::new("laptop"),
+    )
+    .await
+    .expect("build_plan should succeed");
+
+    assert_eq!(plan.steps.len(), 3, "no-target checkout should have 3 steps");
+
+    assert!(matches!(plan.steps[0].action, StepAction::CreateCheckout { .. }));
+    assert!(matches!(plan.steps[1].action, StepAction::PrepareWorkspace { .. }));
+    assert!(matches!(plan.steps[2].action, StepAction::AttachWorkspace));
+}
+
 // -----------------------------------------------------------------------
 // Tests: resolve_checkout_branch
 // -----------------------------------------------------------------------
