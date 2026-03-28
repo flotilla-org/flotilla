@@ -1,7 +1,10 @@
 use flotilla_protocol::ProviderData;
 use ratatui::{
-    layout::Constraint,
-    widgets::{Cell, TableState},
+    layout::{Constraint, Rect},
+    style::Style,
+    text::Span,
+    widgets::{Cell, HighlightSpacing, Row, Table, TableState},
+    Frame,
 };
 
 use crate::theme::Theme;
@@ -181,6 +184,55 @@ impl<T: Identifiable> SectionTable<T> {
     /// The number of items in the table.
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Render the table into `area`.
+    ///
+    /// Builds a header row from the column definitions, then one data row per
+    /// item using each column's extractor. No block/border is added — the
+    /// composing widget owns the outer container.
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderCtx, highlight_style: Style) {
+        let header = Row::new(self.columns.iter().map(|c| {
+            Cell::from(Span::raw(c.header.clone())).style(Style::default().fg(ctx.theme.muted).bold())
+        }))
+        .height(1);
+
+        let rows: Vec<Row> = self.items.iter().map(|item| Row::new(self.columns.iter().map(|c| (c.extract)(item, ctx)))).collect();
+
+        let widths: Vec<Constraint> = self.columns.iter().map(|c| c.width).collect();
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(highlight_style)
+            .highlight_symbol("▸ ")
+            .highlight_spacing(HighlightSpacing::Always);
+
+        frame.render_stateful_widget(table, area, &mut self.table_state);
+    }
+
+    /// Hit-test a y-coordinate against the rendered area.
+    ///
+    /// Row layout (no block/border on the table itself, but the caller places
+    /// the table inside a bordered container, so the table area already
+    /// excludes the border):
+    ///
+    /// - Row 0 (area.y + 0): column header
+    /// - Rows 1.. (area.y + 1..): data rows, offset by scroll
+    ///
+    /// Returns the item index into `self.items`, or `None` if `y` is outside
+    /// the area or maps to the header row.
+    pub fn row_at_y(&self, y: u16, area: Rect) -> Option<usize> {
+        if y < area.y || y >= area.y + area.height {
+            return None;
+        }
+        let relative = (y - area.y) as usize;
+        if relative == 0 {
+            // Header row
+            return None;
+        }
+        let data_row = relative - 1;
+        let idx = self.table_state.offset() + data_row;
+        if idx < self.items.len() { Some(idx) } else { None }
     }
 }
 
