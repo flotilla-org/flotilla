@@ -338,6 +338,25 @@ impl Default for SectionLabels {
     }
 }
 
+/// Identifies a table section by the kind of work items it contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SectionKind {
+    Checkouts,
+    AttachableSets,
+    CloudAgents,
+    ChangeRequests,
+    RemoteBranches,
+    Issues,
+}
+
+/// A single section's worth of sorted work items, ready for display.
+#[derive(Debug, Clone)]
+pub struct SectionData {
+    pub kind: SectionKind,
+    pub label: String,
+    pub items: Vec<flotilla_protocol::WorkItem>,
+}
+
 /// Convert a correlation group into a CorrelationResult.
 /// Returns None for groups that contain only workspaces (no checkout, PR, or session).
 fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_idx: usize) -> Option<CorrelationResult> {
