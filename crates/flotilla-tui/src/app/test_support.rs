@@ -14,8 +14,8 @@ use flotilla_core::{
     data::{GroupEntry, GroupedWorkItems},
 };
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, HostName, ProviderData, ProviderError, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot, StatusResponse,
-    StreamKey, TopologyResponse, WorkItem,
+    Change, Command, DaemonEvent, HostName, ProviderData, ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot,
+    StatusResponse, StreamKey, TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
@@ -194,7 +194,7 @@ pub(crate) struct TestWidgetHarness {
     pub config: Arc<ConfigStore>,
     pub in_flight: HashMap<u64, InFlightCommand>,
     pub commands: CommandQueue,
-    pub target_host: Option<HostName>,
+    pub provisioning_target: ProvisioningTarget,
     pub my_host: Option<HostName>,
     pub is_config: bool,
     pub active_repo_is_remote_only: bool,
@@ -209,7 +209,7 @@ impl TestWidgetHarness {
             config: app.config,
             in_flight: app.in_flight,
             commands: app.proto_commands,
-            target_host: app.ui.target_host,
+            provisioning_target: app.ui.provisioning_target.clone(),
             my_host: None,
             is_config: false,
             active_repo_is_remote_only: false,
@@ -222,7 +222,7 @@ impl TestWidgetHarness {
             keymap: &self.keymap,
             config: &self.config,
             in_flight: &self.in_flight,
-            target_host: self.target_host.as_ref(),
+            provisioning_target: &self.provisioning_target,
             my_host: self.my_host.clone(),
             active_repo: self.model.active_repo,
             repo_order: &self.model.repo_order,

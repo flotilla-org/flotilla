@@ -279,7 +279,7 @@ impl App {
                 Ok(resolved) => {
                     let is_config = self.ui.is_config;
                     let active_repo = if is_config { None } else { Some(self.model.active_repo_identity()) };
-                    let target_host = self.ui.target_host.clone();
+                    let provisioning_target = self.ui.provisioning_target.clone();
                     let remote_only = self.active_repo_is_remote_only();
 
                     match crate::widgets::command_palette::tui_dispatch(
@@ -287,7 +287,7 @@ impl App {
                         Some(item),
                         is_config,
                         active_repo,
-                        &target_host,
+                        &provisioning_target,
                         &my_host,
                         remote_only,
                     ) {

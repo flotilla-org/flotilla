@@ -278,10 +278,7 @@ pub(crate) fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
         RepoViewLayout::Below => "below",
     };
 
-    let host_label = match ui.target_host.as_ref() {
-        Some(host) => format!("@{host}"),
-        None => "@local".into(),
-    };
+    let host_label = ui.provisioning_target.to_string();
 
     vec![
         ModeIndicator::new(layout_icon, layout_label, StatusBarAction::key(KeyCode::Char('l'))),

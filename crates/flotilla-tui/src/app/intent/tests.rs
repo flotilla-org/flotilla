@@ -1,7 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CorrelationKey, HostName, HostPath, RepoLabels, RepoSelector,
+    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CorrelationKey, HostName, HostPath, ProvisioningTarget,
+    RepoLabels, RepoSelector,
 };
 
 use super::*;
@@ -365,7 +366,7 @@ fn resolve_switch_to_workspace_picks_first_ref() {
 #[test]
 fn resolve_create_workspace() {
     let mut app = stub_app();
-    app.ui.target_host = Some(HostName::new("remote-a"));
+    app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("remote-a") };
     let item = checkout_item("feat/x", "/tmp/feat-x", false);
     let cmd = Intent::CreateWorkspace.resolve(&item, &app);
     assert!(cmd.is_some());
@@ -496,7 +497,7 @@ fn resolve_create_worktree_and_workspace_pr_item() {
 #[test]
 fn resolve_create_worktree_and_workspace_uses_selected_target_host() {
     let mut app = stub_app();
-    app.ui.target_host = Some(HostName::new("remote-a"));
+    app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("remote-a") };
     let item = remote_branch_item("feat/remote");
 
     let cmd = Intent::CreateCheckout.resolve(&item, &app).unwrap();
@@ -552,7 +553,7 @@ fn resolve_generate_branch_name_none_without_issues() {
 fn resolve_open_pr() {
     let mut app = stub_app();
     insert_local_host(&mut app.model, &HostName::local().to_string());
-    app.ui.target_host = Some(HostName::new("remote-a"));
+    app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("remote-a") };
     let mut item = pr_item("123");
     item.host = HostName::new("remote-b");
     let cmd = Intent::OpenChangeRequest.resolve(&item, &app);

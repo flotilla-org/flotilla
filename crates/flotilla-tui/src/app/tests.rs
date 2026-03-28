@@ -1,5 +1,5 @@
 use crossterm::event::KeyCode;
-use flotilla_protocol::WorkItemIdentity;
+use flotilla_protocol::{ProvisioningTarget, WorkItemIdentity};
 use tempfile::tempdir;
 use test_support::*;
 
@@ -574,24 +574,24 @@ fn step_failure_surfaces_error_in_status_message() {
 #[test]
 fn peer_disconnect_clears_selected_target_host() {
     let mut app = stub_app();
-    app.ui.target_host = Some(HostName::new("alpha"));
+    app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("alpha") };
     insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
 
     app.handle_daemon_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Disconnected });
 
-    assert_eq!(app.ui.target_host, None);
+    assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
     assert_eq!(app.model.hosts.get(&HostName::new("alpha")).unwrap().status, PeerStatus::Disconnected);
 }
 
 #[test]
 fn host_removed_event_deletes_host_and_clears_selected_target_host() {
     let mut app = stub_app();
-    app.ui.target_host = Some(HostName::new("alpha"));
+    app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("alpha") };
     insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
 
     app.handle_daemon_event(DaemonEvent::HostRemoved { host: HostName::new("alpha"), seq: 2 });
 
-    assert_eq!(app.ui.target_host, None);
+    assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
     assert!(!app.model.hosts.contains_key(&HostName::new("alpha")));
 }
 

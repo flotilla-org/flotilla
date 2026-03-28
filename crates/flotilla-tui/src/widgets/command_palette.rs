@@ -2,7 +2,7 @@ use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use flotilla_commands::{HostResolution, RepoContext, Resolved};
-use flotilla_protocol::{Command, CommandAction, HostName, RepoIdentity, RepoSelector, WorkItem};
+use flotilla_protocol::{Command, CommandAction, HostName, ProvisioningTarget, RepoIdentity, RepoSelector, WorkItem};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -190,7 +190,7 @@ impl CommandPaletteWidget {
             self.source_item.as_ref(),
             *ctx.is_config,
             active_repo.as_ref(),
-            &ctx.target_host.cloned(),
+            ctx.provisioning_target,
             &ctx.my_host,
             ctx.active_repo_is_remote_only,
         ) {
@@ -366,7 +366,7 @@ pub(crate) fn tui_dispatch(
     item: Option<&WorkItem>,
     is_config: bool,
     active_repo: Option<&RepoIdentity>,
-    target_host: &Option<HostName>,
+    provisioning_target: &ProvisioningTarget,
     my_host: &Option<HostName>,
     active_repo_is_remote_only: bool,
 ) -> Result<Command, String> {
@@ -398,18 +398,21 @@ pub(crate) fn tui_dispatch(
             // When the user types `host feta cr #42 open`, HostNoun::resolve() calls set_host("feta")
             // during noun resolution, so command.host is already Some. We must not clobber it.
             if command.host.is_none() {
-                command.host = match host {
-                    HostResolution::Local => None,
-                    HostResolution::ProvisioningTarget => target_host.clone(),
-                    HostResolution::SubjectHost => item.and_then(|i| item_execution_host(i, my_host)),
+                match host {
+                    HostResolution::Local => {}
+                    HostResolution::ProvisioningTarget => {
+                        command.host = Some(provisioning_target.host().clone());
+                        command.provisioning_target = Some(provisioning_target.clone());
+                    }
+                    HostResolution::SubjectHost => {
+                        command.host = item.and_then(|i| item_execution_host(i, my_host));
+                    }
                     HostResolution::ProviderHost => {
                         if active_repo_is_remote_only {
-                            item.and_then(|i| item_execution_host(i, my_host))
-                        } else {
-                            None
+                            command.host = item.and_then(|i| item_execution_host(i, my_host));
                         }
                     }
-                };
+                }
             }
 
             Ok(command)
@@ -550,7 +553,7 @@ impl InteractiveWidget for CommandPaletteWidget {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use flotilla_protocol::{Command, CommandAction, WorkItemIdentity, WorkItemKind};
+    use flotilla_protocol::{Command, CommandAction, ProvisioningTarget, WorkItemIdentity, WorkItemKind};
 
     use super::*;
     use crate::app::test_support::{bare_item, checkout_item, session_item, TestWidgetHarness};
@@ -927,7 +930,8 @@ mod tests {
     #[test]
     fn dispatch_ready_passes_through() {
         let cmd = Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } };
-        let result = tui_dispatch(Resolved::Ready(cmd), None, false, None, &None, &None, false);
+        let local_target = ProvisioningTarget::Host { host: HostName::local() };
+        let result = tui_dispatch(Resolved::Ready(cmd), None, false, None, &local_target, &None, false);
         assert!(result.is_ok());
     }
 
@@ -945,7 +949,8 @@ mod tests {
             },
         };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::ProvisioningTarget };
-        let result = tui_dispatch(resolved, None, true, None, &None, &None, false);
+        let local_target = ProvisioningTarget::Host { host: HostName::local() };
+        let result = tui_dispatch(resolved, None, true, None, &local_target, &None, false);
         assert!(result.is_err());
     }
 
@@ -964,7 +969,8 @@ mod tests {
         };
         let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::Local };
-        let result = tui_dispatch(resolved, None, false, Some(&repo_id), &None, &None, false).unwrap();
+        let local_target = ProvisioningTarget::Host { host: HostName::local() };
+        let result = tui_dispatch(resolved, None, false, Some(&repo_id), &local_target, &None, false).unwrap();
         assert!(result.context_repo.is_some());
         match &result.action {
             CommandAction::Checkout { repo, .. } => assert_ne!(*repo, RepoSelector::Query("".into())),
@@ -983,7 +989,8 @@ mod tests {
             action: CommandAction::OpenChangeRequest { id: "42".into() },
         };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
-        let result = tui_dispatch(resolved, None, false, Some(&repo_id), &None, &None, false).expect("should succeed");
+        let local_target = ProvisioningTarget::Host { host: HostName::local() };
+        let result = tui_dispatch(resolved, None, false, Some(&repo_id), &local_target, &None, false).expect("should succeed");
         // Explicit host must be preserved, not clobbered by ProviderHost resolution
         assert_eq!(result.host, Some(HostName::new("feta")));
     }
@@ -1018,7 +1025,8 @@ mod tests {
         let my_host = Some(HostName::new("local-host"));
         // ProviderHost on a remote-only repo should derive host from the item
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
-        let result = tui_dispatch(resolved, Some(&item), false, Some(&repo_id), &None, &my_host, true).expect("should succeed");
+        let local_target = ProvisioningTarget::Host { host: HostName::local() };
+        let result = tui_dispatch(resolved, Some(&item), false, Some(&repo_id), &local_target, &my_host, true).expect("should succeed");
         assert_eq!(result.host, Some(HostName::new("remote-peer")));
     }
 }

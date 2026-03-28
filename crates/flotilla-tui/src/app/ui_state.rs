@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use flotilla_protocol::{HostName, RepoIdentity, WorkItemIdentity};
+use flotilla_protocol::{HostName, ProvisioningTarget, RepoIdentity, WorkItemIdentity};
 use ratatui::layout::Rect;
 
 use crate::status_bar::StatusBarTarget;
@@ -106,7 +106,7 @@ pub struct DragState {
 
 pub struct UiState {
     pub is_config: bool,
-    pub target_host: Option<HostName>,
+    pub provisioning_target: ProvisioningTarget,
     pub view_layout: RepoViewLayout,
     pub status_bar: StatusBarUiState,
     pub layout: LayoutAreas,
@@ -121,7 +121,7 @@ impl UiState {
     pub fn new(_repo_ids: &[RepoIdentity]) -> Self {
         Self {
             is_config: false,
-            target_host: None,
+            provisioning_target: ProvisioningTarget::Host { host: HostName::local() },
             view_layout: RepoViewLayout::default(),
             status_bar: StatusBarUiState::default(),
             layout: LayoutAreas::default(),
@@ -137,19 +137,6 @@ impl UiState {
             RepoViewLayout::Zoom => RepoViewLayout::Right,
             RepoViewLayout::Right => RepoViewLayout::Below,
             RepoViewLayout::Below => RepoViewLayout::Auto,
-        };
-    }
-
-    /// Cycle through currently connected peer hosts, then back to local.
-    ///
-    /// If the current target is no longer present in `peer_hosts`, cycling
-    /// restarts from the first available peer. Peer status updates are
-    /// responsible for clearing a stale selection when the chosen host
-    /// disconnects.
-    pub fn cycle_target_host(&mut self, peer_hosts: &[HostName]) {
-        self.target_host = match self.target_host.as_ref() {
-            None => peer_hosts.first().cloned(),
-            Some(current) => peer_hosts.iter().position(|host| host == current).and_then(|index| peer_hosts.get(index + 1).cloned()),
         };
     }
 }
@@ -183,9 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn ui_state_defaults_target_host_to_local() {
+    fn ui_state_defaults_provisioning_target_to_local_host() {
         let state = UiState::new(&[]);
-        assert_eq!(state.target_host, None);
+        assert_eq!(state.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
     }
 
     #[test]
@@ -208,29 +195,5 @@ mod tests {
 
         state.cycle_layout();
         assert_eq!(state.view_layout, RepoViewLayout::Auto);
-    }
-
-    #[test]
-    fn cycle_target_host_advances_through_known_peers_and_back_to_local() {
-        let mut state = UiState::new(&[]);
-        let peers = vec![HostName::new("alpha"), HostName::new("beta")];
-
-        state.cycle_target_host(&peers);
-        assert_eq!(state.target_host, Some(HostName::new("alpha")));
-
-        state.cycle_target_host(&peers);
-        assert_eq!(state.target_host, Some(HostName::new("beta")));
-
-        state.cycle_target_host(&peers);
-        assert_eq!(state.target_host, None);
-    }
-
-    #[test]
-    fn cycle_target_host_ignores_empty_peer_list() {
-        let mut state = UiState::new(&[]);
-
-        state.cycle_target_host(&[]);
-
-        assert_eq!(state.target_host, None);
     }
 }

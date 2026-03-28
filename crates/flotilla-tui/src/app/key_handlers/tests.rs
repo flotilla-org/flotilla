@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, WorkItemIdentity};
+use flotilla_protocol::{
+    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, ProvisioningTarget, WorkItemIdentity,
+};
 use ratatui::layout::Rect;
 
 use super::{
@@ -645,8 +647,8 @@ fn normal_h_toggles_help() {
     insert_peer_host(&mut app.model, "alpha");
 
     app.handle_key(key(KeyCode::Char('h')));
-    // h toggles help, not host — target_host stays None
-    assert_eq!(app.ui.target_host, None);
+    // h toggles help, not host — provisioning_target stays at local
+    assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
     assert!(!app.screen.modal_stack.is_empty(), "expected help widget pushed on stack");
 }
 
@@ -703,8 +705,8 @@ fn clicking_host_status_indicator_is_display_only() {
 
     app.handle_mouse(left_click(4, 29));
 
-    // target_host remains None — the click was ignored
-    assert_eq!(app.ui.target_host, None);
+    // provisioning_target remains at local — the click was ignored
+    assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
 }
 
 #[test]

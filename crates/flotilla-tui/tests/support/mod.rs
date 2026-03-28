@@ -1,7 +1,8 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, Checkout, CloudAgentSession, Issue, ProviderData, RepoIdentity, RepoLabels, SessionStatus, WorkItem,
+    CategoryLabels, ChangeRequest, Checkout, CloudAgentSession, HostName, Issue, ProviderData, ProvisioningTarget, RepoIdentity,
+    RepoLabels, SessionStatus, WorkItem,
 };
 // Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
 pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
@@ -34,7 +35,11 @@ pub struct TestHarness {
 impl TestHarness {
     /// Create a `TestHarness` from a pre-built model, populating RepoPages.
     fn from_model(model: TuiModel) -> Self {
-        let ui = UiState::new(&model.repo_order);
+        let mut ui = UiState::new(&model.repo_order);
+        // Pin the provisioning target to a fixed value for snapshot determinism.
+        // Real apps use HostName::local() (the machine hostname), but snapshots
+        // need a stable rendering regardless of which machine runs the tests.
+        ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("local") };
         let mut screen = flotilla_tui::widgets::screen::Screen::new();
         for (identity, rm) in &model.repos {
             let shared = Shared::new(RepoData {

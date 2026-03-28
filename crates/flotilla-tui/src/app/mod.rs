@@ -20,8 +20,8 @@ use flotilla_core::{
     daemon::DaemonHandle,
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandValue, DaemonEvent, HostName, HostSummary, PeerConnectionState, ProviderData, ProviderError, RepoDelta,
-    RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
+    Command, CommandAction, CommandValue, DaemonEvent, HostName, HostSummary, PeerConnectionState, ProviderData, ProviderError,
+    ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
 use tokio::sync::mpsc;
@@ -397,13 +397,15 @@ impl App {
     }
 
     pub fn targeted_command(&self, action: CommandAction) -> Command {
-        Command { host: self.ui.target_host.clone(), provisioning_target: None, context_repo: None, action }
+        let target = &self.ui.provisioning_target;
+        Command { host: Some(target.host().clone()), provisioning_target: Some(target.clone()), context_repo: None, action }
     }
 
     pub fn targeted_repo_command(&self, action: CommandAction) -> Command {
+        let target = &self.ui.provisioning_target;
         Command {
-            host: self.ui.target_host.clone(),
-            provisioning_target: None,
+            host: Some(target.host().clone()),
+            provisioning_target: Some(target.clone()),
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,
         }
@@ -540,7 +542,7 @@ impl App {
             keymap: &self.keymap,
             config: &self.config,
             in_flight: &self.in_flight,
-            target_host: self.ui.target_host.as_ref(),
+            provisioning_target: &self.ui.provisioning_target,
             my_host,
             active_repo: self.model.active_repo,
             repo_order: &self.model.repo_order,
@@ -601,16 +603,14 @@ impl App {
                     self.persist_layout();
                 }
                 AppAction::CycleHost => {
-                    let peer_hosts = self.model.peer_host_names();
-                    self.ui.cycle_target_host(&peer_hosts);
+                    // CycleHost is no longer the primary way to set targets;
+                    // the `target` command in the command palette is. Keep the
+                    // action as a no-op to avoid breaking any remaining callers.
                 }
-                AppAction::SetTarget(name) => {
-                    if name == "local" {
-                        self.ui.target_host = None;
-                    } else {
-                        self.ui.target_host = Some(HostName::new(&name));
-                    }
-                }
+                AppAction::SetTarget(name) => match name.parse::<ProvisioningTarget>() {
+                    Ok(target) => self.ui.provisioning_target = target,
+                    Err(e) => tracing::warn!(%name, %e, "invalid provisioning target"),
+                },
                 AppAction::ToggleDebug => {
                     self.ui.show_debug = !self.ui.show_debug;
                 }
@@ -779,12 +779,12 @@ impl App {
             DaemonEvent::PeerStatusChanged { host, status } => {
                 let peer_status = PeerStatus::from(status);
                 let clear_target =
-                    matches!(peer_status, PeerStatus::Disconnected | PeerStatus::Rejected) && self.ui.target_host.as_ref() == Some(&host);
+                    matches!(peer_status, PeerStatus::Disconnected | PeerStatus::Rejected) && self.ui.provisioning_target.host() == &host;
                 if let Some(entry) = self.model.hosts.get_mut(&host) {
                     entry.status = peer_status;
                 }
                 if clear_target {
-                    self.ui.target_host = None;
+                    self.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::local() };
                 }
             }
             DaemonEvent::HostSnapshot(snap) => {
@@ -797,10 +797,10 @@ impl App {
                 });
             }
             DaemonEvent::HostRemoved { host, .. } => {
-                let clear_target = self.ui.target_host.as_ref() == Some(&host);
+                let clear_target = self.ui.provisioning_target.host() == &host;
                 self.model.hosts.remove(&host);
                 if clear_target {
-                    self.ui.target_host = None;
+                    self.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::local() };
                 }
             }
         }

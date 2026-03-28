@@ -19,7 +19,7 @@ use std::{any::Any, collections::HashMap};
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use flotilla_core::config::ConfigStore;
-use flotilla_protocol::{HostName, RepoIdentity};
+use flotilla_protocol::{HostName, ProvisioningTarget, RepoIdentity};
 use ratatui::{layout::Rect, Frame};
 
 use crate::{
@@ -97,7 +97,7 @@ pub struct WidgetContext<'a> {
     pub keymap: &'a Keymap,
     pub config: &'a ConfigStore,
     pub in_flight: &'a HashMap<u64, InFlightCommand>,
-    pub target_host: Option<&'a HostName>,
+    pub provisioning_target: &'a ProvisioningTarget,
     pub my_host: Option<HostName>,
     pub active_repo: usize,
     pub repo_order: &'a [RepoIdentity],
