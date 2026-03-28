@@ -224,7 +224,7 @@ pub fn palette_completions(input: &str, model: &TuiModel, has_repo_context: bool
 
     // Check if the first token is a palette-local command name.
     if is_palette_local_command(first) {
-        return local_arg_completions(input, first, &tokens, trailing_space);
+        return local_arg_completions(input, first, &tokens, trailing_space, model);
     }
 
     // First token is a noun (or alias). Resolve to canonical noun name.
@@ -503,7 +503,7 @@ fn completion_cursor(consumed: &[&str], partial: &str) -> usize {
 }
 
 /// Argument completions for palette-local commands (layout, theme, target, search).
-fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_space: bool) -> Vec<PaletteCompletion> {
+fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_space: bool, model: &TuiModel) -> Vec<PaletteCompletion> {
     if tokens.len() == 1 && !trailing_space {
         // Still typing the command name — no arg completions yet.
         return vec![];
@@ -517,13 +517,61 @@ fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_s
             .filter(|v| partial.is_empty() || v.starts_with(partial))
             .map(|v| PaletteCompletion { value: v.to_string(), description: String::new(), key_hint: None })
             .collect(),
+        "target" => target_completions(partial, model),
         _ => {
-            // Other palette-local commands (theme, target, search) don't have
+            // Other palette-local commands (theme, search) don't have
             // enumerated completions yet.
             let _ = input; // suppress unused warning
             vec![]
         }
     }
+}
+
+/// Completions for the `target` palette command, built from known hosts.
+///
+/// For each known host:
+/// - Always offer `@<hostname>` (bare host)
+/// - For each provider with `category == "environment"`, offer `+<name>@<hostname>`
+/// - For each running environment, offer `=<env_id>@<hostname>`
+fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion> {
+    let mut completions = Vec::new();
+
+    // Sort hosts for deterministic ordering.
+    let mut hosts: Vec<_> = model.hosts.values().collect();
+    hosts.sort_by_key(|h| h.host_name.as_str());
+
+    for host_state in hosts {
+        let hostname = host_state.host_name.as_str();
+        let summary = &host_state.summary;
+
+        // @<hostname> — bare host target
+        let bare = format!("@{hostname}");
+        if partial.is_empty() || bare.starts_with(partial) {
+            completions.push(PaletteCompletion { value: bare, description: "bare host".to_string(), key_hint: None });
+        }
+
+        // +<provider>@<hostname> — new environment via provider
+        for provider in &summary.providers {
+            if provider.category == "environment" {
+                let provider_name = provider.name.to_lowercase();
+                let value = format!("+{provider_name}@{hostname}");
+                if partial.is_empty() || value.starts_with(partial) {
+                    let description = format!("new {} environment", provider.name);
+                    completions.push(PaletteCompletion { value, description, key_hint: None });
+                }
+            }
+        }
+
+        // =<env_id>@<hostname> — existing running environment
+        for env in &summary.environments {
+            let value = format!("={}@{hostname}", env.id);
+            if partial.is_empty() || value.starts_with(partial) {
+                completions.push(PaletteCompletion { value, description: "existing environment".to_string(), key_hint: None });
+            }
+        }
+    }
+
+    completions
 }
 
 #[cfg(test)]
@@ -808,5 +856,81 @@ mod tests {
         let completions = palette_completions("layout z", &model, true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["zoom"]);
+    }
+
+    fn model_with_rich_hosts() -> TuiModel {
+        use flotilla_protocol::{EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostProviderStatus, ImageId};
+
+        let mut model = empty_model();
+
+        // Host "feta": has a Docker environment provider and one running environment.
+        let mut feta_summary = stub_host_summary("feta");
+        feta_summary.providers.push(HostProviderStatus { category: "environment".to_string(), name: "Docker".to_string(), healthy: true });
+        feta_summary.environments.push(EnvironmentInfo {
+            id: EnvironmentId::new("env-abc123"),
+            image: ImageId::new("image-1"),
+            status: EnvironmentStatus::Running,
+        });
+        model.hosts.insert(HostName::new("feta"), crate::app::TuiHostState {
+            host_name: HostName::new("feta"),
+            is_local: false,
+            status: crate::app::PeerStatus::Connected,
+            summary: feta_summary,
+        });
+
+        // Host "brie": bare host, no environment providers or environments.
+        model.hosts.insert(HostName::new("brie"), crate::app::TuiHostState {
+            host_name: HostName::new("brie"),
+            is_local: false,
+            status: crate::app::PeerStatus::Connected,
+            summary: stub_host_summary("brie"),
+        });
+
+        model
+    }
+
+    #[test]
+    fn target_shows_bare_hosts() {
+        let model = model_with_hosts();
+        let completions = palette_completions("target ", &model, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"@feta"), "expected '@feta' in {values:?}");
+        assert!(values.contains(&"@brie"), "expected '@brie' in {values:?}");
+    }
+
+    #[test]
+    fn target_shows_environment_providers_and_existing_envs() {
+        let model = model_with_rich_hosts();
+        let completions = palette_completions("target ", &model, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+
+        // Bare hosts always present.
+        assert!(values.contains(&"@feta"), "expected '@feta' in {values:?}");
+        assert!(values.contains(&"@brie"), "expected '@brie' in {values:?}");
+
+        // Docker provider on feta → +docker@feta (lowercased).
+        assert!(values.contains(&"+docker@feta"), "expected '+docker@feta' in {values:?}");
+
+        // Running environment on feta → =env-abc123@feta.
+        assert!(values.contains(&"=env-abc123@feta"), "expected '=env-abc123@feta' in {values:?}");
+
+        // brie has no environment providers.
+        assert!(!values.iter().any(|v| v.contains("@brie") && v.starts_with('+')), "brie should have no +provider completions");
+    }
+
+    #[test]
+    fn target_partial_filters() {
+        let model = model_with_rich_hosts();
+        let completions = palette_completions("target @f", &model, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"@feta"), "expected '@feta' in {values:?}");
+        assert!(!values.contains(&"@brie"), "@brie should be filtered by '@f' prefix");
+    }
+
+    #[test]
+    fn target_no_completions_without_hosts() {
+        let model = empty_model();
+        let completions = palette_completions("target ", &model, true);
+        assert!(completions.is_empty(), "expected no completions with no hosts");
     }
 }
