@@ -3009,7 +3009,7 @@ struct MockEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for MockEnvironmentProvider {
-    async fn ensure_image(&self, _spec: &EnvironmentSpec) -> Result<ImageId, String> {
+    async fn ensure_image(&self, _spec: &EnvironmentSpec, _repo_root: &std::path::Path) -> Result<ImageId, String> {
         self.ensure_image_results.lock().await.remove(0)
     }
     async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<EnvironmentHandle, String> {

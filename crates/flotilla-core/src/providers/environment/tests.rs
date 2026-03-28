@@ -157,8 +157,9 @@ async fn ensure_image_builds_dockerfile() {
     let runner = Arc::new(RecordingRunner::new_ok(""));
     let provider = DockerEnvironment::new(runner.clone());
     let spec = EnvironmentSpec { image: ImageSource::Dockerfile("/path/to/Dockerfile".into()), token_env_vars: vec![] };
+    let repo_root = std::path::Path::new("/repo");
 
-    let result = provider.ensure_image(&spec).await;
+    let result = provider.ensure_image(&spec, repo_root).await;
 
     assert!(result.is_ok(), "ensure_image should succeed for Dockerfile source");
     let calls = runner.calls();
@@ -177,8 +178,9 @@ async fn ensure_image_pulls_registry() {
     let runner = Arc::new(RecordingRunner::new_ok(""));
     let provider = DockerEnvironment::new(runner.clone());
     let spec = EnvironmentSpec { image: ImageSource::Registry("ubuntu:22.04".into()), token_env_vars: vec![] };
+    let repo_root = std::path::Path::new("/repo");
 
-    let result = provider.ensure_image(&spec).await;
+    let result = provider.ensure_image(&spec, repo_root).await;
 
     assert!(result.is_ok(), "ensure_image should succeed for Registry source");
     let image_id = result.unwrap();

@@ -1007,7 +1007,7 @@ impl StepResolver for ExecutorStepResolver {
                     .environment_providers
                     .get(&provider)
                     .ok_or_else(|| format!("environment provider not available: {provider}"))?;
-                let image = env_provider.ensure_image(&spec).await?;
+                let image = env_provider.ensure_image(&spec, self.repo.root.as_path()).await?;
                 Ok(StepOutcome::Produced(CommandValue::ImageEnsured { image }))
             }
             StepAction::CreateEnvironment { env_id, provider, image: _ } => {

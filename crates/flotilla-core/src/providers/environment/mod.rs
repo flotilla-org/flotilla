@@ -4,7 +4,7 @@ pub mod runner;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
@@ -28,7 +28,7 @@ pub type EnvironmentHandle = Arc<dyn ProvisionedEnvironment>;
 /// Manages lifecycle of sandbox environments: image building, creation, and listing.
 #[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
-    async fn ensure_image(&self, spec: &EnvironmentSpec) -> Result<ImageId, String>;
+    async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String>;
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String>;
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String>;
 }

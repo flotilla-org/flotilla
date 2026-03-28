@@ -35,19 +35,18 @@ impl EnvironmentProvider for DockerEnvironment {
     // TODO: images built from Dockerfiles accumulate as `flotilla-env-{uuid}` tags.
     // destroy() removes the container but not the image. Phase D should add image
     // lifecycle management (prune unused flotilla images, or reuse by content hash).
-    async fn ensure_image(&self, spec: &EnvironmentSpec) -> Result<ImageId, String> {
+    async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String> {
         match &spec.image {
             ImageSource::Dockerfile(path) => {
                 let tag = format!("flotilla-env-{}", Uuid::new_v4());
-                let context_dir = path.parent().unwrap_or(Path::new(".")).to_string_lossy().into_owned();
-                let path_str = path.to_string_lossy().into_owned();
-                self.runner
-                    .run("docker", &["build", "-t", &tag, "-f", &path_str, &context_dir], Path::new("/"), &ChannelLabel::Noop)
-                    .await?;
+                let abs_path = if path.is_relative() { repo_root.join(path) } else { path.clone() };
+                let context_dir = abs_path.parent().unwrap_or(repo_root).to_string_lossy().into_owned();
+                let path_str = abs_path.to_string_lossy().into_owned();
+                self.runner.run("docker", &["build", "-t", &tag, "-f", &path_str, &context_dir], repo_root, &ChannelLabel::Noop).await?;
                 Ok(ImageId::new(tag))
             }
             ImageSource::Registry(image) => {
-                self.runner.run("docker", &["pull", image], Path::new("/"), &ChannelLabel::Noop).await?;
+                self.runner.run("docker", &["pull", image], repo_root, &ChannelLabel::Noop).await?;
                 Ok(ImageId::new(image.clone()))
             }
         }
