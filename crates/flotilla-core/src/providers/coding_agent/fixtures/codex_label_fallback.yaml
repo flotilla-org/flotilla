@@ -1,0 +1,42 @@
+# Synthetic fixture: tests error-recovery fallback path that cannot be triggered
+# against real infrastructure (requires a 500 from the by-repo endpoint).
+# TODO: replace with recorded fixture once replay supports injected error responses.
+interactions:
+# Primary environment lookup fails with a server error
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/environments/by-repo/github/owner/myrepo"
+  request_headers:
+    authorization: "Bearer test-token"
+    chatgpt-account-id: "acc-1"
+  status: 500
+  response_body: '{"error":"internal server error"}'
+# Fallback: fetch all environments and match by repo_map
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/environments"
+  request_headers:
+    authorization: "Bearer test-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: >-
+    [
+      {"id":"env-match","label":"my env","repo_map":{"github-111":{"repository_full_name":"owner/myrepo"}}},
+      {"id":"env-other","label":"myrepo","repo_map":{"github-222":{"repository_full_name":"other-org/myrepo"}}},
+      {"id":"env-unrelated","label":"unrelated","repo_map":{"github-333":{"repository_full_name":"someone/else"}}}
+    ]
+# Fetch tasks for the matching environment only
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/tasks/list?task_filter=current&limit=20&environment_id=env-match"
+  request_headers:
+    authorization: "Bearer test-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: >-
+    {"items":[
+      {"id":"task_match","title":"Matching task","updated_at":1710000000.0,
+       "task_status_display":{"branch_name":"feat-a",
+         "latest_turn_status_display":{"turn_status":"completed"}},
+       "pull_requests":[]}
+    ]}

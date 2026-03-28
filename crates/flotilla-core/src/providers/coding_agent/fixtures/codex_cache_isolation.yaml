@@ -1,0 +1,49 @@
+interactions:
+# repo-a: environment lookup returns env-a
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/environments/by-repo/github/owner/repo-a"
+  request_headers:
+    authorization: "Bearer test-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: '[{"id":"env-a"}]'
+# repo-a: fetch tasks for env-a
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/tasks/list?task_filter=current&limit=20&environment_id=env-a"
+  request_headers:
+    authorization: "Bearer test-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: >-
+    {"items":[
+      {"id":"task_a","title":"Task A","updated_at":1710000000.0,
+       "task_status_display":{"branch_name":"feat-a",
+         "latest_turn_status_display":{"turn_status":"completed"}},
+       "pull_requests":[]}
+    ]}
+# repo-b: environment lookup returns env-b (different from env-a)
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/environments/by-repo/github/owner/repo-b"
+  request_headers:
+    authorization: "Bearer test-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: '[{"id":"env-b"}]'
+# repo-b: fetch tasks for env-b
+- channel: http
+  method: GET
+  url: "https://chatgpt.com/backend-api/wham/tasks/list?task_filter=current&limit=20&environment_id=env-b"
+  request_headers:
+    authorization: "Bearer test-token"
+    chatgpt-account-id: "acc-1"
+  status: 200
+  response_body: >-
+    {"items":[
+      {"id":"task_b","title":"Task B","updated_at":1710000001.0,
+       "task_status_display":{"branch_name":"feat-b",
+         "latest_turn_status_display":{"turn_status":"pending"}},
+       "pull_requests":[]}
+    ]}

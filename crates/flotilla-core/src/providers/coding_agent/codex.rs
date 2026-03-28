@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -71,6 +72,22 @@ pub struct EnvironmentInfo {
     pub id: String,
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// Full environment info from the `/wham/environments` list endpoint.
+/// Each environment has a `repo_map` mapping repo refs to repo details
+/// including the `repository_full_name` (e.g. "owner/repo").
+#[derive(Debug, Deserialize)]
+struct FullEnvironmentInfo {
+    id: String,
+    #[serde(default)]
+    repo_map: HashMap<String, EnvironmentRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvironmentRepo {
+    #[serde(default)]
+    repository_full_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,9 +226,13 @@ struct AuthCache {
     loaded_at: Option<Instant>,
 }
 
-struct EnvCache {
+struct EnvCacheEntry {
     environment_ids: Vec<String>,
-    loaded_at: Option<Instant>,
+    loaded_at: Instant,
+}
+
+struct EnvCache {
+    entries: HashMap<String, EnvCacheEntry>,
 }
 
 pub struct CodexCodingAgent {
@@ -230,7 +251,7 @@ impl CodexCodingAgent {
             auth_path,
             http,
             auth_cache: Mutex::new(AuthCache { auth: None, loaded_at: None }),
-            env_cache: Mutex::new(EnvCache { environment_ids: Vec::new(), loaded_at: None }),
+            env_cache: Mutex::new(EnvCache { entries: HashMap::new() }),
             auth_warned: AtomicBool::new(false),
         }
     }
@@ -321,29 +342,78 @@ impl CodexCodingAgent {
         Ok(all_items)
     }
 
-    async fn fetch_tasks_by_label(&self, repo_slug: &str, auth: &CodexAuth) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        let repo_name = repo_slug.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo_slug);
-
-        let tasks = match self.fetch_all_tasks("", auth).await {
-            Ok(tasks) => tasks,
+    /// Fallback: fetch all environments and find those whose `repo_map` contains
+    /// a repo matching `repo_slug`. This avoids matching by arbitrary environment
+    /// label, which can cross-contaminate between repos.
+    async fn fallback_via_all_environments(&self, repo_slug: &str, auth: &CodexAuth) -> Result<Vec<(String, CloudAgentSession)>, String> {
+        let env_ids = match self.fetch_env_ids_from_all(auth).await {
+            Ok(ids) => ids,
             Err(e) => {
-                debug!(provider = "codex", error = %e, "failed to fetch tasks by label");
+                debug!(provider = "codex", error = %e, "fallback environment list failed");
                 return Ok(vec![]);
             }
         };
 
-        let sessions: Vec<(String, CloudAgentSession)> = tasks
+        // Deduplicate: an environment may appear multiple times if its repo_map
+        // has several refs pointing at the same owner/repo.
+        let mut seen = HashSet::new();
+        let matching_ids: Vec<&str> = env_ids
             .iter()
-            .filter(|t| {
-                t.task_status_display
-                    .as_ref()
-                    .and_then(|d| d.environment_label.as_deref())
-                    .is_some_and(|label| label.eq_ignore_ascii_case(repo_name))
-            })
-            .map(|t| map_task_to_session(t, &self.provider_name))
+            .filter(|(_, slug)| slug.eq_ignore_ascii_case(repo_slug))
+            .map(|(id, _)| id.as_str())
+            .filter(|id| seen.insert(*id))
             .collect();
 
-        Ok(sessions)
+        if matching_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Cache the discovered env IDs for this repo
+        {
+            let mut cache = self.env_cache.lock().expect("env_cache lock poisoned");
+            cache.entries.insert(repo_slug.to_string(), EnvCacheEntry {
+                environment_ids: matching_ids.iter().map(|s| s.to_string()).collect(),
+                loaded_at: Instant::now(),
+            });
+        }
+
+        let mut all_sessions = Vec::new();
+        for env_id in matching_ids {
+            match self.fetch_tasks(env_id, auth).await {
+                Ok(tasks) => {
+                    for task in &tasks {
+                        all_sessions.push(map_task_to_session(task, &self.provider_name));
+                    }
+                }
+                Err(e) => {
+                    debug!(provider = "codex", %env_id, error = %e, "fallback task fetch failed");
+                }
+            }
+        }
+
+        Ok(all_sessions)
+    }
+
+    /// Fetch all environments and return `(env_id, repository_full_name)` pairs.
+    async fn fetch_env_ids_from_all(&self, auth: &CodexAuth) -> Result<Vec<(String, String)>, String> {
+        let url = format!("{BASE_URL}/wham/environments");
+        let request = self.build_request("GET", &url, auth)?;
+        let resp = http_execute!(self.http, request)?;
+        let status = resp.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(format!("authentication error (HTTP {status})"));
+        }
+        if !resp.status().is_success() {
+            let body = String::from_utf8_lossy(resp.body()).to_string();
+            return Err(format!("environment list failed (HTTP {status}): {body}"));
+        }
+        let envs: Vec<FullEnvironmentInfo> =
+            serde_json::from_slice(resp.body()).map_err(|e| format!("environment list parse error: {e}"))?;
+
+        Ok(envs
+            .into_iter()
+            .flat_map(|env| env.repo_map.into_values().filter_map(|repo| repo.repository_full_name).map(move |slug| (env.id.clone(), slug)))
+            .collect())
     }
 
     async fn fetch_tasks(&self, environment_id: &str, auth: &CodexAuth) -> Result<Vec<TaskItem>, String> {
@@ -380,18 +450,16 @@ impl super::CloudAgentService for CodexCodingAgent {
             },
         };
 
-        // Resolve environment IDs: check cache, then fetch
+        // Resolve environment IDs: check per-repo cache, then fetch
         let env_ids = {
             let cache = self.env_cache.lock().expect("env_cache lock poisoned");
-            if let Some(loaded_at) = cache.loaded_at {
-                if loaded_at.elapsed().as_secs() < ENV_CACHE_TTL_SECS {
-                    Some(cache.environment_ids.clone())
+            cache.entries.get(repo_slug.as_str()).and_then(|entry| {
+                if entry.loaded_at.elapsed().as_secs() < ENV_CACHE_TTL_SECS {
+                    Some(entry.environment_ids.clone())
                 } else {
                     None
                 }
-            } else {
-                None
-            }
+            })
         };
 
         let env_ids = match env_ids {
@@ -400,8 +468,9 @@ impl super::CloudAgentService for CodexCodingAgent {
                 match self.fetch_environment_ids(repo_slug, &auth).await {
                     Ok(ids) => {
                         let mut cache = self.env_cache.lock().expect("env_cache lock poisoned");
-                        cache.environment_ids = ids.clone();
-                        cache.loaded_at = Some(Instant::now());
+                        cache
+                            .entries
+                            .insert(repo_slug.to_string(), EnvCacheEntry { environment_ids: ids.clone(), loaded_at: Instant::now() });
                         ids
                     }
                     Err(e) if is_auth_error(&e) => {
@@ -418,8 +487,10 @@ impl super::CloudAgentService for CodexCodingAgent {
                         match self.fetch_environment_ids(repo_slug, &fresh_auth).await {
                             Ok(ids) => {
                                 let mut cache = self.env_cache.lock().expect("env_cache lock poisoned");
-                                cache.environment_ids = ids.clone();
-                                cache.loaded_at = Some(Instant::now());
+                                cache.entries.insert(repo_slug.to_string(), EnvCacheEntry {
+                                    environment_ids: ids.clone(),
+                                    loaded_at: Instant::now(),
+                                });
                                 auth = fresh_auth;
                                 ids
                             }
@@ -433,14 +504,14 @@ impl super::CloudAgentService for CodexCodingAgent {
                     }
                     Err(e) => {
                         debug!(provider = "codex", error = %e, "environment lookup failed, falling back to label match");
-                        return self.fetch_tasks_by_label(repo_slug, &auth).await;
+                        return self.fallback_via_all_environments(repo_slug, &auth).await;
                     }
                 }
             }
         };
 
         if env_ids.is_empty() {
-            return self.fetch_tasks_by_label(repo_slug, &auth).await;
+            return self.fallback_via_all_environments(repo_slug, &auth).await;
         }
 
         let mut all_sessions = Vec::new();
@@ -852,5 +923,72 @@ mod tests {
         let sessions = agent.list_sessions(&criteria).await.expect("should succeed");
 
         assert!(sessions.is_empty(), "expected empty sessions when no auth");
+    }
+
+    // Fallback: env lookup error triggers /wham/environments fallback, scoped by repo_map
+
+    #[tokio::test]
+    async fn fallback_uses_repo_map_not_label() {
+        let session = replay::test_session(&fixture("codex_label_fallback.yaml"), replay::Masks::new());
+        let http = replay::test_http_client(&session);
+        let agent = CodexCodingAgent::new("codex".into(), ExecutionEnvironmentPath::new("/mock/auth.json"), http);
+
+        // Prime auth cache
+        {
+            let mut cache = agent.auth_cache.lock().expect("lock");
+            cache.auth = Some(CodexAuth { bearer_token: "test-token".to_string(), account_id: Some("acc-1".to_string()) });
+            cache.loaded_at = Some(Instant::now());
+        }
+
+        let criteria = RepoCriteria { repo_slug: Some("owner/myrepo".into()) };
+        let sessions = agent.list_sessions(&criteria).await.expect("should succeed");
+
+        // Only tasks from the environment whose repo_map has "owner/myrepo" should appear,
+        // not from "other-org/myrepo" or "someone/else" environments
+        assert_eq!(sessions.len(), 1, "expected only the repo_map-matched env's tasks");
+        assert_eq!(sessions[0].0, "task_match");
+        assert_eq!(sessions[0].1.title, "Matching task");
+
+        // Fallback should have cached the discovered env IDs for this repo
+        {
+            let cache = agent.env_cache.lock().expect("lock");
+            let entry = cache.entries.get("owner/myrepo").expect("should be cached after fallback");
+            assert_eq!(entry.environment_ids, vec!["env-match"]);
+        }
+
+        session.assert_complete();
+    }
+
+    // Env cache: behavioral test that list_sessions uses per-repo cached env IDs
+
+    #[tokio::test]
+    async fn env_cache_isolates_repos() {
+        // Fixture: repo-a's by-repo lookup returns env-a, repo-b's returns env-b,
+        // then tasks are fetched per env ID. If the cache were global, the second
+        // call would reuse env-a's IDs and fetch the wrong tasks.
+        let session = replay::test_session(&fixture("codex_cache_isolation.yaml"), replay::Masks::new());
+        let http = replay::test_http_client(&session);
+        let agent = CodexCodingAgent::new("codex".into(), ExecutionEnvironmentPath::new("/mock/auth.json"), http);
+
+        // Prime auth cache
+        {
+            let mut cache = agent.auth_cache.lock().expect("lock");
+            cache.auth = Some(CodexAuth { bearer_token: "test-token".to_string(), account_id: Some("acc-1".to_string()) });
+            cache.loaded_at = Some(Instant::now());
+        }
+
+        // First call: repo-a
+        let criteria_a = RepoCriteria { repo_slug: Some("owner/repo-a".into()) };
+        let sessions_a = agent.list_sessions(&criteria_a).await.expect("repo-a should succeed");
+        assert_eq!(sessions_a.len(), 1);
+        assert_eq!(sessions_a[0].0, "task_a");
+
+        // Second call: repo-b — must NOT reuse repo-a's cached env IDs
+        let criteria_b = RepoCriteria { repo_slug: Some("owner/repo-b".into()) };
+        let sessions_b = agent.list_sessions(&criteria_b).await.expect("repo-b should succeed");
+        assert_eq!(sessions_b.len(), 1);
+        assert_eq!(sessions_b[0].0, "task_b");
+
+        session.assert_complete();
     }
 }
