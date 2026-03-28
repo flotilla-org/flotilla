@@ -607,10 +607,14 @@ impl App {
                     // the `target` command in the command palette is. Keep the
                     // action as a no-op to avoid breaking any remaining callers.
                 }
-                AppAction::SetTarget(name) => match name.parse::<ProvisioningTarget>() {
-                    Ok(target) => self.ui.provisioning_target = target,
-                    Err(e) => tracing::warn!(%name, %e, "invalid provisioning target"),
-                },
+                AppAction::SetTarget(name) => {
+                    // Try parsing as-is first, then fall back to bare hostname (auto-prefix @)
+                    let result = name.parse::<ProvisioningTarget>().or_else(|_| format!("@{name}").parse::<ProvisioningTarget>());
+                    match result {
+                        Ok(target) => self.ui.provisioning_target = target,
+                        Err(e) => tracing::warn!(%name, %e, "invalid provisioning target"),
+                    }
+                }
                 AppAction::ToggleDebug => {
                     self.ui.show_debug = !self.ui.show_debug;
                 }

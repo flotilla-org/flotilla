@@ -2440,7 +2440,7 @@ async fn build_plan_with_environment_prepends_lifecycle_steps() {
 
     // Verify step actions in order
     assert!(matches!(plan.steps[0].action, StepAction::ReadEnvironmentSpec));
-    assert!(matches!(plan.steps[1].action, StepAction::EnsureEnvironmentImage));
+    assert!(matches!(plan.steps[1].action, StepAction::EnsureEnvironmentImage { .. }));
     assert!(matches!(plan.steps[2].action, StepAction::CreateEnvironment { .. }));
     assert!(matches!(plan.steps[3].action, StepAction::DiscoverEnvironmentProviders { .. }));
     assert!(matches!(plan.steps[4].action, StepAction::CreateCheckout { .. }));
@@ -3054,8 +3054,8 @@ impl ProvisionedEnvironment for MockProvisionedEnvironment {
 
 fn registry_with_env_provider(provider: Arc<dyn EnvironmentProvider>) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
-    let desc = ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "mock-docker");
-    registry.environment_providers.insert("mock-docker", desc, provider);
+    let desc = ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "Docker");
+    registry.environment_providers.insert("docker", desc, provider);
     registry
 }
 
@@ -3083,7 +3083,7 @@ async fn executor_step_resolver_ensure_environment_image() {
     // Spec is now read from the prior ReadEnvironmentSpec step outcome
     let spec = EnvironmentSpec { image: flotilla_protocol::ImageSource::Registry("test:latest".into()), token_env_vars: vec![] };
     let prior = vec![StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec })];
-    let action = StepAction::EnsureEnvironmentImage;
+    let action = StepAction::EnsureEnvironmentImage { provider: "docker".into() };
     let context = StepExecutionContext::Host(local_host());
     let outcome = resolver.resolve("ensure image", &context, action, &prior).await;
     match outcome {
@@ -3113,11 +3113,11 @@ async fn executor_step_resolver_ensure_environment_image_error_when_no_provider(
     // Spec is now read from the prior ReadEnvironmentSpec step outcome
     let spec = EnvironmentSpec { image: flotilla_protocol::ImageSource::Registry("test:latest".into()), token_env_vars: vec![] };
     let prior = vec![StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec })];
-    let action = StepAction::EnsureEnvironmentImage;
+    let action = StepAction::EnsureEnvironmentImage { provider: "docker".into() };
     let context = StepExecutionContext::Host(local_host());
     let outcome = resolver.resolve("ensure image", &context, action, &prior).await;
     assert!(outcome.is_err(), "should fail when no environment provider available");
-    assert!(outcome.unwrap_err().contains("no environment provider available"));
+    assert!(outcome.unwrap_err().contains("environment provider not available"));
 }
 
 #[tokio::test]
@@ -3150,7 +3150,7 @@ async fn executor_step_resolver_create_environment() {
 
     // Prior step must have produced the image
     let prior = vec![StepOutcome::Produced(CommandValue::ImageEnsured { image: image_id.clone() })];
-    let action = StepAction::CreateEnvironment { env_id: env_id.clone(), image: None };
+    let action = StepAction::CreateEnvironment { env_id: env_id.clone(), provider: "docker".into(), image: None };
     let context = StepExecutionContext::Host(local_host());
     let outcome = resolver.resolve("create env", &context, action, &prior).await;
     match outcome {
