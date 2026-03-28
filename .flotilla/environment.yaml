@@ -1,0 +1,4 @@
+image:
+  dockerfile: .flotilla/Dockerfile.dev-env
+token_env_vars:
+  - GITHUB_TOKEN
