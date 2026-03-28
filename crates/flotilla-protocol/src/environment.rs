@@ -32,6 +32,7 @@ pub struct EnvironmentSpec {
 
 /// Source from which to obtain a container image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ImageSource {
     Dockerfile(PathBuf),
     Registry(String),
