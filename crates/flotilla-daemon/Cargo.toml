@@ -7,11 +7,13 @@ license.workspace = true
 [features]
 default = []
 skip-no-sandbox-tests = []
-test-support = ["flotilla-protocol/test-support"]
+test-support = ["flotilla-protocol/test-support", "dep:flotilla-client"]
 
 [dependencies]
+flotilla-client = { path = "../flotilla-client", optional = true }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
 tokio-util = "0.7"
 serde = { workspace = true }
@@ -27,7 +29,6 @@ visibility = "0.1.1"
 [dev-dependencies]
 indexmap = { workspace = true }
 tempfile = "3"
-flotilla-client = { path = "../flotilla-client" }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }

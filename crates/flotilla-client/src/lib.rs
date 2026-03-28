@@ -14,11 +14,8 @@ use flotilla_protocol::{
     Command, DaemonEvent, Message, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot, Request, Response, ResponseResult, StatusResponse,
     StreamKey, TopologyResponse,
 };
-use tokio::{
-    io::{AsyncBufReadExt, BufReader, BufWriter},
-    net::UnixStream,
-    sync::{broadcast, oneshot, Mutex},
-};
+use flotilla_transport::message::{connect_unix_message_session, MessageSession};
+use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
@@ -55,7 +52,7 @@ impl Drop for SpawnLockGuard {
 }
 
 pub struct SocketDaemon {
-    writer: Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
+    session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     next_id: Arc<AtomicU64>,
@@ -68,12 +65,15 @@ pub struct SocketDaemon {
 impl SocketDaemon {
     /// Connect to a running daemon at the given Unix socket path.
     ///
-    /// Splits the socket into reader/writer halves, spawns a background task
-    /// to read incoming messages, and returns `Arc<Self>`.
+    /// Builds a session from the socket and then starts the shared client
+    /// reader/pending-request machinery on top of it.
     pub async fn connect(socket_path: &Path) -> Result<Arc<Self>, String> {
-        let stream = UnixStream::connect(socket_path).await.map_err(|e| format!("failed to connect to {}: {e}", socket_path.display()))?;
+        let session = connect_unix_message_session(socket_path).await?;
+        Self::from_session(session)
+    }
 
-        let (read_half, write_half) = stream.into_split();
+    pub fn from_session(session: MessageSession) -> Result<Arc<Self>, String> {
+        let session = Arc::new(session);
 
         let (event_tx, _) = broadcast::channel(256);
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -81,62 +81,47 @@ impl SocketDaemon {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
-
         // Spawn background reader task
+        let reader_session = Arc::clone(&session);
         let reader_pending = Arc::clone(&pending);
-        let reader_writer = Arc::clone(&writer);
         let reader_next_id = Arc::clone(&next_id);
         let reader_local_seqs = Arc::clone(&local_seqs);
         let reader_recovering = Arc::clone(&recovering);
         let reader_event_tx = event_tx.clone();
         let reader_task = tokio::spawn(async move {
-            let reader = BufReader::new(read_half);
-            let mut lines = reader.lines();
-
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let msg: Message = match serde_json::from_str(&line) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                warn!(err = %e, "failed to parse message from daemon");
-                                continue;
-                            }
-                        };
-
-                        match msg {
-                            Message::Response { id, response } => {
-                                let mut map = reader_pending.lock().await;
-                                if let Some(tx) = map.remove(&id) {
-                                    let _ = tx.send(*response);
-                                } else {
-                                    warn!(%id, "received response for unknown request id");
-                                }
-                            }
-                            Message::Event { event } => {
-                                let event = *event;
-                                handle_event(
-                                    event,
-                                    &reader_local_seqs,
-                                    &reader_recovering,
-                                    &reader_event_tx,
-                                    &reader_writer,
-                                    &reader_pending,
-                                    &reader_next_id,
-                                );
-                            }
-                            Message::Request { .. } => {
-                                warn!("received unexpected request from daemon");
-                            }
-                            Message::Hello { .. } => {
-                                warn!("received unexpected hello from daemon");
-                            }
-                            Message::Peer(_) => {
-                                warn!("received unexpected peer envelope from daemon");
+                match reader_session.read().await {
+                    Ok(Some(msg)) => match msg {
+                        Message::Response { id, response } => {
+                            let mut map = reader_pending.lock().await;
+                            if let Some(tx) = map.remove(&id) {
+                                let _ = tx.send(*response);
+                            } else {
+                                warn!(%id, "received response for unknown request id");
                             }
                         }
-                    }
+                        Message::Event { event } => {
+                            let event = *event;
+                            handle_event(
+                                event,
+                                &reader_local_seqs,
+                                &reader_recovering,
+                                &reader_event_tx,
+                                &reader_session,
+                                &reader_pending,
+                                &reader_next_id,
+                            );
+                        }
+                        Message::Request { .. } => {
+                            warn!("received unexpected request from daemon");
+                        }
+                        Message::Hello { .. } => {
+                            warn!("received unexpected hello from daemon");
+                        }
+                        Message::Peer(_) => {
+                            warn!("received unexpected peer envelope from daemon");
+                        }
+                    },
                     Ok(None) => {
                         // EOF — daemon closed connection
                         error!("daemon connection closed (EOF)");
@@ -147,7 +132,7 @@ impl SocketDaemon {
                         break;
                     }
                     Err(e) => {
-                        error!(err = %e, "error reading from daemon socket");
+                        error!(err = %e, "error reading from daemon session");
                         let mut map = reader_pending.lock().await;
                         for (_, tx) in map.drain() {
                             let _ = tx.send(ResponseResult::Err { message: format!("daemon read error: {e}") });
@@ -159,7 +144,7 @@ impl SocketDaemon {
         });
 
         let daemon = Arc::new(Self {
-            writer: Arc::clone(&writer),
+            session,
             pending: Arc::clone(&pending),
             event_tx: event_tx.clone(),
             next_id: Arc::clone(&next_id),
@@ -172,7 +157,7 @@ impl SocketDaemon {
 
     /// Send a request to the daemon and wait for the matching response.
     async fn request(&self, request: Request) -> Result<ResponseResult, String> {
-        send_request(&self.writer, &self.pending, &self.next_id, request).await
+        send_request(self.session.as_ref(), &self.pending, &self.next_id, request).await
     }
 }
 
@@ -351,7 +336,7 @@ pub async fn connect_or_spawn(
 /// Extracted as a free function so both the SocketDaemon methods and the
 /// background recovery task can use it.
 async fn send_request(
-    writer: &Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
+    session: &MessageSession,
     pending: &Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>,
     next_id: &AtomicU64,
     request: Request,
@@ -367,11 +352,7 @@ async fn send_request(
 
     let msg = Message::Request { id, request };
 
-    let write_result = async {
-        let mut w = writer.lock().await;
-        flotilla_protocol::framing::write_message_line(&mut *w, &msg).await
-    }
-    .await;
+    let write_result = session.write(msg).await;
 
     if let Err(e) = write_result {
         pending.lock().await.remove(&id);
@@ -413,7 +394,7 @@ fn handle_event(
     local_seqs: &Arc<SeqMap>,
     recovering: &Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
     event_tx: &broadcast::Sender<DaemonEvent>,
-    writer: &Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
+    session: &Arc<MessageSession>,
     pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     next_id: &Arc<AtomicU64>,
 ) {
@@ -466,12 +447,12 @@ fn handle_event(
                     let local_seqs = Arc::clone(local_seqs);
                     let recovering = Arc::clone(recovering);
                     let event_tx = event_tx.clone();
-                    let writer = Arc::clone(writer);
+                    let session = Arc::clone(session);
                     let pending = Arc::clone(pending);
                     let next_id = Arc::clone(next_id);
 
                     tokio::spawn(async move {
-                        recover_from_gap(&local_seqs, &event_tx, &writer, &pending, &next_id).await;
+                        recover_from_gap(&local_seqs, &event_tx, &session, &pending, &next_id).await;
                         // Drain buffered deltas, discarding any that recovery
                         // already covered (their seq <= recovered local_seq).
                         // Only re-process deltas that are genuinely ahead.
@@ -487,7 +468,7 @@ fn handle_event(
                                 debug!("discarding buffered delta already covered by recovery");
                                 continue;
                             }
-                            handle_event(buffered_event, &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
+                            handle_event(buffered_event, &local_seqs, &recovering, &event_tx, &session, &pending, &next_id);
                         }
                     });
                 }
@@ -522,7 +503,7 @@ fn handle_event(
 async fn recover_from_gap(
     local_seqs: &SeqMap,
     event_tx: &broadcast::Sender<DaemonEvent>,
-    writer: &Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
+    session: &Arc<MessageSession>,
     pending: &Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>,
     next_id: &AtomicU64,
 ) {
@@ -532,7 +513,7 @@ async fn recover_from_gap(
     };
 
     let last_seen = encode_replay_cursors(&last_seen);
-    let resp = send_request(writer, pending, next_id, Request::ReplaySince { last_seen }).await;
+    let resp = send_request(session.as_ref(), pending, next_id, Request::ReplaySince { last_seen }).await;
 
     match resp {
         Ok(result) => match into_success_response(result) {

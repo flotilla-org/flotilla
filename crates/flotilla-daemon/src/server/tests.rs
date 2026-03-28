@@ -24,6 +24,7 @@ use flotilla_protocol::{
     PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, RepoIdentity, RepoSelector, Request, Response, ResponseResult,
     RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock, PROTOCOL_VERSION,
 };
+use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
 use tokio::{
     io::{AsyncBufReadExt, BufReader, BufWriter},
@@ -33,7 +34,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    handle_client,
+    handle_client, handle_client_session,
     peer_runtime::{
         disconnect_peer_and_rebuild, forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer,
         should_send_local_version, ForwardResult,
@@ -77,6 +78,10 @@ fn assert_error_response(msg: Message, expected_id: u64, needle: &str) {
         }
         other => panic!("expected response, got {other:?}"),
     }
+}
+
+async fn read_session_message(session: &MessageSession) -> Message {
+    session.read().await.expect("read session message").expect("session message")
 }
 
 async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
@@ -194,10 +199,10 @@ fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, che
 async fn write_message_writes_json_line() {
     let (a, b) = tokio::net::UnixStream::pair().expect("pair");
     let (_read_half, write_half) = a.into_split();
-    let writer = tokio::sync::Mutex::new(BufWriter::new(write_half));
+    let mut writer = BufWriter::new(write_half);
 
     let msg = Message::ok_response(9, Response::Refresh);
-    write_message(&writer, &msg).await.expect("write_message");
+    write_message(&mut writer, &msg).await.expect("write_message");
 
     let mut lines = BufReader::new(b).lines();
     let line = lines.next_line().await.expect("read line").expect("line");
@@ -2192,6 +2197,119 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
     }
 
     drop(writer);
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
+}
+
+#[tokio::test]
+async fn handle_client_session_dispatches_request_messages() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let client_notify = Arc::new(Notify::new());
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (client_session, server_session) = message_session_pair();
+
+    let daemon_for_task = Arc::clone(&daemon);
+    let pm = Arc::clone(&peer_manager);
+    let count_ref = Arc::clone(&client_count);
+    let notify_ref = Arc::clone(&client_notify);
+    let handle = tokio::spawn(async move {
+        let remote_command_router = empty_remote_command_router(&daemon_for_task, &pm);
+        handle_client_session(
+            server_session,
+            daemon_for_task,
+            shutdown_rx,
+            peer_data_tx,
+            pm,
+            remote_command_router,
+            count_ref,
+            notify_ref,
+            peer_connected_tx,
+            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
+        )
+        .await;
+    });
+
+    client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
+
+    match ok_response(read_session_message(&client_session).await, 1) {
+        Response::ListRepos(_) => {}
+        other => panic!("expected ListRepos response, got {other:?}"),
+    }
+
+    drop(client_session);
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+#[tokio::test]
+async fn handle_client_session_streams_daemon_events_to_request_clients() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(HostName::new("local"))));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let client_notify = Arc::new(Notify::new());
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (client_session, server_session) = message_session_pair();
+
+    let daemon_for_task = Arc::clone(&daemon);
+    let pm = Arc::clone(&peer_manager);
+    let count_ref = Arc::clone(&client_count);
+    let notify_ref = Arc::clone(&client_notify);
+    let handle = tokio::spawn(async move {
+        let remote_command_router = empty_remote_command_router(&daemon_for_task, &pm);
+        handle_client_session(
+            server_session,
+            daemon_for_task,
+            shutdown_rx,
+            peer_data_tx,
+            pm,
+            remote_command_router,
+            count_ref,
+            notify_ref,
+            peer_connected_tx,
+            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
+        )
+        .await;
+    });
+
+    client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
+
+    match ok_response(read_session_message(&client_session).await, 1) {
+        Response::ListRepos(_) => {}
+        other => panic!("expected ListRepos response, got {other:?}"),
+    }
+    assert_eq!(client_count.load(Ordering::SeqCst), 1, "request client should be tracked while connected");
+
+    let repo_identity = RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() };
+    let repo = PathBuf::from("/tmp/repo");
+    daemon.send_event(DaemonEvent::CommandStarted {
+        command_id: 77,
+        host: daemon.host_name().clone(),
+        repo_identity: repo_identity.clone(),
+        repo: repo.clone(),
+        description: "streamed event".to_string(),
+    });
+
+    match read_session_message(&client_session).await {
+        Message::Event { event } => match *event {
+            DaemonEvent::CommandStarted { command_id, repo_identity: event_identity, repo: event_repo, description, .. } => {
+                assert_eq!(command_id, 77);
+                assert_eq!(event_identity, repo_identity);
+                assert_eq!(event_repo, repo);
+                assert_eq!(description, "streamed event");
+            }
+            other => panic!("expected CommandStarted event, got {other:?}"),
+        },
+        other => panic!("expected event message, got {other:?}"),
+    }
+
+    drop(client_session);
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
 }

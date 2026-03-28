@@ -1,19 +1,27 @@
 use std::time::Duration;
 
 use flotilla_protocol::{HostName, RepoDelta, RepoIdentity, RepoSnapshot};
-use tokio::net::{unix::OwnedReadHalf, UnixListener, UnixStream};
+use flotilla_transport::message::{message_session_pair, MessageSession};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::UnixListener,
+};
 
 use super::*;
 
-type SharedWriter = Arc<Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>;
+type SharedSession = Arc<MessageSession>;
 type SharedPending = Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>;
-type RequestLines = tokio::io::Lines<BufReader<UnixStream>>;
 
 struct RequestHarness {
-    writer: SharedWriter,
+    session: SharedSession,
     pending: SharedPending,
     next_id: Arc<AtomicU64>,
-    lines: RequestLines,
+    remote: MessageSession,
+}
+
+struct SessionHarness {
+    daemon: Arc<SocketDaemon>,
+    session: MessageSession,
 }
 
 fn repo_identity() -> RepoIdentity {
@@ -51,52 +59,106 @@ fn make_delta(repo: &Path, prev_seq: u64, seq: u64) -> RepoDelta {
 }
 
 fn request_harness() -> RequestHarness {
-    let (client, server) = UnixStream::pair().expect("pair");
-    let (_read_half, write_half) = client.into_split();
+    let (client, server) = message_session_pair();
     RequestHarness {
-        writer: Arc::new(Mutex::new(BufWriter::new(write_half))),
+        session: Arc::new(client),
         pending: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
-        lines: BufReader::new(server).lines(),
+        remote: server,
     }
 }
 
-fn broken_request_harness() -> (SharedWriter, SharedPending, Arc<AtomicU64>) {
-    let (client, server) = UnixStream::pair().expect("pair");
+fn session_harness() -> SessionHarness {
+    let (client, server) = message_session_pair();
+    let daemon = SocketDaemon::from_session(client).expect("build session-backed daemon");
+    SessionHarness { daemon, session: server }
+}
+
+fn broken_request_harness() -> (SharedSession, SharedPending, Arc<AtomicU64>) {
+    let (client, server) = message_session_pair();
     drop(server);
-    let (_read_half, write_half) = client.into_split();
-    (Arc::new(Mutex::new(BufWriter::new(write_half))), Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicU64::new(1)))
+    (Arc::new(client), Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicU64::new(1)))
 }
 
 /// Returns a writer/pending/next_id triple for tests that call `handle_event`.
-/// Also returns the server half of the socket pair so it isn't dropped — dropping
-/// it would close the pipe and cause writes on the client half to fail.
-fn event_harness() -> (SharedWriter, SharedPending, Arc<AtomicU64>, OwnedReadHalf) {
-    let (client, server) = UnixStream::pair().expect("pair");
-    let (server_read, _server_write) = server.into_split();
-    let (_read_half, write_half) = client.into_split();
-    (Arc::new(Mutex::new(BufWriter::new(write_half))), Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicU64::new(1)), server_read)
+/// Also returns the remote half so the session stays open during the test.
+fn event_harness() -> (SharedSession, SharedPending, Arc<AtomicU64>, MessageSession) {
+    let (client, server) = message_session_pair();
+    (Arc::new(client), Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicU64::new(1)), server)
 }
 
-async fn read_request(lines: &mut RequestLines) -> (u64, Request) {
-    let line = lines.next_line().await.expect("read request line").expect("line missing");
-    match serde_json::from_str::<Message>(&line).expect("parse request") {
-        Message::Request { id, request } => (id, request),
+async fn read_request(session: &MessageSession) -> (u64, Request) {
+    match session.read().await.expect("read request") {
+        Some(Message::Request { id, request }) => (id, request),
         other => panic!("expected request, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn send_request_writes_message_and_returns_pending_response() {
-    let mut harness = request_harness();
+async fn session_backed_daemon_sends_requests_and_receives_responses() {
+    let harness = session_harness();
 
-    let request_writer = Arc::clone(&harness.writer);
+    let daemon = Arc::clone(&harness.daemon);
+    let request_task = tokio::spawn(async move { daemon.get_topology().await });
+
+    let (id, request) = read_request(&harness.session).await;
+    assert_eq!(request, Request::GetTopology);
+
+    harness
+        .session
+        .write(Message::Response {
+            id,
+            response: Box::new(ResponseResult::Ok {
+                response: Box::new(Response::GetTopology(TopologyResponse { local_host: HostName::new("local"), routes: vec![] })),
+            }),
+        })
+        .await
+        .expect("write response");
+
+    let topology = request_task.await.expect("join request task").expect("get_topology");
+    assert!(topology.routes.is_empty());
+}
+
+#[tokio::test]
+async fn session_backed_daemon_streams_events_to_subscribers() {
+    let harness = session_harness();
+    let mut event_rx = harness.daemon.subscribe();
+    let repo_identity = repo_identity();
+    let repo = PathBuf::from("/tmp/session-backed-repo");
+
+    harness
+        .session
+        .write(Message::Event {
+            event: Box::new(DaemonEvent::CommandStarted {
+                command_id: 99,
+                host: HostName::new("remote"),
+                repo_identity: repo_identity.clone(),
+                repo: repo.clone(),
+                description: "from session".into(),
+            }),
+        })
+        .await
+        .expect("write event");
+
+    let event = event_rx.recv().await.expect("receive event");
+    assert!(matches!(
+        event,
+        DaemonEvent::CommandStarted { command_id: 99, repo_identity: actual_identity, repo: actual_repo, ref description, .. }
+            if actual_identity == repo_identity && actual_repo == repo && description == "from session"
+    ));
+}
+
+#[tokio::test]
+async fn send_request_writes_message_and_returns_pending_response() {
+    let harness = request_harness();
+
+    let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
     let request_task =
-        tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::ListRepos).await });
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::ListRepos).await });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert_eq!(request, Request::ListRepos);
 
     let tx = harness.pending.lock().await.remove(&id).expect("pending sender should exist");
@@ -133,14 +195,15 @@ async fn dropping_socket_daemon_closes_connection_promptly() {
 
 #[tokio::test]
 async fn send_request_returns_cancelled_when_sender_is_dropped() {
-    let mut harness = request_harness();
+    let harness = request_harness();
 
-    let request_writer = Arc::clone(&harness.writer);
+    let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetTopology).await });
+    let task =
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetTopology).await });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert_eq!(request, Request::GetTopology);
 
     harness.pending.lock().await.remove(&id);
@@ -150,24 +213,25 @@ async fn send_request_returns_cancelled_when_sender_is_dropped() {
 
 #[tokio::test]
 async fn send_request_cleans_pending_on_write_error() {
-    let (writer, pending, next_id) = broken_request_harness();
+    let (session, pending, next_id) = broken_request_harness();
 
-    let err = send_request(&writer, &pending, &next_id, Request::GetTopology).await.expect_err("closed peer should fail writes");
+    let err = send_request(session.as_ref(), &pending, &next_id, Request::GetTopology).await.expect_err("closed peer should fail writes");
 
-    assert!(err.contains("failed to"));
+    assert!(err.contains("closed"));
     assert!(pending.lock().await.is_empty());
 }
 
 #[tokio::test]
 async fn send_request_cleans_pending_on_cancelled_response() {
-    let mut harness = request_harness();
+    let harness = request_harness();
 
-    let request_writer = Arc::clone(&harness.writer);
+    let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetStatus).await });
+    let task =
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetStatus).await });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert_eq!(request, Request::GetStatus);
 
     harness.pending.lock().await.remove(&id);
@@ -179,14 +243,15 @@ async fn send_request_cleans_pending_on_cancelled_response() {
 
 #[tokio::test(start_paused = true)]
 async fn send_request_cleans_pending_on_timeout() {
-    let mut harness = request_harness();
+    let harness = request_harness();
 
-    let request_writer = Arc::clone(&harness.writer);
+    let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task = tokio::spawn(async move { send_request(&request_writer, &request_pending, &request_next_id, Request::GetStatus).await });
+    let task =
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetStatus).await });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert_eq!(id, 1);
     assert_eq!(request, Request::GetStatus);
 
@@ -204,14 +269,14 @@ async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
         DaemonEvent::RepoSnapshot(Box::new(make_snapshot(&repo, 10))),
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -220,7 +285,7 @@ async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -240,14 +305,14 @@ async fn handle_event_buffers_delta_when_recovery_already_running() {
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     recovering.lock().unwrap().insert(repo_identity(), vec![]);
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 99, 100))),
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -264,18 +329,18 @@ async fn recover_from_gap_requests_replay_and_applies_seqs() {
     local_seqs.write().unwrap().insert(StreamKey::Repo { identity: repo_identity() }, 3);
     let (event_tx, mut event_rx) = broadcast::channel(16);
 
-    let mut harness = request_harness();
+    let harness = request_harness();
 
     let recover_local_seqs = Arc::clone(&local_seqs);
     let recover_event_tx = event_tx.clone();
-    let recover_writer = Arc::clone(&harness.writer);
+    let recover_session = Arc::clone(&harness.session);
     let recover_pending = Arc::clone(&harness.pending);
     let recover_next_id = Arc::clone(&harness.next_id);
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
     });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert!(matches!(request, Request::ReplaySince { .. }));
 
     let replay_events = vec![DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 3, 4)))];
@@ -327,7 +392,7 @@ async fn handle_event_starts_recovery_for_unknown_repo_delta() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     // Delta for a repo we have no local seq for — should start recovery.
     handle_event(
@@ -335,7 +400,7 @@ async fn handle_event_starts_recovery_for_unknown_repo_delta() {
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -354,7 +419,7 @@ async fn handle_event_starts_recovery_on_seq_gap() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 5);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     // Delta with prev_seq=10 but local is 5 — gap.
     handle_event(
@@ -362,7 +427,7 @@ async fn handle_event_starts_recovery_on_seq_gap() {
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -381,7 +446,7 @@ async fn handle_event_forwards_repo_added() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     let repo_info = flotilla_protocol::RepoInfo {
         identity: repo_identity(),
@@ -392,7 +457,7 @@ async fn handle_event_forwards_repo_added() {
         provider_health: HashMap::new(),
         loading: false,
     };
-    handle_event(DaemonEvent::RepoTracked(Box::new(repo_info)), &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
+    handle_event(DaemonEvent::RepoTracked(Box::new(repo_info)), &local_seqs, &recovering, &event_tx, &session, &pending, &next_id);
 
     let event = event_rx.try_recv().expect("should receive RepoTracked");
     assert!(matches!(event, DaemonEvent::RepoTracked(_)));
@@ -403,7 +468,7 @@ async fn handle_event_forwards_command_started() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
         DaemonEvent::CommandStarted {
@@ -416,7 +481,7 @@ async fn handle_event_forwards_command_started() {
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -430,7 +495,7 @@ async fn handle_event_forwards_command_finished() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
         DaemonEvent::CommandFinished {
@@ -443,7 +508,7 @@ async fn handle_event_forwards_command_finished() {
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -457,7 +522,7 @@ async fn handle_event_forwards_command_step_update() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
         DaemonEvent::CommandStepUpdate {
@@ -473,7 +538,7 @@ async fn handle_event_forwards_command_step_update() {
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -487,7 +552,7 @@ async fn handle_event_forwards_peer_status_changed() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
         DaemonEvent::PeerStatusChanged {
@@ -497,7 +562,7 @@ async fn handle_event_forwards_peer_status_changed() {
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -511,10 +576,18 @@ async fn handle_event_forwards_host_removed_and_tracks_seq() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
     let host = flotilla_protocol::HostName::new("peer-1");
 
-    handle_event(DaemonEvent::HostRemoved { host: host.clone(), seq: 9 }, &local_seqs, &recovering, &event_tx, &writer, &pending, &next_id);
+    handle_event(
+        DaemonEvent::HostRemoved { host: host.clone(), seq: 9 },
+        &local_seqs,
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
 
     let event = event_rx.try_recv().expect("should receive HostRemoved");
     assert!(matches!(event, DaemonEvent::HostRemoved { seq: 9, .. }));
@@ -530,14 +603,14 @@ async fn handle_event_repo_removed_evicts_seq_and_forwards() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 42);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let (writer, pending, next_id, _server) = event_harness();
+    let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
         DaemonEvent::RepoUntracked { path: repo.clone(), repo_identity: repo_identity() },
         &local_seqs,
         &recovering,
         &event_tx,
-        &writer,
+        &session,
         &pending,
         &next_id,
     );
@@ -560,18 +633,18 @@ async fn recover_from_gap_handles_parse_error_gracefully() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 3);
     let (event_tx, _event_rx) = broadcast::channel(16);
 
-    let mut harness = request_harness();
+    let harness = request_harness();
 
     let recover_local_seqs = Arc::clone(&local_seqs);
     let recover_event_tx = event_tx.clone();
-    let recover_writer = Arc::clone(&harness.writer);
+    let recover_session = Arc::clone(&harness.session);
     let recover_pending = Arc::clone(&harness.pending);
     let recover_next_id = Arc::clone(&harness.next_id);
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
     });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert!(matches!(request, Request::ReplaySince { .. }));
 
     // Respond with the wrong success variant.
@@ -593,10 +666,10 @@ async fn recover_from_gap_handles_request_failure_gracefully() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 5);
     let (event_tx, _event_rx) = broadcast::channel(16);
 
-    let (writer, pending, next_id) = broken_request_harness();
+    let (session, pending, next_id) = broken_request_harness();
 
     // recover_from_gap should complete without panic even when the request fails.
-    recover_from_gap(&local_seqs, &event_tx, &writer, &pending, &next_id).await;
+    recover_from_gap(&local_seqs, &event_tx, &session, &pending, &next_id).await;
     // Local seqs should remain unchanged.
     assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&StreamKey::Repo { identity: repo_identity() }), Some(&5));
 }
@@ -609,18 +682,18 @@ async fn recover_from_gap_handles_error_response_gracefully() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 7);
     let (event_tx, _event_rx) = broadcast::channel(16);
 
-    let mut harness = request_harness();
+    let harness = request_harness();
 
     let recover_local_seqs = Arc::clone(&local_seqs);
     let recover_event_tx = event_tx.clone();
-    let recover_writer = Arc::clone(&harness.writer);
+    let recover_session = Arc::clone(&harness.session);
     let recover_pending = Arc::clone(&harness.pending);
     let recover_next_id = Arc::clone(&harness.next_id);
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
     });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert!(matches!(request, Request::ReplaySince { .. }));
 
     // Respond with a protocol error.
@@ -640,18 +713,18 @@ async fn recover_from_gap_applies_full_snapshot_seqs() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 2);
     let (event_tx, mut event_rx) = broadcast::channel(16);
 
-    let mut harness = request_harness();
+    let harness = request_harness();
 
     let recover_local_seqs = Arc::clone(&local_seqs);
     let recover_event_tx = event_tx.clone();
-    let recover_writer = Arc::clone(&harness.writer);
+    let recover_session = Arc::clone(&harness.session);
     let recover_pending = Arc::clone(&harness.pending);
     let recover_next_id = Arc::clone(&harness.next_id);
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
     });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert!(matches!(request, Request::ReplaySince { .. }));
 
     // Respond with a full snapshot event.
@@ -675,20 +748,20 @@ async fn recover_from_gap_does_not_regress_seq_from_concurrent_live_update() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 3);
     let (event_tx, _event_rx) = broadcast::channel(16);
 
-    let mut harness = request_harness();
+    let harness = request_harness();
 
     let recover_local_seqs = Arc::clone(&local_seqs);
     let recover_event_tx = event_tx.clone();
-    let recover_writer = Arc::clone(&harness.writer);
+    let recover_session = Arc::clone(&harness.session);
     let recover_pending = Arc::clone(&harness.pending);
     let recover_next_id = Arc::clone(&harness.next_id);
     let recover_task = tokio::spawn(async move {
         // Set seq high before recovery starts to validate the monotonic guard.
         recover_local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 20);
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
     });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert!(matches!(request, Request::ReplaySince { .. }));
 
     // Replay returns events with seq=10, which is behind the live update of 20.
@@ -711,18 +784,18 @@ async fn recover_from_gap_forwards_non_snapshot_replay_events() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 1);
     let (event_tx, mut event_rx) = broadcast::channel(16);
 
-    let mut harness = request_harness();
+    let harness = request_harness();
 
     let recover_local_seqs = Arc::clone(&local_seqs);
     let recover_event_tx = event_tx.clone();
-    let recover_writer = Arc::clone(&harness.writer);
+    let recover_session = Arc::clone(&harness.session);
     let recover_pending = Arc::clone(&harness.pending);
     let recover_next_id = Arc::clone(&harness.next_id);
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
     });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert!(matches!(request, Request::ReplaySince { .. }));
 
     // Replay includes a non-snapshot event — it should still be forwarded.
@@ -752,18 +825,18 @@ async fn recover_from_gap_handles_empty_replay() {
     local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 5);
     let (event_tx, mut event_rx) = broadcast::channel(16);
 
-    let mut harness = request_harness();
+    let harness = request_harness();
 
     let recover_local_seqs = Arc::clone(&local_seqs);
     let recover_event_tx = event_tx.clone();
-    let recover_writer = Arc::clone(&harness.writer);
+    let recover_session = Arc::clone(&harness.session);
     let recover_pending = Arc::clone(&harness.pending);
     let recover_next_id = Arc::clone(&harness.next_id);
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_writer, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
     });
 
-    let (id, request) = read_request(&mut harness.lines).await;
+    let (id, request) = read_request(&harness.remote).await;
     assert!(matches!(request, Request::ReplaySince { .. }));
 
     // Respond with empty event list.

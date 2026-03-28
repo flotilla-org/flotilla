@@ -5,6 +5,8 @@ mod peer_runtime;
 mod remote_commands;
 mod request_dispatch;
 mod shared;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use std::{
     collections::HashMap,
@@ -20,8 +22,8 @@ use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
 use flotilla_protocol::{ConfigLabel, EnvironmentId, HostName, Message};
+use flotilla_transport::message::{unix_message_session, MessageSession};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader, BufWriter},
     net::UnixListener,
     sync::{mpsc, watch, Mutex, Notify},
 };
@@ -33,7 +35,7 @@ use self::{
     peer_connection::PeerConnection,
     peer_runtime::PeerRuntime,
     remote_commands::{ForwardedCommandMap, PendingRemoteCancelMap, PendingRemoteCommandMap, RemoteCommandRouter},
-    shared::{sync_peer_query_state, ConnectionWriter, SocketPeerSender},
+    shared::{sync_peer_query_state, SocketPeerSender},
 };
 use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport};
 
@@ -383,6 +385,36 @@ fn spawn_peer_networking_runtime(
 async fn handle_client(
     stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
+    shutdown_rx: watch::Receiver<bool>,
+    peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+    remote_command_router: RemoteCommandRouter,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
+    agent_state_store: SharedAgentStateStore,
+    environment_context: Option<EnvironmentId>,
+) {
+    handle_client_session(
+        unix_message_session(stream),
+        daemon,
+        shutdown_rx,
+        peer_data_tx,
+        peer_manager,
+        remote_command_router,
+        client_count,
+        client_notify,
+        peer_connected_tx,
+        agent_state_store,
+        environment_context,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_session(
+    session: MessageSession,
+    daemon: Arc<InProcessDaemon>,
     mut shutdown_rx: watch::Receiver<bool>,
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
@@ -393,21 +425,11 @@ async fn handle_client(
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
 ) {
-    let (read_half, write_half) = stream.into_split();
-    let reader = BufReader::new(read_half);
-    let writer: ConnectionWriter = Arc::new(tokio::sync::Mutex::new(BufWriter::new(write_half)));
-    let mut lines = reader.lines();
+    let session = Arc::new(session);
     let first_msg = tokio::select! {
-        line_result = lines.next_line() => {
-            match line_result {
-                Ok(Some(line)) => match serde_json::from_str::<Message>(&line) {
-                    Ok(msg) => Some(msg),
-                    Err(e) => {
-                        warn!(err = %e, "failed to parse first message");
-                        None
-                    }
-                },
-                Ok(None) => None,
+        message_result = session.read() => {
+            match message_result {
+                Ok(msg) => msg,
                 Err(e) => {
                     error!(err = %e, "error reading first message from client");
                     None
@@ -424,7 +446,7 @@ async fn handle_client(
     match first_msg {
         Message::Request { id, request } => {
             ClientConnection::new(daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store)
-                .run(lines, writer, id, request)
+                .run(Arc::clone(&session), id, request)
                 .await;
         }
         Message::Hello { protocol_version, host_name, session_id, environment_id } => {
@@ -451,7 +473,7 @@ async fn handle_client(
             }
             // environment_context is None: main socket, accept whatever the client sends.
             PeerConnection::new(daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify)
-                .run(lines, writer, protocol_version, host_name, session_id)
+                .run(session, protocol_version, host_name, session_id)
                 .await;
         }
         other => {

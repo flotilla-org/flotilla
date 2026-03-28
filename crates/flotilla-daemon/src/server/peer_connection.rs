@@ -5,13 +5,13 @@ use std::sync::{
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{GoodbyeReason, HostName, Message, PeerConnectionState, PeerWireMessage, PROTOCOL_VERSION};
+use flotilla_transport::message::MessageSession;
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{error, info, warn};
 
 use super::{
-    peer_runtime::disconnect_peer_and_rebuild,
-    shared::{write_message, ConnectionLines, ConnectionWriter},
-    sync_peer_query_state, ConnectionDirection, ConnectionMeta, PeerConnectedNotice, SocketPeerSender,
+    peer_runtime::disconnect_peer_and_rebuild, sync_peer_query_state, ConnectionDirection, ConnectionMeta, PeerConnectedNotice,
+    SocketPeerSender,
 };
 use crate::peer::{ActivationResult, InboundPeerEnvelope, PeerManager};
 
@@ -38,14 +38,7 @@ impl PeerConnection {
         Self { daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify }
     }
 
-    pub(super) async fn run(
-        mut self,
-        mut lines: ConnectionLines,
-        writer: ConnectionWriter,
-        protocol_version: u32,
-        host_name: HostName,
-        session_id: uuid::Uuid,
-    ) {
+    pub(super) async fn run(mut self, session: Arc<MessageSession>, protocol_version: u32, host_name: HostName, session_id: uuid::Uuid) {
         if protocol_version != PROTOCOL_VERSION {
             warn!(
                 peer = %host_name,
@@ -56,14 +49,15 @@ impl PeerConnection {
             return;
         }
 
-        if write_message(&writer, &Message::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            host_name: self.daemon.host_name().clone(),
-            session_id: self.daemon.session_id(),
-            environment_id: None,
-        })
-        .await
-        .is_err()
+        if session
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                host_name: self.daemon.host_name().clone(),
+                session_id: self.daemon.session_id(),
+                environment_id: None,
+            })
+            .await
+            .is_err()
         {
             return;
         }
@@ -71,10 +65,10 @@ impl PeerConnection {
         let remote_session_id = Some(session_id);
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(64);
-        let relay_writer = Arc::clone(&writer);
+        let relay_session = Arc::clone(&session);
         let relay_task = tokio::spawn(async move {
             while let Some(msg) = outbound_rx.recv().await {
-                if write_message(&relay_writer, &msg).await.is_err() {
+                if relay_session.write(msg).await.is_err() {
                     break;
                 }
             }
@@ -90,7 +84,7 @@ impl PeerConnection {
             ) {
                 ActivationResult::Accepted { generation, displaced } => (generation, displaced),
                 ActivationResult::Rejected { reason } => {
-                    let _ = write_message(&writer, &Message::Peer(Box::new(PeerWireMessage::Goodbye { reason }))).await;
+                    let _ = session.write(Message::Peer(Box::new(PeerWireMessage::Goodbye { reason }))).await;
                     relay_task.abort();
                     return;
                 }
@@ -115,16 +109,9 @@ impl PeerConnection {
 
         loop {
             tokio::select! {
-                line_result = lines.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            let msg: Message = match serde_json::from_str(&line) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    warn!(peer = %host_name, err = %e, "failed to parse peer message");
-                                    break;
-                                }
-                            };
+                message_result = session.read() => {
+                    match message_result {
+                        Ok(Some(msg)) => {
                             match msg {
                                 Message::Peer(peer_msg) => {
                                     if let Err(e) = self.peer_data_tx.send(InboundPeerEnvelope {
@@ -142,11 +129,11 @@ impl PeerConnection {
                                 }
                             }
                         }
-                        Ok(None) => break,
                         Err(e) => {
                             error!(peer = %host_name, err = %e, "error reading from peer");
                             break;
                         }
+                        Ok(None) => break,
                     }
                 }
                 _ = self.shutdown_rx.changed() => {

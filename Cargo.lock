@@ -1099,6 +1099,7 @@ dependencies = [
  "async-trait",
  "flotilla-core",
  "flotilla-protocol",
+ "flotilla-transport",
  "libc",
  "serde_json",
  "tempfile",
@@ -1154,6 +1155,7 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-protocol",
+ "flotilla-transport",
  "futures",
  "indexmap",
  "serde",
@@ -1183,6 +1185,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-transport"
+version = "0.1.0"
+dependencies = [
+ "flotilla-protocol",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-tui"
 version = "0.1.0"
 dependencies = [
@@ -1197,6 +1208,7 @@ dependencies = [
  "flotilla-client",
  "flotilla-commands",
  "flotilla-core",
+ "flotilla-daemon",
  "flotilla-protocol",
  "futures",
  "image",

@@ -3,10 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{GoodbyeReason, Message, PeerWireMessage};
-use tokio::{
-    io::{BufReader, BufWriter},
-    sync::{mpsc, Mutex},
-};
+#[cfg(test)]
+use tokio::io::AsyncWrite;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::peer::{PeerManager, PeerSender};
 
@@ -32,15 +31,9 @@ impl PeerSender for SocketPeerSender {
     }
 }
 
-pub(super) type ConnectionLines = tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>;
-pub(super) type ConnectionWriter = Arc<tokio::sync::Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>>;
-
-pub(super) async fn write_message(
-    writer: &tokio::sync::Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
-    msg: &Message,
-) -> Result<(), ()> {
-    let mut w = writer.lock().await;
-    flotilla_protocol::framing::write_message_line(&mut *w, msg).await.map_err(|_| ())
+#[cfg(test)]
+pub(super) async fn write_message(writer: &mut (impl AsyncWrite + Unpin), msg: &Message) -> Result<(), ()> {
+    flotilla_protocol::framing::write_message_line(writer, msg).await.map_err(|_| ())
 }
 
 pub(super) async fn sync_peer_query_state(peer_manager: &Arc<Mutex<PeerManager>>, daemon: &Arc<InProcessDaemon>) {
