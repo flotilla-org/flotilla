@@ -8,11 +8,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use flotilla_core::{
-    config::ConfigStore,
-    daemon::DaemonHandle,
-    data::{GroupEntry, GroupedWorkItems},
-};
+use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, data::SectionLabels};
 use flotilla_protocol::{
     Change, Command, DaemonEvent, HostName, ProviderData, ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot,
     StatusResponse, StreamKey, TopologyResponse, WorkItem,
@@ -124,24 +120,15 @@ pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-pub(crate) fn grouped_items(items: Vec<WorkItem>) -> GroupedWorkItems {
-    let selectable_indices = (0..items.len()).collect();
-    let table_entries = items.into_iter().map(|item| GroupEntry::Item(Box::new(item))).collect();
-    GroupedWorkItems { table_entries, selectable_indices }
-}
-
-pub(crate) fn issue_table_entries(count: usize) -> GroupedWorkItems {
-    grouped_items((0..count).map(|i| issue_item(i.to_string())).collect())
-}
-
-pub(crate) fn set_active_table_view(app: &mut App, table_view: GroupedWorkItems) {
+pub(crate) fn set_active_table_items(app: &mut App, items: Vec<WorkItem>) {
     let repo_key = app.model.repo_order[app.model.active_repo].clone();
-    // Write directly to the table's grouped_items without triggering auto-select,
-    // so tests that call this retain a None selection until they explicitly navigate.
     if let Some(page) = app.screen.repo_pages.get_mut(&repo_key) {
-        page.table.grouped_items = table_view;
-        page.table.selected_selectable_idx = None;
-        page.table.table_state.select(None);
+        let providers = flotilla_protocol::ProviderData::default();
+        let labels = SectionLabels::default();
+        let sections = flotilla_core::data::group_work_items_split(&items, &providers, &labels, std::path::Path::new("/tmp"));
+        page.table.update_sections(sections);
+        // Clear the auto-selection so tests retain None until they explicitly navigate.
+        page.table.clear_selection();
     }
 }
 

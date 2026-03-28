@@ -175,9 +175,46 @@ impl SplitTable {
         self.sections.iter().flat_map(|(_, table)| table.items.iter())
     }
 
+    /// Iterate all items with `(section_idx, &WorkItem, item_idx)` tuples.
+    pub fn all_items_with_indices(&self) -> impl Iterator<Item = (usize, &WorkItem, usize)> {
+        self.sections
+            .iter()
+            .enumerate()
+            .flat_map(|(section_idx, (_, table))| table.items.iter().enumerate().map(move |(item_idx, item)| (section_idx, item, item_idx)))
+    }
+
     /// Convenience: identity of the currently selected item.
     pub fn selected_identity(&self) -> Option<WorkItemIdentity> {
         self.selected_work_item().map(|item| item.identity.clone())
+    }
+
+    /// Total number of items across all sections.
+    pub fn total_item_count(&self) -> usize {
+        self.sections.iter().map(|(_, table)| table.items.len()).sum()
+    }
+
+    /// A flat selection index across sections, for change-detection purposes.
+    /// Returns `None` when nothing is selected.
+    pub fn selected_flat_index(&self) -> Option<usize> {
+        let selected_idx = self.sections.get(self.active_section).and_then(|(_, t)| t.selected_idx)?;
+        let prior_items: usize = self.sections[..self.active_section].iter().map(|(_, t)| t.items.len()).sum();
+        Some(prior_items + selected_idx)
+    }
+
+    /// Select an item by flat index (across all sections). Used by tests.
+    pub fn select_flat_index(&mut self, flat_idx: usize) {
+        let mut remaining = flat_idx;
+        let mut target_section = None;
+        for (i, (_, table)) in self.sections.iter().enumerate() {
+            if remaining < table.items.len() {
+                target_section = Some((i, remaining));
+                break;
+            }
+            remaining -= table.items.len();
+        }
+        if let Some((section_idx, item_idx)) = target_section {
+            self.select_by_mouse(section_idx, item_idx);
+        }
     }
 
     // ── Rendering ──────────────────────────────────────────────────────

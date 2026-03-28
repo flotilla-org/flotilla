@@ -24,10 +24,10 @@ fn hp(path: &str) -> HostPath {
     HostPath::new(HostName::local(), PathBuf::from(path))
 }
 
-/// Read the active RepoPage's selected selectable index.
+/// Read the active RepoPage's selected flat index.
 fn active_selection(app: &App) -> Option<usize> {
     let identity = &app.model.repo_order[app.model.active_repo];
-    app.screen.repo_pages.get(identity).and_then(|p| p.table.selected_selectable_idx)
+    app.screen.repo_pages.get(identity).and_then(|p| p.table.selected_flat_index())
 }
 
 /// Read the active RepoPage's show_providers flag.
@@ -48,11 +48,11 @@ fn active_search_query(app: &App) -> Option<&str> {
     app.screen.repo_pages.get(identity).and_then(|p| p.active_search_query.as_deref())
 }
 
-/// Set the active RepoPage's selection by selectable index.
+/// Set the active RepoPage's selection by flat index.
 fn set_active_selection(app: &mut App, si: usize) {
     let identity = app.model.repo_order[app.model.active_repo].clone();
     if let Some(page) = app.screen.repo_pages.get_mut(&identity) {
-        page.table.select_row_self(si);
+        page.table.select_flat_index(si);
     }
 }
 

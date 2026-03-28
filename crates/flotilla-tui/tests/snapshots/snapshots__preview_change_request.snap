@@ -1,35 +1,34 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 293
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││Description: Refactor auth module             │
-│      ── Pull Requests ──                                             ││Branch: feat-auth                             │
-│▸  ⊙                   Refactor a feat-         #77                   ││PR #77: Refactor auth module                  │
-│                                                                      ││State: Open                                   │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+── Pull Requests ─────────────────────────────────────────────────────  ┌ Preview ─────────────────────────────────────┐
+      PR#    Title                       Branch        State    Issues  │Description: Refactor auth module             │
+▸  ⊙  #77    Refactor auth module        feat-auth     open             │Branch: feat-auth                             │
+                                                                        │PR #77: Refactor auth module                  │
+                                                                        │State: Open                                   │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
 / for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     ◫ auto   @local

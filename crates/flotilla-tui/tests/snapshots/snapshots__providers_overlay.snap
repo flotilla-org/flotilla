@@ -3,32 +3,32 @@ source: crates/flotilla-tui/tests/snapshots.rs
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ✕ ┐┌ Preview ─────────────────────────────────────┐
-│Role             Provider                 Status                      ││                                              │
-│VCS              Git                                                  ││                                              │
-│Checkout mgr     Git Worktrees                                        ││                                              │
-│Change request   GitHub                   ✗                           ││                                              │
-│Issue tracker    —                                                    ││                                              │
-│Cloud agents     Claude                   ✓                           ││                                              │
-│AI utility       —                                                    ││                                              │
-│Workspace mgr    —                                                    ││                                              │
-│Terminal pool    —                                                    ││                                              │
-│Environment      —                                                    ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+                                                                        ┌ Preview ─────────────────────────────────────┐
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
 PROVIDERS                    <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     ◫ auto   @local

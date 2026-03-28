@@ -1,35 +1,34 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 76
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  ┌ Help ↓ ──────────────────────────────────────────────────────────────┐                       │
-│                       │Item Icons                                                            │                       │
-│                       │●  Checkout with workspace    ○  Checkout (no workspace)              │                       │
-│                       │▶  Running session            ◆  Idle session                         │                       │
-│                       │⊙  Pull request               ◇  Issue                                │                       │
-│                       │⊶  Remote branch                                                      │                       │
-│                       │                                                                      │                       │
-│                       │Column Indicators                                                     │                       │
-│                       │WT: ◆ main  ✓ checked out                                             │                       │
-│                       │WS: ● has workspace  2/3/… multiple                                   │                       │
-│                       │PR: ✓ merged  ✗ closed                                                │                       │
-│                       │Git: ? untracked  M modified  ↑ ahead  ↓ behind                       │                       │
-│                       │                                                                      │                       │
-│                       │Navigation                                                            │                       │
-│                       │Down / j          Move selection down                                 │                       │
-│                       │Up / k            Move selection up                                   │                       │
-│                       │                                                                      │                       │
-│                       │Actions                                                               │                       │
-│                       │Enter             Confirm / execute                                   │                       │
-│                       │/                 Open command palette                                │                       │
-│                       │?                 Open contextual palette (pre-filled)                │                       │
-│                       │.                 Open action menu                                    │                       │
-│                       │n                 New branch input                                    │                       │
-│                       │d                 Remove checkout                                     │                       │
-│                       │p                 Open change request in browser                      │                       │
-│                       └──────────────────────────────────────────────────────────────────────┘                       │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+                                                                        ┌ Preview ─────────────────────────────────────┐
+                        ┌ Help ↓ ──────────────────────────────────────────────────────────────┐                       │
+                        │Item Icons                                                            │                       │
+                        │●  Checkout with workspace    ○  Checkout (no workspace)              │                       │
+                        │▶  Running session            ◆  Idle session                         │                       │
+                        │⊙  Pull request               ◇  Issue                                │                       │
+                        │⊶  Remote branch                                                      │                       │
+                        │                                                                      │                       │
+                        │Column Indicators                                                     │                       │
+                        │WT: ◆ main  ✓ checked out                                             │                       │
+                        │WS: ● has workspace  2/3/… multiple                                   │                       │
+                        │PR: ✓ merged  ✗ closed                                                │                       │
+                        │Git: ? untracked  M modified  ↑ ahead  ↓ behind                       │                       │
+                        │                                                                      │                       │
+                        │Navigation                                                            │                       │
+                        │Down / j          Move selection down                                 │                       │
+                        │Up / k            Move selection up                                   │                       │
+                        │                                                                      │                       │
+                        │Actions                                                               │                       │
+                        │Enter             Confirm / execute                                   │                       │
+                        │/                 Open command palette                                │                       │
+                        │?                 Open contextual palette (pre-filled)                │                       │
+                        │.                 Open action menu                                    │                       │
+                        │n                 New branch input                                    │                       │
+                        │d                 Remove checkout                                     │                       │
+                        │p                 Open change request in browser                      │                       │
+                        └──────────────────────────────────────────────────────────────────────┘                       │
+                                                                        └──────────────────────────────────────────────┘
 HELP                         <j> DOWN  <k> UP  <ESC> CLOSE  <h> CLOSE 

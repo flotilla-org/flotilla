@@ -1,35 +1,34 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 54
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││Description: checkout feat-login              │
-│      ── Checkouts ──                                                 ││Branch: feat-login                            │
-│▸  ○                 f checkout f feat- ✓                             ││Path: /test/my-project/feat-login             │
-│      ── Sessions ──                                                  ││                                              │
-│   ◆             s1    session s1 feat/              ◆                ││                                              │
-│      ── Pull Requests ──                                             ││                                              │
-│   ⊙                   Add login  feat-         #42                   ││                                              │
-│      ── Issues ──                                                    ││                                              │
-│   ◇                   Users need —                       #10         ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+── Checkouts ─────────────────────────────────────────────────────────  ┌ Preview ─────────────────────────────────────┐
+      Source     Path   Description Branc WT  WS  PR   SS   Issues Git  │Description: checkout feat-login              │
+▸  ○             /test/ checkout fe feat- ✓                             │Branch: feat-login                            │
+                                                                        │Path: /test/my-project/feat-login             │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+── Sessions ──────────────────────────────────────────────────────────  │                                              │
+      Source     Key         Description            Branch      Status  │                                              │
+▸  ◆             s1          session s1             feat/sessio ◆       │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+── Pull Requests ─────────────────────────────────────────────────────  │                                              │
+      PR#    Title                       Branch        State    Issues  │                                              │
+▸  ⊙  #42    Add login page              feat-login    open             │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+── Issues ────────────────────────────────────────────────────────────  │                                              │
+      ID     Title                              Labels            PR    │                                              │
+▸  ◇  #10    Users need authentication                                  │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
 / for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     ◫ auto   @local

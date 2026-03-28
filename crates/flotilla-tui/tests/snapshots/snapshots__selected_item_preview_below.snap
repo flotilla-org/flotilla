@@ -3,29 +3,29 @@ source: crates/flotilla-tui/tests/snapshots.rs
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌───────────────────────────────────────────────────────────────────────────────────── ⚙ ┐
-│      Source     Path       Description         Branch    WT  WS  PR   SS   Issues Git  │
-│      ── Checkouts ──                                                                   │
-│▸  ○                   feat checkout feat-dashb feat-dash ✓                             │
-│      ── Pull Requests ──                                                               │
-│   ⊙                        Build analytics das feat-dash         #99                   │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-│                                                                                        │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+── Checkouts ───────────────────────────────────────────────────────────────────────────
+      Source     Path       Description          Branch     WT  WS  PR   SS   Issues Git
+▸  ○             /test/my-p checkout feat-dashbo feat-dashb ✓
+
+
+
+
+
+
+
+
+── Pull Requests ───────────────────────────────────────────────────────────────────────
+      PR#    Title                                   Branch              State    Issues
+▸  ⊙  #99    Build analytics dashboard               feat-dashboard      open
+
+
+
+
+
+
+
+
+
 ┌ Preview ───────────────────────────────────────────────────────────────────────────────┐
 │Description: checkout feat-dashboard                                                    │
 │Branch: feat-dashboard                                                                  │

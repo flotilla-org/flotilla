@@ -573,7 +573,13 @@ fn build_item_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::{checkout_item, grouped_items, issue_item, session_item};
+    use crate::app::test_support::{checkout_item, issue_item, session_item};
+
+    fn grouped_items(items: Vec<WorkItem>) -> GroupedWorkItems {
+        let selectable_indices = (0..items.len()).collect();
+        let table_entries = items.into_iter().map(|item| GroupEntry::Item(Box::new(item))).collect();
+        GroupedWorkItems { table_entries, selectable_indices }
+    }
 
     #[test]
     fn update_items_preserves_selection_by_identity() {

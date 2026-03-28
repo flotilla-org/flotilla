@@ -1,35 +1,34 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 506
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││Description: Feature branch checkout          │
-│      ── Checkouts ──                                                 ││Branch: feat-xyz                              │
-│▸  ○                 f Feature br feat- ✓                             ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      │└──────────────────────────────────────────────┘
-│                                                                      │┌ Debug (D to toggle) ─────────────────────────┐
-│                                                                      ││Group #12                                     │
-│                                                                      ││branch: feat-xyz                              │
-│                                                                      ││checkout: /test/my-project/feat-xyz           │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+── Checkouts ─────────────────────────────────────────────────────────  ┌ Preview ─────────────────────────────────────┐
+      Source     Path   Description Branc WT  WS  PR   SS   Issues Git  │Description: Feature branch checkout          │
+▸  ○             /test/ Feature bra feat- ✓                             │Branch: feat-xyz                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
+                                                                        ┌ Debug (D to toggle) ─────────────────────────┐
+                                                                        │Group #12                                     │
+                                                                        │branch: feat-xyz                              │
+                                                                        │checkout: /test/my-project/feat-xyz           │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
 / for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     ◫ auto   @local

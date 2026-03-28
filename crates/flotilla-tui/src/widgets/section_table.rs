@@ -118,7 +118,9 @@ impl<T: Identifiable> SectionTable<T> {
     }
 
     /// Retreat selection by one row. Returns `false` if already at the start
-    /// (does not wrap).
+    /// (does not wrap). When called with no selection, selects the first item
+    /// (matching the convention that the first user interaction always lands on
+    /// the first item).
     pub fn select_prev(&mut self) -> bool {
         if self.items.is_empty() {
             return false;
@@ -132,9 +134,8 @@ impl<T: Identifiable> SectionTable<T> {
             }
             Some(_) => false, // at start
             None => {
-                let last = self.items.len() - 1;
-                self.selected_idx = Some(last);
-                self.table_state.select(Some(last));
+                self.selected_idx = Some(0);
+                self.table_state.select(Some(0));
                 true
             }
         }

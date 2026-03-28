@@ -1,35 +1,34 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 218
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││Description: checkout feat-dashboard          │
-│      ── Checkouts ──                                                 ││Branch: feat-dashboard                        │
-│▸  ○                 f checkout f feat- ✓                             ││Path: /test/my-project/feat-dashboard         │
-│      ── Pull Requests ──                                             ││                                              │
-│   ⊙                   Build anal feat-         #99                   ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+── Checkouts ─────────────────────────────────────────────────────────  ┌ Preview ─────────────────────────────────────┐
+      Source     Path   Description Branc WT  WS  PR   SS   Issues Git  │Description: checkout feat-dashboard          │
+▸  ○             /test/ checkout fe feat- ✓                             │Branch: feat-dashboard                        │
+                                                                        │Path: /test/my-project/feat-dashboard         │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+── Pull Requests ─────────────────────────────────────────────────────  │                                              │
+      PR#    Title                       Branch        State    Issues  │                                              │
+▸  ⊙  #99    Build analytics dashboard   feat-dashboar open             │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
 / for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     ◫ auto   @local

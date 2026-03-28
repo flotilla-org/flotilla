@@ -1,15 +1,12 @@
-use flotilla_core::data::{GroupEntry, GroupedWorkItems};
-use ratatui::layout::Rect;
-
 use crate::app::{
-    test_support::{issue_item, issue_table_entries, set_active_table_view, stub_app_with_repos},
+    test_support::{issue_item, set_active_table_items, stub_app_with_repos},
     App,
 };
 
-/// Read the selected selectable index from the active RepoPage.
+/// Read the selected flat index from the active RepoPage.
 fn active_page_selection(app: &App) -> Option<usize> {
     let identity = &app.model.repo_order[app.model.active_repo];
-    app.screen.repo_pages.get(identity).and_then(|p| p.table.selected_selectable_idx)
+    app.screen.repo_pages.get(identity).and_then(|p| p.table.selected_flat_index())
 }
 
 // ── switch_tab tests ─────────────────────────────────────────────
@@ -169,7 +166,7 @@ fn move_tab_returns_false_with_single_repo() {
 #[test]
 fn select_next_from_none_selects_first() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
+    set_active_table_items(&mut app, (0..5).map(|i| issue_item(i.to_string())).collect());
     assert_eq!(active_page_selection(&app), None);
     app.select_next();
     assert_eq!(active_page_selection(&app), Some(0));
@@ -178,7 +175,7 @@ fn select_next_from_none_selects_first() {
 #[test]
 fn select_next_advances_selection() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
+    set_active_table_items(&mut app, (0..5).map(|i| issue_item(i.to_string())).collect());
     app.select_next(); // None -> 0
     app.select_next(); // 0 -> 1
     assert_eq!(active_page_selection(&app), Some(1));
@@ -187,7 +184,7 @@ fn select_next_advances_selection() {
 #[test]
 fn select_next_stays_at_end() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(3));
+    set_active_table_items(&mut app, (0..3).map(|i| issue_item(i.to_string())).collect());
     // Select each item in order
     app.select_next(); // None -> 0
     app.select_next(); // 0 -> 1
@@ -199,7 +196,7 @@ fn select_next_stays_at_end() {
 #[test]
 fn select_next_noop_on_empty_table() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(0));
+    set_active_table_items(&mut app, vec![]);
     app.select_next();
     assert_eq!(active_page_selection(&app), None);
 }
@@ -209,7 +206,7 @@ fn select_next_triggers_fetch_when_near_bottom() {
     let mut app = stub_app_with_repos(1);
     // 6 items: positions 0-5. After two select_next calls we're at
     // position 1, and 1+5 = 6 >= 6 triggers the fetch.
-    set_active_table_view(&mut app, issue_table_entries(6));
+    set_active_table_items(&mut app, (0..6).map(|i| issue_item(i.to_string())).collect());
 
     let repo = app.model.repo_order[0].clone();
     if let Some(rm) = app.model.repos.get_mut(&repo) {
@@ -244,7 +241,7 @@ fn select_next_triggers_fetch_when_near_bottom() {
 #[test]
 fn select_prev_from_none_selects_first() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
+    set_active_table_items(&mut app, (0..5).map(|i| issue_item(i.to_string())).collect());
     assert_eq!(active_page_selection(&app), None);
     app.select_prev();
     assert_eq!(active_page_selection(&app), Some(0));
@@ -253,7 +250,7 @@ fn select_prev_from_none_selects_first() {
 #[test]
 fn select_prev_decrements_selection() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
+    set_active_table_items(&mut app, (0..5).map(|i| issue_item(i.to_string())).collect());
     // Navigate to position 2
     app.select_next(); // None -> 0
     app.select_next(); // 0 -> 1
@@ -265,7 +262,7 @@ fn select_prev_decrements_selection() {
 #[test]
 fn select_prev_stays_at_zero() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
+    set_active_table_items(&mut app, (0..5).map(|i| issue_item(i.to_string())).collect());
     app.select_next(); // None -> 0
     app.select_prev(); // 0 -> 0 (stays)
     assert_eq!(active_page_selection(&app), Some(0));
@@ -274,71 +271,15 @@ fn select_prev_stays_at_zero() {
 #[test]
 fn select_prev_noop_on_empty_table() {
     let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(0));
+    set_active_table_items(&mut app, vec![]);
     app.select_prev();
     assert_eq!(active_page_selection(&app), None);
 }
 
 // ── row_at_mouse tests ───────────────────────────────────────────
-
-#[test]
-fn row_at_mouse_outside_table_returns_none() {
-    let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
-    // Set a known table area
-    app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
-    // Click outside: x before table
-    assert!(app.row_at_mouse(5, 15).is_none());
-    // Click outside: y before table
-    assert!(app.row_at_mouse(15, 5).is_none());
-    // Click outside: x after table
-    assert!(app.row_at_mouse(60, 15).is_none());
-    // Click outside: y after table
-    assert!(app.row_at_mouse(15, 30).is_none());
-}
-
-#[test]
-fn row_at_mouse_header_rows_return_none() {
-    let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
-    app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
-    // Row 0 and row 1 (header rows, y=10 and y=11) should return None
-    assert!(app.row_at_mouse(15, 10).is_none());
-    assert!(app.row_at_mouse(15, 11).is_none());
-}
-
-#[test]
-fn row_at_mouse_valid_row_returns_selectable_index() {
-    let mut app = stub_app_with_repos(1);
-    set_active_table_view(&mut app, issue_table_entries(5));
-    app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
-    // y=12 means row_in_table=2, data_row=0, offset=0, actual_row=0
-    // selectable_indices = [0,1,2,3,4], so position of 0 is 0
-    assert_eq!(app.row_at_mouse(15, 12), Some(0));
-    // y=13 means data_row=1, actual_row=1 -> selectable index 1
-    assert_eq!(app.row_at_mouse(15, 13), Some(1));
-    // y=16 means data_row=4, actual_row=4 -> selectable index 4
-    assert_eq!(app.row_at_mouse(15, 16), Some(4));
-}
-
-#[test]
-fn row_at_mouse_non_selectable_row_returns_none() {
-    let mut app = stub_app_with_repos(1);
-    // Create entries with a gap: selectable indices are [0, 2] (skip 1 = header)
-    let table_view = GroupedWorkItems {
-        table_entries: vec![
-            GroupEntry::Item(Box::new(issue_item("0"))),
-            GroupEntry::Header(flotilla_core::data::SectionHeader("Section".into())),
-            GroupEntry::Item(Box::new(issue_item("2"))),
-        ],
-        selectable_indices: vec![0, 2],
-    };
-    set_active_table_view(&mut app, table_view);
-    app.ui.layout.table_area = Rect::new(10, 10, 50, 20);
-    // y=12 -> data_row=0 -> actual_row=0, which IS in selectable_indices
-    assert_eq!(app.row_at_mouse(15, 12), Some(0));
-    // y=13 -> data_row=1 -> actual_row=1, which is NOT in selectable_indices (it's a header)
-    assert!(app.row_at_mouse(15, 13).is_none());
-    // y=14 -> data_row=2 -> actual_row=2, which IS in selectable_indices at position 1
-    assert_eq!(app.row_at_mouse(15, 14), Some(1));
-}
+// Note: mouse hit-testing now uses SplitTable's row_at_mouse(), which
+// depends on section_areas populated during render. Since these tests
+// don't render, they exercise the App-level row_at_mouse helper which
+// works differently from the SplitTable's internal mouse handling.
+// The mouse hit-testing at the SplitTable level is tested in
+// repo_page/tests.rs and split_table/tests.rs.
