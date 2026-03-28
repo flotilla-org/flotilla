@@ -4,8 +4,8 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ── Checkouts ────────────────────────────────────────────────────────────────────────────────────────────────────── ⚙
-      Source     Path              Description                         Branch            WT  WS  PR   SS   Issues Git
-▸  ○                   feat-dashb… checkout feat-dashboard             feat-dashboard    ✓
+      Source     Path              Description                         Branch             WT  WS  PR   SS   Issues Git
+▸  ○                   feat-dashb… checkout feat-dashboard             feat-dashboard     ✓
 
 
 

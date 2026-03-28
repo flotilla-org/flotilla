@@ -212,10 +212,19 @@ impl<T: Identifiable> SectionTable<T> {
         }
 
         let fill_space = usable.saturating_sub(fixed_total);
+        let mut fill_assigned = 0u16;
+        let mut last_fill_idx = None;
         for (i, col) in self.columns.iter().enumerate() {
             if let Constraint::Fill(weight) = col.width {
-                widths[i] = if fill_total > 0 { fill_space * weight / fill_total } else { 0 };
+                let w = if fill_total > 0 { fill_space * weight / fill_total } else { 0 };
+                widths[i] = w;
+                fill_assigned += w;
+                last_fill_idx = Some(i);
             }
+        }
+        // Distribute remainder pixels to the last fill column.
+        if let Some(idx) = last_fill_idx {
+            widths[idx] += fill_space.saturating_sub(fill_assigned);
         }
         widths
     }

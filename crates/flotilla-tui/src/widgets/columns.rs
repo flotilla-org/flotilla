@@ -169,7 +169,7 @@ fn change_request_columns() -> Vec<ColumnDef<WorkItem>> {
         col("State", Constraint::Length(8), |item, ctx| {
             let text = if let Some(ref pr_key) = item.change_request_key {
                 if let Some(cr) = ctx.providers.change_requests.get(pr_key.as_str()) {
-                    format!("{:?}", cr.status).to_lowercase()
+                    cr.status.to_string()
                 } else {
                     String::new()
                 }

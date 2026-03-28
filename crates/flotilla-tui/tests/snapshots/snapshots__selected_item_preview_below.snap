@@ -7,8 +7,8 @@ expression: output
       Source     Path       Description          Branch     WT  WS  PR   SS   Issues Git
 ▸  ○                  feat… checkout feat-dashb… feat-dash… ✓
 ── Pull Requests ───────────────────────────────────────────────────────────────────────
-      PR#    Title                                  Branch              State    Issues
-   ⊙  #99    Build analytics dashboard              feat-dashboard      open
+      PR#    Title                                  Branch               State    Issues
+   ⊙  #99    Build analytics dashboard              feat-dashboard       open
 
 
 

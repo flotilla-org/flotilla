@@ -4,8 +4,8 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ── Pull Requests ────────────────────────────────────────────────── ⚙   ┌ Preview ─────────────────────────────────────┐
-      PR#    Title                      Branch        State    Issues   │Description: Refactor auth module             │
-▸  ⊙  #77    Refactor auth module       feat-auth     open              │Branch: feat-auth                             │
+      PR#    Title                      Branch         State    Issues  │Description: Refactor auth module             │
+▸  ⊙  #77    Refactor auth module       feat-auth      open             │Branch: feat-auth                             │
                                                                         │PR #77: Refactor auth module                  │
                                                                         │State: Open                                   │
                                                                         │                                              │

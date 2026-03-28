@@ -385,7 +385,7 @@ impl SplitTable {
 
         let mut flat_row = 0usize;
 
-        for (section_idx, (_, table)) in self.sections.iter().enumerate() {
+        for (_, table) in &self.sections {
             // ── Divider row ──
             if flat_row >= self.scroll_offset && flat_row < self.scroll_offset + viewport_height {
                 let y = area.y + (flat_row - self.scroll_offset) as u16;
@@ -444,8 +444,6 @@ impl SplitTable {
                 prev_source = item.source.clone();
                 flat_row += 1;
             }
-
-            let _ = section_idx;
         }
 
         // Render gear icon last so it overlays the top-right corner.
@@ -483,7 +481,7 @@ impl SplitTable {
 fn render_divider(frame: &mut Frame, label: &str, theme: &Theme, area: Rect) {
     let dashes_left = 2;
     let left = "\u{2500}".repeat(dashes_left);
-    let right_width = area.width.saturating_sub(dashes_left as u16 + label.len() as u16 + 4);
+    let right_width = area.width.saturating_sub(dashes_left as u16 + label.chars().count() as u16 + 4);
     let right = "\u{2500}".repeat(right_width as usize);
     let header_line = Line::from(vec![
         Span::styled(format!("{left} "), Style::default().fg(theme.muted)),
