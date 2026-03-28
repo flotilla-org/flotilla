@@ -5,6 +5,8 @@ mod peer_runtime;
 mod remote_commands;
 mod request_dispatch;
 mod shared;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use std::{
     collections::HashMap,

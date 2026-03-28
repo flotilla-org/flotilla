@@ -36,14 +36,8 @@ pub fn memory_session_pair_with_buffer<M>(buffer: usize) -> (Session<M>, Session
     let (left_to_right_tx, left_to_right_rx) = mpsc::channel(buffer);
     let (right_to_left_tx, right_to_left_rx) = mpsc::channel(buffer);
 
-    let left = Session {
-        reader: SessionReader { rx: Mutex::new(right_to_left_rx) },
-        writer: SessionWriter { tx: left_to_right_tx },
-    };
-    let right = Session {
-        reader: SessionReader { rx: Mutex::new(left_to_right_rx) },
-        writer: SessionWriter { tx: right_to_left_tx },
-    };
+    let left = Session { reader: SessionReader { rx: Mutex::new(right_to_left_rx) }, writer: SessionWriter { tx: left_to_right_tx } };
+    let right = Session { reader: SessionReader { rx: Mutex::new(left_to_right_rx) }, writer: SessionWriter { tx: right_to_left_tx } };
 
     (left, right)
 }

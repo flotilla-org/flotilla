@@ -91,39 +91,37 @@ impl SocketDaemon {
         let reader_task = tokio::spawn(async move {
             loop {
                 match reader_session.read().await {
-                    Ok(Some(msg)) => {
-                        match msg {
-                            Message::Response { id, response } => {
-                                let mut map = reader_pending.lock().await;
-                                if let Some(tx) = map.remove(&id) {
-                                    let _ = tx.send(*response);
-                                } else {
-                                    warn!(%id, "received response for unknown request id");
-                                }
-                            }
-                            Message::Event { event } => {
-                                let event = *event;
-                                handle_event(
-                                    event,
-                                    &reader_local_seqs,
-                                    &reader_recovering,
-                                    &reader_event_tx,
-                                    &reader_session,
-                                    &reader_pending,
-                                    &reader_next_id,
-                                );
-                            }
-                            Message::Request { .. } => {
-                                warn!("received unexpected request from daemon");
-                            }
-                            Message::Hello { .. } => {
-                                warn!("received unexpected hello from daemon");
-                            }
-                            Message::Peer(_) => {
-                                warn!("received unexpected peer envelope from daemon");
+                    Ok(Some(msg)) => match msg {
+                        Message::Response { id, response } => {
+                            let mut map = reader_pending.lock().await;
+                            if let Some(tx) = map.remove(&id) {
+                                let _ = tx.send(*response);
+                            } else {
+                                warn!(%id, "received response for unknown request id");
                             }
                         }
-                    }
+                        Message::Event { event } => {
+                            let event = *event;
+                            handle_event(
+                                event,
+                                &reader_local_seqs,
+                                &reader_recovering,
+                                &reader_event_tx,
+                                &reader_session,
+                                &reader_pending,
+                                &reader_next_id,
+                            );
+                        }
+                        Message::Request { .. } => {
+                            warn!("received unexpected request from daemon");
+                        }
+                        Message::Hello { .. } => {
+                            warn!("received unexpected hello from daemon");
+                        }
+                        Message::Peer(_) => {
+                            warn!("received unexpected peer envelope from daemon");
+                        }
+                    },
                     Ok(None) => {
                         // EOF — daemon closed connection
                         error!("daemon connection closed (EOF)");

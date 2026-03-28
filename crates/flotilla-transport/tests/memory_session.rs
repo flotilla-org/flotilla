@@ -1,6 +1,5 @@
 use flotilla_protocol::{HostName, Message, Request};
-use flotilla_transport::message::message_session_pair;
-use flotilla_transport::memory::memory_session_pair;
+use flotilla_transport::{memory::memory_session_pair, message::message_session_pair};
 
 #[tokio::test]
 async fn memory_session_pair_delivers_messages_bidirectionally() {
@@ -26,17 +25,9 @@ async fn dropping_one_endpoint_closes_the_other_reader() {
 async fn message_session_pair_transfers_protocol_messages() {
     let (left, right) = message_session_pair();
 
-    left.write(Message::Request {
-        id: 7,
-        request: Request::GetTopology,
-    })
-    .await
-    .expect("write request");
+    left.write(Message::Request { id: 7, request: Request::GetTopology }).await.expect("write request");
 
-    assert!(matches!(
-        right.read().await.expect("read message"),
-        Some(Message::Request { id: 7, request: Request::GetTopology })
-    ));
+    assert!(matches!(right.read().await.expect("read message"), Some(Message::Request { id: 7, request: Request::GetTopology })));
 
     right
         .write(Message::Hello {

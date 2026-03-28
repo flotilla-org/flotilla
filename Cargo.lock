@@ -1208,6 +1208,7 @@ dependencies = [
  "flotilla-client",
  "flotilla-commands",
  "flotilla-core",
+ "flotilla-daemon",
  "flotilla-protocol",
  "futures",
  "image",

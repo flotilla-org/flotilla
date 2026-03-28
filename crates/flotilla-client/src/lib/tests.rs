@@ -162,7 +162,8 @@ async fn send_request_writes_message_and_returns_pending_response() {
     let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let request_task = tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::ListRepos).await });
+    let request_task =
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::ListRepos).await });
 
     let (id, request) = read_request(&harness.remote).await;
     assert_eq!(request, Request::ListRepos);
@@ -206,7 +207,8 @@ async fn send_request_returns_cancelled_when_sender_is_dropped() {
     let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task = tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetTopology).await });
+    let task =
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetTopology).await });
 
     let (id, request) = read_request(&harness.remote).await;
     assert_eq!(request, Request::GetTopology);
@@ -233,7 +235,8 @@ async fn send_request_cleans_pending_on_cancelled_response() {
     let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task = tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetStatus).await });
+    let task =
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetStatus).await });
 
     let (id, request) = read_request(&harness.remote).await;
     assert_eq!(request, Request::GetStatus);
@@ -252,7 +255,8 @@ async fn send_request_cleans_pending_on_timeout() {
     let request_session = Arc::clone(&harness.session);
     let request_pending = Arc::clone(&harness.pending);
     let request_next_id = Arc::clone(&harness.next_id);
-    let task = tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetStatus).await });
+    let task =
+        tokio::spawn(async move { send_request(request_session.as_ref(), &request_pending, &request_next_id, Request::GetStatus).await });
 
     let (id, request) = read_request(&harness.remote).await;
     assert_eq!(id, 1);
@@ -582,7 +586,15 @@ async fn handle_event_forwards_host_removed_and_tracks_seq() {
     let (session, pending, next_id, _server) = event_harness();
     let host = flotilla_protocol::HostName::new("peer-1");
 
-    handle_event(DaemonEvent::HostRemoved { host: host.clone(), seq: 9 }, &local_seqs, &recovering, &event_tx, &session, &pending, &next_id);
+    handle_event(
+        DaemonEvent::HostRemoved { host: host.clone(), seq: 9 },
+        &local_seqs,
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
 
     let event = event_rx.try_recv().expect("should receive HostRemoved");
     assert!(matches!(event, DaemonEvent::HostRemoved { seq: 9, .. }));

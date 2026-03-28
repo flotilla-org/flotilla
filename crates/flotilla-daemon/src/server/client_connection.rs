@@ -4,8 +4,8 @@ use std::sync::{
 };
 
 use flotilla_core::{agents::SharedAgentStateStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_transport::message::MessageSession;
 use flotilla_protocol::{Message, Request};
+use flotilla_transport::message::MessageSession;
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
 

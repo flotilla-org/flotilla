@@ -61,8 +61,5 @@ pub fn unix_message_session(stream: UnixStream) -> MessageSession {
 
 pub fn message_session_pair() -> (MessageSession, MessageSession) {
     let (left, right) = memory_session_pair();
-    (
-        MessageSession { inner: MessageSessionInner::Memory(left) },
-        MessageSession { inner: MessageSessionInner::Memory(right) },
-    )
+    (MessageSession { inner: MessageSessionInner::Memory(left) }, MessageSession { inner: MessageSessionInner::Memory(right) })
 }

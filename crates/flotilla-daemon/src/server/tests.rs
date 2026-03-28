@@ -34,8 +34,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    handle_client_session,
-    handle_client,
+    handle_client, handle_client_session,
     peer_runtime::{
         disconnect_peer_and_rebuild, forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer,
         should_send_local_version, ForwardResult,
@@ -2235,10 +2234,7 @@ async fn handle_client_session_dispatches_request_messages() {
         .await;
     });
 
-    client_session
-        .write(Message::Request { id: 1, request: Request::ListRepos })
-        .await
-        .expect("write request");
+    client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
 
     match ok_response(read_session_message(&client_session).await, 1) {
         Response::ListRepos(_) => {}
@@ -2282,10 +2278,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
         .await;
     });
 
-    client_session
-        .write(Message::Request { id: 1, request: Request::ListRepos })
-        .await
-        .expect("write request");
+    client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
 
     match ok_response(read_session_message(&client_session).await, 1) {
         Response::ListRepos(_) => {}

@@ -37,6 +37,7 @@ libc = "0.2"
 [dev-dependencies]
 async-trait = { workspace = true }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
+flotilla-daemon = { path = "../flotilla-daemon", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 insta = "1"
 tempfile = "3"

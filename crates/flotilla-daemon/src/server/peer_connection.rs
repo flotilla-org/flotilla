@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{error, info, warn};
 
 use super::{
-    peer_runtime::disconnect_peer_and_rebuild,
-    sync_peer_query_state, ConnectionDirection, ConnectionMeta, PeerConnectedNotice, SocketPeerSender,
+    peer_runtime::disconnect_peer_and_rebuild, sync_peer_query_state, ConnectionDirection, ConnectionMeta, PeerConnectedNotice,
+    SocketPeerSender,
 };
 use crate::peer::{ActivationResult, InboundPeerEnvelope, PeerManager};
 
@@ -38,13 +38,7 @@ impl PeerConnection {
         Self { daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify }
     }
 
-    pub(super) async fn run(
-        mut self,
-        session: Arc<MessageSession>,
-        protocol_version: u32,
-        host_name: HostName,
-        session_id: uuid::Uuid,
-    ) {
+    pub(super) async fn run(mut self, session: Arc<MessageSession>, protocol_version: u32, host_name: HostName, session_id: uuid::Uuid) {
         if protocol_version != PROTOCOL_VERSION {
             warn!(
                 peer = %host_name,
