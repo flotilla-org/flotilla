@@ -947,11 +947,18 @@ impl StepResolver for ExecutorStepResolver {
             // Environment lifecycle actions — always use host-side providers
             // -----------------------------------------------------------------
             StepAction::ReadEnvironmentSpec => {
-                let spec_path = self.repo.root.as_path().join(".flotilla/environment.yaml");
-                let yaml = std::fs::read_to_string(&spec_path)
-                    .map_err(|e| format!("failed to read environment spec at {}: {e}", spec_path.display()))?;
+                let yaml = self
+                    .runner
+                    .run(
+                        "git",
+                        &["show", "HEAD:.flotilla/environment.yaml"],
+                        self.repo.root.as_path(),
+                        &crate::providers::ChannelLabel::Noop,
+                    )
+                    .await
+                    .map_err(|e| format!("failed to read .flotilla/environment.yaml from HEAD: {e}"))?;
                 let spec: flotilla_protocol::EnvironmentSpec =
-                    serde_yaml::from_str(&yaml).map_err(|e| format!("failed to parse environment spec at {}: {e}", spec_path.display()))?;
+                    serde_yaml::from_str(&yaml).map_err(|e| format!("invalid .flotilla/environment.yaml: {e}"))?;
                 Ok(StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec }))
             }
             StepAction::EnsureEnvironmentImage => {
@@ -987,8 +994,29 @@ impl StepResolver for ExecutorStepResolver {
                 let daemon_socket =
                     self.daemon_socket_path.clone().ok_or_else(|| "daemon socket path required for environment creation".to_string())?;
 
+                // Resolve token env vars from the environment spec (if available from prior ReadEnvironmentSpec)
+                let tokens: Vec<(String, String)> = prior
+                    .iter()
+                    .find_map(|o| match o {
+                        StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec }) => Some(spec.clone()),
+                        _ => None,
+                    })
+                    .map(|spec| {
+                        spec.token_env_vars
+                            .iter()
+                            .filter_map(|name| match std::env::var(name) {
+                                Ok(val) => Some((name.clone(), val)),
+                                Err(_) => {
+                                    tracing::warn!(env_var = %name, "token env var not set on host, skipping");
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 let opts = crate::providers::environment::CreateOpts {
-                    tokens: vec![],
+                    tokens,
                     reference_repo,
                     daemon_socket_path: daemon_socket,
                     working_directory: None,
