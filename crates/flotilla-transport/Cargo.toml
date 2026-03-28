@@ -1,0 +1,9 @@
+[package]
+name = "flotilla-transport"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
+tokio = { workspace = true }
