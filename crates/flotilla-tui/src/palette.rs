@@ -531,7 +531,7 @@ fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_s
 ///
 /// For each known host:
 /// - Always offer `@<hostname>` (bare host)
-/// - For each provider with `category == "environment"`, offer `+<name>@<hostname>`
+/// - For each provider with `category == "environment_provider"`, offer `+<impl>@<hostname>`
 /// - For each running environment, offer `=<env_id>@<hostname>`
 fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion> {
     let mut completions = Vec::new();
@@ -552,7 +552,7 @@ fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion>
 
         // +<provider>@<hostname> — new environment via provider
         for provider in &summary.providers {
-            if provider.category == "environment" {
+            if provider.category == "environment_provider" {
                 let value = format!("+{}@{hostname}", provider.implementation);
                 if partial.is_empty() || value.starts_with(partial) {
                     let description = format!("new {} environment", provider.name);
@@ -865,7 +865,7 @@ mod tests {
         // Host "feta": has a Docker environment provider and one running environment.
         let mut feta_summary = stub_host_summary("feta");
         feta_summary.providers.push(HostProviderStatus {
-            category: "environment".to_string(),
+            category: "environment_provider".to_string(),
             name: "Docker".to_string(),
             implementation: "docker".to_string(),
             healthy: true,
