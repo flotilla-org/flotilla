@@ -1155,6 +1155,7 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-protocol",
+ "flotilla-transport",
  "futures",
  "indexmap",
  "serde",

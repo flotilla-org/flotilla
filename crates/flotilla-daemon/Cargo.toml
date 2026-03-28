@@ -12,6 +12,7 @@ test-support = ["flotilla-protocol/test-support"]
 [dependencies]
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
 tokio-util = "0.7"
 serde = { workspace = true }
