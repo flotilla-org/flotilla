@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_core::data::{SectionData, SectionKind};
-use flotilla_protocol::{WorkItem, WorkItemIdentity};
+use flotilla_protocol::{HostName, WorkItem, WorkItemIdentity};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Row, Table},
@@ -21,6 +21,7 @@ use crate::{
         ProviderStatus, TuiModel, UiState,
     },
     theme::Theme,
+    ui_helpers,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,22 +37,33 @@ impl Identifiable for WorkItem {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const HIGHLIGHT_SYMBOL: &str = "\u{25b8} ";
+const HIGHLIGHT_WIDTH: u16 = 2;
+const COL_SPACING: u16 = 1;
+
+// ---------------------------------------------------------------------------
 // SplitTable
 // ---------------------------------------------------------------------------
 
 /// Composes multiple `SectionTable<WorkItem>` instances — one per section kind.
-/// Handles cross-section navigation, height allocation, rendering of section
-/// divider headers, and exposes the same `selected_work_item()` API that
-/// `RepoPage` expects.
+/// Renders them as a single scrollable surface with one flat cursor.
+///
+/// Virtual row layout per section:
+///   1 divider row + 1 column header row + N data rows
+///
+/// Only data rows are selectable.
 pub struct SplitTable {
     /// Ordered sections with their kind. Only non-empty sections present.
     sections: Vec<(SectionKind, SectionTable<WorkItem>)>,
     /// Which section currently has focus (index into sections).
     active_section: usize,
+    /// Scroll offset — the first visible virtual row.
+    scroll_offset: usize,
     /// Stored from render for mouse hit-testing.
     pub(crate) table_area: Rect,
-    /// Per-section rendered areas, for mouse dispatch.
-    section_areas: Vec<Rect>,
     /// Gear icon area.
     pub(crate) gear_area: Option<Rect>,
 }
@@ -64,10 +76,10 @@ impl Default for SplitTable {
 
 impl SplitTable {
     pub fn new() -> Self {
-        Self { sections: Vec::new(), active_section: 0, table_area: Rect::default(), section_areas: Vec::new(), gear_area: None }
+        Self { sections: Vec::new(), active_section: 0, scroll_offset: 0, table_area: Rect::default(), gear_area: None }
     }
 
-    // ── Data update ────────────────────────────────────────────────────
+    // ── Data update ─────────���──────────────────────────────────────────
 
     /// Replace section data.
     ///
@@ -75,8 +87,11 @@ impl SplitTable {
     /// `SectionData`, if an existing section of that kind exists, updates its
     /// items (preserving selection); otherwise creates a new `SectionTable`
     /// with columns from `columns_for_section(kind)`. Empty sections are
-    /// skipped. Clamps `active_section` if it is now out of bounds.
+    /// skipped. Preserves `active_section` by `SectionKind`.
     pub fn update_sections(&mut self, section_data: Vec<SectionData>) {
+        // Remember active kind before rebuild.
+        let prev_active_kind = self.sections.get(self.active_section).map(|(k, _)| *k);
+
         // Drain old sections into a lookup by kind.
         let mut old_sections: HashMap<SectionKind, SectionTable<WorkItem>> = self.sections.drain(..).collect();
 
@@ -96,6 +111,13 @@ impl SplitTable {
             }
         }
 
+        // Restore active section by kind.
+        if let Some(kind) = prev_active_kind {
+            self.active_section = self.sections.iter().position(|(k, _)| *k == kind).unwrap_or(0);
+        } else {
+            self.active_section = 0;
+        }
+
         // Clamp active section.
         if self.sections.is_empty() {
             self.active_section = 0;
@@ -104,7 +126,62 @@ impl SplitTable {
         }
     }
 
-    // ── Navigation ─────────────────────────────────────────────────────
+    // ── Virtual row helpers ────────────────────────────────────────────
+
+    /// Total number of virtual rows (dividers + headers + data).
+    #[cfg(test)]
+    fn total_virtual_rows(&self) -> usize {
+        self.sections.iter().map(|(_, t)| 2 + t.items.len()).sum()
+    }
+
+    /// Compute the flat virtual row index of the currently selected data row.
+    /// Returns `None` when nothing is selected.
+    fn selected_flat_row(&self) -> Option<usize> {
+        let (_, table) = self.sections.get(self.active_section)?;
+        let item_idx = table.selected_idx?;
+        let mut flat = 0;
+        for (i, (_, t)) in self.sections.iter().enumerate() {
+            if i == self.active_section {
+                return Some(flat + 2 + item_idx);
+            }
+            flat += 2 + t.items.len();
+        }
+        None
+    }
+
+    /// Given a flat virtual row index, find which section and item it
+    /// corresponds to. Returns `None` for divider/header rows.
+    fn flat_to_section_item(&self, flat: usize) -> Option<(usize, usize)> {
+        let mut offset = 0;
+        for (section_idx, (_, table)) in self.sections.iter().enumerate() {
+            let section_rows = 2 + table.items.len();
+            if flat < offset + section_rows {
+                let relative = flat - offset;
+                if relative < 2 {
+                    return None; // divider or header
+                }
+                return Some((section_idx, relative - 2));
+            }
+            offset += section_rows;
+        }
+        None
+    }
+
+    /// Adjust scroll offset so the selected row is visible.
+    fn ensure_selected_visible(&mut self, viewport_height: usize) {
+        if viewport_height == 0 {
+            return;
+        }
+        if let Some(flat) = self.selected_flat_row() {
+            if flat < self.scroll_offset {
+                self.scroll_offset = flat;
+            } else if flat >= self.scroll_offset + viewport_height {
+                self.scroll_offset = flat - viewport_height + 1;
+            }
+        }
+    }
+
+    // ── Navigation ─────────���───────────────────────────────────────────
 
     /// Advance selection by one row. If the active section is at its end,
     /// moves to the next section's first item.
@@ -148,17 +225,16 @@ impl SplitTable {
         }
     }
 
-    /// Hit-test a mouse coordinate against rendered section areas.
+    /// Hit-test a mouse coordinate against the rendered virtual rows.
     /// Returns `(section_idx, item_idx)` if the point falls on a data row.
     pub fn row_at_mouse(&self, x: u16, y: u16) -> Option<(usize, usize)> {
-        for (section_idx, area) in self.section_areas.iter().enumerate() {
-            if x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height {
-                if let Some(item_idx) = self.sections[section_idx].1.row_at_y(y, *area) {
-                    return Some((section_idx, item_idx));
-                }
-            }
+        let area = self.table_area;
+        if x < area.x || x >= area.x + area.width || y < area.y || y >= area.y + area.height {
+            return None;
         }
-        None
+        let relative_y = (y - area.y) as usize;
+        let flat = self.scroll_offset + relative_y;
+        self.flat_to_section_item(flat)
     }
 
     /// Set active section and select a specific item within it.
@@ -225,7 +301,7 @@ impl SplitTable {
 
     // ── Rendering ──────────────────────────────────────────────────────
 
-    /// Render all sections into the given area.
+    /// Render all sections as a single scrollable surface into the given area.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -253,96 +329,86 @@ impl SplitTable {
         self.gear_area = Some(Rect::new(gear_x, area.y, 3, 1));
 
         if self.sections.is_empty() {
-            self.section_areas.clear();
             return;
         }
 
-        // ── Height allocation ──────────────────────────────────────────
-        //
-        // Each section gets 1 line for its divider header + a proportional
-        // share of remaining space based on item count. Minimum 3 rows for
-        // the table part (column header + border + at least 1 data row).
+        let viewport_height = area.height as usize;
+        self.ensure_selected_visible(viewport_height);
 
-        let section_count = self.sections.len();
-        let divider_lines = section_count as u16;
-        let remaining = area.height.saturating_sub(divider_lines);
-        let total_items: usize = self.sections.iter().map(|(_, t)| t.items.len()).sum();
-
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(section_count * 2);
-        let mut table_heights: Vec<u16> = Vec::with_capacity(section_count);
-
+        // Precompute host_repo_roots from main checkouts across all sections.
+        let local_repo_root = model.active_repo_root().clone();
+        let mut host_repo_roots: HashMap<HostName, std::path::PathBuf> = HashMap::new();
         for (_, table) in &self.sections {
-            let proportional = if total_items > 0 {
-                ((table.items.len() as u64 * remaining as u64) / total_items as u64) as u16
-            } else {
-                remaining / section_count as u16
-            };
-            let table_h = proportional.max(3);
-            table_heights.push(table_h);
-            // 1 line for divider header.
-            constraints.push(Constraint::Length(1));
-            // Proportional height for the table.
-            constraints.push(Constraint::Length(table_h));
+            for item in &table.items {
+                if item.is_main_checkout {
+                    if let Some(co) = item.checkout_key() {
+                        host_repo_roots.insert(co.host.clone(), co.path.clone());
+                    }
+                }
+            }
         }
-
-        let chunks = Layout::vertical(constraints).split(area);
-
-        // ── Render each section ────────────────────────────────────────
 
         let providers = model.active_opt().map(|r| r.providers.as_ref());
         let default_providers = flotilla_protocol::ProviderData::default();
         let providers = providers.unwrap_or(&default_providers);
+        let my_host = model.my_host();
+        let selected_flat = self.selected_flat_row();
 
-        self.section_areas.clear();
+        // Available width for columns (after highlight symbol).
+        let col_available = area.width.saturating_sub(HIGHLIGHT_WIDTH);
 
-        // Build row-style override closure for multi-select and pending-action indicators.
-        let row_style = |item: &WorkItem| -> Option<Style> {
-            if let Some(pending) = pending_actions.get(&item.identity) {
-                match &pending.status {
-                    PendingStatus::Failed(_) => Some(Style::default().fg(theme.error).add_modifier(Modifier::DIM)),
-                    PendingStatus::InFlight => None,
-                }
-            } else if multi_selected.contains(&item.identity) {
-                Some(Style::default().bg(theme.multi_select_bg))
-            } else {
-                None
+        let mut flat_row = 0usize;
+
+        for (section_idx, (_, table)) in self.sections.iter().enumerate() {
+            // ── Divider row ──
+            if flat_row >= self.scroll_offset && flat_row < self.scroll_offset + viewport_height {
+                let y = area.y + (flat_row - self.scroll_offset) as u16;
+                let row_rect = Rect::new(area.x, y, area.width, 1);
+                render_divider(frame, &table.header_label, theme, row_rect);
             }
-        };
+            flat_row += 1;
 
-        for (i, (_kind, table)) in self.sections.iter_mut().enumerate() {
-            let divider_area = chunks[i * 2];
-            let table_area = chunks[i * 2 + 1];
+            // Resolve column widths for this section.
+            let col_widths = table.resolve_widths(col_available, COL_SPACING);
 
-            // Render section divider header: "── Label ──"
-            let label = &table.header_label;
-            let dashes_left = 2;
-            let left = "\u{2500}".repeat(dashes_left);
-            let right_width = divider_area.width.saturating_sub(dashes_left as u16 + label.len() as u16 + 4);
-            let right = "\u{2500}".repeat(right_width as usize);
-            let header_line = Line::from(vec![
-                Span::styled(format!("{left} "), Style::default().fg(theme.muted)),
-                Span::styled(label.clone(), Style::default().fg(theme.section_header)),
-                Span::styled(format!(" {right}"), Style::default().fg(theme.muted)),
-            ]);
-            frame.render_widget(header_line, divider_area);
+            // ── Column header row ──
+            if flat_row >= self.scroll_offset && flat_row < self.scroll_offset + viewport_height {
+                let y = area.y + (flat_row - self.scroll_offset) as u16;
+                let row_rect = Rect::new(area.x, y, area.width, 1);
+                render_column_headers(frame, &table.columns, &col_widths, theme, row_rect);
+            }
+            flat_row += 1;
 
-            // Compute column widths for RenderCtx.
-            let col_widths: Vec<u16> = table
-                .columns
-                .iter()
-                .map(|c| match c.width {
-                    Constraint::Length(n) => n,
-                    Constraint::Fill(_) => table_area.width / table.columns.len().max(1) as u16,
-                    _ => 10,
-                })
-                .collect();
+            // ── Data rows ──
+            let mut prev_source: Option<String> = None;
 
-            let render_ctx = RenderCtx { theme, providers, col_widths };
+            for item in &table.items {
+                if flat_row >= self.scroll_offset && flat_row < self.scroll_offset + viewport_height {
+                    let y = area.y + (flat_row - self.scroll_offset) as u16;
+                    let is_selected = selected_flat == Some(flat_row);
 
-            let highlight_style = if i == self.active_section { Style::default().bg(theme.row_highlight) } else { Style::default() };
+                    let render_ctx = RenderCtx {
+                        theme,
+                        providers,
+                        col_widths: col_widths.clone(),
+                        repo_root: &local_repo_root,
+                        host_repo_roots: &host_repo_roots,
+                        my_host,
+                        prev_source: prev_source.as_deref(),
+                    };
 
-            table.render(frame, table_area, &render_ctx, highlight_style, Some(&row_style));
-            self.section_areas.push(table_area);
+                    // Determine row style override (multi-select / pending).
+                    let row_style = row_style_override(item, multi_selected, pending_actions, theme);
+
+                    render_data_row(frame, item, &table.columns, &render_ctx, is_selected, row_style, y, area.x, area.width, theme);
+                }
+                prev_source = item.source.clone();
+                flat_row += 1;
+            }
+
+            // Emit a blank to separate sections visually (only if not section_idx == last).
+            // Actually, the divider of the next section provides separation. No extra row needed.
+            let _ = section_idx;
         }
     }
 
@@ -371,7 +437,135 @@ impl SplitTable {
     }
 }
 
-// ── Provider table helpers ──────────────────────────────────────────────────
+// ── Row rendering helpers ──────────────────────────────────────────────────
+
+/// Render a section divider: "── Label ──"
+fn render_divider(frame: &mut Frame, label: &str, theme: &Theme, area: Rect) {
+    let dashes_left = 2;
+    let left = "\u{2500}".repeat(dashes_left);
+    let right_width = area.width.saturating_sub(dashes_left as u16 + label.len() as u16 + 4);
+    let right = "\u{2500}".repeat(right_width as usize);
+    let header_line = Line::from(vec![
+        Span::styled(format!("{left} "), Style::default().fg(theme.muted)),
+        Span::styled(label.to_string(), Style::default().fg(theme.section_header)),
+        Span::styled(format!(" {right}"), Style::default().fg(theme.muted)),
+    ]);
+    frame.render_widget(header_line, area);
+}
+
+/// Render column headers for a section.
+fn render_column_headers(
+    frame: &mut Frame,
+    columns: &[super::section_table::ColumnDef<WorkItem>],
+    col_widths: &[u16],
+    theme: &Theme,
+    area: Rect,
+) {
+    let mut spans: Vec<Span> = Vec::new();
+    // Indent to match highlight symbol space.
+    spans.push(Span::raw("  "));
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let w = col_widths.get(i).copied().unwrap_or(0) as usize;
+        let header = &col.header;
+        let padded = format!("{:<width$}", ui_helpers::truncate(header, w), width = w);
+        spans.push(Span::styled(padded, Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)));
+    }
+    let line = Line::from(spans);
+    frame.render_widget(line, area);
+}
+
+/// Render a single data row.
+#[allow(clippy::too_many_arguments)]
+fn render_data_row(
+    frame: &mut Frame,
+    item: &WorkItem,
+    columns: &[super::section_table::ColumnDef<WorkItem>],
+    ctx: &RenderCtx,
+    is_selected: bool,
+    row_style: Option<Style>,
+    y: u16,
+    area_x: u16,
+    area_width: u16,
+    theme: &Theme,
+) {
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Highlight symbol.
+    if is_selected {
+        spans.push(Span::styled(HIGHLIGHT_SYMBOL, Style::default().fg(theme.text).add_modifier(Modifier::BOLD)));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+
+    // Column cells.
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let span = (col.extract)(item, ctx);
+        let w = ctx.col_widths.get(i).copied().unwrap_or(0) as usize;
+        let truncated = ui_helpers::truncate(&span.content, w);
+        let padded = format!("{:<width$}", truncated, width = w);
+        spans.push(Span::styled(padded, span.style));
+    }
+
+    let line = Line::from(spans);
+    let row_rect = Rect::new(area_x, y, area_width, 1);
+    frame.render_widget(line, row_rect);
+
+    // Apply row highlight background for selected row.
+    if is_selected {
+        let buf = frame.buffer_mut();
+        for cx in area_x..area_x + area_width {
+            if let Some(cell) = buf.cell_mut(Position::new(cx, y)) {
+                cell.set_bg(theme.row_highlight);
+            }
+        }
+    }
+
+    // Apply row style override (multi-select / pending-action).
+    if let Some(style) = row_style {
+        let buf = frame.buffer_mut();
+        for cx in area_x..area_x + area_width {
+            if let Some(cell) = buf.cell_mut(Position::new(cx, y)) {
+                if let Some(fg) = style.fg {
+                    cell.set_fg(fg);
+                }
+                if let Some(bg) = style.bg {
+                    cell.set_bg(bg);
+                }
+                // Apply modifier (DIM for failed pending).
+                if style.add_modifier.contains(Modifier::DIM) {
+                    cell.modifier.insert(Modifier::DIM);
+                }
+            }
+        }
+    }
+}
+
+/// Determine the row style override for multi-select or pending-action indicators.
+fn row_style_override(
+    item: &WorkItem,
+    multi_selected: &HashSet<WorkItemIdentity>,
+    pending_actions: &HashMap<WorkItemIdentity, PendingAction>,
+    theme: &Theme,
+) -> Option<Style> {
+    if let Some(pending) = pending_actions.get(&item.identity) {
+        match &pending.status {
+            PendingStatus::Failed(_) => Some(Style::default().fg(theme.error).add_modifier(Modifier::DIM)),
+            PendingStatus::InFlight => None,
+        }
+    } else if multi_selected.contains(&item.identity) {
+        Some(Style::default().bg(theme.multi_select_bg))
+    } else {
+        None
+    }
+}
+
+// ── Provider table helpers ─��────────────────────────────────────────────────
 
 fn provider_status_badge(status: Option<ProviderStatus>, theme: &Theme) -> (&'static str, Color) {
     match status {
@@ -605,5 +799,77 @@ mod tests {
         st.select_prev();
         assert_eq!(st.active_section, 0);
         assert_eq!(st.selected_work_item().expect("selected").description, "Item 1");
+    }
+
+    #[test]
+    fn update_sections_preserves_active_section_by_kind() {
+        let mut st = SplitTable::new();
+        st.update_sections(vec![checkout_section(&["a"]), issue_section(&["1", "2"])]);
+
+        // Navigate to Issues section.
+        st.select_next(); // crosses to Issues
+        st.select_next();
+        assert_eq!(st.active_section, 1);
+        assert_eq!(st.sections[st.active_section].0, SectionKind::Issues);
+
+        // Update sections — Issues section should remain active.
+        st.update_sections(vec![checkout_section(&["a", "b"]), issue_section(&["1", "2", "3"])]);
+
+        assert_eq!(st.sections[st.active_section].0, SectionKind::Issues);
+    }
+
+    #[test]
+    fn total_virtual_rows() {
+        let mut st = SplitTable::new();
+        st.update_sections(vec![checkout_section(&["a", "b"]), issue_section(&["1"])]);
+
+        // Section 0: 1 divider + 1 header + 2 data = 4
+        // Section 1: 1 divider + 1 header + 1 data = 3
+        assert_eq!(st.total_virtual_rows(), 7);
+    }
+
+    #[test]
+    fn selected_flat_row_and_flat_to_section() {
+        let mut st = SplitTable::new();
+        st.update_sections(vec![checkout_section(&["a", "b"]), issue_section(&["1"])]);
+
+        // Initial: section 0, item 0 -> flat row 2 (divider=0, header=1, data=2)
+        assert_eq!(st.selected_flat_row(), Some(2));
+
+        // Navigate to section 0, item 1 -> flat row 3
+        st.select_next();
+        assert_eq!(st.selected_flat_row(), Some(3));
+
+        // Navigate to section 1, item 0 -> flat row 6 (section 0: 4 rows; section 1: divider=4, header=5, data=6)
+        st.select_next();
+        assert_eq!(st.selected_flat_row(), Some(6));
+
+        // Verify flat_to_section_item
+        assert_eq!(st.flat_to_section_item(0), None); // divider
+        assert_eq!(st.flat_to_section_item(1), None); // header
+        assert_eq!(st.flat_to_section_item(2), Some((0, 0))); // data
+        assert_eq!(st.flat_to_section_item(3), Some((0, 1))); // data
+        assert_eq!(st.flat_to_section_item(4), None); // divider
+        assert_eq!(st.flat_to_section_item(5), None); // header
+        assert_eq!(st.flat_to_section_item(6), Some((1, 0))); // data
+        assert_eq!(st.flat_to_section_item(7), None); // beyond
+    }
+
+    #[test]
+    fn ensure_selected_visible_scrolls_down() {
+        let mut st = SplitTable::new();
+        // 10 items -> 12 virtual rows (1 divider + 1 header + 10 data)
+        let ids: Vec<&str> = vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+        st.update_sections(vec![issue_section(&ids)]);
+
+        // Navigate to last item (flat row 11).
+        for _ in 0..9 {
+            st.select_next();
+        }
+        assert_eq!(st.selected_flat_row(), Some(11));
+
+        // With viewport of 5, ensure_selected_visible should scroll.
+        st.ensure_selected_visible(5);
+        assert_eq!(st.scroll_offset, 7); // 11 - 5 + 1 = 7
     }
 }

@@ -4,29 +4,29 @@ expression: output
 ---
  ⚓  flotilla  | my-project | [+]
 ── Checkouts ─────────────────────────────────────────────────────────  ┌ Preview ─────────────────────────────────────┐
-      Source     Path   Description Branc WT  WS  PR   SS   Issues Git  │Description: checkout feat-login              │
-▸  ○             /test/ checkout fe feat- ✓                             │Branch: feat-login                            │
-                                                                        │Path: /test/my-project/feat-login             │
-                                                                        │                                              │
-                                                                        │                                              │
-                                                                        │                                              │
-── Sessions ──────────────────────────────────────────────────────────  │                                              │
+      Source     Path  Description Bran… WT  WS  PR   SS   Issues Git   │Description: checkout feat-login              │
+▸  ○               fe… checkout f… feat… ✓                              │Branch: feat-login                            │
+── Sessions ──────────────────────────────────────────────────────────  │Path: /test/my-project/feat-login             │
       Source     Key         Description            Branch      Status  │                                              │
-▸  ◆             s1          session s1             feat/sessio ◆       │                                              │
-                                                                        │                                              │
-                                                                        │                                              │
-                                                                        │                                              │
-                                                                        │                                              │
+   ◆             s1          session s1             feat/sessi… ◆       │                                              │
 ── Pull Requests ─────────────────────────────────────────────────────  │                                              │
-      PR#    Title                       Branch        State    Issues  │                                              │
-▸  ⊙  #42    Add login page              feat-login    open             │                                              │
-                                                                        │                                              │
-                                                                        │                                              │
-                                                                        │                                              │
-                                                                        │                                              │
+      PR#    Title                      Branch        State    Issues   │                                              │
+   ⊙  #42    Add login page             feat-login    open              │                                              │
 ── Issues ────────────────────────────────────────────────────────────  │                                              │
       ID     Title                              Labels            PR    │                                              │
-▸  ◇  #10    Users need authentication                                  │                                              │
+   ◇  #10    Users need authentication                                  │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
                                                                         │                                              │
                                                                         │                                              │
                                                                         │                                              │

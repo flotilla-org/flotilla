@@ -5,7 +5,7 @@ expression: output
  ⚓  flotilla  | my-project | [+]
 ── Sessions ──────────────────────────────────────────────────────────  ┌ Preview ─────────────────────────────────────┐
       Source     Key         Description            Branch      Status  │Description: Debug API endpoints              │
-▸  ▶             s5          Debug API endpoints    feat/sessio ▶       │Branch: feat/session-branch                   │
+▸  ▶             s5          Debug API endpoints    feat/sessi… ▶       │Branch: feat/session-branch                   │
                                                                         │Session: Debug API endpoints                  │
                                                                         │Id: s5                                        │
                                                                         │Status: Running                               │

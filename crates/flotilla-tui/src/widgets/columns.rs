@@ -1,6 +1,6 @@
 use flotilla_core::data::SectionKind;
 use flotilla_protocol::WorkItem;
-use ratatui::{layout::Constraint, style::Style, text::Span, widgets::Cell};
+use ratatui::{layout::Constraint, style::Style, text::Span};
 
 use super::section_table::{ColumnDef, RenderCtx};
 use crate::ui_helpers;
@@ -28,32 +28,37 @@ pub fn columns_for_section(kind: SectionKind) -> Vec<ColumnDef<WorkItem>> {
 fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
     vec![
         icon_column(),
-        col("Source", Constraint::Length(10), |item, ctx| {
-            let text = item.source.clone().unwrap_or_default();
-            styled_cell(text, ctx.theme.source)
-        }),
+        source_column(),
         col("Path", Constraint::Fill(1), |item, ctx| {
-            let text = if let Some(p) = item.checkout_key() {
-                p.path.display().to_string()
+            let text = if let Some(hp) = item.checkout_key() {
+                let is_local = ctx.my_host.is_none() || ctx.my_host == Some(&hp.host);
+                let (repo_root, home_dir) = if is_local {
+                    (ctx.repo_root.to_path_buf(), dirs::home_dir())
+                } else {
+                    let root = ctx.host_repo_roots.get(&hp.host).cloned().unwrap_or_else(|| hp.path.clone());
+                    (root, None)
+                };
+                let path_col_width = ctx.col_widths.get(2).copied().unwrap_or(40) as usize;
+                ui_helpers::shorten_path(&hp.path, &repo_root, path_col_width, home_dir.as_deref())
             } else if let Some(ref ses_key) = item.session_key {
                 ses_key.clone()
             } else {
                 String::new()
             };
-            styled_cell(text, ctx.theme.path)
+            styled_span(text, ctx.theme.path)
         }),
-        col("Description", Constraint::Fill(2), |item, ctx| styled_cell(item.description.clone(), ctx.theme.text)),
+        col("Description", Constraint::Fill(2), |item, ctx| styled_span(item.description.clone(), ctx.theme.text)),
         col("Branch", Constraint::Fill(1), |item, ctx| {
             let text = item.branch.clone().unwrap_or_else(|| "—".to_string());
-            styled_cell(text, ctx.theme.branch)
+            styled_span(text, ctx.theme.branch)
         }),
         col("WT", Constraint::Length(3), |item, ctx| {
             let text = ui_helpers::checkout_indicator(item.is_main_checkout, item.checkout_key().is_some()).to_string();
-            styled_cell(text, ctx.theme.checkout)
+            styled_span(text, ctx.theme.checkout)
         }),
         col("WS", Constraint::Length(3), |item, ctx| {
             let text = ui_helpers::workspace_indicator(item.workspace_refs.len());
-            styled_cell(text, ctx.theme.workspace)
+            styled_span(text, ctx.theme.workspace)
         }),
         col("PR", Constraint::Length(4), |item, ctx| {
             let text = if let Some(ref pr_key) = item.change_request_key {
@@ -66,7 +71,7 @@ fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
             } else {
                 String::new()
             };
-            styled_cell(text, ctx.theme.change_request)
+            styled_span(text, ctx.theme.change_request)
         }),
         col("SS", Constraint::Length(4), |item, ctx| {
             let text = if let Some(ref ses_key) = item.session_key {
@@ -84,11 +89,11 @@ fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
             } else {
                 String::new()
             };
-            styled_cell(text, ctx.theme.session)
+            styled_span(text, ctx.theme.session)
         }),
         col("Issues", Constraint::Length(6), |item, ctx| {
             let text = item.issue_keys.iter().map(|k| format!("#{}", k)).collect::<Vec<_>>().join(",");
-            styled_cell(text, ctx.theme.issue)
+            styled_span(text, ctx.theme.issue)
         }),
         col("Git", Constraint::Length(5), |item, ctx| {
             let text = if let Some(wt_key) = item.checkout_key() {
@@ -100,7 +105,7 @@ fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
             } else {
                 String::new()
             };
-            styled_cell(text, ctx.theme.git_status)
+            styled_span(text, ctx.theme.git_status)
         }),
     ]
 }
@@ -108,18 +113,15 @@ fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
 fn cloud_agent_columns() -> Vec<ColumnDef<WorkItem>> {
     vec![
         icon_column(),
-        col("Source", Constraint::Length(10), |item, ctx| {
-            let text = item.source.clone().unwrap_or_default();
-            styled_cell(text, ctx.theme.source)
-        }),
+        source_column(),
         col("Key", Constraint::Fill(1), |item, ctx| {
             let text = item.session_key.clone().unwrap_or_default();
-            styled_cell(text, ctx.theme.path)
+            styled_span(text, ctx.theme.path)
         }),
-        col("Description", Constraint::Fill(2), |item, ctx| styled_cell(item.description.clone(), ctx.theme.text)),
+        col("Description", Constraint::Fill(2), |item, ctx| styled_span(item.description.clone(), ctx.theme.text)),
         col("Branch", Constraint::Fill(1), |item, ctx| {
             let text = item.branch.clone().unwrap_or_else(|| "—".to_string());
-            styled_cell(text, ctx.theme.branch)
+            styled_span(text, ctx.theme.branch)
         }),
         col("Status", Constraint::Length(8), |item, ctx| {
             let text = if let Some(ref ses_key) = item.session_key {
@@ -137,7 +139,7 @@ fn cloud_agent_columns() -> Vec<ColumnDef<WorkItem>> {
             } else {
                 String::new()
             };
-            styled_cell(text, ctx.theme.session)
+            styled_span(text, ctx.theme.session)
         }),
     ]
 }
@@ -156,12 +158,12 @@ fn change_request_columns() -> Vec<ColumnDef<WorkItem>> {
             } else {
                 String::new()
             };
-            styled_cell(text, ctx.theme.change_request)
+            styled_span(text, ctx.theme.change_request)
         }),
-        col("Title", Constraint::Fill(2), |item, ctx| styled_cell(item.description.clone(), ctx.theme.text)),
+        col("Title", Constraint::Fill(2), |item, ctx| styled_span(item.description.clone(), ctx.theme.text)),
         col("Branch", Constraint::Fill(1), |item, ctx| {
             let text = item.branch.clone().unwrap_or_else(|| "—".to_string());
-            styled_cell(text, ctx.theme.branch)
+            styled_span(text, ctx.theme.branch)
         }),
         col("State", Constraint::Length(8), |item, ctx| {
             let text = if let Some(ref pr_key) = item.change_request_key {
@@ -173,11 +175,11 @@ fn change_request_columns() -> Vec<ColumnDef<WorkItem>> {
             } else {
                 String::new()
             };
-            styled_cell(text, ctx.theme.change_request)
+            styled_span(text, ctx.theme.change_request)
         }),
         col("Issues", Constraint::Length(8), |item, ctx| {
             let text = item.issue_keys.iter().map(|k| format!("#{}", k)).collect::<Vec<_>>().join(",");
-            styled_cell(text, ctx.theme.issue)
+            styled_span(text, ctx.theme.issue)
         }),
     ]
 }
@@ -187,9 +189,9 @@ fn issue_columns() -> Vec<ColumnDef<WorkItem>> {
         icon_column(),
         col("ID", Constraint::Length(6), |item, ctx| {
             let text = item.issue_keys.first().map(|k| format!("#{}", k)).unwrap_or_default();
-            styled_cell(text, ctx.theme.issue)
+            styled_span(text, ctx.theme.issue)
         }),
-        col("Title", Constraint::Fill(2), |item, ctx| styled_cell(item.description.clone(), ctx.theme.text)),
+        col("Title", Constraint::Fill(2), |item, ctx| styled_span(item.description.clone(), ctx.theme.text)),
         col("Labels", Constraint::Fill(1), |item, ctx| {
             let text = item
                 .issue_keys
@@ -197,17 +199,17 @@ fn issue_columns() -> Vec<ColumnDef<WorkItem>> {
                 .and_then(|k| ctx.providers.issues.get(k.as_str()))
                 .map(|issue| issue.labels.join(", "))
                 .unwrap_or_default();
-            styled_cell(text, ctx.theme.muted)
+            styled_span(text, ctx.theme.muted)
         }),
         col("PR", Constraint::Length(6), |item, ctx| {
             let text = item.change_request_key.as_ref().map(|k| format!("#{}", k)).unwrap_or_default();
-            styled_cell(text, ctx.theme.change_request)
+            styled_span(text, ctx.theme.change_request)
         }),
     ]
 }
 
 fn attachable_set_columns() -> Vec<ColumnDef<WorkItem>> {
-    vec![icon_column(), col("Description", Constraint::Fill(2), |item, ctx| styled_cell(item.description.clone(), ctx.theme.text))]
+    vec![icon_column(), col("Description", Constraint::Fill(2), |item, ctx| styled_span(item.description.clone(), ctx.theme.text))]
 }
 
 fn remote_branch_columns() -> Vec<ColumnDef<WorkItem>> {
@@ -215,7 +217,7 @@ fn remote_branch_columns() -> Vec<ColumnDef<WorkItem>> {
         icon_column(),
         col("Branch", Constraint::Fill(1), |item, ctx| {
             let text = item.branch.clone().unwrap_or_else(|| "—".to_string());
-            styled_cell(text, ctx.theme.branch)
+            styled_span(text, ctx.theme.branch)
         }),
     ]
 }
@@ -224,6 +226,15 @@ fn remote_branch_columns() -> Vec<ColumnDef<WorkItem>> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Shared source column: renders the source with dedup against `ctx.prev_source`.
+fn source_column() -> ColumnDef<WorkItem> {
+    col("Source", Constraint::Length(10), |item, ctx| {
+        let raw = item.source.clone().unwrap_or_default();
+        let text = if ctx.prev_source == Some(raw.as_str()) { String::new() } else { raw };
+        styled_span(text, ctx.theme.source)
+    })
+}
+
 /// Shared icon column: renders the work-item icon with its kind-appropriate color.
 fn icon_column() -> ColumnDef<WorkItem> {
     col("", Constraint::Length(3), |item, ctx| {
@@ -231,21 +242,21 @@ fn icon_column() -> ColumnDef<WorkItem> {
         let has_workspace = !item.workspace_refs.is_empty();
         let (icon, color) = ui_helpers::work_item_icon(&item.kind, has_workspace, session_status, ctx.theme);
         let text = format!(" {}", icon);
-        styled_cell(text, color)
+        styled_span(text, color)
     })
 }
 
 /// Build a `ColumnDef<WorkItem>` with the given header, width, and extract closure.
 fn col<F>(header: &str, width: Constraint, extract: F) -> ColumnDef<WorkItem>
 where
-    F: Fn(&WorkItem, &RenderCtx) -> Cell<'static> + 'static,
+    F: Fn(&WorkItem, &RenderCtx) -> Span<'static> + 'static,
 {
     ColumnDef { header: header.to_string(), width, extract: Box::new(extract) }
 }
 
-/// Produce a `Cell` with the given text and foreground color.
-fn styled_cell(text: String, color: ratatui::style::Color) -> Cell<'static> {
-    Cell::from(Span::styled(text, Style::default().fg(color)))
+/// Produce a `Span` with the given text and foreground color.
+fn styled_span(text: String, color: ratatui::style::Color) -> Span<'static> {
+    Span::styled(text, Style::default().fg(color))
 }
 
 // ---------------------------------------------------------------------------

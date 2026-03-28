@@ -5,18 +5,18 @@ expression: output
  ⚓  flotilla  | my-project | [+]
 ── Checkouts ───────────────────────────────────────────────────────────────────────────
       Source     Path       Description          Branch     WT  WS  PR   SS   Issues Git
-▸  ○             /test/my-p checkout feat-dashbo feat-dashb ✓
-
-
-
-
-
-
-
-
+▸  ○                  feat… checkout feat-dashb… feat-dash… ✓
 ── Pull Requests ───────────────────────────────────────────────────────────────────────
-      PR#    Title                                   Branch              State    Issues
-▸  ⊙  #99    Build analytics dashboard               feat-dashboard      open
+      PR#    Title                                  Branch              State    Issues
+   ⊙  #99    Build analytics dashboard              feat-dashboard      open
+
+
+
+
+
+
+
+
 
 
 

@@ -1,11 +1,7 @@
-use flotilla_protocol::ProviderData;
-use ratatui::{
-    layout::{Constraint, Rect},
-    style::Style,
-    text::Span,
-    widgets::{Cell, HighlightSpacing, Row, Table, TableState},
-    Frame,
-};
+use std::{collections::HashMap, path::Path};
+
+use flotilla_protocol::{HostName, ProviderData};
+use ratatui::{layout::Constraint, text::Span};
 
 use crate::theme::Theme;
 
@@ -18,6 +14,15 @@ pub struct RenderCtx<'a> {
     pub theme: &'a Theme,
     pub providers: &'a ProviderData,
     pub col_widths: Vec<u16>,
+    /// Local repo root path (for path shortening).
+    pub repo_root: &'a Path,
+    /// Per-host repo roots (keyed by host name, from main checkouts).
+    pub host_repo_roots: &'a HashMap<HostName, std::path::PathBuf>,
+    /// The local host's name, if known.
+    pub my_host: Option<&'a HostName>,
+    /// Previous row's source value — `None` if this is the first data row in
+    /// a section or if the previous source was absent. Used for source dedup.
+    pub prev_source: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -25,7 +30,10 @@ pub struct RenderCtx<'a> {
 // ---------------------------------------------------------------------------
 
 /// The extractor function type for column definitions.
-pub type ExtractFn<T> = dyn Fn(&T, &RenderCtx) -> Cell<'static>;
+///
+/// Returns a `Span` — the styled text for one cell. The `SplitTable` render
+/// loop pads/truncates the content to the resolved column width.
+pub type ExtractFn<T> = dyn Fn(&T, &RenderCtx) -> Span<'static>;
 
 /// A column definition for a `SectionTable<T>`.
 pub struct ColumnDef<T> {
@@ -55,14 +63,13 @@ pub trait Identifiable {
 pub struct SectionTable<T: Identifiable> {
     pub columns: Vec<ColumnDef<T>>,
     pub items: Vec<T>,
-    pub table_state: TableState,
     pub selected_idx: Option<usize>,
     pub header_label: String,
 }
 
 impl<T: Identifiable> SectionTable<T> {
     pub fn new(header_label: String, columns: Vec<ColumnDef<T>>) -> Self {
-        Self { columns, items: Vec::new(), table_state: TableState::default(), selected_idx: None, header_label }
+        Self { columns, items: Vec::new(), selected_idx: None, header_label }
     }
 
     /// Replace items, restoring selection by identity.
@@ -78,19 +85,15 @@ impl<T: Identifiable> SectionTable<T> {
 
         if self.items.is_empty() {
             self.selected_idx = None;
-            self.table_state.select(None);
         } else if let Some(ref prev) = prev_id {
             if let Some(new_idx) = self.items.iter().position(|item| item.id() == *prev) {
                 self.selected_idx = Some(new_idx);
-                self.table_state.select(Some(new_idx));
             } else {
                 self.selected_idx = Some(0);
-                self.table_state.select(Some(0));
             }
         } else {
             // First call — auto-select first item
             self.selected_idx = Some(0);
-            self.table_state.select(Some(0));
         }
     }
 
@@ -103,15 +106,12 @@ impl<T: Identifiable> SectionTable<T> {
         }
         match self.selected_idx {
             Some(idx) if idx + 1 < self.items.len() => {
-                let next = idx + 1;
-                self.selected_idx = Some(next);
-                self.table_state.select(Some(next));
+                self.selected_idx = Some(idx + 1);
                 true
             }
             Some(_) => false, // at end
             None => {
                 self.selected_idx = Some(0);
-                self.table_state.select(Some(0));
                 true
             }
         }
@@ -127,15 +127,12 @@ impl<T: Identifiable> SectionTable<T> {
         }
         match self.selected_idx {
             Some(idx) if idx > 0 => {
-                let prev = idx - 1;
-                self.selected_idx = Some(prev);
-                self.table_state.select(Some(prev));
+                self.selected_idx = Some(idx - 1);
                 true
             }
             Some(_) => false, // at start
             None => {
                 self.selected_idx = Some(0);
-                self.table_state.select(Some(0));
                 true
             }
         }
@@ -145,7 +142,6 @@ impl<T: Identifiable> SectionTable<T> {
     pub fn select_idx(&mut self, idx: usize) {
         if idx < self.items.len() {
             self.selected_idx = Some(idx);
-            self.table_state.select(Some(idx));
         }
     }
 
@@ -153,16 +149,13 @@ impl<T: Identifiable> SectionTable<T> {
     pub fn select_first(&mut self) {
         if !self.items.is_empty() {
             self.selected_idx = Some(0);
-            self.table_state.select(Some(0));
         }
     }
 
     /// Jump to the last item.
     pub fn select_last(&mut self) {
         if !self.items.is_empty() {
-            let last = self.items.len() - 1;
-            self.selected_idx = Some(last);
-            self.table_state.select(Some(last));
+            self.selected_idx = Some(self.items.len() - 1);
         }
     }
 
@@ -174,7 +167,6 @@ impl<T: Identifiable> SectionTable<T> {
     /// Clear the current selection.
     pub fn clear_selection(&mut self) {
         self.selected_idx = None;
-        self.table_state.select(None);
     }
 
     /// Whether the table has no items.
@@ -187,81 +179,43 @@ impl<T: Identifiable> SectionTable<T> {
         self.items.len()
     }
 
-    /// Render the table into `area`.
+    /// Resolve column widths for rendering.
     ///
-    /// Builds a header row from the column definitions, then one data row per
-    /// item using each column's extractor. No block/border is added — the
-    /// composing widget owns the outer container.
+    /// Fixed-width columns (`Constraint::Length(n)`) get their exact width.
+    /// Fill columns (`Constraint::Fill(weight)`) share the remaining space
+    /// proportionally by weight. Other constraint types get a fallback of 10.
     ///
-    /// If `row_style_override` is provided, it is called for each item. When it
-    /// returns `Some(style)`, that style is applied to the row (e.g. for
-    /// multi-select or pending-action indicators).
-    #[allow(clippy::type_complexity)]
-    pub fn render(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        ctx: &RenderCtx,
-        highlight_style: Style,
-        row_style_override: Option<&dyn Fn(&T) -> Option<Style>>,
-    ) {
-        let header = Row::new(
-            self.columns.iter().map(|c| Cell::from(Span::raw(c.header.clone())).style(Style::default().fg(ctx.theme.muted).bold())),
-        )
-        .height(1);
+    /// The `col_spacing` parameter reserves space between columns (typically 1).
+    pub fn resolve_widths(&self, available: u16, col_spacing: u16) -> Vec<u16> {
+        let spacing_total = if self.columns.len() > 1 { (self.columns.len() as u16 - 1) * col_spacing } else { 0 };
+        let usable = available.saturating_sub(spacing_total);
+        let mut widths = vec![0u16; self.columns.len()];
+        let mut fixed_total = 0u16;
+        let mut fill_total = 0u16;
 
-        let rows: Vec<Row> = self
-            .items
-            .iter()
-            .map(|item| {
-                let mut row = Row::new(self.columns.iter().map(|c| (c.extract)(item, ctx)));
-                if let Some(ref style_fn) = row_style_override {
-                    if let Some(style) = style_fn(item) {
-                        row = row.style(style);
-                    }
+        for (i, col) in self.columns.iter().enumerate() {
+            match col.width {
+                Constraint::Length(n) => {
+                    widths[i] = n;
+                    fixed_total += n;
                 }
-                row
-            })
-            .collect();
-
-        let widths: Vec<Constraint> = self.columns.iter().map(|c| c.width).collect();
-
-        let table = Table::new(rows, widths)
-            .header(header)
-            .row_highlight_style(highlight_style)
-            .highlight_symbol("▸ ")
-            .highlight_spacing(HighlightSpacing::Always);
-
-        frame.render_stateful_widget(table, area, &mut self.table_state);
-    }
-
-    /// Hit-test a y-coordinate against the rendered area.
-    ///
-    /// Row layout (no block/border on the table itself, but the caller places
-    /// the table inside a bordered container, so the table area already
-    /// excludes the border):
-    ///
-    /// - Row 0 (area.y + 0): column header
-    /// - Rows 1.. (area.y + 1..): data rows, offset by scroll
-    ///
-    /// Returns the item index into `self.items`, or `None` if `y` is outside
-    /// the area or maps to the header row.
-    pub fn row_at_y(&self, y: u16, area: Rect) -> Option<usize> {
-        if y < area.y || y >= area.y + area.height {
-            return None;
+                Constraint::Fill(w) => {
+                    fill_total += w;
+                }
+                _ => {
+                    widths[i] = 10;
+                    fixed_total += 10;
+                }
+            }
         }
-        let relative = (y - area.y) as usize;
-        if relative == 0 {
-            // Header row
-            return None;
+
+        let fill_space = usable.saturating_sub(fixed_total);
+        for (i, col) in self.columns.iter().enumerate() {
+            if let Constraint::Fill(weight) = col.width {
+                widths[i] = if fill_total > 0 { fill_space * weight / fill_total } else { 0 };
+            }
         }
-        let data_row = relative - 1;
-        let idx = self.table_state.offset() + data_row;
-        if idx < self.items.len() {
-            Some(idx)
-        } else {
-            None
-        }
+        widths
     }
 }
 
@@ -313,7 +267,7 @@ mod tests {
         table.update_items(rows(&[(1, "alpha"), (2, "bravo")]));
 
         assert_eq!(table.selected_idx, Some(0));
-        assert_eq!(table.table_state.selected(), Some(0));
+
         assert_eq!(table.selected_item().expect("should have selection").id, 1);
     }
 
@@ -331,7 +285,7 @@ mod tests {
         table.update_items(rows(&[(1, "alpha"), (3, "charlie"), (2, "bravo")]));
 
         assert_eq!(table.selected_idx, Some(2));
-        assert_eq!(table.table_state.selected(), Some(2));
+
         assert_eq!(table.selected_item().expect("selected").id, 2);
     }
 
@@ -349,7 +303,7 @@ mod tests {
 
         // Falls back to first
         assert_eq!(table.selected_idx, Some(0));
-        assert_eq!(table.table_state.selected(), Some(0));
+
         assert_eq!(table.selected_item().expect("selected").id, 1);
     }
 
@@ -362,7 +316,7 @@ mod tests {
         table.update_items(Vec::new());
 
         assert_eq!(table.selected_idx, None);
-        assert_eq!(table.table_state.selected(), None);
+
         assert!(table.selected_item().is_none());
     }
 
@@ -436,7 +390,6 @@ mod tests {
 
         table.select_idx(2);
         assert_eq!(table.selected_idx, Some(2));
-        assert_eq!(table.table_state.selected(), Some(2));
     }
 
     #[test]
@@ -485,7 +438,7 @@ mod tests {
 
         table.clear_selection();
         assert_eq!(table.selected_idx, None);
-        assert_eq!(table.table_state.selected(), None);
+
         assert!(table.selected_item().is_none());
     }
 
