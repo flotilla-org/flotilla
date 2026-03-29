@@ -694,10 +694,8 @@ fn pending_action_in_flight_shows_spinner() {
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
 
     // Insert an in-flight pending action for the checkout item.
-    let identity = WorkItemIdentity::Checkout(QualifiedPath::from_host_path(
-        &HostName::local(),
-        PathBuf::from("/test/my-project/feat-login"),
-    ));
+    let identity =
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat-login")));
     let repo = harness.model.repo_order[0].clone();
     harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
         command_id: 1,
@@ -741,10 +739,8 @@ fn pending_action_failed_shows_error_icon() {
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
 
     // Insert a failed pending action.
-    let identity = WorkItemIdentity::Checkout(QualifiedPath::from_host_path(
-        &HostName::local(),
-        PathBuf::from("/test/my-project/feat-broken"),
-    ));
+    let identity =
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat-broken")));
     let repo = harness.model.repo_order[0].clone();
     harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
         command_id: 2,
