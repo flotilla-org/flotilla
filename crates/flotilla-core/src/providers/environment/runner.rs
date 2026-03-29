@@ -38,4 +38,49 @@ impl CommandRunner for EnvironmentRunner {
         let docker_args = ["exec", &self.container_name, "which", cmd];
         self.inner.run("docker", &docker_args, Path::new("/"), &ChannelLabel::Noop).await.is_ok()
     }
+
+    async fn ensure_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
+        let path_str = path.to_string_lossy();
+        // Use printf with %s to avoid echo's backslash interpretation.
+        // All interpolated values are single-quoted with embedded single
+        // quotes escaped via the '\'' idiom.
+        let escape = |s: &str| s.replace('\'', "'\\''");
+        let escaped_parent = escape(&parent);
+        let escaped_path = escape(&path_str);
+        let escaped_content = escape(content);
+        let script = format!("mkdir -p '{escaped_parent}' && printf '%s' '{escaped_content}' > '{escaped_path}'");
+        let docker_args = vec!["exec", &self.container_name, "sh", "-c", &script];
+        self.inner.run("docker", &docker_args, Path::new("/"), &ChannelLabel::Noop).await.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, sync::Arc};
+
+    use super::EnvironmentRunner;
+    use crate::providers::{testing::MockRunner, CommandRunner};
+
+    #[tokio::test]
+    async fn ensure_file_delegates_via_docker_exec_sh() {
+        let inner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let runner = EnvironmentRunner::new("my-container".into(), inner.clone());
+
+        runner.ensure_file(Path::new("/app/config/shpool.toml"), "key = true\n").await.expect("ensure_file");
+
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "docker");
+        let args = &calls[0].1;
+        assert!(args.contains(&"exec".to_string()));
+        assert!(args.contains(&"my-container".to_string()));
+        assert!(args.contains(&"sh".to_string()));
+        assert!(args.contains(&"-c".to_string()));
+        // The sh -c script should create the parent dir and write the file
+        let script = args.last().expect("should have script arg");
+        assert!(script.contains("mkdir -p"), "script should create parent dirs: {script}");
+        assert!(script.contains("/app/config/shpool.toml"), "script should reference target path: {script}");
+        assert!(script.contains("key = true"), "script should contain file content: {script}");
+    }
 }
