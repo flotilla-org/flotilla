@@ -60,7 +60,8 @@ impl Factory for CloneCheckoutManagerFactory {
             return Err(vec![UnmetRequirement::MissingBinary("git (reference repo at /ref/repo)".into())]);
         }
 
-        Ok(Arc::new(CloneCheckoutManager::new(runner, ExecutionEnvironmentPath::new("/ref/repo"))))
+        let host_name = env.host_name().cloned().unwrap_or_else(flotilla_protocol::HostName::local);
+        Ok(Arc::new(CloneCheckoutManager::new(runner, ExecutionEnvironmentPath::new("/ref/repo"), host_name)))
     }
 }
 

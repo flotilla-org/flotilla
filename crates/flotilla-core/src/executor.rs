@@ -744,7 +744,8 @@ impl StepResolver for ExecutorStepResolver {
                     workspace_config(self.repo.root.as_path(), &label, checkout_path.as_path(), "claude", self.config_base.as_path());
                 let template_yaml = workspace_config.template_yaml.clone();
                 let prepared_commands = if let Some(ref tm) = tm {
-                    let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
+                    let terminal_preparation =
+                        TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()), &self.local_host);
                     let workspace_config = workspace_config.clone();
                     terminal_preparation
                         .prepare_terminal_commands(&branch, checkout_path.as_path(), &[], move || workspace_config.clone())
@@ -860,7 +861,7 @@ impl StepResolver for ExecutorStepResolver {
                         workspace_orchestrator.ensure_attachable_set_for_checkout(&self.local_host, checkout_path.as_path(), None);
                     let commands = if let Some(ref tm) = tm {
                         let terminal_preparation =
-                            TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
+                            TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()), &self.local_host);
                         terminal_preparation
                             .prepare_terminal_commands(&co.branch, checkout_path.as_path(), &requested_commands, || {
                                 workspace_config(

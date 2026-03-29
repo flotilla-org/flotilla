@@ -311,7 +311,8 @@ impl InProcessDaemon {
         let mut path_identities = HashMap::new();
 
         // Run host detection once before the repo loop
-        let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
+        let mut host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
+        host_bag.set_host_name(host_name.clone());
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
 
         for path in repo_paths {
@@ -336,7 +337,8 @@ impl InProcessDaemon {
 
             let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
             let slug = repo_slug.clone();
-            let mut model = RepoModel::new(path.clone(), registry, repo_slug, attachable_store, Arc::clone(&agent_state_store));
+            let mut model =
+                RepoModel::new(path.clone(), registry, repo_slug, attachable_store, Arc::clone(&agent_state_store), host_name.clone());
             model.data.loading = true;
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
@@ -1401,6 +1403,7 @@ impl InProcessDaemon {
             repo_slug,
             self.discovery.shared_attachable_store(&self.config),
             Arc::clone(&self.agent_state_store),
+            self.host_name.clone(),
         );
         model.data.loading = true;
         let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };

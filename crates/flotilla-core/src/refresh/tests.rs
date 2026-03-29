@@ -340,6 +340,7 @@ fn compute_provider_health_maps_error_categories() {
 #[tokio::test]
 async fn refresh_empty_registry_produces_empty_data() {
     let mut pd = ProviderData::default();
+    let host = flotilla_protocol::HostName::new("test-host");
     let errors = refresh_providers(
         &mut pd,
         &repo_root(),
@@ -347,6 +348,7 @@ async fn refresh_empty_registry_produces_empty_data() {
         &criteria(),
         &test_attachable_store(),
         &test_agent_state_store(),
+        &host,
     )
     .await;
 
@@ -389,8 +391,9 @@ async fn refresh_populates_all_provider_data_and_merged_wins_branch_conflict() {
     );
 
     let mut pd = ProviderData::default();
+    let host = flotilla_protocol::HostName::new("test-host");
     let errors =
-        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store()).await;
+        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store(), &host).await;
 
     assert!(errors.is_empty());
     assert_eq!(pd.checkouts.len(), 1);
@@ -414,8 +417,11 @@ fn project_attachable_data_populates_sets_and_ids() {
     let set_id = {
         let mut store = attachable_store.lock().expect("lock store");
         let set_id = store.ensure_terminal_set(
-            Some(flotilla_protocol::HostName::local()),
-            Some(flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat"))),
+            Some(flotilla_protocol::HostName::new("test-host")),
+            Some(flotilla_protocol::QualifiedPath::from_host_path(
+                &flotilla_protocol::HostName::new("test-host"),
+                PathBuf::from("/tmp/wt-feat"),
+            )),
         );
         let _attachable_id = store.ensure_terminal_attachable(
             &set_id,
@@ -439,7 +445,7 @@ fn project_attachable_data_populates_sets_and_ids() {
 
     let mut pd = ProviderData::default();
     pd.checkouts.insert(
-        flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")),
+        flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::new("test-host"), PathBuf::from("/tmp/wt-feat")),
         Checkout {
             branch: "feat".into(),
             is_main: false,
@@ -467,8 +473,9 @@ async fn refresh_reports_checkout_errors() {
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("checkout failed")));
 
     let mut pd = ProviderData::default();
+    let host = flotilla_protocol::HostName::new("test-host");
     let errors =
-        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store()).await;
+        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store(), &host).await;
 
     assert!(errors.iter().any(|e| e.category == "checkouts"));
     assert!(pd.checkouts.is_empty());
@@ -488,8 +495,9 @@ async fn refresh_collects_multiple_errors_and_preserves_successful_providers() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail")));
 
     let mut pd = ProviderData::default();
+    let host = flotilla_protocol::HostName::new("test-host");
     let errors =
-        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store()).await;
+        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), &test_attachable_store(), &test_agent_state_store(), &host).await;
 
     let categories: HashSet<&str> = errors.iter().map(|e| e.category).collect();
     for expected in ["PRs", "merged", "sessions", "branches", "workspaces"] {
@@ -512,6 +520,7 @@ async fn spawn_produces_initial_snapshot() {
         test_attachable_store(),
         test_agent_state_store(),
         Duration::from_secs(3600),
+        flotilla_protocol::HostName::new("test-host"),
     );
 
     let mut rx = handle.snapshot_rx.clone();
@@ -533,6 +542,7 @@ async fn spawn_with_failing_provider_sets_error_and_unhealthy_health() {
         test_attachable_store(),
         test_agent_state_store(),
         Duration::from_secs(3600),
+        flotilla_protocol::HostName::new("test-host"),
     );
 
     let mut rx = handle.snapshot_rx.clone();
@@ -550,6 +560,7 @@ async fn trigger_refresh_produces_another_snapshot() {
         test_attachable_store(),
         test_agent_state_store(),
         Duration::from_secs(3600),
+        flotilla_protocol::HostName::new("test-host"),
     );
 
     let mut rx = handle.snapshot_rx.clone();
@@ -587,6 +598,7 @@ async fn spawn_with_mixed_provider_health_isolates_failures() {
         test_attachable_store(),
         test_agent_state_store(),
         Duration::from_secs(3600),
+        flotilla_protocol::HostName::new("test-host"),
     );
 
     let mut rx = handle.snapshot_rx.clone();
@@ -600,7 +612,7 @@ async fn spawn_with_mixed_provider_health_isolates_failures() {
 #[test]
 fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let host = flotilla_protocol::HostName::local();
+    let host = flotilla_protocol::HostName::new("test-host");
     let checkout_a = flotilla_protocol::QualifiedPath::from_host_path(&host, "/repo/wt-feat");
     let checkout_b = flotilla_protocol::QualifiedPath::from_host_path(&host, "/repo/wt-other");
 
@@ -634,7 +646,7 @@ fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
 #[test]
 fn project_attachable_data_set_appears_without_terminal_scan() {
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let host = flotilla_protocol::HostName::local();
+    let host = flotilla_protocol::HostName::new("test-host");
     let checkout = flotilla_protocol::QualifiedPath::from_host_path(&host, "/repo/wt-feat");
 
     {

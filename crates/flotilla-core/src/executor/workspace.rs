@@ -49,7 +49,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
 
         let mut config = workspace_config(self.repo_root, label, checkout_path, teleport_cmd, self.config_base);
         if let Some(tm) = self.terminal_manager {
-            let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
+            let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path, self.local_host);
             terminal_preparation.resolve_workspace_commands(&mut config).await;
         }
         let attach_request = workspace_attach_request_from_config(config);
