@@ -61,6 +61,10 @@ impl Vcs for StubVcs {
 struct StubCheckoutManager;
 #[async_trait]
 impl CheckoutManager for StubCheckoutManager {
+    async fn validate_target(&self, _: &ExecutionEnvironmentPath, _: &str, _: flotilla_protocol::CheckoutIntent) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn list_checkouts(&self, _: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(vec![])
     }

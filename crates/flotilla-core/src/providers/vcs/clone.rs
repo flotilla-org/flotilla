@@ -53,6 +53,16 @@ impl CloneCheckoutManager {
 
 #[async_trait]
 impl super::CheckoutManager for CloneCheckoutManager {
+    async fn validate_target(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        let ref_dir = self.ref_dir_str()?;
+        super::validate_checkout_target_in_git_dir(ref_dir, std::path::Path::new("/"), branch, intent, &*self.runner).await
+    }
+
     async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         // List directories under /workspace/
         let output = self
@@ -121,30 +131,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
         info!(%branch, %checkout_dir, %create_branch, "clone: creating checkout");
 
         if create_branch {
-            // Reject if branch already exists locally or remotely in the reference repo
-            let local_exists = self
-                .runner
-                .run(
-                    "git",
-                    &["--git-dir", ref_dir, "show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
-                    std::path::Path::new("/"),
-                    &ChannelLabel::Noop,
-                )
-                .await
-                .is_ok();
-            let remote_exists = self
-                .runner
-                .run(
-                    "git",
-                    &["--git-dir", ref_dir, "show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")],
-                    std::path::Path::new("/"),
-                    &ChannelLabel::Noop,
-                )
-                .await
-                .is_ok();
-            if local_exists || remote_exists {
-                return Err(format!("branch already exists: {branch}"));
-            }
+            self.validate_target(_repo_root, branch, flotilla_protocol::CheckoutIntent::FreshBranch).await?;
 
             // Fresh branch: clone without checkout, then create branch
             self.runner
@@ -157,7 +144,12 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 .await?;
 
             self.runner
-                .run("git", &["-C", &checkout_dir, "checkout", "-b", branch], std::path::Path::new(&checkout_dir), &ChannelLabel::Noop)
+                .run(
+                    "git",
+                    &["-C", &checkout_dir, "checkout", "-b", branch, "HEAD"],
+                    std::path::Path::new(&checkout_dir),
+                    &ChannelLabel::Noop,
+                )
                 .await?;
         } else {
             // Existing branch: clone with -b
@@ -202,12 +194,21 @@ impl super::CheckoutManager for CloneCheckoutManager {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, path::Path, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        fs,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
 
     use async_trait::async_trait;
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::providers::{vcs::CheckoutManager, ChannelLabel, CommandOutput, CommandRunner};
+    use crate::providers::{
+        vcs::{checkout_test_support::git, CheckoutManager},
+        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
+    };
 
     /// A test runner that records all (cmd, args) calls and returns queued responses.
     struct RecordingRunner {
@@ -242,6 +243,81 @@ mod tests {
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
             true
         }
+    }
+
+    /// Executes real git commands while remapping the logical `/workspace` paths
+    /// used by `CloneCheckoutManager` into a writable temp directory for tests.
+    struct WorkspaceMappingRunner {
+        inner: ProcessCommandRunner,
+        workspace_root: PathBuf,
+    }
+
+    impl WorkspaceMappingRunner {
+        fn new(workspace_root: PathBuf) -> Self {
+            Self { inner: ProcessCommandRunner, workspace_root }
+        }
+
+        fn map_path(&self, path: &Path) -> PathBuf {
+            Self::map_workspace_path(path.to_string_lossy().as_ref(), &self.workspace_root)
+        }
+
+        fn map_arg(&self, arg: &str) -> String {
+            Self::map_workspace_path(arg, &self.workspace_root).to_string_lossy().into_owned()
+        }
+
+        fn map_workspace_path(raw: &str, workspace_root: &Path) -> PathBuf {
+            if raw == WORKSPACE_ROOT {
+                return workspace_root.to_path_buf();
+            }
+
+            if let Some(rest) = raw.strip_prefix(&format!("{WORKSPACE_ROOT}/")) {
+                return workspace_root.join(rest);
+            }
+
+            PathBuf::from(raw)
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for WorkspaceMappingRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            let mapped_args: Vec<String> = args.iter().map(|arg| self.map_arg(arg)).collect();
+            let mapped_arg_refs: Vec<&str> = mapped_args.iter().map(String::as_str).collect();
+            self.inner.run(cmd, &mapped_arg_refs, &self.map_path(cwd), label).await
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            let mapped_args: Vec<String> = args.iter().map(|arg| self.map_arg(arg)).collect();
+            let mapped_arg_refs: Vec<&str> = mapped_args.iter().map(String::as_str).collect();
+            self.inner.run_output(cmd, &mapped_arg_refs, &self.map_path(cwd), label).await
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            self.inner.exists(cmd, args).await
+        }
+    }
+
+    fn setup_real_clone_repo() -> (TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let base = dir.path().canonicalize().expect("failed to canonicalize tempdir");
+        let remote = base.join("origin.git");
+        let reference = base.join("reference");
+        let workspace_root = base.join("workspace-root");
+
+        git(&base, &["init", "--bare", remote.to_str().expect("non-UTF-8 path")]);
+        git(&base, &["clone", remote.to_str().expect("non-UTF-8 path"), reference.to_str().expect("non-UTF-8 path")]);
+        git(&reference, &["config", "user.email", "test@test.com"]);
+        git(&reference, &["config", "user.name", "Test"]);
+
+        fs::write(reference.join("README.md"), "# Test\n").expect("failed to write README");
+        git(&reference, &["add", "README.md"]);
+        git(&reference, &["commit", "-m", "Initial commit"]);
+        git(&reference, &["branch", "-M", "main"]);
+        git(&reference, &["push", "origin", "main"]);
+
+        fs::create_dir(&workspace_root).expect("failed to create workspace root");
+
+        (dir, reference.join(".git"), workspace_root)
     }
 
     #[tokio::test]
@@ -288,7 +364,7 @@ mod tests {
             Err("".to_string()),
             // git clone --reference /ref/repo --no-checkout ... /workspace/my-feature
             Ok(String::new()),
-            // git -C /workspace/my-feature checkout -b my-feature
+            // git -C /workspace/my-feature checkout -b my-feature HEAD
             Ok(String::new()),
         ]));
 
@@ -325,6 +401,30 @@ mod tests {
         assert!(calls[4].1.contains(&"checkout".to_string()));
         assert!(calls[4].1.contains(&"-b".to_string()));
         assert!(calls[4].1.contains(&"my-feature".to_string()));
+        assert!(calls[4].1.contains(&"HEAD".to_string()));
+    }
+
+    #[tokio::test]
+    async fn create_checkout_fresh_branch_populates_working_tree() {
+        let (_dir, reference_git_dir, workspace_root) = setup_real_clone_repo();
+        let runner = Arc::new(WorkspaceMappingRunner::new(workspace_root.clone()));
+        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new(reference_git_dir.clone()));
+
+        let (_path, checkout) = mgr
+            .create_checkout(&ExecutionEnvironmentPath::new(reference_git_dir), "my-feature", true)
+            .await
+            .expect("create_checkout should succeed");
+
+        assert_eq!(checkout.branch, "my-feature");
+
+        let checkout_dir = workspace_root.join("my-feature");
+        assert!(checkout_dir.join("README.md").exists(), "fresh branch checkout should populate the working tree");
+
+        let status = runner
+            .run("git", &["status", "--short"], &checkout_dir, &ChannelLabel::Noop)
+            .await
+            .expect("git status should succeed");
+        assert!(status.trim().is_empty(), "fresh branch checkout should be clean, got: {status:?}");
     }
 
     #[tokio::test]
