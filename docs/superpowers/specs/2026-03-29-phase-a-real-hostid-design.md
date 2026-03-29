@@ -5,17 +5,47 @@
 
 ## Problem
 
-`HostId` exists as a type (`QualifiedPath::host(HostId, PathBuf)`) and `host_identity.rs` exists with machine-id resolution and atomic UUID creation. But nothing calls them. The daemon still uses `HostName` for path qualification — `EnvironmentBag` carries `HostName`, factories read it, providers call `QualifiedPath::from_host_path()` which stringifies the hostname into `HostId`. The real UUID-based `HostId` is unused.
+#557 replaced `HostPath` with `QualifiedPath` but smuggled hostname strings into `HostId` via `from_host_path()`. Every "host-qualified" path in the system actually contains a hostname string, not a real stable UUID. The type system can't distinguish migrated paths from legacy ones — `HostId` is doing double duty as both "real UUID" and "hostname string pretending to be a host ID."
+
+Meanwhile `host_identity.rs` exists with machine-id resolution and atomic UUID creation, but nothing calls it.
 
 ## Goal
 
-The daemon's local machine gets a real stable `HostId` (UUID), and the discovery → factory → provider pipeline uses it for checkout path qualification instead of the hostname string.
+1. Restore type-level distinction between real `HostId` (UUID) and legacy `HostName`-derived paths.
+2. Wire real `HostId` through the local daemon's discovery → factory → provider pipeline.
+3. Make migration progress compiler-visible: `PathQualifier::HostName` usages are the remaining work.
+
+## Core Change: Three-Variant PathQualifier
+
+```rust
+pub enum PathQualifier {
+    /// Real stable host identity (UUID from host_identity.rs).
+    /// Used for paths on hosts with resolved identity.
+    Host(HostId),
+    /// Legacy hostname-derived qualifier.
+    /// Used for paths where only a HostName is available (remote/peer paths).
+    /// Each usage is a migration target for future phases.
+    HostName(HostName),
+    /// Execution environment (Docker container, etc).
+    Environment(EnvironmentId),
+}
+```
+
+`from_host_path()` becomes the constructor for the `HostName` variant — it no longer pretends to produce a `HostId`:
+
+```rust
+pub fn from_host_path(host: &HostName, path: impl Into<PathBuf>) -> Self {
+    Self { qualifier: PathQualifier::HostName(host.clone()), path: path.into() }
+}
+```
+
+The compiler forces every match on `PathQualifier` to handle both `Host` and `HostName`, making it visible where migration is incomplete.
 
 ## Changes
 
 ### DaemonConfig
 
-Add `machine_id: Option<String>` for the NFS shared-home case (where `/etc/machine-id` and `IOPlatformUUID` are unavailable):
+Add `machine_id: Option<String>` for the NFS shared-home case:
 
 ```rust
 pub struct DaemonConfig {
@@ -62,7 +92,7 @@ host_bag.set_host_id(host_id.clone());
 
 ### EnvironmentBag
 
-Replace `host_name: Option<HostName>` with `host_id: Option<HostId>`:
+Carries `HostId` for the local daemon's identity. The old `host_name` field is replaced:
 
 ```rust
 pub struct EnvironmentBag {
@@ -71,129 +101,80 @@ pub struct EnvironmentBag {
 }
 ```
 
-Methods:
+`set_host_id()` / `host_id()` replace `set_host_name()` / `host_name()`. `merge()` preserves `host_id` from `self`, falls back to `other`.
 
-```rust
-pub fn set_host_id(&mut self, host_id: HostId) {
-    self.host_id = Some(host_id);
-}
+### Checkout Manager Factories — Local Path
 
-pub fn host_id(&self) -> Option<&HostId> {
-    self.host_id.as_ref()
-}
-```
+All three factories read `env.host_id()` and produce `QualifiedPath::host(host_id, path)` for local checkouts:
 
-`merge()` preserves `host_id` from `self`, falls back to `other` — same pattern as today's `host_name` merge.
-
-The old `set_host_name()` / `host_name()` methods are removed.
-
-### Checkout Manager Factories
-
-All three factories read `env.host_id()` instead of `env.host_name()` and pass `HostId` to the provider constructor:
-
-**`CloneCheckoutManagerFactory::probe()`:**
 ```rust
 let host_id = env.host_id().cloned()
-    .unwrap_or_else(|| HostId::new(HostName::local().as_str()));
-Ok(Arc::new(CloneCheckoutManager::new(runner, reference_dir, host_id)))
-```
-
-**`GitCheckoutManagerFactory::probe()`:**
-```rust
-let host_id = env.host_id().cloned()
-    .unwrap_or_else(|| HostId::new(HostName::local().as_str()));
+    .expect("host_id must be set on bag during local discovery");
 Ok(Arc::new(GitCheckoutManager::new(checkout_config.path, runner, host_id)))
 ```
 
-**`WtCheckoutManagerFactory::probe()`:**
-```rust
-let host_id = env.host_id().cloned()
-    .unwrap_or_else(|| HostId::new(HostName::local().as_str()));
-Ok(Arc::new(WtCheckoutManager::new(runner, host_id)))
-```
-
-**Fallback policy:** The `HostName::local()` fallback exists only for two cases:
-1. **Tests** — factories probed without a full discovery runtime.
-2. **Docker discovery hack** — explicitly deferred to Phase B.
-
-In the local host discovery path (the normal daemon startup → host detection → repo discovery flow), absence of `host_id` on the bag is a bug. The production factory code should `expect("host_id must be set on bag during local discovery")` rather than silently falling back. The fallback only applies when `FLOTILLA_ENVIRONMENT_ID` is present in the bag (Docker path) or in test code.
-
-### Provider Structs
-
-All three checkout managers store `HostId` instead of `HostName`:
-
-**`CloneCheckoutManager`:**
-```rust
-pub struct CloneCheckoutManager {
-    runner: Arc<dyn CommandRunner>,
-    reference_dir: ExecutionEnvironmentPath,
-    host_id: HostId,
-}
-```
-
-**`GitCheckoutManager`:**
-```rust
-pub struct GitCheckoutManager {
-    checkout_path: String,
-    env: minijinja::Environment<'static>,
-    runner: Arc<dyn CommandRunner>,
-    host_id: HostId,
-}
-```
-
-**`WtCheckoutManager`:**
-```rust
-pub struct WtCheckoutManager {
-    runner: Arc<dyn CommandRunner>,
-    host_id: HostId,
-}
-```
-
-All call sites change from `QualifiedPath::from_host_path(&self.host_name, path)` to `QualifiedPath::host(self.host_id.clone(), path)`.
+These factories store `HostId` on the provider struct. The providers call `QualifiedPath::host(self.host_id.clone(), path)` — producing real `PathQualifier::Host(HostId)` paths.
 
 ### normalize_local_provider_hosts()
 
-**Critical:** `normalize_local_provider_hosts()` in `in_process.rs` rewrites every checkout's `QualifiedPath` via `from_host_path(host_name, path)` after discovery. This would overwrite the real UUID-backed `HostId` from providers. It must take `HostId` instead of `HostName` and call `QualifiedPath::host(host_id, path)`. The companion `normalize_correlation_keys()` needs the same change.
+Takes `HostId` instead of `HostName`. Calls `QualifiedPath::host(host_id, path)` instead of `from_host_path()`. The companion `normalize_correlation_keys()` gets the same change.
 
-### Other from_host_path() Production Callers — Local Daemon Paths Only
+### Call Sites That Stay on from_host_path()
 
-Phase A migrates call sites that qualify paths for the **local daemon's own checkouts**. These switch from `from_host_path(host_name, path)` to `QualifiedPath::host(host_id, path)`:
+These produce `PathQualifier::HostName(HostName)` — the legacy variant. The compiler makes each one visible:
 
-- `in_process.rs` — `normalize_local_provider_hosts()`, `normalize_correlation_keys()` (take `HostId` instead of `HostName`)
-- `refresh.rs` — local refresh path
-- `convert.rs` — core-to-protocol conversion for local data
+- `executor/workspace.rs` — `target_host: &HostName` for remote workspace/attachable bindings
+- `executor/terminals.rs` — terminal set allocation from `HostName`
+- `executor/session_actions.rs` — session operations targeting remote hosts
+- `executor.rs` — executor paths using `target_host`
+- `peer/merge.rs` — peer data with hostname-derived identity
+- `repo_state.rs` — may handle both local and peer data
 
-### Call Sites That Stay on from_host_path() in Phase A
-
-Several code paths operate on **remote host paths** where the identity arrives as `HostName` from a peer or target-host context. These are not migrated in Phase A because remote hosts don't have real `HostId` yet:
-
-- `executor/workspace.rs` — `target_host: &HostName` for remote workspace/attachable bindings (lines 131-227). These qualify paths on arbitrary target hosts, not just the local daemon.
-- `executor/terminals.rs` — allocates terminal sets from `HostName` for both local and remote hosts.
-- `executor/session_actions.rs` — session operations that may target remote hosts.
-- `executor.rs` — executor paths that use `target_host` (lines 705, 847).
-- `peer/merge.rs` — peer data merge compares `qp.host_id().as_str()` against `HostName::as_str()` for ownership. The local side now has a real `HostId`; peer-owned paths still use hostname-derived IDs.
-- `repo_state.rs` — may handle both local and peer data.
-
-These call sites continue using `from_host_path()` until remote hosts also carry stable `HostId` (Phase D / node identity spec).
-
-### from_host_path() Stays in Production
-
-`from_host_path()` remains in production code — it's still needed for remote/peer path qualification where only `HostName` is available. Phase A does not remove or hide it. The goal is: the local daemon's own paths use real `HostId`, everything else is unchanged.
+These are the migration targets for future phases (Phase D / node identity).
 
 ### Merge Compatibility
 
-`merge.rs` compares `qp.host_id().as_str()` against `HostName::as_str()` for ownership checks. After Phase A, the local daemon's checkouts have a UUID-based `HostId` while peer checkouts still have hostname-derived IDs. These are different strings and won't collide — which is correct. The local ownership check needs to compare against the daemon's `HostId`, not its `HostName`:
+`merge_provider_data()` currently compares `qp.host_id()` against `HostName`. After this change, local checkouts have `PathQualifier::Host(HostId)` and peer checkouts have `PathQualifier::HostName(HostName)`. The merge function needs to handle both:
 
 ```rust
-// Before: if qp.host_id().map(|h| h.as_str()) == Some(local_host.as_str())
-// After:  if qp.host_id() == Some(&local_host_id)
+fn is_local_checkout(qp: &QualifiedPath, local_host_id: &HostId) -> bool {
+    match &qp.qualifier {
+        PathQualifier::Host(id) => id == local_host_id,
+        PathQualifier::HostName(name) => false,  // HostName-qualified paths are never "local" after Phase A
+        PathQualifier::Environment(_) => false,
+    }
+}
+
+fn is_peer_checkout(qp: &QualifiedPath, peer_host: &HostName) -> bool {
+    match &qp.qualifier {
+        PathQualifier::Host(_) => false,  // HostId-qualified paths come from real identity, not peer hostname
+        PathQualifier::HostName(name) => name == peer_host,
+        PathQualifier::Environment(_) => false,
+    }
+}
 ```
 
-The merge function signature changes from `local_host: &HostName` to `local_host_id: &HostId`.
+The merge function signature gains `local_host_id: &HostId` alongside or instead of `local_host: &HostName`.
+
+### QualifiedPath API Changes
+
+- `host_id()` returns `Option<&HostId>` — only for `Host` variant
+- `host_name()` returns `Option<&HostName>` — only for `HostName` variant (new accessor)
+- `from_host_path()` stays in production, now produces `HostName` variant
+- `Display` / `FromStr` / serde need to handle both variants (e.g. `host:uuid:/path` vs `hostname:name:/path`, or a tag in serialized form)
+
+### Serialization
+
+The three variants need distinct serialized forms so that a `Host(HostId)` path round-trips differently from a `HostName(HostName)` path. Options:
+
+- Tagged: `{"qualifier": {"Host": "uuid..."}, "path": "..."}` vs `{"qualifier": {"HostName": "desktop"}, "path": "..."}`
+- Prefixed string: `host:uuid:/path` vs `hn:desktop:/path` vs `env:id:/path`
+
+The existing `qualified_path_map` serde module and `Display`/`FromStr` impls need updating. The exact format is an implementation detail, but the round-trip must preserve the variant.
 
 ### Docker Discovery
 
-Left unchanged. The executor's `DiscoverEnvironmentProviders` handler builds its own `EnvironmentBag` from raw env vars without setting `host_id`. Factories fall back to `HostId::new(HostName::local().as_str())`. This is already wrong (same as today's `HostName::local()` fallback) and is fixed in Phase B.
+Left unchanged. The executor's `DiscoverEnvironmentProviders` handler builds its own `EnvironmentBag` without `host_id`. Factories in this path need a fallback — they can use `from_host_path()` which now correctly produces `PathQualifier::HostName`, making the legacy status visible. Phase B fixes this.
 
 ### Host Summary and Discovery Responses
 
@@ -208,12 +189,17 @@ No changes needed:
 - `HostSummary` structure
 - Docker environment discovery
 - `EnvironmentId` for local machine
-- `DaemonHandle` trait (only `InProcessDaemon` needs `HostId` for now; `SocketDaemon` doesn't construct providers)
+- `DaemonHandle` trait
 - `suppress_local_environment` behavior
 
 ## Testing
 
-- Existing `host_identity.rs` tests cover `HostId` generation and stability.
-- Existing provider/factory tests pass with `HostId` instead of `HostName` after updating test helpers.
-- Replay fixture tests are unaffected — fixtures capture command interactions, not internal identity resolution.
-- The `qp()` test helper in `test_support.rs` already creates `QualifiedPath::host(HostId::new("test-host"), path)`.
+- `host_identity.rs` tests cover `HostId` generation and stability.
+- Factory/provider tests updated to inject `HostId` and assert `PathQualifier::Host` on results.
+- Existing `from_host_path()` test call sites continue working — they now produce `PathQualifier::HostName`, which is correct for test scenarios using hostname strings.
+- `qp()` test helper produces `PathQualifier::Host(HostId::new("test-host"))` — unchanged.
+- Snapshot tests may need updating if serialized `QualifiedPath` format changes.
+
+## Migration Visibility
+
+After Phase A, `grep -r 'PathQualifier::HostName\|from_host_path'` in production code shows exactly what's left to migrate. Each occurrence is a place where a real `HostId` should replace a hostname-derived path. The compiler enforces exhaustive matching, so new code must decide which variant to produce.
