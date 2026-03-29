@@ -69,8 +69,13 @@ impl<'a> WorkspaceOrchestrator<'a> {
         };
 
         let scope_prefix = ws_mgr.binding_scope_prefix();
-        if let Some(ws_ref) = self.find_existing_workspace_ref(provider_name, &scope_prefix, &prepared.target_host, &prepared.checkout_path)
-        {
+        if let Some(ws_ref) = self.find_existing_workspace_ref(
+            provider_name,
+            &scope_prefix,
+            &prepared.target_host,
+            &prepared.checkout_path,
+            prepared.environment_id.as_ref(),
+        ) {
             info!(%ws_ref, "found existing workspace via binding, selecting");
             match ws_mgr.select_workspace(&ws_ref).await {
                 Ok(()) => return Ok(()),
@@ -161,10 +166,11 @@ impl<'a> WorkspaceOrchestrator<'a> {
         scope_prefix: &str,
         target_host: &HostName,
         checkout_path: &Path,
+        environment_id: Option<&EnvironmentId>,
     ) -> Option<String> {
         let store = self.attachable_store.lock().ok()?;
         let checkout = QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf());
-        let set_ids = store.sets_for_checkout(&checkout);
+        let set_ids = store.sets_for_checkout(&checkout, environment_id);
         for set_id in set_ids {
             if let Some(ws_ref) = store.lookup_workspace_ref_for_set("workspace_manager", provider_name, &set_id) {
                 if ws_ref.starts_with(scope_prefix) {

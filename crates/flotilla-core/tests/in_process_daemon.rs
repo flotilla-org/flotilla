@@ -2600,3 +2600,75 @@ async fn two_commands_can_run_concurrently() {
         "ArchiveSession should complete successfully after release, got: {archive_result:?}"
     );
 }
+
+#[tokio::test]
+async fn remove_checkout_with_host_disambiguates_among_peers() {
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+
+    // Inject peer data from two different hosts, both with a checkout named "feat-x"
+    let host_a = HostName::new("host-a");
+    let host_b = HostName::new("host-b");
+
+    let mut peer_a = ProviderData::default();
+    peer_a.checkouts.insert(QualifiedPath::from_host_path(&host_a, "/srv/host-a/repo"), Checkout {
+        branch: "feat-x".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+        environment_id: None,
+    });
+
+    let mut peer_b = ProviderData::default();
+    peer_b.checkouts.insert(QualifiedPath::from_host_path(&host_b, "/srv/host-b/repo"), Checkout {
+        branch: "feat-x".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![],
+        association_keys: vec![],
+        environment_id: None,
+    });
+
+    daemon.set_peer_providers(&repo, vec![(host_a.clone(), peer_a), (host_b.clone(), peer_b)], 0).await;
+    // Let poll loop process the peer data
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Without host filter, "feat-x" is ambiguous (exists on both peers)
+    let err = daemon
+        .execute(Command {
+            host: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()) },
+        })
+        .await
+        .expect_err("ambiguous checkout without host should fail");
+    assert!(err.contains("ambiguous"), "expected ambiguous error, got: {err}");
+
+    // With host filter, the checkout selector resolves (no ambiguity).
+    // execute() rejects it as a remote command since host-a != local host,
+    // but critically the error is about remote routing, NOT about ambiguity.
+    let err = daemon
+        .execute(Command {
+            host: Some(host_a.clone()),
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()) },
+        })
+        .await
+        .expect_err("remote host command should fail in test (no remote executor)");
+    assert!(
+        err.contains("remote command routing"),
+        "expected remote routing error (meaning resolution succeeded), got: {err}"
+    );
+    assert!(
+        !err.contains("ambiguous"),
+        "should not be ambiguous when host is specified, got: {err}"
+    );
+}

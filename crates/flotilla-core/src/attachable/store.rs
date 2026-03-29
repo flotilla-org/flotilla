@@ -87,7 +87,7 @@ pub trait AttachableStoreApi: Send + Sync {
         external_ref: &str,
     ) -> bool;
     fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo>;
-    fn sets_for_checkout(&self, checkout: &QualifiedPath) -> Vec<AttachableSetId>;
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId>;
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool;
     fn save(&self) -> Result<(), String>;
 }
@@ -395,8 +395,13 @@ impl AttachableStoreState {
         Some(RemovedSetInfo { member_binding_refs })
     }
 
-    fn sets_for_checkout(&self, checkout: &QualifiedPath) -> Vec<AttachableSetId> {
-        self.registry.sets.values().filter(|set| set.checkout.as_ref() == Some(checkout)).map(|set| set.id.clone()).collect()
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.registry
+            .sets
+            .values()
+            .filter(|set| set.checkout.as_ref() == Some(checkout) && set.environment_id.as_ref() == environment_id)
+            .map(|set| set.id.clone())
+            .collect()
     }
 
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
@@ -555,8 +560,8 @@ impl AttachableStore {
         self.state.remove_set(id)
     }
 
-    pub fn sets_for_checkout(&self, checkout: &QualifiedPath) -> Vec<AttachableSetId> {
-        self.state.sets_for_checkout(checkout)
+    pub fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout, environment_id)
     }
 
     pub fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
@@ -699,8 +704,8 @@ impl AttachableStoreApi for AttachableStore {
         self.state.remove_set(id)
     }
 
-    fn sets_for_checkout(&self, checkout: &QualifiedPath) -> Vec<AttachableSetId> {
-        self.state.sets_for_checkout(checkout)
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout, environment_id)
     }
 
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
@@ -843,8 +848,8 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         self.state.remove_set(id)
     }
 
-    fn sets_for_checkout(&self, checkout: &QualifiedPath) -> Vec<AttachableSetId> {
-        self.state.sets_for_checkout(checkout)
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout, environment_id)
     }
 
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
