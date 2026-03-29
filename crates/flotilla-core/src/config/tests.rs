@@ -443,6 +443,19 @@ fn load_daemon_config_from_file() {
 }
 
 #[test]
+fn daemon_config_suppress_local_environment() {
+    let toml = r#"suppress_local_environment = true"#;
+    let config: DaemonConfig = toml::from_str(toml).unwrap();
+    assert!(config.suppress_local_environment);
+}
+
+#[test]
+fn daemon_config_defaults_to_not_suppressed() {
+    let config: DaemonConfig = toml::from_str("").unwrap();
+    assert!(!config.suppress_local_environment);
+}
+
+#[test]
 fn load_hosts_with_ssh_config() {
     let dir = tempdir().unwrap();
     let base = dir.path();

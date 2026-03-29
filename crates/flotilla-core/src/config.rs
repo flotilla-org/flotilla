@@ -284,6 +284,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub follower: bool,
     pub host_name: Option<String>,
+    #[serde(default)]
+    pub suppress_local_environment: bool,
 }
 
 #[derive(Serialize, Deserialize)]
