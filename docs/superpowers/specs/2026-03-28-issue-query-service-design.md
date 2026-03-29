@@ -133,7 +133,11 @@ pub trait IssueQueryService: Send + Sync {
 
 A cursor tracks query parameters and accumulated results. For GitHub's stateless REST pagination, the cursor holds `(query_params, next_page_number, accumulated_items)`. Cursors expire after 5 minutes of inactivity.
 
-**Connection lifecycle.** When a client disconnects, all cursors owned by that connection are closed. The `Message::Hello` handshake already carries a `session_id: Uuid` — this identifies the connection for cursor ownership. The service implementation maps `session_id → Vec<CursorId>` and cleans up on disconnect.
+**Client handshake.** Today, only peers send `Message::Hello`; clients start with a bare `Request` and the server infers the connection type from the first message. This work adds a client `Hello` so that all connections identify themselves on connect. The client sends `Hello` with a `session_id: Uuid` (generated per connection), and the server acknowledges before RPCs begin. This unifies the handshake path and gives the server a stable client identity for cursor ownership, future per-client subscriptions, and diagnostics.
+
+`SocketDaemon` (in `flotilla-client`) sends `Hello` on connect. `InProcessDaemon` assigns a `session_id` internally when the TUI or CLI creates a handle.
+
+**Connection lifecycle.** When a client disconnects, all cursors owned by that connection are closed. The service maps `session_id → Vec<CursorId>` and cleans up on disconnect. The `session_id` is passed to the service when executing query commands.
 
 **Multiple clients, same repo.** Each client that opens the issues section gets its own default cursor and its own search cursor. There is no shared "default cursor" — warming (incremental refresh) runs per-cursor. If two TUI clients view the same repo's issues, they each hold independent cursors with independent pagination state.
 
@@ -283,8 +287,8 @@ Proper service-targeted routing (dispatching commands to the host that has the s
 `GitHubIssueQueryService` implements the trait. Internally:
 
 - Maintains a `HashMap<CursorId, CursorState>` and a `HashMap<Uuid, Vec<CursorId>>` (session → cursors) behind a mutex.
-- `CursorState` holds the owning session ID, query parameters, accumulated results, next page number, and last-accessed timestamp.
-- `open_query` creates a cursor tagged with the requesting session's ID. It does not fetch eagerly — the caller issues `fetch_page` when ready.
+- `CursorState` holds the owning `session_id`, query parameters, accumulated results, next page number, and last-accessed timestamp.
+- `open_query` creates a cursor tagged with the requesting client's `session_id`. It does not fetch eagerly — the caller issues `fetch_page` when ready.
 - `fetch_page` calls the GitHub REST API (`repos/{owner}/{repo}/issues` or `search/issues`) with the cursor's page number, appends results, advances the cursor.
 - A background sweep expires cursors inactive for 5 minutes.
 - On client disconnect, the daemon notifies the service with the disconnecting `session_id`; all cursors owned by that session are closed.
