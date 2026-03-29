@@ -86,7 +86,6 @@ struct FullEnvironmentInfo {
 
 #[derive(Debug, Deserialize)]
 struct EnvironmentRepo {
-    #[serde(default)]
     repository_full_name: Option<String>,
 }
 
@@ -503,7 +502,7 @@ impl super::CloudAgentService for CodexCodingAgent {
                         }
                     }
                     Err(e) => {
-                        debug!(provider = "codex", error = %e, "environment lookup failed, falling back to label match");
+                        debug!(provider = "codex", error = %e, "by-repo lookup failed, falling back to all-environments repo_map");
                         return self.fallback_via_all_environments(repo_slug, &auth).await;
                     }
                 }
