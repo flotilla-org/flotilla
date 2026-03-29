@@ -31,12 +31,13 @@ fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
         source_column(),
         col("Path", Constraint::Fill(1), |item, ctx| {
             let text = if let Some(hp) = item.checkout_key() {
-                let is_local = ctx.my_host.is_none() || ctx.my_host == Some(&hp.host);
+                let hp_host = hp.host_id().map(|h| flotilla_protocol::HostName::new(h.as_str()));
+                let is_local = ctx.my_host.is_none() || hp_host.as_ref() == ctx.my_host;
                 let (repo_root, home_dir) = if is_local {
                     (ctx.repo_root.to_path_buf(), dirs::home_dir())
                 } else {
-                    let root = ctx.host_repo_roots.get(&hp.host).cloned().unwrap_or_else(|| hp.path.clone());
-                    let home = ctx.host_home_dirs.get(&hp.host).map(|p| p.to_path_buf());
+                    let root = hp_host.as_ref().and_then(|h| ctx.host_repo_roots.get(h)).cloned().unwrap_or_else(|| hp.path.clone());
+                    let home = hp_host.as_ref().and_then(|h| ctx.host_home_dirs.get(h)).map(|p| p.to_path_buf());
                     (root, home)
                 };
                 let path_col_width = ctx.col_widths.get(2).copied().unwrap_or(40) as usize;

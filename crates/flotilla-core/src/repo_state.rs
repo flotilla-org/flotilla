@@ -334,17 +334,20 @@ mod tests {
         let mut state = make_repo_state();
 
         let mut new_providers = ProviderData::default();
-        new_providers.checkouts.insert(flotilla_protocol::HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")), Checkout {
-            branch: "feat".into(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-            environment_id: None,
-        });
+        new_providers.checkouts.insert(
+            flotilla_protocol::QualifiedPath::from_host_path(&HostName::new("host"), PathBuf::from("/tmp/co")),
+            Checkout {
+                branch: "feat".into(),
+                is_main: false,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                correlation_keys: vec![],
+                association_keys: vec![],
+                environment_id: None,
+            },
+        );
 
         let entry = state.record_delta(&new_providers, &HashMap::new(), &[], vec![]);
 
@@ -446,7 +449,7 @@ mod tests {
             let mut providers = ProviderData::default();
             // Change something each iteration so a delta is produced
             providers.checkouts.insert(
-                flotilla_protocol::HostPath::new(HostName::new("host"), PathBuf::from(format!("/tmp/co-{i}"))),
+                flotilla_protocol::QualifiedPath::from_host_path(&HostName::new("host"), PathBuf::from(format!("/tmp/co-{i}"))),
                 Checkout {
                     branch: format!("feat-{i}"),
                     is_main: false,
@@ -490,17 +493,20 @@ mod tests {
         let new_health = HashMap::from([("vcs".into(), HashMap::from([("git".into(), true)]))]);
         let new_errors = vec![ProviderError { category: "vcs".into(), provider: "git".into(), message: "oops".into() }];
         let mut new_providers = ProviderData::default();
-        new_providers.checkouts.insert(flotilla_protocol::HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")), Checkout {
-            branch: "feat".into(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
-            environment_id: None,
-        });
+        new_providers.checkouts.insert(
+            flotilla_protocol::QualifiedPath::from_host_path(&HostName::new("host"), PathBuf::from("/tmp/co")),
+            Checkout {
+                branch: "feat".into(),
+                is_main: false,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                correlation_keys: vec![],
+                association_keys: vec![],
+                environment_id: None,
+            },
+        );
 
         state.record_delta(&new_providers, &new_health, &new_errors, vec![]);
 

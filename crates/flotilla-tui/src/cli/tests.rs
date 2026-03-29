@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use flotilla_protocol::{
     snapshot::{WorkItem, WorkItemIdentity, WorkItemKind},
-    HostName, HostPath,
+    HostName, QualifiedPath,
 };
 
 fn health(entries: &[(&str, &str, bool)]) -> HashMap<String, HashMap<String, bool>> {
@@ -16,7 +16,7 @@ fn health(entries: &[(&str, &str, bool)]) -> HashMap<String, HashMap<String, boo
 fn make_work_item(kind: WorkItemKind, branch: Option<&str>, description: &str) -> WorkItem {
     WorkItem {
         kind,
-        identity: WorkItemIdentity::Checkout(HostPath::new(HostName::new("test"), PathBuf::from("/tmp/wt"))),
+        identity: WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::new("test"), PathBuf::from("/tmp/wt"))),
         host: HostName::new("test"),
         branch: branch.map(String::from),
         description: description.to_string(),
@@ -188,8 +188,8 @@ mod watch_human {
             work_items: (0..work_item_count)
                 .map(|i| WorkItem {
                     kind: WorkItemKind::Checkout,
-                    identity: WorkItemIdentity::Checkout(flotilla_protocol::HostPath::new(
-                        HostName::new("test"),
+                    identity: WorkItemIdentity::Checkout(flotilla_protocol::QualifiedPath::from_host_path(
+                        &HostName::new("test"),
                         PathBuf::from(format!("/tmp/wt{i}")),
                     )),
                     host: HostName::new("test"),

@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use flotilla_protocol::{CheckoutRef, HostName, HostPath, RepoInfo, RepoLabels, WorkItem, WorkItemIdentity, WorkItemKind};
+use flotilla_protocol::{CheckoutRef, HostName, QualifiedPath, RepoInfo, RepoLabels, WorkItem, WorkItemIdentity, WorkItemKind};
 
 pub fn bare_item() -> WorkItem {
     WorkItem {
@@ -51,14 +51,14 @@ pub fn issue_item(id: impl Into<String>) -> WorkItem {
 }
 
 pub fn checkout_item(branch: &str, path: &str, is_main: bool) -> WorkItem {
-    let host_path = HostPath::new(HostName::local(), PathBuf::from(path));
+    let qp = QualifiedPath::from_host_path(&HostName::local(), PathBuf::from(path));
     WorkItem {
         kind: WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(host_path.clone()),
+        identity: WorkItemIdentity::Checkout(qp.clone()),
         host: HostName::local(),
         branch: Some(branch.into()),
         description: format!("checkout {branch}"),
-        checkout: Some(CheckoutRef { key: host_path, is_main_checkout: is_main }),
+        checkout: Some(CheckoutRef { key: qp, is_main_checkout: is_main }),
         change_request_key: None,
         session_key: None,
         issue_keys: Vec::new(),

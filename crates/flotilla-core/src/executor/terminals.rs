@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use flotilla_protocol::{arg::Arg, HostName, HostPath, PreparedTerminalCommand, ResolvedPaneCommand};
+use flotilla_protocol::{arg::Arg, HostName, PreparedTerminalCommand, QualifiedPath, ResolvedPaneCommand};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -13,19 +13,19 @@ use crate::{
 pub(super) struct TerminalPreparationService<'a> {
     terminal_manager: &'a TerminalManager,
     daemon_socket_path: Option<&'a Path>,
+    host_name: &'a HostName,
 }
 
 impl<'a> TerminalPreparationService<'a> {
-    pub(super) fn new(terminal_manager: &'a TerminalManager, daemon_socket_path: Option<&'a Path>) -> Self {
-        Self { terminal_manager, daemon_socket_path }
+    pub(super) fn new(terminal_manager: &'a TerminalManager, daemon_socket_path: Option<&'a Path>, host_name: &'a HostName) -> Self {
+        Self { terminal_manager, daemon_socket_path, host_name }
     }
 
     pub(super) async fn resolve_workspace_commands(&self, config: &mut WorkspaceConfig) {
         let rendered = parse_workspace_template(config).render(&config.template_vars);
         info!(count = rendered.content.len(), "terminal manager: resolving content entries");
-        let host = HostName::local();
-        let checkout_path = HostPath::new(host.clone(), config.working_directory.clone().into_path_buf());
-        let set_id = match self.terminal_manager.allocate_set(host, checkout_path) {
+        let checkout_path = QualifiedPath::from_host_path(self.host_name, config.working_directory.clone().into_path_buf());
+        let set_id = match self.terminal_manager.allocate_set(self.host_name.clone(), checkout_path) {
             Ok(id) => id,
             Err(err) => {
                 warn!(err = %err, "failed to allocate terminal set");
@@ -86,9 +86,8 @@ impl<'a> TerminalPreparationService<'a> {
         workspace_config: impl FnOnce() -> WorkspaceConfig,
     ) -> Result<Vec<ResolvedPaneCommand>, String> {
         if !requested_commands.is_empty() {
-            let host = HostName::local();
-            let hp = HostPath::new(host.clone(), checkout_path.to_path_buf());
-            let set_id = self.terminal_manager.allocate_set(host, hp)?;
+            let hp = QualifiedPath::from_host_path(self.host_name, checkout_path.to_path_buf());
+            let set_id = self.terminal_manager.allocate_set(self.host_name.clone(), hp)?;
             let socket_str = self.daemon_socket_path.map(|p| p.display().to_string());
 
             let mut resolved = Vec::new();

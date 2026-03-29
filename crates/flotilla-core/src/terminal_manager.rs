@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use flotilla_protocol::{arg, AttachableId, AttachableSet, AttachableSetId, HostName, HostPath, TerminalStatus};
+use flotilla_protocol::{arg, AttachableId, AttachableSet, AttachableSetId, HostName, QualifiedPath, TerminalStatus};
 use tracing::warn;
 
 use crate::{
@@ -48,9 +48,9 @@ impl TerminalManager {
     }
 
     /// Returns the existing `AttachableSet` for the given checkout, or creates a new one.
-    pub fn allocate_set(&self, host: HostName, checkout_path: HostPath) -> Result<AttachableSetId, String> {
+    pub fn allocate_set(&self, host: HostName, checkout_path: QualifiedPath) -> Result<AttachableSetId, String> {
         let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
-        let existing = store.sets_for_checkout(&checkout_path);
+        let existing = store.sets_for_checkout(&checkout_path, None);
         if let Some(id) = existing.into_iter().next() {
             return Ok(id);
         }
@@ -254,14 +254,22 @@ impl TerminalManager {
 
     /// Removes all sets matching the given checkout paths and kills their sessions.
     /// Session kill failures are logged but do not cause the overall operation to fail.
-    pub async fn cascade_delete(&self, checkout_paths: &[HostPath]) -> Result<(), String> {
+    pub async fn cascade_delete(&self, checkout_paths: &[QualifiedPath]) -> Result<(), String> {
         let attachable_ids_to_kill = {
             let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let mut ids_to_kill = Vec::new();
 
             let mut any_removed = false;
             for checkout in checkout_paths {
-                let set_ids = store.sets_for_checkout(checkout);
+                // Collect all sets for this checkout regardless of environment_id,
+                // since removing a checkout should clean up all associated environments.
+                let set_ids: Vec<_> = store
+                    .registry()
+                    .sets
+                    .values()
+                    .filter(|set| set.checkout.as_ref() == Some(checkout))
+                    .map(|set| set.id.clone())
+                    .collect();
                 for set_id in set_ids {
                     if let Some(set) = store.registry().sets.get(&set_id) {
                         ids_to_kill.extend(set.members.iter().cloned());

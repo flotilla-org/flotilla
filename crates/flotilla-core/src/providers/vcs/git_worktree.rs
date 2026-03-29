@@ -30,13 +30,14 @@ pub struct GitCheckoutManager {
     checkout_path: String,
     env: minijinja::Environment<'static>,
     runner: Arc<dyn CommandRunner>,
+    host_name: flotilla_protocol::HostName,
 }
 
 impl GitCheckoutManager {
-    pub fn new(checkout_path: String, runner: Arc<dyn CommandRunner>) -> Self {
+    pub fn new(checkout_path: String, runner: Arc<dyn CommandRunner>, host_name: flotilla_protocol::HostName) -> Self {
         let mut env = minijinja::Environment::new();
         env.add_filter("sanitize", |value: String| -> String { value.replace(['/', '\\'], "-") });
-        Self { checkout_path, env, runner }
+        Self { checkout_path, env, runner, host_name }
     }
 
     /// Render the worktree path template for a given repo and branch.
@@ -127,8 +128,8 @@ impl GitCheckoutManager {
         is_main: bool,
         default_branch: &str,
     ) -> (ExecutionEnvironmentPath, Checkout) {
-        let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), path.as_path());
-        let correlation_keys = vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(host_path)];
+        let qp = flotilla_protocol::QualifiedPath::from_host_path(&self.host_name, path.as_path());
+        let correlation_keys = vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(qp)];
 
         let trunk_ref = format!("HEAD...{default_branch}");
         let remote_ref = format!("HEAD...origin/{branch}");
@@ -363,7 +364,7 @@ branch refs/heads/feature
     fn render_worktree_path_default_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
         let checkout_path = crate::config::default_checkout_path();
-        let mgr = GitCheckoutManager::new(checkout_path, runner);
+        let mgr = GitCheckoutManager::new(checkout_path, runner, flotilla_protocol::HostName::new("test-host"));
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(&repo, "feature/my-branch").unwrap();
@@ -373,7 +374,11 @@ branch refs/heads/feature
     #[test]
     fn render_worktree_path_absolute_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
-        let mgr = GitCheckoutManager::new("/tmp/worktrees/{{ repo }}.{{ branch | sanitize }}".to_string(), runner);
+        let mgr = GitCheckoutManager::new(
+            "/tmp/worktrees/{{ repo }}.{{ branch | sanitize }}".to_string(),
+            runner,
+            flotilla_protocol::HostName::new("test-host"),
+        );
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(&repo, "fix\\backslash").unwrap();
@@ -383,7 +388,8 @@ branch refs/heads/feature
     #[test]
     fn render_worktree_path_relative_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
-        let mgr = GitCheckoutManager::new("worktrees/{{ branch | sanitize }}".to_string(), runner);
+        let mgr =
+            GitCheckoutManager::new("worktrees/{{ branch | sanitize }}".to_string(), runner, flotilla_protocol::HostName::new("test-host"));
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(&repo, "dev/thing").unwrap();
@@ -411,7 +417,7 @@ branch refs/heads/feature
         let runner = replay::test_runner(&session);
 
         let checkout_path = crate::config::default_checkout_path();
-        let mgr = GitCheckoutManager::new(checkout_path, runner.clone());
+        let mgr = GitCheckoutManager::new(checkout_path, runner.clone(), flotilla_protocol::HostName::new("test-host"));
 
         checkout_test_support::assert_checkout_tracks_remote_branch(&mgr, &runner, &repo_path).await;
 
