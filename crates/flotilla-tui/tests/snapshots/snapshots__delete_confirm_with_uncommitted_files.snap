@@ -1,35 +1,34 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 375
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                       ┌ Remove Worktree ─────────────────────────────────────────────────────┐                       │
-│                       │Branch: feat-wip                                                      │                       │
-│                       │                                                                      │                       │
-│                       │PR: OPEN                                                              │                       │
-│                       │                                                                      │                       │
-│                       │⚠ 3 uncommitted file(s):                                              │                       │
-│                       │M src/main.rs                                                         │                       │
-│                       │M src/lib.rs                                                          │                       │
-│                       │?? TODO.txt                                                           │                       │
-│                       │⚠ 1 unpushed commit(s):                                               │                       │
-│                       │abc1234 work in progress                                              │                       │
-│                       │                                                                      │                       │
-│                       │y/Enter: confirm    n/Esc: cancel                                     │                       │
-│                       │                                                                      │                       │
-│                       └──────────────────────────────────────────────────────────────────────┘                       │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+                                                                    ⚙   ┌ Preview ─────────────────────────────────────┐
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                        ┌ Remove Worktree ─────────────────────────────────────────────────────┐                       │
+                        │Branch: feat-wip                                                      │                       │
+                        │                                                                      │                       │
+                        │PR: OPEN                                                              │                       │
+                        │                                                                      │                       │
+                        │⚠ 3 uncommitted file(s):                                              │                       │
+                        │M src/main.rs                                                         │                       │
+                        │M src/lib.rs                                                          │                       │
+                        │?? TODO.txt                                                           │                       │
+                        │⚠ 1 unpushed commit(s):                                               │                       │
+                        │abc1234 work in progress                                              │                       │
+                        │                                                                      │                       │
+                        │y/Enter: confirm    n/Esc: cancel                                     │                       │
+                        │                                                                      │                       │
+                        └──────────────────────────────────────────────────────────────────────┘                       │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
 CONFIRM DELETE               <y> YES  <n> NO 

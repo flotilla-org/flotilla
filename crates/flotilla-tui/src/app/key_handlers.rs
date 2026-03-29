@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_core::data::GroupEntry;
 use flotilla_protocol::{Command, CommandAction, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent};
@@ -158,14 +157,14 @@ impl App {
             return None;
         }
         let identity = &self.model.repo_order[self.model.active_repo];
-        self.screen.repo_pages.get(identity).and_then(|page| page.table.selected_selectable_idx)
+        self.screen.repo_pages.get(identity).and_then(|page| page.table.selected_flat_index())
     }
 
     // ── Private helpers ──
 
     /// Check if the current selection is near the bottom and fetch more issues.
     ///
-    /// The WorkItemTable widget handles selection changes but can't mutate
+    /// The SplitTable widget handles selection changes but can't mutate
     /// `model.repos` (to set `issue_fetch_pending`). This post-dispatch check
     /// runs after every key event to trigger infinite scroll when needed.
     fn check_infinite_scroll(&mut self) {
@@ -176,10 +175,10 @@ impl App {
         let Some(page) = self.screen.repo_pages.get(identity) else {
             return;
         };
-        let Some(next) = page.table.selected_selectable_idx else {
+        let Some(next) = page.table.selected_flat_index() else {
             return;
         };
-        let total = page.table.grouped_items.selectable_indices.len();
+        let total = page.table.total_item_count();
         if next + 5 >= total && self.model.active().issue_has_more && !self.model.active().issue_fetch_pending {
             let repo = self.model.active_repo_root().clone();
             let issue_count = self.model.active().providers.issues.len();
@@ -224,11 +223,9 @@ impl App {
         let mut all_issue_keys: Vec<String> = Vec::new();
 
         // Collect issues from multi-selected items
-        for entry in &page.table.grouped_items.table_entries {
-            if let GroupEntry::Item(item) = entry {
-                if multi_selected.contains(&item.identity) {
-                    all_issue_keys.extend(item.issue_keys.iter().cloned());
-                }
+        for item in page.table.all_items() {
+            if multi_selected.contains(&item.identity) {
+                all_issue_keys.extend(item.issue_keys.iter().cloned());
             }
         }
 
