@@ -133,11 +133,41 @@ pub trait IssueQueryService: Send + Sync {
 
 A cursor tracks query parameters and accumulated results. For GitHub's stateless REST pagination, the cursor holds `(query_params, next_page_number, accumulated_items)`. Cursors expire after 5 minutes of inactivity.
 
-**Client handshake.** Today, only peers send `Message::Hello`; clients start with a bare `Request` and the server infers the connection type from the first message. This work adds a client `Hello` so that all connections identify themselves on connect. The client sends `Hello` with a `session_id: Uuid` (generated per connection), and the server acknowledges before RPCs begin. This unifies the handshake path and gives the server a stable client identity for cursor ownership, future per-client subscriptions, and diagnostics.
+**Client handshake.** Today, only peers send `Message::Hello`; clients start with a bare `Request` and the server infers the connection type from the first message. This work keeps the fast bare-request path for stateless clients, but adds an explicit client handshake for stateful client features:
 
-`SocketDaemon` (in `flotilla-client`) sends `Hello` on connect. `InProcessDaemon` assigns a `session_id` internally when the TUI or CLI creates a handle.
+```rust
+pub enum ConnectionRole {
+    Client,
+    Peer,
+}
 
-**Connection lifecycle.** When a client disconnects, all cursors owned by that connection are closed. The service maps `session_id → Vec<CursorId>` and cleans up on disconnect. The `session_id` is passed to the service when executing query commands.
+pub enum Message {
+    Hello {
+        protocol_version: u32,
+        host_name: HostName,
+        session_id: Uuid,
+        connection_role: ConnectionRole,
+        environment_id: Option<EnvironmentId>,
+    },
+    // ...
+}
+```
+
+Peer transports send `Hello { connection_role: Peer, ... }` and must complete the handshake before exchanging peer envelopes.
+
+Clients have two supported modes:
+
+- **Stateful client mode.** Send `Hello { connection_role: Client, ... }`, receive the server's `Hello`, then enter the normal RPC loop. This gives the connection a stable `session_id` and enables features that require per-client identity, such as issue query cursors, directed query responses, future per-client subscriptions, and disconnect cleanup.
+- **Stateless client mode.** Send a bare `Request` as the first frame and use the connection for ordinary request/response RPCs only. These clients have no durable server-side identity and cannot use features that require cursor ownership or other per-client state.
+
+After `Hello`, the server validates the handshake, then branches on `connection_role`:
+
+- `Client` enters the normal RPC loop (`ClientConnection`) and may send `Request` messages after the handshake completes.
+- `Peer` enters the peer runtime (`PeerConnection`) and may send peer envelopes after the handshake completes.
+
+This removes the ambiguity for handshaken connections while preserving the current fast path for single-request clients. `SocketDaemon` (in `flotilla-client`) sends `Hello { connection_role: Client, ... }` when it needs stateful features. Lightweight callers such as agent hooks may continue using a bare `Request` if they only need simple RPC semantics. Peer transports send `Hello { connection_role: Peer, ... }`. `InProcessDaemon` assigns a `session_id` internally when the TUI or CLI creates a handle.
+
+**Connection lifecycle.** When a stateful client disconnects, all cursors owned by that connection are closed. The service maps `session_id → Vec<CursorId>` and cleans up on disconnect. The `session_id` from the client `Hello` is passed to the service when executing query commands. Stateless bare-request clients do not receive cursor-backed features and therefore do not participate in this lifecycle.
 
 **Multiple clients, same repo.** Each client that opens the issues section gets its own default cursor and its own search cursor. There is no shared "default cursor" — warming (incremental refresh) runs per-cursor. If two TUI clients view the same repo's issues, they each hold independent cursors with independent pagination state.
 
@@ -231,6 +261,8 @@ pub enum Response {
 
 The server returns `Response::QueryResult` to the requesting connection instead of broadcasting `CommandFinished`. The `command_id` is included so the client can correlate with in-flight tracking. Non-query commands continue to use `CommandFinished` broadcast as before.
 
+Connection setup also changes: peers still require `Message::Hello` first, while clients may either handshake (`Hello { connection_role: Client, ... }`) for stateful features or begin with a bare `Request` for stateless RPC-only use. For handshaken connections, the server routes post-handshake by `connection_role`.
+
 **`DaemonHandle` trait.** Add an `execute_query()` method that returns the `CommandValue` directly:
 
 ```rust
@@ -241,7 +273,14 @@ For `InProcessDaemon`, this calls the executor and returns the result without br
 
 The existing `execute()` method and `CommandFinished` broadcast remain for non-query commands.
 
-**Server dispatch** (`client_connection.rs`). When handling `Request::Execute` where `command.action.is_query()`:
+**Server dispatch** (`server.rs`, `client_connection.rs`). On accept, the server handles two valid first frames on the main socket:
+
+- `Hello { connection_role: Peer, ... }` or `Hello { connection_role: Client, ... }`: validate, send the server's `Hello`, then dispatch by `connection_role`.
+- `Request { ... }`: treat the connection as a stateless client and enter the normal request/response loop without assigning a durable client identity.
+
+Commands that require per-client identity, such as issue query cursors, must reject stateless clients with a clear error such as `client handshake required for this operation`.
+
+When `ClientConnection` handles `Request::Execute` where `command.action.is_query()`:
 
 1. Execute the command.
 2. Send `Message::Response { id, Response::QueryResult { command_id, value } }` to the requesting connection.
