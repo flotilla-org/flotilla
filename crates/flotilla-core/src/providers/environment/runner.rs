@@ -43,10 +43,13 @@ impl CommandRunner for EnvironmentRunner {
         let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
         let path_str = path.to_string_lossy();
         // Use printf with %s to avoid echo's backslash interpretation.
-        // Content is passed as a shell argument — single-quote it and escape
-        // embedded single quotes with the '\'' idiom.
-        let escaped = content.replace('\'', "'\\''");
-        let script = format!("mkdir -p '{parent}' && printf '%s' '{escaped}' > '{path_str}'");
+        // All interpolated values are single-quoted with embedded single
+        // quotes escaped via the '\'' idiom.
+        let escape = |s: &str| s.replace('\'', "'\\''");
+        let escaped_parent = escape(&parent);
+        let escaped_path = escape(&path_str);
+        let escaped_content = escape(content);
+        let script = format!("mkdir -p '{escaped_parent}' && printf '%s' '{escaped_content}' > '{escaped_path}'");
         let docker_args = vec!["exec", &self.container_name, "sh", "-c", &script];
         self.inner.run("docker", &docker_args, Path::new("/"), &ChannelLabel::Noop).await.map(|_| ())
     }

@@ -22,7 +22,7 @@ async fn ensure_file(&self, path: &Path, content: &str) -> Result<(), String>;
 
 **`EnvironmentRunner` (Docker/remote):** Delegates to the inner runner: `sh -c "mkdir -p '<parent>' && printf '%s' '<content>' > '<path>'"`.
 
-**`MockRunner` (tests):** Records the call (path + content) for assertion. Succeeds by default.
+**`MockRunner` (tests):** Inherits the trait's default no-op (returns `Ok(())`). No recording needed — current tests don't assert on `ensure_file` calls.
 
 **Replay:** Recorded as a `command` channel interaction, like any other runner call.
 
