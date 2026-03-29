@@ -3,9 +3,7 @@ use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
 
 use crate::{
-    path_context::ExecutionEnvironmentPath,
-    provider_data::ProviderData,
-    providers::registry::ProviderRegistry,
+    path_context::ExecutionEnvironmentPath, provider_data::ProviderData, providers::registry::ProviderRegistry,
     terminal_manager::TerminalManager,
 };
 

@@ -35,12 +35,12 @@ pub trait Vcs: Send + Sync {
 
 #[async_trait]
 pub trait CheckoutManager: Send + Sync {
-    async fn validate_target(
-        &self,
-        repo_root: &ExecutionEnvironmentPath,
-        branch: &str,
-        intent: CheckoutIntent,
-    ) -> Result<(), String>;
+    /// Validate whether this checkout manager can satisfy the requested branch intent.
+    ///
+    /// For ambient checkout flows the executor calls this before `create_checkout`.
+    /// Managers used in constructed environments may need to call it from
+    /// `create_checkout` themselves when bootstrap/discovery bypasses that outer preflight.
+    async fn validate_target(&self, repo_root: &ExecutionEnvironmentPath, branch: &str, intent: CheckoutIntent) -> Result<(), String>;
     async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
     async fn create_checkout(
         &self,
@@ -127,7 +127,7 @@ pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
 
 /// Read issue links from git config for a specific branch.
 /// Returns empty vec if no links or on error (non-fatal).
-pub async fn read_branch_issue_links(repo_root: &Path, branch: &str, runner: &dyn CommandRunner) -> Vec<AssociationKey> {
+pub(crate) async fn read_branch_issue_links(repo_root: &Path, branch: &str, runner: &dyn CommandRunner) -> Vec<AssociationKey> {
     let pattern = format!("branch\\.{}\\.flotilla\\.issues\\.", regex_escape_branch(branch));
     let result = run!(runner, "git", &["config", "--get-regexp", &pattern], repo_root);
     match result {
@@ -138,7 +138,7 @@ pub async fn read_branch_issue_links(repo_root: &Path, branch: &str, runner: &dy
 
 /// Write issue links to git config for a specific branch.
 /// Errors are logged and ignored because issue linking is best-effort metadata.
-pub async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
+pub(crate) async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
     use std::collections::HashMap;
 
     let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -180,7 +180,7 @@ async fn validate_checkout_target_with_prefix(
     }
 }
 
-pub async fn validate_checkout_target_in_repo(
+pub(crate) async fn validate_checkout_target_in_repo(
     repo_root: &Path,
     branch: &str,
     intent: CheckoutIntent,
@@ -189,13 +189,14 @@ pub async fn validate_checkout_target_in_repo(
     validate_checkout_target_with_prefix(repo_root, &[], branch, intent, runner).await
 }
 
-pub async fn validate_checkout_target_in_git_dir(
-    git_dir: &str,
+pub(crate) async fn validate_checkout_target_in_git_dir(
+    git_dir: &Path,
     cwd: &Path,
     branch: &str,
     intent: CheckoutIntent,
     runner: &dyn CommandRunner,
 ) -> Result<(), String> {
+    let git_dir = git_dir.to_str().ok_or_else(|| "git dir path is not valid UTF-8".to_string())?;
     validate_checkout_target_with_prefix(cwd, &["--git-dir", git_dir], branch, intent, runner).await
 }
 
@@ -285,13 +286,11 @@ mod tests {
         write_branch_issue_links(Path::new("/repo"), "feat-x", &issue_ids, &runner).await;
 
         assert_eq!(runner.remaining(), 0, "single provider should consume exactly 1 response");
-        assert_eq!(
-            runner.calls(),
-            vec![(
-                "git".to_string(),
-                vec!["config".to_string(), "branch.feat-x.flotilla.issues.github".to_string(), "10,20".to_string()],
-            )]
-        );
+        assert_eq!(runner.calls(), vec![("git".to_string(), vec![
+            "config".to_string(),
+            "branch.feat-x.flotilla.issues.github".to_string(),
+            "10,20".to_string()
+        ],)]);
     }
 
     #[tokio::test]

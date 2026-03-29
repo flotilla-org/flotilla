@@ -86,12 +86,7 @@ impl MockCheckoutManager {
 
 #[async_trait]
 impl CheckoutManager for MockCheckoutManager {
-    async fn validate_target(
-        &self,
-        _repo_root: &ExecutionEnvironmentPath,
-        _branch: &str,
-        _intent: CheckoutIntent,
-    ) -> Result<(), String> {
+    async fn validate_target(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str, _intent: CheckoutIntent) -> Result<(), String> {
         self.validate_result.lock().await.take().expect("validate_target called more than expected")
     }
 

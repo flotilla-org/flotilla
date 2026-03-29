@@ -59,8 +59,8 @@ impl super::CheckoutManager for CloneCheckoutManager {
         branch: &str,
         intent: flotilla_protocol::CheckoutIntent,
     ) -> Result<(), String> {
-        let ref_dir = self.ref_dir_str()?;
-        super::validate_checkout_target_in_git_dir(ref_dir, std::path::Path::new("/"), branch, intent, &*self.runner).await
+        super::validate_checkout_target_in_git_dir(self.reference_dir.as_path(), std::path::Path::new("/"), branch, intent, &*self.runner)
+            .await
     }
 
     async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
@@ -420,10 +420,8 @@ mod tests {
         let checkout_dir = workspace_root.join("my-feature");
         assert!(checkout_dir.join("README.md").exists(), "fresh branch checkout should populate the working tree");
 
-        let status = runner
-            .run("git", &["status", "--short"], &checkout_dir, &ChannelLabel::Noop)
-            .await
-            .expect("git status should succeed");
+        let status =
+            runner.run("git", &["status", "--short"], &checkout_dir, &ChannelLabel::Noop).await.expect("git status should succeed");
         assert!(status.trim().is_empty(), "fresh branch checkout should be clean, got: {status:?}");
     }
 
