@@ -1113,6 +1113,33 @@ async fn remove_checkout_resolves_for_remote_host() {
     );
 }
 
+#[tokio::test]
+async fn remove_checkout_disambiguates_by_target_host() {
+    // Same branch on two hosts — command.host should disambiguate
+    let local = hp("/repo/wt-feat");
+    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat"));
+    let mut data = empty_data();
+    data.checkouts.insert(local, TestCheckout::new("feat").build());
+    data.checkouts.insert(remote, TestCheckout::new("feat").build());
+
+    let config_base = config_base();
+    let plan = build_plan(
+        command_with_host("remote-box", remove_checkout_action("feat")),
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(empty_registry()),
+        Arc::new(data),
+        config_base.clone(),
+        test_attachable_store(&config_base),
+        None,
+        local_host(),
+    )
+    .await;
+
+    let plan = plan.expect("build_plan should not be ambiguous when command.host disambiguates");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("remote-box")));
+}
+
 // -----------------------------------------------------------------------
 // Tests: RemoveCheckout — terminal cleanup
 // -----------------------------------------------------------------------
