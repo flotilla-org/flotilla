@@ -5,6 +5,7 @@ pub mod environment;
 pub mod framing;
 mod host;
 mod host_summary;
+pub mod qualified_path;
 pub mod output;
 pub mod path_context;
 pub mod peer;
