@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CorrelationKey, HostName, HostPath, ProvisioningTarget,
+    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CorrelationKey, HostName, ProvisioningTarget, QualifiedPath,
     RepoLabels, RepoSelector,
 };
 
@@ -386,8 +386,10 @@ fn resolve_create_workspace_on_remote_checkout_routes_single_command_to_remote_h
     insert_local_host(&mut app.model, &HostName::local().to_string());
     let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
     item.host = HostName::new("remote-a");
-    item.checkout =
-        Some(CheckoutRef { key: HostPath::new(HostName::new("remote-a"), PathBuf::from("/remote/feat-x")), is_main_checkout: false });
+    item.checkout = Some(CheckoutRef {
+        key: QualifiedPath::from_host_path(&HostName::new("remote-a"), PathBuf::from("/remote/feat-x")),
+        is_main_checkout: false,
+    });
 
     let cmd = Intent::CreateWorkspace.resolve(&item, &app).unwrap();
 
@@ -437,8 +439,10 @@ fn resolve_remove_worktree_none_for_non_checkout_kind() {
     let app = stub_app();
     let mut item = pr_item("42");
     // Even with a checkout path, the kind check prevents resolve
-    item.checkout =
-        Some(CheckoutRef { key: HostPath::new(HostName::new("test-host"), PathBuf::from("/tmp/pr-co")), is_main_checkout: false });
+    item.checkout = Some(CheckoutRef {
+        key: QualifiedPath::from_host_path(&HostName::new("test-host"), PathBuf::from("/tmp/pr-co")),
+        is_main_checkout: false,
+    });
     assert!(Intent::RemoveCheckout.resolve(&item, &app).is_none());
 }
 
@@ -634,7 +638,10 @@ fn resolve_open_issue_none_without_issues() {
 fn resolve_teleport_session() {
     let app = stub_app();
     let mut item = session_item("sess-42");
-    item.checkout = Some(CheckoutRef { key: HostPath::new(HostName::new("test-host"), PathBuf::from("/tmp/co")), is_main_checkout: false });
+    item.checkout = Some(CheckoutRef {
+        key: QualifiedPath::from_host_path(&HostName::new("test-host"), PathBuf::from("/tmp/co")),
+        is_main_checkout: false,
+    });
     let cmd = Intent::TeleportSession.resolve(&item, &app);
     assert!(cmd.is_some());
     match cmd.unwrap() {
@@ -727,7 +734,7 @@ fn app_with_pr_and_issues(checkout_issue_ids: &[&str]) -> App {
         provider_name: String::new(),
         provider_display_name: String::new(),
     });
-    let co_path = HostPath::new(HostName::local(), PathBuf::from("/tmp/feat-x"));
+    let co_path = QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/tmp/feat-x"));
     providers.checkouts.insert(co_path.clone(), Checkout {
         branch: "feat/x".into(),
         is_main: false,
@@ -778,7 +785,7 @@ fn remote_only_app_with_providers() -> App {
 
     let mut app = remote_only_app();
     let remote_host = HostName::new("desktop");
-    let checkout_path = HostPath::new(remote_host.clone(), PathBuf::from("/srv/repo.feat-x"));
+    let checkout_path = QualifiedPath::from_host_path(&remote_host, PathBuf::from("/srv/repo.feat-x"));
 
     let mut providers = flotilla_protocol::ProviderData::default();
     providers.change_requests.insert("42".into(), ChangeRequest {
@@ -847,8 +854,10 @@ fn resolve_link_issues_to_pr_on_remote_only_repo_routes_to_remote_host_by_identi
 
     let mut item = checkout_item("feat/x", "/srv/repo.feat-x", false);
     item.host = HostName::new("desktop");
-    item.checkout =
-        Some(CheckoutRef { key: HostPath::new(HostName::new("desktop"), PathBuf::from("/srv/repo.feat-x")), is_main_checkout: false });
+    item.checkout = Some(CheckoutRef {
+        key: QualifiedPath::from_host_path(&HostName::new("desktop"), PathBuf::from("/srv/repo.feat-x")),
+        is_main_checkout: false,
+    });
     item.change_request_key = Some("42".into());
     item.issue_keys = vec!["10".into(), "20".into()];
 
@@ -978,7 +987,7 @@ fn teleport_session_with_branch_and_checkout() {
     let mut item = bare_item();
     item.session_key = Some("claude-1".into());
     item.branch = Some("feat".into());
-    item.checkout = Some(CheckoutRef { key: HostPath::new(HostName::local(), "/work/repo"), is_main_checkout: false });
+    item.checkout = Some(CheckoutRef { key: QualifiedPath::from_host_path(&HostName::local(), "/work/repo"), is_main_checkout: false });
     let noun = Intent::TeleportSession.to_noun_command(&item).expect("should produce noun");
     assert_eq!(noun.to_string(), "agent claude-1 teleport --branch feat --checkout /work/repo");
 }

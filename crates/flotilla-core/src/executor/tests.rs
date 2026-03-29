@@ -37,12 +37,16 @@ use async_trait::async_trait;
 use flotilla_protocol::{
     arg::Arg,
     test_support::{TestCheckout, TestIssue, TestSession},
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PreparedTerminalCommand, RepoSelector,
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, PreparedTerminalCommand, QualifiedPath, RepoSelector,
     ResolvedPaneCommand, TerminalStatus,
 };
 
-fn hp(path: &str) -> HostPath {
-    HostPath::new(HostName::local(), PathBuf::from(path))
+fn hp(path: &str) -> QualifiedPath {
+    QualifiedPath::from_host_path(&local_host(), PathBuf::from(path))
+}
+
+fn remote_host() -> HostName {
+    HostName::new("test-remote")
 }
 
 // -----------------------------------------------------------------------
@@ -308,7 +312,7 @@ fn command_with_host(host: &str, action: CommandAction) -> Command {
 }
 
 fn local_host() -> HostName {
-    HostName::local()
+    HostName::new("test-local")
 }
 
 fn repo_identity() -> flotilla_protocol::RepoIdentity {
@@ -495,7 +499,7 @@ async fn create_workspace_for_checkout_persists_workspace_binding() {
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
     let set = store.registry().sets.values().find(|set| set.id.as_str() == object_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), checkout_path)));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&local_host(), checkout_path)));
 }
 
 #[tokio::test]
@@ -536,7 +540,7 @@ async fn prepare_terminal_for_checkout_returns_terminal_commands() {
     match result {
         CommandValue::TerminalPrepared { repo_identity, target_host, branch, checkout_path, attachable_set_id, commands } => {
             assert_eq!(repo_identity, flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
-            assert_eq!(target_host, HostName::local());
+            assert_eq!(target_host, local_host());
             assert_eq!(branch, "feat");
             assert_eq!(checkout_path, path);
             assert!(attachable_set_id.is_some(), "prepare should allocate an attachable set");
@@ -557,11 +561,12 @@ async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present()
     let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     {
         let mut store = attachable_store.lock().expect("store lock");
-        let ensured_set_id = store.ensure_terminal_set(Some(local_host()), Some(HostPath::new(local_host(), path.clone())));
+        let ensured_set_id =
+            store.ensure_terminal_set(Some(local_host()), Some(QualifiedPath::from_host_path(&local_host(), path.clone())));
         store.save().expect("save attachable store");
         assert_eq!(
             store.registry().sets.get(&ensured_set_id).and_then(|set| set.checkout.clone()),
-            Some(HostPath::new(local_host(), path.clone()))
+            Some(QualifiedPath::from_host_path(&local_host(), path.clone()))
         );
     }
 
@@ -614,7 +619,7 @@ async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
 
     let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
     let set = store.registry().sets.get(&set_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), path)));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&local_host(), path)));
     assert!(temp.path().join("attachables").join("registry.json").exists(), "registry should be written");
 }
 
@@ -745,7 +750,7 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
         .expect("workspace binding should exist");
     assert_eq!(object_id, set_id.as_str());
     let set = store.registry().sets.get(&set_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(HostName::new("desktop"), PathBuf::from("/remote/feat"))));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&HostName::new("desktop"), PathBuf::from("/remote/feat"))));
 }
 
 #[tokio::test]
@@ -766,7 +771,7 @@ async fn create_workspace_for_checkout_selects_existing_workspace() {
     {
         let mut store = attachable_store.lock().expect("lock store");
         let host = local_host();
-        let checkout = HostPath::new(host.clone(), PathBuf::from("/repo/wt-feat"));
+        let checkout = QualifiedPath::from_host_path(&host, PathBuf::from("/repo/wt-feat"));
         let set_id = store.ensure_terminal_set(Some(host), Some(checkout));
         store.replace_binding(ProviderBinding {
             provider_category: "workspace_manager".into(),
@@ -937,7 +942,7 @@ async fn teleport_session_persists_workspace_binding() {
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
     let set = store.registry().sets.values().find(|set| set.id.as_str() == object_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), PathBuf::from("/repo/wt-feat"))));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&local_host(), PathBuf::from("/repo/wt-feat"))));
 }
 // -----------------------------------------------------------------------
 // Tests: SelectWorkspace
@@ -1094,7 +1099,7 @@ async fn remove_checkout_failure() {
 #[tokio::test]
 async fn remove_checkout_resolves_for_remote_host() {
     let remote = HostName::new("remote-box");
-    let remote_hp = HostPath::new(remote.clone(), PathBuf::from("/repo/wt-feat"));
+    let remote_hp = QualifiedPath::from_host_path(&remote, PathBuf::from("/repo/wt-feat"));
     let mut data = empty_data();
     data.checkouts.insert(remote_hp, TestCheckout::new("feat").build());
 
@@ -1124,7 +1129,7 @@ async fn remove_checkout_resolves_for_remote_host() {
 async fn remove_checkout_disambiguates_by_target_host() {
     // Same branch on two hosts — command.host should disambiguate
     let local = hp("/repo/wt-feat");
-    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat"));
+    let remote = QualifiedPath::from_host_path(&HostName::new("remote-box"), PathBuf::from("/repo/wt-feat"));
     let mut data = empty_data();
     data.checkouts.insert(local, TestCheckout::new("feat").build());
     data.checkouts.insert(remote, TestCheckout::new("feat").build());
@@ -1845,7 +1850,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
     // Pre-populate the store with a set and members
     {
         let mut store = attachable_store.lock().expect("lock store");
-        let checkout_path = HostPath::new(host.clone(), "/repo/wt-feat-x");
+        let checkout_path = QualifiedPath::from_host_path(&host, "/repo/wt-feat-x");
         let set_id = store.ensure_terminal_set(Some(host.clone()), Some(checkout_path));
         store.ensure_terminal_attachable(
             &set_id,
@@ -1926,7 +1931,7 @@ async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
     let data = empty_data();
 
     let plan = build_plan(
-        command_with_host("feta", fresh_checkout_action("feat-x")),
+        command_with_host(remote_host().as_str(), fresh_checkout_action("feat-x")),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::new(registry),
         Arc::new(data),
@@ -1939,9 +1944,9 @@ async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 3);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::new("feta")));
-    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(remote_host()));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(remote_host()));
+    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(local_host()));
 }
 
 #[tokio::test]
@@ -1951,7 +1956,7 @@ async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
 
     let plan = build_plan(
-        command_with_host("feta", CommandAction::Checkout {
+        command_with_host(remote_host().as_str(), CommandAction::Checkout {
             repo: repo_selector(),
             target: CheckoutTarget::FreshBranch("feat-x".to_string()),
             issue_ids: vec![("github".into(), "123".into())],
@@ -1968,12 +1973,12 @@ async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 4);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::new("feta")));
-    assert_eq!(plan.steps[2].description, "Prepare workspace for feat-x@feta");
-    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::new("feta")));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(remote_host()));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(remote_host()));
+    assert_eq!(plan.steps[2].description, format!("Prepare workspace for feat-x@{}", remote_host()));
+    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(remote_host()));
     assert_eq!(plan.steps[3].description, "Attach workspace");
-    assert_eq!(plan.steps[3].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[3].host, StepExecutionContext::Host(local_host()));
 }
 
 #[tokio::test]
@@ -1998,9 +2003,9 @@ async fn build_plan_create_checkout_treats_local_host_as_local() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 3);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::local()));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
-    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(local_host()));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local_host()));
+    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(local_host()));
 }
 
 #[tokio::test]
@@ -2053,7 +2058,7 @@ async fn build_plan_prepare_terminal_uses_command_host_for_terminal_step() {
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat").build());
 
     let plan = build_plan(
-        command_with_host("feta", CommandAction::PrepareTerminalForCheckout { checkout_path: path, commands: vec![] }),
+        command_with_host(remote_host().as_str(), CommandAction::PrepareTerminalForCheckout { checkout_path: path, commands: vec![] }),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::new(registry),
         Arc::new(data),
@@ -2066,7 +2071,7 @@ async fn build_plan_prepare_terminal_uses_command_host_for_terminal_step() {
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(remote_host()));
 }
 
 #[tokio::test]
@@ -2090,13 +2095,13 @@ async fn build_plan_create_workspace_for_checkout_uses_prepare_and_attach_steps_
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(local_host()));
     assert!(matches!(
         plan.steps[0].action,
         StepAction::PrepareWorkspace { ref checkout_path, ref label }
             if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat"
     ));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local_host()));
     assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
 }
 
@@ -2105,10 +2110,13 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
     let registry = empty_registry();
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(HostPath::new(HostName::new("feta"), path.clone()), TestCheckout::new("feat").build());
+    data.checkouts.insert(QualifiedPath::from_host_path(&remote_host(), path.clone()), TestCheckout::new("feat").build());
 
     let plan = build_plan(
-        command_with_host("feta", CommandAction::CreateWorkspaceForCheckout { checkout_path: path.clone(), label: "feat".into() }),
+        command_with_host(remote_host().as_str(), CommandAction::CreateWorkspaceForCheckout {
+            checkout_path: path.clone(),
+            label: "feat".into(),
+        }),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::new(registry),
         Arc::new(data),
@@ -2121,13 +2129,13 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
     .expect("build plan");
 
     assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(remote_host()));
     assert!(matches!(
         plan.steps[0].action,
         StepAction::PrepareWorkspace { ref checkout_path, ref label }
-            if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat@feta"
+            if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == &format!("feat@{}", remote_host())
     ));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local_host()));
     assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
 }
 
@@ -2443,9 +2451,9 @@ async fn build_plan_with_environment_prepends_lifecycle_steps() {
     let data = empty_data();
 
     let cmd = Command {
-        host: Some(HostName::new("feta")),
+        host: Some(remote_host()),
         provisioning_target: Some(flotilla_protocol::ProvisioningTarget::NewEnvironment {
-            host: HostName::new("feta"),
+            host: remote_host(),
             provider: "docker".to_string(),
         }),
         context_repo: Some(repo_selector()),
@@ -2482,18 +2490,18 @@ async fn build_plan_with_environment_prepends_lifecycle_steps() {
     assert!(matches!(plan.steps[6].action, StepAction::AttachWorkspace));
 
     // Verify host assignments — steps 0-3: Host(feta)
-    assert_eq!(*plan.steps[0].host.host_name(), HostName::new("feta"));
-    assert_eq!(*plan.steps[1].host.host_name(), HostName::new("feta"));
-    assert_eq!(*plan.steps[2].host.host_name(), HostName::new("feta"));
-    assert_eq!(*plan.steps[3].host.host_name(), HostName::new("feta"));
+    assert_eq!(*plan.steps[0].host.host_name(), remote_host());
+    assert_eq!(*plan.steps[1].host.host_name(), remote_host());
+    assert_eq!(*plan.steps[2].host.host_name(), remote_host());
+    assert_eq!(*plan.steps[3].host.host_name(), remote_host());
     assert!(matches!(&plan.steps[0].host, StepExecutionContext::Host(_)));
     assert!(matches!(&plan.steps[1].host, StepExecutionContext::Host(_)));
     assert!(matches!(&plan.steps[2].host, StepExecutionContext::Host(_)));
     assert!(matches!(&plan.steps[3].host, StepExecutionContext::Host(_)));
 
     // Steps 4-5: Environment(feta, env_id)
-    assert!(matches!(&plan.steps[4].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
-    assert!(matches!(&plan.steps[5].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
+    assert!(matches!(&plan.steps[4].host, StepExecutionContext::Environment(h, _) if *h == remote_host()));
+    assert!(matches!(&plan.steps[5].host, StepExecutionContext::Environment(h, _) if *h == remote_host()));
 
     // Step 6: Host(laptop) — attach on local
     assert_eq!(*plan.steps[6].host.host_name(), HostName::new("laptop"));
@@ -2501,7 +2509,7 @@ async fn build_plan_with_environment_prepends_lifecycle_steps() {
 
     // Verify workspace label includes remote host suffix
     if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[5].action {
-        assert_eq!(label, "feature-x@feta");
+        assert_eq!(label, "feature-x@test-remote");
     } else {
         panic!("step 5 should be PrepareWorkspace");
     }
@@ -2560,9 +2568,9 @@ async fn build_plan_with_existing_environment_returns_4_steps() {
     let data = empty_data();
 
     let cmd = Command {
-        host: Some(HostName::new("feta")),
+        host: Some(remote_host()),
         provisioning_target: Some(flotilla_protocol::ProvisioningTarget::ExistingEnvironment {
-            host: HostName::new("feta"),
+            host: remote_host(),
             env_id: flotilla_protocol::EnvironmentId::new("env-abc"),
         }),
         context_repo: Some(repo_selector()),
@@ -2594,12 +2602,12 @@ async fn build_plan_with_existing_environment_returns_4_steps() {
     assert!(matches!(plan.steps[3].action, StepAction::AttachWorkspace));
 
     // Steps 0 executes on Host(feta)
-    assert_eq!(*plan.steps[0].host.host_name(), HostName::new("feta"));
+    assert_eq!(*plan.steps[0].host.host_name(), remote_host());
     assert!(matches!(&plan.steps[0].host, StepExecutionContext::Host(_)));
 
     // Steps 1-2 execute in Environment(feta, env_id)
-    assert!(matches!(&plan.steps[1].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
-    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Environment(h, _) if *h == HostName::new("feta")));
+    assert!(matches!(&plan.steps[1].host, StepExecutionContext::Environment(h, _) if *h == remote_host()));
+    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Environment(h, _) if *h == remote_host()));
 
     // Step 3 attaches on the local host
     assert_eq!(*plan.steps[3].host.host_name(), HostName::new("laptop"));
@@ -2613,8 +2621,8 @@ async fn build_plan_with_host_target_returns_standard_checkout_plan() {
 
     // ProvisioningTarget::Host should fall through to the standard checkout plan
     let cmd = Command {
-        host: Some(HostName::new("feta")),
-        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("feta") }),
+        host: Some(remote_host()),
+        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::Host { host: remote_host() }),
         context_repo: Some(repo_selector()),
         action: CommandAction::Checkout {
             repo: repo_selector(),
@@ -2644,8 +2652,8 @@ async fn build_plan_with_host_target_returns_standard_checkout_plan() {
     assert!(matches!(plan.steps[2].action, StepAction::AttachWorkspace));
 
     // CreateCheckout and PrepareWorkspace run on the target host
-    assert_eq!(*plan.steps[0].host.host_name(), HostName::new("feta"));
-    assert_eq!(*plan.steps[1].host.host_name(), HostName::new("feta"));
+    assert_eq!(*plan.steps[0].host.host_name(), remote_host());
+    assert_eq!(*plan.steps[1].host.host_name(), remote_host());
     // AttachWorkspace runs on the local host
     assert_eq!(*plan.steps[2].host.host_name(), HostName::new("laptop"));
 }
@@ -2657,7 +2665,7 @@ async fn build_plan_with_no_provisioning_target_returns_standard_checkout_plan()
 
     // No provisioning_target should also produce the standard checkout plan
     let cmd = Command {
-        host: Some(HostName::new("feta")),
+        host: Some(remote_host()),
         provisioning_target: None,
         context_repo: Some(repo_selector()),
         action: CommandAction::Checkout {
@@ -2695,7 +2703,7 @@ async fn build_plan_with_no_provisioning_target_returns_standard_checkout_plan()
 fn resolve_checkout_branch_path_found() {
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-branch").build());
-    let local_host = HostName::local();
+    let local_host = local_host();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/repo/wt-feat")), &data, &local_host);
 
@@ -2705,7 +2713,7 @@ fn resolve_checkout_branch_path_found() {
 #[test]
 fn resolve_checkout_branch_path_not_found() {
     let data = empty_data();
-    let local_host = HostName::local();
+    let local_host = local_host();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/nonexistent")), &data, &local_host);
 
@@ -2717,7 +2725,7 @@ fn resolve_checkout_branch_path_not_found() {
 fn resolve_checkout_branch_query_exact_match() {
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-login").build());
-    let local_host = HostName::local();
+    let local_host = local_host();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("feat-login".to_string()), &data, &local_host);
 
@@ -2728,7 +2736,7 @@ fn resolve_checkout_branch_query_exact_match() {
 fn resolve_checkout_branch_query_substring_match() {
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-login-page").build());
-    let local_host = HostName::local();
+    let local_host = local_host();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("login".to_string()), &data, &local_host);
 
@@ -2739,7 +2747,7 @@ fn resolve_checkout_branch_query_substring_match() {
 fn resolve_checkout_branch_query_not_found() {
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat"), TestCheckout::new("feat-login").build());
-    let local_host = HostName::local();
+    let local_host = local_host();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("nonexistent".to_string()), &data, &local_host);
 
@@ -2752,7 +2760,7 @@ fn resolve_checkout_branch_query_ambiguous() {
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-a"), TestCheckout::new("feat-a").build());
     data.checkouts.insert(hp("/repo/wt-feat-b"), TestCheckout::new("feat-b").build());
-    let local_host = HostName::local();
+    let local_host = local_host();
 
     let result = resolve_checkout_branch(&CheckoutSelector::Query("feat".to_string()), &data, &local_host);
 
@@ -2768,7 +2776,7 @@ fn resolve_checkout_branch_query_ambiguous() {
 async fn resolve_workspace_commands_no_template_uses_default() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, local_host());
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
         working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
@@ -2777,7 +2785,8 @@ async fn resolve_workspace_commands_no_template_uses_default() {
         resolved_commands: None,
     };
 
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    let host = local_host();
+    let service = super::terminals::TerminalPreparationService::new(&tm, None, &host);
     service.resolve_workspace_commands(&mut config).await;
 
     // Default template has one "main" terminal entry
@@ -2791,7 +2800,7 @@ async fn resolve_workspace_commands_no_template_uses_default() {
 async fn resolve_workspace_commands_skips_non_terminal_content() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, local_host());
     let yaml = r#"
 content:
   - role: docs
@@ -2806,7 +2815,8 @@ content:
         resolved_commands: None,
     };
 
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    let host = local_host();
+    let service = super::terminals::TerminalPreparationService::new(&tm, None, &host);
     service.resolve_workspace_commands(&mut config).await;
 
     // All content entries were non-terminal, so resolved_commands stays None
@@ -2817,9 +2827,10 @@ content:
 async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, local_host());
 
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    let host = local_host();
+    let service = super::terminals::TerminalPreparationService::new(&tm, None, &host);
     let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }, PreparedTerminalCommand {
         role: "main".into(),
         command: "bash".into(),
@@ -2843,7 +2854,7 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
 async fn resolve_workspace_commands_invalid_template_uses_default() {
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, local_host());
     let mut config = WorkspaceConfig {
         name: "test-branch".to_string(),
         working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
@@ -2852,7 +2863,8 @@ async fn resolve_workspace_commands_invalid_template_uses_default() {
         resolved_commands: None,
     };
 
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    let host = local_host();
+    let service = super::terminals::TerminalPreparationService::new(&tm, None, &host);
     service.resolve_workspace_commands(&mut config).await;
 
     let commands = config.resolved_commands.expect("invalid template should fall back to default template");

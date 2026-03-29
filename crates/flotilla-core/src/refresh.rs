@@ -55,6 +55,7 @@ impl RepoRefreshHandle {
         attachable_store: SharedAttachableStore,
         agent_state_store: crate::agents::SharedAgentStateStore,
         interval: Duration,
+        host_name: flotilla_protocol::HostName,
     ) -> Self {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(RefreshSnapshot::default()));
         let refresh_trigger = Arc::new(Notify::new());
@@ -71,8 +72,16 @@ impl RepoRefreshHandle {
 
                 // Fetch all provider data
                 let mut provider_data = ProviderData::default();
-                let errors =
-                    refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, &attachable_store, &agent_state_store).await;
+                let errors = refresh_providers(
+                    &mut provider_data,
+                    &repo_root,
+                    &registry,
+                    &criteria,
+                    &attachable_store,
+                    &agent_state_store,
+                    &host_name,
+                )
+                .await;
                 let provider_health = compute_provider_health(&registry, &errors);
 
                 // Correlate
@@ -162,6 +171,7 @@ async fn refresh_providers(
     criteria: &RepoCriteria,
     attachable_store: &SharedAttachableStore,
     agent_state_store: &crate::agents::SharedAgentStateStore,
+    host_name: &flotilla_protocol::HostName,
 ) -> Vec<RefreshError> {
     let mut errors = Vec::new();
     let ee_root = ExecutionEnvironmentPath::new(repo_root);
@@ -207,8 +217,7 @@ async fn refresh_providers(
     };
 
     let terminal_manager = registry.terminal_pools.preferred_with_desc().map(|(desc, tp)| {
-        let tm =
-            crate::terminal_manager::TerminalManager::new(Arc::clone(tp), attachable_store.clone(), flotilla_protocol::HostName::local());
+        let tm = crate::terminal_manager::TerminalManager::new(Arc::clone(tp), attachable_store.clone(), host_name.clone());
         (desc.display_name.clone(), tm)
     });
     let tp_fut = async {
@@ -237,9 +246,8 @@ async fn refresh_providers(
         }
     }
 
-    let local_host = flotilla_protocol::HostName::local();
     pd.checkouts =
-        checkouts.into_iter().map(|(path, co)| (flotilla_protocol::HostPath::new(local_host.clone(), path.as_path()), co)).collect();
+        checkouts.into_iter().map(|(path, co)| (flotilla_protocol::QualifiedPath::from_host_path(host_name, path.as_path()), co)).collect();
     collect_errors(&mut errors, "checkouts", checkout_errors);
 
     pd.change_requests = crs.into_iter().collect();
@@ -326,7 +334,7 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
     }
 
     // Set selection: project sets whose checkout matches a repo checkout
-    let checkout_paths: std::collections::HashSet<&flotilla_protocol::HostPath> = pd.checkouts.keys().collect();
+    let checkout_paths: std::collections::HashSet<&flotilla_protocol::QualifiedPath> = pd.checkouts.keys().collect();
     pd.attachable_sets = store
         .registry()
         .sets

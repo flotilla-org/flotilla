@@ -6,7 +6,6 @@ use crate::{
     providers::testing::MockRunner,
 };
 
-/// Create a ShpoolTerminalPool in a temp dir so config writes succeed.
 fn test_pool(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("create tempdir for shpool test");
     let socket_path = DaemonHostPath::new(dir.path().join("shpool.socket"));
@@ -17,38 +16,8 @@ fn test_pool(runner: Arc<MockRunner>) -> (ShpoolTerminalPool, tempfile::TempDir)
 fn test_pool_with_env(runner: Arc<MockRunner>, terminal_env: TerminalEnvVars) -> (ShpoolTerminalPool, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("create tempdir for shpool test");
     let socket_path = DaemonHostPath::new(dir.path().join("shpool.socket"));
-    let config_path = DaemonHostPath::new(dir.path().join("config.toml"));
-    ShpoolTerminalPool::write_config(config_path.as_path());
-    let pool = ShpoolTerminalPool { runner, socket_path, config_path, terminal_env_defaults: terminal_env };
+    let pool = ShpoolTerminalPool::new_with_env(runner, socket_path, terminal_env);
     (pool, dir)
-}
-
-#[test]
-fn write_config_writes_expected_content() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let config_path = dir.path().join("config.toml");
-    assert!(ShpoolTerminalPool::write_config(&config_path));
-    let content = std::fs::read_to_string(&config_path).expect("config should have been written");
-    assert!(content.contains("prompt_prefix = \"\""));
-    assert!(content.contains("TERMINFO"));
-    assert!(content.contains("COLORTERM"));
-}
-
-#[test]
-fn config_needs_update_tracks_staleness() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let config_path = dir.path().join("config.toml");
-
-    // File doesn't exist → needs update
-    assert!(ShpoolTerminalPool::config_needs_update(&config_path));
-
-    // Write config, now it matches → no update needed
-    ShpoolTerminalPool::write_config(&config_path);
-    assert!(!ShpoolTerminalPool::config_needs_update(&config_path));
-
-    // Modify externally → needs update again
-    std::fs::write(&config_path, "stale config").expect("write stale");
-    assert!(ShpoolTerminalPool::config_needs_update(&config_path));
 }
 
 #[test]

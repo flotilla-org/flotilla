@@ -3,8 +3,9 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    host::{HostName, HostPath, RepoIdentity},
+    host::{HostName, RepoIdentity},
     provider_data::{AttachableSetId, Issue, ProviderData},
+    QualifiedPath,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +112,7 @@ pub struct WorkItem {
 }
 
 impl WorkItem {
-    pub fn checkout_key(&self) -> Option<&HostPath> {
+    pub fn checkout_key(&self) -> Option<&QualifiedPath> {
         self.checkout.as_ref().map(|co| &co.key)
     }
 }
@@ -129,7 +130,7 @@ pub enum WorkItemKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkItemIdentity {
-    Checkout(HostPath),
+    Checkout(QualifiedPath),
     AttachableSet(AttachableSetId),
     ChangeRequest(String),
     Session(String),
@@ -140,14 +141,14 @@ pub enum WorkItemIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckoutRef {
-    pub key: HostPath,
+    pub key: QualifiedPath,
     pub is_main_checkout: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{host::HostName, provider_data::ProviderData, test_helpers::assert_json_roundtrip, test_support::hp};
+    use crate::{host::HostName, provider_data::ProviderData, test_helpers::assert_json_roundtrip, test_support::qp};
 
     #[test]
     fn category_labels_defaults_and_capitalization() {
@@ -231,11 +232,11 @@ mod tests {
             work_items: vec![
                 WorkItem {
                     kind: WorkItemKind::Checkout,
-                    identity: WorkItemIdentity::Checkout(hp("/repos/project/wt")),
+                    identity: WorkItemIdentity::Checkout(qp("/repos/project/wt")),
                     host: HostName::new("test-host"),
                     branch: Some("feat-x".into()),
                     description: "Feature X".into(),
-                    checkout: Some(CheckoutRef { key: hp("/repos/project/wt"), is_main_checkout: false }),
+                    checkout: Some(CheckoutRef { key: qp("/repos/project/wt"), is_main_checkout: false }),
                     change_request_key: None,
                     session_key: None,
                     issue_keys: vec![],
@@ -305,11 +306,11 @@ mod tests {
             },
             WorkItem {
                 kind: WorkItemKind::Checkout,
-                identity: WorkItemIdentity::Checkout(hp("/wt")),
+                identity: WorkItemIdentity::Checkout(qp("/wt")),
                 host: HostName::new("test-host"),
                 branch: Some("main".into()),
                 description: "Main".into(),
-                checkout: Some(CheckoutRef { key: hp("/repos/main"), is_main_checkout: true }),
+                checkout: Some(CheckoutRef { key: qp("/repos/main"), is_main_checkout: true }),
                 change_request_key: Some("1".into()),
                 session_key: Some("sess-1".into()),
                 issue_keys: vec!["I-1".into(), "I-2".into()],
@@ -334,7 +335,7 @@ mod tests {
         let without_checkout = &cases[0];
         assert!(without_checkout.checkout_key().is_none());
         let with_checkout = &cases[1];
-        assert_eq!(with_checkout.checkout_key(), Some(&hp("/repos/main")));
+        assert_eq!(with_checkout.checkout_key(), Some(&qp("/repos/main")));
     }
 
     #[test]
@@ -409,7 +410,7 @@ mod tests {
         }
 
         let identities = vec![
-            WorkItemIdentity::Checkout(hp("/path/to/wt")),
+            WorkItemIdentity::Checkout(qp("/path/to/wt")),
             WorkItemIdentity::AttachableSet(AttachableSetId::new("set-1")),
             WorkItemIdentity::ChangeRequest("99".into()),
             WorkItemIdentity::Session("sess-abc".into()),
@@ -424,8 +425,8 @@ mod tests {
 
     #[test]
     fn checkout_ref_roundtrip_covers_both_boolean_values() {
-        let cases = vec![CheckoutRef { key: hp("/repos/proj/wt-1"), is_main_checkout: true }, CheckoutRef {
-            key: hp("/tmp/wt"),
+        let cases = vec![CheckoutRef { key: qp("/repos/proj/wt-1"), is_main_checkout: true }, CheckoutRef {
+            key: qp("/tmp/wt"),
             is_main_checkout: false,
         }];
         for case in &cases {

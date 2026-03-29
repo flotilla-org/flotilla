@@ -21,13 +21,14 @@ use crate::{
 pub struct CloneCheckoutManager {
     runner: Arc<dyn CommandRunner>,
     reference_dir: ExecutionEnvironmentPath,
+    host_name: flotilla_protocol::HostName,
 }
 
 const WORKSPACE_ROOT: &str = "/workspace";
 
 impl CloneCheckoutManager {
-    pub fn new(runner: Arc<dyn CommandRunner>, reference_dir: ExecutionEnvironmentPath) -> Self {
-        Self { runner, reference_dir }
+    pub fn new(runner: Arc<dyn CommandRunner>, reference_dir: ExecutionEnvironmentPath, host_name: flotilla_protocol::HostName) -> Self {
+        Self { runner, reference_dir, host_name }
     }
 
     fn ref_dir_str(&self) -> Result<&str, String> {
@@ -105,7 +106,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| entry.to_string());
 
-            let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), std::path::Path::new(&dir));
+            let host_path = flotilla_protocol::QualifiedPath::from_host_path(&self.host_name, std::path::Path::new(&dir));
             let correlation_keys = vec![CorrelationKey::Branch(branch.clone()), CorrelationKey::CheckoutPath(host_path)];
 
             let checkout = Checkout {
@@ -175,7 +176,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 .await?;
         }
 
-        let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), std::path::Path::new(&checkout_dir));
+        let host_path = flotilla_protocol::QualifiedPath::from_host_path(&self.host_name, std::path::Path::new(&checkout_dir));
         let correlation_keys = vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(host_path)];
 
         let checkout = Checkout {
@@ -341,7 +342,11 @@ mod tests {
             Ok(String::new()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = CloneCheckoutManager::new(
+            runner.clone(),
+            ExecutionEnvironmentPath::new("/ref/repo"),
+            flotilla_protocol::HostName::new("test-host"),
+        );
         let (path, checkout) =
             mgr.create_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "feat", false).await.expect("create_checkout should succeed");
 
@@ -382,7 +387,11 @@ mod tests {
             Ok(String::new()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = CloneCheckoutManager::new(
+            runner.clone(),
+            ExecutionEnvironmentPath::new("/ref/repo"),
+            flotilla_protocol::HostName::new("test-host"),
+        );
         let (path, checkout) = mgr
             .create_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "my-feature", true)
             .await
@@ -451,7 +460,11 @@ mod tests {
             Err("".to_string()),                                 // show-ref local — not found
             Ok("".to_string()),                                  // show-ref remote — found!
         ]));
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = CloneCheckoutManager::new(
+            runner.clone(),
+            ExecutionEnvironmentPath::new("/ref/repo"),
+            flotilla_protocol::HostName::new("test-host"),
+        );
 
         let result = mgr.create_checkout(&ExecutionEnvironmentPath::new("/workspace"), "existing-branch", true).await;
 
@@ -463,7 +476,11 @@ mod tests {
     async fn create_checkout_sanitizes_slashes() {
         let runner = Arc::new(RecordingRunner::new(vec![Ok("https://github.com/org/repo.git\n".into()), Ok(String::new())]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = CloneCheckoutManager::new(
+            runner.clone(),
+            ExecutionEnvironmentPath::new("/ref/repo"),
+            flotilla_protocol::HostName::new("test-host"),
+        );
         let (path, _) = mgr
             .create_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "feature/deep/branch", false)
             .await
@@ -479,7 +496,11 @@ mod tests {
             Ok(String::new()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = CloneCheckoutManager::new(
+            runner.clone(),
+            ExecutionEnvironmentPath::new("/ref/repo"),
+            flotilla_protocol::HostName::new("test-host"),
+        );
         mgr.remove_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "my-feature").await.expect("remove_checkout should succeed");
 
         let calls = runner.calls();
@@ -505,7 +526,11 @@ mod tests {
             Err("fatal: not a git repository".into()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = CloneCheckoutManager::new(
+            runner.clone(),
+            ExecutionEnvironmentPath::new("/ref/repo"),
+            flotilla_protocol::HostName::new("test-host"),
+        );
         let checkouts = mgr.list_checkouts(&ExecutionEnvironmentPath::new("/ref/repo")).await.expect("list should succeed");
 
         assert_eq!(checkouts.len(), 2);

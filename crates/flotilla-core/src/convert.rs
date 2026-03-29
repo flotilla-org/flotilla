@@ -228,7 +228,7 @@ pub fn snapshot_to_proto(
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{test_support::hp, HostName, HostPath, HostProviderStatus, WorkItemIdentity, WorkItemKind};
+    use flotilla_protocol::{test_support::qp, HostName, HostProviderStatus, QualifiedPath, WorkItemIdentity, WorkItemKind};
 
     use super::*;
     use crate::{
@@ -328,8 +328,8 @@ mod tests {
     #[test]
     fn convert_correlated_checkout() {
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
-            anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/repos/my-project/wt-1"), is_main_checkout: false }),
-            checkout_ref: Some(CheckoutRef { key: hp("/repos/my-project/wt-1"), is_main_checkout: false }),
+            anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: qp("/repos/my-project/wt-1"), is_main_checkout: false }),
+            checkout_ref: Some(CheckoutRef { key: qp("/repos/my-project/wt-1"), is_main_checkout: false }),
             attachable_set_id: None,
             branch: Some("feature-login".to_string()),
             description: "Implement login flow".to_string(),
@@ -347,14 +347,14 @@ mod tests {
         let proto = correlation_result_to_work_item(&item, &[], &test_host());
 
         assert_eq!(proto.kind, WorkItemKind::Checkout);
-        assert_eq!(proto.identity, WorkItemIdentity::Checkout(hp("/repos/my-project/wt-1")));
+        assert_eq!(proto.identity, WorkItemIdentity::Checkout(qp("/repos/my-project/wt-1")));
         // Checkout-anchored items derive host from HostPath
         assert_eq!(proto.host, test_host());
         assert_eq!(proto.branch.as_deref(), Some("feature-login"));
         assert_eq!(proto.description, "Implement login flow");
 
         let checkout = proto.checkout.expect("should have checkout ref");
-        assert_eq!(checkout.key, hp("/repos/my-project/wt-1"));
+        assert_eq!(checkout.key, qp("/repos/my-project/wt-1"));
         assert!(!checkout.is_main_checkout);
 
         assert_eq!(proto.change_request_key.as_deref(), Some("55"));
@@ -391,8 +391,8 @@ mod tests {
     fn convert_correlated_checkout_has_hostname_source() {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
-            anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/repos/proj/wt"), is_main_checkout: false }),
-            checkout_ref: Some(CheckoutRef { key: hp("/repos/proj/wt"), is_main_checkout: false }),
+            anchor: CorrelatedAnchor::Checkout(CheckoutRef { key: qp("/repos/proj/wt"), is_main_checkout: false }),
+            checkout_ref: Some(CheckoutRef { key: qp("/repos/proj/wt"), is_main_checkout: false }),
             attachable_set_id: None,
             branch: Some("feat".to_string()),
             description: "Feature".to_string(),
@@ -457,11 +457,11 @@ mod tests {
         let remote_host = HostName::new("remote-server");
         let item = CorrelationResult::Correlated(CorrelatedWorkItem {
             anchor: CorrelatedAnchor::Checkout(CheckoutRef {
-                key: HostPath::new(remote_host.clone(), PathBuf::from("/repos/proj")),
+                key: QualifiedPath::from_host_path(&remote_host, PathBuf::from("/repos/proj")),
                 is_main_checkout: false,
             }),
             checkout_ref: Some(CheckoutRef {
-                key: HostPath::new(remote_host.clone(), PathBuf::from("/repos/proj")),
+                key: QualifiedPath::from_host_path(&remote_host, PathBuf::from("/repos/proj")),
                 is_main_checkout: false,
             }),
             attachable_set_id: None,
@@ -479,7 +479,7 @@ mod tests {
         });
         let local = HostName::new("local-machine");
         let proto = correlation_result_to_work_item(&item, &[], &local);
-        // Should use the checkout's HostPath host, not the local fallback
+        // Should use the checkout's QualifiedPath host, not the local fallback
         assert_eq!(proto.host, remote_host);
     }
 }

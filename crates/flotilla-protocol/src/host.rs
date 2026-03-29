@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf, sync::OnceLock};
+use std::{fmt, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -46,91 +46,6 @@ fn strip_domain(fqdn: &str) -> &str {
 impl fmt::Display for HostName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct HostPath {
-    pub host: HostName,
-    pub path: PathBuf,
-}
-
-impl HostPath {
-    pub fn new(host: HostName, path: impl Into<PathBuf>) -> Self {
-        Self { host, path: path.into() }
-    }
-}
-
-impl fmt::Display for HostPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host, self.path.display())
-    }
-}
-
-impl std::str::FromStr for HostPath {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Format: "host:path" — split on the first colon
-        if let Some((host, path)) = s.split_once(':') {
-            Ok(Self { host: HostName::new(host), path: PathBuf::from(path) })
-        } else {
-            Err(format!("invalid HostPath: expected 'host:path', got '{s}'"))
-        }
-    }
-}
-
-/// Serde helpers for `IndexMap<HostPath, V>` — serializes keys as `"host:path"` strings
-/// so they work as JSON object keys.
-pub mod host_path_map {
-    use std::{fmt, marker::PhantomData};
-
-    use indexmap::IndexMap;
-    use serde::{
-        de::{self, Deserializer, MapAccess, Visitor},
-        ser::{SerializeMap, Serializer},
-        Deserialize, Serialize,
-    };
-
-    use super::HostPath;
-
-    pub fn serialize<V, S>(map: &IndexMap<HostPath, V>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        V: Serialize,
-        S: Serializer,
-    {
-        let mut m = serializer.serialize_map(Some(map.len()))?;
-        for (k, v) in map {
-            m.serialize_entry(&k.to_string(), v)?;
-        }
-        m.end()
-    }
-
-    pub fn deserialize<'de, V, D>(deserializer: D) -> Result<IndexMap<HostPath, V>, D::Error>
-    where
-        V: Deserialize<'de>,
-        D: Deserializer<'de>,
-    {
-        struct MapVisitor<V>(PhantomData<V>);
-
-        impl<'de, V: Deserialize<'de>> Visitor<'de> for MapVisitor<V> {
-            type Value = IndexMap<HostPath, V>;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a map with HostPath string keys")
-            }
-
-            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Self::Value, M::Error> {
-                let mut map = IndexMap::with_capacity(access.size_hint().unwrap_or(0));
-                while let Some((key_str, value)) = access.next_entry::<String, V>()? {
-                    let key: HostPath = key_str.parse().map_err(de::Error::custom)?;
-                    map.insert(key, value);
-                }
-                Ok(map)
-            }
-        }
-
-        deserializer.deserialize_map(MapVisitor(PhantomData))
     }
 }
 
@@ -231,29 +146,6 @@ mod tests {
         assert_eq!(json, "\"cloud-vm\"");
         let back: HostName = serde_json::from_str(&json).unwrap();
         assert_eq!(h, back);
-    }
-
-    // HostPath tests
-
-    #[test]
-    fn host_path_display_format() {
-        let hp = HostPath { host: HostName::new("desktop"), path: PathBuf::from("/Users/dev/project") };
-        assert_eq!(format!("{hp}"), "desktop:/Users/dev/project");
-    }
-
-    #[test]
-    fn host_path_equality_different_hosts() {
-        let a = HostPath { host: HostName::new("laptop"), path: PathBuf::from("/home/dev/repo") };
-        let b = HostPath { host: HostName::new("desktop"), path: PathBuf::from("/home/dev/repo") };
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn host_path_serde_roundtrip() {
-        let hp = HostPath { host: HostName::new("cloud"), path: PathBuf::from("/opt/repos/app") };
-        let json = serde_json::to_string(&hp).unwrap();
-        let back: HostPath = serde_json::from_str(&json).unwrap();
-        assert_eq!(hp, back);
     }
 
     // RepoIdentity tests

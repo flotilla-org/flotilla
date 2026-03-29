@@ -10,6 +10,7 @@ pub mod path_context;
 pub mod peer;
 pub mod provider_data;
 mod provisioning_target;
+pub mod qualified_path;
 pub mod query;
 pub mod snapshot;
 pub mod step;
@@ -18,11 +19,12 @@ pub mod step;
 pub mod test_support;
 
 pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
-pub use host::{HostName, HostPath, RepoIdentity};
+pub use host::{HostName, RepoIdentity};
 pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, SystemInfo, ToolInventory};
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 pub use provisioning_target::ProvisioningTarget;
+pub use qualified_path::{HostId, PathQualifier, QualifiedPath};
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};
 
 #[cfg(test)]

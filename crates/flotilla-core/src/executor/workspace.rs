@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use flotilla_protocol::{arg, AttachableSetId, EnvironmentId, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand};
+use flotilla_protocol::{arg, AttachableSetId, EnvironmentId, HostName, PreparedWorkspace, QualifiedPath, ResolvedPaneCommand};
 use tracing::{info, warn};
 
 use super::{terminals::TerminalPreparationService, workspace_config};
@@ -49,7 +49,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
 
         let mut config = workspace_config(self.repo_root, label, checkout_path, teleport_cmd, self.config_base);
         if let Some(tm) = self.terminal_manager {
-            let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
+            let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path, self.local_host);
             terminal_preparation.resolve_workspace_commands(&mut config).await;
         }
         let attach_request = workspace_attach_request_from_config(config);
@@ -69,8 +69,13 @@ impl<'a> WorkspaceOrchestrator<'a> {
         };
 
         let scope_prefix = ws_mgr.binding_scope_prefix();
-        if let Some(ws_ref) = self.find_existing_workspace_ref(provider_name, &scope_prefix, &prepared.target_host, &prepared.checkout_path)
-        {
+        if let Some(ws_ref) = self.find_existing_workspace_ref(
+            provider_name,
+            &scope_prefix,
+            &prepared.target_host,
+            &prepared.checkout_path,
+            prepared.environment_id.as_ref(),
+        ) {
             info!(%ws_ref, "found existing workspace via binding, selecting");
             match ws_mgr.select_workspace(&ws_ref).await {
                 Ok(()) => return Ok(()),
@@ -134,7 +139,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             return None;
         };
 
-        let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
+        let checkout = QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf());
         let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout), environment_id.cloned());
         if changed {
             if let Err(err) = store.save() {
@@ -161,10 +166,11 @@ impl<'a> WorkspaceOrchestrator<'a> {
         scope_prefix: &str,
         target_host: &HostName,
         checkout_path: &Path,
+        environment_id: Option<&EnvironmentId>,
     ) -> Option<String> {
         let store = self.attachable_store.lock().ok()?;
-        let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
-        let set_ids = store.sets_for_checkout(&checkout);
+        let checkout = QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf());
+        let set_ids = store.sets_for_checkout(&checkout, environment_id);
         for set_id in set_ids {
             if let Some(ws_ref) = store.lookup_workspace_ref_for_set("workspace_manager", provider_name, &set_id) {
                 if ws_ref.starts_with(scope_prefix) {
@@ -183,7 +189,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
 
         let (set_id, changed_set) = store.ensure_terminal_set_with_change(
             Some(target_host.clone()),
-            Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+            Some(QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf())),
             None,
         );
         let changed_binding = store.replace_binding(ProviderBinding {
@@ -217,7 +223,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             store.insert_set(flotilla_protocol::AttachableSet {
                 id: set_id.clone(),
                 host_affinity: Some(target_host.clone()),
-                checkout: Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+                checkout: Some(QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf())),
                 template_identity: None,
                 environment_id: None,
                 members: Vec::new(),

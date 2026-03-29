@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use flotilla_protocol::{EnvironmentId, HostName, HostPath, TerminalStatus};
+use flotilla_protocol::{EnvironmentId, HostName, QualifiedPath, TerminalStatus};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -39,7 +39,7 @@ pub trait AttachableStoreApi: Send + Sync {
     fn allocate_attachable_id(&self) -> AttachableId;
     fn insert_set(&mut self, set: AttachableSet);
     fn insert_attachable(&mut self, attachable: Attachable);
-    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId;
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<QualifiedPath>) -> AttachableSetId;
     #[allow(clippy::too_many_arguments)]
     fn ensure_terminal_attachable(
         &mut self,
@@ -55,7 +55,7 @@ pub trait AttachableStoreApi: Send + Sync {
     fn ensure_terminal_set_with_change(
         &mut self,
         host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
+        checkout: Option<QualifiedPath>,
         environment_id: Option<EnvironmentId>,
     ) -> (AttachableSetId, bool);
     #[allow(clippy::too_many_arguments)]
@@ -87,7 +87,9 @@ pub trait AttachableStoreApi: Send + Sync {
         external_ref: &str,
     ) -> bool;
     fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo>;
-    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId>;
+    /// Find sets matching a checkout and environment. `None` for `environment_id`
+    /// matches only sets with no environment — not all sets for the checkout.
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId>;
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool;
     fn save(&self) -> Result<(), String>;
 }
@@ -145,7 +147,7 @@ impl AttachableStoreState {
         self.registry.attachables.insert(attachable.id.clone(), attachable);
     }
 
-    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<QualifiedPath>) -> AttachableSetId {
         self.ensure_terminal_set_with_change(host_affinity, checkout, None).0
     }
 
@@ -177,7 +179,7 @@ impl AttachableStoreState {
     fn ensure_terminal_set_with_change(
         &mut self,
         host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
+        checkout: Option<QualifiedPath>,
         environment_id: Option<EnvironmentId>,
     ) -> (AttachableSetId, bool) {
         if let Some(existing) = self
@@ -395,8 +397,13 @@ impl AttachableStoreState {
         Some(RemovedSetInfo { member_binding_refs })
     }
 
-    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
-        self.registry.sets.values().filter(|set| set.checkout.as_ref() == Some(checkout)).map(|set| set.id.clone()).collect()
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.registry
+            .sets
+            .values()
+            .filter(|set| set.checkout.as_ref() == Some(checkout) && set.environment_id.as_ref() == environment_id)
+            .map(|set| set.id.clone())
+            .collect()
     }
 
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
@@ -462,14 +469,14 @@ impl AttachableStore {
         self.state.insert_attachable(attachable);
     }
 
-    pub fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+    pub fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<QualifiedPath>) -> AttachableSetId {
         self.state.ensure_terminal_set(host_affinity, checkout)
     }
 
     pub fn ensure_terminal_set_with_change(
         &mut self,
         host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
+        checkout: Option<QualifiedPath>,
         environment_id: Option<EnvironmentId>,
     ) -> (AttachableSetId, bool) {
         self.state.ensure_terminal_set_with_change(host_affinity, checkout, environment_id)
@@ -555,8 +562,8 @@ impl AttachableStore {
         self.state.remove_set(id)
     }
 
-    pub fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
-        self.state.sets_for_checkout(checkout)
+    pub fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout, environment_id)
     }
 
     pub fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
@@ -608,14 +615,14 @@ impl AttachableStoreApi for AttachableStore {
         self.state.insert_attachable(attachable);
     }
 
-    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<QualifiedPath>) -> AttachableSetId {
         self.state.ensure_terminal_set(host_affinity, checkout)
     }
 
     fn ensure_terminal_set_with_change(
         &mut self,
         host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
+        checkout: Option<QualifiedPath>,
         environment_id: Option<EnvironmentId>,
     ) -> (AttachableSetId, bool) {
         self.state.ensure_terminal_set_with_change(host_affinity, checkout, environment_id)
@@ -699,8 +706,8 @@ impl AttachableStoreApi for AttachableStore {
         self.state.remove_set(id)
     }
 
-    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
-        self.state.sets_for_checkout(checkout)
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout, environment_id)
     }
 
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {
@@ -752,14 +759,14 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         self.state.insert_attachable(attachable);
     }
 
-    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<HostPath>) -> AttachableSetId {
+    fn ensure_terminal_set(&mut self, host_affinity: Option<HostName>, checkout: Option<QualifiedPath>) -> AttachableSetId {
         self.state.ensure_terminal_set(host_affinity, checkout)
     }
 
     fn ensure_terminal_set_with_change(
         &mut self,
         host_affinity: Option<HostName>,
-        checkout: Option<HostPath>,
+        checkout: Option<QualifiedPath>,
         environment_id: Option<EnvironmentId>,
     ) -> (AttachableSetId, bool) {
         self.state.ensure_terminal_set_with_change(host_affinity, checkout, environment_id)
@@ -843,8 +850,8 @@ impl AttachableStoreApi for InMemoryAttachableStore {
         self.state.remove_set(id)
     }
 
-    fn sets_for_checkout(&self, checkout: &HostPath) -> Vec<AttachableSetId> {
-        self.state.sets_for_checkout(checkout)
+    fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId> {
+        self.state.sets_for_checkout(checkout, environment_id)
     }
 
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool {

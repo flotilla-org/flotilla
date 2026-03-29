@@ -15,9 +15,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse, TopologyRoute,
+    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostProvidersResponse,
+    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, QualifiedPath, RepoDelta, RepoDetailResponse,
+    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
+    TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -56,9 +57,9 @@ fn normalize_local_provider_hosts(mut providers: ProviderData, host_name: &HostN
     providers.checkouts = providers
         .checkouts
         .into_iter()
-        .map(|(host_path, mut checkout)| {
+        .map(|(qp, mut checkout)| {
             checkout.correlation_keys = normalize_correlation_keys(checkout.correlation_keys, host_name);
-            (HostPath::new(host_name.clone(), host_path.path), checkout)
+            (QualifiedPath::from_host_path(host_name, qp.path), checkout)
         })
         .collect();
 
@@ -80,7 +81,7 @@ fn normalize_local_provider_hosts(mut providers: ProviderData, host_name: &HostN
 fn normalize_correlation_keys(keys: Vec<CorrelationKey>, host_name: &HostName) -> Vec<CorrelationKey> {
     keys.into_iter()
         .map(|key| match key {
-            CorrelationKey::CheckoutPath(host_path) => CorrelationKey::CheckoutPath(HostPath::new(host_name.clone(), host_path.path)),
+            CorrelationKey::CheckoutPath(qp) => CorrelationKey::CheckoutPath(QualifiedPath::from_host_path(host_name, qp.path)),
             other => other,
         })
         .collect()
@@ -310,7 +311,8 @@ impl InProcessDaemon {
         let mut path_identities = HashMap::new();
 
         // Run host detection once before the repo loop
-        let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
+        let mut host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
+        host_bag.set_host_name(host_name.clone());
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
 
         for path in repo_paths {
@@ -335,7 +337,8 @@ impl InProcessDaemon {
 
             let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
             let slug = repo_slug.clone();
-            let mut model = RepoModel::new(path.clone(), registry, repo_slug, attachable_store, Arc::clone(&agent_state_store));
+            let mut model =
+                RepoModel::new(path.clone(), registry, repo_slug, attachable_store, Arc::clone(&agent_state_store), host_name.clone());
             model.data.loading = true;
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
@@ -585,7 +588,7 @@ impl InProcessDaemon {
             };
             for (host_path, checkout) in &providers.checkouts {
                 if let Some(host) = target_host {
-                    if host_path.host != *host {
+                    if host_path.host_id().map(|h| h.as_str()) != Some(host.as_str()) {
                         continue;
                     }
                 }
@@ -596,6 +599,12 @@ impl InProcessDaemon {
                     }
                 };
                 if matched {
+                    // If a target host was specified, only include checkouts on that host
+                    if let Some(target) = target_host {
+                        if host_path.host_id().map(|h| h.as_str()) != Some(target.as_str()) {
+                            continue;
+                        }
+                    }
                     matches.push((state.preferred_path().to_path_buf(), checkout.branch.clone()));
                 }
             }
@@ -1411,6 +1420,7 @@ impl InProcessDaemon {
             repo_slug,
             self.discovery.shared_attachable_store(&self.config),
             Arc::clone(&self.agent_state_store),
+            self.host_name.clone(),
         );
         model.data.loading = true;
         let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };

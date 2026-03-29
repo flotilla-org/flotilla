@@ -33,7 +33,7 @@ fn cr_with_issue(issue_id: &str) -> ChangeRequest {
 fn collect_linked_issue_ids_deduplicates_across_sources() {
     let mut providers = ProviderData::default();
     providers.checkouts.insert(
-        flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from("/tmp/repo")),
+        flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::new("test-host"), PathBuf::from("/tmp/repo")),
         checkout_with_issue("123"),
     );
     providers.change_requests.insert("1".into(), cr_with_issue("123"));
@@ -210,7 +210,7 @@ fn build_repo_snapshot_with_peers_merges_peer_data() {
 
     // Create peer provider data with a checkout owned by host_b
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(flotilla_protocol::HostPath::new(host_b.clone(), PathBuf::from("/remote/repo")), Checkout {
+    peer_data.checkouts.insert(flotilla_protocol::QualifiedPath::from_host_path(&host_b, PathBuf::from("/remote/repo")), Checkout {
         branch: "remote-feat".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -256,21 +256,24 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
 
     // Simulate local checkout
     let mut local_providers = ProviderData::default();
-    local_providers.checkouts.insert(flotilla_protocol::HostPath::new(local_host.clone(), PathBuf::from("/home/dev/repo")), Checkout {
-        branch: "main".into(),
-        is_main: true,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        correlation_keys: vec![],
-        association_keys: vec![],
-        environment_id: None,
-    });
+    local_providers.checkouts.insert(
+        flotilla_protocol::QualifiedPath::from_host_path(&local_host, PathBuf::from("/home/dev/repo")),
+        Checkout {
+            branch: "main".into(),
+            is_main: true,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            environment_id: None,
+        },
+    );
 
     // Create peer data
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(flotilla_protocol::HostPath::new(peer_host.clone(), PathBuf::from("/srv/kiwi/repo")), Checkout {
+    peer_data.checkouts.insert(flotilla_protocol::QualifiedPath::from_host_path(&peer_host, PathBuf::from("/srv/kiwi/repo")), Checkout {
         branch: "peer-feat".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -325,11 +328,12 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
     );
 
     // The peer checkout must appear exactly once under kiwi
-    let kiwi_count = second_snap.providers.checkouts.keys().filter(|hp| hp.host == peer_host).count();
+    let kiwi_count =
+        second_snap.providers.checkouts.keys().filter(|qp| qp.host_id().map(|h| h.as_str()) == Some(peer_host.as_str())).count();
     assert_eq!(kiwi_count, 1, "peer checkout should appear once under kiwi, got {kiwi_count}");
 
     // No ghost checkout — kiwi's path must not appear under the local host
-    let ghost = flotilla_protocol::HostPath::new(local_host.clone(), PathBuf::from("/srv/kiwi/repo"));
+    let ghost = flotilla_protocol::QualifiedPath::from_host_path(&local_host, PathBuf::from("/srv/kiwi/repo"));
     assert!(
         !second_snap.providers.checkouts.contains_key(&ghost),
         "peer checkout at /srv/kiwi/repo must not be re-stamped as local host checkout"
@@ -349,7 +353,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
     let cache = IssueCache::new();
     let local_host = HostName::new("kiwi");
     let remote_host = HostName::new("feta");
-    let remote_checkout = HostPath::new(remote_host.clone(), PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"));
+    let remote_checkout = QualifiedPath::from_host_path(&remote_host, PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"));
     let set_id = flotilla_protocol::AttachableSetId::new("set-remote");
 
     let mut local_providers = ProviderData::default();
@@ -414,7 +418,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
     );
     assert_eq!(set_item.workspace_refs, vec!["workspace:9".to_string()]);
 
-    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"));
+    let ghost_checkout = QualifiedPath::from_host_path(&local_host, PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"));
     assert!(
         !snapshot.providers.checkouts.contains_key(&ghost_checkout),
         "remote checkout path must not be duplicated under the local host"
