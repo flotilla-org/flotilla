@@ -156,6 +156,12 @@ pub trait CommandRunner: Send + Sync {
 
     /// Check if a command is available by running it.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool;
+
+    /// Write `content` to `path`, creating parent directories as needed.
+    /// Default implementation succeeds silently — override in production runners.
+    async fn ensure_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Production implementation that delegates to `tokio::process::Command`.
@@ -203,6 +209,13 @@ impl CommandRunner for ProcessCommandRunner {
             .await
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    async fn ensure_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
     }
 }
 
@@ -392,6 +405,16 @@ pub(crate) mod testing {
     /// `provider_dir` is the subdirectory under `src/providers/` (e.g. `"vcs"`, `"change_request"`).
     pub fn fixture_path(provider_dir: &str, name: &str) -> String {
         format!("{}/src/providers/{}/fixtures/{}", env!("CARGO_MANIFEST_DIR"), provider_dir, name)
+    }
+
+    #[tokio::test]
+    async fn process_runner_ensure_file_creates_parents_and_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/dir/config.toml");
+        let runner = super::ProcessCommandRunner;
+        runner.ensure_file(&path, "hello = true\n").await.expect("ensure_file");
+        let content = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(content, "hello = true\n");
     }
 }
 
