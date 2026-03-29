@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use flotilla_protocol::{arg::Arg, HostName, HostPath, PreparedTerminalCommand, ResolvedPaneCommand};
+use flotilla_protocol::{arg::Arg, HostName, PreparedTerminalCommand, QualifiedPath, ResolvedPaneCommand};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -24,7 +24,7 @@ impl<'a> TerminalPreparationService<'a> {
         let rendered = parse_workspace_template(config).render(&config.template_vars);
         info!(count = rendered.content.len(), "terminal manager: resolving content entries");
         let host = HostName::local();
-        let checkout_path = HostPath::new(host.clone(), config.working_directory.clone().into_path_buf());
+        let checkout_path = QualifiedPath::from_host_path(&host, config.working_directory.clone().into_path_buf());
         let set_id = match self.terminal_manager.allocate_set(host, checkout_path) {
             Ok(id) => id,
             Err(err) => {
@@ -87,7 +87,7 @@ impl<'a> TerminalPreparationService<'a> {
     ) -> Result<Vec<ResolvedPaneCommand>, String> {
         if !requested_commands.is_empty() {
             let host = HostName::local();
-            let hp = HostPath::new(host.clone(), checkout_path.to_path_buf());
+            let hp = QualifiedPath::from_host_path(&host, checkout_path.to_path_buf());
             let set_id = self.terminal_manager.allocate_set(host, hp)?;
             let socket_str = self.daemon_socket_path.map(|p| p.display().to_string());
 

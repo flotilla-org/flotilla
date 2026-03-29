@@ -1,7 +1,7 @@
 use std::path::Path;
 
 pub use flotilla_protocol::CheckoutIntent;
-use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
+use flotilla_protocol::{CheckoutSelector, HostName, QualifiedPath};
 use tracing::warn;
 
 use crate::{
@@ -41,7 +41,7 @@ impl<'a> CheckoutService<'a> {
         &self,
         repo_root: &ExecutionEnvironmentPath,
         branch: &str,
-        deleted_checkout_paths: &[HostPath],
+        deleted_checkout_paths: &[QualifiedPath],
         terminal_manager: Option<&TerminalManager>,
     ) -> Result<(), String> {
         let checkout_manager =
@@ -68,18 +68,16 @@ pub(super) fn resolve_checkout_branch(
         CheckoutSelector::Path(path) => providers_data
             .checkouts
             .iter()
-            .find(|(host_path, _)| host_path.host == *local_host && host_path.path == *path)
+            .find(|(qp, _)| qp.host_id().map(|h| h.as_str()) == Some(local_host.as_str()) && qp.path == *path)
             .map(|(_, checkout)| checkout.branch.clone())
             .ok_or_else(|| format!("checkout not found: {}", path.display())),
         CheckoutSelector::Query(query) => {
             let matches: Vec<String> = providers_data
                 .checkouts
                 .iter()
-                .filter(|(host_path, checkout)| {
-                    host_path.host == *local_host
-                        && (checkout.branch == *query
-                            || checkout.branch.contains(query)
-                            || host_path.path.to_string_lossy().contains(query))
+                .filter(|(qp, checkout)| {
+                    qp.host_id().map(|h| h.as_str()) == Some(local_host.as_str())
+                        && (checkout.branch == *query || checkout.branch.contains(query) || qp.path.to_string_lossy().contains(query))
                 })
                 .map(|(_, checkout)| checkout.branch.clone())
                 .collect();

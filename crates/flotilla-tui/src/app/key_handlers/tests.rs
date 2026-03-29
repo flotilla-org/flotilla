@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{
-    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, ProvisioningTarget, WorkItemIdentity,
+    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, ProvisioningTarget, QualifiedPath, WorkItemIdentity,
 };
 use ratatui::layout::Rect;
 
@@ -20,8 +20,8 @@ use crate::{
     status_bar::{StatusBarAction, StatusBarTarget},
 };
 
-fn hp(path: &str) -> HostPath {
-    HostPath::new(HostName::local(), PathBuf::from(path))
+fn hp(path: &str) -> QualifiedPath {
+    QualifiedPath::from_host_path(&HostName::local(), PathBuf::from(path))
 }
 
 /// Read the active RepoPage's selected selectable index.

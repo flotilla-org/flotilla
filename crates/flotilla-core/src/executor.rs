@@ -15,7 +15,7 @@ use std::{
 };
 
 use flotilla_protocol::{
-    arg::Arg, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand,
+    arg::Arg, CheckoutTarget, Command, CommandAction, CommandValue, HostName, PreparedWorkspace, QualifiedPath, ResolvedPaneCommand,
 };
 use tracing::{debug, error, info};
 
@@ -61,9 +61,9 @@ impl<'a> CheckoutFlow<'a> {
             // Environment namespaces are independent — host checkouts don't apply
             return None;
         }
-        self.providers_data.checkouts.iter().find_map(|(hp, co)| {
-            if hp.host == *self.local_host && co.branch == self.branch {
-                Some(ExecutionEnvironmentPath::new(&hp.path))
+        self.providers_data.checkouts.iter().find_map(|(qp, co)| {
+            if qp.host_id().map(|h| h.as_str()) == Some(self.local_host.as_str()) && co.branch == self.branch {
+                Some(ExecutionEnvironmentPath::new(&qp.path))
             } else {
                 None
             }
@@ -151,16 +151,16 @@ pub async fn build_plan(
         CommandAction::RemoveCheckout { checkout } => {
             debug!(
                 ?checkout, %target_host, %local_host,
-                checkout_hosts = ?providers_data.checkouts.keys().map(|hp| (&hp.host, &hp.path)).collect::<Vec<_>>(),
+                checkout_hosts = ?providers_data.checkouts.keys().map(|qp| (qp.host_id(), &qp.path)).collect::<Vec<_>>(),
                 "resolving checkout for removal"
             );
             match resolve_checkout_branch(&checkout, &providers_data, &target_host) {
                 Ok(branch) => {
-                    let deleted_paths: Vec<HostPath> = providers_data
+                    let deleted_paths: Vec<QualifiedPath> = providers_data
                         .checkouts
                         .iter()
-                        .filter(|(hp, co)| co.branch == branch && hp.host == target_host)
-                        .map(|(hp, _)| hp.clone())
+                        .filter(|(qp, co)| co.branch == branch && qp.host_id().map(|h| h.as_str()) == Some(target_host.as_str()))
+                        .map(|(qp, _)| qp.clone())
                         .collect();
                     info!(%branch, ?deleted_paths, %target_host, "built remove checkout plan");
                     Ok(build_remove_checkout_plan(branch, deleted_paths, target_host))
@@ -527,7 +527,7 @@ async fn build_teleport_session_plan(
 /// Steps:
 /// 1. Remove the checkout via the checkout manager
 /// 2. Clean up correlated terminal sessions (best-effort)
-fn build_remove_checkout_plan(branch: String, deleted_checkout_paths: Vec<HostPath>, local_host: HostName) -> StepPlan {
+fn build_remove_checkout_plan(branch: String, deleted_checkout_paths: Vec<QualifiedPath>, local_host: HostName) -> StepPlan {
     StepPlan::new(vec![Step {
         description: format!("Remove checkout for branch {branch}"),
         host: StepExecutionContext::Host(local_host),
@@ -704,7 +704,7 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::PrepareWorkspace { checkout_path: explicit_path, label } => {
                 let prepared_checkout: Option<(ExecutionEnvironmentPath, String)> = if let Some(p) = explicit_path {
-                    let host_key = HostPath::new(self.local_host.clone(), p.as_path().to_path_buf());
+                    let host_key = QualifiedPath::from_host_path(&self.local_host, p.as_path().to_path_buf());
                     let branch = self
                         .providers_data
                         .checkouts
@@ -844,7 +844,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::PrepareTerminalForCheckout { checkout_path, commands: requested_commands } => {
-                let host_key = HostPath::new(self.local_host.clone(), checkout_path.as_path().to_path_buf());
+                let host_key = QualifiedPath::from_host_path(&self.local_host, checkout_path.as_path().to_path_buf());
                 if let Some(co) = self.providers_data.checkouts.get(&host_key).cloned() {
                     let tm = self.terminal_manager();
                     let workspace_orchestrator = WorkspaceOrchestrator::new(

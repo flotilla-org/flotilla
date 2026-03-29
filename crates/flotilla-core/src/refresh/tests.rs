@@ -415,7 +415,7 @@ fn project_attachable_data_populates_sets_and_ids() {
         let mut store = attachable_store.lock().expect("lock store");
         let set_id = store.ensure_terminal_set(
             Some(flotilla_protocol::HostName::local()),
-            Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat"))),
+            Some(flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat"))),
         );
         let _attachable_id = store.ensure_terminal_attachable(
             &set_id,
@@ -438,17 +438,20 @@ fn project_attachable_data_populates_sets_and_ids() {
     };
 
     let mut pd = ProviderData::default();
-    pd.checkouts.insert(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")), Checkout {
-        branch: "feat".into(),
-        is_main: false,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        correlation_keys: vec![],
-        association_keys: vec![],
-        environment_id: None,
-    });
+    pd.checkouts.insert(
+        flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")),
+        Checkout {
+            branch: "feat".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            environment_id: None,
+        },
+    );
     pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
 
     project_attachable_data(&mut pd, &registry, &attachable_store);
@@ -598,8 +601,8 @@ async fn spawn_with_mixed_provider_health_isolates_failures() {
 fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
     let store = crate::attachable::shared_in_memory_attachable_store();
     let host = flotilla_protocol::HostName::local();
-    let checkout_a = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-feat");
-    let checkout_b = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-other");
+    let checkout_a = flotilla_protocol::QualifiedPath::from_host_path(&host, "/repo/wt-feat");
+    let checkout_b = flotilla_protocol::QualifiedPath::from_host_path(&host, "/repo/wt-other");
 
     {
         let mut s = store.lock().expect("lock");
@@ -632,7 +635,7 @@ fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
 fn project_attachable_data_set_appears_without_terminal_scan() {
     let store = crate::attachable::shared_in_memory_attachable_store();
     let host = flotilla_protocol::HostName::local();
-    let checkout = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-feat");
+    let checkout = flotilla_protocol::QualifiedPath::from_host_path(&host, "/repo/wt-feat");
 
     {
         let mut s = store.lock().expect("lock");

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use flotilla_protocol::test_support::{hp, TestChangeRequest, TestCheckout, TestIssue, TestSession};
+use flotilla_protocol::test_support::{qp, TestChangeRequest, TestCheckout, TestIssue, TestSession};
 
 use super::*;
 use crate::{provider_data::ProviderData, providers::types::*};
@@ -40,7 +40,7 @@ fn checkout_item(path: &str, branch: Option<&str>, is_main: bool) -> Correlation
     CorrelationResult::Correlated(CorrelatedWorkItem {
         branch: branch.map(|s| s.to_string()),
         description: branch.unwrap_or("").to_string(),
-        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp(path), is_main_checkout: is_main }))
+        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: qp(path), is_main_checkout: is_main }))
     })
 }
 
@@ -74,7 +74,10 @@ fn make_attachable_set(id: &str, path: &str) -> flotilla_protocol::AttachableSet
     flotilla_protocol::AttachableSet {
         id: flotilla_protocol::AttachableSetId::new(id),
         host_affinity: Some(flotilla_protocol::HostName::new("test-host")),
-        checkout: Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path))),
+        checkout: Some(flotilla_protocol::QualifiedPath::from_host_path(
+            &flotilla_protocol::HostName::new("test-host"),
+            PathBuf::from(path),
+        )),
         template_identity: None,
         environment_id: None,
         members: vec![],
@@ -240,7 +243,7 @@ fn description_returns_expected_value() {
 fn checkout_returns_some_for_checkout_anchor() {
     let wi = checkout_item("/tmp/wt", Some("main"), true);
     let co = wi.checkout().expect("should return checkout");
-    assert_eq!(co.key, hp("/tmp/wt"));
+    assert_eq!(co.key, qp("/tmp/wt"));
     assert!(co.is_main_checkout);
 }
 
@@ -262,7 +265,7 @@ fn checkout_returns_none_for_non_checkout() {
 #[test]
 fn checkout_key_returns_path() {
     let wi = checkout_item("/repos/proj", None, false);
-    assert_eq!(wi.checkout_key(), Some(&hp("/repos/proj")));
+    assert_eq!(wi.checkout_key(), Some(&qp("/repos/proj")));
 }
 
 #[test]
@@ -297,7 +300,7 @@ fn change_request_key_returns_expected_value() {
 fn change_request_key_from_linked_on_checkout() {
     let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
         linked_change_request: Some("99".to_string()),
-        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
+        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: qp("/tmp/wt"), is_main_checkout: false }))
     });
     assert_eq!(wi.change_request_key(), Some("99"));
 }
@@ -319,7 +322,7 @@ fn session_key_returns_expected_value() {
 fn session_key_from_linked_on_checkout() {
     let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
         linked_session: Some("linked-sess".to_string()),
-        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
+        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: qp("/tmp/wt"), is_main_checkout: false }))
     });
     assert_eq!(wi.session_key(), Some("linked-sess"));
 }
@@ -332,7 +335,7 @@ fn session_key_from_linked_on_checkout() {
 fn issue_keys_from_correlated_with_linked_issues() {
     let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
         linked_issues: vec!["10".to_string(), "20".to_string()],
-        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
+        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: qp("/tmp/wt"), is_main_checkout: false }))
     });
     assert_eq!(wi.issue_keys(), &["10".to_string(), "20".to_string()]);
 }
@@ -354,7 +357,7 @@ fn issue_keys_returns_expected_value() {
 fn workspace_refs_from_correlated() {
     let wi = CorrelationResult::Correlated(CorrelatedWorkItem {
         workspace_refs: vec!["ws-1".to_string()],
-        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: hp("/tmp/wt"), is_main_checkout: false }))
+        ..correlated(CorrelatedAnchor::Checkout(CheckoutRef { key: qp("/tmp/wt"), is_main_checkout: false }))
     });
     assert_eq!(wi.workspace_refs(), &["ws-1".to_string()]);
 }
@@ -413,7 +416,7 @@ fn as_correlated_mut_returns_none_for_standalone() {
 #[test]
 fn identity_returns_correct_variant() {
     let cases = [
-        ("checkout", checkout_item("/tmp/foo", None, false), WorkItemIdentity::Checkout(hp("/tmp/foo"))),
+        ("checkout", checkout_item("/tmp/foo", None, false), WorkItemIdentity::Checkout(qp("/tmp/foo"))),
         ("change_request", cr_item("42", "PR"), WorkItemIdentity::ChangeRequest("42".to_string())),
         ("session", session_item("sess-1", "title"), WorkItemIdentity::Session("sess-1".to_string())),
         ("issue", issue_item("7", "desc"), WorkItemIdentity::Issue("7".to_string())),
@@ -439,7 +442,7 @@ fn correlate_empty_provider_data() {
 #[test]
 fn correlate_single_checkout() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
 
     let (items, groups) = correlate(&providers);
     assert_eq!(items.len(), 1);
@@ -451,7 +454,7 @@ fn correlate_single_checkout() {
 #[test]
 fn correlate_trunk_checkout_marked_as_main() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/main"), TestCheckout::new("main").at("/tmp/main").is_main(true).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/main"), TestCheckout::new("main").at("/tmp/main").is_main(true).with_branch_key().build());
 
     let (items, _) = correlate(&providers);
     assert_eq!(items.len(), 1);
@@ -461,7 +464,7 @@ fn correlate_trunk_checkout_marked_as_main() {
 #[test]
 fn correlate_checkout_and_pr_merge_on_branch() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/feat-x"), TestCheckout::new("feat-x").at("/tmp/feat-x").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/feat-x"), TestCheckout::new("feat-x").at("/tmp/feat-x").is_main(false).with_branch_key().build());
     providers.change_requests.insert("10".to_string(), TestChangeRequest::new("Add auth", "feat-x").with_branch_key().build());
 
     let (items, _) = correlate(&providers);
@@ -503,7 +506,7 @@ fn correlate_agent_with_terminal_via_attachable_set() {
     // Checkout in same set (via CheckoutPath)
     providers
         .checkouts
-        .insert(hp("/repo/feat"), TestCheckout::new("feat-branch").at("/repo/feat").is_main(false).with_branch_key().build());
+        .insert(qp("/repo/feat"), TestCheckout::new("feat-branch").at("/repo/feat").is_main(false).with_branch_key().build());
 
     // Agent with same attachable set key
     providers.agents.insert("att-1".to_string(), flotilla_protocol::Agent {
@@ -529,7 +532,7 @@ fn correlate_agent_with_terminal_via_attachable_set() {
 #[test]
 fn correlate_checkout_pr_session_merge_on_branch() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/feat-y"), TestCheckout::new("feat-y").at("/tmp/feat-y").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/feat-y"), TestCheckout::new("feat-y").at("/tmp/feat-y").is_main(false).with_branch_key().build());
     providers.change_requests.insert("20".to_string(), TestChangeRequest::new("Improve perf", "feat-y").with_branch_key().build());
     providers.sessions.insert(
         "sess-a".to_string(),
@@ -609,7 +612,7 @@ fn correlate_remote_branches_excludes_head_main_master() {
 fn correlate_remote_branches_excludes_already_known() {
     let mut providers = new_providers();
     // A checkout on branch "feat-z"
-    providers.checkouts.insert(hp("/tmp/feat-z"), TestCheckout::new("feat-z").at("/tmp/feat-z").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/feat-z"), TestCheckout::new("feat-z").at("/tmp/feat-z").is_main(false).with_branch_key().build());
     // Same branch also in remote
     providers.branches.insert("feat-z".to_string(), flotilla_protocol::delta::Branch { status: flotilla_protocol::BranchStatus::Remote });
 
@@ -633,7 +636,7 @@ fn correlate_merged_branches_excluded() {
 #[test]
 fn correlate_pr_links_issue_via_association_key() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
     let mut cr = TestChangeRequest::new("Impl feature", "feat").with_branch_key().build();
     cr.association_keys.push(AssociationKey::IssueRef("gh".to_string(), "77".to_string()));
     providers.change_requests.insert("5".to_string(), cr);
@@ -650,7 +653,7 @@ fn correlate_pr_links_issue_via_association_key() {
 fn checkout_association_keys_link_issues() {
     let mut providers = new_providers();
 
-    let co_path = hp("/tmp/feat-x");
+    let co_path = qp("/tmp/feat-x");
     let mut co = TestCheckout::new("feat-x").at("/tmp/feat-x").is_main(false).with_branch_key().build();
     co.association_keys.push(AssociationKey::IssueRef("github".into(), "42".into()));
     providers.checkouts.insert(co_path, co);
@@ -680,7 +683,7 @@ fn correlate_workspace_only_group_is_skipped() {
 #[test]
 fn correlate_workspace_without_attachable_set_is_not_linked_to_checkout() {
     let mut providers = new_providers();
-    let co_path = hp("/tmp/feat-ws");
+    let co_path = qp("/tmp/feat-ws");
     providers.checkouts.insert(co_path.clone(), TestCheckout::new("feat-ws").at("/tmp/feat-ws").is_main(false).with_branch_key().build());
     providers.workspaces.insert("ws-1".to_string(), make_workspace("ws-1", "dev-session", vec![CorrelationKey::CheckoutPath(co_path)]));
 
@@ -692,7 +695,7 @@ fn correlate_workspace_without_attachable_set_is_not_linked_to_checkout() {
 #[test]
 fn correlate_description_prefers_pr_title() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
     providers.change_requests.insert("1".to_string(), TestChangeRequest::new("My PR Title", "feat").with_branch_key().build());
     providers
         .sessions
@@ -705,7 +708,7 @@ fn correlate_description_prefers_pr_title() {
 #[test]
 fn correlate_description_falls_back_to_session_title() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/feat"), TestCheckout::new("feat").at("/tmp/feat").is_main(false).with_branch_key().build());
     providers
         .sessions
         .insert("s1".to_string(), TestSession::new("Session Title").with_session_ref("claude", "s1").with_branch_key("feat").build());
@@ -719,7 +722,7 @@ fn correlate_description_falls_back_to_branch() {
     let mut providers = new_providers();
     providers
         .checkouts
-        .insert(hp("/tmp/my-branch"), TestCheckout::new("my-branch").at("/tmp/my-branch").is_main(false).with_branch_key().build());
+        .insert(qp("/tmp/my-branch"), TestCheckout::new("my-branch").at("/tmp/my-branch").is_main(false).with_branch_key().build());
 
     let (items, _) = correlate(&providers);
     assert_eq!(items[0].description(), "my-branch");
@@ -730,7 +733,7 @@ fn correlate_multiple_items_sharing_branch_merge() {
     let mut providers = new_providers();
     providers
         .checkouts
-        .insert(hp("/tmp/shared"), TestCheckout::new("shared-branch").at("/tmp/shared").is_main(false).with_branch_key().build());
+        .insert(qp("/tmp/shared"), TestCheckout::new("shared-branch").at("/tmp/shared").is_main(false).with_branch_key().build());
     providers.change_requests.insert("1".to_string(), TestChangeRequest::new("PR on shared", "shared-branch").with_branch_key().build());
     providers.sessions.insert(
         "s1".to_string(),
@@ -748,8 +751,8 @@ fn correlate_multiple_items_sharing_branch_merge() {
 #[test]
 fn correlate_two_checkouts_stay_separate() {
     let mut providers = new_providers();
-    providers.checkouts.insert(hp("/tmp/a"), TestCheckout::new("branch-a").at("/tmp/a").is_main(false).with_branch_key().build());
-    providers.checkouts.insert(hp("/tmp/b"), TestCheckout::new("branch-b").at("/tmp/b").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/a"), TestCheckout::new("branch-a").at("/tmp/a").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/tmp/b"), TestCheckout::new("branch-b").at("/tmp/b").is_main(false).with_branch_key().build());
 
     let (items, _) = correlate(&providers);
     assert_eq!(items.len(), 2);
@@ -1120,8 +1123,8 @@ fn filter_archived_sessions_removes_archived_and_expired() {
 
     let checkout = flotilla_protocol::WorkItem {
         kind: WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(flotilla_protocol::HostPath::new(
-            flotilla_protocol::HostName::local(),
+        identity: WorkItemIdentity::Checkout(flotilla_protocol::QualifiedPath::from_host_path(
+            &flotilla_protocol::HostName::local(),
             std::path::PathBuf::from("/tmp/co"),
         )),
         host: flotilla_protocol::HostName::local(),
@@ -1234,9 +1237,9 @@ fn end_to_end_mixed_providers() {
     let mut providers = new_providers();
 
     // trunk checkout
-    providers.checkouts.insert(hp("/repo"), TestCheckout::new("main").at("/repo").is_main(true).with_branch_key().build());
+    providers.checkouts.insert(qp("/repo"), TestCheckout::new("main").at("/repo").is_main(true).with_branch_key().build());
     // feature checkout + PR
-    providers.checkouts.insert(hp("/repo.feat"), TestCheckout::new("feat-login").at("/repo.feat").is_main(false).with_branch_key().build());
+    providers.checkouts.insert(qp("/repo.feat"), TestCheckout::new("feat-login").at("/repo.feat").is_main(false).with_branch_key().build());
     providers.change_requests.insert("10".to_string(), TestChangeRequest::new("Add login", "feat-login").with_branch_key().build());
     // standalone session
     providers.sessions.insert("s-solo".to_string(), TestSession::new("Solo work").with_session_ref("claude", "s-solo").build());
@@ -1284,8 +1287,9 @@ fn end_to_end_mixed_providers() {
 fn workspace_only_joins_checkout_through_attachable_set() {
     let mut providers = new_providers();
 
-    let remote_checkout = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("feta"), "/remote/feat-set");
-    let local_checkout = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("kiwi"), "/Users/robert/dev/project");
+    let remote_checkout = flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::new("feta"), "/remote/feat-set");
+    let local_checkout =
+        flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::new("kiwi"), "/Users/robert/dev/project");
     let set_id = flotilla_protocol::AttachableSetId::new("set-remote");
 
     let mut remote_checkout_data = TestCheckout::new("feat-set").at("/remote/feat-set").is_main(false).with_branch_key().build();
@@ -1333,7 +1337,7 @@ fn workspace_only_joins_checkout_through_attachable_set() {
 fn correlate_checkout_remains_anchor_when_attachable_set_present() {
     let mut providers = new_providers();
 
-    let co_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), "/tmp/feat-set");
+    let co_path = flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::local(), "/tmp/feat-set");
     let set_id = flotilla_protocol::AttachableSetId::new("set-1");
 
     providers.checkouts.insert(co_path.clone(), TestCheckout::new("feat-set").at("/tmp/feat-set").is_main(false).with_branch_key().build());

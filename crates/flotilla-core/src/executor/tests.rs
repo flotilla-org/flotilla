@@ -37,12 +37,12 @@ use async_trait::async_trait;
 use flotilla_protocol::{
     arg::Arg,
     test_support::{TestCheckout, TestIssue, TestSession},
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PreparedTerminalCommand, RepoSelector,
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, PreparedTerminalCommand, QualifiedPath, RepoSelector,
     ResolvedPaneCommand, TerminalStatus,
 };
 
-fn hp(path: &str) -> HostPath {
-    HostPath::new(HostName::local(), PathBuf::from(path))
+fn hp(path: &str) -> QualifiedPath {
+    QualifiedPath::from_host_path(&HostName::local(), PathBuf::from(path))
 }
 
 // -----------------------------------------------------------------------
@@ -488,7 +488,7 @@ async fn create_workspace_for_checkout_persists_workspace_binding() {
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
     let set = store.registry().sets.values().find(|set| set.id.as_str() == object_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), checkout_path)));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&local_host(), checkout_path)));
 }
 
 #[tokio::test]
@@ -550,11 +550,12 @@ async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present()
     let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     {
         let mut store = attachable_store.lock().expect("store lock");
-        let ensured_set_id = store.ensure_terminal_set(Some(local_host()), Some(HostPath::new(local_host(), path.clone())));
+        let ensured_set_id =
+            store.ensure_terminal_set(Some(local_host()), Some(QualifiedPath::from_host_path(&local_host(), path.clone())));
         store.save().expect("save attachable store");
         assert_eq!(
             store.registry().sets.get(&ensured_set_id).and_then(|set| set.checkout.clone()),
-            Some(HostPath::new(local_host(), path.clone()))
+            Some(QualifiedPath::from_host_path(&local_host(), path.clone()))
         );
     }
 
@@ -607,7 +608,7 @@ async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
 
     let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
     let set = store.registry().sets.get(&set_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), path)));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&local_host(), path)));
     assert!(temp.path().join("attachables").join("registry.json").exists(), "registry should be written");
 }
 
@@ -738,7 +739,7 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
         .expect("workspace binding should exist");
     assert_eq!(object_id, set_id.as_str());
     let set = store.registry().sets.get(&set_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(HostName::new("desktop"), PathBuf::from("/remote/feat"))));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&HostName::new("desktop"), PathBuf::from("/remote/feat"))));
 }
 
 #[tokio::test]
@@ -759,7 +760,7 @@ async fn create_workspace_for_checkout_selects_existing_workspace() {
     {
         let mut store = attachable_store.lock().expect("lock store");
         let host = local_host();
-        let checkout = HostPath::new(host.clone(), PathBuf::from("/repo/wt-feat"));
+        let checkout = QualifiedPath::from_host_path(&host, PathBuf::from("/repo/wt-feat"));
         let set_id = store.ensure_terminal_set(Some(host), Some(checkout));
         store.replace_binding(ProviderBinding {
             provider_category: "workspace_manager".into(),
@@ -930,7 +931,7 @@ async fn teleport_session_persists_workspace_binding() {
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
     let set = store.registry().sets.values().find(|set| set.id.as_str() == object_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), PathBuf::from("/repo/wt-feat"))));
+    assert_eq!(set.checkout, Some(QualifiedPath::from_host_path(&local_host(), PathBuf::from("/repo/wt-feat"))));
 }
 // -----------------------------------------------------------------------
 // Tests: SelectWorkspace
@@ -1087,7 +1088,7 @@ async fn remove_checkout_failure() {
 #[tokio::test]
 async fn remove_checkout_resolves_for_remote_host() {
     let remote = HostName::new("remote-box");
-    let remote_hp = HostPath::new(remote.clone(), PathBuf::from("/repo/wt-feat"));
+    let remote_hp = QualifiedPath::from_host_path(&remote, PathBuf::from("/repo/wt-feat"));
     let mut data = empty_data();
     data.checkouts.insert(remote_hp, TestCheckout::new("feat").build());
 
@@ -1811,7 +1812,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
     // Pre-populate the store with a set and members
     {
         let mut store = attachable_store.lock().expect("lock store");
-        let checkout_path = HostPath::new(host.clone(), "/repo/wt-feat-x");
+        let checkout_path = QualifiedPath::from_host_path(&host, "/repo/wt-feat-x");
         let set_id = store.ensure_terminal_set(Some(host.clone()), Some(checkout_path));
         store.ensure_terminal_attachable(
             &set_id,
@@ -2071,7 +2072,7 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
     let registry = empty_registry();
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(HostPath::new(HostName::new("feta"), path.clone()), TestCheckout::new("feat").build());
+    data.checkouts.insert(QualifiedPath::from_host_path(&HostName::new("feta"), path.clone()), TestCheckout::new("feat").build());
 
     let plan = build_plan(
         command_with_host("feta", CommandAction::CreateWorkspaceForCheckout { checkout_path: path.clone(), label: "feat".into() }),

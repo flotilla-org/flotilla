@@ -2,7 +2,7 @@ mod support;
 
 use std::path::PathBuf;
 
-use flotilla_protocol::{HostName, HostPath, ProviderData, RepoIdentity, SessionStatus, WorkItemIdentity};
+use flotilla_protocol::{HostName, ProviderData, QualifiedPath, RepoIdentity, SessionStatus, WorkItemIdentity};
 use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout};
 use ratatui::style::Color;
 use support::*;
@@ -404,7 +404,7 @@ fn delete_confirm_safe_to_delete() {
             uncommitted_files: vec![],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-cleanup"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/tmp/my-project/feat-cleanup"))),
         None,
     ));
     let output = harness.render_to_string();
@@ -423,7 +423,7 @@ fn delete_confirm_with_uncommitted_files() {
             uncommitted_files: vec![" M src/main.rs".into(), " M src/lib.rs".into(), "?? TODO.txt".into()],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-wip"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/tmp/my-project/feat-wip"))),
         None,
     ));
     let output = harness.render_to_string();
@@ -443,7 +443,7 @@ fn delete_confirm_with_many_uncommitted_files() {
             uncommitted_files: files,
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-big-wip"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/tmp/my-project/feat-big-wip"))),
         None,
     ));
     let output = harness.render_to_string();
@@ -462,7 +462,10 @@ fn delete_confirm_remote_host() {
             uncommitted_files: vec![],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::new("feta"), PathBuf::from("/home/dev/my-project/feat-remote"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(
+            &HostName::new("feta"),
+            PathBuf::from("/home/dev/my-project/feat-remote"),
+        )),
         Some(HostName::new("feta")),
     ));
     let output = harness.render_to_string();
@@ -625,7 +628,7 @@ fn close_confirm_widget_renders_on_short_terminals_without_overflow() {
 #[test]
 fn delete_confirm_widget_renders_on_short_terminals_without_overflow() {
     let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat/a"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat/a"))),
         None,
         None,
     );

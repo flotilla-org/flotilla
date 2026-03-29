@@ -15,9 +15,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse, TopologyRoute,
+    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostProvidersResponse,
+    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, QualifiedPath, RepoDelta, RepoDetailResponse,
+    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
+    TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -56,9 +57,9 @@ fn normalize_local_provider_hosts(mut providers: ProviderData, host_name: &HostN
     providers.checkouts = providers
         .checkouts
         .into_iter()
-        .map(|(host_path, mut checkout)| {
+        .map(|(qp, mut checkout)| {
             checkout.correlation_keys = normalize_correlation_keys(checkout.correlation_keys, host_name);
-            (HostPath::new(host_name.clone(), host_path.path), checkout)
+            (QualifiedPath::from_host_path(host_name, qp.path), checkout)
         })
         .collect();
 
@@ -80,7 +81,7 @@ fn normalize_local_provider_hosts(mut providers: ProviderData, host_name: &HostN
 fn normalize_correlation_keys(keys: Vec<CorrelationKey>, host_name: &HostName) -> Vec<CorrelationKey> {
     keys.into_iter()
         .map(|key| match key {
-            CorrelationKey::CheckoutPath(host_path) => CorrelationKey::CheckoutPath(HostPath::new(host_name.clone(), host_path.path)),
+            CorrelationKey::CheckoutPath(qp) => CorrelationKey::CheckoutPath(QualifiedPath::from_host_path(host_name, qp.path)),
             other => other,
         })
         .collect()

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use flotilla_protocol::{arg, AttachableSetId, EnvironmentId, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand};
+use flotilla_protocol::{arg, AttachableSetId, EnvironmentId, HostName, PreparedWorkspace, QualifiedPath, ResolvedPaneCommand};
 use tracing::{info, warn};
 
 use super::{terminals::TerminalPreparationService, workspace_config};
@@ -134,7 +134,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             return None;
         };
 
-        let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
+        let checkout = QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf());
         let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout), environment_id.cloned());
         if changed {
             if let Err(err) = store.save() {
@@ -163,7 +163,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         checkout_path: &Path,
     ) -> Option<String> {
         let store = self.attachable_store.lock().ok()?;
-        let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
+        let checkout = QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf());
         let set_ids = store.sets_for_checkout(&checkout);
         for set_id in set_ids {
             if let Some(ws_ref) = store.lookup_workspace_ref_for_set("workspace_manager", provider_name, &set_id) {
@@ -183,7 +183,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
 
         let (set_id, changed_set) = store.ensure_terminal_set_with_change(
             Some(target_host.clone()),
-            Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+            Some(QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf())),
             None,
         );
         let changed_binding = store.replace_binding(ProviderBinding {
@@ -217,7 +217,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             store.insert_set(flotilla_protocol::AttachableSet {
                 id: set_id.clone(),
                 host_affinity: Some(target_host.clone()),
-                checkout: Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+                checkout: Some(QualifiedPath::from_host_path(target_host, checkout_path.to_path_buf())),
                 template_identity: None,
                 environment_id: None,
                 members: Vec::new(),

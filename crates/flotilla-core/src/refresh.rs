@@ -238,8 +238,10 @@ async fn refresh_providers(
     }
 
     let local_host = flotilla_protocol::HostName::local();
-    pd.checkouts =
-        checkouts.into_iter().map(|(path, co)| (flotilla_protocol::HostPath::new(local_host.clone(), path.as_path()), co)).collect();
+    pd.checkouts = checkouts
+        .into_iter()
+        .map(|(path, co)| (flotilla_protocol::QualifiedPath::from_host_path(&local_host, path.as_path()), co))
+        .collect();
     collect_errors(&mut errors, "checkouts", checkout_errors);
 
     pd.change_requests = crs.into_iter().collect();
@@ -326,7 +328,7 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
     }
 
     // Set selection: project sets whose checkout matches a repo checkout
-    let checkout_paths: std::collections::HashSet<&flotilla_protocol::HostPath> = pd.checkouts.keys().collect();
+    let checkout_paths: std::collections::HashSet<&flotilla_protocol::QualifiedPath> = pd.checkouts.keys().collect();
     pd.attachable_sets = store
         .registry()
         .sets

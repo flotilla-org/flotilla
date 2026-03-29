@@ -222,8 +222,8 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
 
 // ── Provider data builders (unique to snapshot tests) ───────────────────
 
-pub fn make_checkout(branch: &str, path: &str, is_main: bool) -> (flotilla_protocol::HostPath, Checkout) {
-    let key = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from(path));
+pub fn make_checkout(branch: &str, path: &str, is_main: bool) -> (flotilla_protocol::QualifiedPath, Checkout) {
+    let key = flotilla_protocol::QualifiedPath::from_host_path(&flotilla_protocol::HostName::local(), PathBuf::from(path));
     let mut checkout = flotilla_protocol::test_support::TestCheckout::new(branch).is_main(is_main).with_branch_key().build();
     checkout.correlation_keys.push(flotilla_protocol::CorrelationKey::CheckoutPath(key.clone()));
     (key, checkout)

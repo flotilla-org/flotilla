@@ -242,7 +242,9 @@ impl WorkItemTable {
             if let GroupEntry::Item(item) = entry {
                 if item.is_main_checkout {
                     if let Some(co) = item.checkout_key() {
-                        host_repo_roots.insert(co.host.clone(), co.path.clone());
+                        if let Some(host_id) = co.host_id() {
+                            host_repo_roots.insert(HostName::new(host_id.as_str()), co.path.clone());
+                        }
                     }
                 }
             }
@@ -264,16 +266,17 @@ impl WorkItemTable {
                     }
                     GroupEntry::Item(item) => {
                         let pending = pending_actions.get(&item.identity);
-                        let is_local_item = item
-                            .checkout_key()
-                            .is_none_or(|co| model.my_host().is_some_and(|my| *my == co.host) || !model.hosts.contains_key(&co.host));
+                        let co_host_name = item.checkout_key().and_then(|co| co.host_id().map(|h| HostName::new(h.as_str())));
+                        let is_local_item = co_host_name
+                            .as_ref()
+                            .is_none_or(|hn| model.my_host().is_some_and(|my| my == hn) || !model.hosts.contains_key(hn));
                         let local_home = if is_local_item { dirs::home_dir() } else { None };
-                        let home_dir = item
-                            .checkout_key()
-                            .and_then(|co| model.hosts.get(&co.host))
+                        let home_dir = co_host_name
+                            .as_ref()
+                            .and_then(|hn| model.hosts.get(hn))
                             .and_then(|h| h.summary.system.home_dir.as_deref())
                             .or(local_home.as_deref());
-                        let repo_root = item.checkout_key().and_then(|co| host_repo_roots.get(&co.host)).unwrap_or(&local_repo_root);
+                        let repo_root = co_host_name.as_ref().and_then(|hn| host_repo_roots.get(hn)).unwrap_or(&local_repo_root);
                         let mut row =
                             build_item_row(item, &rm.providers, &col_widths, repo_root, prev_source.as_deref(), pending, theme, home_dir);
                         prev_source = item.source.clone();

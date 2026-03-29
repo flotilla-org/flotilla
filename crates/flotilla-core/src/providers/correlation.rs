@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use flotilla_protocol::HostPath;
+use flotilla_protocol::QualifiedPath;
 
 use super::types::CorrelationKey;
 
@@ -21,7 +21,7 @@ pub enum ItemKind {
 /// A key that uniquely identifies a provider item by its natural identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProviderItemKey {
-    Checkout(HostPath),
+    Checkout(QualifiedPath),
     AttachableSet(flotilla_protocol::AttachableSetId),
     ChangeRequest(String),
     Session(String),
@@ -194,7 +194,7 @@ pub fn correlate(items: Vec<CorrelatedItem>) -> Vec<CorrelatedGroup> {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::test_support::hp;
+    use flotilla_protocol::test_support::qp;
 
     use super::*;
 
@@ -215,7 +215,7 @@ mod tests {
             ItemKind::Checkout,
             "feat-x",
             vec![CorrelationKey::Branch("feat-x".into())],
-            ProviderItemKey::Checkout(hp("/code/feat-x")),
+            ProviderItemKey::Checkout(qp("/code/feat-x")),
         )];
         let groups = correlate(items);
         assert_eq!(groups.len(), 1);
@@ -231,7 +231,7 @@ mod tests {
                 ItemKind::Checkout,
                 "feat-x checkout",
                 vec![CorrelationKey::Branch("feat-x".into())],
-                ProviderItemKey::Checkout(hp("/code/feat-x")),
+                ProviderItemKey::Checkout(qp("/code/feat-x")),
             ),
             item(
                 "github",
@@ -258,8 +258,8 @@ mod tests {
                 "git",
                 ItemKind::Checkout,
                 "feat-x checkout",
-                vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(hp("/code/feat-x"))],
-                ProviderItemKey::Checkout(hp("/code/feat-x")),
+                vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(qp("/code/feat-x"))],
+                ProviderItemKey::Checkout(qp("/code/feat-x")),
             ),
             item(
                 "github",
@@ -272,7 +272,7 @@ mod tests {
                 "cmux",
                 ItemKind::Workspace,
                 "my-workspace",
-                vec![CorrelationKey::CheckoutPath(hp("/code/feat-x"))],
+                vec![CorrelationKey::CheckoutPath(qp("/code/feat-x"))],
                 ProviderItemKey::Workspace("cmux:my-workspace".into()),
             ),
         ];
@@ -293,14 +293,14 @@ mod tests {
                 ItemKind::Checkout,
                 "branch-a",
                 vec![CorrelationKey::Branch("branch-a".into())],
-                ProviderItemKey::Checkout(hp("/code/branch-a")),
+                ProviderItemKey::Checkout(qp("/code/branch-a")),
             ),
             item(
                 "git",
                 ItemKind::Checkout,
                 "branch-b",
                 vec![CorrelationKey::Branch("branch-b".into())],
-                ProviderItemKey::Checkout(hp("/code/branch-b")),
+                ProviderItemKey::Checkout(qp("/code/branch-b")),
             ),
             item(
                 "claude",
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn no_correlation_keys_each_item_separate() {
         let items = vec![
-            item("git", ItemKind::Checkout, "orphan-a", vec![], ProviderItemKey::Checkout(hp("/code/orphan-a"))),
+            item("git", ItemKind::Checkout, "orphan-a", vec![], ProviderItemKey::Checkout(qp("/code/orphan-a"))),
             item("github", ItemKind::ChangeRequest, "orphan-b", vec![], ProviderItemKey::ChangeRequest("orphan-b".into())),
             item("claude", ItemKind::CloudSession, "orphan-c", vec![], ProviderItemKey::Session("orphan-c".into())),
         ];
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn workspace_correlates_via_checkout_path() {
-        let repo = hp("/home/user/project");
+        let repo = qp("/home/user/project");
         let items = vec![
             item(
                 "git",
@@ -358,8 +358,8 @@ mod tests {
     fn two_checkouts_never_merge() {
         // A workspace with paths matching two different checkouts should NOT
         // cause those checkouts to merge into one group.
-        let main_path = hp("/code/project");
-        let feat_path = hp("/code/project.feat-x");
+        let main_path = qp("/code/project");
+        let feat_path = qp("/code/project.feat-x");
         let items = vec![
             item(
                 "git",
@@ -425,7 +425,7 @@ mod tests {
                 ItemKind::Checkout,
                 "feat-x",
                 vec![CorrelationKey::Branch("feat-x".into())],
-                ProviderItemKey::Checkout(hp("/code/feat-x")),
+                ProviderItemKey::Checkout(qp("/code/feat-x")),
             ),
             item(
                 "claude",
