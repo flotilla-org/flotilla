@@ -213,9 +213,9 @@ impl CommandRunner for ProcessCommandRunner {
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
         }
-        std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
+        tokio::fs::write(path, content).await.map_err(|e| format!("write {}: {e}", path.display()))
     }
 }
 
