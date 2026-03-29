@@ -23,6 +23,7 @@ pub struct ClaudeCodingAgentFactory;
 
 #[async_trait]
 impl Factory for ClaudeCodingAgentFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CloudAgentService;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -53,6 +54,7 @@ pub struct ClaudeApiAiUtilityFactory;
 
 #[async_trait]
 impl Factory for ClaudeApiAiUtilityFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn AiUtility;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -83,6 +85,7 @@ pub struct ClaudeCliAiUtilityFactory;
 
 #[async_trait]
 impl Factory for ClaudeCliAiUtilityFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn AiUtility;
 
     fn descriptor(&self) -> ProviderDescriptor {

@@ -22,6 +22,7 @@ pub struct CodexCodingAgentFactory;
 
 #[async_trait]
 impl Factory for CodexCodingAgentFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CloudAgentService;
 
     fn descriptor(&self) -> ProviderDescriptor {

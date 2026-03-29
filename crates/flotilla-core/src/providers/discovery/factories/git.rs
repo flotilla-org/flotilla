@@ -22,6 +22,7 @@ pub struct GitVcsFactory;
 
 #[async_trait]
 impl Factory for GitVcsFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn Vcs;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -51,6 +52,7 @@ pub struct WtCheckoutManagerFactory;
 
 #[async_trait]
 impl Factory for WtCheckoutManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CheckoutManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -80,6 +82,7 @@ pub struct GitCheckoutManagerFactory;
 
 #[async_trait]
 impl Factory for GitCheckoutManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CheckoutManager;
 
     fn descriptor(&self) -> ProviderDescriptor {

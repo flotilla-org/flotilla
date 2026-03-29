@@ -18,6 +18,7 @@ pub struct TmuxWorkspaceManagerFactory;
 
 #[async_trait]
 impl Factory for TmuxWorkspaceManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn WorkspaceManager;
 
     fn descriptor(&self) -> ProviderDescriptor {

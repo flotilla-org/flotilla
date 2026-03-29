@@ -18,6 +18,7 @@ pub struct ZellijWorkspaceManagerFactory;
 
 #[async_trait]
 impl Factory for ZellijWorkspaceManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn WorkspaceManager;
 
     fn descriptor(&self) -> ProviderDescriptor {

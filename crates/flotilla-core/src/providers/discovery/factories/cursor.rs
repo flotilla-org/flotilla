@@ -22,6 +22,7 @@ pub struct CursorCodingAgentFactory;
 
 #[async_trait]
 impl Factory for CursorCodingAgentFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CloudAgentService;
 
     fn descriptor(&self) -> ProviderDescriptor {

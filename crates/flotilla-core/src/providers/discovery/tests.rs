@@ -235,3 +235,20 @@ fn discovery_runtime_is_follower_checks_factories() {
     assert!(!DiscoveryRuntime::for_process(false).is_follower());
     assert!(DiscoveryRuntime::for_process(true).is_follower());
 }
+
+#[test]
+fn service_descriptor_fields() {
+    let desc = ServiceDescriptor {
+        category: ServiceCategory::IssueQuery,
+        backend: "github".into(),
+        implementation: "github".into(),
+        display_name: "GitHub Issues".into(),
+    };
+    assert_eq!(desc.backend, "github");
+    assert_eq!(desc.display_name, "GitHub Issues");
+}
+
+#[test]
+fn service_category_slug() {
+    assert_eq!(ServiceCategory::IssueQuery.slug(), "issue_query");
+}

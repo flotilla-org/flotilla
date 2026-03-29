@@ -103,6 +103,7 @@ struct SlowCloudAgentFactory {
 
 #[async_trait]
 impl Factory for SlowCloudAgentFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CloudAgentService;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -160,6 +161,7 @@ struct SlowAiUtilityFactory {
 
 #[async_trait]
 impl Factory for SlowAiUtilityFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn AiUtility;
 
     fn descriptor(&self) -> ProviderDescriptor {

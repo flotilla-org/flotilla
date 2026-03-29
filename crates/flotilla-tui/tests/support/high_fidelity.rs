@@ -472,6 +472,7 @@ struct CheckoutManagerFactory(Arc<dyn CheckoutManager>);
 
 #[async_trait]
 impl Factory for CheckoutManagerFactory {
+    type Descriptor = flotilla_core::providers::discovery::ProviderDescriptor;
     type Output = dyn CheckoutManager;
 
     fn descriptor(&self) -> flotilla_core::providers::discovery::ProviderDescriptor {

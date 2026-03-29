@@ -810,6 +810,7 @@ pub struct FakeIssueTrackerFactory(pub Arc<dyn IssueTracker>);
 
 #[async_trait::async_trait]
 impl Factory for FakeIssueTrackerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn IssueTracker;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -852,6 +853,7 @@ impl FakeVcsFactory {
 
 #[async_trait::async_trait]
 impl Factory for FakeVcsFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn Vcs;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -896,6 +898,7 @@ impl FakeCheckoutManagerFactory {
 
 #[async_trait::async_trait]
 impl Factory for FakeCheckoutManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CheckoutManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -923,6 +926,7 @@ pub struct FakeChangeRequestFactory(pub Arc<dyn ChangeRequestTracker>);
 
 #[async_trait::async_trait]
 impl Factory for FakeChangeRequestFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn ChangeRequestTracker;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -944,6 +948,7 @@ pub struct FakeWorkspaceManagerFactory(pub Arc<dyn WorkspaceManager>);
 
 #[async_trait::async_trait]
 impl Factory for FakeWorkspaceManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn WorkspaceManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -972,6 +977,7 @@ pub struct FakeTerminalPoolFactory(pub Arc<dyn TerminalPool>);
 
 #[async_trait::async_trait]
 impl Factory for FakeTerminalPoolFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn TerminalPool;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -1039,6 +1045,7 @@ struct ArcCheckoutManagerFactory(Arc<dyn CheckoutManager>);
 
 #[async_trait::async_trait]
 impl Factory for ArcCheckoutManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CheckoutManager;
 
     fn descriptor(&self) -> ProviderDescriptor {

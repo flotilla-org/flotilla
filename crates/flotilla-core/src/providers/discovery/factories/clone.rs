@@ -28,6 +28,7 @@ pub struct CloneCheckoutManagerFactory;
 
 #[async_trait]
 impl Factory for CloneCheckoutManagerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn CheckoutManager;
 
     fn descriptor(&self) -> ProviderDescriptor {

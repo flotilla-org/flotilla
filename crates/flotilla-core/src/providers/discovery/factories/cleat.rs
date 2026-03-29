@@ -18,6 +18,7 @@ pub struct CleatTerminalPoolFactory;
 
 #[async_trait]
 impl Factory for CleatTerminalPoolFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn TerminalPool;
 
     fn descriptor(&self) -> ProviderDescriptor {

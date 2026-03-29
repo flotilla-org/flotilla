@@ -358,6 +358,33 @@ impl ProviderDescriptor {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ServiceDescriptor {
+    pub category: ServiceCategory,
+    pub backend: String,
+    pub implementation: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ServiceCategory {
+    IssueQuery,
+}
+
+impl ServiceCategory {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::IssueQuery => "issue_query",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::IssueQuery => "Issue Query",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Detector traits
 // ---------------------------------------------------------------------------
@@ -383,9 +410,10 @@ pub trait RepoDetector: Send + Sync {
 
 #[async_trait]
 pub trait Factory: Send + Sync {
+    type Descriptor;
     type Output: ?Sized + Send + Sync;
 
-    fn descriptor(&self) -> ProviderDescriptor;
+    fn descriptor(&self) -> Self::Descriptor;
 
     async fn probe(
         &self,
@@ -396,15 +424,18 @@ pub trait Factory: Send + Sync {
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>>;
 }
 
-pub type VcsFactory = dyn Factory<Output = dyn Vcs>;
-pub type CheckoutManagerFactory = dyn Factory<Output = dyn CheckoutManager>;
-pub type ChangeRequestFactory = dyn Factory<Output = dyn ChangeRequestTracker>;
-pub type IssueTrackerFactory = dyn Factory<Output = dyn IssueTracker>;
-pub type CloudAgentFactory = dyn Factory<Output = dyn CloudAgentService>;
-pub type AiUtilityFactory = dyn Factory<Output = dyn AiUtility>;
-pub type WorkspaceManagerFactory = dyn Factory<Output = dyn WorkspaceManager>;
-pub type TerminalPoolFactory = dyn Factory<Output = dyn TerminalPool>;
-pub type EnvironmentProviderFactory = dyn Factory<Output = dyn crate::providers::environment::EnvironmentProvider>;
+pub type ProviderFactory<T> = dyn Factory<Descriptor = ProviderDescriptor, Output = T>;
+pub type ServiceFactory<T> = dyn Factory<Descriptor = ServiceDescriptor, Output = T>;
+
+pub type VcsFactory = ProviderFactory<dyn Vcs>;
+pub type CheckoutManagerFactory = ProviderFactory<dyn CheckoutManager>;
+pub type ChangeRequestFactory = ProviderFactory<dyn ChangeRequestTracker>;
+pub type IssueTrackerFactory = ProviderFactory<dyn IssueTracker>;
+pub type CloudAgentFactory = ProviderFactory<dyn CloudAgentService>;
+pub type AiUtilityFactory = ProviderFactory<dyn AiUtility>;
+pub type WorkspaceManagerFactory = ProviderFactory<dyn WorkspaceManager>;
+pub type TerminalPoolFactory = ProviderFactory<dyn TerminalPool>;
+pub type EnvironmentProviderFactory = ProviderFactory<dyn crate::providers::environment::EnvironmentProvider>;
 
 // ---------------------------------------------------------------------------
 // Factory registry
@@ -434,7 +465,7 @@ impl FactoryRegistry {
         runner: Arc<dyn CommandRunner>,
     ) -> ProviderRegistry {
         async fn probe_category<T: ?Sized + Send + Sync + 'static>(
-            factories: &[Box<dyn Factory<Output = T>>],
+            factories: &[Box<dyn Factory<Descriptor = ProviderDescriptor, Output = T>>],
             env: &EnvironmentBag,
             config: &ConfigStore,
             repo_root: &ExecutionEnvironmentPath,
@@ -557,7 +588,7 @@ pub async fn discover_providers(
     let mut unmet = Vec::new();
 
     async fn probe_all<T: ?Sized + Send + Sync + 'static, F>(
-        factories: &[Box<dyn Factory<Output = T>>],
+        factories: &[Box<dyn Factory<Descriptor = ProviderDescriptor, Output = T>>],
         env: &EnvironmentBag,
         config: &ConfigStore,
         repo_root: &ExecutionEnvironmentPath,

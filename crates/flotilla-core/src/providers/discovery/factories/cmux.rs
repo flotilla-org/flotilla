@@ -29,6 +29,7 @@ pub struct CmuxInsideFactory;
 
 #[async_trait]
 impl Factory for CmuxInsideFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn WorkspaceManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -56,6 +57,7 @@ pub struct CmuxBinaryFallbackFactory;
 
 #[async_trait]
 impl Factory for CmuxBinaryFallbackFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn WorkspaceManager;
 
     fn descriptor(&self) -> ProviderDescriptor {

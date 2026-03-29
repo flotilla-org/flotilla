@@ -18,6 +18,7 @@ pub struct PassthroughTerminalPoolFactory;
 
 #[async_trait]
 impl Factory for PassthroughTerminalPoolFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn TerminalPool;
 
     fn descriptor(&self) -> ProviderDescriptor {

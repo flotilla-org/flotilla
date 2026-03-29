@@ -40,6 +40,7 @@ pub struct GitHubChangeRequestFactory;
 
 #[async_trait]
 impl Factory for GitHubChangeRequestFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn ChangeRequestTracker;
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -74,6 +75,7 @@ pub struct GitHubIssueTrackerFactory;
 
 #[async_trait]
 impl Factory for GitHubIssueTrackerFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn IssueTracker;
 
     fn descriptor(&self) -> ProviderDescriptor {

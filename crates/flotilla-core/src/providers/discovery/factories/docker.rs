@@ -18,6 +18,7 @@ pub struct DockerEnvironmentFactory;
 
 #[async_trait]
 impl Factory for DockerEnvironmentFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn EnvironmentProvider;
 
     fn descriptor(&self) -> ProviderDescriptor {

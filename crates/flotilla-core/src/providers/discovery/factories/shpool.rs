@@ -18,6 +18,7 @@ pub struct ShpoolTerminalPoolFactory;
 
 #[async_trait]
 impl Factory for ShpoolTerminalPoolFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn TerminalPool;
 
     fn descriptor(&self) -> ProviderDescriptor {
