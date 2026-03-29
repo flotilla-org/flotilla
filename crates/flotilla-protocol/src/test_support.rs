@@ -9,14 +9,8 @@ use std::path::PathBuf;
 use crate::{
     provider_data::{ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, SessionStatus},
     qualified_path::HostId,
-    HostName, HostPath, QualifiedPath,
+    QualifiedPath,
 };
-
-/// Build a `HostPath` with a deterministic `"test-host"` hostname.
-/// Kept for downstream crates that still use `HostPath`.
-pub fn hp(path: &str) -> HostPath {
-    HostPath::new(HostName::new("test-host"), PathBuf::from(path))
-}
 
 /// Build a `QualifiedPath` with a deterministic `"test-host"` host qualifier.
 pub fn qp(path: &str) -> QualifiedPath {
