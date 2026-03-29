@@ -87,6 +87,8 @@ pub trait AttachableStoreApi: Send + Sync {
         external_ref: &str,
     ) -> bool;
     fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo>;
+    /// Find sets matching a checkout and environment. `None` for `environment_id`
+    /// matches only sets with no environment — not all sets for the checkout.
     fn sets_for_checkout(&self, checkout: &QualifiedPath, environment_id: Option<&EnvironmentId>) -> Vec<AttachableSetId>;
     fn update_terminal_status(&mut self, id: &AttachableId, status: TerminalStatus) -> bool;
     fn save(&self) -> Result<(), String>;

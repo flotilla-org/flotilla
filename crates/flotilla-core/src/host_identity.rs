@@ -12,19 +12,25 @@ use std::{
 use flotilla_protocol::qualified_path::HostId;
 use uuid::Uuid;
 
+use crate::providers::{ChannelLabel, CommandRunner};
+
 /// Resolve a machine-scoped state directory under `base_state_dir`.
 ///
 /// Resolution order for the machine identifier:
 /// 1. `config_machine_id` parameter (from daemon.toml)
 /// 2. `/etc/machine-id` file (Linux)
-/// 3. `IOPlatformUUID` via `ioreg` (macOS)
+/// 3. `IOPlatformUUID` via `ioreg` (macOS, using injected `runner`)
 /// 4. Error
-pub fn machine_scoped_state_dir(base_state_dir: &Path, config_machine_id: Option<&str>) -> Result<PathBuf, String> {
+pub async fn machine_scoped_state_dir(
+    base_state_dir: &Path,
+    config_machine_id: Option<&str>,
+    runner: &dyn CommandRunner,
+) -> Result<PathBuf, String> {
     let machine_id = if let Some(id) = config_machine_id {
         id.to_owned()
     } else if let Some(id) = read_etc_machine_id() {
         id
-    } else if let Some(id) = read_macos_platform_uuid() {
+    } else if let Some(id) = read_macos_platform_uuid(runner).await {
         id
     } else {
         return Err("Cannot determine machine identity. Set `machine_id` in daemon.toml.".to_owned());
@@ -44,18 +50,12 @@ fn read_etc_machine_id() -> Option<String> {
     }
 }
 
-/// Query macOS `IOPlatformUUID` via `ioreg`.
-fn read_macos_platform_uuid() -> Option<String> {
-    let output = std::process::Command::new("ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]).output().ok()?;
+/// Query macOS `IOPlatformUUID` via the injected `CommandRunner`.
+async fn read_macos_platform_uuid(runner: &dyn CommandRunner) -> Option<String> {
+    let output = runner.run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Path::new("/"), &ChannelLabel::Noop).await.ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
+    for line in output.lines() {
         if line.contains("IOPlatformUUID") {
-            // Line looks like: "IOPlatformUUID" = "XXXXXXXX-XXXX-..."
             if let Some(uuid_start) = line.rfind('"') {
                 let before_last = &line[..uuid_start];
                 if let Some(uuid_begin) = before_last.rfind('"') {
@@ -115,6 +115,7 @@ pub fn resolve_or_create_host_id(state_dir: &Path) -> Result<HostId, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProcessCommandRunner;
 
     #[test]
     fn generates_and_persists_host_id() {
@@ -134,21 +135,23 @@ mod tests {
         assert_eq!(id.as_str(), "my-custom-id");
     }
 
-    #[test]
-    fn machine_scoped_dir_uses_config_override() {
+    #[tokio::test]
+    async fn machine_scoped_dir_uses_config_override() {
         let base = std::path::Path::new("/tmp/flotilla-test");
-        let dir = machine_scoped_state_dir(base, Some("my-machine")).unwrap();
+        let runner = ProcessCommandRunner;
+        let dir = machine_scoped_state_dir(base, Some("my-machine"), &runner).await.unwrap();
         assert_eq!(dir, base.join("my-machine"));
     }
 
-    #[test]
-    fn machine_scoped_dir_falls_back_to_etc_machine_id() {
+    #[tokio::test]
+    async fn machine_scoped_dir_falls_back_to_etc_machine_id() {
         let base = std::path::Path::new("/tmp/flotilla-test");
+        let runner = ProcessCommandRunner;
         // This test only works on Linux with /etc/machine-id
         if std::path::Path::new("/etc/machine-id").exists() {
-            let dir = machine_scoped_state_dir(base, None).unwrap();
+            let dir = machine_scoped_state_dir(base, None, &runner).await.unwrap();
             assert!(dir.starts_with(base));
-            assert_ne!(dir, *base); // Should have a machine-id segment
+            assert_ne!(dir, *base);
         }
     }
 }
