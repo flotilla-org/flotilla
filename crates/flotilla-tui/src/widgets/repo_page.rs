@@ -7,16 +7,14 @@ use std::{
 };
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_core::data::{GroupEntry, SectionLabels};
+use flotilla_core::data::SectionLabels;
 use flotilla_protocol::{ProviderData, RepoIdentity, RepoLabels, WorkItem, WorkItemIdentity};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
 };
 
-use super::{
-    preview_panel::PreviewPanel, work_item_table::WorkItemTable, AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
-};
+use super::{preview_panel::PreviewPanel, split_table::SplitTable, AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{ui_state::PendingAction, RepoViewLayout},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
@@ -97,7 +95,7 @@ pub struct RepoData {
 #[derive(Default)]
 struct DoubleClickState {
     last_time: Option<Instant>,
-    last_selectable_idx: Option<usize>,
+    last_selectable_idx: Option<(usize, usize)>,
 }
 
 // ── RepoPage ──
@@ -111,7 +109,7 @@ struct DoubleClickState {
 pub struct RepoPage {
     repo_identity: RepoIdentity,
     repo_data: Shared<RepoData>,
-    pub table: WorkItemTable,
+    pub table: SplitTable,
     pub preview: PreviewPanel,
     pub multi_selected: HashSet<WorkItemIdentity>,
     pub pending_actions: HashMap<WorkItemIdentity, PendingAction>,
@@ -128,7 +126,7 @@ impl RepoPage {
         Self {
             repo_identity,
             repo_data,
-            table: WorkItemTable::new(),
+            table: SplitTable::new(),
             preview: PreviewPanel::new(),
             multi_selected: HashSet::new(),
             pending_actions: HashMap::new(),
@@ -168,21 +166,11 @@ impl RepoPage {
             issues: data.labels.issues.section.clone(),
             sessions: data.labels.cloud_agents.section.clone(),
         };
-        let grouped = flotilla_core::data::group_work_items(&data.work_items, &data.providers, &section_labels, &data.path);
-        let grouped = if self.show_archived { grouped } else { grouped.filter_archived_sessions(&data.providers) };
-        self.table.update_items(grouped);
+        let sections = flotilla_core::data::group_work_items_split(&data.work_items, &data.providers, &section_labels, &data.path);
+        let sections = if self.show_archived { sections } else { flotilla_core::data::filter_archived_sections(sections, &data.providers) };
+        self.table.update_sections(sections);
 
-        // Prune stale multi_selected and pending_actions
-        let current_identities: HashSet<WorkItemIdentity> = self
-            .table
-            .grouped_items
-            .table_entries
-            .iter()
-            .filter_map(|e| match e {
-                GroupEntry::Item(item) => Some(item.identity.clone()),
-                _ => None,
-            })
-            .collect();
+        let current_identities: HashSet<WorkItemIdentity> = self.table.all_items().map(|item| item.identity.clone()).collect();
         self.multi_selected.retain(|id| current_identities.contains(id));
         self.pending_actions.retain(|id, _| current_identities.contains(id));
     }
@@ -230,16 +218,7 @@ impl RepoPage {
     /// Render the table using RepoPage-owned state,
     fn render_table(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
         self.table.table_area = area;
-        self.table.render_table_owned(
-            ctx.model,
-            ctx.ui,
-            ctx.theme,
-            frame,
-            area,
-            self.show_providers,
-            &self.multi_selected,
-            &self.pending_actions,
-        );
+        self.table.render(ctx.model, ctx.ui, ctx.theme, frame, area, self.show_providers, &self.multi_selected, &self.pending_actions);
     }
 
     // ── Action helpers ──
@@ -282,23 +261,17 @@ impl RepoPage {
     }
 
     fn toggle_multi_select(&mut self) {
-        if let Some(si) = self.table.selected_selectable_idx {
-            if let Some(&table_idx) = self.table.grouped_items.selectable_indices.get(si) {
-                if let Some(GroupEntry::Item(item)) = self.table.grouped_items.table_entries.get(table_idx) {
-                    let identity = item.identity.clone();
-                    if !self.multi_selected.remove(&identity) {
-                        self.multi_selected.insert(identity);
-                    }
-                }
+        if let Some(item) = self.table.selected_work_item() {
+            let identity = item.identity.clone();
+            if !self.multi_selected.remove(&identity) {
+                self.multi_selected.insert(identity);
             }
         }
     }
 
     pub fn select_all(&mut self) {
-        for entry in &self.table.grouped_items.table_entries {
-            if let GroupEntry::Item(item) = entry {
-                self.multi_selected.insert(item.identity.clone());
-            }
+        for item in self.table.all_items() {
+            self.multi_selected.insert(item.identity.clone());
         }
     }
 }
@@ -309,11 +282,11 @@ impl InteractiveWidget for RepoPage {
 
         match action {
             Action::SelectNext => {
-                self.table.select_next_self();
+                self.table.select_next();
                 Outcome::Consumed
             }
             Action::SelectPrev => {
-                self.table.select_prev_self();
+                self.table.select_prev();
                 Outcome::Consumed
             }
             Action::ToggleMultiSelect => {
@@ -375,14 +348,14 @@ impl InteractiveWidget for RepoPage {
                     let y = mouse.row;
 
                     // Double-click detection using owned table state
-                    if let Some(si) = self.table.row_at_mouse_self(x, y) {
+                    if let Some(hit) = self.table.row_at_mouse(x, y) {
                         let now = Instant::now();
                         let is_double_click = self.double_click.last_time.map(|t| now.duration_since(t).as_millis() < 400).unwrap_or(false)
-                            && self.double_click.last_selectable_idx == Some(si);
+                            && self.double_click.last_selectable_idx == Some(hit);
 
                         if is_double_click {
                             // Select the row, then trigger double-click action
-                            self.table.select_row_self(si);
+                            self.table.select_by_mouse(hit.0, hit.1);
                             ctx.app_actions.push(AppAction::ActionEnter);
                             self.double_click.last_time = None;
                             self.double_click.last_selectable_idx = None;
@@ -390,7 +363,7 @@ impl InteractiveWidget for RepoPage {
                         }
 
                         self.double_click.last_time = Some(now);
-                        self.double_click.last_selectable_idx = Some(si);
+                        self.double_click.last_selectable_idx = Some(hit);
                     }
 
                     // Gear icon click (still needs ctx for the AppAction)
@@ -402,8 +375,8 @@ impl InteractiveWidget for RepoPage {
                     }
 
                     // Single click: select row using owned state
-                    if let Some(si) = self.table.row_at_mouse_self(x, y) {
-                        self.table.select_row_self(si);
+                    if let Some(hit) = self.table.row_at_mouse(x, y) {
+                        self.table.select_by_mouse(hit.0, hit.1);
                         return Outcome::Consumed;
                     }
                 }
@@ -414,8 +387,8 @@ impl InteractiveWidget for RepoPage {
             MouseEventKind::Down(MouseButton::Right) => {
                 if !*ctx.is_config {
                     // Right-click: select row using owned state, then open action menu
-                    if let Some(si) = self.table.row_at_mouse_self(mouse.column, mouse.row) {
-                        self.table.select_row_self(si);
+                    if let Some(hit) = self.table.row_at_mouse(mouse.column, mouse.row) {
+                        self.table.select_by_mouse(hit.0, hit.1);
                         ctx.app_actions.push(AppAction::OpenActionMenu);
                         return Outcome::Consumed;
                     }
@@ -425,7 +398,7 @@ impl InteractiveWidget for RepoPage {
 
             MouseEventKind::ScrollDown => {
                 if !*ctx.is_config {
-                    self.table.select_next_self();
+                    self.table.select_next();
                     return Outcome::Consumed;
                 }
                 Outcome::Ignored
@@ -433,7 +406,7 @@ impl InteractiveWidget for RepoPage {
 
             MouseEventKind::ScrollUp => {
                 if !*ctx.is_config {
-                    self.table.select_prev_self();
+                    self.table.select_prev();
                     return Outcome::Consumed;
                 }
                 Outcome::Ignored

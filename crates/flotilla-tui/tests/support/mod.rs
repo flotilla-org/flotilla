@@ -206,6 +206,11 @@ fn test_labels() -> RepoLabels {
     }
 }
 
+/// Public entry point for tests that need to convert a rendered buffer to text.
+pub fn buffer_to_string_for_test(buffer: &ratatui::buffer::Buffer) -> String {
+    buffer_to_string(buffer)
+}
+
 fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
     let area = buffer.area;
     let mut lines = Vec::new();

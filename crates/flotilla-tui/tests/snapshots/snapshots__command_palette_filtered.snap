@@ -1,28 +1,27 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 662
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
+                                                                    ⚙   ┌ Preview ─────────────────────────────────────┐
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
 /he                          <ENT> RUN  <ESC> CLOSE  <TAB> FILL                                   ◫ auto   @local
   help  show key bindings                                                                                         h

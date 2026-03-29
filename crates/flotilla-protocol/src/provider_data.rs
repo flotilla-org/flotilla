@@ -79,6 +79,17 @@ pub enum ChangeRequestStatus {
     Closed,
 }
 
+impl std::fmt::Display for ChangeRequestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => write!(f, "open"),
+            Self::Draft => write!(f, "draft"),
+            Self::Merged => write!(f, "merged"),
+            Self::Closed => write!(f, "closed"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
     pub title: String,

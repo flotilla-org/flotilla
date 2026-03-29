@@ -1,35 +1,34 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 309
 expression: output
 ---
  ⚓  flotilla  | my-project | [+]
-┌─────────────────────────────────────────────────────────────────── ⚙ ┐┌ Preview ─────────────────────────────────────┐
-│      Source     Path  Descriptio Branc WT  WS  PR   SS   Issues Git  ││Description: Fix login timeout bug            │
-│      ── Issues ──                                                    ││Issue #25: Fix login timeout bug []           │
-│▸  ◇                   Fix login  —                       #25         ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-│                                                                      ││                                              │
-└──────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────┘
+── Issues ───────────────────────────────────────────────────────── ⚙   ┌ Preview ─────────────────────────────────────┐
+      ID     Title                              Labels            PR    │Description: Fix login timeout bug            │
+▸  ◇  #25    Fix login timeout bug                                      │Issue #25: Fix login timeout bug []           │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
 / for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     ◫ auto   @local

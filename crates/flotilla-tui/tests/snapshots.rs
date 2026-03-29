@@ -2,8 +2,13 @@ mod support;
 
 use std::path::PathBuf;
 
-use flotilla_protocol::{HostName, HostPath, ProviderData, RepoIdentity, SessionStatus, WorkItemIdentity};
-use flotilla_tui::app::{BranchInputKind, InFlightCommand, Intent, ProviderStatus, RepoViewLayout};
+use flotilla_protocol::{
+    CheckoutRef, HostName, HostPath, HostSummary, ProviderData, RepoIdentity, SessionStatus, SystemInfo, WorkItem, WorkItemIdentity,
+};
+use flotilla_tui::app::{
+    ui_state::{PendingAction, PendingStatus},
+    BranchInputKind, InFlightCommand, Intent, PeerStatus, ProviderStatus, RepoViewLayout, TuiHostState,
+};
 use ratatui::style::Color;
 use support::*;
 use tui_input::Input;
@@ -673,4 +678,266 @@ fn command_palette_selection() {
     let mut harness = TestHarness::single_repo("my-project").with_widget(Box::new(widget));
     let output = harness.render_to_string();
     insta::assert_snapshot!(output);
+}
+
+// ── Regression tests ─────────────────────────────────────────────────────
+
+/// In-flight pending action replaces the normal icon with a spinner character
+/// and preserves the rest of the row content.
+#[test]
+fn pending_action_in_flight_shows_spinner() {
+    let items = vec![make_work_item_checkout("feat-login", "/test/my-project/feat-login")];
+    let providers = ProviderData::default();
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+
+    // Insert an in-flight pending action for the checkout item.
+    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-login")));
+    let repo = harness.model.repo_order[0].clone();
+    harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
+        command_id: 1,
+        status: PendingStatus::InFlight,
+        description: "Deleting checkout...".into(),
+    });
+
+    let buffer = harness.render_to_buffer();
+
+    // The spinner character appears in the icon column (column 0 after the
+    // highlight symbol). Find the first braille spinner character in the
+    // rendered buffer — it should be on the data row (row 2 in the table:
+    // divider=0, header=1, data=2).
+    let braille_spinner: &[char] = &['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}'];
+    let area = buffer.area;
+    let mut found_spinner = false;
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            let sym = buffer[(x, y)].symbol();
+            if sym.len() == 3 && sym.chars().next().is_some_and(|ch| braille_spinner.contains(&ch)) {
+                found_spinner = true;
+                break;
+            }
+        }
+        if found_spinner {
+            break;
+        }
+    }
+    assert!(found_spinner, "expected a braille spinner character in the rendered buffer for an in-flight pending action");
+
+    // Verify the row still contains the branch text and description.
+    let output = support::buffer_to_string_for_test(&buffer);
+    assert!(output.contains("feat-login"), "expected branch name to be preserved in shimmer row");
+}
+
+/// Failed pending action shows the error icon and applies error styling.
+#[test]
+fn pending_action_failed_shows_error_icon() {
+    let items = vec![make_work_item_checkout("feat-broken", "/test/my-project/feat-broken")];
+    let providers = ProviderData::default();
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+
+    // Insert a failed pending action.
+    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-broken")));
+    let repo = harness.model.repo_order[0].clone();
+    harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
+        command_id: 2,
+        status: PendingStatus::Failed("network error".into()),
+        description: "Deleting checkout...".into(),
+    });
+
+    let output = harness.render_to_string();
+    // The failed icon is ✗ (U+2717).
+    assert!(output.contains('\u{2717}'), "expected error icon (✗) in rendered output for failed pending action");
+
+    // Verify error styling on the data row.
+    let buffer = harness.render_to_buffer();
+    let theme = flotilla_tui::theme::Theme::classic();
+
+    // Find the row containing the ✗ icon and check its styling.
+    let area = buffer.area;
+    let mut error_row_y = None;
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if buffer[(x, y)].symbol() == "\u{2717}" {
+                error_row_y = Some(y);
+                break;
+            }
+        }
+        if error_row_y.is_some() {
+            break;
+        }
+    }
+    let y = error_row_y.expect("should find error icon row");
+
+    // Check that cells on this row have the error fg color and DIM modifier.
+    // Pick a cell that is part of the content (not the icon itself or spaces).
+    // The description "checkout feat-broken" should be rendered with error color.
+    let mut found_error_styled_cell = false;
+    for x in area.x..area.x + area.width {
+        let cell = &buffer[(x, y)];
+        if cell.fg == theme.error && cell.modifier.contains(ratatui::style::Modifier::DIM) && cell.symbol().trim() != "" {
+            found_error_styled_cell = true;
+            break;
+        }
+    }
+    assert!(found_error_styled_cell, "expected cells on the failed row to have error fg and DIM modifier");
+}
+
+/// Multi-select applies multi_select_bg, but the active (highlighted) row
+/// uses row_highlight which takes precedence.
+#[test]
+fn multi_select_with_active_row_highlight() {
+    let items = vec![
+        make_work_item_checkout("feat-a", "/test/my-project/feat-a"),
+        make_work_item_checkout("feat-b", "/test/my-project/feat-b"),
+        make_work_item_checkout("feat-c", "/test/my-project/feat-c"),
+    ];
+    let providers = ProviderData::default();
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+
+    let repo = harness.model.repo_order[0].clone();
+    let page = harness.screen.repo_pages.get_mut(&repo).expect("repo page exists");
+
+    // Multi-select items 0 and 1.
+    let identity_a = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-a")));
+    let identity_b = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-b")));
+    page.multi_selected.insert(identity_a);
+    page.multi_selected.insert(identity_b);
+
+    // Navigate to item 1 (feat-b) so it is both selected AND multi-selected.
+    page.table.select_next();
+
+    let theme = flotilla_tui::theme::Theme::classic();
+    let buffer = harness.render_to_buffer();
+
+    // Determine the y-coordinates of each data row.
+    // Layout: tab bar(1) + divider(1) + column header(1) + data rows (3).
+    // Tab bar is at y=0, then content starts at y=1.
+    // Divider at y=1, column header at y=2, data rows at y=3, y=4, y=5.
+    let area = buffer.area;
+
+    // Find the y-coords of the three data rows by scanning for the checkout
+    // icons (○). The first three rows with ○ or ▸ are our data rows.
+    let mut data_row_ys: Vec<u16> = Vec::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            let sym = buffer[(x, y)].symbol();
+            if sym == "○" || sym == "●" {
+                data_row_ys.push(y);
+                break;
+            }
+        }
+    }
+    assert!(data_row_ys.len() >= 3, "expected at least 3 data rows with checkout icons, found {}", data_row_ys.len());
+
+    let y_item_0 = data_row_ys[0]; // feat-a: multi-selected only
+    let y_item_1 = data_row_ys[1]; // feat-b: multi-selected AND active
+    let y_item_2 = data_row_ys[2]; // feat-c: neither
+
+    // Pick a content cell in the middle of each row for the bg check.
+    let test_x = area.x + 10;
+
+    // Item 0: multi-selected only -> multi_select_bg
+    assert_eq!(buffer[(test_x, y_item_0)].bg, theme.multi_select_bg, "item 0 (multi-selected only) should have multi_select_bg");
+
+    // Item 1: multi-selected AND active -> row_highlight wins
+    assert_eq!(
+        buffer[(test_x, y_item_1)].bg,
+        theme.row_highlight,
+        "item 1 (multi-selected + active) should have row_highlight, not multi_select_bg"
+    );
+
+    // Item 2: neither -> default background (Reset)
+    assert_ne!(buffer[(test_x, y_item_2)].bg, theme.multi_select_bg, "item 2 (neither) should NOT have multi_select_bg");
+    assert_ne!(buffer[(test_x, y_item_2)].bg, theme.row_highlight, "item 2 (neither) should NOT have row_highlight");
+}
+
+/// Remote host checkout paths are shortened using the remote host's home
+/// directory, not the local home directory.
+#[test]
+fn remote_host_home_directory_shortening() {
+    // Build a remote checkout item on host "feta" at /home/alice/dev/myrepo/feat-x.
+    let remote_host = HostName::new("feta");
+    let remote_path = PathBuf::from("/home/alice/dev/myrepo/feat-x");
+    let remote_main_path = PathBuf::from("/home/alice/dev/myrepo");
+    let host_path = HostPath::new(remote_host.clone(), remote_path.clone());
+    let main_host_path = HostPath::new(remote_host.clone(), remote_main_path.clone());
+
+    let main_item = WorkItem {
+        kind: flotilla_protocol::WorkItemKind::Checkout,
+        identity: WorkItemIdentity::Checkout(main_host_path.clone()),
+        host: remote_host.clone(),
+        branch: Some("main".into()),
+        description: "checkout main".into(),
+        checkout: Some(CheckoutRef { key: main_host_path, is_main_checkout: true }),
+        change_request_key: None,
+        session_key: None,
+        issue_keys: Vec::new(),
+        workspace_refs: Vec::new(),
+        is_main_checkout: true,
+        debug_group: Vec::new(),
+        source: Some("feta".into()),
+        terminal_keys: Vec::new(),
+        attachable_set_id: None,
+        agent_keys: Vec::new(),
+    };
+
+    let feat_item = WorkItem {
+        kind: flotilla_protocol::WorkItemKind::Checkout,
+        identity: WorkItemIdentity::Checkout(host_path.clone()),
+        host: remote_host.clone(),
+        branch: Some("feat-x".into()),
+        description: "checkout feat-x".into(),
+        checkout: Some(CheckoutRef { key: host_path, is_main_checkout: false }),
+        change_request_key: None,
+        session_key: None,
+        issue_keys: Vec::new(),
+        workspace_refs: Vec::new(),
+        is_main_checkout: false,
+        debug_group: Vec::new(),
+        source: Some("feta".into()),
+        terminal_keys: Vec::new(),
+        attachable_set_id: None,
+        agent_keys: Vec::new(),
+    };
+
+    let items = vec![main_item, feat_item];
+    let providers = ProviderData::default();
+    let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
+
+    // Add local host so the model can distinguish local vs remote.
+    let local_host = HostName::new("local");
+    harness.model.hosts.insert(local_host.clone(), TuiHostState {
+        host_name: local_host,
+        is_local: true,
+        status: PeerStatus::Connected,
+        summary: HostSummary {
+            host_name: HostName::new("local"),
+            system: SystemInfo::default(),
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        },
+    });
+
+    // Add remote host info with home_dir set.
+    harness.model.hosts.insert(remote_host.clone(), TuiHostState {
+        host_name: remote_host.clone(),
+        is_local: false,
+        status: PeerStatus::Connected,
+        summary: HostSummary {
+            host_name: remote_host,
+            system: SystemInfo { home_dir: Some(PathBuf::from("/home/alice")), ..SystemInfo::default() },
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        },
+    });
+
+    // Use a wider display so the path column isn't truncated.
+    harness = harness.with_width(180);
+    let output = harness.render_to_string();
+
+    // The main checkout path should be shortened to ~/dev/myrepo.
+    assert!(output.contains("~/dev/myrepo"), "expected remote main path to be shortened with ~/: {output}");
+    // The full path /home/alice/dev/myrepo should NOT appear.
+    assert!(!output.contains("/home/alice/dev/myrepo"), "expected /home/alice to be replaced with ~ in remote path: {output}");
 }

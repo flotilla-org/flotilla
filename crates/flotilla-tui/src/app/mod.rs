@@ -669,16 +669,10 @@ impl App {
                 AppAction::ToggleMultiSelect => {
                     if let Some(repo_identity) = self.model.active_repo_identity_opt().cloned() {
                         if let Some(page) = self.screen.repo_pages.get_mut(&repo_identity) {
-                            if let Some(si) = page.table.selected_selectable_idx {
-                                if let Some(&table_idx) = page.table.grouped_items.selectable_indices.get(si) {
-                                    if let Some(flotilla_core::data::GroupEntry::Item(item)) =
-                                        page.table.grouped_items.table_entries.get(table_idx)
-                                    {
-                                        let item_identity = item.identity.clone();
-                                        if !page.multi_selected.remove(&item_identity) {
-                                            page.multi_selected.insert(item_identity.clone());
-                                        }
-                                    }
+                            if let Some(item) = page.table.selected_work_item() {
+                                let item_identity = item.identity.clone();
+                                if !page.multi_selected.remove(&item_identity) {
+                                    page.multi_selected.insert(item_identity);
                                 }
                             }
                         }

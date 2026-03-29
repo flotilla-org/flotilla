@@ -159,23 +159,16 @@ impl HighFidelityHarness {
         };
         page.reconcile_if_changed();
 
-        let selected = page
-            .table
-            .grouped_items
-            .selectable_indices
-            .iter()
-            .enumerate()
-            .find_map(|(selectable_idx, table_idx)| match page.table.grouped_items.table_entries.get(*table_idx) {
-                Some(flotilla_core::data::GroupEntry::Item(item))
-                    if item.kind == WorkItemKind::Checkout && item.branch.as_deref() == Some(branch) =>
-                {
-                    Some(selectable_idx)
-                }
-                _ => None,
-            })
-            .ok_or_else(|| format!("checkout row not found for branch {branch}"))?;
-
-        page.table.select_row_self(selected);
+        // Find the item matching the requested branch across all sections.
+        let mut found = None;
+        for (section_idx, item, item_idx) in page.table.all_items_with_indices() {
+            if item.kind == WorkItemKind::Checkout && item.branch.as_deref() == Some(branch) {
+                found = Some((section_idx, item_idx));
+                break;
+            }
+        }
+        let (section_idx, item_idx) = found.ok_or_else(|| format!("checkout row not found for branch {branch}"))?;
+        page.table.select_by_mouse(section_idx, item_idx);
         Ok(())
     }
 

@@ -39,13 +39,13 @@ impl App {
         }
         let identity = self.model.repo_order[self.model.active_repo].clone();
         if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-            let total = page.table.grouped_items.selectable_indices.len();
+            let total = page.table.total_item_count();
             if total == 0 {
                 return;
             }
-            page.table.select_next_self();
+            page.table.select_next();
             // Infinite scroll: fetch more issues when near the bottom
-            if let Some(si) = page.table.selected_selectable_idx {
+            if let Some(si) = page.table.selected_flat_index() {
                 if si + 5 >= total && self.model.repos[&identity].issue_has_more && !self.model.repos[&identity].issue_fetch_pending {
                     let repo_path = self.model.repos[&identity].path.clone();
                     let issue_count = self.model.repos[&identity].providers.issues.len();
@@ -69,29 +69,7 @@ impl App {
         }
         let identity = self.model.repo_order[self.model.active_repo].clone();
         if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-            page.table.select_prev_self();
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn row_at_mouse(&self, x: u16, y: u16) -> Option<usize> {
-        let ta = self.ui.layout.table_area;
-        if x >= ta.x && x < ta.x + ta.width && y >= ta.y && y < ta.y + ta.height {
-            let row_in_table = (y - ta.y) as usize;
-            if row_in_table < 2 {
-                return None;
-            }
-            let data_row = row_in_table - 2;
-            let identity = &self.model.repo_order[self.model.active_repo];
-            if let Some(page) = self.screen.repo_pages.get(identity) {
-                let offset = page.table.table_state.offset();
-                let actual_row = data_row + offset;
-                page.table.grouped_items.selectable_indices.iter().position(|&idx| idx == actual_row)
-            } else {
-                None
-            }
-        } else {
-            None
+            page.table.select_prev();
         }
     }
 }
