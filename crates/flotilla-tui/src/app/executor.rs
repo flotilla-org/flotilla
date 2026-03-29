@@ -1,7 +1,8 @@
-use flotilla_protocol::{Command, CommandValue};
+use flotilla_protocol::{Command, CommandAction, CommandValue};
 use tracing::info;
 
 use super::{
+    issue_view::IssueQueryUpdate,
     ui_state::{PendingAction, PendingActionContext, PendingStatus},
     App,
 };
@@ -9,14 +10,56 @@ use crate::widgets::{branch_input::BranchInputWidget, delete_confirm::DeleteConf
 
 /// Dispatch a single protocol command through the daemon.
 ///
-/// All commands go through the shared `execute(command)` path and return a
-/// command ID immediately.
+/// Query commands (where `action.is_query()`) are dispatched via
+/// `execute_query` in a background task so results arrive asynchronously
+/// through the `issue_update_tx` channel. Non-query commands use the
+/// regular `execute` path.
 ///
 /// When `pending_ctx` is provided the successful command ID is recorded as a
 /// [`PendingAction`] on the active repo's UI state so the renderer can show
 /// an in-flight indicator on the affected work item row.
 pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>) {
     app.model.status_message = None;
+
+    // Route issue query commands through the background query path.
+    if let CommandAction::QueryIssueOpen { ref repo, ref params } = cmd.action {
+        let repo_identity = match repo {
+            flotilla_protocol::RepoSelector::Identity(id) => id.clone(),
+            _ => {
+                app.model.status_message = Some("issue query requires RepoSelector::Identity".into());
+                return;
+            }
+        };
+        let is_search = params.search.is_some();
+        let search_query = params.search.clone();
+        let daemon = app.daemon.clone();
+        let tx = app.issue_update_tx.clone();
+        tokio::spawn(async move {
+            match daemon.execute_query(cmd).await {
+                Ok(CommandValue::IssueQueryOpened { cursor }) => {
+                    if is_search {
+                        let _ = tx.send(IssueQueryUpdate::SearchCursorOpened {
+                            repo: repo_identity,
+                            cursor,
+                            query: search_query.unwrap_or_default(),
+                        });
+                    } else {
+                        let _ = tx.send(IssueQueryUpdate::DefaultCursorOpened { repo: repo_identity, cursor });
+                    }
+                }
+                Ok(other) => {
+                    let _ = tx.send(IssueQueryUpdate::QueryFailed {
+                        repo: repo_identity,
+                        message: format!("unexpected query result: {other:?}"),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(IssueQueryUpdate::QueryFailed { repo: repo_identity, message: e });
+                }
+            }
+        });
+        return;
+    }
 
     match app.daemon.execute(cmd).await {
         Ok(command_id) => {

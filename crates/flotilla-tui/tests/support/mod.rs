@@ -49,6 +49,7 @@ impl TestHarness {
                 provider_names: rm.provider_names.clone(),
                 provider_health: rm.provider_health.clone(),
                 work_items: Vec::new(),
+                issue_items: Vec::new(),
                 loading: rm.loading,
             });
             let page = flotilla_tui::widgets::repo_page::RepoPage::new(identity.clone(), shared, ui.view_layout);

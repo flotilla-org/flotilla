@@ -84,6 +84,9 @@ pub struct RepoData {
     pub provider_names: HashMap<String, Vec<String>>,
     pub provider_health: HashMap<String, HashMap<String, bool>>,
     pub work_items: Vec<WorkItem>,
+    /// Standalone issue items from `IssueViewState`. These are rendered in the
+    /// Issues section alongside any correlation-linked issues from `work_items`.
+    pub issue_items: Vec<WorkItem>,
     pub loading: bool,
 }
 
@@ -163,7 +166,10 @@ impl RepoPage {
             issues: data.labels.issues.section.clone(),
             sessions: data.labels.cloud_agents.section.clone(),
         };
-        let sections = flotilla_core::data::group_work_items_split(&data.work_items, &data.providers, &section_labels, &data.path);
+        // Merge snapshot work_items with query-driven issue_items.
+        let mut combined = data.work_items.clone();
+        combined.extend(data.issue_items.iter().cloned());
+        let sections = flotilla_core::data::group_work_items_split(&combined, &data.providers, &section_labels, &data.path);
         let sections = if self.show_archived { sections } else { flotilla_core::data::filter_archived_sections(sections, &data.providers) };
         self.table.update_sections(sections);
 

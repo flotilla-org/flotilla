@@ -1,6 +1,7 @@
 pub mod executor;
 mod file_picker;
 pub mod intent;
+pub mod issue_view;
 mod key_handlers;
 mod navigation;
 #[doc(hidden)]
@@ -24,6 +25,7 @@ use flotilla_protocol::{
     ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
+use tokio::sync::mpsc;
 use tui_input::Input;
 use ui_state::PendingStatus;
 pub use ui_state::{BranchInputKind, DirEntry, RepoViewLayout, TabId, UiState};
@@ -272,6 +274,12 @@ pub struct App {
     /// Per-repo shared data handles. Written by `apply_snapshot()`/`apply_delta()`,
     /// read by `RepoPage` widgets during reconciliation and rendering.
     pub repo_data: HashMap<RepoIdentity, Shared<RepoData>>,
+    /// Per-repo issue cursor state, driven by `IssueQueryService`.
+    pub issue_views: HashMap<RepoIdentity, issue_view::IssueViewState>,
+    /// Sender half for background issue query tasks. Cloned into spawned tasks.
+    pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
+    /// Receiver half, drained each event-loop iteration.
+    pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
 }
 
 impl App {
@@ -298,12 +306,15 @@ impl App {
                 provider_names: rm.provider_names.clone(),
                 provider_health: rm.provider_health.clone(),
                 work_items: Vec::new(),
+                issue_items: Vec::new(),
                 loading: rm.loading,
             });
             let page = RepoPage::new(identity.clone(), shared.clone(), ui.view_layout);
             repo_data_map.insert(identity.clone(), shared);
             screen.repo_pages.insert(identity.clone(), page);
         }
+
+        let (issue_update_tx, issue_update_rx) = mpsc::unbounded_channel();
 
         Self {
             daemon,
@@ -318,6 +329,9 @@ impl App {
             should_quit: false,
             screen,
             repo_data: repo_data_map,
+            issue_views: HashMap::new(),
+            issue_update_tx,
+            issue_update_rx,
         }
     }
 
@@ -476,8 +490,132 @@ impl App {
     }
 
     pub(crate) fn drain_background_updates(&mut self) {
-        // No-op: background issue commands have been removed.
-        // Retained as a no-op so callers don't need to change yet.
+        use issue_view::{IssueCursorState, IssueQueryUpdate};
+
+        while let Ok(update) = self.issue_update_rx.try_recv() {
+            match update {
+                IssueQueryUpdate::DefaultCursorOpened { repo, cursor } => {
+                    let view = self.issue_views.entry(repo.clone()).or_default();
+                    view.default = Some(IssueCursorState {
+                        cursor: cursor.clone(),
+                        items: Vec::new(),
+                        total: None,
+                        has_more: true,
+                        fetch_pending: true,
+                    });
+                    // Immediately fetch the first page.
+                    self.spawn_fetch_page(repo, cursor, 50);
+                }
+                IssueQueryUpdate::SearchCursorOpened { repo, cursor, query } => {
+                    let view = self.issue_views.entry(repo.clone()).or_default();
+                    view.search = Some(IssueCursorState {
+                        cursor: cursor.clone(),
+                        items: Vec::new(),
+                        total: None,
+                        has_more: true,
+                        fetch_pending: true,
+                    });
+                    view.search_query = Some(query);
+                    // Immediately fetch the first page.
+                    self.spawn_fetch_page(repo, cursor, 50);
+                }
+                IssueQueryUpdate::PageFetched { repo, cursor, page } => {
+                    if let Some(view) = self.issue_views.get_mut(&repo) {
+                        // Match cursor to search or default.
+                        let target = if view.search.as_ref().is_some_and(|s| s.cursor == cursor) {
+                            view.search.as_mut()
+                        } else if view.default.as_ref().is_some_and(|d| d.cursor == cursor) {
+                            view.default.as_mut()
+                        } else {
+                            None
+                        };
+                        if let Some(cursor_state) = target {
+                            cursor_state.append_page(page);
+                        }
+                        // Push updated issue items into Shared<RepoData>.
+                        self.push_issue_items_to_repo_data(&repo);
+                    }
+                }
+                IssueQueryUpdate::QueryFailed { repo: _, message } => {
+                    tracing::warn!(%message, "issue query failed");
+                    self.set_status_message(Some(message));
+                }
+            }
+        }
+    }
+
+    /// Spawn a background task to fetch one page of issue results.
+    fn spawn_fetch_page(&self, repo: RepoIdentity, cursor: flotilla_protocol::issue_query::CursorId, count: usize) {
+        let daemon = self.daemon.clone();
+        let tx = self.issue_update_tx.clone();
+        tokio::spawn(async move {
+            let cmd = Command {
+                host: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryIssueFetchPage { cursor: cursor.clone(), count },
+            };
+            match daemon.execute_query(cmd).await {
+                Ok(CommandValue::IssuePage(page)) => {
+                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetched { repo, cursor, page });
+                }
+                Ok(other) => {
+                    let _ =
+                        tx.send(issue_view::IssueQueryUpdate::QueryFailed { repo, message: format!("unexpected query result: {other:?}") });
+                }
+                Err(e) => {
+                    let _ = tx.send(issue_view::IssueQueryUpdate::QueryFailed { repo, message: e });
+                }
+            }
+        });
+    }
+
+    /// Open a default issue cursor for a repo if one hasn't been opened yet.
+    fn maybe_open_default_issue_cursor(&self, repo_identity: &RepoIdentity) {
+        if self.issue_views.contains_key(repo_identity) {
+            return;
+        }
+        // Guard: only spawn when inside a tokio runtime (unit tests that call
+        // apply_snapshot directly may not have one).
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let daemon = self.daemon.clone();
+        let tx = self.issue_update_tx.clone();
+        let repo_id = repo_identity.clone();
+        let cmd = Command {
+            host: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::QueryIssueOpen {
+                repo: RepoSelector::Identity(repo_id.clone()),
+                params: flotilla_protocol::issue_query::IssueQuery::default(),
+            },
+        };
+        tokio::spawn(async move {
+            match daemon.execute_query(cmd).await {
+                Ok(CommandValue::IssueQueryOpened { cursor }) => {
+                    let _ = tx.send(issue_view::IssueQueryUpdate::DefaultCursorOpened { repo: repo_id, cursor });
+                }
+                Ok(_) => { /* ignore unexpected result for default cursor */ }
+                Err(e) => {
+                    tracing::debug!(repo = %repo_id.path, %e, "default issue cursor open failed (expected when no issue provider)");
+                }
+            }
+        });
+    }
+
+    /// Push issue items from `IssueViewState` into the `Shared<RepoData>` for
+    /// a repo so the `SplitTable` can render them.
+    fn push_issue_items_to_repo_data(&self, repo_identity: &RepoIdentity) {
+        let Some(view) = self.issue_views.get(repo_identity) else { return };
+        let host_name = self.model.my_host().cloned().unwrap_or_else(HostName::local);
+        let issue_work_items = view.active_work_items(&host_name);
+        if let Some(handle) = self.repo_data.get(repo_identity) {
+            handle.mutate(|d| {
+                d.issue_items = issue_work_items;
+            });
+        }
     }
 
     // ── Widget stack helpers ──
@@ -682,6 +820,12 @@ impl App {
                     if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
                         page.active_search_query = None;
                     }
+                    // Clear the search cursor, reverting to the default listing.
+                    if let Some(view) = self.issue_views.get_mut(&repo) {
+                        view.search = None;
+                        view.search_query = None;
+                    }
+                    self.push_issue_items_to_repo_data(&repo);
                 }
             }
         }
@@ -833,6 +977,9 @@ impl App {
 
         // Log and display errors (clears status when errors resolve)
         self.set_status_message(format_error_status(&snap.errors, &path));
+
+        // On first snapshot for a repo, open a default issue cursor.
+        self.maybe_open_default_issue_cursor(&repo_identity);
     }
 
     fn apply_delta(&mut self, delta: RepoDelta) {
@@ -939,6 +1086,7 @@ impl App {
             provider_names: info.provider_names.clone(),
             provider_health: info.provider_health.clone(),
             work_items: Vec::new(),
+            issue_items: Vec::new(),
             loading: info.loading,
         });
         let page = RepoPage::new(identity.clone(), shared.clone(), self.ui.view_layout);
@@ -962,6 +1110,7 @@ impl App {
         self.model.repos.remove(repo_identity);
         self.model.repo_order.retain(|repo| repo != repo_identity);
         self.repo_data.remove(repo_identity);
+        self.issue_views.remove(repo_identity);
         self.screen.repo_pages.remove(repo_identity);
         if self.model.repo_order.is_empty() {
             self.should_quit = true;

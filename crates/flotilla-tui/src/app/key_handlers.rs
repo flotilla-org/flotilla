@@ -162,14 +162,40 @@ impl App {
 
     // ── Private helpers ──
 
-    /// Check if the current selection is near the bottom and fetch more issues.
-    ///
-    /// The SplitTable widget handles selection changes but can't mutate
-    /// `model.repos` (to set `issue_fetch_pending`). This post-dispatch check
-    /// runs after every key event to trigger infinite scroll when needed.
+    /// Check if the current selection is near the bottom of the issue section
+    /// and fetch more results if the active cursor has more pages.
     fn check_infinite_scroll(&mut self) {
-        // No-op: issue infinite scroll has been removed.
-        // Will be re-added via IssueViewState in a future task.
+        if self.model.repo_order.is_empty() {
+            return;
+        }
+        let repo_identity = self.model.repo_order[self.model.active_repo].clone();
+        let Some(page) = self.screen.repo_pages.get(&repo_identity) else { return };
+
+        // Check if the selection is in the issues section and near the bottom.
+        let Some(view) = self.issue_views.get(&repo_identity) else { return };
+        let Some(active_cursor) = view.active() else { return };
+        if !active_cursor.has_more || active_cursor.fetch_pending {
+            return;
+        }
+
+        // Use the table's proximity detection: if we're within 5 rows of the bottom.
+        let issue_count = active_cursor.items.len();
+        if issue_count == 0 {
+            return;
+        }
+        let total_items = page.table.total_item_count();
+        let Some(flat_idx) = page.table.selected_flat_index() else { return };
+        // Trigger fetch when within 5 items of the end of the full table
+        // and there are issue items to paginate.
+        if flat_idx + 5 >= total_items {
+            let cursor_id = active_cursor.cursor.clone();
+            if let Some(view) = self.issue_views.get_mut(&repo_identity) {
+                if let Some(c) = view.active_mut() {
+                    c.fetch_pending = true;
+                }
+            }
+            self.spawn_fetch_page(repo_identity, cursor_id, 50);
+        }
     }
 
     pub(super) fn action_enter(&mut self) {
