@@ -30,10 +30,10 @@ pub struct DaemonConfig {
 
 ### HostId Resolution
 
-`DaemonServer::new()` in `crates/flotilla-daemon/src/server.rs` is the production owner. It already reads `DaemonConfig` and has the config store and runner. Before constructing `InProcessDaemon`, it:
+`DaemonServer::new()` in `crates/flotilla-daemon/src/server.rs:174` is the production owner. It receives `config: Arc<ConfigStore>` and `discovery: DiscoveryRuntime` (which carries `discovery.runner: Arc<dyn CommandRunner>`). Before constructing `InProcessDaemon`, it:
 
 1. Reads `DaemonConfig` for `machine_id`.
-2. Calls `machine_scoped_state_dir(config.state_dir(), config_machine_id, runner)` (exists in `host_identity.rs`).
+2. Calls `machine_scoped_state_dir(config.state_dir(), config_machine_id, discovery.runner.as_ref())` (exists in `host_identity.rs`).
 3. Calls `resolve_or_create_host_id(scoped_dir)` (exists in `host_identity.rs`).
 4. Injects the resulting `HostId` into `InProcessDaemon::new()`.
 
@@ -155,22 +155,41 @@ All call sites change from `QualifiedPath::from_host_path(&self.host_name, path)
 
 **Critical:** `normalize_local_provider_hosts()` in `in_process.rs` rewrites every checkout's `QualifiedPath` via `from_host_path(host_name, path)` after discovery. This would overwrite the real UUID-backed `HostId` from providers. It must take `HostId` instead of `HostName` and call `QualifiedPath::host(host_id, path)`. The companion `normalize_correlation_keys()` needs the same change.
 
-### Other from_host_path() Production Callers
+### Other from_host_path() Production Callers — Local Daemon Paths Only
 
-`from_host_path()` is used in 29 production call sites beyond the factories and providers. All must switch to `QualifiedPath::host(host_id, path)`:
+Phase A migrates call sites that qualify paths for the **local daemon's own checkouts**. These switch from `from_host_path(host_name, path)` to `QualifiedPath::host(host_id, path)`:
 
-- `in_process.rs` — `normalize_local_provider_hosts()`, `normalize_correlation_keys()` (take `HostId`)
-- `executor.rs`, `executor/session_actions.rs`, `executor/terminals.rs`, `executor/workspace.rs` — executor paths that construct `QualifiedPath` (thread `HostId` through `ExecutorStepResolver`)
-- `refresh.rs` — refresh path
-- `convert.rs` — core-to-protocol conversion
-- `repo_state.rs` — repo state management
-- `peer/merge.rs` — peer data merge (takes `HostName` for the local host — needs `HostId`)
+- `in_process.rs` — `normalize_local_provider_hosts()`, `normalize_correlation_keys()` (take `HostId` instead of `HostName`)
+- `refresh.rs` — local refresh path
+- `convert.rs` — core-to-protocol conversion for local data
 
-Each of these currently receives or captures `HostName` and calls `from_host_path()`. They need `HostId` threaded to them instead.
+### Call Sites That Stay on from_host_path() in Phase A
 
-### from_host_path() Removal
+Several code paths operate on **remote host paths** where the identity arrives as `HostName` from a peer or target-host context. These are not migrated in Phase A because remote hosts don't have real `HostId` yet:
 
-After all production callers are migrated, `from_host_path()` moves behind `#[cfg(any(test, feature = "test-support"))]`. There are ~100 test call sites that can continue using it as a convenience helper (they don't need real UUIDs).
+- `executor/workspace.rs` — `target_host: &HostName` for remote workspace/attachable bindings (lines 131-227). These qualify paths on arbitrary target hosts, not just the local daemon.
+- `executor/terminals.rs` — allocates terminal sets from `HostName` for both local and remote hosts.
+- `executor/session_actions.rs` — session operations that may target remote hosts.
+- `executor.rs` — executor paths that use `target_host` (lines 705, 847).
+- `peer/merge.rs` — peer data merge compares `qp.host_id().as_str()` against `HostName::as_str()` for ownership. The local side now has a real `HostId`; peer-owned paths still use hostname-derived IDs.
+- `repo_state.rs` — may handle both local and peer data.
+
+These call sites continue using `from_host_path()` until remote hosts also carry stable `HostId` (Phase D / node identity spec).
+
+### from_host_path() Stays in Production
+
+`from_host_path()` remains in production code — it's still needed for remote/peer path qualification where only `HostName` is available. Phase A does not remove or hide it. The goal is: the local daemon's own paths use real `HostId`, everything else is unchanged.
+
+### Merge Compatibility
+
+`merge.rs` compares `qp.host_id().as_str()` against `HostName::as_str()` for ownership checks. After Phase A, the local daemon's checkouts have a UUID-based `HostId` while peer checkouts still have hostname-derived IDs. These are different strings and won't collide — which is correct. The local ownership check needs to compare against the daemon's `HostId`, not its `HostName`:
+
+```rust
+// Before: if qp.host_id().map(|h| h.as_str()) == Some(local_host.as_str())
+// After:  if qp.host_id() == Some(&local_host_id)
+```
+
+The merge function signature changes from `local_host: &HostName` to `local_host_id: &HostId`.
 
 ### Docker Discovery
 
