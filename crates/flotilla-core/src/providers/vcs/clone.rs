@@ -436,7 +436,11 @@ mod tests {
     async fn create_checkout_fresh_branch_populates_working_tree() {
         let (_dir, reference_git_dir, workspace_root) = setup_real_clone_repo();
         let runner = Arc::new(WorkspaceMappingRunner::new(workspace_root.clone()));
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new(reference_git_dir.clone()));
+        let mgr = CloneCheckoutManager::new(
+            runner.clone(),
+            ExecutionEnvironmentPath::new(reference_git_dir.clone()),
+            flotilla_protocol::HostName::new("test-host"),
+        );
 
         let (_path, checkout) = mgr
             .create_checkout(&ExecutionEnvironmentPath::new(reference_git_dir), "my-feature", true)
